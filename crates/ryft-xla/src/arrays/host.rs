@@ -694,6 +694,60 @@ fn row_major_element_strides(shape: &[usize], element_type: DataType) -> Result<
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Merges `source_bytes` into `global_bytes` starting at `global_byte_offset` and records the written range in
+/// `written_intervals`, which stays sorted and disjoint. Returns [`ArrayError::InconsistentOverlappingShardData`] when
+/// two overlapping shards disagree on the value of a byte.
+#[allow(clippy::single_range_in_vec_init)]
+fn merge_dense_byte_segment(
+    source_bytes: &[u8],
+    global_byte_offset: usize,
+    shard_index: ShardIndex,
+    global_bytes: &mut [u8],
+    written_intervals: &mut Vec<Range<usize>>,
+) -> Result<(), Error> {
+    // Shard slices with zero extents produce empty segments, and recording their degenerate `[x, x)` intervals would
+    // only bloat the overlap bookkeeping without ever contributing bytes.
+    if source_bytes.is_empty() {
+        return Ok(());
+    }
+    let range = global_byte_offset..global_byte_offset + source_bytes.len();
+    let insertion_index = written_intervals.partition_point(|written| written.start <= range.start);
+    let mut first_overlap = insertion_index.saturating_sub(1);
+    while first_overlap < written_intervals.len() && written_intervals[first_overlap].end <= range.start {
+        first_overlap += 1;
+    }
+    let mut overlap_index = first_overlap;
+    while overlap_index < written_intervals.len() && written_intervals[overlap_index].start < range.end {
+        let written = &written_intervals[overlap_index];
+        let overlap = written.start.max(range.start)..written.end.min(range.end);
+        if overlap.start < overlap.end {
+            let source_offset = overlap.start - range.start;
+            if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
+                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
+            }
+        }
+        overlap_index += 1;
+    }
+    global_bytes[range.clone()].copy_from_slice(source_bytes);
+
+    let mut merged_start = range.start;
+    let mut merged_end = range.end;
+    let mut remove_start = insertion_index;
+    if remove_start > 0 && written_intervals[remove_start - 1].end >= merged_start {
+        remove_start -= 1;
+        merged_start = merged_start.min(written_intervals[remove_start].start);
+        merged_end = merged_end.max(written_intervals[remove_start].end);
+    }
+    let mut remove_end = remove_start;
+    while remove_end < written_intervals.len() && written_intervals[remove_end].start <= merged_end {
+        merged_end = merged_end.max(written_intervals[remove_end].end);
+        remove_end += 1;
+    }
+    // The replacement is one interval, not the elements of a range.
+    written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
+    Ok(())
+}
+
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
 /// element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are row-major element
 /// strides. [`merge_dense_byte_segment`] uses the sorted, disjoint byte ranges in `written_intervals` to detect
@@ -747,60 +801,6 @@ fn merge_dense_shard_bytes_recursive(
             written_intervals,
         )?;
     }
-    Ok(())
-}
-
-/// Merges `source_bytes` into `global_bytes` starting at `global_byte_offset` and records the written range in
-/// `written_intervals`, which stays sorted and disjoint. Returns [`ArrayError::InconsistentOverlappingShardData`] when
-/// two overlapping shards disagree on the value of a byte.
-fn merge_dense_byte_segment(
-    source_bytes: &[u8],
-    global_byte_offset: usize,
-    shard_index: ShardIndex,
-    global_bytes: &mut [u8],
-    written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), Error> {
-    // Shard slices with zero extents produce empty segments, and recording their degenerate `[x, x)` intervals would
-    // only bloat the overlap bookkeeping without ever contributing bytes.
-    if source_bytes.is_empty() {
-        return Ok(());
-    }
-    let range = global_byte_offset..global_byte_offset + source_bytes.len();
-    let insertion_index = written_intervals.partition_point(|written| written.start <= range.start);
-    let mut first_overlap = insertion_index.saturating_sub(1);
-    while first_overlap < written_intervals.len() && written_intervals[first_overlap].end <= range.start {
-        first_overlap += 1;
-    }
-    let mut overlap_index = first_overlap;
-    while overlap_index < written_intervals.len() && written_intervals[overlap_index].start < range.end {
-        let written = &written_intervals[overlap_index];
-        let overlap = written.start.max(range.start)..written.end.min(range.end);
-        if overlap.start < overlap.end {
-            let source_offset = overlap.start - range.start;
-            if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
-                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
-            }
-        }
-        overlap_index += 1;
-    }
-    global_bytes[range.clone()].copy_from_slice(source_bytes);
-
-    let mut merged_start = range.start;
-    let mut merged_end = range.end;
-    let mut remove_start = insertion_index;
-    if remove_start > 0 && written_intervals[remove_start - 1].end >= merged_start {
-        remove_start -= 1;
-        merged_start = merged_start.min(written_intervals[remove_start].start);
-        merged_end = merged_end.max(written_intervals[remove_start].end);
-    }
-    let mut remove_end = remove_start;
-    while remove_end < written_intervals.len() && written_intervals[remove_end].start <= merged_end {
-        merged_end = merged_end.max(written_intervals[remove_end].end);
-        remove_end += 1;
-    }
-    // The replacement is one interval, not the elements of a range.
-    #[allow(clippy::single_range_in_vec_init)]
-    written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
     Ok(())
 }
 
