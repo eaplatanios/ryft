@@ -3,7 +3,9 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
-use ryft_core::{ArrayType, Parameter, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed};
+use ryft_core::{
+    ArrayType, DeviceMesh, Parameter, ProgramError, Sharding, Type, TypeError, TypeIdentityRenaming, Typed,
+};
 use ryft_macros::Parameter;
 use ryft_pjrt::{Client, ExecutionFence};
 
@@ -95,6 +97,25 @@ impl RetainedArray {
         }
     }
 
+    /// Returns the runtime [`Sharding`] of the retained array, including placement over auto mesh axes that its
+    /// declared [`ArrayType`] does not record.
+    #[inline]
+    pub fn sharding(&self) -> &Sharding {
+        self.metadata.sharding()
+    }
+
+    /// Returns the concrete [`DeviceMesh`] of the retained array.
+    #[inline]
+    pub fn mesh(&self) -> &DeviceMesh {
+        self.metadata.mesh()
+    }
+
+    /// Returns whether the retained array is [committed to its devices](Array::is_committed).
+    #[inline]
+    pub fn is_committed(&self) -> bool {
+        self.committed
+    }
+
     /// Returns a new [`Array`] that refers to the device buffers of this retained array and belongs to `session`.
     ///
     /// # Errors
@@ -102,13 +123,7 @@ impl RetainedArray {
     /// Returns a [`ProgramError::Type`] error if the buffers are owned by another PJRT client than the one
     /// of `session`, which cannot use them.
     pub fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
-        if !std::ptr::eq(self.client, session.client()) {
-            return Err(TypeError::invalid(format!(
-                "session constant `{self}` retains an array of a different PJRT client \
-                 than the client of this session",
-            ))
-            .into());
-        }
+        self.validate_session_client(session)?;
 
         // The new array has storage of its own, and its shards refer to the same device buffers.
         // The parts need no validation because they come from an array that was already validated.
@@ -128,6 +143,22 @@ impl RetainedArray {
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self { declared_type: self.declared_type.rename_identities(renaming)?, ..self.clone() })
+    }
+
+    /// Validates that `session` can use the buffers of this retained array.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError::Type`] error if the buffers belong to a different PJRT client.
+    pub(crate) fn validate_session_client(&self, session: &Session) -> Result<(), ProgramError> {
+        if !std::ptr::eq(self.client, session.client()) {
+            return Err(TypeError::invalid(format!(
+                "session constant `{self}` retains an array of a different PJRT client \
+                 than the client of this session",
+            ))
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -186,10 +217,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DataType, DimensionBounds, DimensionVariable};
+    use ryft_core::{DataType, DimensionBounds, DimensionVariable, ShardingDimension};
 
-    use crate::sessions::tests::{domain_mesh, replicated_scalar_type, shares_effect_scope};
-    use crate::tests::{execution_client, hash_of, other_cpu_client};
+    use crate::sessions::tests::{domain_mesh, f32_scalar, replicated_scalar_type, shares_effect_scope};
+    use crate::tests::{cpu_client, execution_client, hash_of, other_cpu_client, values_to_bytes};
 
     use super::*;
 
@@ -213,6 +244,41 @@ mod tests {
         // An array that was created from a retained array has storage of its own, so retaining it yields a different
         // retained array.
         assert_ne!(RetainedArray::new(&restored), retained);
+    }
+
+    #[test]
+    fn test_retained_array_sharding() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            mesh,
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2f32]),
+        )
+        .unwrap();
+        assert_eq!(RetainedArray::new(&array).sharding(), &sharding);
+    }
+
+    #[test]
+    fn test_retained_array_mesh() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let array = f32_scalar(&session, &mesh, 1f32);
+        assert_eq!(RetainedArray::new(&array).mesh(), &mesh);
+    }
+
+    #[test]
+    fn test_retained_array_is_committed() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
+            .unwrap();
+        assert!(!RetainedArray::new(&array).is_committed());
+        assert!(RetainedArray::new(&array.with_committed(true)).is_committed());
     }
 
     #[test]
