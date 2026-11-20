@@ -26,24 +26,21 @@ use crate::operations::{
     ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
     OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
     ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation,
-    RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation,
-    RematerializeOperation, ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator,
-    RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation, SaturatingSub,
-    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, Select, SelectOperation,
-    ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort, SortOperation,
-    SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, TanOperation,
-    TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations, UpdateSliceOperation,
-    WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Place, PlaceOperation, PowOperation,
+    Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
+    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
+    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
+    SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, Select,
+    SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort,
+    SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation,
+    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
+    UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 
-#[cfg(doc)]
-use crate::programs::{Operation, TypeError, Typed};
-
-/// [`Operation`] family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
+/// [`Operation`](crate::Operation) family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(identity, partial_evaluation, batching, differentiation, transposition))]
 pub enum ArrayOperation<V: Value<Type = ArrayType>> {
@@ -139,6 +136,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
     ReducePrecision(ReducePrecisionOperation<ArrayType>),
     TransferToMemory(TransferToMemoryOperation),
+    Place(PlaceOperation),
     Reshard(ReshardOperation),
     ConstrainSharding(ConstrainShardingOperation),
     Condition(ConditionOperation<ArrayType>),
@@ -177,13 +175,13 @@ impl<V: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayOperati
 /// implementing value. Homogeneous array values (e.g., [`Array`] and the tracers over [`ArrayType`]) implement
 /// `ArrayOperations<ArrayType>`, and array IR values (e.g., [`ArrayIrValue`] and the tracers over [`ArrayIrType`])
 /// implement `ArrayOperations<ArrayIrType>` by applying the array capabilities to their array members (a first-class
-/// dimension or reference member fails with the projection's [`TypeError`]). Generic code bounded by
+/// dimension or reference member fails with the projection's [`TypeError`](crate::TypeError)). Generic code bounded by
 /// `V: ArrayOperations` therefore works for values of either universe without projecting them.
 ///
-/// The bundle deliberately does not pin `Value<Type = T>`. A value's capability universe is its own [`Typed::Type`] by
-/// convention (refer to [`Capability`]), and an equality between the two in the bound would make the trait solver
-/// normalize `V::Type` to the universe projection, so that bounds on `V::Type` in generic code (e.g.,
-/// `V::Type: DifferentiableType`) would no longer apply.
+/// The bundle deliberately does not pin `Value<Type = T>`. A value's capability universe is its own
+/// [`Typed::Type`](crate::Typed::Type) by convention (refer to [`Capability`]), and an equality between the two in the
+/// bound would make the trait solver normalize `V::Type` to the universe projection, so that bounds on `V::Type` in
+/// generic code (e.g., `V::Type: DifferentiableType`) would no longer apply.
 pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     Value
     + ConstantOperations<T>
@@ -206,6 +204,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Compare<Self, T>
     + Select<T>
     + ManipulationOperations<T>
+    + Place<T>
     + ShardingOperations<Self, T>
     + StopGradient<T>
     + Tag<T>
@@ -240,6 +239,7 @@ impl<
         + Compare<V, T>
         + Select<T>
         + ManipulationOperations<T>
+        + Place<T>
         + ShardingOperations<V, T>
         + StopGradient<T>
         + Tag<T>
@@ -252,7 +252,7 @@ impl<
 {
 }
 
-/// [`Operation`] family used for staged [`Program`](crate::Program)s over [`DimensionValue`]s.
+/// [`Operation`](crate::Operation) family used for staged [`Program`](crate::Program)s over [`DimensionValue`]s.
 #[derive(Clone, Debug, Operation)]
 #[ryft(dispatch(identity, partial_evaluation))]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
@@ -311,11 +311,11 @@ impl<
 {
 }
 
-/// [`Operation`] family for Ryft's array Intermediate Representation (IR), whose values include arrays, first-class
-/// dimensions, and array references. Homogeneous operations project their complete boundary into [`ArrayOperation`]
-/// or [`DimensionOperation`], delegate to that family's rule, and lift the result types back into [`ArrayIrType`].
-/// Mixed signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array and produces
-/// a dimension. Reference operations also stay family-native so that their array/reference boundaries,
+/// [`Operation`](crate::Operation) family for Ryft's array Intermediate Representation (IR), whose values include
+/// arrays, first-class dimensions, and array references. Homogeneous operations project their complete boundary into
+/// [`ArrayOperation`] or [`DimensionOperation`], delegate to that family's rule, and lift the result types back into
+/// [`ArrayIrType`]. Mixed signatures need explicit variants. For example, [`DimensionSizeOperation`] consumes an array
+/// and produces a dimension. Reference operations also stay family-native so that their array/reference boundaries,
 /// [`ArrayReferenceTransform`] access paths, and ordered effects remain visible to program passes.
 ///
 /// Mixed array constructors and shape-changing operations receive runtime extents as explicit first-class dimension
@@ -632,7 +632,9 @@ mod tests {
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::references::ArrayReferenceTransform;
-    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::meshes::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::placements::Placement;
+    use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -904,6 +906,11 @@ mod tests {
         // their own universe, including nested tracers over both homogeneous and array IR contexts.
         fn requires_array_operations<V: ArrayOperations>() {}
 
+        /// Places `input` on `target` through the bundle bound alone.
+        fn place_through_bundle<V: ArrayOperations>(input: &V, target: &Placement) -> Result<V, ProgramError> {
+            input.place(target, None)
+        }
+
         requires_array_operations::<Array>();
         requires_array_operations::<ArrayIrValue<Array>>();
         requires_array_operations::<Tracer<TracingContext<Array, ArrayOperation<Array>>>>();
@@ -932,6 +939,20 @@ mod tests {
                 ArrayIrBatchingPolicy,
             >,
         >();
+
+        // Generic code bounded by the bundle can move values of either universe to a concrete placement.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let devices = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let target =
+            Placement::new(devices, Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap()).unwrap();
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(target.sharding().clone()).unwrap(),
+            &[1.0f32, 2.0],
+        )
+        .unwrap();
+        assert_eq!(place_through_bundle(&input, &target), Ok(expected.clone()));
+        assert_eq!(place_through_bundle(&ArrayIrValue::Array(input), &target), Ok(ArrayIrValue::Array(expected)));
     }
 
     #[test]

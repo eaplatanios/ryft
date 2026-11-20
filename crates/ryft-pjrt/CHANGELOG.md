@@ -69,6 +69,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added live task incarnation snapshots to cross-host send/receive APIs and explicit cancellation notifier admission
   to the deprecated receive API. Deprecated sends now provide the native descriptor destructor and keep descriptor
   data alive independently from completion callback state.
+- Added `Client::host_to_device_transfer_manager_with_default_layouts`, which creates a `HostToDeviceTransferManager`
+  whose buffers use the default device layouts of the PJRT plugin.
+- Added `HostToDeviceTransferManager::supports_transfer_data` and
+  `HostToDeviceTransferManager::supports_transfer_literal` for checking whether the PJRT plugin provides the
+  corresponding transfer functions before any data is transferred.
+- Added a `Send` implementation for `HostToDeviceTransferManager`, so that a transfer manager can be created on one
+  thread and moved to another thread that transfers its data. It is deliberately not `Sync`.
 
 ### Changed
 
@@ -123,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   device completes, instead of releasing per-device callbacks as each device completes. Executions that supply an
   execution context or callbacks now require native `PJRT_Event_OnReady` or `PJRT_Event_Await` support and return
   `Error::MissingFunction` before submission when neither is available.
+- Changed `HostToDeviceTransferManager` to validate its calls before they reach the PJRT plugin, which only checks
+  them in debug builds or aborts the process. Buffer indices must be in range, each buffer can be retrieved once, a
+  buffer accepts nothing after its last transfer or an error, a buffer accepts either raw data transfers or one
+  literal transfer but not both, and `HostToDeviceTransferManager::transfer_data` rejects data that does not fit in
+  the buffer. `Client::host_to_device_transfer_manager` rejects invalid element types and shapes whose dimensions or
+  size in bytes overflow a signed 64-bit integer.
+- Changed `HostToDeviceTransferManager::transfer_literal` to require a literal that matches the element type and the
+  dimensions of the buffer that it is transferred into, a dense layout whose minor-to-major order is a valid
+  permutation (i.e., strided and tiled layouts are rejected), and data of exactly the size in bytes of that literal.
+  Token literals must be empty.
 
 ### Fixed
 
@@ -149,6 +166,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   an error instead of passing an undersized destination to PJRT.
 - Fixed `LoadedExecutable::execute` releasing launch resources early when a failure occurred after successful native
   submission. It now waits for every participating device to complete before returning the error.
+- Fixed out-of-bounds reads of host data in `HostToDeviceTransferManager::transfer_literal`, which passed the data to
+  PJRT without checking it against the size of the literal, and out-of-bounds accesses for invalid buffer indices in
+  the other `HostToDeviceTransferManager` functions.
+- Fixed process aborts in `HostToDeviceTransferManager` for sequences of calls that the PJRT plugin enforces with fatal
+  checks (e.g., setting an error twice, transferring data after an error, or transferring a literal after a partial
+  raw data transfer), which now return an `Error` instead.
 
 ### Removed
 

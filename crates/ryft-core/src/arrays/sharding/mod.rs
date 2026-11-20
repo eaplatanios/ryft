@@ -3,10 +3,12 @@ use thiserror::Error;
 use crate::programs::{Type, TypeError};
 
 pub mod meshes;
+pub mod placements;
 pub mod shardings;
 pub mod visualizations;
 
 pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
+pub use placements::Placement;
 pub use shardings::{ReductionStateKind, Sharding, ShardingDimension, UnreducedKind};
 pub use visualizations::ShardingVisualization;
 

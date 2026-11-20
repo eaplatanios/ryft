@@ -523,8 +523,9 @@ where
 /// differentiation) delegate to their parent, and eager contexts have none. A derived default mesh would be wrong
 /// in two ways. A named batching level that shadows a manual mesh axis hides the binding of that axis although the
 /// computation is still inside the manual region of its mesh (and with several enclosing meshes, the shadowing may
-/// expose an outer mesh instead), and a context may have a default mesh without binding any manual axes. Concrete
-/// device meshes stay with backend domains and compilation options.
+/// expose an outer mesh instead), and a context may have a default mesh without binding any manual axes. Contexts do
+/// not own concrete device meshes. Programs name them explicitly through the [`Placement`](crate::Placement)s of
+/// [`place`](crate::Place::place), and backend domains and compilation options supply the rest.
 pub trait MeshContext: Context {
     /// Returns the default [`LogicalMesh`] of this context, or [`None`] when it has none.
     fn default_mesh(&self) -> Option<LogicalMesh>;

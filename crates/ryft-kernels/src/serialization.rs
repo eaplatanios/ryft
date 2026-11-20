@@ -3597,6 +3597,11 @@ impl Encoder {
             ArrayOperation::TransferToMemory(operation) => {
                 WireOperation::TransferToMemory(operation.destination().into())
             }
+            ArrayOperation::Place(_) => {
+                // A placement names the device assignment of one runtime, which a serialized kernel must not depend on,
+                // so neither a transported kernel nor a kernel key can carry one.
+                return Err(unsupported(format!("`{}`", portable.name())));
+            }
             ArrayOperation::Reshard(operation) => {
                 self.key_only(portable, WireKeyOnlyOperation::Reshard(Box::new(operation.sharding().into())))?
             }

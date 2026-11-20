@@ -59,9 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Execution with transactional external state for backends that implement `StatefulCompilationDomain`.
 - Added arrays and array programs in `ryft_core::arrays`. `ArrayType`s model data types, shapes with static or symbolic
   bounded `Dimension`s, layouts, memory spaces, and shardings over `LogicalMesh`es and `DeviceMesh`es, which are
-  defined in `ryft_core::arrays::sharding` and support unreduced axes (i.e., `UnreducedKind`). `Array` is an eager
-  reference implementation, `ArrayReference` provides mutable array references with indexed and sliced views, and
-  `ArrayIrValue` unifies arrays, dimensions, and references within one program.
+  defined in `ryft_core::arrays::sharding` and support unreduced axes (i.e., `UnreducedKind`). A `Placement` names
+  where an array concretely lives (i.e., a `DeviceMesh`, a sharding over it, and optionally a memory space and a
+  layout). `Array` is an eager reference implementation, `ArrayReference` provides mutable array references with
+  indexed and sliced views, and `ArrayIrValue` unifies arrays, dimensions, and references within one program.
 - Added operations along with value capability traits in `ryft_core::operations`, which can be applied uniformly to
   eager values and to traced values, and which provide rules for interpretation and all of the above transforms.
   Related capabilities are also bundled for generic code (e.g., `ArithmeticOperations`, `ManipulationOperations`,
@@ -97,11 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     capabilities.
   - **References:** `ReferenceNew`, `ReferenceRead`, `ReferenceWrite`, `ReferenceSwap`, `ReferenceAddUpdate`,
     `ReferenceAtomicAddUpdate`, and `ReferenceFreeze`.
-  - **Sharding & Collectives:** `Reshard`, `ConstrainSharding`, `ShardMap`, `AxisIndex`, `ParallelReduce`,
+  - **Sharding & Collectives:** `Reshard`, `ConstrainSharding`, `Place`, `ShardMap`, `AxisIndex`, `ParallelReduce`,
     `ParallelVary`, `ParallelCast`, `ParallelArgExtrema`, `ParallelAllGather`, `ParallelSumScatter`, `ParallelPermute`,
     `ParallelBroadcast`, `ParallelAllToAll`, and `ParallelRaggedAllToAll`, along with `shard_map` for manual Single
     Program Multiple Data (SPMD) computations and `auto_axes` and `explicit_axes` for switching the types of mesh
-    axes within a function.
+    axes within a function. `Place` moves a value to a `Placement`, possibly on the devices of another mesh, and values
+    report where they concretely live via `Placed`, so that reverse mode differentiation moves cotangents back to where
+    their primals came from.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
     are created via `composite` and support custom JVP, VJP, and batching rules. Composites can also be named (i.e.,
