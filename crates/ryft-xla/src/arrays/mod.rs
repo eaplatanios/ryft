@@ -1026,26 +1026,6 @@ impl std::ops::BitXor for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
-#[inline]
-pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
-    for array in values.parameters() {
-        array.ready().await?;
-    }
-    Ok(())
-}
-
-/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
-#[inline]
-pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
-    for array in values.parameters() {
-        array.block_until_ready()?;
-    }
-    Ok(())
-}
-
 /// Provides XLA-specific helpers for [`ArrayType`]s.
 pub trait ArrayTypeExtension {
     /// Returns the number of logical payload bytes required by a dense [`Array`] of this [`ArrayType`].
@@ -1070,6 +1050,24 @@ impl ArrayTypeExtension for ArrayType {
             ),
         })
     }
+}
+
+/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
+#[inline]
+pub async fn ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.ready().await?;
+    }
+    Ok(())
+}
+
+/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
+#[inline]
+pub fn block_until_ready<Values: Parameterized<Array>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.block_until_ready()?;
+    }
+    Ok(())
 }
 
 /// Immutable storage of an [`Array`] that its clones share.
