@@ -558,12 +558,18 @@ impl Array {
     ///   - **Session Mesh:** It was created without a mesh and without array inputs by a [`Session`] that has a
     ///     [default mesh](Session::device_mesh), which then decides its placement. This covers
     ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the results of eager operations without
-    ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, such arrays are uncommitted.
+    ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, such arrays are uncommitted,
+    ///     unless they are eager results on more than one device. In particular, [`Self::from_host_buffer`] without
+    ///     a mesh lays the logical mesh of a sharding out over the first addressable devices and leaves the upload
+    ///     uncommitted even when that spans more than one device.
     ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
     ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
     ///   - **Committed Inputs:** It is the result of an operation or of a compiled function that has a committed array
     ///     input, including the arrays that the function captures.
+    ///   - **Eager Results on Several Devices:** It is the result of an eager operation, or of a reshard that moves an
+    ///     array to the devices that an eager operation runs on, and it lives on more than one device. An uncommitted
+    ///     eager result therefore always lives on a single device.
     ///   - **Compiled Functions:** It is an output of a compiled function that was compiled for more than one device,
     ///     or a public output of a compiled function that requests a placement explicitly anywhere (i.e., through a
     ///     sharding override, a [`PlaceOperation`](ryft_core::PlaceOperation) with a target, or a sharding constraint),
@@ -578,13 +584,13 @@ impl Array {
     /// inputs follow committed ones, so when all committed inputs live on the same devices, the operation moves its
     /// uncommitted inputs to the mesh of the committed inputs and runs there. When inputs on different devices are
     /// all uncommitted, the operation moves them to the [default mesh](Session::device_mesh) of the session (or,
-    /// without one, to the first addressable device), as JAX does, and its result stays uncommitted. A moved input
-    /// keeps its sharding when that sharding is over the logical mesh of its destination, and it is replicated over
-    /// that mesh when it is replicated. A move shares the buffers of the shards that stay on their devices. The
-    /// operation still fails when two committed inputs live on different devices and when an uncommitted input
-    /// cannot be moved (i.e., when it is sharded over another logical mesh, or when it or its destination is not fully
-    /// addressable from this process). Compiled functions always run on the devices that they were compiled for and
-    /// move every input there, whatever its commitment.
+    /// without one, to the first addressable device), as JAX does, and its result stays uncommitted when it lives on a
+    /// single device. A moved input keeps its sharding when that sharding is over the logical mesh of its destination,
+    /// and it is replicated over that mesh when it is replicated. A move shares the buffers of the shards that stay on
+    /// their devices. The operation still fails when two committed inputs live on different devices and when an
+    /// uncommitted input cannot be moved (i.e., when it is sharded over another logical mesh, or when it or its
+    /// destination is not fully addressable from this process). Compiled functions always run on the devices that
+    /// they were compiled for and move every input there, whatever its commitment.
     ///
     /// [jax-placement]: https://docs.jax.dev/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
     #[inline]

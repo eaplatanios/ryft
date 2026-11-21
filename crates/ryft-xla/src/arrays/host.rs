@@ -38,6 +38,11 @@ impl Array {
     /// [committed](Self::is_committed) to its devices when `mesh` or the mesh of `session` selected them,
     /// and it is uncommitted when they are only this default.
     ///
+    /// When the destination mesh spans several processes, each process uploads only the shards of its own devices,
+    /// so every process must call this function with the same host value. Nothing compares the values across processes,
+    /// so differing values leave the shards and the replicas of the array inconsistent. Use [`Self::from_host_shards`]
+    /// for values that are meant to differ between processes.
+    ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`.
     /// [`Memory::Device`](ryft_core::Memory::Device) uses the device's default memory. Host placements select
     /// its `pinned_host` or `unpinned_host` memory. A device without the requested host space produces
