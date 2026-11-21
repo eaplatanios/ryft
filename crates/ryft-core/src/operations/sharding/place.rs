@@ -388,7 +388,9 @@ where
         // copy policy, so that interpretation over staging values (e.g., program batching, re-tracing, etc.) preserves
         // them, while concrete values move to the target or stay where they are without one.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![place_with_inferred_source(&inputs[0], self.source.as_ref(), self.target.as_ref(), self.may_alias)?])
+        let input = &inputs[0];
+        let source = self.source.clone().or_else(|| input.placement());
+        Ok(vec![<C::Value as Value>::Dispatch::place(input, source, self.target.as_ref(), self.may_alias)?])
     }
 }
 
@@ -467,7 +469,9 @@ where
 
         // Placement changes preserve the packed shape and mapped batch axis, and the copy policy applies to the packed
         // value unchanged.
-        let output = place_with_inferred_source(input.value(), source.as_ref(), target.as_ref(), self.may_alias)?;
+        let packed = input.value();
+        let source = source.or_else(|| packed.placement());
+        let output = <C::Value as Value>::Dispatch::place(packed, source, target.as_ref(), self.may_alias)?;
         Ok(vec![ArrayBatch::new(output, input.batch_axis())?])
     }
 }
@@ -490,14 +494,14 @@ impl_differentiable_operation! {
             // linear map, whose transpose must move the cotangent back to where the primal lived.
             check_count!("input", inputs, 1, ProgramError);
             let may_alias = operation.may_alias();
-            let source = operation.source().cloned().or_else(|| inputs[0].primal().placement());
-            let primal =
-                place_with_inferred_source(inputs[0].primal(), source.as_ref(), operation.target(), may_alias)?;
+            let input = inputs[0].primal();
+            let source = operation.source().cloned().or_else(|| input.placement());
+            let primal = <C::Value as Value>::Dispatch::place(input, source.clone(), operation.target(), may_alias)?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                MaybeZero::Value(tangent) => MaybeZero::Value(place_with_inferred_source(
+                MaybeZero::Value(tangent) => MaybeZero::Value(<C::Value as Value>::Dispatch::place(
                     tangent,
-                    source.as_ref().map(placement_without_layout).as_ref(),
+                    source.as_ref().map(placement_without_layout).or_else(|| tangent.placement()),
                     operation.target().map(placement_without_layout).as_ref(),
                     may_alias,
                 )?),
@@ -965,7 +969,8 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
             .parameters()
             .zip(targets.parameters())
             .map(|(input, target)| {
-                place_with_inferred_source(input, sources.next().and_then(Into::into), Some(target), true)
+                let source = sources.next().and_then(Into::into).cloned().or_else(|| input.placement());
+                P::Dispatch::place(input, source, Some(target), true)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(S::from_parameters(self.parameter_structure(), outputs)?)
@@ -973,18 +978,6 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Places `input` on the optional `target` through its [`PlaceDispatch`] primitive with the copy policy `may_alias`,
-/// using `source` when it is given and otherwise the placement that `input` concretely lives on (i.e., via [`Placed`]),
-/// if any.
-fn place_with_inferred_source<V: Value<Dispatch: PlaceDispatch<V::Type, V>> + Placed>(
-    input: &V,
-    source: Option<&Placement>,
-    target: Option<&Placement>,
-    may_alias: bool,
-) -> Result<V, ProgramError> {
-    V::Dispatch::place(input, source.cloned().or_else(|| input.placement()), target, may_alias)
-}
 
 /// Returns the placement of the batch items of a packed value that lives on `placement` and whose batch dimension is
 /// at position `batch_axis`, or [`None`] if the sharding of `placement` has no such dimension. The batch dimension is
