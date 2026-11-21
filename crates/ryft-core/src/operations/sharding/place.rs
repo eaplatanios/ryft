@@ -835,7 +835,27 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Source argument accepted by [`Place::place`]. A borrowed tree of `Leaf` values has the same ordered
+/// parameter paths as the receiver. `Option<&S>` supplies or omits a whole tree of [`Placement`]s, while
+/// `&S` with `Option<Placement>` leaves lets each leaf omit its own source.
+pub trait PlacementSources<P: Parameter, S: Parameterized<P>> {
+    /// Returns the supplied source tree, or [`None`] to infer the source of every leaf.
+    fn as_parameterized(&self) -> Option<&S>;
+}
+
+impl<S: Parameterized<Placement>> PlacementSources<Placement, S> for Option<&S> {
+    #[inline]
+    fn as_parameterized(&self) -> Option<&S> {
+        *self
+    }
+}
+
+impl<S: Parameterized<Option<Placement>>> PlacementSources<Option<Placement>, S> for &S {
+    #[inline]
+    fn as_parameterized(&self) -> Option<&S> {
+        Some(self)
+    }
+}
 
 /// Moves a value to a target [`Placement`], possibly on the devices of another [`DeviceMesh`](crate::DeviceMesh),
 /// without changing its elements, shape, or data type. This is the Ryft analogue of
@@ -864,10 +884,10 @@ impl<
 /// instead, which also forces that copy when the placement is staged and later executes on concrete values.
 /// [`PlaceDispatch::place`] also places a leaf without a target, which leaves it where it is.
 ///
-/// A single value accepts one target and an optional source. A [`Parameterized`] receiver accepts placements with the
-/// same ordered parameter paths and preserves its structure and static fields. The universe parameter `T` defaults to
-/// the [`Capability`] universe of a single-value receiver, which is [`ArrayType`] for homogeneous arrays and
-/// [`ArrayIrType`] for array IR values. The leaf parameter `P` defaults to `Self`, so single-value bounds
+/// A single value accepts an optional source followed by its target. A [`Parameterized`] receiver accepts placements
+/// with the same ordered parameter paths and preserves its structure and static fields. The universe parameter `T`
+/// defaults to the [`Capability`] universe of a single-value receiver, which is [`ArrayType`] for homogeneous arrays
+/// and [`ArrayIrType`] for array IR values. The leaf parameter `P` defaults to `Self`, so single-value bounds
 /// can use `Place<T>`. A structured receiver implements `Place<T, P>` for the universe `T` of its leaves.
 ///
 /// # Examples
@@ -883,21 +903,23 @@ impl<
 /// let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])?;
 /// let target = Placement::new(devices, sharding.clone())?.with_memory(Memory::Host { pinned: true });
 /// let input = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 2])?;
-/// let output = input.place(&target, None)?;
+/// let output = input.place(None, &target)?;
 /// assert_eq!(output.r#type().sharding(), Some(&sharding));
 /// assert_eq!(output.r#type().memory(), Memory::Host { pinned: true });
 /// assert_eq!(output.elements::<i32>()?, vec![1, 2]);
 ///
 /// let inputs = (input, output);
 /// let targets = (target.clone(), target.clone());
-/// let outputs = inputs.place_with_optional_sources(&targets, &(None, Some(target)))?;
+/// let outputs = inputs.place(&(None, Some(target)), &targets)?;
 /// assert_eq!(outputs.0, outputs.1);
+/// assert_eq!(outputs.place(Some(&targets), &targets)?, outputs);
 /// # Ok(())
 /// # }
 /// ```
 pub trait Place<T = <Self as Capability>::Universe, P: Parameter + Capability = Self>: Sized {
-    /// Places each leaf on its corresponding target. With `None`, each leaf infers its own source. With `Some`,
-    /// `sources` supplies one explicit source per leaf. The source is informative as described by [`PlaceOperation`].
+    /// Places each leaf on its corresponding target. Pass `None` to infer all sources, `Some(&sources)` to supply
+    /// every source, or a borrowed tree of `Option<Placement>` to infer just its `None` leaves. Each inferred source
+    /// comes from the leaf's [`Placed::placement`], which can itself be unknown.
     ///
     /// # Errors
     ///
@@ -905,84 +927,52 @@ pub trait Place<T = <Self as Capability>::Universe, P: Parameter + Capability = 
     /// receiver, targets, or supplied sources differ, and otherwise the first error that placing a leaf returns (refer
     /// to [`PlaceDispatch::place`]), such as a [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects
     /// the target or source of that leaf.
-    fn place(
+    fn place<Source: Parameter>(
         &self,
+        sources: impl PlacementSources<Source, <Self as Parameterized<P>>::To<Source>>,
         targets: &<Self as Parameterized<P>>::To<Placement>,
-        sources: Option<&<Self as Parameterized<P>>::To<Placement>>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Parameterized<P, Family: ParameterizedFamily<Placement>>;
-
-    /// Places each leaf as in [`Self::place`], using an explicit source for each `Some` leaf and inferring the source
-    /// of each `None` leaf independently. All three structures must have the same ordered parameter paths.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::InvalidArgument`] before placing any leaf if the ordered parameter paths of the
-    /// receiver, targets, or sources differ, and otherwise the first error that placing a leaf returns (refer to
-    /// [`PlaceDispatch::place`]), such as a [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects
-    /// the target or source of that leaf.
-    fn place_with_optional_sources(
-        &self,
-        targets: &<Self as Parameterized<P>>::To<Placement>,
-        sources: &<Self as Parameterized<P>>::To<Option<Placement>>,
-    ) -> Result<Self, ProgramError>
-    where
-        Self: Parameterized<P, Family: ParameterizedFamily<Placement> + ParameterizedFamily<Option<Placement>>>;
+        Self: Parameterized<P, Family: ParameterizedFamily<Placement> + ParameterizedFamily<Source>>,
+        for<'s> &'s Source: Into<Option<&'s Placement>>;
 }
 
 impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T> + Placed, S: Parameterized<P>>
     Place<T, P> for S
 {
-    fn place(&self, targets: &S::To<Placement>, sources: Option<&S::To<Placement>>) -> Result<Self, ProgramError>
-    where
-        S::Family: ParameterizedFamily<Placement>,
-    {
-        place_parameters(self, targets, sources, |source| Some(source))
-    }
-
-    fn place_with_optional_sources(
+    fn place<Source: Parameter>(
         &self,
+        sources: impl PlacementSources<Source, S::To<Source>>,
         targets: &S::To<Placement>,
-        sources: &S::To<Option<Placement>>,
     ) -> Result<Self, ProgramError>
     where
-        S::Family: ParameterizedFamily<Placement> + ParameterizedFamily<Option<Placement>>,
+        S::Family: ParameterizedFamily<Placement> + ParameterizedFamily<Source>,
+        for<'s> &'s Source: Into<Option<&'s Placement>>,
     {
-        place_parameters(self, targets, Some(sources), Option::as_ref)
+        let sources = sources.as_parameterized();
+        if !self.parameter_paths().eq(targets.parameter_paths()) {
+            return Err(ProgramError::InvalidArgument {
+                message: "receiver and `targets` must have the same parameter structure".to_string(),
+            });
+        }
+        if sources.is_some_and(|sources| !self.parameter_paths().eq(sources.parameter_paths())) {
+            return Err(ProgramError::InvalidArgument {
+                message: "receiver and `sources` must have the same parameter structure".to_string(),
+            });
+        }
+        let mut sources = sources.into_iter().flat_map(|sources| sources.parameters());
+        let outputs = self
+            .parameters()
+            .zip(targets.parameters())
+            .map(|(input, target)| {
+                place_with_inferred_source(input, sources.next().and_then(Into::into), Some(target), true)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(S::from_parameters(self.parameter_structure(), outputs)?)
     }
 }
 
-/// Checks the target and source paths before dispatching any leaf and rebuilds the result from the receiver's
-/// structure so that its static fields are preserved.
-fn place_parameters<
-    P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Placed,
-    Source: Parameter,
-    S: Parameterized<P, Family: ParameterizedFamily<Placement> + ParameterizedFamily<Source>>,
->(
-    input: &S,
-    targets: &S::To<Placement>,
-    sources: Option<&S::To<Source>>,
-    as_source: fn(&Source) -> Option<&Placement>,
-) -> Result<S, ProgramError> {
-    if !input.parameter_paths().eq(targets.parameter_paths()) {
-        return Err(ProgramError::InvalidArgument {
-            message: "receiver and `targets` must have the same parameter structure".to_string(),
-        });
-    }
-    if sources.is_some_and(|sources| !input.parameter_paths().eq(sources.parameter_paths())) {
-        return Err(ProgramError::InvalidArgument {
-            message: "receiver and `sources` must have the same parameter structure".to_string(),
-        });
-    }
-    let mut sources = sources.into_iter().flat_map(|sources| sources.parameters()).map(as_source);
-    let outputs = input
-        .parameters()
-        .zip(targets.parameters())
-        .map(|(input, target)| place_with_inferred_source(input, sources.next().flatten(), Some(target), true))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(S::from_parameters(input.parameter_structure(), outputs)?)
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Places `input` on the optional `target` through its [`PlaceDispatch`] primitive with the copy policy `may_alias`,
 /// using `source` when it is given and otherwise the placement that `input` concretely lives on (i.e., via [`Placed`]),
@@ -2012,7 +2002,7 @@ mod tests {
         check_operation_partial_evaluation!(
             operation = PlaceOperation::new(None, target.clone()),
             inputs = [input.clone()],
-            expected = input.place(&target, None).unwrap(),
+            expected = input.place(None, &target).unwrap(),
         );
         check_operation_partial_evaluation!(
             operation = PlaceOperation::new(None, None).with_may_alias(false),
@@ -2049,7 +2039,7 @@ mod tests {
             |x| {
                 let (target, source) = (target.clone(), source.clone());
                 Ok(batch(
-                    move |item| item.place(&target, Some(&source)),
+                    move |item| item.place(Some(&source), &target),
                     x,
                     BatchAxis::new(0),
                     BatchAxis::new(0),
@@ -2085,7 +2075,7 @@ mod tests {
             |x| {
                 let (target, source) = (target.clone(), source.clone());
                 Ok(batch(
-                    move |item| item.place(&target, Some(&source)),
+                    move |item| item.place(Some(&source), &target),
                     x,
                     BatchAxis::new(1),
                     BatchAxis::new(1),
@@ -2214,7 +2204,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 Ok(batch(
-                    move |item| item.place(&target, Some(&source)),
+                    move |item| item.place(Some(&source), &target),
                     x,
                     BatchAxis::new(0),
                     BatchAxis::new(0),
@@ -2299,7 +2289,7 @@ mod tests {
         let input = PlacedArray { array: array.clone(), placement: Some(packed.clone()), context: context.clone() };
         let target = Placement::new(mesh_x(), Sharding::replicated(auto_mesh.clone(), 0)).unwrap();
         let replicated =
-            batch(|item| item.place(&target, None), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+            batch(|item| item.place(None, &target), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         let kept = batch(
             |item| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&item, None, None, true),
             input,
@@ -2333,7 +2323,7 @@ mod tests {
         let input = PlacedArray { array: array.clone(), placement: Some(packed.clone()), context: context.clone() };
         let target = placement(&mesh_x(), vec![]);
         let replicated =
-            batch(|item| item.place(&target, None), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+            batch(|item| item.place(None, &target), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         let kept = batch(
             |item| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&item, None, None, true),
             input,
@@ -2400,7 +2390,7 @@ mod tests {
             context: context.clone(),
         };
         let output = batch(
-            |(mapped, unmapped)| unmapped.place(&mapped.placement().unwrap(), None),
+            |(mapped, unmapped)| unmapped.place(None, &mapped.placement().unwrap()),
             (mapped, unmapped),
             (BatchAxis::new(0), BatchAxis::replicated()),
             BatchAxis::replicated(),
@@ -2438,7 +2428,7 @@ mod tests {
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[replicated]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis_position(), None);
-        assert_eq!(outputs[0].value(), &array.place(&target, None).unwrap());
+        assert_eq!(outputs[0].value(), &array.place(None, &target).unwrap());
         assert_eq!(outputs[0].r#type().layout(), Some(&layout));
     }
 
@@ -2447,7 +2437,7 @@ mod tests {
         // A placement is linear, so the tangent is placed with the same target as the primal.
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]).with_memory(PINNED_HOST);
         let (primal, tangent) = differentiate_at(Array::vector(vec![1.0f32, 2.0]).unwrap())
-            .jvp(Array::vector(vec![3.0f32, 4.0]).unwrap(), |x| x.place(&target, None))
+            .jvp(Array::vector(vec![3.0f32, 4.0]).unwrap(), |x| x.place(None, &target))
             .unwrap();
         let expected_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(target.sharding().clone())
@@ -2509,7 +2499,7 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![1])));
         let primal = Array::from_logical_bytes(ArrayType::new_static(DataType::F8E8M0FNU, [2]), &[127, 128]).unwrap();
         let (primal, tangent) = differentiate_at(primal)
-            .jvp(Array::vector(vec![3.0f32, 4.0]).unwrap(), |x| x.place(&target, None))
+            .jvp(Array::vector(vec![3.0f32, 4.0]).unwrap(), |x| x.place(None, &target))
             .unwrap();
         assert_eq!(
             primal,
@@ -2542,7 +2532,7 @@ mod tests {
             |(x, t)| {
                 Ok(batch(
                     move |(item, tangent)| {
-                        Ok(differentiate_at(item).jvp(tangent, |item| item.place(&target, Some(&source)))?)
+                        Ok(differentiate_at(item).jvp(tangent, |item| item.place(Some(&source), &target))?)
                     },
                     (x, t),
                     (BatchAxis::new(0), BatchAxis::new(0)),
@@ -2587,7 +2577,7 @@ mod tests {
         let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         let (_, pullback) = differentiate_at(input)
             .vjp(|x| {
-                Ok(batch(|item| item.place(&target, Some(&source)), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+                Ok(batch(|item| item.place(Some(&source), &target), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
             })
             .unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
@@ -2628,7 +2618,7 @@ mod tests {
         };
         let gradient = batch(
             |item| {
-                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(&target, None))?;
+                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(None, &target))?;
                 pullback.apply_materialized(output)
             },
             input,
@@ -2691,7 +2681,7 @@ mod tests {
         let input = PlacedArray { array: array.clone(), placement: Some(packed.clone()), context: context.clone() };
         let gradient = batch(
             |item| {
-                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(&target, None))?;
+                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(None, &target))?;
                 pullback.apply_materialized(output)
             },
             input,
@@ -2867,7 +2857,7 @@ mod tests {
         let target = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
         let gradient = batch(
             |item| {
-                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(&target, None))?;
+                let (output, pullback) = differentiate_at(item).vjp(|x| x.place(None, &target))?;
                 pullback.apply_materialized(output)
             },
             input,
@@ -2896,7 +2886,7 @@ mod tests {
         let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]).with_memory(PINNED_HOST);
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(source.sharding().clone()).unwrap();
         let input = Array::from_elements(input_type.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let (output, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (output, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let cotangent = pullback
             .apply_materialized(
                 Array::from_elements(output.r#type().cotangent().unwrap(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap(),
@@ -2926,7 +2916,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh_x().logical_mesh().clone(), 1))
             .unwrap();
         let input = Array::from_elements(input_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, None)).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(None, &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -2943,7 +2933,7 @@ mod tests {
 
         // An input without a tracked sharding gets its exact cotangent type through a placement-only broadcast.
         let input = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, None)).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(None, &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -2965,7 +2955,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh_y().logical_mesh().clone(), 1))
             .unwrap();
         let input = Array::from_elements(input_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, None)).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(None, &target)).unwrap();
         assert!(matches!(
             pullback.into_transposed_parts(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -3070,7 +3060,7 @@ mod tests {
         let source = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
         let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
         let input = Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -3102,7 +3092,7 @@ mod tests {
         .unwrap();
         let source = Placement::new(mesh_x(), unreduced.clone()).unwrap();
         let target = Placement::new(other_mesh_x.clone(), unreduced).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -3127,7 +3117,7 @@ mod tests {
         .unwrap();
         let source = Placement::new(mesh_x(), reduced.clone()).unwrap();
         let target = Placement::new(other_mesh_x, reduced).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -3195,7 +3185,7 @@ mod tests {
             &[1.0f32, 2.0, 3.0, 4.0],
         )
         .unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -3229,7 +3219,7 @@ mod tests {
             &[1.0f32, 2.0, 3.0],
         )
         .unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         assert!(matches!(
             pullback.into_transposed_parts(),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
@@ -3253,7 +3243,7 @@ mod tests {
             &[1.0f32, 2.0, 3.0, 4.0],
         )
         .unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target)).unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         assert_eq!(
             pullback.into_program().to_string(),
@@ -3278,7 +3268,7 @@ mod tests {
         let target = Placement::new(mesh_x(), Sharding::replicated(manual_mesh.clone(), 0)).unwrap();
         let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(manual_mesh, 0)).unwrap();
         let input = Array::from_elements(input_type.clone(), &[3.0f32]).unwrap();
-        let (output, pullback) = differentiate_at(input).vjp(|x| x.place(&target, None)).unwrap();
+        let (output, pullback) = differentiate_at(input).vjp(|x| x.place(None, &target)).unwrap();
         assert_eq!(output, Array::from_elements(input_type.clone(), &[3.0f32]).unwrap());
         let cotangent =
             pullback.apply_materialized(Array::from_elements(input_type.clone(), &[5.0f32]).unwrap()).unwrap();
@@ -3316,7 +3306,7 @@ mod tests {
         let (_, pullback) = differentiate_at(output_cotangent)
             .vjp(|cotangent| {
                 let input = cotangent.context().constant(input)?;
-                let (_, pullback) = differentiate_at(input).vjp(|x| x.place(&target, Some(&source)))?;
+                let (_, pullback) = differentiate_at(input).vjp(|x| x.place(Some(&source), &target))?;
                 pullback.apply_materialized(cotangent)
             })
             .unwrap();
@@ -3522,7 +3512,7 @@ mod tests {
         // Staged values have no concrete placement, so placing them without a source stages an unknown source.
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |input| input.place(&target, None),
+            |input| input.place(None, &target),
             ArrayType::new_static(DataType::F32, [4]),
         )
         .unwrap();
@@ -3545,7 +3535,7 @@ mod tests {
         // Array IR values place their array members, with a given source staged as is.
         let source = placement(&mesh_y(), vec![ShardingDimension::Replicated]);
         let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |input| input.place(&target, Some(&source)),
+            |input| input.place(Some(&source), &target),
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
         )
         .unwrap();
@@ -3569,14 +3559,14 @@ mod tests {
             },
         );
         assert_eq!(
-            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap()).place(&target, None),
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap()).place(None, &target),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
 
         // Reference arrays have no devices, so placing them keeps their payload and records the placement in their
         // type, and they validate the target and source exactly like staged programs do.
         let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
-        let output = input.place(&target.clone().with_memory(PINNED_HOST), None).unwrap();
+        let output = input.place(None, &target.clone().with_memory(PINNED_HOST)).unwrap();
         assert_eq!(
             output,
             Array::from_elements(
@@ -3590,13 +3580,13 @@ mod tests {
         );
         assert!(Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
         assert_eq!(
-            input.place(&placement(&mesh_x(), vec![]), None),
+            input.place(None, &placement(&mesh_x(), vec![])),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PLACE_OPERATION_NAME}` target sharding rank (0) does not match the input rank (1)",
             )))),
         );
         assert_eq!(
-            input.place(&target, Some(&placement(&mesh_x(), vec![]))),
+            input.place(Some(&placement(&mesh_x(), vec![])), &target),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{PLACE_OPERATION_NAME}` source sharding rank (0) does not match the input rank (1)",
             )))),
@@ -3616,19 +3606,19 @@ mod tests {
                 .unwrap()
                 .with_layout(Layout::Strided(StridedLayout::new(vec![stride])))
         };
-        let output = input.place(&target.clone().with_layout(Layout::Strided(StridedLayout::new(vec![-1]))), None);
+        let output = input.place(None, &target.clone().with_layout(Layout::Strided(StridedLayout::new(vec![-1]))));
         assert_eq!(output, Array::new(output_type(-1), vec![20, 10]));
         let output = output.unwrap();
         assert_eq!(output.elements::<u8>(), Ok(vec![10, 20]));
         assert_eq!(output.logical_bytes(), vec![10, 20]);
-        let output = input.place(&target.clone().with_layout(Layout::Strided(StridedLayout::new(vec![2]))), None);
+        let output = input.place(None, &target.clone().with_layout(Layout::Strided(StridedLayout::new(vec![2]))));
         assert_eq!(output, Array::new(output_type(2), vec![10, 0, 20]));
         let output = output.unwrap();
         assert_eq!(output.elements::<u8>(), Ok(vec![10, 20]));
         assert_eq!(output.logical_bytes(), vec![10, 20]);
 
         // An unchanged layout keeps sharing the storage.
-        let output = input.place(&target, None).unwrap();
+        let output = input.place(None, &target).unwrap();
         assert!(Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
     }
 
@@ -3644,9 +3634,9 @@ mod tests {
 
         // A value with a concrete placement records it as the source, an explicit source wins over it, and a value
         // without a concrete placement stages no source.
-        placed.place(&target, None).unwrap();
-        placed.place(&target, Some(&explicit)).unwrap();
-        unplaced.place(&target, None).unwrap();
+        placed.place(None, &target).unwrap();
+        placed.place(Some(&explicit), &target).unwrap();
+        unplaced.place(None, &target).unwrap();
         assert_eq!(
             context.0.borrow().as_slice(),
             &[
@@ -3661,7 +3651,7 @@ mod tests {
     fn test_place_structured() {
         /// Exercises a single-value caller that specifies its universe.
         fn place_array<V: Value + Place<ArrayType>>(input: &V, target: &Placement) -> Result<V, ProgramError> {
-            input.place(target, None)
+            input.place(None, target)
         }
 
         /// Only the placeholder structure needs to be cloneable to rebuild this receiver.
@@ -3686,22 +3676,22 @@ mod tests {
         let y = placement(&mesh_y(), vec![]).with_memory(PINNED_HOST);
         let inputs = Inputs { values: (vector.clone(), vec![scalar.clone()]), label: "inputs" };
         let targets = Inputs { values: (x.clone(), vec![y.clone()]), label: "targets" };
-        let outputs = inputs.place(&targets, None).unwrap();
+        let outputs = inputs.place(None, &targets).unwrap();
         assert_eq!(outputs.label, "inputs");
-        assert_eq!(outputs.values, (place_array(&vector, &x).unwrap(), vec![scalar.place(&y, None).unwrap()]));
+        assert_eq!(outputs.values, (place_array(&vector, &x).unwrap(), vec![scalar.place(None, &y).unwrap()]));
 
         let inputs = vec![ArrayIrValue::Array(scalar.clone())];
         assert_eq!(
-            inputs.place(&vec![y.clone()], None),
-            Ok(vec![ArrayIrValue::Array(scalar.place(&y, None).unwrap())])
+            inputs.place(None, &vec![y.clone()]),
+            Ok(vec![ArrayIrValue::Array(scalar.place(None, &y).unwrap())])
         );
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
         assert_eq!(
-            vec![dimension].place(&vec![y], None),
+            vec![dimension].place(None, &vec![y]),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
         );
-        assert!(Vec::<Array>::new().place(&Vec::new(), None).unwrap().is_empty());
-        assert_eq!(<() as Place<ArrayType, Array>>::place(&(), &(), Some(&())), Ok(()));
+        assert!(Vec::<Array>::new().place(None, &Vec::new()).unwrap().is_empty());
+        assert_eq!(<() as Place<ArrayType, Array>>::place(&(), Some(&()), &()), Ok(()));
     }
 
     #[test]
@@ -3714,7 +3704,7 @@ mod tests {
         let second = PlacedArray { array: array.clone(), placement: Some(y.clone()), context: context.clone() };
         let inputs = (first, [second, context.lift(array).unwrap()]);
         let targets = (y.clone(), [x.clone(), x.clone()]);
-        inputs.place(&targets, None).unwrap();
+        inputs.place(None, &targets).unwrap();
         assert_eq!(
             context.0.take(),
             vec![
@@ -3725,7 +3715,7 @@ mod tests {
         );
 
         let sources = (y.clone(), [x.clone(), y.clone()]);
-        inputs.place(&targets, Some(&sources)).unwrap();
+        inputs.place(Some(&sources), &targets).unwrap();
         assert_eq!(
             context.0.take(),
             vec![
@@ -3735,7 +3725,7 @@ mod tests {
             ]
         );
 
-        inputs.place_with_optional_sources(&targets, &(None, [Some(x.clone()), None])).unwrap();
+        inputs.place(&(None, [Some(x.clone()), None]), &targets).unwrap();
         assert_eq!(
             context.0.take(),
             vec![
@@ -3760,10 +3750,12 @@ mod tests {
         let source_error = ProgramError::InvalidArgument {
             message: "receiver and `sources` must have the same parameter structure".to_string(),
         };
-        assert_eq!(inputs.place(&mismatched, None).unwrap_err(), target_error);
-        assert_eq!(inputs.place(&targets, Some(&mismatched)).unwrap_err(), source_error);
+        assert_eq!(inputs.place(None, &mismatched).unwrap_err(), target_error);
+        assert_eq!(inputs.place(Some(&mismatched), &targets).unwrap_err(), source_error);
         let missing = BTreeMap::from([("a", None)]);
-        assert_eq!(inputs.place_with_optional_sources(&targets, &missing).unwrap_err(), source_error);
+        assert_eq!(inputs.place(&missing, &targets).unwrap_err(), source_error);
+        let wrong_paths = BTreeMap::from([("a", None), ("c", None)]);
+        assert_eq!(inputs.place(&wrong_paths, &targets).unwrap_err(), source_error);
         assert!(context.0.borrow().is_empty());
     }
 }
