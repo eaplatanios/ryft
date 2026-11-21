@@ -1473,7 +1473,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let output =
-            builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(PlaceOperation::new(None, target), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // An output override with an unconstrained dimension is closed at the function boundary like the target of the
@@ -1760,7 +1760,7 @@ mod tests {
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
             if place {
                 builder
-                    .add_instruction(PlaceOperation::new(other_target.clone(), None), Vec::new(), vec![linear], None)
+                    .add_instruction(PlaceOperation::new(None, other_target.clone()), Vec::new(), vec![linear], None)
                     .unwrap();
             }
             builder
@@ -1858,7 +1858,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let output = builder
-                .add_instruction(PlaceOperation::new(target.clone(), None), Vec::new(), vec![output], None)
+                .add_instruction(PlaceOperation::new(None, target.clone()), Vec::new(), vec![output], None)
                 .unwrap()[0];
             let program: FlatProgram =
                 builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();

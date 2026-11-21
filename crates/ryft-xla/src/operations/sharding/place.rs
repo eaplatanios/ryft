@@ -135,7 +135,7 @@ mod tests {
         // A placement that keeps the storage of its input lowers to a sharding constraint alone.
         let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
         let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(move |input: ArrayTracer| input.place(&target, None).unwrap(), input_type.clone()).unwrap();
+            trace(move |input: ArrayTracer| input.place(None, &target).unwrap(), input_type.clone()).unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {r#"
@@ -156,7 +156,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true })
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(move |input: ArrayTracer| input.place(&target, None).unwrap(), input_type).unwrap();
+            trace(move |input: ArrayTracer| input.place(None, &target).unwrap(), input_type).unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {r#"
@@ -187,7 +187,7 @@ mod tests {
         .unwrap();
         let target = Placement::new(mesh, sharding).unwrap();
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            move |input: ArrayTracer| input.place(&target, None).unwrap(),
+            move |input: ArrayTracer| input.place(None, &target).unwrap(),
             ArrayType::new_static(DataType::F32, [4, 2]),
         )
         .unwrap();
@@ -221,7 +221,7 @@ mod tests {
             let target = target.clone();
             trace(
                 move |input: ArrayTracer| {
-                    <ArrayTracer as CoreValue>::Dispatch::place(&input, Some(&target), None, may_alias).unwrap()
+                    <ArrayTracer as CoreValue>::Dispatch::place(&input, None, Some(&target), may_alias).unwrap()
                 },
                 input_type.clone(),
             )
@@ -272,7 +272,7 @@ mod tests {
         let place = |source: Option<Placement>, may_alias: bool| -> TracedProgram<ArrayType, ArrayType> {
             trace(
                 move |input: ArrayTracer| {
-                    <ArrayTracer as CoreValue>::Dispatch::place(&input, None, source.clone(), may_alias).unwrap()
+                    <ArrayTracer as CoreValue>::Dispatch::place(&input, source.clone(), None, may_alias).unwrap()
                 },
                 input_type.clone(),
             )
@@ -318,7 +318,7 @@ mod tests {
             .unwrap();
         let place_error = |target: Placement| {
             let compiled: Result<CompiledFunction<ArrayType, ArrayType>, _> =
-                compile(move |input| input.place(&target, None).unwrap(), input_type.clone(), &session, mesh.clone());
+                compile(move |input| input.place(None, &target).unwrap(), input_type.clone(), &session, mesh.clone());
             compiled.err().unwrap()
         };
 
@@ -371,7 +371,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
         let place = |sharding: Sharding| -> Result<CompiledFunction<ArrayType, ArrayType>, Error> {
             let target = Placement::new(mesh.clone(), sharding).unwrap();
-            compile(move |input| input.place(&target, None).unwrap(), input_type.clone(), &session, mesh.clone())
+            compile(move |input| input.place(None, &target).unwrap(), input_type.clone(), &session, mesh.clone())
         };
 
         // Bounded dynamic programs run one fully replicated replica per device, because the Shardy partitioner rejects
@@ -406,7 +406,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> =
-            compile(move |input| input.place(&target, None).unwrap(), input_type.clone(), &session, mesh.clone())
+            compile(move |input| input.place(None, &target).unwrap(), input_type.clone(), &session, mesh.clone())
                 .unwrap();
         let input = Array::from_host_buffer(
             &session,
@@ -436,7 +436,7 @@ mod tests {
         let place = |input_sharding: &Sharding, target_sharding: &Sharding| {
             let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
             let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
-                move |input| input.place(&target, None).unwrap(),
+                move |input| input.place(None, &target).unwrap(),
                 input_type.clone(),
                 &session,
                 Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]),
@@ -482,7 +482,7 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(input_sharding.clone()).unwrap();
             let target = Placement::new(mesh.clone(), target_sharding).unwrap();
             let compiled: CompiledFunction<ArrayType, ArrayType> =
-                compile(move |input| input.place(&target, None).unwrap(), input_type.clone(), &session, mesh.clone())
+                compile(move |input| input.place(None, &target).unwrap(), input_type.clone(), &session, mesh.clone())
                     .unwrap();
             let input = Array::from_host_buffer(
                 &session,
@@ -526,7 +526,7 @@ mod tests {
         // its placement to the compiler.
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
-            move |input| input.place(&target, None).unwrap(),
+            move |input| input.place(None, &target).unwrap(),
             input_type.clone(),
             &session,
             Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
@@ -572,7 +572,7 @@ mod tests {
         // split along `x` that the target requires and the unconstrained dimension replicated.
         let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
-            move |input| input.place(&target, None).unwrap(),
+            move |input| input.place(None, &target).unwrap(),
             input_type.clone(),
             &session,
             Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]),
@@ -613,7 +613,7 @@ mod tests {
         // comes from the target alone.
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
-            move |input| input.place(&target, None).unwrap(),
+            move |input| input.place(None, &target).unwrap(),
             input_type.clone(),
             &session,
             Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
@@ -628,7 +628,7 @@ mod tests {
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
             move |input: CompileTracer| {
-                let placed = input.place(&target, None).unwrap();
+                let placed = input.place(None, &target).unwrap();
                 <CompileTracer as CoreValue>::Dispatch::place(&placed, None, None, true).unwrap()
             },
             input_type,
@@ -653,7 +653,7 @@ mod tests {
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
-            move |input: CompileTracer| input.place(&target, None).unwrap().stop_gradient().unwrap(),
+            move |input: CompileTracer| input.place(None, &target).unwrap().stop_gradient().unwrap(),
             input_type.clone(),
             &session,
             Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
@@ -681,7 +681,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::I32, [4]).with_sharding(input_sharding.clone()).unwrap();
         let target = Placement::new(mesh.clone(), reduced.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-            move |input: CompileTracer| input.place(&target, None).unwrap().stop_gradient().unwrap(),
+            move |input: CompileTracer| input.place(None, &target).unwrap().stop_gradient().unwrap(),
             input_type.clone(),
             &session,
             mesh.clone(),
@@ -712,7 +712,7 @@ mod tests {
 
         // The primal and the tangent both move to the device of the target mesh.
         let (value, tangent): (Array, Array) =
-            differentiate_at(primal).jvp(tangent, |x| x.place(&target, None)).unwrap();
+            differentiate_at(primal).jvp(tangent, |x| x.place(None, &target)).unwrap();
         assert_eq!(value.mesh(), &target_mesh);
         assert_eq!(tangent.mesh(), &target_mesh);
         assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
@@ -729,7 +729,7 @@ mod tests {
         let primal = f32_vector(&session, &source_mesh, &[1., 2., 3.]);
 
         // The pullback moves the cotangent from the target device back to the source device and mesh.
-        let (value, pullback) = differentiate_at(primal.clone()).vjp(|x| x.place(&target, None)).unwrap();
+        let (value, pullback) = differentiate_at(primal.clone()).vjp(|x| x.place(None, &target)).unwrap();
         assert_eq!(value.mesh(), &target_mesh);
         assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
         let cotangent = f32_vector(&session, &target_mesh, &[4., 5., 6.]);
@@ -741,7 +741,7 @@ mod tests {
         // The cotangent of a sum that is computed on the target device is broadcast there and then comes back on the
         // source device.
         let (value, pullback) = differentiate_at(primal.clone())
-            .vjp(|x| x.place(&target, None)?.reduce(&[0], ReductionKind::Sum))
+            .vjp(|x| x.place(None, &target)?.reduce(&[0], ReductionKind::Sum))
             .unwrap();
         assert_eq!(value.mesh(), &target_mesh);
         assert_eq!(shard_values(&value), vec![vec![6.]]);
@@ -772,7 +772,7 @@ mod tests {
         // lives. The transposed placement moves the cotangent from wherever it actually lives, so the gradient still
         // comes back on the source device and mesh.
         let gradient: Array = differentiate_at(primal.clone())
-            .gradient(|x| x.place(&target, None)?.reduce(&[0], ReductionKind::Sum))
+            .gradient(|x| x.place(None, &target)?.reduce(&[0], ReductionKind::Sum))
             .unwrap();
         assert_eq!(gradient.mesh(), &source_mesh);
         assert_eq!(gradient.r#type(), primal.r#type());
@@ -797,7 +797,7 @@ mod tests {
 
         // Each batch item is placed on the target device, so the packed result lives there.
         let output: Array =
-            batch(|x| x.place(&target, None), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+            batch(|x| x.place(None, &target), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(output.mesh(), &target_mesh);
         assert_eq!(output.r#type().shape(), ArrayType::new_static(DataType::F32, [2, 3]).shape());
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4., 5., 6.]]);
@@ -822,7 +822,7 @@ mod tests {
         // A batched value reports the placement of its batch items, so the gradient of each item comes back on the
         // source device without an explicit source.
         let gradient: Array = batch(
-            |x| Ok(differentiate_at(x).gradient(|x| x.place(&target, None)?.reduce(&[0], ReductionKind::Sum))?),
+            |x| Ok(differentiate_at(x).gradient(|x| x.place(None, &target)?.reduce(&[0], ReductionKind::Sum))?),
             input,
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -867,7 +867,7 @@ mod tests {
         // of each item is replicated on the last two devices, as its explicit target says.
         let (value, cotangent): (Array, Array) = batch(
             |x| {
-                let (value, pullback) = differentiate_at(x).vjp(|x| x.place(&target, None))?;
+                let (value, pullback) = differentiate_at(x).vjp(|x| x.place(None, &target))?;
                 let cotangent = pullback.apply_materialized(value.clone())?;
                 Ok((value, cotangent))
             },

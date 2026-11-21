@@ -249,9 +249,10 @@ pub enum ArrayPlacementTarget {
     Sharding(Sharding),
 }
 
-/// A destination or source leaf in the tree prefixes of [`PlacementOptions`]. Both resolved [`Placement`]s and
-/// [`ArrayPlacement`] requests are accepted, as are their [`Option`]s. A [`None`] leaf omits the option for its
-/// branch of the input tree.
+/// A destination or source leaf in the tree prefixes of [`PlacementOptions`]. Resolved [`Placement`]s,
+/// [`ArrayPlacement`] requests, and bare [`Device`]s and [`Sharding`]s (which convert into [`ArrayPlacement`]
+/// requests) are accepted, as are their [`Option`]s. A [`None`] leaf omits the option for its branch of the input
+/// tree.
 pub trait PlaceableParameter: Parameter {
     /// Returns the placement to apply to this branch, if any.
     fn into_optional_placement(self) -> Option<ArrayPlacement>;
@@ -1090,7 +1091,7 @@ fn place_traced<V: Placed + ConcreteArrays + CoreValue<Type = ArrayType, Dispatc
         Some(target) => (Some(resolve(target)?), source.or(current)),
         None => (None, source),
     };
-    Ok(V::Dispatch::place(&value, target.as_ref(), source, may_alias != Some(false))?)
+    Ok(V::Dispatch::place(&value, source, target.as_ref(), may_alias != Some(false))?)
 }
 
 #[cfg(test)]
@@ -1759,13 +1760,24 @@ mod tests {
         // A bare sharding is a placement on the session mesh, also as a prefix leaf.
         let partitioned = session
             .place(
-                CoreArray::vector(values).unwrap(),
+                CoreArray::vector(values.clone()).unwrap(),
                 PlacementOptions::<_, ArrayPlacement>::new(Some(Some(sharded.clone())), None, None, None),
             )
             .unwrap();
         assert_eq!(partitioned.mesh(), &mesh);
         assert_eq!(partitioned.sharding(), &sharded);
         assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
+
+        // A bare device is a placement on that device, also as a prefix leaf.
+        let device = mesh.devices()[1];
+        let placed = session
+            .place(
+                CoreArray::vector(values.clone()).unwrap(),
+                PlacementOptions::<_, ArrayPlacement>::new(Some(Some(device)), None, None, None),
+            )
+            .unwrap();
+        assert_eq!(placed.mesh().devices(), &[device]);
+        assert_eq!(shard_values(&placed), vec![values]);
     }
 
     #[test]

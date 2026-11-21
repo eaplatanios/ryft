@@ -508,7 +508,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh, sharding).unwrap();
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(),
+            move |x: ArrayTracer| x.place(None, &target).unwrap().stop_gradient().unwrap(),
             ArrayType::new_static(DataType::F32, [8]),
         )
         .unwrap();
@@ -552,7 +552,7 @@ mod tests {
         .unwrap();
         let target = Placement::new(mesh, open_sharding.clone()).unwrap();
         let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(move |x: ArrayTracer| x.place(&target, None).unwrap(), ArrayType::new_static(DataType::I32, [4, 4]))
+            trace(move |x: ArrayTracer| x.place(None, &target).unwrap(), ArrayType::new_static(DataType::I32, [4, 4]))
                 .unwrap();
         let expected = indoc! {r#"
             module {

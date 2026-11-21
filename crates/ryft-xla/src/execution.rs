@@ -2633,7 +2633,7 @@ mod tests {
         };
         let double = |input: CompileTracer, _: &Placement| input.clone() + input;
         let double_and_place =
-            |input: CompileTracer, target: &Placement| (input.clone() + input).place(target, None).unwrap();
+            |input: CompileTracer, target: &Placement| (input.clone() + input).place(None, target).unwrap();
 
         // The outputs of a function on uncommitted inputs are committed when the function requests their placement
         // explicitly, through a `place` with a target that produces them or through any sharding override, as in JAX.

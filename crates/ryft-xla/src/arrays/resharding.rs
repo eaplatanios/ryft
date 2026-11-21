@@ -247,11 +247,15 @@ impl Array {
         // describes the failure of the device work, because that failure is what made the host fallback necessary.
         let readback_source = source.clone();
         let device_error = compiled_error.to_string();
+        let Ok(readback_fence) = source.host_readback_fence() else {
+            return Err(compiled_error);
+        };
         let uploaded = Self::from_host_buffer_in_background(
             session,
             host_type.clone(),
             mesh.clone(),
             sharding.clone(),
+            readback_fence,
             move || readback_source.copy_to_host_bytes(),
             move |error| {
                 PjrtError::internal(format!(
@@ -407,8 +411,13 @@ impl Array {
                 // register). Their readiness joins the reservation and the result only once the job has been handed
                 // over. Each shard is read back from its own device, because devices can hold different values for
                 // the same slice (e.g., the contributions along unreduced axes), so no two shards share host bytes.
+                // The job waits for the source buffers before it occupies a worker, because their readbacks wait for
+                // nothing else.
+                let source_events =
+                    upload_sources.iter().map(|(source_buffer, _)| source_buffer.ready()).collect::<Result<_, _>>()?;
                 submit_host_uploads(
                     session,
+                    ExecutionFence::new(source_events),
                     uploads,
                     move |index| {
                         let (source_buffer, shape) = &upload_sources[index];
