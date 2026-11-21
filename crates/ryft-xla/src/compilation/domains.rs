@@ -449,19 +449,25 @@ impl Session {
         // every execution, as JAX commits every result of a `jit` function with any explicit sharding, which makes this
         // a property of the whole function rather than of the outputs that the request reaches. The function requests a
         // placement through an input or output sharding override, or through a `place` with a target or a
-        // `constrain_sharding` in any region that lowering emits (refer to `has_placement_requests`). JAX also commits
-        // the results of computations on more than one device, but the program mesh is not such a request, because
-        // functions on uncommitted inputs are compiled for it as well. Every output of a function that captures a
-        // committed array is committed as well, like the outputs of a function with a committed input. The executable
-        // receives the arrays of session constants once per buffer, through whichever handle the program references
-        // first, so this is decided over every handle instead (refer to `has_committed_session_constants`). Other
-        // outputs are committed when an input of an execution is.
+        // `constrain_sharding` in any region that lowering emits (refer to `has_placement_requests`). Every output of a
+        // function that is compiled for more than one device is committed as well, including its hidden reference
+        // states, as JAX commits every result of a computation on more than one device (refer to
+        // `lower_sharding_computation` in `jax._src.interpreters.pxla`), whereas a function that is compiled for a
+        // single device leaves its outputs to the other rules. Every output of a function that captures a committed
+        // array is committed too, like the outputs of a function with a committed input. The executable receives the
+        // arrays of session constants once per buffer, through whichever handle the program references first, so this
+        // is decided over every handle instead (refer to `has_committed_session_constants`). Other outputs are
+        // committed when an input of an execution is. Eager operations and compiled reshards set the commitment of
+        // their results themselves, so these flags do not reach them.
         let requests_placement = options.input_shardings().is_some()
             || options.output_shardings().is_some()
             || has_placement_requests(program);
+        let runs_on_multiple_devices = options.mesh().devices().len() > 1;
         let has_committed_captures = has_committed_session_constants(program);
         let committed_outputs = (0..output_types.len())
-            .map(|index| has_committed_captures || index < output_count && requests_placement)
+            .map(|index| {
+                has_committed_captures || runs_on_multiple_devices || index < output_count && requests_placement
+            })
             .collect::<Vec<_>>();
         // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
@@ -1475,7 +1481,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let output =
-            builder.add_instruction(PlaceOperation::new(None, target), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // An output override with an unconstrained dimension is closed at the function boundary like the target of the
@@ -1552,7 +1558,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
         let placed =
-            builder.add_instruction(PlaceOperation::new(None, target), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
         let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -1834,7 +1840,7 @@ mod tests {
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
             if place {
                 builder
-                    .add_instruction(PlaceOperation::new(None, other_target.clone()), Vec::new(), vec![linear], None)
+                    .add_instruction(PlaceOperation::new(other_target.clone(), None), Vec::new(), vec![linear], None)
                     .unwrap();
             }
             builder
@@ -1932,7 +1938,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let output = builder
-                .add_instruction(PlaceOperation::new(None, target.clone()), Vec::new(), vec![output], None)
+                .add_instruction(PlaceOperation::new(target.clone(), None), Vec::new(), vec![output], None)
                 .unwrap()[0];
             let program: FlatProgram =
                 builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();

@@ -724,11 +724,13 @@ impl CompiledProgram {
     }
 
     /// Returns whether executions of the lowering that this program serves commit each logical output to its devices
-    /// whatever the commitment of their inputs. This is the case for a public output whose placement the lowering
-    /// requests explicitly, through a `place` with a target that produces the output in its entry region, an output
-    /// sharding override, or any input sharding override, as JAX commits the results of `jit` functions with explicit
-    /// shardings, and for every output of a lowering that captures a committed array through any of its handles,
-    /// like the outputs of an operation that has a committed input.
+    /// whatever the commitment of their inputs. This is the case for every public output of a lowering that requests a
+    /// placement explicitly anywhere (i.e., through an input or output sharding override, or through a `place` with a
+    /// target or a `constrain_sharding` in any region that it emits), as JAX commits the results of `jit` functions
+    /// with explicit shardings. It is also the case for every output, including the hidden final reference states, of
+    /// a lowering for a mesh of more than one device, as JAX commits every result of a computation on more than one
+    /// device, and of a lowering that captures a committed array through any of its handles, like the outputs of an
+    /// operation that has a committed input.
     #[inline]
     pub(crate) fn committed_outputs(&self) -> &[bool] {
         &self.committed_outputs

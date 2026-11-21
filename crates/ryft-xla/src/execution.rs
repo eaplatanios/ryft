@@ -1498,9 +1498,11 @@ impl Session {
     /// Reconstructs selected logical outputs from one submitted execution's physical buffers. The outputs are
     /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any array
     /// input of the execution, including the arrays that the program captures, is committed. The outputs that
-    /// [`CompiledProgram::committed_outputs`] flags (e.g., those whose placement the program requests explicitly, or
-    /// all of them when the program captures a committed array through any of its handles) are committed in either
-    /// case, which both the plain and the stateful execution paths rely on.
+    /// [`CompiledProgram::committed_outputs`] flags (e.g., the public outputs of a program that requests a placement
+    /// explicitly, or all of them when the program runs on more than one device or captures a committed array through
+    /// any of its handles) are committed in either case, which both the plain and the stateful execution paths rely
+    /// on. Eager operations and compiled reshards replace the commitment of the arrays that this function returns with
+    /// their own.
     fn reconstruct_compiled_outputs(
         &self,
         program: &CompiledProgram,
@@ -2605,9 +2607,11 @@ mod tests {
 
     #[test]
     fn test_session_execute_compiled_async_commits_outputs_of_explicit_placements() {
-        let client = cpu_client(2);
+        // Every output of a function compiled for more than one device is committed, so the function runs on a single
+        // device here, where only the rules below commit its outputs.
+        let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let mesh = domain_mesh(client, "x", 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
         let uncommitted =
@@ -2633,9 +2637,9 @@ mod tests {
         };
         let double = |input: CompileTracer, _: &Placement| input.clone() + input;
         let double_and_place =
-            |input: CompileTracer, target: &Placement| (input.clone() + input).place(None, target).unwrap();
+            |input: CompileTracer, target: &Placement| (input.clone() + input).place(target, None).unwrap();
         let place_and_double = |input: CompileTracer, target: &Placement| {
-            let placed = input.place(None, target).unwrap();
+            let placed = input.place(target, None).unwrap();
             placed.clone() + placed
         };
         let constrain_and_double = |input: CompileTracer, target: &Placement| {
@@ -2656,7 +2660,7 @@ mod tests {
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let staged = crate::stage::<_, ArrayType, (ArrayType, ArrayType)>(
             move |input: CompileTracer| {
-                let placed = input.clone().place(None, &target).unwrap();
+                let placed = input.clone().place(&target, None).unwrap();
                 (placed.clone() + placed, input)
             },
             staged_type.clone(),
@@ -2691,6 +2695,48 @@ mod tests {
         session.clear_cache();
         assert!(!execute(&observed));
         assert!(execute(&requested));
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_commits_outputs_on_multiple_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let narrow_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[0]]).unwrap();
+        let uncommitted = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        assert!(!uncommitted.is_committed());
+        let execute = |mesh: &DeviceMesh| {
+            let staged = crate::stage::<_, ArrayType, (ArrayType, ArrayType)>(
+                |input: CompileTracer| (input.clone() + input.clone(), input),
+                replicated_vector_type(mesh, 2),
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let compiled: CompiledFunction<Session, Type, (Type, Type)> =
+                staged.lower(&session).unwrap().compile(&session).unwrap();
+            let (first, second) = compiled.executable().execute(&session, Value::Array(uncommitted.clone())).unwrap();
+            let (first, second) = (program_array(&first), program_array(&second));
+            assert_eq!(first.mesh(), mesh);
+            assert_eq!(second.mesh(), mesh);
+            assert_eq!(first.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.0, 4.0]);
+            assert_eq!(second.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0]);
+            (first.is_committed(), second.is_committed())
+        };
+
+        // A function on uncommitted inputs that requests no placement commits every output when it is compiled for
+        // more than one device, as JAX commits every result of a computation over more than one device, and it keeps
+        // the rule for the commitment of its inputs when it is compiled for a single device.
+        assert_eq!(execute(&wide_mesh), (true, true));
+        assert_eq!(execute(&narrow_mesh), (false, false));
     }
 
     #[test]

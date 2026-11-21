@@ -910,7 +910,7 @@ mod tests {
 
         /// Places `input` on `target` through the bundle bound alone.
         fn place_through_bundle<V: ArrayOperations>(input: &V, target: &Placement) -> Result<V, ProgramError> {
-            input.place(None, target)
+            input.place(target, None)
         }
 
         requires_array_operations::<Array>();
