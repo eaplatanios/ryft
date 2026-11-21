@@ -1931,7 +1931,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             output_type,
-            dynamic_type.with_sharding(target.sharding().clone()).unwrap().with_memory(PINNED_HOST)
+            dynamic_type.with_sharding(target.sharding().clone()).unwrap().with_memory(PINNED_HOST),
         );
         assert_eq!(
             program.to_string(),
@@ -2143,6 +2143,8 @@ mod tests {
             .unwrap(),
         );
 
+        // A target that records the batch sharding `y` splits the batch dimension along `y`, whatever the batching
+        // level selects.
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 4)
             .with_axis_sharding(ShardingDimension::sharded(["x"]));
         let split_target = target.with_batch_sharding(ShardingDimension::sharded(["y"])).unwrap();
@@ -2610,6 +2612,7 @@ mod tests {
             None,
         )
         .unwrap();
+
         // The forward placement records the packed input placement as its source, so the lifted transpose moves the
         // cotangent back to the devices 0 and 1 with the sharding of the packed input, which the source of each batch
         // item records for its batch dimension. The explicit replicated target of each batch item replicates the
@@ -3092,6 +3095,7 @@ mod tests {
             },
         );
 
+        // A reduced input receives an unreduced cotangent.
         let reduced = Sharding::replicated(mesh_x().logical_mesh().clone(), 1).with_reduced_axes(["x"]).unwrap();
         let input = Array::from_elements(
             ArrayType::new_static(DataType::F32, [4]).with_sharding(reduced.clone()).unwrap(),
@@ -3491,6 +3495,20 @@ mod tests {
     }
 
     #[test]
+    fn test_placement_sources() {
+        let x = placement(&mesh_x(), vec![]);
+
+        // An optional structure of placements supplies the source of every leaf or of none.
+        let sources = (x.clone(), vec![x.clone()]);
+        assert_eq!(PlacementSources::as_parameterized(&Some(&sources)), Some(&sources));
+        assert_eq!(PlacementSources::<Placement, (Placement, Vec<Placement>)>::as_parameterized(&None), None);
+
+        // A structure of optional placements is always supplied, and each of its leaves can omit its own source.
+        let sources = (Some(x), vec![None]);
+        assert_eq!(PlacementSources::as_parameterized(&&sources), Some(&sources));
+    }
+
+    #[test]
     fn test_place() {
         // Staged values have no concrete placement, so placing them without a source stages an unknown source.
         let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
@@ -3657,22 +3675,27 @@ mod tests {
         let scalar = Array::scalar(3.0f32).unwrap();
         let x = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
         let y = placement(&mesh_y(), vec![]).with_memory(PINNED_HOST);
+
+        // Every leaf is placed on the target at its parameter path, and the rest of the structure is kept.
         let inputs = Inputs { values: (vector.clone(), vec![scalar.clone()]), label: "inputs" };
         let targets = Inputs { values: (x.clone(), vec![y.clone()]), label: "targets" };
         let outputs = inputs.place(None, &targets).unwrap();
         assert_eq!(outputs.label, "inputs");
         assert_eq!(outputs.values, (place_array(&vector, &x).unwrap(), vec![scalar.place(None, &y).unwrap()]));
 
+        // Structures of array IR values place their array members, and their other members cannot be placed.
         let inputs = vec![ArrayIrValue::Array(scalar.clone())];
         assert_eq!(
             inputs.place(None, &vec![y.clone()]),
-            Ok(vec![ArrayIrValue::Array(scalar.place(None, &y).unwrap())])
+            Ok(vec![ArrayIrValue::Array(scalar.place(None, &y).unwrap())]),
         );
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap());
         assert_eq!(
             vec![dimension].place(None, &vec![y]),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type")))
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
+
+        // Structures without leaves place nothing.
         assert!(Vec::<Array>::new().place(None, &Vec::new()).unwrap().is_empty());
         assert_eq!(<() as Place<ArrayType, Array>>::place(&(), Some(&()), &()), Ok(()));
     }
@@ -3687,6 +3710,8 @@ mod tests {
         let second = PlacedArray { array: array.clone(), placement: Some(y.clone()), context: context.clone() };
         let inputs = (first, [second, context.lift(array).unwrap()]);
         let targets = (y.clone(), [x.clone(), x.clone()]);
+
+        // Without sources, every leaf records where it concretely lives, if it reports that.
         inputs.place(None, &targets).unwrap();
         assert_eq!(
             context.0.take(),
@@ -3694,9 +3719,10 @@ mod tests {
                 ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), y.clone())),
                 ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), x.clone())),
                 ArrayOperation::Place(PlaceOperation::new(None, x.clone())),
-            ]
+            ],
         );
 
+        // A structure of sources overrides the placement that every leaf reports.
         let sources = (y.clone(), [x.clone(), y.clone()]);
         inputs.place(Some(&sources), &targets).unwrap();
         assert_eq!(
@@ -3705,9 +3731,10 @@ mod tests {
                 ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), y.clone())),
                 ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), x.clone())),
                 ArrayOperation::Place(PlaceOperation::new(Some(y.clone()), x.clone())),
-            ]
+            ],
         );
 
+        // A structure of optional sources overrides it only for the leaves that it names a source for.
         inputs.place(&(None, [Some(x.clone()), None]), &targets).unwrap();
         assert_eq!(
             context.0.take(),
@@ -3715,7 +3742,7 @@ mod tests {
                 ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), y)),
                 ArrayOperation::Place(PlaceOperation::new(Some(x.clone()), x.clone())),
                 ArrayOperation::Place(PlaceOperation::new(None, x)),
-            ]
+            ],
         );
     }
 
@@ -3733,6 +3760,8 @@ mod tests {
         let source_error = ProgramError::InvalidArgument {
             message: "receiver and `sources` must have the same parameter structure".to_string(),
         };
+
+        // The targets and the sources must have the parameter paths of the receiver, and no leaf is placed otherwise.
         assert_eq!(inputs.place(None, &mismatched).unwrap_err(), target_error);
         assert_eq!(inputs.place(Some(&mismatched), &targets).unwrap_err(), source_error);
         let missing = BTreeMap::from([("a", None)]);
@@ -3740,5 +3769,65 @@ mod tests {
         let wrong_paths = BTreeMap::from([("a", None), ("c", None)]);
         assert_eq!(inputs.place(&wrong_paths, &targets).unwrap_err(), source_error);
         assert!(context.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_unbatched_placement() {
+        let packed = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
+            .with_memory(PINNED_HOST)
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+
+        // The batch dimension leaves the sharding and is recorded as how the batch is distributed, the memory is kept,
+        // and the layout, which describes the storage of the packed value, is dropped.
+        assert_eq!(
+            unbatched_placement(packed.clone(), Some(0)),
+            Some(
+                placement(&mesh_x(), vec![ShardingDimension::Replicated])
+                    .with_memory(PINNED_HOST)
+                    .with_batch_sharding(ShardingDimension::sharded(["x"]))
+                    .unwrap(),
+            ),
+        );
+        assert_eq!(
+            unbatched_placement(packed.clone(), Some(1)),
+            Some(
+                placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])])
+                    .with_memory(PINNED_HOST)
+                    .with_batch_sharding(ShardingDimension::Replicated)
+                    .unwrap(),
+            ),
+        );
+
+        // A sharding that has no dimension at the batch axis describes no batch items.
+        assert_eq!(unbatched_placement(packed.clone(), Some(2)), None);
+
+        // A value without a batch dimension is its own batch item, so it keeps its placement, including its layout,
+        // with a replicated batch recorded.
+        assert_eq!(
+            unbatched_placement(packed.clone(), None),
+            Some(packed.clone().with_batch_sharding(ShardingDimension::Replicated).unwrap()),
+        );
+
+        // The batch shardings of enclosing batching levels are kept from the outermost to the innermost.
+        let item = unbatched_placement(unbatched_placement(packed, Some(0)).unwrap(), Some(0)).unwrap();
+        assert_eq!(item.sharding().rank(), 0);
+        assert_eq!(item.batch_shardings(), &[ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+    }
+
+    #[test]
+    fn test_placement_without_layout() {
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+
+        // Only the layout is dropped, so the memory and the recorded batch shardings are kept.
+        let placed = placement(&mesh_x(), vec![ShardingDimension::Replicated])
+            .with_memory(PINNED_HOST)
+            .with_batch_sharding(ShardingDimension::sharded(["x"]))
+            .unwrap();
+        assert_eq!(placement_without_layout(&placed.clone().with_layout(layout.clone())), placed);
+        assert_eq!(placement_without_layout(&placed), placed);
+
+        // A placement that names no memory still names none.
+        let placed = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
+        assert_eq!(placement_without_layout(&placed.clone().with_layout(layout)), placed);
     }
 }
