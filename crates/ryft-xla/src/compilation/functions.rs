@@ -2075,7 +2075,10 @@ where
 
 /// Calls `function` as a `jit_call` operation in `context` on behalf of [`StagedFunction::call_in_context`] and
 /// [`CompiledFunction::call_in_context`]. Inputs whose type differs from the input type of `function` only in its
-/// sharding are first brought to that type in `context` (refer to `place_inputs`).
+/// sharding are first brought to that type in `context` (refer to `place_inputs`). The call carries the sharding
+/// overrides of the boundary of `function` (refer to `JitCallOperation::with_boundary_shardings`), because its callee
+/// cannot show them all (e.g., a replicated output override over auto mesh axes stages nothing), so that a result of
+/// the call is placed as an execution of `function` places it.
 fn call_staged_in_context<In, Out, C, Path>(
     function: &CoreStagedFunction<Session, ProgramParameters<In>, ProgramParameters<Out>>,
     context: &C,
@@ -2101,7 +2104,19 @@ where
         input_structure,
         place_inputs(inputs, function.input_types(), function.options().input_shardings())?,
     )?;
-    project_values::<Out, C::Value>(function.call_in_context(context, inputs)?)
+    let options = function.options();
+    let decorate = |operation: Operation| match operation {
+        Operation::JitCall(call) => {
+            // The lifted capture prefix of the callee precedes its inputs and has no overrides.
+            let input_shardings = std::iter::repeat_n(None, call.capture_count())
+                .chain(options.input_shardings().into_iter().flatten().cloned().map(Some))
+                .collect();
+            let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
+            Operation::JitCall(call.with_boundary_shardings(input_shardings, output_shardings))
+        }
+        operation => operation,
+    };
+    project_values::<Out, C::Value>(function.call_in_context_with(context, inputs, decorate)?)
 }
 
 /// Stages `function` through [`stage_with_flat_captures`] and compiles the result against `session`. This is the shared
@@ -2223,7 +2238,7 @@ mod tests {
         DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable,
         DomainTracer, Dot, DotDimensionNumbers, DotsSavable, ErasedOperation, Error as CoreError,
         ForwardModeDifferentiate, Hessian, ImportingContext, Jacobian, MaybeZero, Memory, MeshAxisType, Mul, Parameter,
-        Placeholder, Program, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
+        Place, Placeholder, Placement, Program, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
         ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation,
         ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualRejection, ResidualStorage,
@@ -4174,6 +4189,125 @@ mod tests {
         let batched = ValueProjection::<ArrayType>::into_projected(batched).unwrap();
         assert_eq!(batched.r#type().as_ref(), &matrix_type);
         assert_close(read(&batched), matrix_values.iter().copied().map(f32::sin).collect());
+    }
+
+    #[test]
+    fn test_compiled_function_call_keeps_replicated_output_override_inside_compile() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let engine = Session::builder().client(client).build().unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let shapes = |array: &Array| array.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>();
+        let values =
+            |array: &Array| array.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+
+        // The callee splits its value along `x` but requests a replicated output, which stages nothing in its body.
+        // Executed directly or called inside another compiled function, it returns two replicas.
+        let vector_type = ArrayType::new_static(DataType::I32, [4]);
+        let vector = Array::from_host_buffer(
+            &engine,
+            vector_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1i32, 2, 3, 4]),
+        )
+        .unwrap();
+        let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+        let placing: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            move |x| x.place(&target, None).unwrap(),
+            vector_type.clone(),
+            &engine,
+            Options::new(mesh.clone()).with_output_shardings(vec![replicated.clone()]),
+        )
+        .unwrap();
+        let wrapped: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| placing.call(x).unwrap(), vector_type.clone(), &engine, mesh.clone()).unwrap();
+        for output in [
+            placing.executable().execute(&engine, vector.clone()).unwrap(),
+            wrapped.executable().execute(&engine, vector.clone()).unwrap(),
+        ] {
+            output.block_until_ready().unwrap();
+            assert_eq!(output.sharding(), &replicated);
+            assert_eq!(shapes(&output), vec!["[4]", "[4]"]);
+            assert_eq!(values(&output), vec![values_to_bytes(&[1i32, 2, 3, 4]), values_to_bytes(&[1i32, 2, 3, 4])]);
+        }
+    }
+
+    #[test]
+    fn test_compiled_function_call_keeps_unconstrained_output_override_inside_compile() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let engine = Session::builder().client(client).build().unwrap();
+        let shapes = |array: &Array| array.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>();
+        let values =
+            |array: &Array| array.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+
+        // An identity with an output override that leaves a dimension unconstrained returns that dimension whole,
+        // whose runtime placement records it as unconstrained, directly and inside another compiled function.
+        let unconstrained = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained],
+        )
+        .unwrap();
+        let matrix_type = ArrayType::new_static(DataType::I32, [4, 4]);
+        let matrix_values = (0..16).collect::<Vec<i32>>();
+        let matrix =
+            Array::from_host_buffer(&engine, matrix_type.clone(), mesh.clone(), None, values_to_bytes(&matrix_values))
+                .unwrap();
+        let identity: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x| x,
+            matrix_type.clone(),
+            &engine,
+            Options::new(mesh.clone()).with_output_shardings(vec![unconstrained.clone()]),
+        )
+        .unwrap();
+        let wrapped: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| identity.call(x).unwrap(), matrix_type, &engine, mesh.clone()).unwrap();
+        for output in [
+            identity.executable().execute(&engine, matrix.clone()).unwrap(),
+            wrapped.executable().execute(&engine, matrix.clone()).unwrap(),
+        ] {
+            output.block_until_ready().unwrap();
+            assert_eq!(output.sharding(), &unconstrained);
+            assert_eq!(shapes(&output), vec!["[2, 4]", "[2, 4]"]);
+            assert_eq!(
+                values(&output),
+                vec![values_to_bytes(&matrix_values[..8]), values_to_bytes(&matrix_values[8..])],
+            );
+        }
+    }
+
+    #[test]
+    fn test_compiled_function_call_keeps_split_output_override_of_zero_arrays_inside_compile() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let engine = Session::builder().client(client).build().unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let shapes = |array: &Array| array.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>();
+
+        // An identity over a bufferless array with a split output override keeps the split, which no buffer could
+        // report, directly and inside another compiled function.
+        let zero_type = ArrayType::new_static(DataType::Zero, [4]);
+        let zero = Array::from_host_buffer(&engine, zero_type.clone(), mesh.clone(), None, []).unwrap();
+        let identity: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x| x,
+            zero_type.clone(),
+            &engine,
+            Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]),
+        )
+        .unwrap();
+        let wrapped: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| identity.call(x).unwrap(), zero_type, &engine, mesh.clone()).unwrap();
+        for output in [
+            identity.executable().execute(&engine, zero.clone()).unwrap(),
+            wrapped.executable().execute(&engine, zero.clone()).unwrap(),
+        ] {
+            output.block_until_ready().unwrap();
+            assert_eq!(output.sharding(), &sharded);
+            assert_eq!(shapes(&output), vec!["[2]", "[2]"]);
+            assert!(output.shards().iter().all(|shard| shard.buffer().is_none()));
+        }
     }
 
     #[test]

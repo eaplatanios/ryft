@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, PLACE_OPERATION_NAME, PlaceOperation};
+use ryft_core::{ArrayType, PLACE_OPERATION_NAME, PlaceOperation, PlaceTarget};
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -43,7 +43,9 @@ impl LowerableOperation for PlaceOperation {
 
         // The values of a manual region live on the devices of that region. Type inference rejects inputs that are
         // tracked over manual mesh axes, but a value that is created inside the region (e.g., a constant) has no
-        // tracked sharding, and constraining it over the whole mesh there would contradict the region.
+        // tracked sharding, and constraining it over the whole mesh there would contradict the region. A device target
+        // is rejected there as well, because it moves the value onto one device, which a value of the region cannot
+        // leave, even when the program mesh consists of that device alone.
         if !lowerer.collective_state().bound_manual_axes().is_empty() {
             return Err(LoweringError::UnsupportedOperation {
                 operation: PLACE_OPERATION_NAME.to_string(),
@@ -51,15 +53,20 @@ impl LowerableOperation for PlaceOperation {
             }
             .into());
         }
+        // A device target is the only device of the program mesh (refer to `validate_placements`), and its output keeps
+        // the sharding of its input, so it lowers to no sharding constraint and changes the storage only.
         let (input_type, output_type) = (&input_types[0], &output_types[0]);
-        let location = lowerer.location();
-        let sharding = target.sharding().to_mlir(location)?;
-        let mut value = lowerer
-            .block()
-            .append_operation(shardy::sharding_constraint(input_values[0], sharding, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
+        let mut value = input_values[0];
+        if let PlaceTarget::Placement(target) = target {
+            let location = lowerer.location();
+            let sharding = target.sharding().to_mlir(location)?;
+            value = lowerer
+                .block()
+                .append_operation(shardy::sharding_constraint(value, sharding, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+        }
         if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
             value = lower_layout_conversion(value, output_type, lowerer)?;
         }
@@ -78,20 +85,23 @@ impl LowerableOperation for PlaceOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         BatchAxis, DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Place, PlaceDispatch, Placement, Reduce, ReductionKind, Shape, Sharding,
-        ShardingDimension, StopGradient, TiledLayout, Typed, Value as CoreValue, batch, differentiate_at,
+        MeshAxis, MeshAxisType, NegOperation, PartialValue, Place, PlaceDispatch, Placeholder, Placement, Reduce,
+        ReductionKind, Shape, Sharding, ShardingDimension, StopGradient, TiledLayout, Typed, Value as CoreValue, batch,
+        differentiate_at,
     };
     use ryft_pjrt::Client;
 
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, Session, TracedProgram, compile,
-        compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, ProgramBuilder, Session,
+        TracedProgram, Type, Value, compile, compile_with_options, trace,
     };
 
     use super::*;
@@ -218,7 +228,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh, sharding).unwrap();
         let place = |may_alias: bool| -> TracedProgram<ArrayType, ArrayType> {
-            let target = target.clone();
+            let target = PlaceTarget::Placement(target.clone());
             trace(
                 move |input: ArrayTracer| {
                     <ArrayTracer as CoreValue>::Dispatch::place(&input, Some(&target), None, may_alias).unwrap()
@@ -701,6 +711,60 @@ mod tests {
     }
 
     #[test]
+    fn test_place_operation_eager_partial_evaluation_may_alias() {
+        // The XLA operation family holds the placement through its projected array member. Specializing a program on a
+        // known input of a placement that forces a copy keeps that placement residual, so that two executions of the
+        // specialized program return distinct buffers, while the negation of the unknown input stays residual too.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
+        )
+        .unwrap();
+        let input = f32_vector(&session, &mesh, &[1., 2.]);
+        let r#type = Type::Array(input.r#type().into_owned());
+        let mut builder = ProgramBuilder::new();
+        let known = builder.add_input(r#type.clone());
+        let unknown = builder.add_input(r#type.clone());
+        let copy = builder
+            .add_instruction(PlaceOperation::new(None, None).with_may_alias(false), Vec::new(), vec![known], None)
+            .unwrap()[0];
+        let negation = builder.add_instruction(NegOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![copy, negation], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let input = Value::Array(input);
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &session,
+                &[PartialValue::Known(input.clone()), PartialValue::Unknown(r#type)],
+            )
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [may_alias=false] %1
+                    %3:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = neg %0
+                in (%2, %3)"
+            },
+        );
+        assert_eq!(evaluation.outputs().iter().map(|output| output.is_known()).collect::<Vec<_>>(), vec![false, false]);
+        let first = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
+        let second = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
+        let (Value::Array(first), Value::Array(second), Value::Array(input)) = (&first[0], &second[0], &input) else {
+            unreachable!("placements of arrays return arrays");
+        };
+        assert_eq!(shard_values(first), vec![vec![1., 2.]]);
+        assert_eq!(shard_values(second), vec![vec![1., 2.]]);
+        let buffer = |array: &Array| array.shards()[0].buffer().unwrap().clone();
+        assert!(!Arc::ptr_eq(&buffer(first), &buffer(second)));
+        assert!(!Arc::ptr_eq(&buffer(first), &buffer(input)));
+    }
+
+    #[test]
     fn test_place_operation_eager_jvp() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -882,5 +946,117 @@ mod tests {
         assert_eq!(cotangent.mesh(), &source_mesh);
         assert_eq!(cotangent.sharding(), &sharding);
         assert_eq!(shard_values(&cotangent), vec![vec![1., 2., 3.], vec![4., 5., 6.]]);
+    }
+
+    #[test]
+    fn test_place_operation_eager_batch_gradient_across_device_sets() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+
+        // The batch is split along `x` on the first two devices, so each of them holds one `[1, 2]` batch item, and
+        // the gradient of each item comes back split in the same way, whatever the type of `x`, rather than as the
+        // whole batch on each of those devices.
+        for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let source_mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+            let target_mesh = DeviceMesh::new(logical_mesh.clone(), devices[2..].to_vec()).unwrap();
+            let sharding = Sharding::new(
+                logical_mesh.clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+            )
+            .unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                ArrayType::new_static(DataType::F32, [2, 2]),
+                source_mesh.clone(),
+                Some(sharding.clone()),
+                values_to_bytes(&[1f32, 2., 3., 4.]),
+            )
+            .unwrap();
+            let target = Placement::new(target_mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
+            let gradient: Array = batch(
+                |x| Ok(differentiate_at(x).gradient(|x| x.place(&target, None)?.reduce(&[0], ReductionKind::Sum))?),
+                input,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(gradient.mesh(), &source_mesh);
+            assert_eq!(gradient.sharding(), &sharding);
+            assert_eq!(
+                gradient
+                    .shards()
+                    .iter()
+                    .map(|shard| shard.buffer().unwrap().dimensions().unwrap().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![1, 2], vec![1, 2]],
+            );
+            assert_eq!(shard_values(&gradient), vec![vec![1., 1.], vec![1., 1.]]);
+            assert!(gradient.is_committed());
+        }
+    }
+
+    #[test]
+    fn test_place_operation_eager_batch_gradient_across_differently_named_meshes() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+
+        // The batch is split along the explicit axis `x` of the mesh of the first two devices, and each batch item is
+        // moved to the mesh of the other two devices, whose only axis is the explicit axis `y`. The cotangent of the
+        // sum is the same for every batch item and lives on the mesh of `y`, so it gains its batch dimension there
+        // replicated, and the transposed placement moves it back split along `x`.
+        let source_logical_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let target_logical_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let source_mesh = DeviceMesh::new(source_logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let target_mesh = DeviceMesh::new(target_logical_mesh.clone(), devices[2..].to_vec()).unwrap();
+        let sharding = Sharding::new(
+            source_logical_mesh,
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 2]),
+            source_mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let target = Placement::new(target_mesh, Sharding::replicated(target_logical_mesh, 1)).unwrap();
+        let gradient: Array = batch(
+            |x| Ok(differentiate_at(x).gradient(|x| x.place(&target, None)?.reduce(&[0], ReductionKind::Sum))?),
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(gradient.mesh(), &source_mesh);
+        assert_eq!(gradient.sharding(), &sharding);
+        assert_eq!(
+            gradient
+                .shards()
+                .iter()
+                .map(|shard| shard.buffer().unwrap().dimensions().unwrap().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![1, 2]],
+        );
+        assert_eq!(shard_values(&gradient), vec![vec![1., 1.], vec![1., 1.]]);
+        assert!(gradient.is_committed());
     }
 }

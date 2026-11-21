@@ -27,7 +27,7 @@ use ryft_core::{
     ProjectedValue, Sharding, ValueProjection,
 };
 
-use crate::lowering::{entry_result_placements, entry_result_shardings};
+use crate::lowering::{entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings};
 use crate::{Constant, Error, Program, Session, Tracer, Type};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
@@ -193,12 +193,14 @@ where
     /// `[5]` on 2 partitions producing `[3]` + `[2]`). Without explicit shardings, the arguments carry the sharding of
     /// each of their global types that has one, and the results carry the placement that the program gives them
     /// (i.e., the target of a `place` that produces them, including over auto mesh axes, or the sharding of the
-    /// argument that they return) or otherwise the sharding of their global types, as the compilation path of
-    /// [`Session`] does. Like that path, results replicate the unconstrained dimensions of explicit result shardings,
-    /// of the placements that the program gives them, and of their types, which their runtime placements read as
-    /// replicated. Unlike that path, which places a value without either as replicated because it lowers for concrete
-    /// placed arrays, such a value is left unannotated here, so that Shardy propagates its placement from the program
-    /// (as JAX does for unspecified shardings).
+    /// argument that they return, also through the callee of a `jit_call`) or otherwise the sharding of their global
+    /// types, as the compilation path of [`Session`] does. Like that path, arguments and results replicate the
+    /// unconstrained dimensions of their shardings, which their runtime placements read as replicated, and results
+    /// whose placement over auto mesh axes nothing fixes are left open over those axes, so that the compiler chooses
+    /// it (refer to `entry_open_results` for what this export can and cannot know). Unlike that path, which places a
+    /// value without either as replicated because it lowers for concrete placed arrays, such a value is left
+    /// unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
+    /// shardings).
     ///
     /// The traced program is pruned before lowering (refer to
     /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), which drops dead outputs of instructions that carry
@@ -232,18 +234,24 @@ where
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => self.global_input_types.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
+        let argument_annotations = argument_shardings
+            .iter()
+            .map(|sharding| sharding.as_ref().map(entry_boundary_sharding).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types = self.global_output_types.parameters().cloned().collect::<Vec<_>>();
         let placements = entry_result_placements(&simplified_program, output_types.len());
-        let result_shardings =
+        let result_annotations =
             entry_result_shardings(&output_types, result_shardings, &placements, &argument_shardings)?;
+        let open_results = entry_open_results(&output_types, result_shardings, &placements, &result_annotations);
         Ok(super::lowering::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &[],
             &self.global_input_types,
             &self.global_output_types,
             function_name,
-            &argument_shardings,
-            &result_shardings,
+            &argument_annotations,
+            &result_annotations,
+            &open_results,
         )?
         .into_stable_hlo())
     }
@@ -460,7 +468,8 @@ mod tests {
     fn test_traced_program_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
         // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
         // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
-        // the tracked type by marking the explicit axis replicated.
+        // the tracked type by marking the explicit axis replicated. The result is not the result of a `place`, so its
+        // placement along the auto axis is left to the compiler, as compilation leaves it.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
@@ -486,7 +495,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "a"=2]>
-                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x", ?}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", "a"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -625,6 +634,44 @@ mod tests {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}, {?}]> : tensor<4x4xi32>
                     %1 = stablehlo.add %0, %0 : tensor<4x4xi32>
                     return %1 : tensor<4x4xi32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_traced_program_to_mlir_module_leaves_results_open_over_auto_axes() {
+        // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
+        // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
+        // result is annotated open over it, as compilation annotates it.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh, sharded).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
+                let placed = x.place(&target, None).unwrap();
+                placed.clone() + placed
+            },
+            ArrayType::new_static(DataType::F32, [4]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced
+                .to_mlir_module_with_signature_shardings("main", Some(std::slice::from_ref(&replicated)), None)
+                .unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<4xf32>
+                    %1 = stablehlo.add %0, %0 : tensor<4xf32>
+                    return %1 : tensor<4xf32>
                   }
                 }
             "#},

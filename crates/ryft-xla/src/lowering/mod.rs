@@ -30,15 +30,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation, CollectiveAxes,
-    CompositeKey, ConstrainShardingOperation, DataType, DeviceMesh, DimensionOperation, DimensionType, DimensionValue,
-    DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
-    FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation, LogicalMesh, Memory,
-    OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME,
-    Parameterized, PlaceOperation, ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation,
-    ReshardOperation, ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
-    StopGradientOperation, TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation,
-    ZeroOperation,
+    Array, ArrayOperation, ArrayType, AtomId, BroadcastLikeOperation, BroadcastOperation, CastOperation,
+    CollectiveAxes, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh, DimensionOperation,
+    DimensionType, DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses,
+    ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation,
+    LogicalMesh, Memory, MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlaceTarget, ProgramError,
+    Provenance, RegionId, RegionRef, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
+    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation,
+    TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -64,8 +64,9 @@ use crate::operations::manipulation::conversions::cast_changes_explicit_placemen
 use crate::operations::manipulation::memory::validate_boundary_memory;
 use crate::sharding::ShardyTensorSharding;
 use crate::{
-    ArrayConstant, CompilationError, Constant, Error, FlatProgram, Operation, Program, RaggedDotLoweringStrategy,
-    RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
+    ArrayConstant, CompilationError, Constant, Error, FlatProgram, JitCallOperation, Operation, Program,
+    RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
+    normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -121,6 +122,15 @@ pub enum LoweringError {
         .mesh.logical_mesh(),
     )]
     PlacementOutsideProgramMesh { target: DeviceMesh, mesh: DeviceMesh },
+
+    #[error(
+        "`{}` cannot move a value to the device {} inside a program compiled for the devices {:?} of mesh `{}`",
+        PLACE_OPERATION_NAME,
+        .device.id(),
+        .mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>(),
+        .mesh.logical_mesh(),
+    )]
+    DeviceOutsideProgramMesh { device: Device, mesh: DeviceMesh },
 
     /// A valid operation requests behavior this backend cannot lower.
     #[error("cannot lower `{operation}`: {reason}")]
@@ -1332,7 +1342,10 @@ where
 
 /// Lowers an arbitrary traced XLA program like [`lower_mlir_module_for_program`], but with one optional sharding per
 /// entry function argument (i.e., captures first) and per result, so that only the values whose sharding is known carry
-/// an `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program.
+/// an `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program. The results
+/// flagged in `open_results` (i.e., one flag per result, or none at all) are lowered open over auto mesh axes, so that
+/// the compiler chooses their placement over those axes (refer to [`entry_open_results`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     Input,
     Output,
@@ -1348,6 +1361,7 @@ pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     function_name: S,
     argument_shardings: &[Option<Sharding>],
     result_shardings: &[Option<Sharding>],
+    open_results: &[bool],
 ) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -1367,7 +1381,7 @@ where
         None,
         &[],
         RaggedDotLoweringStrategy::default(),
-        &[],
+        open_results,
         false,
     )
 }
@@ -1479,8 +1493,10 @@ where
 /// through a `place` with a target or a `constrain_sharding`, whether or not that value reaches a result. These are the
 /// analogues of the `device_put` and `with_sharding_constraint` calls that make JAX commit every output of a `jit`
 /// function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). A `place` without a target leaves its input
-/// where it is, so it requests nothing. A `reshard` is not counted, because JAX does not count its own `reshard` among
-/// these requests either.
+/// where it is, so it requests nothing. A `place` with a device target (i.e., a [`PlaceTarget::Device`]) is counted,
+/// as an explicit device commits an array eagerly, although JAX leaves a value that a bare device places inside `jit`
+/// uncommitted and on the devices that it already occupies. A `reshard` is not counted, because JAX does not count its
+/// own `reshard` among these requests either.
 pub(crate) fn has_placement_requests<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
@@ -1512,17 +1528,26 @@ pub(crate) enum EntryResultPlacement {
 /// Returns the placement that `program` itself gives each of its first `output_count` results, or [`None`] for a
 /// result that it gives no placement. A result that a `place` in the entry region produces has the placement of its
 /// target, which states the placement along every mesh axis, including the auto mesh axes that the result type drops.
-/// Only placements in the entry region count, because a placement in a nested region reaches a result only through the
-/// result of the operation that owns that region. A result that is an entry argument is placed where that argument
-/// enters the program, which the caller knows and which also covers arguments without buffers (i.e., of the zero data
-/// type), whose placement the compiler cannot report.
+/// Only placements in the entry region and in the callees of its `jit_call`s count, because a placement in another
+/// nested region (e.g., a branch of a `condition` or the body of a loop) reaches a result only through the result of
+/// the operation that owns that region, which the compiler is free to place differently. A result that is an entry
+/// argument is placed where that argument enters the program, which the caller knows and which also covers arguments
+/// without buffers (i.e., of the zero data type), whose placement the compiler cannot report. A result that returns a
+/// [`RetainedArray`] is likewise placed as that array, which enters the program as a hidden argument.
 ///
 /// Operations that return the value of an input together with its placement are followed back to that input, so that a
 /// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
-/// target, which leaves its input where it is, and `stop_gradient` and `tag`, which only mark values for program
-/// transforms and lower to nothing. Other operations that return a value equal to an input are not followed, because
-/// they change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
-/// results differently (e.g., the `optimization_barrier` of rematerialization).
+/// target, which leaves its input where it is, a `place` with a device target, which keeps the sharding of its input
+/// on the only device of the program mesh, and `stop_gradient` and `tag`, which only mark values for program
+/// transforms and lower to nothing. A `jit_call` always runs its callee, whose results are the results of the call, so
+/// a result of a call has the placement that the callee gives the corresponding callee result, and a callee result
+/// that returns a callee input is followed back to the corresponding input of the call. A sharding override of the
+/// boundary of the callee that the call carries (i.e., of a compiled function that it calls) takes precedence, because
+/// the callee body cannot always show it, so a result of the call that such an output override covers, or that
+/// returns a callee input that such an input override covers, is placed as that override. Other operations that
+/// return a value equal to an input are not followed, because they change its placement (e.g., `reshard` and
+/// `constrain_sharding`) or because the compiler is free to place their results differently (e.g., the
+/// `optimization_barrier` of rematerialization).
 pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     output_count: usize,
@@ -1531,38 +1556,29 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    let instruction_by_output = program.instruction_by_output();
-    program.output_ids()[..output_count]
+    let mut callee_placements = HashMap::new();
+    region_result_placements(program.entry_region_ref(), &mut callee_placements)[..output_count].to_vec()
+}
+
+/// Returns the sharding with which the entry function of a program annotates a value at its boundary (i.e., an
+/// argument or a result) whose runtime array is placed as `sharding`. This is `sharding` with its unconstrained
+/// dimensions replicated. A runtime array stores such a dimension replicated, because its placement reads an
+/// unconstrained dimension as replicated, so an annotation that left the dimension open would let the compiler shard
+/// it and exchange buffers of other shapes than those of the array (e.g., expect `[2, 2]` argument buffers where an
+/// array placed as `[{"x"}, {?}]` supplies `[2, 4]` buffers).
+pub(crate) fn entry_boundary_sharding(sharding: &Sharding) -> Result<Sharding, Error> {
+    if !sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
+        return Ok(sharding.clone());
+    }
+    let dimensions = sharding
+        .dimensions()
         .iter()
-        .map(|&output_id| {
-            let mut value_id = output_id;
-            loop {
-                let Some(instruction_index) = instruction_by_output[value_id.index()] else {
-                    return program
-                        .input_ids()
-                        .iter()
-                        .position(|input_id| *input_id == value_id)
-                        .map(EntryResultPlacement::Argument);
-                };
-                let instruction = &program.instructions()[instruction_index];
-                let operation = instruction.operation();
-                let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
-                    match operation.target() {
-                        Some(target) => return Some(EntryResultPlacement::Target(target.sharding().clone())),
-                        None => 0,
-                    }
-                } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
-                    || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
-                {
-                    // Both operations return each of their inputs as the output at the same position.
-                    instruction.outputs().iter().position(|output| *output == value_id)?
-                } else {
-                    return None;
-                };
-                value_id = instruction.inputs()[input_index];
-            }
+        .map(|dimension| match dimension {
+            ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+            dimension => dimension.clone(),
         })
-        .collect()
+        .collect();
+    Ok(sharding.with_dimensions(dimensions)?)
 }
 
 /// Returns the sharding with which the entry function of a program annotates each of its results, whose types are
@@ -1577,33 +1593,20 @@ where
 ///
 /// An override, a `place` target, an argument placement, or a result type may leave dimensions unconstrained, but the
 /// runtime placement of an array reads such a dimension as replicated, and the result type records it exactly, so it
-/// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here,
-/// whatever operation produces the result (e.g., arithmetic whose result type inherits an unconstrained dimension from
-/// the target of a `place` that precedes it), so that the executable returns the buffers that the runtime placement of
-/// the result describes, while the dimensions that they constrain keep their placement. Provided overrides are not
-/// checked against `output_types`, so that a count mismatch is still reported when the module is lowered.
+/// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here
+/// (refer to [`entry_boundary_sharding`]), whatever operation produces the result (e.g., arithmetic whose result type
+/// inherits an unconstrained dimension from the target of a `place` that precedes it), so that the executable returns
+/// the buffers that the runtime placement of the result describes, while the dimensions that they constrain keep their
+/// placement. Provided overrides are not checked against `output_types`, so that a count mismatch is still reported
+/// when the module is lowered.
 pub(crate) fn entry_result_shardings(
     output_types: &[ArrayType],
     result_shardings: Option<&[Sharding]>,
     placements: &[Option<EntryResultPlacement>],
     argument_shardings: &[Option<Sharding>],
 ) -> Result<Vec<Option<Sharding>>, Error> {
-    let closed = |sharding: &Sharding| -> Result<Sharding, Error> {
-        if !sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
-            return Ok(sharding.clone());
-        }
-        let dimensions = sharding
-            .dimensions()
-            .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Unconstrained => ShardingDimension::Replicated,
-                dimension => dimension.clone(),
-            })
-            .collect();
-        Ok(sharding.with_dimensions(dimensions)?)
-    };
     match result_shardings {
-        Some(shardings) => shardings.iter().map(|sharding| closed(sharding).map(Some)).collect(),
+        Some(shardings) => shardings.iter().map(|sharding| entry_boundary_sharding(sharding).map(Some)).collect(),
         None => output_types
             .iter()
             .zip(placements)
@@ -1615,10 +1618,57 @@ pub(crate) fn entry_result_shardings(
                     }
                     None => None,
                 };
-                placement.or(output_type.sharding()).map(closed).transpose()
+                placement.or(output_type.sharding()).map(entry_boundary_sharding).transpose()
             })
             .collect(),
     }
+}
+
+/// Returns whether the entry function of a program leaves each of its results, whose types are `output_types` and
+/// whose annotations are `result_annotations` (i.e., the shardings that [`entry_result_shardings`] returns for
+/// `result_shardings` and `placements`), open over the auto mesh axes of its annotation, so that the compiler chooses
+/// the placement of the result along those axes, like JAX lowers the results of a `jit` function without
+/// `out_shardings`. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
+/// [`TracedProgram`](crate::TracedProgram) both decide this with this function, so that an exported module leaves
+/// open the results whose placement the compiler chooses for the executable that a session compiles for it.
+///
+/// A result is open when it has an annotation over a mesh with an auto axis larger than one (i.e., one along which the
+/// compiler has a choice), and when nothing else fixes its placement. A result sharding override, a placement that the
+/// program gives the result (i.e., that a `place` produces it or that it returns an argument), reduction state or
+/// manual variation in the annotation, which the compiler must not change, and unconstrained dimensions in the result
+/// type, which the runtime placement of the result must record as its type does and read as replicated, all fix it.
+/// Results without an annotation are never open, because they have no annotation that could be.
+///
+/// Export lowers a program without a device mesh, so it can only decide what the program and its signature state.
+/// It cannot know whether compilation runs the program partitioned, because a program with bounded dynamic shapes
+/// runs as fully replicated replicas whose results are never open, nor which placements the compiler then chooses for
+/// the open results, which only the compiled executable reports. It also cannot know the runtime placements of
+/// arguments without signature shardings, whose types do not record auto mesh axes, so that their annotations and
+/// those of the results that return them are left to Shardy.
+pub(crate) fn entry_open_results(
+    output_types: &[ArrayType],
+    result_shardings: Option<&[Sharding]>,
+    placements: &[Option<EntryResultPlacement>],
+    result_annotations: &[Option<Sharding>],
+) -> Vec<bool> {
+    output_types
+        .iter()
+        .zip(placements)
+        .zip(result_annotations)
+        .map(|((output_type, placement), annotation)| {
+            result_shardings.is_none()
+                && placement.is_none()
+                && annotation.as_ref().is_some_and(|sharding| {
+                    sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
+                        && sharding.unreduced_axes().is_empty()
+                        && sharding.reduced_axes().is_empty()
+                        && sharding.varying_manual_axes().is_empty()
+                })
+                && !output_type
+                    .sharding()
+                    .is_some_and(|sharding| sharding.dimensions().contains(&ShardingDimension::Unconstrained))
+        })
+        .collect()
 }
 
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
@@ -1799,9 +1849,11 @@ where
                         .map(|operation| operation.sharding().mesh())
                 })
                 .or_else(|| {
+                    // A device target names no mesh and lowers to no sharding constraint.
                     operation
                         .projected_payload::<PlaceOperation>()
                         .and_then(PlaceOperation::target)
+                        .and_then(PlaceTarget::placement)
                         .map(|target| target.sharding().mesh())
                 });
             let incoming = if let Some(mesh) = declared_mesh {
@@ -2513,6 +2565,87 @@ where
         runtime_requirements,
         mesh,
     })
+}
+
+/// Returns the placement that `region` gives each of its results, which [`entry_result_placements`] describes, with
+/// [`EntryResultPlacement::Argument`] naming an input of `region`. A result that returns a [`RetainedArray`] has the
+/// placement of that array, which enters the executable as a hidden argument with that placement, and which has no
+/// buffer whose placement the compiler could report when it has the zero data type. The placements of the callee
+/// regions of `jit_call`s are computed once per callee and memoized in `callee_placements`, because repeated calls
+/// share their callee region. The inputs of `region` and the producer of each of its values, together with the
+/// position of that value among the outputs of its producer, are indexed once, so that following a result back to an
+/// input costs one lookup per step rather than a scan of the inputs or of the outputs of an instruction.
+fn region_result_placements<O: LowerableOperationFamily>(
+    region: RegionRef<'_, Constant, O>,
+    callee_placements: &mut HashMap<RegionId, Rc<[Option<EntryResultPlacement>]>>,
+) -> Rc<[Option<EntryResultPlacement>]> {
+    let mut producers = vec![None; region.atoms().len()];
+    for (instruction_index, instruction) in region.instructions().iter().enumerate() {
+        for (output_index, output) in instruction.outputs().iter().enumerate() {
+            producers[output.index()] = Some((instruction_index, output_index));
+        }
+    }
+    // A value that is several inputs is placed as the first of them, so later positions are visited first.
+    let mut input_positions = vec![None; region.atoms().len()];
+    for (position, input) in region.input_ids().iter().enumerate().rev() {
+        input_positions[input.index()] = Some(position);
+    }
+    let mut result_placement = |output_id: AtomId| {
+        let mut value_id = output_id;
+        loop {
+            let Some((instruction_index, output_index)) = producers[value_id.index()] else {
+                if let Some(Constant::Session(constant)) = region.atoms()[value_id.index()].as_constant() {
+                    return Some(EntryResultPlacement::Target(constant.sharding().clone()));
+                }
+                return input_positions[value_id.index()].map(EntryResultPlacement::Argument);
+            };
+            let instruction = &region.instructions()[instruction_index];
+            let operation = instruction.operation();
+            let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
+                match operation.target() {
+                    Some(PlaceTarget::Placement(target)) => {
+                        return Some(EntryResultPlacement::Target(target.sharding().clone()));
+                    }
+                    Some(PlaceTarget::Device { .. }) | None => 0,
+                }
+            } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
+                || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
+            {
+                // Both operations return each of their inputs as the output at the same position.
+                output_index
+            } else if let Some(call) = operation.projected_payload::<JitCallOperation<Type>>() {
+                // The inputs of the callee receive the inputs of the call positionally, and the results of the call
+                // are the results of the callee. A sharding override of the boundary of the callee places the result
+                // or the forwarded input that it covers, as an execution of the callee does, which its body cannot
+                // always show (e.g., a replicated override over auto mesh axes stages nothing).
+                if let Some(sharding) = call.output_sharding(output_index) {
+                    return Some(EntryResultPlacement::Target(sharding.clone()));
+                }
+                let callee = *instruction.regions().first()?;
+                let placements = match callee_placements.get(&callee) {
+                    Some(placements) => Rc::clone(placements),
+                    None => {
+                        let placements = region_result_placements(region.with_id(callee).ok()?, callee_placements);
+                        callee_placements.insert(callee, Rc::clone(&placements));
+                        placements
+                    }
+                };
+                match placements.get(output_index)?.as_ref()? {
+                    EntryResultPlacement::Target(sharding) => {
+                        return Some(EntryResultPlacement::Target(sharding.clone()));
+                    }
+                    EntryResultPlacement::Argument(index) => match call.input_sharding(*index) {
+                        Some(sharding) => return Some(EntryResultPlacement::Target(sharding.clone())),
+                        None => *index,
+                    },
+                }
+            } else {
+                return None;
+            };
+            value_id = *instruction.inputs().get(input_index)?;
+        }
+    };
+    region.output_ids().iter().map(|&output_id| result_placement(output_id)).collect()
 }
 
 /// Validates that `incoming` has the topology of the module mesh `existing`, which it returns. The module mesh keeps

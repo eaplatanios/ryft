@@ -11,10 +11,9 @@ use std::time::Instant;
 
 use ryft_core::{
     ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh, DispatchInputs,
-    ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, MeshAxisType, OperationPayloadProjection,
-    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, ProgramError, ReferenceDischargeResult,
-    SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError,
-    Typed, TypedProgram,
+    ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, OperationPayloadProjection, PLACE_OPERATION_NAME,
+    Parameterized, PlaceOperation, PlaceTarget, ProgramError, ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME,
+    Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -28,8 +27,9 @@ use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredP
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::{
-    collect_session_constants, contains_unresolved_references, contains_unresolved_state, entry_result_placements,
-    entry_result_shardings, has_committed_session_constants, has_placement_requests,
+    collect_session_constants, contains_unresolved_references, contains_unresolved_state, entry_boundary_sharding,
+    entry_open_results, entry_result_placements, entry_result_shardings, has_committed_session_constants,
+    has_placement_requests,
 };
 use crate::{
     Constant, Error, ExecutionError, FlatProgram, LoweringError, OpShardingExtension, Operation, Session, Type, Value,
@@ -362,6 +362,11 @@ impl Session {
                 }))
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        // An argument is annotated as its runtime array stores it, which replicates the dimensions that its placement
+        // leaves unconstrained, as the StableHLO export of traced programs annotates it (refer to
+        // `entry_boundary_sharding`). Execution still expects the placement itself, which describes the same buffers.
+        let argument_annotations =
+            logical_argument_shardings.iter().map(entry_boundary_sharding).collect::<Result<Vec<_>, _>>()?;
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.output_index().is_some() {
@@ -395,16 +400,16 @@ impl Session {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        // A public output that a `place` in the entry region produces, directly or through operations that return its
-        // value and placement unchanged, has the placement of its target, which states the placement along every mesh
-        // axis, and one that returns an argument in the same way is placed where that argument enters the executable
-        // (refer to `entry_result_placements`). Its type drops the auto mesh axes of that placement, and its result has
-        // no physical buffer whose placement the compiler could report when it has the zero data type, so the placement
-        // is carried to the boundary instead. Outputs are then placed as an output override requests, then as the
-        // program places them, both including over auto mesh axes, and otherwise as their types are, which is the same
-        // rule that the StableHLO export of traced programs follows (refer to `entry_result_shardings`). The arguments
-        // of the program are its captures and its public inputs, between which the executable receives the arrays of
-        // session constants.
+        // A public output that a `place` in the entry region or in the callee of a `jit_call` produces, directly or
+        // through operations that return its value and placement unchanged, has the placement of its target, which
+        // states the placement along every mesh axis, and one that returns an argument in the same way is placed where
+        // that argument enters the executable (refer to `entry_result_placements`). Its type drops the auto mesh axes
+        // of that placement, and its result has no physical buffer whose placement the compiler could report when it
+        // has the zero data type, so the placement is carried to the boundary instead. Outputs are then placed as an
+        // output override requests, then as the program places them, both including over auto mesh axes, and
+        // otherwise as their types are, which is the same rule that the StableHLO export of traced programs follows
+        // (refer to `entry_result_shardings`). The arguments of the program are its captures and its public inputs,
+        // between which the executable receives the arrays of session constants.
         let placed_outputs = entry_result_placements(program, output_count);
         let program_argument_shardings = logical_argument_shardings[..source_capture_count]
             .iter()
@@ -441,14 +446,14 @@ impl Session {
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if state.is_mutated() {
                 output_types.push(effective_input_types[logical_input_index].clone());
-                result_annotations.push(logical_argument_shardings[logical_input_index].clone());
+                result_annotations.push(argument_annotations[logical_input_index].clone());
                 output_shardings.push(logical_argument_shardings[logical_input_index].clone());
             }
         }
-        // Every public output of a function that requests a placement explicitly anywhere is committed to its devices by
-        // every execution, as JAX commits every result of a `jit` function with any explicit sharding, which makes this
-        // a property of the whole function rather than of the outputs that the request reaches. The function requests a
-        // placement through an input or output sharding override, or through a `place` with a target or a
+        // Every public output of a function that requests a placement explicitly anywhere is committed to its devices
+        // by every execution, as JAX commits every result of a `jit` function with any explicit sharding, which makes
+        // this a property of the whole function rather than of the outputs that the request reaches. The function
+        // requests a placement through an input or output sharding override, or through a `place` with a target or a
         // `constrain_sharding` in any region that lowering emits (refer to `has_placement_requests`). Every output of a
         // function that is compiled for more than one device is committed as well, including its hidden reference
         // states, as JAX commits every result of a computation on more than one device (refer to
@@ -486,12 +491,12 @@ impl Session {
                     .to_string(),
             }));
         }
+        // The effective placements of the arguments and results (i.e., their annotations) are checked rather than their
+        // types, which do not record placements along auto mesh axes (e.g., an output override that splits an output
+        // along an auto axis), so that no replica returns a full buffer where the runtime placement describes a part.
         if !use_shardy_partitioner
             && options.mesh().devices().len() > 1
-            && logical_argument_shardings
-                .iter()
-                .chain(output_types.iter().filter_map(ArrayType::sharding))
-                .any(|sharding| !sharding.is_replicated())
+            && argument_annotations.iter().chain(&result_annotations).any(|sharding| !sharding.is_replicated())
         {
             return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
@@ -512,30 +517,20 @@ impl Session {
         let target_platform = Some(target.platform_name());
         // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
-        let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
+        let lowered_argument_shardings = use_shardy_partitioner.then_some(argument_annotations.as_slice());
         let lowered_result_shardings = use_shardy_partitioner.then_some(result_annotations.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
-        // outputs without `out_shardings`, and compilation reads that placement back from the executable. Axes of size
-        // one admit only one placement, so meshes without larger auto axes keep every result closed. Outputs with
-        // reduction state or manual variation, outputs that the program places (i.e., that a `place` produces or that
-        // return an argument), and hidden reference states, are always placed as declared. So are outputs whose types
-        // record unconstrained dimensions, because their runtime placements must record those dimensions as their
-        // types do and read them as replicated, which their closed annotations guarantee (refer to
-        // `entry_result_shardings`), whereas a placement that the compiler chose could shard them.
-        let open_outputs = output_shardings
-            .iter()
-            .enumerate()
-            .map(|(index, sharding)| {
-                lowered_result_shardings.is_some()
-                    && index < output_count
-                    && options.output_shardings().is_none()
-                    && placed_outputs[index].is_none()
-                    && sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
-                    && sharding.unreduced_axes().is_empty()
-                    && sharding.reduced_axes().is_empty()
-                    && sharding.varying_manual_axes().is_empty()
-                    && !sharding.dimensions().contains(&ShardingDimension::Unconstrained)
-            })
+        // outputs without `out_shardings`, and compilation reads that placement back from the executable. The StableHLO
+        // export of traced programs makes the same decision (refer to `entry_open_results`). Hidden reference states
+        // are always placed as declared, and so is every output of a program that runs as replicas without Shardy.
+        let public_open_outputs = entry_open_results(
+            &output_types[..output_count],
+            options.output_shardings(),
+            &placed_outputs,
+            &result_annotations[..output_count].iter().cloned().map(Some).collect::<Vec<_>>(),
+        );
+        let open_outputs = (0..output_shardings.len())
+            .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
             .collect::<Vec<_>>();
         let lowered_module = crate::lowering::lower_mlir_module_for_program_with_reference_state(
             program,
@@ -719,11 +714,10 @@ pub(super) fn apply_input_shardings(input_types: Vec<Type>, options: &Options) -
 ///
 /// ```
 /// use ryft_core::{
-///     Type, ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
-///     ShardingDimension,
+///     ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
 /// };
-/// use ryft_xla::Options;
 /// use ryft_xla::compilation::with_input_shardings;
+/// use ryft_xla::{Options, Type};
 ///
 /// let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit)?])?;
 /// let mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 0), Device::new(1, 0)])?;
@@ -973,30 +967,49 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// A compiled program runs on the devices of one mesh, so a `place` inside it can only redistribute a value over those
 /// devices and change its storage. Lowering only knows the logical mesh of the module, so the devices are checked
 /// before lowering, which also reports a target over another mesh topology as such rather than as a less specific
-/// mismatch of the module mesh. JAX instead silently ignores the devices of such a `device_put` target inside `jit`.
-/// Without the Shardy partitioner (i.e., for bounded dynamic programs), the compiler runs one fully replicated replica
-/// of the program on each device and ignores sharding constraints, so it would silently ignore a `place` whose target
-/// is not replicated. A `place` without a target leaves its input where it is and lowers to nothing, so it is not
-/// checked. Regions that lowering never reaches (e.g., the rule regions of composites or the transpose region of a
-/// `linear_call`) are not checked, because they are not part of the compiled program. Entry points that lower a program
-/// without compiling it for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module))
-/// know no devices and do not run it.
+/// mismatch of the module mesh. JAX treats the devices of a `device_put` target inside `jit` according to the kind of
+/// target. A bare device leaves an uncommitted input on the devices that it already occupies, whereas a concrete
+/// `NamedSharding` selects its devices for the computation and commits the output, and JAX raises an incompatible
+/// devices error when an input is committed to other devices. The devices of a Ryft program are fixed by its mesh
+/// before lowering, so a target on other devices is rejected instead. A device target (i.e., a
+/// [`PlaceTarget::Device`]) keeps the sharding of its input, so it is accepted exactly when `mesh` consists of that
+/// device alone, in which case it lowers to its layout and memory only. Unlike JAX, which leaves a value that a bare
+/// device places inside `jit` uncommitted and on the devices that it occupies, a function with such a target commits
+/// its outputs, as an explicit device commits an array eagerly. Without the Shardy partitioner (i.e., for
+/// bounded dynamic programs), the compiler runs one fully replicated replica of the program on each device and ignores
+/// sharding constraints, so it would silently ignore a `place` whose target is not replicated. A `place` without a
+/// target leaves its input where it is and lowers to nothing, so it is not checked. Regions that lowering never reaches
+/// (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not checked, because they are
+/// not part of the compiled program. Entry points that lower a program without compiling it for a device mesh (e.g.,
+/// [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices and do not run it.
 ///
 /// # Errors
 ///
 /// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
-/// the same devices in another order, or another topology than `mesh`, and [`LoweringError::UnsupportedOperation`]
-/// for the first `place` whose target sharding is not fully replicated (refer to [`Sharding::is_replicated`]) when
-/// `use_shardy_partitioner` is not set and `mesh` has more than one device.
+/// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`]
+/// for the first `place` whose device target is not the only device of `mesh`, and
+/// [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding is not fully replicated (refer
+/// to [`Sharding::is_replicated`]) when `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
     for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
             // A `place` without a target leaves its input where it is and lowers to nothing, so it has nothing to
             // validate, whatever its source says.
-            let Some(target) =
-                instruction.operation().projected_payload::<PlaceOperation>().and_then(PlaceOperation::target)
-            else {
-                continue;
+            let target = match instruction.operation().projected_payload::<PlaceOperation>().and_then(PlaceOperation::target)
+            {
+                Some(PlaceTarget::Placement(target)) => target,
+                Some(PlaceTarget::Device { device, .. }) => {
+                    // A device target keeps the sharding of its input, which is over the program mesh, so it is valid
+                    // exactly when that mesh consists of the device alone.
+                    if mesh.devices() != [*device] {
+                        return Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
+                            device: *device,
+                            mesh: mesh.clone(),
+                        }));
+                    }
+                    continue;
+                }
+                None => continue,
             };
             let target_mesh = target.mesh();
             if target_mesh.devices() != mesh.devices()
@@ -1023,7 +1036,9 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
 /// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
 /// that lowering left open over auto mesh axes, as recorded by [`LoweredProgram::open_outputs`], is the placement that
 /// the compiler chose for it, which must agree with the placement that the output type records over the other mesh
-/// axes.
+/// axes. The compiler reports placements in a physical format that cannot name mesh axes of size one, because they do
+/// not change how a value is stored, so the declared axes of size one of each dimension are kept in front of the auto
+/// axes that the compiler added to it (refer to `with_declared_singleton_axes`).
 fn resolve_output_shardings(
     executable: &LoadedExecutable<'_>,
     program: &LoweredProgram,
@@ -1053,6 +1068,7 @@ fn resolve_output_shardings(
             })?;
             op_sharding
                 .to_sharding(declared.mesh(), declared.rank())
+                .and_then(|sharding| with_declared_singleton_axes(&sharding, declared))
                 .filter(|sharding| sharding.without_auto_axes() == declared.without_auto_axes())
                 .ok_or_else(|| {
                     incompatible(format!(
@@ -1062,6 +1078,41 @@ fn resolve_output_shardings(
                 })
         })
         .collect()
+}
+
+/// Returns `physical`, which is a placement that the compiler reports for an output that lowering left open over auto
+/// mesh axes and which therefore names no mesh axis of size one, with the axes of each dimension of `declared` put back
+/// in front of the axes that the compiler added to that dimension, or [`None`] when `physical` does not extend
+/// `declared` that way. A dimension of `declared` that is sharded only along axes of size one is stored like a
+/// replicated dimension, so the compiler reports it as replicated or as sharded along auto axes alone, and the result
+/// keeps the axes that `declared` (i.e., the output type) records for it (e.g., `[{"e", "a"}]` for a declared `[{"e"}]`
+/// with `e` of size one that the compiler reports as `[{"a"}]`).
+fn with_declared_singleton_axes(physical: &Sharding, declared: &Sharding) -> Option<Sharding> {
+    let mesh = declared.mesh();
+    let axes = |dimension: &ShardingDimension| match dimension {
+        ShardingDimension::Sharded(axes) => axes.clone(),
+        ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
+    };
+    let dimensions = physical
+        .dimensions()
+        .iter()
+        .zip(declared.dimensions())
+        .map(|(physical, declared)| {
+            let (physical, mut declared) = (axes(physical), axes(declared));
+            let stored = declared
+                .iter()
+                .filter(|axis| mesh.axis_index(axis).is_some_and(|index| mesh.axes()[index].size() > 1))
+                .collect::<Vec<_>>();
+            if physical.len() < stored.len()
+                || !physical.iter().zip(&stored).all(|(physical, stored)| physical == *stored)
+            {
+                return None;
+            }
+            declared.extend(physical[stored.len()..].iter().cloned());
+            Some(if declared.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(declared) })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    physical.with_dimensions(dimensions).ok()
 }
 
 #[cfg(test)]
@@ -1562,9 +1613,9 @@ mod tests {
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
         let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // The output type inherits the unconstrained dimension of the `place` target, but the output is not the result of
-        // that `place`. Its annotation closes that dimension like the target of a `place` that produces an output, so
-        // that the compiler returns the buffers that the runtime placement of the output describes.
+        // The output type inherits the unconstrained dimension of the `place` target, but the output is not the result
+        // of that `place`. Its annotation closes that dimension like the target of a `place` that produces an output,
+        // so that the compiler returns the buffers that the runtime placement of the output describes.
         let options = Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]);
         let lowered = session.lower_program(&program, 0, &options).unwrap();
         assert_eq!(
@@ -1601,6 +1652,85 @@ mod tests {
     }
 
     #[test]
+    fn test_session_lower_program_closes_unconstrained_argument_shardings() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let input_type = ArrayType::new_static(DataType::I32, [4, 4]);
+        let input_sharding = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()],
+        )
+        .unwrap();
+        let target_sharding =
+            Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["r"])])
+                .unwrap();
+        let target = Placement::new(mesh.clone(), target_sharding).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let placed =
+            builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // An array placed with an unconstrained dimension stores that dimension replicated, so the argument that it
+        // enters as is annotated with that dimension closed, whether its placement is an input override or the observed
+        // placement of the runtime array. Otherwise, the compiler could shard that dimension and expect smaller buffers
+        // than the array supplies.
+        let values = (0..16).collect::<Vec<i32>>();
+        for options in [
+            Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]),
+            Options::new(mesh.clone()).with_input_placements(vec![Some(input_sharding.clone())].into()),
+        ] {
+            let lowered = session.lower_program(&program, 0, &options).unwrap();
+            assert_eq!(
+                lowered.stable_hlo(),
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2, "r"=2]>
+                      func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{?}, {?}]>}) {
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}, {"r"}]> : tensor<4x4xi32>
+                        %1 = stablehlo.add %0, %0 : tensor<4x4xi32>
+                        return %1 : tensor<4x4xi32>
+                      }
+                    }
+                "#},
+            );
+            let compiled = session.compile_program(&lowered).unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                input_type.clone(),
+                mesh.clone(),
+                Some(input_sharding.clone()),
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            assert_eq!(
+                input.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+                vec!["[2, 4]", "[2, 4]", "[2, 4]", "[2, 4]"],
+            );
+            let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+            // The output is open over the auto axes, and the compiler keeps the placement of the `place` target.
+            assert_eq!(outputs[0].sharding().to_string(), "{mesh<['x'=2:auto, 'r'=2:auto]>, [{'x'}, {'r'}]}");
+            assert_eq!(
+                outputs[0].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+                vec!["[2, 2]", "[2, 2]", "[2, 2]", "[2, 2]"],
+            );
+            assert_eq!(
+                outputs[0].copy_to_host().unwrap().elements::<i32>().unwrap(),
+                values.iter().map(|value| 2 * value).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
     fn test_session_lower_program_places_outputs_that_return_inputs_as_their_inputs() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -1625,6 +1755,117 @@ mod tests {
             outputs[0].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
             vec!["[2]", "[2]"],
         );
+    }
+
+    #[test]
+    fn test_session_lower_program_places_outputs_of_jit_calls_as_their_callees() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let input_type = ArrayType::new_static(DataType::Zero, [4]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let placing_callee = {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+            let output =
+                builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let forwarding_callee = {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::new();
+        let placing_callee = builder.import_region(placing_callee.entry_region_ref());
+        let forwarding_callee = builder.import_region(forwarding_callee.entry_region_ref());
+        let replicated_input = builder.add_input(input_type.clone().into());
+        let sharded_input = builder.add_input(input_type.clone().into());
+        let call = |builder: &mut ProgramBuilder, callee, input| {
+            builder
+                .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+                .unwrap()[0]
+        };
+        let placed = call(&mut builder, placing_callee, replicated_input);
+        let forwarded = call(&mut builder, forwarding_callee, sharded_input);
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![placed, forwarded], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // A `jit_call` whose callee places its result or returns one of its inputs places its own result as the callee
+        // does. A result of the zero data type has no buffer whose placement the compiler could report, so it takes
+        // its placement from the `place` in the callee or from the argument that the call forwards.
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone(), sharded.clone()]);
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let replicated_input =
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), Some(replicated), []).unwrap();
+        let sharded_input = Array::from_host_buffer(&session, input_type, mesh, Some(sharded.clone()), []).unwrap();
+        let outputs = session.execute_program(&compiled, vec![replicated_input, sharded_input]).unwrap();
+        assert_eq!(outputs[0].sharding(), &sharded);
+        assert_eq!(outputs[1].sharding(), &sharded);
+        assert_eq!(
+            outputs[0].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2]", "[2]"],
+        );
+        assert_eq!(
+            outputs[1].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2]", "[2]"],
+        );
+    }
+
+    #[test]
+    fn test_session_lower_program_places_retained_array_outputs_as_their_arrays() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let zero_type = ArrayType::new_static(DataType::Zero, [4]);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array =
+            Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), Some(sharded.clone()), []).unwrap();
+        let retained = RetainedArray::new(&array);
+        let callee = {
+            let mut builder = ProgramBuilder::new();
+            let output = builder.add_constant(Constant::Session(retained.clone()));
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let returned = builder.add_constant(Constant::Session(retained));
+        let called = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], Vec::new(), None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![returned, called], Vec::new(), vec![Placeholder; 2])
+            .unwrap();
+
+        // A retained array of the zero data type has no buffer whose placement the compiler could report, so a result
+        // that returns it, directly or from the callee of a `jit_call`, takes the placement of the retained array.
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        // The executable receives the retained array as its hidden session constant argument.
+        let outputs = session.execute_program(&compiled, vec![array]).unwrap();
+        let output_type = zero_type.with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &output_type);
+        assert_eq!(outputs[0].sharding(), &sharded);
+        assert_eq!(
+            outputs[0].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2]", "[2]"],
+        );
+        assert_eq!(outputs[1].r#type().as_ref(), &output_type);
+        assert_eq!(outputs[1].sharding(), &sharded);
+        assert_eq!(
+            outputs[1].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2]", "[2]"],
+        );
+        outputs[0].block_until_ready().unwrap();
+        outputs[1].block_until_ready().unwrap();
     }
 
     #[test]
@@ -1813,6 +2054,39 @@ mod tests {
             "cannot lower `shard_map`: bounded-dynamic programs cannot contain `shard_map` regions because \
              `sdy.manual_computation` requires the Shardy partitioner",
         );
+    }
+
+    #[test]
+    fn test_session_lower_program_rejects_split_output_shardings_in_bounded_dynamic_programs() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.into());
+        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let lower = |output_sharding: &Sharding| {
+            let options = Options::new(mesh.clone())
+                .with_input_shardings(vec![replicated.clone()])
+                .with_output_shardings(vec![output_sharding.clone()]);
+            session.lower_program(&program, 0, &options)
+        };
+
+        // Bounded dynamic programs run one fully replicated replica per device, because the Shardy partitioner rejects
+        // dynamic tensors, so an output override that splits a dimension along an auto axis, which the output type does
+        // not record, would return full buffers where the runtime placement of the output describes halves.
+        assert!(matches!(
+            lower(&sharded),
+            Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
+                if reason == "bounded-dynamic multi-device programs currently require fully replicated shardings \
+                              because Shardy rejects dynamic tensors",
+        ));
+
+        // A replicated override is what every replica computes anyway.
+        assert!(lower(&replicated).is_ok());
     }
 
     #[test]
@@ -3268,6 +3542,48 @@ mod tests {
     }
 
     #[test]
+    fn test_session_compile_program_keeps_singleton_axes_of_open_outputs() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("e", 1, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let target_sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["e"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::I32, [4]).with_sharding(replicated.clone()).unwrap();
+        let target = Placement::new(mesh.clone(), target_sharding).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let placed =
+            builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // The output is left open over the auto axis `a`, and the compiler reports its placement without the explicit
+        // axis `e` of size one that the output type records, because that axis does not change how the output is
+        // stored. The two placements are physically the same along `e`, so the output keeps `e` from its type.
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.open_outputs(), &[true]);
+        let compiled = session.compile_program(&lowered).unwrap();
+        assert_eq!(compiled.output_shardings()[0].to_string(), "{mesh<['e'=1:explicit, 'a'=2:auto]>, [{'e'}]}");
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh, Some(replicated), values_to_bytes(&[1i32, 2, 3, 4]))
+                .unwrap();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+        assert_eq!(outputs[0].sharding(), &compiled.output_shardings()[0]);
+        assert_eq!(
+            outputs[0].shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[4]", "[4]"],
+        );
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<i32>().unwrap(), vec![2, 4, 6, 8]);
+    }
+
+    #[test]
     fn test_session_validate_cached_program_rejects_foreign_invocation_contracts() {
         // Exchange on the follower side that answers every key with one fixed artifact. This is the reachable
         // stand-in for a colliding or corrupted persistent entry, because the disk tier keys entries by the digest of
@@ -3366,6 +3682,52 @@ mod tests {
         ));
         assert_eq!(required_consumer.compilation_cache().statistics().compilations, 0);
     }
+
+    #[test]
+    fn test_session_validate_cached_program_rejects_foreign_output_shardings() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let along_y = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let lower = |options: Options| session.lower_program(&program, 0, &options).unwrap();
+
+        // Output types do not record placements along auto axes, so executables that place an output along `x` and
+        // along `y`, which have the same size, return buffers of the same shapes and differ only in the placements
+        // that their invocation contracts record for that output.
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]);
+        let along_x_lowered = lower(options.clone().with_output_shardings(vec![along_x.clone()]));
+        let along_y_lowered = lower(options.with_output_shardings(vec![along_y]));
+        let along_x_compiled = session.compile_program(&along_x_lowered).unwrap();
+        assert!(session.validate_cached_program(&along_x_lowered, &along_x_compiled).is_ok());
+        assert!(matches!(
+            session.validate_cached_program(&along_y_lowered, &along_x_compiled),
+            Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
+                if reason == "cached executable has incompatible output shardings",
+        ));
+
+        // The compiler chooses the placement of an open output, so its placement in the executable may differ from
+        // the one that the lowering declares.
+        let open_lowered = lower(Options::new(mesh).with_input_shardings(vec![along_x.clone()]));
+        assert_eq!(open_lowered.open_outputs(), &[true]);
+        assert_eq!(open_lowered.output_shardings(), &[replicated]);
+        let open_compiled = session.compile_program(&open_lowered).unwrap();
+        assert_eq!(open_compiled.output_shardings(), &[along_x]);
+        assert!(session.validate_cached_program(&open_lowered, &open_compiled).is_ok());
+    }
+
     #[test]
     fn test_jit_compilation_options() {
         let devices = [Device::new(3, 0), Device::new(1, 0)];

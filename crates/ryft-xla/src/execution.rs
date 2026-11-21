@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension, Layout, Memory, Pad,
+    ArrayReference, ArrayType, Cast, DataType, Device, DeviceId, DeviceMesh, Dimension, Layout, Memory, Pad, Placement,
     ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
     ReferenceCompletionBackend, ReferenceError, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape,
     Sharding, ShardingDimension, ShardingError, StatefulCompilationDomain, StatefulExecution, Type as CoreType,
@@ -644,8 +644,13 @@ impl Session {
         // A logical input without a layout constraint admits any physical representation. Match the compiled
         // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order.
         // Known layouts convert on device through the existing capability. Unknown layouts require observing the
-        // shard buffers. Only a mismatch takes the host fallback, which also handles shards with differing
-        // layouts.
+        // shard buffers, whose layouts may differ. When one of them differs from the expected layout, the storage
+        // placement of the input converts every mismatching shard on its own and keeps the others, on the device or
+        // through host memory in the background, so that preparation never waits for the producer of a shard. It
+        // keeps the placement of the input, because the input type does not record the splits along auto mesh axes
+        // (e.g., of an input placed by the compiler) and a dense readback would combine the values of unreduced
+        // shards, so neither can be rebuilt from the whole array, and its result joins the execution fence of the
+        // input with the completion of every conversion.
         for (input, physical_type) in inputs.iter_mut().zip(&plan.physical_input_types) {
             if input.data_type().is_zero() {
                 continue;
@@ -667,52 +672,13 @@ impl Session {
                         break;
                     }
                 }
-                if needs_conversion && !input.sharding().unreduced_axes().is_empty() {
-                    // A dense readback would combine the values along unreduced axes. An unchecked shard_map can
-                    // observe each device's original value, so round-trip each addressable shard separately.
-                    let buffer_type = input.data_type().executable_buffer_type();
-                    let mut work = self.reserve_work();
-                    let mut buffers = Vec::new();
-                    for shard in input.addressable_shards() {
-                        let buffer = shard.buffer().ok_or_else(|| {
-                            Error::from(ArrayError::MissingShardBuffer {
-                                shard_index: shard.index(),
-                                device_id: shard.device().id(),
-                            })
-                        })?;
-                        // Read row-major bytes for the host upload API, then upload to the original memory with
-                        // the executable's layout. Track both transfers so session synchronization observes them.
-                        let shape = shard.shape();
-                        let layout = ryft_pjrt::Layout::dense_major_to_minor(shape.rank());
-                        let bytes = work.track_host_copy(buffer.copy_to_host(Some(layout))?).wait()?;
-                        let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-                        let uploaded = self.client().buffer(
-                            Arc::<[u8]>::from(bytes),
-                            buffer_type,
-                            dimensions.as_slice(),
-                            None,
-                            buffer.memory()?,
-                            Some(expected_buffer_layout.clone()),
-                        )?;
-                        work.track_buffer(&uploaded);
-                        buffers.push(uploaded);
-                    }
-                    *input = Array::from_addressable_buffers(
-                        self,
-                        input.r#type().into_owned().with_layout(expected.clone()),
-                        input.mesh().clone(),
-                        Some(input.sharding().clone()),
-                        buffers,
-                    )?;
-                } else if needs_conversion {
-                    let bytes = input.copy_to_host_bytes()?;
-                    *input = Array::from_host_buffer(
-                        self,
-                        input.r#type().into_owned().with_layout(expected.clone()),
-                        input.mesh().clone(),
-                        None,
-                        bytes,
-                    )?;
+                if needs_conversion {
+                    // Keep the commitment of the input, which the placement would otherwise set, because outputs
+                    // are committed when an input of the execution is.
+                    let committed = input.is_committed();
+                    let target =
+                        Placement::new(input.mesh().clone(), input.sharding().clone())?.with_layout(expected.clone());
+                    *input = input.clone().run_placement_dispatch(self, &target, false)?.with_committed(committed);
                 }
             }
         }
@@ -3265,6 +3231,147 @@ mod tests {
         for (shard, bytes) in input.addressable_shards().zip(summands) {
             assert_eq!(shard.copy_to_host_bytes().unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn test_session_prepare_compiled_execution_preserves_auto_axis_shards_during_relayout() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+
+        // Supply row shards in column-major order, which differs from the executable's, with no layout declared on the
+        // input type, whose sharding does not record the split along the auto axis `x`. Each shard is converted on its
+        // own, so the input keeps the split instead of being uploaded again as replicated.
+        let expected = compiled.plan().physical_input_types[0].layout().unwrap();
+        assert_eq!(expected, &Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
+        let buffers = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .zip([(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()])
+            .map(|(device, bytes)| {
+                client
+                    .buffer(bytes.as_slice(), BufferType::U8, [2, 4], None, device, Some(column_major.clone()))
+                    .unwrap()
+            })
+            .collect();
+        let input =
+            Array::from_addressable_buffers(&session, input_type, mesh, Some(sharding.clone()), buffers).unwrap();
+        let prepared = session.prepare_compiled_execution(&compiled, vec![input], &[]).unwrap();
+
+        let input = &prepared.inputs[0];
+        input.block_until_ready().unwrap();
+        assert_eq!(input.layout(), Some(expected));
+        assert_eq!(input.sharding(), &sharding);
+        assert_eq!(
+            input.addressable_shards().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2, 4]", "[2, 4]"],
+        );
+        assert_eq!(
+            input.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
+            vec![(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()],
+        );
+    }
+
+    #[test]
+    fn test_session_prepare_compiled_execution_relayouts_only_mismatching_shards_without_waiting() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let expected = compiled.plan().physical_input_types[0].layout().unwrap().clone();
+        assert_eq!(expected, Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
+
+        // The first row shard is ready in column-major order, and the second one is still pending in the row-major
+        // order of the executable. The source also carries the execution fence of its producer.
+        let devices = client.addressable_devices().unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
+        let first = client
+            .buffer(
+                (0..8).collect::<Vec<u8>>().as_slice(),
+                BufferType::U8,
+                [2, 4],
+                None,
+                devices[0].clone(),
+                Some(column_major),
+            )
+            .unwrap();
+        let specification = BufferSpecification::new(BufferType::U8, [2u64, 4]);
+        let manager = client
+            .host_to_device_transfer_manager(vec![specification], devices[1].default_memory().unwrap())
+            .unwrap();
+        let second = manager.retrieve_buffer(0).unwrap();
+        let (producer, producer_promise) = client.event(()).unwrap();
+        let input =
+            Array::from_addressable_buffers(&session, input_type, mesh, Some(sharding.clone()), vec![first, second])
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![producer]));
+        let second = Arc::clone(input.addressable_shards().nth(1).unwrap().buffer().unwrap());
+
+        // Preparation returns before the pending shard has its data, so a caller that supplies that data only after
+        // preparation returns can proceed. The pending shard already has the expected layout and is kept as it is.
+        let (sender, receiver) = mpsc::channel();
+        let preparing_session = session.clone();
+        let preparing_compiled = compiled.clone();
+        std::thread::spawn(move || {
+            let prepared = preparing_session.prepare_compiled_execution(&preparing_compiled, vec![input], &[]);
+            sender.send(prepared.map(|prepared| prepared.inputs.into_iter().next().unwrap())).unwrap();
+        });
+        let input = receiver.recv_timeout(Duration::from_secs(60)).unwrap().unwrap();
+        assert_eq!(input.layout(), Some(&expected));
+        assert_eq!(input.sharding(), &sharding);
+        assert_eq!(input.r#type().memory(), Memory::Device);
+        assert_eq!(
+            input.addressable_shards().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+            vec!["[2, 4]", "[2, 4]"],
+        );
+        assert!(Arc::ptr_eq(input.addressable_shards().nth(1).unwrap().buffer().unwrap(), &second));
+        assert_eq!(input.execution_fence().unwrap().is_ready(), Ok(false));
+
+        // Once the pending shard and the producer complete, the converted input holds the values of both shards and
+        // reports the failure of the producer of its source.
+        manager
+            .transfer_data(0, Arc::new((8..16).collect::<Vec<u8>>()), 0, true)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(
+            input.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
+            vec![(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()],
+        );
+        producer_promise.set(Some(ryft_pjrt::Error::aborted("producer failed"))).unwrap();
+        assert!(matches!(
+            input.block_until_ready(),
+            Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed",
+        ));
     }
 
     #[test]

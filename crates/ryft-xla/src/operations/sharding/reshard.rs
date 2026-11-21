@@ -130,7 +130,7 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>
-                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", ?}, {?}]> : tensor<4x2xf32>
                     %1 = stablehlo.cosine %0 : tensor<4x2xf32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>

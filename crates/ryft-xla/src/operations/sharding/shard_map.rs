@@ -1045,7 +1045,7 @@ pub(crate) mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["data"=2, "model"=4]>
-                  func.func @main(%arg0: tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) -> (tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) {
+                  func.func @main(%arg0: tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data"}]>}) -> (tensor<16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"data", ?}]>}) {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"data", ?}]>] out_shardings=[<@mesh, [{"data", ?}]>] manual_axes={"data"} (%arg1: tensor<8xf32>) {
                       %1 = stablehlo.add %arg1, %arg1 : tensor<8xf32>
                       sdy.return %1 : tensor<8xf32>

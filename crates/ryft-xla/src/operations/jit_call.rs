@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,10 +20,10 @@ use ryft_core::{
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
     RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
-    ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, StagedCallOperation,
-    TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
-    Value as CoreValue, ValueProjection, Zero,
+    ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension,
+    StagedCallOperation, TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
+    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
+    Typed, TypedProgram, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -389,7 +389,13 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
 /// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
 /// while separate calls receive independent local result identities.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// A call of a compiled function also carries the sharding overrides of that function's boundary (refer to
+/// `with_boundary_shardings`), because its body cannot show them all (e.g., a
+/// replicated output override over auto mesh axes stages nothing). Lowering places the results of the call as these
+/// overrides request, as an execution of the function does. They take part in equality and hashing, but a call without
+/// them hashes exactly as it did before they existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation<T: CoreType> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
     capture_count: usize,
@@ -399,6 +405,28 @@ pub struct JitCallOperation<T: CoreType> {
 
     /// Caller-owned result identities and the formal input scope used to instantiate forwarded names.
     output_types: Option<CallTypeBindings<T>>,
+
+    /// Sharding override of each callee input, by position, or [`None`] when no callee input has one.
+    input_shardings: Option<Arc<[Option<Sharding>]>>,
+
+    /// Sharding override of each callee output, by position, or [`None`] when no callee output has one.
+    output_shardings: Option<Arc<[Option<Sharding>]>>,
+}
+
+impl<T: CoreType + Hash> Hash for JitCallOperation<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The fields that existed before the boundary shardings hash as the derived implementation did, and absent
+        // boundary shardings write nothing, so that the keys of programs whose calls have none stay unchanged.
+        self.capture_count.hash(state);
+        self.marker.hash(state);
+        self.output_types.hash(state);
+        if let Some(shardings) = &self.input_shardings {
+            shardings.hash(state);
+        }
+        if let Some(shardings) = &self.output_shardings {
+            shardings.hash(state);
+        }
+    }
 }
 
 impl<T: CoreType> JitCallOperation<T> {
@@ -406,7 +434,23 @@ impl<T: CoreType> JitCallOperation<T> {
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
     pub(crate) fn new(capture_count: usize) -> Self {
-        Self { capture_count, marker: PhantomData, output_types: None }
+        Self { capture_count, marker: PhantomData, output_types: None, input_shardings: None, output_shardings: None }
+    }
+
+    /// Returns this call with the sharding overrides of the boundary of its callee, by callee input and output
+    /// position, where [`None`] marks a position without one. Positions past the end of either list have none. A list
+    /// without any override is stored as absent, so that the call equals and hashes like one without overrides.
+    pub(crate) fn with_boundary_shardings(
+        mut self,
+        input_shardings: Vec<Option<Sharding>>,
+        output_shardings: Vec<Option<Sharding>>,
+    ) -> Self {
+        let normalize = |shardings: Vec<Option<Sharding>>| {
+            shardings.iter().any(Option::is_some).then(|| Arc::<[Option<Sharding>]>::from(shardings))
+        };
+        self.input_shardings = normalize(input_shardings);
+        self.output_shardings = normalize(output_shardings);
+        self
     }
 
     /// Instantiates every callee-local result identity freshly for this call. Input identities continue to name the
@@ -453,6 +497,99 @@ impl<T: CoreType> JitCallOperation<T> {
     #[inline]
     pub(crate) fn capture_count(&self) -> usize {
         self.capture_count
+    }
+
+    /// Returns the sharding override of callee input `index`, if the callee has one.
+    #[inline]
+    pub(crate) fn input_sharding(&self, index: usize) -> Option<&Sharding> {
+        self.input_shardings.as_deref().and_then(|shardings| shardings.get(index)?.as_ref())
+    }
+
+    /// Returns the sharding override of callee output `index`, if the callee has one.
+    #[inline]
+    pub(crate) fn output_sharding(&self, index: usize) -> Option<&Sharding> {
+        self.output_shardings.as_deref().and_then(|shardings| shardings.get(index)?.as_ref())
+    }
+
+    /// Returns whether the callee has any boundary sharding override.
+    #[inline]
+    fn has_boundary_shardings(&self) -> bool {
+        self.input_shardings.is_some() || self.output_shardings.is_some()
+    }
+
+    /// Returns the input overrides at `indices` and the output overrides at `output_indices`, where [`None`] selects
+    /// a position without one, for a call that is derived from this one (e.g., by a program transform).
+    fn derived_boundary_shardings(
+        &self,
+        input_indices: impl IntoIterator<Item = Option<usize>>,
+        output_indices: impl IntoIterator<Item = Option<usize>>,
+    ) -> (Vec<Option<Sharding>>, Vec<Option<Sharding>>) {
+        let inputs = input_indices.into_iter().map(|index| index.and_then(|index| self.input_sharding(index)).cloned());
+        let outputs =
+            output_indices.into_iter().map(|index| index.and_then(|index| self.output_sharding(index)).cloned());
+        (inputs.collect(), outputs.collect())
+    }
+
+    /// Returns `derived` with the boundary shardings of this call at the positions that `input_indices` and
+    /// `output_indices` select (refer to `derived_boundary_shardings`), or `derived` unchanged when this call has
+    /// none.
+    fn with_derived_boundary_shardings<U: CoreType>(
+        &self,
+        derived: JitCallOperation<U>,
+        input_indices: impl IntoIterator<Item = Option<usize>>,
+        output_indices: impl IntoIterator<Item = Option<usize>>,
+    ) -> JitCallOperation<U> {
+        if !self.has_boundary_shardings() {
+            return derived;
+        }
+        let (inputs, outputs) = self.derived_boundary_shardings(input_indices, output_indices);
+        derived.with_boundary_shardings(inputs, outputs)
+    }
+
+    /// Returns `known_call` and `residual_call`, the calls of the two sides of a partial evaluation split of this call,
+    /// with the boundary shardings of the inputs and outputs of this call that they receive and return, as JAX keeps
+    /// the shardings of the known and unknown inputs and outputs of a split `pjit`. Residual edges have none.
+    ///
+    /// # Parameters
+    ///
+    ///   - `known_input_indices`: Input of this call that each known callee input receives.
+    ///   - `residual_inputs`: Source of each residual callee input.
+    ///   - `outputs`: Source of each output of this call among the outputs of the known or the residual callee.
+    ///   - `known_output_count`: Number of outputs of the known callee, including its residual edges.
+    ///   - `residual_output_count`: Number of outputs of the residual callee.
+    fn with_split_boundary_shardings(
+        &self,
+        known_call: Self,
+        residual_call: Self,
+        known_input_indices: &[usize],
+        residual_inputs: &[ResidualInputSource],
+        outputs: &[PartialEvaluationOutput<usize>],
+        known_output_count: usize,
+        residual_output_count: usize,
+    ) -> (Self, Self) {
+        let mut known_outputs = vec![None; known_output_count];
+        let mut residual_outputs = vec![None; residual_output_count];
+        for (index, output) in outputs.iter().enumerate() {
+            let position = match *output {
+                PartialEvaluationOutput::Known(position) => known_outputs.get_mut(position),
+                PartialEvaluationOutput::Unknown(position) => residual_outputs.get_mut(position),
+            };
+            if let Some(position) = position {
+                *position = Some(index);
+            }
+        }
+        let residual_input_indices = residual_inputs.iter().map(|source| match *source {
+            ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => Some(index),
+            ResidualInputSource::KnownOutput(_) | ResidualInputSource::ResidualEdge(_) => None,
+        });
+        let known_call = self.with_derived_boundary_shardings(
+            known_call,
+            known_input_indices.iter().copied().map(Some),
+            known_outputs,
+        );
+        let residual_call =
+            self.with_derived_boundary_shardings(residual_call, residual_input_indices, residual_outputs);
+        (known_call, residual_call)
     }
 
     /// Checks that the lexical capture namespace is a valid prefix of this callee's actual boundary.
@@ -600,6 +737,15 @@ impl<T: CoreType> CoreOperation for JitCallOperation<T> {
         let mut operation = self.clone();
         operation.output_types =
             self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;
+        // The boundary shardings follow the kept callee inputs and outputs.
+        let kept_input_indices = kept_inputs.iter().enumerate().filter_map(|(index, kept)| kept.then_some(Some(index)));
+        let kept_output_indices =
+            used_outputs.iter().enumerate().filter_map(|(index, used)| used.then_some(Some(index)));
+        let operation = self.with_derived_boundary_shardings(
+            JitCallOperation { input_shardings: None, output_shardings: None, ..operation },
+            kept_input_indices,
+            kept_output_indices,
+        );
         Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
@@ -610,15 +756,29 @@ impl<T: CoreType> CoreOperation for JitCallOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
-        if self.capture_count == 0 && self.output_types.is_none() {
+        if self.capture_count == 0 && self.output_types.is_none() && !self.has_boundary_shardings() {
             Ok(())
         } else {
+            // Boundary shardings render only when present, so that calls without them render as before. A position
+            // without an override renders as `_`.
+            let render_shardings = |shardings: &[Option<Sharding>]| {
+                shardings
+                    .iter()
+                    .map(|sharding| sharding.as_ref().map_or_else(|| "_".to_string(), Sharding::to_string))
+                    .collect::<Vec<_>>()
+            };
             operation.bracketed(|operation| {
                 if self.capture_count != 0 {
                     operation.field("capture_count", self.capture_count)?;
                 }
                 if let Some(outputs) = &self.output_types {
                     operation.list("output_types", outputs.outputs())?;
+                }
+                if let Some(shardings) = &self.input_shardings {
+                    operation.list("input_shardings", render_shardings(shardings))?;
+                }
+                if let Some(shardings) = &self.output_shardings {
+                    operation.list("output_shardings", render_shardings(shardings))?;
                 }
                 Ok(())
             })
@@ -717,6 +877,17 @@ where
         let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
         let callee = driver.region(0)?;
         if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
+            // An all-known call folds as a whole, unless its callee holds work that must not fold under this context
+            // (e.g., a copy that every execution of a specialized program must make), in which case the whole call
+            // stays residual.
+            if all_known && !context.can_fold_regions(driver, &[callee])? {
+                let callee = shared_jit_call_callee(callee)?;
+                return context.residualize(
+                    Operation::JitCall(self.clone()),
+                    AttachedRegions::Callees(std::slice::from_ref(&callee)),
+                    inputs,
+                );
+            }
             let outputs = fold_or_residualize_jit_call(self, context, driver, inputs)?;
             if all_known && context.residual_policy().is_some() && !keeps_jit_call_boundary(callee, inputs) {
                 return Ok(forward_jit_call_inputs(callee, inputs, outputs));
@@ -788,6 +959,15 @@ where
             &partition.residual_program().input_types(),
             &partition.residual_program().output_types(),
         )?;
+        let (known_call, residual_call) = self.with_split_boundary_shardings(
+            known_call,
+            residual_call,
+            partition.known_input_indices(),
+            partition.residual_inputs(),
+            partition.outputs(),
+            partition.known_program().output_count(),
+            partition.residual_program().output_count(),
+        );
         context.inline_partitioned_program(
             partition,
             Some(callee),
@@ -868,6 +1048,23 @@ where
         let mut values = vec![context.axis_extent().clone()];
         values.extend(inputs.iter().map(|input| input.value().clone()));
         let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
+        // The boundary shardings gain a replicated batch dimension, and the leading extent input has none.
+        let operation = if self.has_boundary_shardings() {
+            let input_shardings =
+                std::iter::once(None)
+                    .chain(inputs.iter().enumerate().map(|(index, input)| {
+                        batched_boundary_sharding(self.input_sharding(index), &input.batch_axis())
+                    }))
+                    .collect();
+            let output_shardings = axes
+                .iter()
+                .enumerate()
+                .map(|(index, axis)| batched_boundary_sharding(self.output_sharding(index), axis))
+                .collect();
+            operation.with_boundary_shardings(input_shardings, output_shardings)
+        } else {
+            operation
+        };
         let outputs = context.parent().bind(operation, vec![callee], &values)?;
         check_count!("output", outputs, axes.len(), ProgramError);
         outputs
@@ -926,6 +1123,27 @@ where
             (callee.to_program(), output_axes)
         };
         let operation = Self::new(self.capture_count()).with_callee_region(batched_callee.entry_region_ref())?;
+        // The boundary shardings gain a replicated batch dimension at the batch axis of each mapped value.
+        let operation = if self.has_boundary_shardings() {
+            let input_shardings = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let axis = BatchAxis::from_optional_position(input.batch_axis_position());
+                    batched_boundary_sharding(self.input_sharding(index), &axis)
+                })
+                .collect();
+            let output_shardings = output_axes
+                .iter()
+                .enumerate()
+                .map(|(index, axis)| {
+                    batched_boundary_sharding(self.output_sharding(index), &BatchAxis::from_optional_position(*axis))
+                })
+                .collect();
+            operation.with_boundary_shardings(input_shardings, output_shardings)
+        } else {
+            operation
+        };
         let outputs = context.parent().bind(
             operation,
             AttachedRegions::Callees(&[Arc::new(batched_callee)]),
@@ -1054,9 +1272,14 @@ where
             );
 
             // The primal operands come first, so the lifted-capture prefix of the source call carries over unchanged.
-            let operation = Operation::JitCall(
+            // Each tangent has the boundary sharding of its primal, as JAX's `_pjit_jvp` gives each tangent the
+            // sharding of its primal.
+            let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
+            let operation = Operation::JitCall(self.with_derived_boundary_shardings(
                 JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
-            );
+                (0..input_types.len()).chain(activity.input_indices().iter().copied()).map(Some),
+                (0..output_count).chain(live_outputs).map(Some),
+            ));
             let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
             check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
             let mut tangents = outputs.split_off(output_count).into_iter();
@@ -1122,9 +1345,12 @@ where
         // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
         // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
         // survives verbatim and its length carries over.
-        let primal_call = Operation::JitCall(
+        // The primal call has the boundary shardings of this call, and its trailing residuals have none.
+        let primal_call = Operation::JitCall(self.with_derived_boundary_shardings(
             JitCallOperation::new(self.capture_count()).with_callee_region(primal_program.entry_region_ref())?,
-        );
+            (0..input_types.len()).map(Some),
+            (0..output_count).map(Some),
+        ));
         let mut primal_call_outputs =
             context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
@@ -1156,8 +1382,16 @@ where
         // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
         // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
         // value.
-        let tangent_call =
-            Operation::JitCall(JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?);
+        // Each active input tangent and each live output tangent has the boundary sharding of its primal, and the
+        // trailing residual inputs have none.
+        let active_inputs = activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
+        let live_outputs =
+            output_activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
+        let tangent_call = Operation::JitCall(self.with_derived_boundary_shardings(
+            JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?,
+            active_inputs,
+            live_outputs,
+        ));
         let tangent_outputs =
             context
                 .tangent()
@@ -1212,7 +1446,7 @@ pub fn transpose_primal_jit_call<
     V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
     D: TranspositionDriver<V, Operation<V>>,
 >(
-    _operation: &JitCallOperation<Type>,
+    operation: &JitCallOperation<Type>,
     context: &mut TracingContext<V, Operation<V>>,
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, Operation<V>>>>],
@@ -1284,9 +1518,35 @@ pub fn transpose_primal_jit_call<
     // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
     // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
     // traced through fresh-root contexts.
-    let transposed_call = Operation::JitCall(
-        JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?,
-    );
+    // Each output cotangent has the boundary sharding of its output and each known input value that of its input, and
+    // the cotangent references have none, as JAX's `_pjit_transpose` gives the cotangents the shardings of their
+    // primals. The linear input cotangents have the shardings of their inputs when the transposed callee returns one
+    // per linear input.
+    let mut transposed_call =
+        JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
+    if operation.has_boundary_shardings() {
+        let output_cotangent_shardings = outputs
+            .iter()
+            .zip(output_types.iter())
+            .enumerate()
+            .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
+            .map(|(index, _)| operation.output_sharding(index).cloned());
+        let reference_shardings = cotangents.references().iter().map(|_| None);
+        let known_input_shardings = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.as_known().is_some())
+            .map(|(index, _)| operation.input_sharding(index).cloned());
+        let input_shardings =
+            output_cotangent_shardings.chain(reference_shardings).chain(known_input_shardings).collect();
+        let output_shardings = if transposed_callee.program().output_count() == input_indices.len() {
+            input_indices.iter().map(|&index| operation.input_sharding(index).cloned()).collect()
+        } else {
+            Vec::new()
+        };
+        transposed_call = transposed_call.with_boundary_shardings(input_shardings, output_shardings);
+    }
+    let transposed_call = Operation::JitCall(transposed_call);
     let input_cotangents = context.bind(
         transposed_call,
         AttachedRegions::Callees(&[transposed_callee.program().clone()]),
@@ -1711,6 +1971,10 @@ struct JitCallSplitArguments {
     /// [`PartialEvaluationContext::allow_effect_folding`]).
     allow_effect_folding: bool,
 
+    /// Whether operations whose results must have storage of their own for every execution may fold into the known
+    /// callee (refer to [`PartialEvaluationContext::allow_copy_folding`]), which program specialization disallows.
+    allow_copy_folding: bool,
+
     /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
     /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
     /// `false` because their partitions do not depend on this mode.
@@ -1985,6 +2249,22 @@ where
     Ok(())
 }
 
+/// Returns `sharding`, the boundary sharding of a value that batching maps along `axis`, with a replicated batch
+/// dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding or when
+/// the batch dimension cannot be inserted.
+fn batched_boundary_sharding(sharding: Option<&Sharding>, axis: &BatchAxis) -> Option<Sharding> {
+    let sharding = sharding?;
+    let Some(axis) = axis.axis() else {
+        return Some(sharding.clone());
+    };
+    let rank = sharding.dimensions().len() as i128 + 1;
+    let position = if axis.value() < 0 { axis.value() + rank } else { axis.value() };
+    let position = usize::try_from(position).ok().filter(|&position| (position as i128) < rank)?;
+    let mut dimensions = sharding.dimensions().to_vec();
+    dimensions.insert(position, ShardingDimension::Replicated);
+    sharding.with_dimensions(dimensions).ok()
+}
+
 /// Validates that `input_types` match `expected_types` exactly, in count and position, and reports the first mismatch
 /// as a type error naming `operation_name`.
 fn validate_call_input_types<T: CoreType>(
@@ -2150,6 +2430,7 @@ where
         policy: context.residual_policy().cloned(),
         residual_rounding_type: context.residual_rounding_type(),
         allow_effect_folding: context.allow_effect_folding(),
+        allow_copy_folding: context.allow_copy_folding(),
         repeated_residual: keeps_trivial_splits_whole
             && !callee.effects().classes().is_empty()
             && driver.partitions_for_repeated_residual_calls(),
@@ -2182,6 +2463,15 @@ where
         split.known_input_indices.iter().filter(|index| **index < operation.capture_count()).count();
     let known_call = JitCallOperation::new(known_capture_count).with_callee_region(known_callee.entry_region_ref())?;
     let residual_call = JitCallOperation::new(0).with_callee_region(residual_callee.entry_region_ref())?;
+    let (known_call, residual_call) = operation.with_split_boundary_shardings(
+        known_call,
+        residual_call,
+        &split.known_input_indices,
+        &split.residual_inputs,
+        &split.outputs,
+        known_callee.output_count(),
+        residual_callee.output_count(),
+    );
     let known_inputs = split.known_input_indices.iter().map(|index| inputs[*index].clone()).collect::<Vec<_>>();
     let known_outputs = context.fold_or_residualize(
         Operation::JitCall(known_call),
@@ -2284,6 +2574,7 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 
 #[cfg(test)]
 mod tests {
+    use std::hash::DefaultHasher;
     use std::sync::{Arc, Mutex};
 
     use indoc::{formatdoc, indoc};
@@ -2298,16 +2589,17 @@ mod tests {
         DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses,
         InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, NamedComposite, NoStorage, NothingSavable, Operation as CoreOperation, OutputRegionProvenance,
-        PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialValue,
-        Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface,
-        RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision,
-        ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames,
-        ScanOperation, Shape, Sharding, ShardingDimension, Sin, SinOperation, StagingContext, TagOperation, Tracer,
-        TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver,
-        TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
+        MulOperation, NamedComposite, NegOperation, NoStorage, NothingSavable, Operation as CoreOperation,
+        OutputRegionProvenance, PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput,
+        PartialEvaluationOutput, PartialValue, PlaceOperation, Placeholder, PrintOperation,
+        ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
+        ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
+        RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
+        ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames, ScanOperation, Shape,
+        Sharding, ShardingDimension, Sin, SinOperation, StagingContext, TagOperation, Tracer, TracingContext,
+        TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver, TypeError,
+        TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
     use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -3224,6 +3516,89 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_operation_with_boundary_shardings() {
+        let hash = |operation: &JitCallOperation<Type>| {
+            let mut hasher = DefaultHasher::new();
+            operation.hash(&mut hasher);
+            hasher.finish()
+        };
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh, 1);
+
+        // A call without overrides, including one whose lists hold no override, equals and hashes like a call whose
+        // fields hash as the derived implementation did before the overrides existed.
+        let plain = JitCallOperation::<Type>::new(1);
+        let mut expected = DefaultHasher::new();
+        1usize.hash(&mut expected);
+        PhantomData::<fn() -> Type>.hash(&mut expected);
+        None::<CallTypeBindings<Type>>.hash(&mut expected);
+        assert_eq!(hash(&plain), expected.finish());
+        let empty = JitCallOperation::<Type>::new(1).with_boundary_shardings(vec![None, None], vec![None]);
+        assert_eq!(empty, plain);
+        assert_eq!(hash(&empty), hash(&plain));
+
+        // Overrides take part in equality and hashing, and render only when present.
+        let placed = JitCallOperation::<Type>::new(1)
+            .with_boundary_shardings(vec![None, Some(sharded.clone())], vec![Some(replicated.clone())]);
+        assert_ne!(placed, plain);
+        assert_ne!(hash(&placed), hash(&plain));
+        assert_eq!(placed.input_sharding(0), None);
+        assert_eq!(placed.input_sharding(1), Some(&sharded));
+        assert_eq!(placed.input_sharding(2), None);
+        assert_eq!(placed.output_sharding(0), Some(&replicated));
+        let input_type: Type = ArrayType::new_static(DataType::F32, [4]).into();
+        let mut builder = ArrayIrProgramBuilder::new();
+        builder.add_input(input_type.clone());
+        let input = builder.add_input(input_type.clone());
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let render = |operation: JitCallOperation<Type>| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let callee_region = builder.import_region(callee.entry_region_ref());
+            let inputs = vec![builder.add_input(input_type.clone()), builder.add_input(input_type.clone())];
+            let output =
+                builder.add_instruction(Operation::JitCall(operation), vec![callee_region], inputs, None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            render(plain),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = jit_call [capture_count=1] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(
+            render(placed),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = jit_call [
+                    capture_count=1,
+                    input_shardings=[_, {mesh<['x'=2:auto]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:auto]>, [{}]}],
+                ] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
         );
     }
 
@@ -4195,6 +4570,167 @@ mod tests {
             outputs.iter().map(read).collect::<Vec<_>>(),
             vec![vec![2.0, 4.0, 6.0, 8.0], vec![10.0, 24.0, 42.0, 64.0]],
         );
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_keeps_forced_copies_under_specialization() {
+        // Specializing a program never folds a copy that every execution must make (i.e., a `place` with `may_alias`
+        // disabled), whether the call that holds it is all known or split, so two executions of the specialized
+        // program return distinct buffers. A call without such a copy still folds.
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let array_type = vector_type().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let r#type = Type::Array(array_type.clone());
+        let array = |values: &[f64]| {
+            let bytes = values_to_bytes::<f64>(values);
+            Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, bytes).unwrap())
+        };
+        let buffer = |value: &Value| {
+            let Value::Array(array) = value else {
+                panic!("expected an array value");
+            };
+            Arc::clone(array.addressable_shards().next().unwrap().buffer().unwrap())
+        };
+        let read = |value: &Value| {
+            values_from_bytes::<f64>(buffer(value).copy_to_host(None).unwrap().r#await().unwrap().as_slice())
+        };
+
+        // Program `(a, x) -> call(a, x)` whose callee returns `(copy(a), -x)` when `mixed` is set and `copy(a)` or
+        // `-a` otherwise.
+        let program = |copy: bool, mixed: bool| {
+            let callee = {
+                let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+                let a = builder.add_input(r#type.clone());
+                let x = builder.add_input(r#type.clone());
+                let first = if copy {
+                    let place = PlaceOperation::new(None, None).with_may_alias(false);
+                    builder.add_instruction(place, Vec::new(), vec![a], None).unwrap()[0]
+                } else {
+                    builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0]
+                };
+                let mut outputs = vec![first];
+                if mixed {
+                    outputs.push(builder.add_instruction(NegOperation::new(), Vec::new(), vec![x], None).unwrap()[0]);
+                }
+                let count = outputs.len();
+                builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; count])
+            }
+            .unwrap();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let a = builder.add_input(r#type.clone());
+            let x = builder.add_input(r#type.clone());
+            let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+            let call = Operation::JitCall(JitCallOperation::new(0));
+            let outputs = builder.add_instruction(call, vec![callee_region], vec![a, x], None).unwrap().to_vec();
+            let count = outputs.len();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; count])
+                .unwrap()
+        };
+        let known = array(&[1.0, 2.0, 3.0, 4.0]);
+
+        // An all-known call whose callee forces a copy stays residual as a whole.
+        let copying = program(true, false);
+        let evaluation = copying
+            .partially_evaluate_in_context(
+                &session,
+                &[PartialValue::Known(known.clone()), PartialValue::Known(known.clone())],
+            )
+            .unwrap();
+        assert!(evaluation.outputs().iter().all(PartialEvaluationOutput::is_unknown));
+        let first = evaluation.interpret(&session, &[]).unwrap();
+        let second = evaluation.interpret(&session, &[]).unwrap();
+        assert_eq!(read(&first[0]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read(&second[0]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(!Arc::ptr_eq(&buffer(&first[0]), &buffer(&second[0])));
+        assert!(!Arc::ptr_eq(&buffer(&first[0]), &buffer(&known)));
+
+        // An all-known call without a forced copy folds.
+        let negating = program(false, false);
+        let evaluation = negating
+            .partially_evaluate_in_context(&session, &[PartialValue::Known(known.clone()), PartialValue::Known(known)])
+            .unwrap();
+        let [PartialEvaluationOutput::Known(negated)] = evaluation.outputs() else {
+            panic!("expected one known output");
+        };
+        assert_eq!(read(negated), vec![-1.0, -2.0, -3.0, -4.0]);
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_does_not_reuse_splits_that_fold_forced_copies() {
+        // The split of a mixed call is cached per callee and partial evaluation configuration, so a split that a
+        // partition which folds copies computed is not reused by a specialization, which must not fold them.
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let array_type = vector_type().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let r#type = Type::Array(array_type.clone());
+        let array = |values: &[f64]| {
+            let bytes = values_to_bytes::<f64>(values);
+            Value::Array(Array::from_host_buffer(&session, array_type.clone(), mesh.clone(), None, bytes).unwrap())
+        };
+        let buffer = |value: &Value| {
+            let Value::Array(array) = value else {
+                panic!("expected an array value");
+            };
+            Arc::clone(array.addressable_shards().next().unwrap().buffer().unwrap())
+        };
+        let read = |value: &Value| {
+            values_from_bytes::<f64>(buffer(value).copy_to_host(None).unwrap().r#await().unwrap().as_slice())
+        };
+
+        // Program `(a, x) -> call(a, x)` whose callee returns `(copy(a), -x)` when `mixed` is set and `copy(a)` or
+        // `-a` otherwise.
+        let program = |copy: bool, mixed: bool| {
+            let callee = {
+                let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+                let a = builder.add_input(r#type.clone());
+                let x = builder.add_input(r#type.clone());
+                let first = if copy {
+                    let place = PlaceOperation::new(None, None).with_may_alias(false);
+                    builder.add_instruction(place, Vec::new(), vec![a], None).unwrap()[0]
+                } else {
+                    builder.add_instruction(NegOperation::new(), Vec::new(), vec![a], None).unwrap()[0]
+                };
+                let mut outputs = vec![first];
+                if mixed {
+                    outputs.push(builder.add_instruction(NegOperation::new(), Vec::new(), vec![x], None).unwrap()[0]);
+                }
+                let count = outputs.len();
+                builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; count])
+            }
+            .unwrap();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let a = builder.add_input(r#type.clone());
+            let x = builder.add_input(r#type.clone());
+            let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+            let call = Operation::JitCall(JitCallOperation::new(0));
+            let outputs = builder.add_instruction(call, vec![callee_region], vec![a, x], None).unwrap().to_vec();
+            let count = outputs.len();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; count])
+                .unwrap()
+        };
+        let known = array(&[1.0, 2.0, 3.0, 4.0]);
+        let unknown = array(&[5.0, 6.0, 7.0, 8.0]);
+
+        // A mixed call whose split was cached by a partition that folds copies does not reuse that split.
+        let mixed = program(true, true);
+        mixed.partition(&[true, false]).unwrap();
+        let evaluation = mixed
+            .partially_evaluate_in_context(
+                &session,
+                &[PartialValue::Known(known.clone()), PartialValue::Unknown(r#type.clone())],
+            )
+            .unwrap();
+        assert!(evaluation.outputs().iter().all(PartialEvaluationOutput::is_unknown));
+        let first = evaluation.interpret(&session, std::slice::from_ref(&unknown)).unwrap();
+        let second = evaluation.interpret(&session, std::slice::from_ref(&unknown)).unwrap();
+        assert_eq!(read(&first[0]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read(&first[1]), vec![-5.0, -6.0, -7.0, -8.0]);
+        assert!(!Arc::ptr_eq(&buffer(&first[0]), &buffer(&second[0])));
+        assert!(!Arc::ptr_eq(&buffer(&first[0]), &buffer(&known)));
     }
 
     #[test]
@@ -5343,6 +5879,7 @@ mod tests {
             policy: None,
             residual_rounding_type: None,
             allow_effect_folding: true,
+            allow_copy_folding: true,
             repeated_residual: false,
         };
         let derive = |region: RegionRef<'_, Constant, Operation>, _: &JitCallSplitArguments| {

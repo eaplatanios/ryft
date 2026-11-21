@@ -543,13 +543,15 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    #[cfg(feature = "cuda-13")]
-    use ryft_core::ParallelBroadcast;
     use ryft_core::{
         ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType,
         Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, ProjectedValue,
         ReductionKind, ReferenceType, ShardMapOptions, Sharding, ShardingDimension, UnreducedKind, ValueProjection,
         batch, shard_map,
+    };
+    #[cfg(feature = "cuda-13")]
+    use ryft_core::{
+        CompilationArtifactExchangePolicy, CompilationCache, Layout, Memory, ParallelBroadcast, TiledLayout,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{
@@ -562,13 +564,13 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
 
-    #[cfg(feature = "cuda-13")]
-    use crate::ArrayPlacement;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
     #[cfg(feature = "cuda-13")]
     use crate::tests::test_compilation_options;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
+    #[cfg(feature = "cuda-13")]
+    use crate::{ArrayPlacement, ToPjrt};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -902,6 +904,30 @@ mod tests {
                     println!("probe: rank {rank} {name}: {}", error.to_string().lines().next().unwrap_or(""));
                 }
             }
+        }
+    }
+
+    /// Places `source` on `target` with [`Array::to_placement`] and prints a `probe:` line labeled `name` with the
+    /// memory kind and the elements of every shard that this process addresses afterwards and the result of
+    /// [`Array::block_until_ready`], or with the first line of the error of the placement.
+    #[cfg(feature = "cuda-13")]
+    fn probe_placement(rank: usize, name: &str, session: &Session, source: &Array, target: ArrayPlacement) {
+        match source.to_placement(session, target) {
+            Ok(placed) => {
+                let ready = match placed.block_until_ready() {
+                    Ok(()) => "ready".to_string(),
+                    Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+                };
+                let shards = placed
+                    .addressable_shards()
+                    .map(|shard| {
+                        let kind = shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned();
+                        (kind, values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
+                    })
+                    .collect::<Vec<_>>();
+                println!("probe: rank {rank} {name}: {shards:?} {ready}");
+            }
+            Err(error) => println!("probe: rank {rank} {name}: {}", error.to_string().lines().next().unwrap_or("")),
         }
     }
 
@@ -1896,6 +1922,556 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 rank 1 replicated_to_sharded: [[7.0, 8.0]] ready
                 rank 1 sharded_to_reversed_replicated: [[13.0, 14.0, 15.0, 16.0]] ready
                 rank 1 replicated_to_replicated_again: [[17.0, 18.0, 19.0, 20.0]] ready"},
+        );
+    }
+
+    // Worker of `test_array_to_placement_relayouts_cross_host_replica_on_two_cuda_processes`, which returns immediately
+    // unless that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_relayouts_cross_host_replica_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh =
+                |size| LogicalMesh::new(vec![MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let source_mesh = DeviceMesh::new(logical_mesh(1), vec![devices[0]]).unwrap();
+            let destination_mesh = DeviceMesh::new(logical_mesh(2), devices.clone()).unwrap();
+            let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+
+            // A column-major replica of `[[1, 2, 3], [4, 5, 6]]` on the device of rank 0 is split by rows over both
+            // ranks. Neither whole shards nor shard regions apply, so rank 0 sends its replica to rank 1 for a
+            // compiled reshard on the destination mesh, and it must convert the replica to the row-major layout that
+            // the receive of rank 1 allocates, or rank 1 would decode its row as `[5, 3, 6]`.
+            let r#type = ArrayType::new_static(DataType::F32, [2, 3])
+                .with_layout(column_major.clone())
+                .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 2))
+                .unwrap();
+            let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
+            let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
+            let rows = Sharding::new(
+                destination_mesh.logical_mesh().clone(),
+                vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+            )
+            .unwrap();
+            let placed =
+                source.to_placement(&session, ArrayPlacement::mesh(destination_mesh.clone(), rows.clone()).unwrap());
+            let placed = placed.unwrap();
+            placed.block_until_ready().unwrap();
+            assert_eq!(placed.mesh(), &destination_mesh);
+            assert_eq!(placed.sharding(), &rows);
+            assert_eq!(placed.layout(), Some(&column_major));
+
+            // Each rank prints the slice, the physical layout, and the dense row-major values of its shard, so that the
+            // values of both ranks are compared together.
+            let shards = placed
+                .addressable_shards()
+                .map(|shard| {
+                    let layout = shard.buffer().unwrap().specification().unwrap().layout;
+                    let column_major = layout == column_major.to_pjrt().unwrap();
+                    (
+                        shard.slice().to_vec(),
+                        column_major,
+                        values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            println!("probe: rank {rank} relayouts_cross_host_replica: {shards:?}");
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_relayouts_cross_host_replica_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_relayouts_cross_host_replica_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 relayouts_cross_host_replica: [([0..1, 0..3], true, [1.0, 2.0, 3.0])]
+                rank 1 relayouts_cross_host_replica: [([1..2, 0..3], true, [4.0, 5.0, 6.0])]"},
+        );
+    }
+
+    // Worker of `test_array_to_placement_agrees_on_strategy_on_two_cuda_processes`, which returns immediately unless that
+    // test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_agrees_on_strategy_cuda_process_helper() {
+        // Compilation artifact exchange that requires sharing every artifact with the other rank, so that neither rank
+        // can compile operations for its own shards. A placement that compiled anything would publish an artifact.
+        struct SharedCompilationExchange {
+            process_index: usize,
+        }
+
+        impl CompilationArtifactExchange for SharedCompilationExchange {
+            fn process_index(&self) -> usize {
+                self.process_index
+            }
+
+            fn process_count(&self) -> usize {
+                2
+            }
+
+            fn publish(&self, _: &[u8], _: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
+                panic!("a placement of whole shards must not compile a program");
+            }
+
+            fn receive(&self, _: &[u8], _: Duration) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
+                panic!("a placement of whole shards must not wait for a compiled program");
+            }
+        }
+
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let cache = CompilationCache::new().with_artifact_exchange(
+                Arc::new(SharedCompilationExchange { process_index: rank }),
+                CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(60) },
+            );
+            let session = Session::builder().client(client).compilation_cache(cache).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 2);
+            let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+            let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
+
+            // Rank 0 holds `[[1, 2, 3], [4, 5, 6]]` in a column-major buffer, which the type does not declare, so only
+            // rank 0 knows that its buffer is not in the row-major layout that the receive of rank 1 allocates. Rank 1
+            // only receives. Both ranks choose whole shards from the shared metadata, and rank 0, which cannot compile
+            // a conversion of its own, converts its buffer through host memory rather than switching to a compiled
+            // reshard that rank 1 would never join.
+            let buffers = if rank == 0 {
+                let device = client.addressable_devices().unwrap().remove(0);
+                let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
+                let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
+                let memory = device.default_memory().unwrap();
+                let buffer =
+                    client.buffer(values.as_slice(), BufferType::F32, [2u64, 3], None, memory, Some(column_major));
+                let buffer = buffer.unwrap();
+                assert_ne!(
+                    buffer.specification().unwrap().layout,
+                    Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])).to_pjrt().unwrap(),
+                );
+                vec![buffer]
+            } else {
+                Vec::new()
+            };
+            let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated.clone()).unwrap();
+            let source = Array::from_addressable_buffers(&session, r#type, source_mesh, None, buffers).unwrap();
+            let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated).unwrap();
+            let placed = source.to_placement(&session, target).unwrap();
+            placed.block_until_ready().unwrap();
+            assert_eq!(placed.mesh(), &destination_mesh);
+            assert_eq!(session.cached_program_count(), 0);
+            let shards =
+                placed.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+            if rank == 0 {
+                assert_eq!(shards.len(), 0);
+            } else {
+                assert_eq!(
+                    shards.iter().map(|bytes| values_from_bytes::<f32>(bytes)).collect::<Vec<_>>(),
+                    [vec![1., 2., 3., 4., 5., 6.]]
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_agrees_on_strategy_on_two_cuda_processes() {
+        run_cuda_rank_pair("distributed::tests::test_array_to_placement_agrees_on_strategy_cuda_process_helper");
+    }
+
+    // Worker of `test_array_to_placement_swaps_shards_into_memory_on_two_cuda_processes`, which returns immediately
+    // unless that test launched it as one of its two ranks. It swaps the halves of `[1, 2, 3, 4]` between the ranks
+    // into each memory and prints one `probe:` line per memory with the result.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_swaps_shards_into_memory_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let forward_mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+            let reversed_mesh = DeviceMesh::new(logical_mesh, vec![devices[1], devices[0]]).unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+            let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+            let source = Array::from_host_buffer(&session, r#type, forward_mesh, None, values).unwrap();
+
+            // Each rank sends its half to the other one and receives the other half into default device memory, which it
+            // then copies to the requested memory. Both ranks look up that memory before they issue any transfer, so a
+            // memory that a device lacks fails on both ranks alike, and every later swap still pairs its transfers. A
+            // swap that left a transfer unmatched would make the next swap between the same devices read stale halves.
+            for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
+                let target = ArrayPlacement::mesh(reversed_mesh.clone(), sharded.clone()).unwrap().with_memory(memory);
+                match source.to_placement(&session, target) {
+                    Ok(placed) => {
+                        let ready = match placed.block_until_ready() {
+                            Ok(()) => "ready".to_string(),
+                            Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+                        };
+                        let shards = placed
+                            .addressable_shards()
+                            .map(|shard| {
+                                let kind = shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned();
+                                (kind, values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
+                            })
+                            .collect::<Vec<_>>();
+                        println!("probe: rank {rank} {memory:?}: {shards:?} {ready}");
+                    }
+                    Err(error) => {
+                        println!("probe: rank {rank} {memory:?}: {}", error.to_string().lines().next().unwrap_or(""));
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_swaps_shards_into_memory_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_swaps_shards_into_memory_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {r#"
+                rank 0 Host { pinned: true }: [("pinned_host", [3.0, 4.0])] ready
+                rank 0 Host { pinned: false }: [("unpinned_host", [3.0, 4.0])] ready
+                rank 0 Device: [("device", [3.0, 4.0])] ready
+                rank 1 Host { pinned: true }: [("pinned_host", [1.0, 2.0])] ready
+                rank 1 Host { pinned: false }: [("unpinned_host", [1.0, 2.0])] ready
+                rank 1 Device: [("device", [1.0, 2.0])] ready"#},
+        );
+    }
+
+    // Worker of `test_array_to_placement_sends_from_host_memory_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_sends_from_host_memory_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+            let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+            let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
+
+            // Rank 0 only sends `[1, 2, 3, 4]` from host memory and rank 1 only receives it, into the same memory of
+            // its own device, because the destination keeps the memory of the source. The CUDA cross-host transfer
+            // reads a device buffer, so rank 0 stages its host buffer in device memory before it sends it.
+            for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
+                let r#type = ArrayType::new_static(DataType::F32, [4])
+                    .with_memory(memory)
+                    .with_sharding(replicated.clone())
+                    .unwrap();
+                let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+                let source = Array::from_host_buffer(&session, r#type, source_mesh.clone(), None, values).unwrap();
+                let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap();
+                probe_placement(rank, &format!("{memory:?}"), &session, &source, target);
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_sends_from_host_memory_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_sends_from_host_memory_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {r#"
+                rank 0 Host { pinned: true }: [] ready
+                rank 0 Host { pinned: false }: [] ready
+                rank 1 Host { pinned: true }: [("pinned_host", [1.0, 2.0, 3.0, 4.0])] ready
+                rank 1 Host { pinned: false }: [("unpinned_host", [1.0, 2.0, 3.0, 4.0])] ready"#},
+        );
+    }
+
+    // Worker of `test_array_to_placement_receives_into_memory_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_receives_into_memory_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+            let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+            let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
+            let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+            let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
+
+            // Rank 0 only sends and rank 1 only receives, into default device memory, and copies the received buffer to
+            // the requested memory only after it issued its receive. A memory that only the receiver checks therefore
+            // never leaves the sender waiting, and both ranks finish every placement. A placement that left a transfer
+            // unmatched would make the next one between the same devices read stale values.
+            for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
+                let target =
+                    ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap().with_memory(memory);
+                probe_placement(rank, &format!("{memory:?}"), &session, &source, target);
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_receives_into_memory_on_two_cuda_processes() {
+        let Some(outputs) =
+            run_cuda_rank_pair("distributed::tests::test_array_to_placement_receives_into_memory_cuda_process_helper")
+        else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {r#"
+                rank 0 Host { pinned: true }: [] ready
+                rank 0 Host { pinned: false }: [] ready
+                rank 0 Device: [] ready
+                rank 1 Host { pinned: true }: [("pinned_host", [1.0, 2.0, 3.0, 4.0])] ready
+                rank 1 Host { pinned: false }: [("unpinned_host", [1.0, 2.0, 3.0, 4.0])] ready
+                rank 1 Device: [("device", [1.0, 2.0, 3.0, 4.0])] ready"#},
+        );
+    }
+
+    // Worker of `test_array_to_placement_places_uncommitted_values_on_two_cuda_processes`, which returns immediately
+    // unless that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_places_uncommitted_values_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+            let sharded = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+            // Each rank uploads `[1, 2, 3, 4]` without a destination, so its array lives uncommitted on its own device,
+            // which the other rank does not know. Each rank places its own value on its own devices of the global mesh,
+            // and neither plans a transfer. The last placement copies `[5, 6, 7, 8]` from rank 0 to rank 1, which would
+            // receive the bytes of an earlier send that no receive matched.
+            let r#type = ArrayType::new_static(DataType::F32, [4]);
+            let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+            let source = Array::from_host_buffer(&session, r#type, None, None, values).unwrap();
+            assert!(!source.is_committed());
+            assert_eq!(source.mesh().devices(), [devices[rank]]);
+            for (name, sharding) in [("replicated", &replicated), ("sharded", &sharded)] {
+                let target = ArrayPlacement::mesh(mesh.clone(), sharding.clone()).unwrap();
+                probe_placement(rank, name, &session, &source, target);
+            }
+            let source_mesh = DeviceMesh::new(
+                LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+                vec![devices[0]],
+            )
+            .unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [4]);
+            let values = values_to_bytes(&[5f32, 6., 7., 8.]);
+            let committed = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
+            let target = ArrayPlacement::mesh(mesh, replicated).unwrap();
+            probe_placement(rank, "committed", &session, &committed, target);
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_places_uncommitted_values_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_places_uncommitted_values_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {r#"
+                rank 0 replicated: [("device", [1.0, 2.0, 3.0, 4.0])] ready
+                rank 0 sharded: [("device", [1.0, 2.0])] ready
+                rank 0 committed: [("device", [5.0, 6.0, 7.0, 8.0])] ready
+                rank 1 replicated: [("device", [1.0, 2.0, 3.0, 4.0])] ready
+                rank 1 sharded: [("device", [3.0, 4.0])] ready
+                rank 1 committed: [("device", [5.0, 6.0, 7.0, 8.0])] ready"#},
+        );
+    }
+
+    // Worker of `test_array_to_placement_agrees_on_mixed_layouts_on_two_cuda_processes`, which returns immediately
+    // unless that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_agrees_on_mixed_layouts_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = |size| LogicalMesh::new(vec![MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap()]);
+            let source_mesh = DeviceMesh::new(logical_mesh(1).unwrap(), vec![devices[0]]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh(2).unwrap(), devices.clone()).unwrap();
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+            let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+            let r#type = ArrayType::new_static(DataType::F32, [2, 3])
+                .with_layout(column_major.clone())
+                .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 2))
+                .unwrap();
+            let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
+            let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
+
+            // The implicit reshard of a compiled input copies the column-major replica of rank 0 to its own device and
+            // sends it to rank 1, which receives it in the default row-major layout. Both ranks record the layout that
+            // the moves of both ranks imply (i.e., none), rather than rank 0 keeping the declared layout of its copy,
+            // so both prepare the result for the compiled function below in the same way.
+            let moved = source.clone().reshard_on_devices(&session, &mesh, &replicated, false).unwrap();
+            moved.block_until_ready().unwrap();
+            let shards = moved
+                .addressable_shards()
+                .map(|shard| {
+                    let layout = shard.buffer().unwrap().specification().unwrap().layout;
+                    (
+                        layout == column_major.to_pjrt().unwrap(),
+                        values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            println!("probe: rank {rank} moved: {:?} {shards:?}", moved.layout());
+
+            // A compiled function on both devices takes the source, which it moves to its devices first, and the moved
+            // array, whose buffers differ in layout between the ranks.
+            let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated).unwrap();
+            let compiled =
+                crate::compile::<_, ArrayType, ArrayType>(|x| x.clone() + x, input_type, &session, mesh).unwrap();
+            for (name, input) in [("source", source), ("moved", moved)] {
+                let output = compiled.executable().execute(&session, input).unwrap();
+                output.block_until_ready().unwrap();
+                println!("probe: rank {rank} doubled {name}: {:?}", read_addressable_f32s(&output));
+            }
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_agrees_on_mixed_layouts_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_agrees_on_mixed_layouts_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 moved: None [(true, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+                rank 0 doubled source: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
+                rank 0 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
+                rank 1 moved: None [(false, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+                rank 1 doubled source: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
+                rank 1 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]"},
         );
     }
 }

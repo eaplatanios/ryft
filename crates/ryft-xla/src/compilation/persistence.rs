@@ -39,8 +39,8 @@ use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 /// Fixed header identifying the executable envelope.
 const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL01";
 
-/// Metadata schema emitted by executable serialization.
-const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 1;
+/// Metadata schema emitted by executable serialization. Version 2 added the commitment of every logical output.
+const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 2;
 
 /// Required features for reference states, dynamic extents, effects, and runtime contracts.
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
@@ -520,6 +520,7 @@ impl CompiledProgram {
                 .map(PersistentSharding::from)
                 .collect(),
             output_shardings: self.output_shardings().iter().map(PersistentSharding::from).collect(),
+            committed_outputs: self.committed_outputs().to_vec(),
             mesh: PersistentDeviceMesh::from(self.mesh()),
             device_kinds: self.device_kinds().to_vec(),
             kernel_execution_facts: self.kernel_execution_facts().map(<[u8]>::to_vec),
@@ -785,6 +786,11 @@ impl Session {
                 reason: "output shardings do not match the output types or the executable mesh".into(),
             }));
         }
+        if metadata.committed_outputs.len() != output_types.len() {
+            return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
+                reason: "output commitment metadata does not match the output count".into(),
+            }));
+        }
         let physical_input_count = signature.array_input_count();
         if expected_argument_shardings.len() != physical_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
@@ -912,6 +918,7 @@ impl Session {
             capture_count,
             expected_argument_shardings.into(),
             output_shardings.into(),
+            metadata.committed_outputs.into(),
             mesh,
             compilation_options,
             metadata.platform_name.into(),
@@ -988,6 +995,11 @@ struct PersistentExecutableMetadata {
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
+
+    /// Whether executions commit each logical output whatever the commitment of their inputs. Envelopes of earlier
+    /// schemas do not record it, so it defaults to empty, which lets them decode and be rejected by their version.
+    #[serde(default)]
+    committed_outputs: Vec<bool>,
 
     /// Concrete compilation and execution mesh.
     mesh: PersistentDeviceMesh,
@@ -1709,6 +1721,48 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_program_serialize_round_trips_committed_outputs() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let input_type = ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding.clone()).unwrap();
+        let input = Array::from_host_buffer(&session, input_type.clone(), None, None, values_to_bytes(&[1f32, 2., 3.]))
+            .unwrap();
+        assert!(!input.is_committed());
+        let restore = |options: Options| {
+            let staged = StagedFunction::<Session, Type, Type>::stage(
+                |_, _, input| Ok(input),
+                vec![],
+                Type::Array(input_type.clone()),
+                options,
+            )
+            .unwrap();
+            let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+            let bytes = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+            (compiled, session.deserialize_program(&bytes).unwrap().unwrap())
+        };
+
+        // A program that is deserialized on its own commits the outputs that the program that was serialized commits
+        // (i.e., every output of a function with an explicit output sharding), even for an uncommitted input.
+        let (compiled, restored) = restore(Options::new(mesh.clone()).with_output_shardings(vec![sharding]));
+        assert_eq!(compiled.compiled_program().committed_outputs(), &[true]);
+        assert_eq!(restored.committed_outputs(), &[true]);
+        let output = session.execute(&restored, vec![Value::Array(input.clone())]).unwrap().pop().unwrap();
+        let output = program_array(&output);
+        output.block_until_ready().unwrap();
+        assert!(output.is_committed());
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3.]);
+
+        // Without an explicit placement on a single device, the outputs follow the commitment of the inputs.
+        let (compiled, restored) = restore(Options::new(mesh));
+        assert_eq!(compiled.compiled_program().committed_outputs(), &[false]);
+        assert_eq!(restored.committed_outputs(), &[false]);
+        let output = session.execute(&restored, vec![Value::Array(input)]).unwrap().pop().unwrap();
+        assert!(!program_array(&output).is_committed());
+    }
+
+    #[test]
     fn test_compiled_program_serialize_round_trips_external_reference_state() {
         let client = cpu_client(1);
         // The corruptions below add unreduced placement to persisted shardings, which types and persisted reference
@@ -2212,6 +2266,7 @@ mod tests {
             capture_count: 0,
             expected_argument_shardings: Vec::new(),
             output_shardings: Vec::new(),
+            committed_outputs: Vec::new(),
             mesh: PersistentDeviceMesh {
                 logical_mesh: PersistentLogicalMesh { axes: Vec::new() },
                 devices: Vec::new(),

@@ -525,9 +525,10 @@ impl CompiledProgram {
 
     /// Creates a compiled program from an `executable` that was loaded from its serialized form and from the
     /// invocation contract that was persisted with it. Which outputs executions always commit is a property of the
-    /// lowering that a program serves rather than of its executable (refer to [`Self::committed_outputs`]), so it is
-    /// not persisted, and the result commits no output by itself until it is rebound to a lowering (refer to
-    /// [`Self::rebound_to`]).
+    /// lowering that a program serves rather than of its executable (refer to [`Self::committed_outputs`]), so the
+    /// persisted flags are those of the lowering that the serialized program served. A program that is executed on its
+    /// own keeps that commitment contract, and a program that the compilation cache reuses for another lowering takes
+    /// the flags of that lowering instead (refer to [`Self::rebound_to`]).
     ///
     /// # Parameters
     ///
@@ -543,6 +544,7 @@ impl CompiledProgram {
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
     ///   - `expected_argument_shardings`: Sharding that each physical argument must have at the call boundary.
     ///   - `output_shardings`: Resolved sharding of each output.
+    ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
     ///   - `mesh`: Device mesh that the program executes on.
     ///   - `compilation_options`: Options that the executable was compiled with.
     ///   - `platform_name`: Name of the platform that compiled the executable.
@@ -567,6 +569,7 @@ impl CompiledProgram {
         capture_count: usize,
         expected_argument_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
+        committed_outputs: Arc<[bool]>,
         mesh: DeviceMesh,
         compilation_options: CompilationOptions,
         platform_name: Arc<str>,
@@ -590,8 +593,8 @@ impl CompiledProgram {
             donation_flags,
             capture_count,
             expected_argument_shardings,
-            committed_outputs: vec![false; output_shardings.len()].into(),
             output_shardings,
+            committed_outputs,
             mesh,
             compilation_options,
             platform_name,
@@ -886,6 +889,14 @@ pub(super) struct InvocationMetadata<'o> {
     /// Effective sharding of every physical executable argument, including materialized captures first.
     expected_argument_shardings: &'o [Sharding],
 
+    /// Runtime placement of every logical output, including the hidden final reference states.
+    output_shardings: &'o [Sharding],
+
+    /// Whether the compiler chooses the placement of each logical output over auto mesh axes, which only a lowering
+    /// records (refer to [`LoweredProgram::open_outputs`]). A compiled program records the placement that the compiler
+    /// chose instead, so it has [`None`] here.
+    open_outputs: Option<&'o [bool]>,
+
     /// Concrete device mesh used for compilation and execution.
     mesh: &'o DeviceMesh,
 
@@ -897,7 +908,12 @@ pub(super) struct InvocationMetadata<'o> {
 }
 
 impl InvocationMetadata<'_> {
-    /// Returns the first field of the invocation metadata on which the two programs disagree, if any.
+    /// Returns the first field of the invocation metadata on which the two programs disagree, if any. Output placements
+    /// are compared for the outputs that neither program leaves to the compiler, because the placement of an open
+    /// output is only known once the compiler has chosen it, and they are not compared when neither program is a
+    /// lowering, because a compiled program does not record which of its outputs were open. Output types do not record
+    /// placements along auto mesh axes, so this comparison is what distinguishes executables that place an output
+    /// along different auto axes of the same size, whose buffers have the same shapes.
     pub(super) fn incompatible_field(self, other: Self) -> Option<&'static str> {
         // Structurally equal boundary types have equal canonical encodings, so only unequal ones pay for encoding both.
         let equal_boundary_types = self.input_types == other.input_types && self.output_types == other.output_types;
@@ -920,6 +936,8 @@ impl InvocationMetadata<'_> {
             Some("capture count")
         } else if self.expected_argument_shardings != other.expected_argument_shardings {
             Some("argument shardings")
+        } else if !self.has_compatible_output_shardings(other) {
+            Some("output shardings")
         } else if self.mesh != other.mesh {
             Some("device mesh")
         } else if self.kernel_execution_facts != other.kernel_execution_facts {
@@ -929,6 +947,25 @@ impl InvocationMetadata<'_> {
         } else {
             None
         }
+    }
+
+    /// Returns whether the two programs place the outputs that neither of them leaves open the same way, as
+    /// [`Self::incompatible_field`] describes.
+    fn has_compatible_output_shardings(self, other: Self) -> bool {
+        if self.open_outputs.is_none() && other.open_outputs.is_none() {
+            return true;
+        }
+        let is_open = |open_outputs: Option<&[bool]>, index: usize| {
+            open_outputs.is_some_and(|open_outputs| open_outputs.get(index).copied().unwrap_or(false))
+        };
+        self.output_shardings.len() == other.output_shardings.len()
+            && self.output_shardings.iter().zip(other.output_shardings).enumerate().all(
+                |(index, (sharding, other_sharding))| {
+                    is_open(self.open_outputs, index)
+                        || is_open(other.open_outputs, index)
+                        || sharding == other_sharding
+                },
+            )
     }
 
     /// Validates that `replacement` preserves this program's complete invocation contract, naming the first
@@ -955,6 +992,8 @@ impl<'o> From<&'o CompiledProgram> for InvocationMetadata<'o> {
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
+            output_shardings: &program.output_shardings,
+            open_outputs: None,
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
             kernel_execution_facts: program.kernel_execution_facts.as_deref(),
@@ -974,6 +1013,8 @@ impl<'o> From<&'o LoweredProgram> for InvocationMetadata<'o> {
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
+            output_shardings: &program.output_shardings,
+            open_outputs: Some(&program.open_outputs),
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
             kernel_execution_facts: program.kernel_execution_facts.as_deref(),
@@ -1045,6 +1086,8 @@ mod tests {
             donation_flags: &[false],
             capture_count: 0,
             expected_argument_shardings: &[],
+            output_shardings: &[],
+            open_outputs: None,
             mesh: &mesh,
             requires_assertion_handler: false,
             kernel_execution_facts: None,
@@ -1069,6 +1112,25 @@ mod tests {
             current.incompatible_field(InvocationMetadata { mesh: &other_mesh, ..current }),
             Some("device mesh")
         );
+
+        // Output placements are compared for the outputs that a lowering leaves closed, because a compiled program
+        // records the placement that the compiler chose for an open output and does not record which outputs were open.
+        let other_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let lowered = InvocationMetadata {
+            output_shardings: std::slice::from_ref(&sharding),
+            open_outputs: Some(&[false]),
+            ..current
+        };
+        let compiled = InvocationMetadata {
+            output_shardings: std::slice::from_ref(&other_sharding),
+            open_outputs: None,
+            ..current
+        };
+        assert_eq!(lowered.incompatible_field(lowered), None);
+        assert_eq!(lowered.incompatible_field(compiled), Some("output shardings"));
+        assert_eq!(compiled.incompatible_field(lowered), Some("output shardings"));
+        assert_eq!(InvocationMetadata { open_outputs: Some(&[true]), ..lowered }.incompatible_field(compiled), None);
+        assert_eq!(compiled.incompatible_field(InvocationMetadata { open_outputs: None, ..lowered }), None);
     }
 
     #[test]
@@ -1086,6 +1148,8 @@ mod tests {
             donation_flags: &[false],
             capture_count: 0,
             expected_argument_shardings: &[],
+            output_shardings: &[],
+            open_outputs: None,
             mesh: &mesh,
             requires_assertion_handler: false,
             kernel_execution_facts: None,

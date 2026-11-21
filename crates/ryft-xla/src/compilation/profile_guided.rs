@@ -517,9 +517,10 @@ where
         let session = &self.inner.session;
         let program = session.compilation_cache().compile(session, &lowered_program)?;
 
-        // A program from the cache may have been compiled for another lowering with the same key and profile, or
-        // restored from its persisted form, which records neither the boundary identities nor the committed outputs of
-        // this lowering, so it takes them from this lowering, as `CompilationDomain::compile` does for every request.
+        // A program from the cache may have been compiled, or persisted and restored, for another lowering with the
+        // same key and profile. Its persisted form records the committed outputs of that lowering, which can differ
+        // from those that this lowering requests, and its boundary types have the dimension variable identities of
+        // that lowering, so it takes both from this lowering, as `CompilationDomain::compile` does for every request.
         let program = CompiledProgram::rebound_to(program, &lowered_program);
         session.replace_executable_program(&self.inner.baseline, program)
     }
