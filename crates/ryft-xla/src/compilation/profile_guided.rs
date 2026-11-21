@@ -17,7 +17,7 @@ use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 use crate::compilation::CompilationError;
 use crate::compilation::functions::ExecutableFunction;
 use crate::compilation::options::{FeedbackDirectedProfile, Options};
-use crate::compilation::programs::LoweredProgram;
+use crate::compilation::programs::{CompiledProgram, LoweredProgram};
 use crate::{Array, Constant, Error, Session, Type, Value};
 
 /// Namespace of the auxiliary disk cache entries that persist aggregated adaptive profiles.
@@ -516,6 +516,11 @@ where
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let session = &self.inner.session;
         let program = session.compilation_cache().compile(session, &lowered_program)?;
+
+        // A program from the cache may have been compiled for another lowering with the same key and profile, or
+        // restored from its persisted form, which records neither the boundary identities nor the committed outputs of
+        // this lowering, so it takes them from this lowering, as `CompilationDomain::compile` does for every request.
+        let program = CompiledProgram::rebound_to(program, &lowered_program);
         session.replace_executable_program(&self.inner.baseline, program)
     }
 

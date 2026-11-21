@@ -12,7 +12,7 @@ use ryft_pjrt::{
     ExecutionFence,
 };
 
-use crate::arrays::host::{PendingHostUpload, SharedHostBytes, run_host_uploads};
+use crate::arrays::host::{HostBufferSlice, PendingHostUpload, run_host_uploads};
 use crate::arrays::placement::ArrayPlacement;
 use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError};
@@ -75,12 +75,15 @@ impl Array {
     /// needs live on a remote process or because the source varies along manual mesh axes, the original error of the
     /// device work is propagated as the most informative diagnostic.
     ///
-    /// The destination uses the requested [`Memory`], or the source memory if omitted. PJRT cross-host receives land
-    /// in device memory and can then be copied to the requested memory on that device. An explicit [`Layout`] applies
-    /// to each destination shard, and a source with a known layout keeps it when the layout is omitted. Layout changes
-    /// use a compiled conversion on each shard's device when supported. Otherwise, each affected local shard is read
-    /// back and uploaded in the requested layout on a background thread, as for the host fallback, and this call only
-    /// blocks on the readback when the PJRT plugin lacks host to device transfer managers or their literal transfers.
+    /// The destination uses the requested [`Memory`]. When the memory is omitted, a destination that names a single
+    /// device (i.e., [`ArrayPlacementTarget::Device`](crate::ArrayPlacementTarget::Device)) uses the default memory of
+    /// that device, as `jax.device_put(x, device)` does, and a mesh or sharding destination keeps the memory of the
+    /// source. PJRT cross-host receives land in device memory and can then be copied to the requested memory on that
+    /// device. An explicit [`Layout`] applies to each destination shard, and a source with a known layout keeps it
+    /// when the layout is omitted. Layout changes use a compiled conversion on each shard's device when supported.
+    /// Otherwise, each affected local shard is read back and uploaded in the requested layout on a background thread,
+    /// as for the host fallback, and this call only blocks on the readback when the PJRT plugin lacks host to device
+    /// transfer managers or their literal transfers.
     /// Both paths preserve the separate contributions along unreduced axes.
     ///
     /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
@@ -285,15 +288,16 @@ impl Array {
     /// compiled conversion on the device and can fall back to a host round trip for that shard. Once a buffer has the
     /// requested layout, it can be reused or copied directly to the requested memory.
     ///
-    /// The host round trips of all shards share one job on the background upload workers of `session`, which reads
-    /// each shard back and uploads it into a destination buffer that this function creates up front, so this function
-    /// returns without waiting for them. A failed readback or upload poisons the destination buffers that have not
-    /// received their bytes, so the readiness functions and readbacks of the result and [`Session::synchronize`]
-    /// report it. The execution fence of the result joins the fences of this array with the readiness of every buffer
-    /// that this function creates (i.e., the copies to another memory and the buffers of host round trips) and with the
-    /// fences of the compiled conversions, because a readback reads only one replica of each tile and would otherwise
-    /// succeed with a replica that did not fail. This function blocks on the readback of a shard only when the PJRT
-    /// plugin lacks host to device transfer managers or their literal transfers.
+    /// The host round trip of each shard is its own job on the background upload workers of `session`, which reads the
+    /// shard back once its source buffer is ready and uploads it into a destination buffer that this function creates
+    /// up front, so this function returns without waiting for them, and the round trip of one shard never waits for
+    /// the source of another. A failed readback or upload poisons the destination buffer of its shard, so the
+    /// readiness functions and readbacks of the result and [`Session::synchronize`] report it. The execution fence of
+    /// the result joins the fences of this array with the readiness of every buffer that this function creates (i.e.,
+    /// the copies to another memory and the buffers of host round trips) and with the fences of the compiled
+    /// conversions, because a readback reads only one replica of each tile and would otherwise succeed with a replica
+    /// that did not fail. This function blocks on the readback of a shard only when the PJRT plugin lacks host to
+    /// device transfer managers or their literal transfers.
     fn place_storage(self, session: &Session, memory: Memory, layout: Option<Layout>) -> Result<Self, Error> {
         let layout = layout.or_else(|| self.layout().cloned());
         if self.r#type().memory() == memory && self.layout() == layout.as_ref() {
@@ -318,8 +322,6 @@ impl Array {
             let mut work = session.reserve_work();
             let mut buffers = Vec::new();
             let mut uploads = Vec::new();
-            let mut upload_sources = Vec::new();
-            let mut upload_buffers = Vec::new();
             for shard in source.addressable_shards() {
                 let source_buffer = shard.buffer().unwrap();
                 let device = source_buffer.device()?;
@@ -384,9 +386,7 @@ impl Array {
                 )?;
                 if let Some((upload, placed)) = destination {
                     let placed = Arc::new(placed);
-                    uploads.push(upload);
-                    upload_sources.push((Arc::clone(source_buffer), shape));
-                    upload_buffers.push(Arc::clone(&placed));
+                    uploads.push((upload, Arc::clone(source_buffer), shape, Arc::clone(&placed)));
                     buffers.push(placed);
                     continue;
                 }
@@ -403,35 +403,33 @@ impl Array {
                 completion.track_buffer(&placed)?;
                 buffers.push(Arc::new(placed));
             }
-            if !uploads.is_empty() {
-                // The background job owns its own handles of the source buffers, so they stay alive until it has
-                // read them back even if the source array is dropped first. It is handed over before anything observes
-                // the destination buffers that it fills, because nothing else can complete them, and observing them
-                // can wait for them (e.g., a fence built from their events awaits an event whose callback PJRT fails to
-                // register). Their readiness joins the reservation and the result only once the job has been handed
-                // over. Each shard is read back from its own device, because devices can hold different values for
-                // the same slice (e.g., the contributions along unreduced axes), so no two shards share host bytes.
-                // The job waits for the source buffers before it occupies a worker, because their readbacks wait for
-                // nothing else.
-                let source_events =
-                    upload_sources.iter().map(|(source_buffer, _)| source_buffer.ready()).collect::<Result<_, _>>()?;
-                session.host_upload_workers().submit(ExecutionFence::new(source_events), move || {
+            // Each shard is read back from its own device, because devices can hold different values for the same slice
+            // (e.g., the contributions along unreduced axes), so no two shards share host bytes. The relayouts of the
+            // shards are therefore independent, and each is its own background job, which waits only for its own
+            // source buffer before it occupies a worker, because its readback waits for nothing else. The relayout of
+            // one shard thus never waits for the source of another (e.g., for a source that a producer fills only once
+            // the relayout of another shard is ready), and the fence of the result joins all of them. Each job owns its
+            // own handle of its source buffer, so that buffer stays alive until the job has read it back even if the
+            // source array is dropped first. A job is handed over before anything observes the destination buffer that
+            // it fills, because nothing else can complete that buffer, and observing it can wait for it (e.g., a fence
+            // built from its event awaits an event whose callback PJRT fails to register). Its readiness joins the
+            // reservation and the result only once the job has been handed over. If a job cannot be handed over, the
+            // reservation keeps the buffers of the jobs before it, and dropping the remaining transfer managers poisons
+            // the buffers that they would have filled.
+            for (upload, source_buffer, shape, placed) in uploads {
+                let sources = ExecutionFence::new(vec![source_buffer.ready()?]);
+                session.host_upload_workers().submit(sources, move || {
                     run_host_uploads(
-                        uploads,
-                        |index| {
-                            let (source_buffer, shape) = &upload_sources[index];
-                            read_shard_to_host(source_buffer, shape, Event::r#await).map(SharedHostBytes::from)
-                        },
+                        vec![upload],
+                        |_| read_shard_to_host(&source_buffer, &shape, Event::r#await).map(HostBufferSlice::from),
                         |error| match error {
                             Error::Pjrt(error) => error,
                             error => PjrtError::internal(error.to_string()),
                         },
                     )
                 })?;
-                for buffer in &upload_buffers {
-                    work.track_buffer(buffer);
-                    completion.track_buffer(buffer)?;
-                }
+                work.track_buffer(&placed);
+                completion.track_buffer(&placed)?;
             }
             Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, buffers, false)?
         };
@@ -2042,6 +2040,8 @@ fn preferred_source_shard<'o>(source_shards: &[&'o ArrayShard], destination_shar
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     use indoc::indoc;
@@ -2524,6 +2524,26 @@ mod tests {
     }
 
     #[test]
+    fn test_array_to_placement_splits_boolean_values_into_unreduced_summands() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::Boolean, [2]);
+        let value = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated), [1u8, 0]).unwrap();
+
+        // Boolean summands combine with logical or, so the device away from coordinate zero along `x` holds `false`.
+        let summands = value.to_placement(&session, ArrayPlacement::mesh(mesh, unreduced.clone()).unwrap()).unwrap();
+        assert_eq!(summands.sharding(), &unreduced);
+        assert_eq!(
+            summands.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
+            vec![vec![1, 0], vec![0, 0]],
+        );
+        assert_eq!(summands.copy_to_host_bytes().unwrap(), vec![1, 0]);
+    }
+
+    #[test]
     fn test_array_to_placement_preserves_host_memory() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -2879,19 +2899,19 @@ mod tests {
             .to_placement(&session, ArrayPlacement::mesh(mesh, sharding).unwrap().with_layout(layout))
             .unwrap();
 
-        // The readback of the first shard fails, which poisons both destination buffers with its error.
+        // The readback of the first shard fails, which poisons its destination buffer with its error, while the
+        // independent relayout of the second shard completes. The result reports the failure through its fence.
         managers[0].set_error(0, PjrtError::aborted("source upload failed")).unwrap();
         managers[1]
             .transfer_data(0, Arc::new(values_to_bytes(&[5f32, 6., 7., 8.])), 0, true)
             .unwrap()
             .r#await()
             .unwrap();
-        for shard in placed.addressable_shards() {
-            assert!(matches!(
-                shard.buffer().unwrap().ready().unwrap().r#await(),
-                Err(PjrtError::Aborted { message, .. }) if message == "source upload failed",
-            ));
-        }
+        assert!(matches!(
+            placed.shards()[0].buffer().unwrap().ready().unwrap().r#await(),
+            Err(PjrtError::Aborted { message, .. }) if message == "source upload failed",
+        ));
+        assert_eq!(values_from_bytes::<f32>(&placed.shards()[1].copy_to_host_bytes().unwrap()), [5., 6., 7., 8.]);
         assert!(matches!(
             placed.block_until_ready(),
             Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "source upload failed",
@@ -2955,6 +2975,64 @@ mod tests {
                         if message == "second replica failed"),
             ));
         }
+    }
+
+    #[test]
+    fn test_array_to_placement_relayouts_shards_through_host_in_background_independently() {
+        let client = cpu_client(2);
+        let session = peer_exchange_session(client);
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let managers = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| {
+                let specification = BufferSpecification::new(BufferType::F32, [2u64, 2]);
+                client
+                    .host_to_device_transfer_manager(vec![specification], device.default_memory().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let buffers = managers.iter().map(|manager| manager.retrieve_buffer(0).unwrap()).collect();
+        let r#type = ArrayType::new_static(DataType::F32, [4, 2]);
+        let source =
+            Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding.clone()), buffers).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let placed = source
+            .to_placement(&session, ArrayPlacement::mesh(mesh, sharding).unwrap().with_layout(layout))
+            .unwrap();
+
+        // The relayout of the first shard completes while the source of the second one is still pending, so that a
+        // producer of that source may depend on the first destination shard.
+        let (sender, receiver) = mpsc::channel();
+        let first_shard_ready = placed.shards()[0].buffer().unwrap().ready().unwrap();
+        thread::spawn(move || sender.send(first_shard_ready.r#await()).unwrap());
+        managers[0]
+            .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(60)), Ok(Ok(())));
+        assert_eq!(placed.execution_fence().unwrap().is_ready(), Ok(false));
+
+        // The result still joins the relayout of the second shard, and with it the failure of its source.
+        managers[1].set_error(0, PjrtError::aborted("second source failed")).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&placed.shards()[0].copy_to_host_bytes().unwrap()), [1., 2., 3., 4.]);
+        assert!(matches!(
+            placed.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second source failed",
+        ));
+        assert!(matches!(
+            session.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(_, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "second source failed"),
+        ));
     }
 
     #[test]

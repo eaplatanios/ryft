@@ -1475,6 +1475,30 @@ where
     })
 }
 
+/// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
+/// through a `place` with a target or a `constrain_sharding`, whether or not that value reaches a result. These are the
+/// analogues of the `device_put` and `with_sharding_constraint` calls that make JAX commit every output of a `jit`
+/// function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). A `place` without a target leaves its input
+/// where it is, so it requests nothing. A `reshard` is not counted, because JAX does not count its own `reshard` among
+/// these requests either.
+pub(crate) fn has_placement_requests<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+) -> bool
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    program.entry_region_ref().computation_regions().any(|region| {
+        region.instructions().iter().any(|instruction| {
+            let operation = instruction.operation();
+            operation
+                .projected_payload::<PlaceOperation>()
+                .is_some_and(|operation| operation.target().is_some())
+                || operation.projected_payload::<ConstrainShardingOperation>().is_some()
+        })
+    })
+}
+
 /// Placement that the entry region of a program gives one of its results, as [`entry_result_placements`] returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum EntryResultPlacement {
@@ -1551,22 +1575,22 @@ where
 /// shardings of results with this function, so that an exported module places its results as the executable that a
 /// session compiles for it does.
 ///
-/// An override, a `place` target, or an argument placement may leave dimensions unconstrained, but the runtime
-/// placement of an array reads such a dimension as replicated, and the result type records it exactly, so it cannot
-/// record the placement that the compiler would choose for it. These dimensions are therefore replicated here, so that
-/// the executable returns the buffers that the runtime placement of the result describes, while the dimensions that
-/// they constrain keep their placement. Unconstrained dimensions of result types are kept, because such results leave
-/// their whole placement to the compiler. Provided overrides are not checked against `output_types`, so that a count
-/// mismatch is still reported when the module is lowered.
+/// An override, a `place` target, an argument placement, or a result type may leave dimensions unconstrained, but the
+/// runtime placement of an array reads such a dimension as replicated, and the result type records it exactly, so it
+/// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here,
+/// whatever operation produces the result (e.g., arithmetic whose result type inherits an unconstrained dimension from
+/// the target of a `place` that precedes it), so that the executable returns the buffers that the runtime placement of
+/// the result describes, while the dimensions that they constrain keep their placement. Provided overrides are not
+/// checked against `output_types`, so that a count mismatch is still reported when the module is lowered.
 pub(crate) fn entry_result_shardings(
     output_types: &[ArrayType],
     result_shardings: Option<&[Sharding]>,
     placements: &[Option<EntryResultPlacement>],
     argument_shardings: &[Option<Sharding>],
 ) -> Result<Vec<Option<Sharding>>, Error> {
-    let closed = |sharding: &Sharding| -> Result<Option<Sharding>, Error> {
+    let closed = |sharding: &Sharding| -> Result<Sharding, Error> {
         if !sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
-            return Ok(Some(sharding.clone()));
+            return Ok(sharding.clone());
         }
         let dimensions = sharding
             .dimensions()
@@ -1576,10 +1600,10 @@ pub(crate) fn entry_result_shardings(
                 dimension => dimension.clone(),
             })
             .collect();
-        Ok(Some(sharding.with_dimensions(dimensions)?))
+        Ok(sharding.with_dimensions(dimensions)?)
     };
     match result_shardings {
-        Some(shardings) => shardings.iter().map(closed).collect(),
+        Some(shardings) => shardings.iter().map(|sharding| closed(sharding).map(Some)).collect(),
         None => output_types
             .iter()
             .zip(placements)
@@ -1591,10 +1615,7 @@ pub(crate) fn entry_result_shardings(
                     }
                     None => None,
                 };
-                match placement {
-                    Some(sharding) => closed(sharding),
-                    None => Ok(output_type.sharding().cloned()),
-                }
+                placement.or(output_type.sharding()).map(closed).transpose()
             })
             .collect(),
     }

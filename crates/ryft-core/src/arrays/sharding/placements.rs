@@ -65,6 +65,23 @@ impl Placement {
         Ok(Self { mesh, sharding, layout: None, memory: None, batch_shardings: Vec::new() })
     }
 
+    /// Returns this [`Placement`] with its sharding replaced by `sharding`, keeping its mesh, [`Layout`], [`Memory`],
+    /// and recorded batch shardings (refer to [`Self::batch_shardings`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::MeshMismatch`] if the logical mesh of `sharding` does not have the same topology as the
+    /// logical mesh of [`Self::mesh`], and the errors of [`Self::with_batch_sharding`] if a recorded batch sharding
+    /// cannot be put back into `sharding` (e.g., because `sharding` already uses one of its axes).
+    pub fn with_sharding(mut self, sharding: Sharding) -> Result<Self, ShardingError> {
+        check_sharding!(self.mesh, sharding);
+        if !self.batch_shardings.is_empty() {
+            sharding.with_dimensions(sharding.dimensions().iter().chain(&self.batch_shardings).cloned().collect())?;
+        }
+        self.sharding = sharding;
+        Ok(self)
+    }
+
     /// Returns this [`Placement`] with its storage [`Layout`] set to `layout`.
     #[inline]
     pub fn with_layout(mut self, layout: Layout) -> Self {
@@ -72,10 +89,24 @@ impl Placement {
         self
     }
 
+    /// Returns this [`Placement`] without a storage [`Layout`], keeping everything else.
+    #[inline]
+    pub fn without_layout(mut self) -> Self {
+        self.layout = None;
+        self
+    }
+
     /// Returns this [`Placement`] with its [`Memory`] space set to `memory`.
     #[inline]
     pub fn with_memory(mut self, memory: Memory) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Returns this [`Placement`] without a [`Memory`] space, keeping everything else.
+    #[inline]
+    pub fn without_memory(mut self) -> Self {
+        self.memory = None;
         self
     }
 
@@ -227,6 +258,48 @@ mod tests {
     }
 
     #[test]
+    fn test_placement_with_sharding() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = (0..4).map(|id| Device::new(id, 0)).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let split = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let placement = Placement::new(mesh.clone(), replicated)
+            .unwrap()
+            .with_layout(layout.clone())
+            .with_memory(Memory::Host { pinned: true })
+            .with_batch_sharding(ShardingDimension::sharded(["x"]))
+            .unwrap();
+
+        // Only the sharding changes, so the layout, the memory, and the recorded batch shardings are kept.
+        let placed = placement.clone().with_sharding(split.clone()).unwrap();
+        assert_eq!(placed.mesh(), &mesh);
+        assert_eq!(placed.sharding(), &split);
+        assert_eq!(placed.layout(), Some(&layout));
+        assert_eq!(placed.memory(), Some(Memory::Host { pinned: true }));
+        assert_eq!(placed.batch_shardings(), &[ShardingDimension::sharded(["x"])]);
+
+        // A sharding that uses the axis of a recorded batch sharding could not have that batch put back.
+        let conflicting = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(
+            placement.clone().with_sharding(conflicting),
+            Err(ShardingError::DuplicateMeshAxisName { name: "x".to_string() }),
+        );
+
+        // A sharding over a mesh with a different topology is rejected.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            placement.with_sharding(Sharding::replicated(other_mesh.clone(), 1)),
+            Err(ShardingError::MeshMismatch { expected: mesh.logical_mesh().clone(), actual: other_mesh }),
+        );
+    }
+
+    #[test]
     fn test_placement_with_layout() {
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
@@ -243,6 +316,21 @@ mod tests {
     }
 
     #[test]
+    fn test_placement_without_layout() {
+        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true })
+            .with_batch_sharding(ShardingDimension::Replicated)
+            .unwrap();
+
+        // Only the layout is dropped, so the memory and the recorded batch shardings are kept.
+        assert_eq!(placement.clone().with_layout(layout).without_layout(), placement);
+        assert_eq!(placement.clone().without_layout(), placement);
+    }
+
+    #[test]
     fn test_placement_with_memory() {
         let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
         let placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -251,6 +339,21 @@ mod tests {
         assert_eq!(placement.layout(), None);
         assert_eq!(placement.memory(), Some(Memory::Host { pinned: true }));
         assert_eq!(placement.to_string(), "{mesh<[]>, devices=[3], sharding={mesh<[]>, []}, memory=Host[Pinned]}");
+    }
+
+    #[test]
+    fn test_placement_without_memory() {
+        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(3, 1)]).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap()
+            .with_layout(layout)
+            .with_batch_sharding(ShardingDimension::Replicated)
+            .unwrap();
+
+        // Only the memory is dropped, so the layout and the recorded batch shardings are kept.
+        assert_eq!(placement.clone().with_memory(Memory::Device).without_memory(), placement);
+        assert_eq!(placement.clone().without_memory(), placement);
     }
 
     #[test]

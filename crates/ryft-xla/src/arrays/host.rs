@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::panic::AssertUnwindSafe;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use ryft_core::{Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Sharding, Typed, UnreducedKind};
+use ryft_core::{
+    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Or, Sharding, Typed, UnreducedKind,
+};
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
     ExecutionFence, HostBuffer, HostDestination, HostToDeviceTransferManager, Memory as PjrtMemory,
@@ -45,14 +47,14 @@ impl Array {
     /// value, so the devices at coordinate zero along every unreduced axis receive their shards of the host value and
     /// the others receive the additive identity of its data type. That identity is negative zero for the floating
     /// point and complex types that have signed zeros, because adding positive zero would turn a negative zero into a
-    /// positive one, and plain zero for the integer types and for the floating point types with a single zero. A data
-    /// type without an additive identity (i.e., [`DataType::Boolean`], which does not support addition, and
-    /// [`DataType::F8E8M0FNU`], whose every encoding is a nonzero number) cannot be split into summands, so it is
-    /// rejected before anything is uploaded whenever a device away from coordinate zero would receive a non-empty
-    /// shard. It is accepted when every unreduced axis has size one or when those shards are empty (e.g., for an
-    /// array without elements), because no identity is written then. With kind [`UnreducedKind::Max`] or
-    /// [`UnreducedKind::Min`], every device receives its shard of the host value, which is its own
-    /// extremum for every data type.
+    /// positive one, and plain zero for the integer types and for the floating point types with a single zero. The
+    /// summands of [`DataType::Boolean`] values combine with logical or (refer to [`Self::copy_to_host_bytes`]), so
+    /// their identity is `false`. A data type without an additive identity (i.e., [`DataType::F8E8M0FNU`], whose every
+    /// encoding is a nonzero number) cannot be split into summands, so it is rejected before anything is uploaded
+    /// whenever a device away from coordinate zero would receive a non-empty shard. It is accepted when every
+    /// unreduced axis has size one or when those shards are empty (e.g., for an array without elements), because no
+    /// identity is written then. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`], every device receives
+    /// its shard of the host value, which is its own extremum for every data type.
     ///
     /// # Parameters
     ///
@@ -96,8 +98,8 @@ impl Array {
             // default memory and could silently mislabel a host-resident array as pinned or unpinned memory.
             let memory = shard.device.memory(r#type.memory())?;
             let dimensions = shard.dimensions.as_slice();
-            let uploaded = match shard.bytes {
-                HostShardBytes::AdditiveIdentity { element, count } => {
+            let uploaded = match shard.source {
+                HostShardSource::AdditiveIdentity { element, count } => {
                     // The shards that hold an identity of the same size share one host allocation, which PJRT retains
                     // until it has read it, instead of each holding a copy of their own.
                     let identity = match identities.iter().find(|(identity_count, _)| *identity_count == count) {
@@ -110,7 +112,7 @@ impl Array {
                     };
                     client.buffer(identity, buffer_type, dimensions, None, memory, device_layout.clone())?
                 }
-                HostShardBytes::Window { window, byte_strides } => client.buffer(
+                HostShardSource::Window { window, byte_strides } => client.buffer(
                     &buffer[window],
                     buffer_type,
                     dimensions,
@@ -210,7 +212,7 @@ impl Array {
             };
             pending_uploads.push(upload);
             buffers.push(buffer);
-            shards.push((shard.dimensions, shard.bytes));
+            shards.push((shard.dimensions, shard.source));
         }
         let (r#type, sharding, mesh, byte_count) = (uploads.r#type, uploads.sharding, uploads.mesh, uploads.byte_count);
 
@@ -383,11 +385,15 @@ impl Array {
     /// it also surfaces the errors of that execution.
     ///
     /// When each tile occupies a contiguous byte range of the dense array, one replica of each tile is copied
-    /// directly into the destination. Otherwise, the shard copies are merged on the host. When the [`Sharding`] has
-    /// unreduced axes, every shard that this process holds is copied and the separate per-device values (e.g.,
+    /// directly into the destination. Otherwise, the shard copies are merged on the host. When the [`Sharding`]
+    /// has unreduced axes, every shard that this process holds is copied and the separate per-device values (e.g.,
     /// summands) are combined with the [`UnreducedKind`] of the sharding, counting the replicas of each value
-    /// once. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes and issue no copies. Use
-    /// [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device holds.
+    /// once. The values of each tile are combined in ascending order of their coordinates along the unreduced axes,
+    /// irrespective of which replicas this process holds, so every process that holds the whole value reads back the
+    /// same bytes. Sums of [`DataType::Boolean`] values combine with logical or. Tiles without elements contribute
+    /// nothing, so they need no replica in this process. Arrays with no elements and [`DataType::Zero`] arrays produce
+    /// no bytes and issue no copies. Use [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device
+    /// holds.
     ///
     /// # Errors
     ///
@@ -431,75 +437,53 @@ impl Array {
         let unreduced_axis_indices = self.unreduced_axis_indices();
 
         // Select the shards to copy before issuing any copy, so that no copy is in flight when the selection fails.
-        let shards = self.readback_shards(unreduced_axis_indices.as_slice())?;
-
+        // The checked global byte count bounds the global strides.
+        let (shards, contiguous_tiles) = self.host_readback_shards(unreduced_axis_indices.as_slice())?;
+        let global_strides = row_major_element_strides(global_shape.as_slice(), element_type)?;
         let mut work = self.session().reserve_work();
-        let compute_global_strides = || row_major_element_strides(global_shape.as_slice(), element_type);
-        let direct_copy_strides =
-            if unreduced_axis_indices.is_empty() { Some(compute_global_strides()?) } else { None };
 
-        // Without unreduced axes, every device holds its tile of the array itself, so one shard per distinct tile
-        // suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only
-        // the leading dimension is sharded, or for a replicated array), each is copied directly into that range of
-        // one destination.
-        if let Some(global_strides) = &direct_copy_strides {
-            let mut tiles = Vec::<(&ArrayShard, Range<usize>)>::new();
-            let mut contiguous = true;
-            for shard in &shards {
-                let slices = shard.slice();
-                if tiles.iter().any(|(tile, _)| tile.slice() == slices) {
-                    continue;
-                }
+        // When the selected shards are one replica of each tile and every tile occupies one contiguous byte range of
+        // the dense representation, each is copied directly into that range of one destination.
+        if contiguous_tiles {
+            // The checked global byte count bounds the size and the offset of every tile.
+            let tiles = shards
+                .iter()
+                .map(|shard| {
+                    let slices = shard.slice();
+                    let byte_count = slices.iter().map(Range::len).product::<usize>() * element_size_in_bytes;
+                    let start =
+                        slices.iter().zip(&global_strides).map(|(slice, stride)| slice.start * stride).sum::<usize>()
+                            * element_size_in_bytes;
+                    (*shard, start..start + byte_count)
+                })
+                .collect::<Vec<_>>();
+            let mut destination = HostDestination::new(total_byte_count);
+            let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
+            let slices = destination.split(ranges.as_slice())?;
+            let copies = tiles
+                .iter()
+                .zip(slices)
+                .map(|((shard, _), slice)| {
+                    let layout = ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank());
+                    let event = shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?;
+                    Ok(work.track_host_copy(event))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
 
-                // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
-                let first_non_unit_dimension = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
-                let trailing_dimensions_are_whole = slices
-                    .iter()
-                    .zip(global_shape.as_slice())
-                    .skip(first_non_unit_dimension + 1)
-                    .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
-                if !trailing_dimensions_are_whole {
-                    contiguous = false;
-                    break;
-                }
+            // Publish the readback to the session after issuing all copies, then check the producer before consuming
+            // the transfer results so any execution error takes precedence.
+            drop(work);
 
-                // The checked global byte count bounds the size of every tile.
-                let byte_count = slices.iter().map(Range::len).product::<usize>() * element_size_in_bytes;
-                let start =
-                    slices.iter().zip(global_strides).map(|(slice, stride)| slice.start * stride).sum::<usize>()
-                        * element_size_in_bytes;
-                tiles.push((shard, start..start + byte_count));
+            if let Some(completion) = completion {
+                completion.block_until_ready()?;
             }
 
-            if contiguous {
-                let mut destination = HostDestination::new(total_byte_count);
-                let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
-                let slices = destination.split(ranges.as_slice())?;
-                let copies = tiles
-                    .iter()
-                    .zip(slices)
-                    .map(|((shard, _), slice)| {
-                        let layout = ryft_pjrt::Layout::dense_major_to_minor(shard.shape().rank());
-                        let event = shard.buffer().unwrap().copy_to_host_buffer(Some(layout), slice)?;
-                        Ok(work.track_host_copy(event))
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-
-                // Publish the readback to the session after issuing all copies, then check the producer before
-                // consuming the transfer results so any execution error takes precedence.
-                drop(work);
-
-                if let Some(completion) = completion {
-                    completion.block_until_ready()?;
-                }
-
-                // Drop each returned slice so the destination can yield its full byte buffer.
-                for copy in copies {
-                    drop(copy.wait()?);
-                }
-
-                return Ok(destination.into_bytes().ok().unwrap());
+            // Drop each returned slice so the destination can yield its full byte buffer.
+            for copy in copies {
+                drop(copy.wait()?);
             }
+
+            return Ok(destination.into_bytes().ok().unwrap());
         }
 
         // Non-contiguous tiles and per-device values along unreduced axes need separate host buffers. Request
@@ -571,7 +555,12 @@ impl Array {
                 }
             }
 
-            // Combine distinct contributions to each tile elementwise using the sharding's unreduced kind.
+            // Combine distinct contributions to each tile elementwise using the sharding's unreduced kind, in ascending
+            // order of their unreduced coordinates. That order does not depend on which replica of each contribution
+            // this process holds, so every process computes the same bytes even for floating point sums, which do not
+            // associate. Boolean values do not support addition, so their sums combine with logical or instead, whose
+            // identity is `false`.
+            contributions.sort_by(|(_, left, _, _), (_, right, _, _)| left.cmp(right));
             let unreduced_kind = self.sharding().unreduced_kind();
             let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, CoreArray)>::new();
             for (slices, _, shard_index, bytes) in contributions {
@@ -580,6 +569,7 @@ impl Array {
                 match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
                     Some((_, _, tile)) => {
                         *tile = match unreduced_kind {
+                            UnreducedKind::Sum if element_type == DataType::Boolean => Or::or(&*tile, &contribution)?,
                             UnreducedKind::Sum => Add::add(&*tile, &contribution)?,
                             UnreducedKind::Max => Max::max(&*tile, &contribution)?,
                             UnreducedKind::Min => Min::min(&*tile, &contribution)?,
@@ -621,12 +611,6 @@ impl Array {
             return Ok(global_bytes);
         }
 
-        // Reuse the destination strides from the direct-copy check when it ran.
-        let global_strides = match direct_copy_strides {
-            Some(strides) => strides,
-            None => compute_global_strides()?,
-        };
-
         for (shard_index, slices, bytes) in shards {
             let shard_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
             let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
@@ -662,8 +646,11 @@ impl Array {
 
     /// Returns an [`ExecutionFence`] that completes once [`Self::copy_to_host_bytes`] can read this array back without
     /// waiting for anything but its own copies (i.e., once the execution that produced this array and the buffers that
-    /// the readback copies are ready), and that reports the first error among them. A host upload that reads this array
-    /// back waits for this fence before it occupies a worker (refer to [`HostUploadWorkers`]).
+    /// the readback copies are ready), and that reports the first error among them. The fence waits for exactly the
+    /// buffers that the readback waits for, which [`Self::host_readback_shards`] selects for both, so it does not wait
+    /// for a replica that the readback does not read (e.g., a replica that a producer fills only once the result of
+    /// the upload that reads this array back is ready). A host upload that reads this array back waits for this fence
+    /// before it occupies a worker (refer to [`HostUploadWorkers`]).
     ///
     /// # Errors
     ///
@@ -672,9 +659,14 @@ impl Array {
     pub(super) fn host_readback_fence(&self) -> Result<ExecutionFence, Error> {
         let global_shape = self.shape();
         let shards = if self.data_type().is_zero() || global_shape.as_slice().contains(&0) {
-            self.addressable_shards().collect()
+            // A readback without elements copies nothing and waits for the producing execution or, without one,
+            // for every addressable buffer.
+            match self.execution_fence() {
+                Some(_) => Vec::new(),
+                None => self.addressable_shards().collect(),
+            }
         } else {
-            self.readback_shards(self.unreduced_axis_indices().as_slice())?
+            self.host_readback_shards(self.unreduced_axis_indices().as_slice())?.0
         };
         let events = shards
             .into_iter()
@@ -685,15 +677,54 @@ impl Array {
         Ok(ExecutionFence::join(self.execution_fence().cloned().into_iter().chain([buffers])))
     }
 
-    /// Selects the shards that [`Self::copy_to_host_bytes`] copies, given the indices of the unreduced axes of
-    /// the sharding within its mesh. When this process holds every shard, all of them are copied. Otherwise, the
+    /// Selects the shards that [`Self::copy_to_host_bytes`] of an array with elements copies, given the indices of the
+    /// unreduced axes of the sharding within its mesh, and returns them together with whether they are tiles that the
+    /// readback copies directly into the dense destination. [`Self::host_readback_fence`] waits for the same shards.
+    /// Without unreduced axes, every device holds its tile of the array itself, so one replica of each distinct tile
+    /// suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only the
+    /// leading dimension is sharded, or for a replicated array), the selection is the first replica of each tile among
+    /// the shards of [`Self::readback_shards`], and the readback copies each of them into its range. Otherwise, the
+    /// selection is every shard of [`Self::readback_shards`], whose copies the readback merges on the host after
+    /// checking that the overlapping ones agree.
+    fn host_readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<(Vec<&ArrayShard>, bool), Error> {
+        let shards = self.readback_shards(unreduced_axis_indices)?;
+        if !unreduced_axis_indices.is_empty() {
+            return Ok((shards, false));
+        }
+
+        let global_shape = self.shape();
+        let mut tiles = Vec::<&ArrayShard>::new();
+        for shard in &shards {
+            let slices = shard.slice();
+            if tiles.iter().any(|tile| tile.slice() == slices) {
+                continue;
+            }
+
+            // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
+            let first_non_unit_dimension = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
+            let trailing_dimensions_are_whole = slices
+                .iter()
+                .zip(global_shape.as_slice())
+                .skip(first_non_unit_dimension + 1)
+                .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
+            if !trailing_dimensions_are_whole {
+                return Ok((shards, false));
+            }
+            tiles.push(shard);
+        }
+        Ok((tiles, true))
+    }
+
+    /// Selects the shards that [`Self::copy_to_host_bytes`] reads from, given the indices of the unreduced axes of
+    /// the sharding within its mesh. When this process holds every shard, all of them are selected. Otherwise, the
     /// addressable shards suffice when they hold a replica of every distinct contribution to the value, which
     /// the merge identifies by the tile of a shard and its coordinates along the unreduced axes (refer to
     /// [`Self::unreduced_coordinates`]). The tiles of a sharding are either disjoint or identical, so this holds
     /// exactly when the current process can assemble the whole value (e.g., for a replicated array, which JAX also
     /// reads when the current process holds it in full, or for an unreduced array whose summands each have a local
-    /// replica). Returns [`ArrayError::MissingShardBuffer`] for the first shard whose contribution has no local
-    /// replica.
+    /// replica). A tile without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no
+    /// local replica. Returns [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution
+    /// has no local replica.
     fn readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<Vec<&ArrayShard>, Error> {
         let all_shards = self.shards();
         if all_shards.iter().all(|shard| shard.buffer().is_some()) {
@@ -704,7 +735,9 @@ impl Array {
         let contribution =
             |shard: &ArrayShard| (shard.slice().to_vec(), self.unreduced_coordinates(shard, unreduced_axis_indices));
         let covered = addressable.iter().map(|shard| contribution(shard)).collect::<HashSet<_>>();
-        if let Some(missing) = all_shards.iter().find(|shard| !covered.contains(&contribution(shard))) {
+        let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
+        let missing = all_shards.iter().filter(required).find(|shard| !covered.contains(&contribution(shard)));
+        if let Some(missing) = missing {
             return Err(Error::from(ArrayError::MissingShardBuffer {
                 shard_index: missing.index(),
                 device_id: missing.device().id(),
@@ -849,10 +882,12 @@ impl HostBufferUploads {
         let additive_identity = if needs_identity {
             // Use negative zero for each signed floating-point component so adding the identity preserves negative
             // zero. FNUZ types have only unsigned zero. Sub-byte elements occupy the low bits of one host byte.
+            // Boolean sums combine with logical or, whose identity is `false`.
             match data_type {
-                DataType::Token | DataType::Zero | DataType::Boolean | DataType::F8E8M0FNU => {
+                DataType::Token | DataType::Zero | DataType::F8E8M0FNU => {
                     return Err(ArrayError::MissingUnreducedSumIdentity { data_type }.into());
                 }
+                DataType::Boolean => vec![0x00],
                 DataType::I1
                 | DataType::I2
                 | DataType::I4
@@ -881,6 +916,14 @@ impl HostBufferUploads {
             Vec::new()
         };
 
+        // Row-major strides in units of elements translate each shard slice into flat element offsets in the full dense
+        // host buffer. Only the shards of an array with elements read bytes at such offsets.
+        let strides = if shape.as_slice().contains(&0) {
+            Vec::new()
+        } else {
+            row_major_element_strides(shape.as_slice(), data_type)?
+        };
+
         let mut shards = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -905,36 +948,19 @@ impl HostBufferUploads {
             let buffer_type = data_type.executable_buffer_type();
 
             // An empty shard that holds the identity receives no bytes, so its empty identity element is not read.
-            let bytes = if holds_identity(shard) {
-                HostShardBytes::AdditiveIdentity {
+            let source = if holds_identity(shard) {
+                HostShardSource::AdditiveIdentity {
                     element: additive_identity.clone(),
                     count: shard_shape.element_count()?,
                 }
             } else if shard_slice.is_empty() {
-                HostShardBytes::Window { window: 0..expected_byte_count, byte_strides: None }
+                HostShardSource::Window { window: 0..expected_byte_count, byte_strides: None }
             } else if shard_shape.as_slice().contains(&0) {
                 // An empty shard reads no bytes, but the offset of its first element can lie past the end of the host
                 // buffer (e.g., the second column shard of an `f32[0, 4]` array would start at byte 8 of an empty
                 // buffer). Its window is therefore the empty range at the start of the buffer.
-                HostShardBytes::Window { window: 0..0, byte_strides: None }
+                HostShardSource::Window { window: 0..0, byte_strides: None }
             } else {
-                // Compute row-major strides in units of elements so that each shard slice can be translated
-                // into flat element offsets in the full dense host buffer.
-                let mut strides = vec![1usize; shape.rank()];
-                let mut stride = 1usize;
-                for dimension in (0..shape.rank()).rev() {
-                    strides[dimension] = stride;
-                    stride = stride.checked_mul(shape[dimension]).ok_or_else(|| Error::SizeLimitExceeded {
-                        message: format!(
-                            "row-major stride for array with shape `{}` and element type `{}` exceeds \
-                             the maximum allowed size of {}",
-                            shape,
-                            buffer_type,
-                            usize::MAX,
-                        ),
-                    })?;
-                }
-
                 // Convert the shard's starting coordinates into a flat row-major element offset in the full host
                 // buffer, and then into the corresponding byte offset.
                 let element_size_in_bytes = buffer_type.element_size_in_bytes()?;
@@ -955,11 +981,13 @@ impl HostBufferUploads {
                         .sum::<usize>();
                 let end_byte_offset = last_element_offset * element_size_in_bytes + element_size_in_bytes;
 
-                // If the shard is already contiguous in the dense row-major host buffer, use no explicit strides and
-                // read the window as a packed dense shard. Otherwise, describe the global row-major strides in bytes
-                // so that the strided shard can be gathered directly from the original host buffer.
-                let (block_dimension, _) = shard.contiguous_inner_block(&shape)?;
-                let byte_strides = if block_dimension == 0 {
+                // The elements of the shard are distinct positions of its window, in row-major order, so the shard is
+                // contiguous in the dense row-major host buffer exactly when they fill the window (e.g., a column tile
+                // of a single row, whose trailing dimension is partial). Such a shard reads the window as a packed
+                // dense shard without explicit strides. Otherwise, describe the global row-major strides in bytes so
+                // that the strided shard can be gathered directly from the original host buffer.
+                let dense_byte_count = shard_shape.as_slice().iter().product::<usize>() * element_size_in_bytes;
+                let byte_strides = if end_byte_offset - start_byte_offset == dense_byte_count {
                     None
                 } else {
                     Some(
@@ -981,10 +1009,10 @@ impl HostBufferUploads {
                     )
                 };
 
-                HostShardBytes::Window { window: start_byte_offset..end_byte_offset, byte_strides }
+                HostShardSource::Window { window: start_byte_offset..end_byte_offset, byte_strides }
             };
 
-            shards.push(HostShardUpload { device: device.clone(), dimensions: shard_dimensions, bytes });
+            shards.push(HostShardUpload { device: device.clone(), dimensions: shard_dimensions, source });
         }
 
         Ok(Self { r#type, sharding, mesh, byte_count: expected_byte_count, device_layout, shards })
@@ -999,13 +1027,13 @@ struct HostShardUpload {
     /// Dimensions of the shard.
     dimensions: Vec<u64>,
 
-    /// Bytes that the shard receives.
-    bytes: HostShardBytes,
+    /// Source of the bytes to upload to this shard.
+    source: HostShardSource,
 }
 
-/// Bytes that one addressable shard receives from a dense row-major host buffer.
-#[derive(PartialEq)]
-enum HostShardBytes {
+/// Describes how to obtain the bytes for one addressable shard from a host buffer or a repeated additive identity.
+#[derive(PartialEq, Eq, Hash)]
+enum HostShardSource {
     /// `count` copies of `element`, which encodes the additive identity of one element, for a summand along an
     /// unreduced axis that does not hold the host value.
     AdditiveIdentity { element: Vec<u8>, count: usize },
@@ -1016,9 +1044,9 @@ enum HostShardBytes {
     Window { window: Range<usize>, byte_strides: Option<Vec<i64>> },
 }
 
-impl HostShardBytes {
-    /// Returns the dense row-major bytes of a shard with `dimensions` that these bytes describe within the host
-    /// buffer `bytes`, whose elements occupy `element_size_in_bytes` bytes each.
+impl HostShardSource {
+    /// Returns the dense row-major bytes for a shard with `dimensions`. Window sources read from the host buffer
+    /// `bytes`, whose elements occupy `element_size_in_bytes` bytes each.
     fn to_dense_bytes(&self, bytes: &[u8], dimensions: &[u64], element_size_in_bytes: usize) -> Vec<u8> {
         match self {
             Self::AdditiveIdentity { element, count } => element.repeat(*count),
@@ -1064,82 +1092,85 @@ impl HostShardBytes {
 /// own (i.e., the strided shards, whose elements must be gathered, and the additive identities along unreduced axes),
 /// and those are prepared once for all the shards that hold the same bytes (e.g., the replicas of one strided tile).
 struct PreparedHostShards {
-    /// Dimensions of each shard and the bytes that it receives, in shard order.
-    shards: Vec<(Vec<u64>, HostShardBytes)>,
+    /// Dimensions and source of each shard, in shard order.
+    shards: Vec<(Vec<u64>, HostShardSource)>,
 
-    /// Bytes prepared so far for the shards that are not windows of the host buffer, by shard index, which the later
-    /// shards with equal dimensions and bytes share.
-    prepared: Vec<Option<SharedHostBytes>>,
+    /// Index of the first shard with the same dimensions and source as each shard, in shard order. The shards with
+    /// equal dimensions and sources share the slice prepared for that first shard.
+    representatives: Vec<usize>,
+
+    /// Slices prepared for strided windows and additive identities, indexed by the shards of
+    /// [`Self::representatives`].
+    prepared: Vec<Option<HostBufferSlice>>,
 
     /// Size of one element in bytes.
     element_size_in_bytes: usize,
 }
 
 impl PreparedHostShards {
-    /// Creates the preparation of `shards`, which hold the dimensions of each shard and the bytes that it receives,
-    /// whose elements occupy `element_size_in_bytes` bytes each.
-    fn new(shards: Vec<(Vec<u64>, HostShardBytes)>, element_size_in_bytes: usize) -> Self {
+    /// Creates a cache for `shards` from their dimensions, sources, and size of each element in bytes.
+    fn new(shards: Vec<(Vec<u64>, HostShardSource)>, element_size_in_bytes: usize) -> Self {
+        // Index the shards by their dimensions and sources, so that finding the shards that share bytes does not scan
+        // the earlier shards for every distinct strided tile.
+        let mut first_shards = HashMap::with_capacity(shards.len());
+        let representatives = shards
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| *first_shards.entry(shard).or_insert(index))
+            .collect();
         let prepared = vec![None; shards.len()];
-        Self { shards, prepared, element_size_in_bytes }
+        Self { shards, representatives, prepared, element_size_in_bytes }
     }
 
-    /// Returns the dense row-major bytes of the shard at `index` within the host buffer `host_bytes`, which must be
-    /// the same buffer in every call. They share the allocation of `host_bytes` when the shard is contiguous in it,
-    /// and otherwise the allocation prepared for the first shard with the same dimensions and bytes.
-    fn bytes(&mut self, host_bytes: &Arc<Vec<u8>>, index: usize) -> SharedHostBytes {
-        let (dimensions, bytes) = &self.shards[index];
-        if let HostShardBytes::Window { window, byte_strides: None } = bytes {
-            return SharedHostBytes::new(Arc::clone(host_bytes), window.clone());
+    /// Returns a slice containing the dense row-major bytes of the shard at `index`. A contiguous window shares the
+    /// allocation of `host_bytes`, which must be the same buffer in every call. Other sources share the allocation
+    /// prepared for the first shard with the same dimensions and source.
+    fn bytes(&mut self, host_bytes: &Arc<Vec<u8>>, index: usize) -> HostBufferSlice {
+        let (dimensions, source) = &self.shards[index];
+        if let HostShardSource::Window { window, byte_strides: None } = source {
+            return HostBufferSlice::new(Arc::clone(host_bytes), window.clone());
         }
 
-        let shared = (0..index).find_map(|other| match &self.prepared[other] {
-            Some(prepared) if self.shards[other] == self.shards[index] => Some(prepared.clone()),
-            _ => None,
-        });
-
-        let shared = shared.unwrap_or_else(|| {
-            SharedHostBytes::from(bytes.to_dense_bytes(host_bytes, dimensions, self.element_size_in_bytes))
-        });
-
-        self.prepared[index] = Some(shared.clone());
-
-        shared
+        self.prepared[self.representatives[index]]
+            .get_or_insert_with(|| {
+                HostBufferSlice::from(source.to_dense_bytes(host_bytes, dimensions, self.element_size_in_bytes))
+            })
+            .clone()
     }
 }
 
-// TODO(eaplatanios): Review from here.
-
-/// Contiguous window of a host allocation that several host to device transfers can share (refer to
-/// [`HostToDeviceTransferManager::transfer_literal`], which retains its own handle of the data until PJRT has read it).
-/// The allocation is freed once the last window of it is dropped.
+/// A contiguous byte slice that keeps its host buffer alive. Clones share the backing allocation, so each call to
+/// [`HostToDeviceTransferManager::transfer_literal`] can retain a slice until PJRT has read it.
 #[derive(Clone)]
-pub(super) struct SharedHostBytes {
+pub(super) struct HostBufferSlice {
     /// Shared host allocation.
     bytes: Arc<Vec<u8>>,
 
-    /// Range of [`Self::bytes`] that this window covers.
+    /// Range of [`Self::bytes`] that this slice covers.
     range: Range<usize>,
 }
 
-impl SharedHostBytes {
-    /// Creates the window of `bytes` that covers `range`, which must lie within `bytes`.
+impl HostBufferSlice {
+    /// Creates a slice covering `range`, which must lie within `bytes`.
     fn new(bytes: Arc<Vec<u8>>, range: Range<usize>) -> Self {
         Self { bytes, range }
     }
 }
 
-impl From<Vec<u8>> for SharedHostBytes {
+impl From<Vec<u8>> for HostBufferSlice {
     fn from(bytes: Vec<u8>) -> Self {
         let range = 0..bytes.len();
         Self::new(Arc::new(bytes), range)
     }
 }
 
-impl AsRef<[u8]> for SharedHostBytes {
+impl AsRef<[u8]> for HostBufferSlice {
     fn as_ref(&self) -> &[u8] {
         &self.bytes[self.range.clone()]
     }
 }
+
+// TODO(eaplatanios): Review from here.
 
 /// Destination buffer of an upload from host memory whose bytes become available only after the buffer has been
 /// handed out, together with the PJRT [`HostToDeviceTransferManager`] that fills it. The manager is created for the
@@ -1249,8 +1280,11 @@ impl PendingHostUpload {
 /// buffers), because those buffers can outlive the session (e.g., in arrays that were moved to another session of the
 /// same client, or in PJRT buffers retained elsewhere) and must then hold the right values. The owner does not join
 /// its workers, because a worker can drop the owner itself (e.g., when a job holds the last handle of the session) and
-/// because a job can stay parked for as long as its sources stay pending. Workers and parked jobs hold the shared queue
-/// but never a session, so they do not keep the owner alive.
+/// because a job can stay parked for as long as its sources stay pending. The workers themselves hold only the shared
+/// queue, so they do not keep the owner alive. A job, however, retains whatever it captures, which can include a handle
+/// of the session (e.g., the source [`Array`] that the host fallback of [`Array::to_placement`] reads back, which also
+/// retains the caches of its session). Such a job keeps the owner alive until it has run, so the owner shuts down only
+/// after the sources of that job have completed and the job has released its captures.
 pub(crate) struct HostUploadWorkers {
     /// State that the workers share with this owner.
     state: Arc<HostUploadWorkersState>,
@@ -1264,7 +1298,7 @@ impl HostUploadWorkers {
 
     /// Creates a set of workers that runs at most `worker_limit` threads, none of which start before the first job is
     /// submitted.
-    pub(crate) fn new(worker_limit: NonZeroUsize) -> Self {
+    fn new(worker_limit: NonZeroUsize) -> Self {
         let state = HostUploadWorkersState {
             queue: Mutex::new(HostUploadQueue::default()),
             available: Condvar::new(),
@@ -1352,8 +1386,15 @@ impl HostUploadWorkersState {
             if let Some(job) = queue.jobs.pop_front() {
                 drop(queue);
                 // Unwinding drops what the job owns, and the panic itself has already been reported by the panic hook.
-                if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(job)) {
-                    drop(panic);
+                // The payload is dropped under its own guard, because a custom payload can panic in its destructor,
+                // which would otherwise stop this worker before it updates the counters below. Ordinary panic messages
+                // drop safely, and any other payload whose destructor panicked is forgotten instead of dropped again.
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(job))
+                    && let Err(drop_panic) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
+                    && !drop_panic.is::<&'static str>()
+                    && !drop_panic.is::<String>()
+                {
+                    std::mem::forget(drop_panic);
                 }
                 queue = self.lock();
                 queue.accepted_job_count -= 1;
@@ -1416,7 +1457,7 @@ struct HostUploadQueue {
 /// submission fails or `prepare` panics, dropping the job's transfer managers makes PJRT poison the unfinished buffers.
 pub(super) fn run_host_uploads<P, E>(uploads: Vec<PendingHostUpload>, mut prepare: P, poison: E)
 where
-    P: FnMut(usize) -> Result<SharedHostBytes, Error>,
+    P: FnMut(usize) -> Result<HostBufferSlice, Error>,
     E: FnOnce(Error) -> PjrtError,
 {
     // Issue every transfer before awaiting any of them, so that the uploads to different devices overlap.
@@ -2911,7 +2952,7 @@ mod tests {
         };
         let wait = |fence: ExecutionFence| {
             let (sender, receiver) = mpsc::channel();
-            fence.on_ready(move |result| sender.send(result).unwrap());
+            thread::spawn(move || sender.send(fence.block_until_ready()).unwrap());
             receiver.recv_timeout(WAIT_TIMEOUT)
         };
 
@@ -2954,11 +2995,11 @@ mod tests {
         let host_bytes = Arc::new(values_to_bytes(&[0f32, 1., 2., 3., 4., 5., 6., 7.]));
         let prepare = |r#type: ArrayType, sharding: Sharding| {
             let uploads = HostBufferUploads::new(&session, r#type, Some(mesh.clone()), Some(sharding), None).unwrap();
-            let shards = uploads.shards.into_iter().map(|shard| (shard.dimensions, shard.bytes)).collect();
+            let shards = uploads.shards.into_iter().map(|shard| (shard.dimensions, shard.source)).collect();
             let mut prepared = PreparedHostShards::new(shards, 4);
             (0..4).map(|index| prepared.bytes(&host_bytes, index)).collect::<Vec<_>>()
         };
-        let values = |bytes: &SharedHostBytes| values_from_bytes::<f32>(bytes.as_ref());
+        let values = |bytes: &HostBufferSlice| values_from_bytes::<f32>(bytes.as_ref());
 
         // Every replica of a fully replicated array is a window of the host bytes, so none of them copies them.
         let replicated =

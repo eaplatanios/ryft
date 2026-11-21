@@ -291,9 +291,10 @@ impl ExecutionPlan {
                 output_type.static_shape().is_some() && (physical_index.is_some() || output_type.data_type().is_zero())
             });
         // Declared shardings only fix output placement when XLA must honor them. Lowering emits no result shardings
-        // when any output lacks one, and Shardy propagation may shard the open dimensions that `Unconstrained` lowers
-        // to, so XLA chooses the placement of such outputs. Their buffers are validated by the general constructor
-        // instead. Every placement on a single device holds the whole array, so it is always fixed.
+        // when any output lacks one, so XLA chooses the placement of such outputs. Outputs whose placements record
+        // `Unconstrained` dimensions, which their result annotations replicate, are not planned either. The buffers of
+        // these outputs are validated by the general constructor instead. Every placement on a single device holds the
+        // whole array, so it is always fixed.
         let declared_placement = mesh.devices().len() == 1
             || output_types.iter().all(|output_type| output_type.sharding().is_some())
                 && output_shardings.iter().all(|sharding| {
@@ -1768,12 +1769,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
-        CompiledFunction, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation,
-        Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis, MeshAxisType, Place, Placeholder,
-        Placement, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceError, ReferenceRead, ReferenceReadOperation, ReferenceType, Shape, ShardMapBoundary, Sharding,
-        ShardingDimension, ShardingError, StagedFunction, StaticShape, TiledLayout, Typed,
+        CompiledFunction, ConstrainSharding, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh,
+        Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
+        DynamicSliceOperation, Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis, MeshAxisType, Place,
+        Placeholder, Placement, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation, ReferenceType, Shape,
+        ShardMapBoundary, Sharding, ShardingDimension, ShardingError, StagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -2148,9 +2149,8 @@ mod tests {
             .unwrap();
         let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // XLA chooses the placement of outputs with open (i.e., `Unconstrained`) dimensions and of outputs without
-        // declared shardings, so their programs have no output plans and validate the returned buffers
-        // instead.
+        // Outputs with open (i.e., `Unconstrained`) dimensions and outputs without declared shardings have no output
+        // plans, so their programs validate the returned buffers instead.
         for input_type in [unconstrained_type, unsharded_type] {
             let staged = crate::stage::<_, ArrayType, ArrayType>(
                 |input| input.clone() + input,
@@ -2634,12 +2634,43 @@ mod tests {
         let double = |input: CompileTracer, _: &Placement| input.clone() + input;
         let double_and_place =
             |input: CompileTracer, target: &Placement| (input.clone() + input).place(None, target).unwrap();
+        let place_and_double = |input: CompileTracer, target: &Placement| {
+            let placed = input.place(None, target).unwrap();
+            placed.clone() + placed
+        };
+        let constrain_and_double = |input: CompileTracer, target: &Placement| {
+            let constrained = input.constrain_sharding(target.sharding()).unwrap();
+            constrained.clone() + constrained
+        };
 
-        // The outputs of a function on uncommitted inputs are committed when the function requests their placement
-        // explicitly, through a `place` with a target that produces them or through any sharding override, as in JAX.
+        // The outputs of a function on uncommitted inputs are committed when the function requests a placement
+        // explicitly anywhere, through a `place` with a target, a sharding constraint, or any sharding override, as in
+        // JAX, whether or not that request produces the outputs.
         assert!(execute(&lower(double_and_place, Options::new(mesh.clone()))));
+        assert!(execute(&lower(place_and_double, Options::new(mesh.clone()))));
+        assert!(execute(&lower(constrain_and_double, Options::new(mesh.clone()))));
         assert!(execute(&lower(double, Options::new(mesh.clone()).with_output_shardings(vec![sharded.clone()]))));
         assert!(execute(&lower(double, Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]))));
+
+        // A request commits every output of the function, including outputs that it does not reach.
+        let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
+        let staged = crate::stage::<_, ArrayType, (ArrayType, ArrayType)>(
+            move |input: CompileTracer| {
+                let placed = input.clone().place(None, &target).unwrap();
+                (placed.clone() + placed, input)
+            },
+            staged_type.clone(),
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: CompiledFunction<Session, Type, (Type, Type)> =
+            staged.lower(&session).unwrap().compile(&session).unwrap();
+        let (first, second) = compiled.executable().execute(&session, Value::Array(uncommitted.clone())).unwrap();
+        assert_eq!(program_array(&first).copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.0, 4.0]);
+        assert_eq!(program_array(&second).copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0]);
+        assert!(program_array(&first).is_committed());
+        assert!(program_array(&second).is_committed());
 
         // Without an explicit request, the outputs keep the rule for the commitment of the inputs.
         assert!(!execute(&lower(double, Options::new(mesh.clone()))));

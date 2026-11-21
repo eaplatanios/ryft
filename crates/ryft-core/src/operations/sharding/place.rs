@@ -449,17 +449,7 @@ where
 
             let batched = |placement: &Placement, batch_sharding: ShardingDimension| -> Result<_, BatchingError> {
                 let sharding = placement.sharding().batched(batch_axis, batch_sharding)?;
-                let mut result = Placement::new(placement.mesh().clone(), sharding).map_err(TypeError::from)?;
-                if let Some(memory) = placement.memory() {
-                    result = result.with_memory(memory);
-                }
-                if let Some(layout) = placement.layout() {
-                    result = result.with_layout(layout.clone());
-                }
-                for enclosing in placement.batch_shardings() {
-                    result = result.with_batch_sharding(enclosing.clone()).map_err(TypeError::from)?;
-                }
-                Ok(result)
+                Ok(placement.clone().with_sharding(sharding).map_err(TypeError::from)?)
             };
 
             if let Some(placement) = &target {
@@ -511,8 +501,8 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(<C::Value as Value>::Dispatch::place(
                     tangent,
-                    source.as_ref().map(placement_without_layout).or_else(|| tangent.placement()),
-                    operation.target().map(placement_without_layout).as_ref(),
+                    source.map(Placement::without_layout).or_else(|| tangent.placement()),
+                    operation.target().cloned().map(Placement::without_layout).as_ref(),
                     may_alias,
                 )?),
             };
@@ -545,11 +535,8 @@ impl_differentiable_operation! {
             let input_type = inputs[0].r#type();
             let input_cotangent_type = input_type.cotangent()?;
             let cotangent_placement = |placement: &Placement| -> Result<Placement, TypeError> {
-                let mut result = Placement::new(placement.mesh().clone(), placement.sharding().cotangent()?)?;
-                for enclosing in placement.batch_shardings() {
-                    result = result.with_batch_sharding(enclosing.clone())?;
-                }
-                Ok(result)
+                let sharding = placement.sharding().cotangent()?;
+                Ok(placement.clone().with_sharding(sharding)?.without_layout().without_memory())
             };
 
             let transposed = match (operation.source(), operation.target()) {
@@ -582,11 +569,8 @@ impl_differentiable_operation! {
                         }
                         None => target.sharding().cotangent().map_err(TypeError::from)?,
                     };
-                    let mut placement = Placement::new(target.mesh().clone(), sharding).map_err(TypeError::from)?;
-                    for enclosing in target.batch_shardings() {
-                        placement = placement.with_batch_sharding(enclosing.clone()).map_err(TypeError::from)?;
-                    }
-                    PlaceOperation::new(None, placement.with_memory(input_type.memory()))
+                    let placement = target.clone().with_sharding(sharding).map_err(TypeError::from)?;
+                    PlaceOperation::new(None, placement.without_layout().with_memory(input_type.memory()))
                 }
                 (Some(source), None) => {
                     // Without a target, the forward placement left the value where it was, which its source describes
@@ -1011,28 +995,7 @@ fn unbatched_placement(placement: Placement, batch_axis: Option<usize>) -> Optio
     let mut dimensions = sharding.dimensions().to_vec();
     let batch_sharding = dimensions.remove(batch_axis);
     let sharding = sharding.with_dimensions(dimensions).ok()?;
-    let mut result = Placement::new(placement.mesh().clone(), sharding).ok()?;
-    if let Some(memory) = placement.memory() {
-        result = result.with_memory(memory);
-    }
-    for enclosing in placement.batch_shardings() {
-        result = result.with_batch_sharding(enclosing.clone()).ok()?;
-    }
-    result.with_batch_sharding(batch_sharding).ok()
-}
-
-/// Returns `placement` without its layout, keeping its mesh, sharding, memory, and recorded batch shardings.
-fn placement_without_layout(placement: &Placement) -> Placement {
-    let mut result = Placement::new(placement.mesh().clone(), placement.sharding().clone()).unwrap();
-    if let Some(memory) = placement.memory() {
-        result = result.with_memory(memory);
-    }
-
-    // The batch shardings were recorded over the same sharding, so recording them again cannot fail.
-    for enclosing in placement.batch_shardings() {
-        result = result.with_batch_sharding(enclosing.clone()).unwrap();
-    }
-    result
+    placement.with_sharding(sharding).ok()?.without_layout().with_batch_sharding(batch_sharding).ok()
 }
 
 #[cfg(test)]
@@ -3812,22 +3775,5 @@ mod tests {
         let item = unbatched_placement(unbatched_placement(packed, Some(0)).unwrap(), Some(0)).unwrap();
         assert_eq!(item.sharding().rank(), 0);
         assert_eq!(item.batch_shardings(), &[ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
-    }
-
-    #[test]
-    fn test_placement_without_layout() {
-        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
-
-        // Only the layout is dropped, so the memory and the recorded batch shardings are kept.
-        let placed = placement(&mesh_x(), vec![ShardingDimension::Replicated])
-            .with_memory(PINNED_HOST)
-            .with_batch_sharding(ShardingDimension::sharded(["x"]))
-            .unwrap();
-        assert_eq!(placement_without_layout(&placed.clone().with_layout(layout.clone())), placed);
-        assert_eq!(placement_without_layout(&placed), placed);
-
-        // A placement that names no memory still names none.
-        let placed = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
-        assert_eq!(placement_without_layout(&placed.clone().with_layout(layout)), placed);
     }
 }
