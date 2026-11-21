@@ -2066,8 +2066,14 @@ impl<
         self.validate_application(&input_types, body)?;
 
         // When every input is known the whole scan folds by binding it in the known-side context so we
-        // defer to that default behavior.
+        // defer to that default behavior, unless its body holds work that must not fold under this context
+        // (e.g., a copy that every execution of a specialized program must make), in which case the whole scan
+        // stays residual.
         if inputs.iter().all(PartialEvaluationValue::is_known) {
+            if !context.can_fold_regions(driver, &[body])? {
+                return context.residualize(O::from(self.clone()), vec![body.to_program()], inputs);
+            }
+
             return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs);
         }
 

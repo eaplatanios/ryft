@@ -804,6 +804,13 @@ impl<
             inputs = Cow::Owned(guarded_inputs);
         }
 
+        // A condition whose inputs are all known but whose predicate selects no branch here folds whole, unless one
+        // of its branches holds work that must not fold under this context (e.g., a copy that every execution of a
+        // specialized program must make), in which case the whole condition stays residual.
+        if inputs.iter().all(PartialEvaluationValue::is_known) && !context.can_fold_regions(driver, &branches)? {
+            return context.residualize(O::from(*self), driver.region_programs(), &inputs);
+        }
+
         context.fold_or_residualize(O::from(*self), driver.region_programs(), &inputs)
     }
 

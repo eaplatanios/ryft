@@ -436,7 +436,32 @@ where
         Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        let outputs = self.call_flat_in_context(context, inputs.into_parameters().collect())?;
+        self.call_in_context_with(context, inputs, |operation| operation)
+    }
+
+    /// Calls this function in the provided `context` like [`Self::call_in_context`], binding the staged-call operation
+    /// that `transform_fn` returns for the one that this function constructs. A compilation domain uses it to record
+    /// facts about the called function that its operation keeps but that the callee program does not show (e.g., the
+    /// sharding overrides of the boundary of a compiled function). `transform_fn` must return a call of the same callee
+    /// with the same capture prefix, because the call is bound with this function's callee and inputs.
+    pub fn call_in_context_with<V, CallerContext, Path, F>(
+        &self,
+        context: &CallerContext,
+        inputs: Input::To<V>,
+        transform_fn: F,
+    ) -> Result<Output::To<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Input::To<V>: Parameterized<V>,
+        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
+        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        F: FnOnce(C::Operation) -> C::Operation,
+    {
+        let outputs = self.call_flat_in_context_with(context, inputs.into_parameters().collect(), transform_fn)?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -455,6 +480,24 @@ where
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
     {
+        self.call_flat_in_context_with(context, inputs, |operation| operation)
+    }
+
+    /// Binds one staged-call operation of this function in `context` over flat `inputs`, after `transform_fn`
+    /// (refer to [`Self::call_in_context_with`]), and returns its flat outputs.
+    fn call_flat_in_context_with<V, CallerContext, Path, F>(
+        &self,
+        context: &CallerContext,
+        inputs: Vec<V>,
+        transform_fn: F,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        C::Operation: StagedCallOperation<C::Constant>,
+        V: Value<Type = C::Type>,
+        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
+            + ImportingContext<C, Path>,
+        F: FnOnce(C::Operation) -> C::Operation,
+    {
         let mut flat_inputs = self
             .state
             .program
@@ -467,8 +510,11 @@ where
         let capture_count = flat_inputs.len();
         flat_inputs.extend(inputs);
         let callee = self.callee_program()?;
-        let operation =
-            C::Operation::staged_call_with_types(capture_count, &callee.input_types(), &callee.output_types())?;
+        let operation = transform_fn(C::Operation::staged_call_with_types(
+            capture_count,
+            &callee.input_types(),
+            &callee.output_types(),
+        )?);
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
@@ -2492,6 +2538,48 @@ mod tests {
                     %2:f64[] = call %1 [
                         callee={
                             lambda %0:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_staged_function_call_in_context_with() {
+        // The call binds the operation that `decorate` returns for the call that the function constructs, which is
+        // decorated exactly once.
+        let callee: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, _input| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        let decorations = Cell::new(0usize);
+        let caller: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, _, input: CompilationTracer<TestCallDomain>| {
+                let context = input.context().clone();
+                callee.call_in_context_with(&context, input, |operation| {
+                    assert!(matches!(operation, TestCallFamily::Call(TestCallOperation { capture_count: 1 })));
+                    decorations.set(decorations.get() + 1);
+                    TestCallFamily::Call(TestCallOperation { capture_count: 1 })
+                })
+            },
+            Vec::new(),
+            ArrayType::scalar(DataType::F64),
+            (),
+        )
+        .unwrap();
+        assert_eq!(decorations.get(), 1);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
                             in (%0)
                         },
                     ]

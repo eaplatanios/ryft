@@ -120,7 +120,9 @@ pub use axis_types::{AxisTypesError, auto_axes, explicit_axes};
 pub use constrain_sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
-pub use place::{PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, PlacementSources};
+pub use place::{
+    IntoPlaceTarget, PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, PlaceTarget, Placed, PlacementSources,
+};
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
     LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, SHARD_MAP_OPERATION_NAME, ShardMap,

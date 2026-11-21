@@ -10066,7 +10066,7 @@ pub(crate) mod tests {
 
         /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
         #[derive(Clone, Debug, Operation)]
-        #[ryft(type(ArrayType), constant(Array), dispatch(differentiation, transposition))]
+        #[ryft(type(ArrayType), constant(Array), dispatch(partial_evaluation, differentiation, transposition))]
         enum ValueOnlyArrayOperation {
             Constant(ConstantOperation<Array>),
             Zero(ZeroOperation<ArrayType>),

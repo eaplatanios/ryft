@@ -1430,6 +1430,12 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.validate_application(&input_types, condition, body)?;
         if inputs.iter().all(PartialEvaluationValue::is_known) {
+            // Work that must not fold under this context (e.g., a copy that every execution of a specialized program
+            // must make) keeps the whole loop residual.
+            if !context.can_fold_regions(driver, &[condition, body])? {
+                return context.residualize(*self, driver.region_programs(), inputs);
+            }
+
             return context.fold_or_residualize(*self, driver.region_programs(), inputs);
         }
 

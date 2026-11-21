@@ -1443,6 +1443,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
             input_known,
             true,
             true,
+            true,
             Some(required_known_outputs),
             Some(residual_placement),
         )?;
@@ -1594,6 +1595,7 @@ where
             region.transform::<JvpPartitionTransform, _, DifferentiationError>(arguments, |region, arguments| {
                 let (partition, _) = region.partition_with_configuration(
                     &arguments.input_known,
+                    true,
                     true,
                     true,
                     Some(&arguments.required_known_outputs),

@@ -2511,7 +2511,9 @@ mod tests {
             input_known: &[bool],
             required_known_outputs: &[usize],
         ) -> Result<PartitionedProgram<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
-            Ok(region.partition_with_configuration(input_known, true, true, Some(required_known_outputs), None)?.0)
+            Ok(region
+                .partition_with_configuration(input_known, true, true, true, Some(required_known_outputs), None)?
+                .0)
         }
 
         fn bind_jvp_operation<P: DifferentiationPolicy<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>(

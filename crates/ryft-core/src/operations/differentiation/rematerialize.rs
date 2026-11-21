@@ -608,6 +608,7 @@ where
                 input_known.as_slice(),
                 true,
                 true,
+                true,
                 Some(required_known_outputs.as_slice()),
                 Some(placement),
             )?;

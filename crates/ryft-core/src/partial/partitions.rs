@@ -944,7 +944,7 @@ where
     where
         O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
-        self.partition_with_configuration(input_known, true, false, None, None)
+        self.partition_with_configuration(input_known, true, true, false, None, None)
             .map(|(partition, _)| partition)
     }
 
@@ -962,7 +962,7 @@ where
         O: PartiallyEvaluatableOperation<TracingContext<V, O>> + OperationPayloadProjection,
     {
         let residual_placement: Rc<dyn ResidualPlacement<V, O>> = Rc::new(policy.clone());
-        self.partition_with_configuration(input_known, true, false, None, Some(residual_placement))
+        self.partition_with_configuration(input_known, true, true, false, None, Some(residual_placement))
             .map(|(partition, _)| partition)
     }
 
@@ -988,6 +988,9 @@ where
     ///   - `input_known`: Whether each source input is available to the known invocation, in input order.
     ///   - `allow_effect_folding`: Whether known effectful work may be recorded in the known program, subject to
     ///     ordering constraints. Pure known work can fold even when this is false.
+    ///   - `allow_copy_folding`: Whether known operations whose results must have storage of their own for every
+    ///     execution may be recorded in the known program (refer to
+    ///     [`PartialEvaluationContext::with_allow_copy_folding`]).
     ///   - `repeated_residual`: Whether to analyze allocations for a known invocation followed by repeated residual
     ///     calls. When false, returns after one pass with no explicitly deferred instruction IDs.
     ///   - `required_known_outputs`: Output positions that repeated-call partitioning must keep known. When absent,
@@ -999,6 +1002,7 @@ where
         self,
         input_known: &[bool],
         allow_effect_folding: bool,
+        allow_copy_folding: bool,
         repeated_residual: bool,
         required_known_outputs: Option<&[usize]>,
         residual_placement: Option<Rc<dyn ResidualPlacement<V, O>>>,
@@ -1021,7 +1025,12 @@ where
             Some(residual_placement) => residual_placement.place_residuals(
                 partition,
                 Some(&|region: RegionRef<'_, V, O>, instruction_index: usize, demanded_outputs: &[bool]| {
-                    region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement.clone())
+                    region.split_on_residual_demand(
+                        instruction_index,
+                        demanded_outputs,
+                        allow_copy_folding,
+                        residual_placement.clone(),
+                    )
                 }),
             ),
             None => Ok(partition),
@@ -1040,6 +1049,7 @@ where
             let evaluation_context = PartialEvaluationContext::new(context.clone())
                 .with_reference_placement(ReferencePlacement::Stage)
                 .with_allow_effect_folding(allow_effect_folding)
+                .with_allow_copy_folding(allow_copy_folding)
                 .with_residual_placement(residual_placement.clone());
             let seed = input_types
                 .iter()
@@ -1185,7 +1195,9 @@ where
 
     /// Partitions this region with every input known while its residual program also returns the outputs that
     /// `demanded_outputs` marks, placing the residuals of the partition and of the partitions nested within it
-    /// with `residual_placement` (refer to [`PartialEvaluationContext::partition_residual_demand`]).
+    /// with `residual_placement` (refer to [`PartialEvaluationContext::partition_residual_demand`]). Effectful and
+    /// copying work folds into the known program as `allow_effect_folding` and `allow_copy_folding` permit (refer to
+    /// [`Self::partition_with_configuration`]).
     ///
     /// # Errors
     ///
@@ -1196,6 +1208,7 @@ where
         self,
         demanded_outputs: &[bool],
         allow_effect_folding: bool,
+        allow_copy_folding: bool,
         residual_placement: Rc<dyn ResidualPlacement<V, O>>,
     ) -> Result<PartitionedProgram<V, O>, ProgramError>
     where
@@ -1205,6 +1218,7 @@ where
         let (mut partition, _) = self.partition_with_configuration(
             &input_known,
             allow_effect_folding,
+            allow_copy_folding,
             false,
             None,
             Some(residual_placement.clone()),
@@ -1287,7 +1301,12 @@ where
         residual_placement.place_residuals(
             partition,
             Some(&|region: RegionRef<'_, V, O>, instruction_index: usize, demanded_outputs: &[bool]| {
-                region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement.clone())
+                region.split_on_residual_demand(
+                    instruction_index,
+                    demanded_outputs,
+                    allow_copy_folding,
+                    residual_placement.clone(),
+                )
             }),
         )
     }
@@ -1297,7 +1316,9 @@ where
     /// operation, and returns the split as a partition of that instruction. The partition receives every input of the
     /// instruction as a known input. Its known program returns the outputs of the instruction followed by its residual
     /// edges, which are the values that the residual policy of `residual_placement` saves together with the inputs that
-    /// the replay part reads, and its residual program returns the demanded outputs, in output order.
+    /// the replay part reads, and its residual program returns the demanded outputs, in output order. The partial
+    /// evaluation context of the split permits copying work to fold as `allow_copy_folding` states (refer to
+    /// [`PartialEvaluationContext::with_allow_copy_folding`]).
     ///
     /// Returns [`None`] when the operation keeps the instruction whole, and without consulting the operation when the
     /// instruction has effects or deferred work, or when one of its inputs or outputs is a reference or has type
@@ -1312,6 +1333,7 @@ where
         self,
         instruction_index: usize,
         demanded_outputs: &[bool],
+        allow_copy_folding: bool,
         residual_placement: Rc<dyn ResidualPlacement<V, O>>,
     ) -> Result<Option<PartitionedProgram<V, O>>, ProgramError>
     where
@@ -1337,6 +1359,7 @@ where
         let context = TracingContext::<V, O>::new();
         let evaluation_context = PartialEvaluationContext::new(context.clone())
             .with_reference_placement(ReferencePlacement::Stage)
+            .with_allow_copy_folding(allow_copy_folding)
             .with_residual_placement(Some(residual_placement));
         let inputs = input_types
             .iter()
@@ -1936,7 +1959,7 @@ mod tests {
         assert!(ordinary.has_effect_ordering_conflicts());
         let (repeated, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[true, false], true, true, true, Some(&[0]), None)
             .unwrap();
         assert!(!repeated.has_effect_ordering_conflicts());
         assert!(!program.partition(&[false, false]).unwrap().has_effect_ordering_conflicts());
@@ -2315,7 +2338,7 @@ mod tests {
             .unwrap();
         let (repeated, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[true, false], true, true, true, Some(&[0]), None)
             .unwrap();
         assert!(!repeated.forward_residuals().unwrap().has_effect_ordering_conflicts());
 
@@ -2336,7 +2359,7 @@ mod tests {
             .unwrap();
         let (repeated, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false, true], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[true, false, true], true, true, true, Some(&[0]), None)
             .unwrap();
         assert!(!repeated.has_effect_ordering_conflicts());
         let forwarded = repeated.forward_residuals().unwrap();
@@ -2592,7 +2615,7 @@ mod tests {
             .unwrap();
         let (partition, deferred_instructions) = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[true, false], true, true, true, Some(&[0]), None)
             .unwrap();
 
         assert_eq!(deferred_instructions, HashSet::from([InstructionId::new(program.entry_region_ref().id(), 0)]));
@@ -2617,7 +2640,7 @@ mod tests {
             Ok(vec![TestValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
         assert!(
-            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[1]), None),
+            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, true, Some(&[1]), None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "required output 1 depends on deferred work in a repeated residual computation",),
         );
@@ -2628,7 +2651,7 @@ mod tests {
         let program = reference_ordering_program();
         let partition = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, false, None, None)
+            .partition_with_configuration(&[true, false], true, true, false, None, None)
             .unwrap()
             .0;
         let destination = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
@@ -2660,7 +2683,7 @@ mod tests {
         let program = reference_ordering_program();
         let partition = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, None, None)
+            .partition_with_configuration(&[true, false], true, true, true, None, None)
             .unwrap()
             .0;
         let destination = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
@@ -2722,7 +2745,7 @@ mod tests {
             .unwrap();
         let (partition, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[false], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[false], true, true, true, Some(&[0]), None)
             .unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
         assert!(partition.residual_program().instructions().is_empty());
@@ -2750,7 +2773,7 @@ mod tests {
         // each residual call, rather than retain a reference created once by the known program.
         let (partition, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[false], true, true, Some(&[]), None)
+            .partition_with_configuration(&[false], true, true, true, Some(&[]), None)
             .unwrap();
         assert!(partition.known_program().instructions().is_empty());
         assert!(partition.known_reference_inputs().next().is_none());
@@ -2780,7 +2803,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert!(
-            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[0]), None),
+            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, true, Some(&[0]), None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "required output 0 depends on deferred work in a repeated residual computation",),
         );
@@ -2802,7 +2825,7 @@ mod tests {
         // A captured reference and a symbolic input have different analysis roots, but that alone cannot establish
         // their runtime independence. Keep the captured access behind the earlier deferred read.
         assert!(matches!(
-            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0]), None),
+            program.entry_region_ref().partition_with_configuration(&[false], true, true, true, Some(&[0]), None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "required output 0 depends on deferred work in a repeated residual computation",
         ),);
@@ -2831,9 +2854,11 @@ mod tests {
 
         // Recursive discovery preserves the initially known output. Until its ownership is explicit, keeping the
         // allocation outside repeated execution would silently retain updates from earlier calls.
-        assert!(matches!(program.entry_region_ref().partition_with_configuration(&[false], true, true, None, None),
+        assert!(
+            matches!(program.entry_region_ref().partition_with_configuration(&[false], true, true, true, None, None),
             Err(ProgramError::MalformedProgram(message))
-                if message == "local reference allocation contributes to both required known outputs and deferred state",),);
+                if message == "local reference allocation contributes to both required known outputs and deferred state",),
+        );
     }
 
     #[test]
@@ -2843,7 +2868,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         assert!(matches!(
-            program.entry_region_ref().partition_with_configuration(&[true], true, true, Some(&[1]), None),
+            program.entry_region_ref().partition_with_configuration(&[true], true, true, true, Some(&[1]), None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "required known output index 1 is out of bounds",
         ),);
@@ -2873,7 +2898,7 @@ mod tests {
         // Initially only the final write is residual, so it defers the second allocation. Replaying then defers its
         // read and print; that print keeps the first allocation's write residual, requiring another discovery pass.
         let (partition, deferred_instructions) =
-            region.partition_with_configuration(&[false], true, true, Some(&[]), None).unwrap();
+            region.partition_with_configuration(&[false], true, true, true, Some(&[]), None).unwrap();
         assert_eq!(
             deferred_instructions,
             HashSet::from([InstructionId::new(region.id(), 0), InstructionId::new(region.id(), 1)]),
@@ -2920,7 +2945,7 @@ mod tests {
         // The required read folds on the first pass. Deferring the local allocation also defers the preceding print,
         // so preserving ordered effects makes the required read residual on the next pass.
         assert!(matches!(
-            program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[0]), None),
+            program.entry_region_ref().partition_with_configuration(&[true, false], true, true, true, Some(&[0]), None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "required output 0 depends on deferred work in a repeated residual computation",
         ),);
@@ -2946,7 +2971,7 @@ mod tests {
         // It can remain on the known side and cross the boundary without accumulating state between calls.
         let (partition, deferred_instructions) = program
             .entry_region_ref()
-            .partition_with_configuration(&[false], true, true, Some(&[0]), None)
+            .partition_with_configuration(&[false], true, true, true, Some(&[0]), None)
             .unwrap();
         assert!(deferred_instructions.is_empty());
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
@@ -3409,7 +3434,9 @@ mod tests {
                 .unwrap();
             let placement: Rc<dyn ResidualPlacement<TestValue, GuardedSplitFamily>> =
                 Rc::new(ResidualPolicyReference::new(NothingSavable));
-            assert!(program.entry_region_ref().split_on_residual_demand(0, &[true], placement).unwrap().is_none());
+            assert!(
+                program.entry_region_ref().split_on_residual_demand(0, &[true], true, placement).unwrap().is_none()
+            );
         }
 
         let scalar = ArrayType::scalar(DataType::F32);
@@ -3438,11 +3465,11 @@ mod tests {
         let placement: Rc<dyn ResidualPlacement<Array, MalformedSplitFamily>> =
             Rc::new(ResidualPolicyReference::new(NothingSavable));
         assert_eq!(
-            program.entry_region_ref().split_on_residual_demand(0, &[], placement.clone()).map(|_| ()),
+            program.entry_region_ref().split_on_residual_demand(0, &[], true, placement.clone()).map(|_| ()),
             Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            program.entry_region_ref().split_on_residual_demand(1, &[true], placement).map(|_| ()),
+            program.entry_region_ref().split_on_residual_demand(1, &[true], true, placement).map(|_| ()),
             Err(ProgramError::MalformedProgram("instruction index 1 is out of range".to_string())),
         );
     }
@@ -3463,7 +3490,10 @@ mod tests {
             let placement: Rc<dyn ResidualPlacement<Array, MalformedSplitFamily>> =
                 Rc::new(ResidualPolicyReference::new(NothingSavable));
             assert_eq!(
-                program.entry_region_ref().split_on_residual_demand(0, &demanded_outputs, placement).map(|_| ()),
+                program
+                    .entry_region_ref()
+                    .split_on_residual_demand(0, &demanded_outputs, true, placement)
+                    .map(|_| ()),
                 Err(ProgramError::MalformedProgram(
                     "operation `malformed_split` split on residual demand does not reproduce the outputs of the \
                      instruction"
