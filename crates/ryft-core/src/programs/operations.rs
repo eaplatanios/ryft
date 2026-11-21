@@ -273,10 +273,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [family](#nested-families), and member variants instead use the enclosing operation's canonical
 ///     fold-or-residualize path, which also consults their [`Operation::fold`] rules without a second partial-value
 ///     protocol, because the partial evaluation rule of a member or nested family belongs to programs over that family.
-///     Computational projected payloads must still implement that rule for a [`TracingContext`](crate::TracingContext)
-///     over the member projection of the constant type, which a context that does not allow copies to fold consults
-///     through [`PartialEvaluationContext::partially_evaluate_projected_operation`](
-///     crate::PartialEvaluationContext::partially_evaluate_projected_operation).
+///     That path still keeps an application with known inputs residual when the payload requires fresh storage under
+///     a context that does not allow copies to fold (refer to [`Operation::requires_fresh_storage`]).
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation and dispatches mixed variants in either role to the payload's parent-universe
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy
@@ -1021,6 +1019,20 @@ pub trait Operation: Clone {
         false
     }
 
+    /// Returns whether every execution of this [`Operation`] must give its outputs storage of their own (e.g., a
+    /// placement that forces a copy), so that two executions never return the same storage, even for the same inputs.
+    /// A transform that executes an application once and reuses its outputs across later executions must therefore
+    /// keep such an application, and every application whose executable computation regions contain one, in the work
+    /// that runs every time. Specialization does so using
+    /// [`PartialEvaluationContext::with_allow_copy_folding`](crate::PartialEvaluationContext::with_allow_copy_folding).
+    /// This describes only this operation and not the operations in its attached regions. The `false` default is
+    /// correct for every operation whose outputs may share storage with its inputs or with the outputs of its other
+    /// executions.
+    #[inline]
+    fn requires_fresh_storage(&self) -> bool {
+        false
+    }
+
     /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
     /// [`EffectClass`](crate::EffectClass)es and its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
     /// accesses), all expressed in this operation's input/output index space. Refer to the documentation of [`Effects`]
@@ -1210,6 +1222,11 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn defers_reference_discharge(&self) -> bool {
         self.as_ref().defers_reference_discharge()
+    }
+
+    #[inline]
+    fn requires_fresh_storage(&self) -> bool {
+        self.as_ref().requires_fresh_storage()
     }
 
     #[inline]
@@ -1920,6 +1937,10 @@ mod tests {
             region_index == 0 && mode == ReferenceAccessMode::Read
         }
 
+        fn requires_fresh_storage(&self) -> bool {
+            true
+        }
+
         fn effects(&self) -> Cow<'_, Effects> {
             Cow::Owned(
                 Effects::new(
@@ -2155,6 +2176,8 @@ mod tests {
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
+        assert!(operation.requires_fresh_storage());
+        assert!(!SinOperation::<ArrayType>::new().requires_fresh_storage());
         assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
         assert_eq!(
             operation.effects().classes(),

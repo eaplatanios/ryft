@@ -425,6 +425,7 @@ impl OperationCodeGenerator {
         let allows_reference_access_through_region_input_arms =
             forwarding_arms("allows_reference_access_through_region_input", quote!(region_index, mode));
         let defers_reference_discharge_arms = forwarding_arms("defers_reference_discharge", quote!());
+        let requires_fresh_storage_arms = forwarding_arms("requires_fresh_storage", quote!());
         let effects_arms = forwarding_arms("effects", quote!());
         let type_identity_renaming_arms = self.variants.iter().map(|variant| {
             let renaming =
@@ -559,6 +560,11 @@ impl OperationCodeGenerator {
                 #[inline]
                 fn defers_reference_discharge(&self) -> bool {
                     match self { #(#defers_reference_discharge_arms)* }
+                }
+
+                #[inline]
+                fn requires_fresh_storage(&self) -> bool {
+                    match self { #(#requires_fresh_storage_arms)* }
                 }
 
                 #[inline]
@@ -783,13 +789,12 @@ impl OperationCodeGenerator {
 
     /// Generates the `#[ryft(dispatch(partial_evaluation))]` implementation, which is a `PartiallyEvaluatableOperation`
     /// dispatcher that is generic over the partial evaluation context. Family-native variants delegate to the partial
-    /// evaluation rules of their payloads. Computational projected member variants are partially evaluated through
-    /// `PartialEvaluationContext::partially_evaluate_projected_operation`, which asks the rule of their payload,
-    /// in a staging context of their member universe, whether an application with known inputs folds. Bare generic
-    /// extension, family, mixed member, and structural projected member variants instead use the canonical
-    /// fold-or-residualize path of the complete enum, because the partial evaluation rule of a member or family payload
-    /// belongs to programs over its own family and cannot consume the partial values of the enclosing family without a
-    /// separate parent-boundary contract.
+    /// evaluation rules of their payloads. Bare generic extension, family, and member variants instead use the
+    /// canonical fold-or-residualize path of the complete enum, because the partial evaluation rule of a member or
+    /// family payload belongs to programs over its own family and cannot consume the partial values of the enclosing
+    /// family without a separate parent-boundary contract. That path still keeps an application whose payload requires
+    /// fresh storage residual under a context that does not allow copies to fold, because the enum forwards
+    /// `Operation::requires_fresh_storage` to its payloads.
     fn generate_partial_evaluation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -801,14 +806,6 @@ impl OperationCodeGenerator {
             !variant.is_generic_extension
                 && !variant.is_family
                 && matches!(variant.class, OperationVariantClass::FamilyNative)
-        };
-        let projected_member_type = |variant: &OperationVariant| match &variant.class {
-            OperationVariantClass::ProjectedMember { member_type, structural: false }
-                if !variant.is_generic_extension && !variant.is_family =>
-            {
-                Some(member_type.clone())
-            }
-            _ => None,
         };
         let mut generics = self.program_generics.clone();
         generics.params.push(syn::parse_quote!(__Context));
@@ -822,22 +819,6 @@ impl OperationCodeGenerator {
             let payload_type = &variant.program_payload_type;
             syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::PartiallyEvaluatableOperation<__Context>)
         }));
-
-        // The rule of a computational projected member payload runs in a staging context over the member projection
-        // of the constant type of the enum, which is the context in which programs of the member family are
-        // partitioned.
-        for variant in &self.variants {
-            let Some(member_type) = projected_member_type(variant) else {
-                continue;
-            };
-            let payload_type = &variant.program_payload_type;
-            let member_constant_type: syn::Type =
-                syn::parse_quote!(<#constant_type as #ryft::ValueProjection<#member_type>>::Projected);
-            where_clause.predicates.push(syn::parse_quote_spanned! { variant.span =>
-                #payload_type: #ryft::PartiallyEvaluatableOperation<#ryft::TracingContext<#member_constant_type, #payload_type>>
-            });
-        }
-
         let arms = self.variants.iter().map(|variant| {
             if delegates(variant) {
                 let payload_type = &variant.program_payload_type;
@@ -845,16 +826,6 @@ impl OperationCodeGenerator {
                 variant.arm(quote! {
                     <#payload_type as #ryft::PartiallyEvaluatableOperation<__Context>>::
                         partially_evaluate(#receiver, context, driver, inputs)
-                })
-            } else if let Some(member_type) = projected_member_type(variant) {
-                let receiver = variant.receiver();
-                variant.arm(quote! {
-                    context.partially_evaluate_projected_operation::<#member_type, _, __D>(
-                        self.clone(),
-                        #receiver,
-                        driver,
-                        inputs,
-                    )
                 })
             } else {
                 variant.wildcard_arm(quote!(context.fold_or_residualize(
@@ -3437,7 +3408,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(rendering(&generated.generics.where_clause), rendering(&operation.operation_generics.where_clause));
-        assert_eq!(generated.items.len(), 20);
+        assert_eq!(generated.items.len(), 21);
 
         // Functions that do not see the instruction boundary forward to the payload of every variant directly.
         assert_eq!(
@@ -3449,6 +3420,25 @@ mod tests {
                         Self::Add(operation) => { <AddOperation<ArrayIrType> as ryft::Operation>::name(operation) },
                         Self::Array(operation) => { <ArrayOperation<A> as ryft::Operation>::name(&**operation) },
                         Self::Gather(operation) => { <GatherOperation as ryft::Operation>::name(operation) },
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            function("requires_fresh_storage"),
+            rendering(&quote! {
+                #[inline]
+                fn requires_fresh_storage(&self) -> bool {
+                    match self {
+                        Self::Add(operation) => {
+                            <AddOperation<ArrayIrType> as ryft::Operation>::requires_fresh_storage(operation)
+                        },
+                        Self::Array(operation) => {
+                            <ArrayOperation<A> as ryft::Operation>::requires_fresh_storage(&**operation)
+                        },
+                        Self::Gather(operation) => {
+                            <GatherOperation as ryft::Operation>::requires_fresh_storage(operation)
+                        },
                     }
                 }
             }),
@@ -3766,9 +3756,8 @@ mod tests {
 
     #[test]
     fn test_operation_code_generator_generate_partial_evaluation_dispatcher() {
-        // Family-native variants delegate to their payloads, computational projected member variants are partially
-        // evaluated through the rule of their payloads in a staging context of their member universe, and family and
-        // generic extension variants use the canonical fold-or-residualize path of the complete enum.
+        // Family-native variants delegate to their payloads, while member, family, and generic extension variants use
+        // the canonical fold-or-residualize path of the complete enum.
         let operation = code_generator(quote! {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), dispatch(partial_evaluation))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
@@ -3801,12 +3790,6 @@ mod tests {
                         Operation = Operation<A, Extension>,
                     >,
                     AddOperation<ArrayIrType>: ryft::PartiallyEvaluatableOperation<__Context>,
-                    ArrayOperation<A>: ryft::PartiallyEvaluatableOperation<
-                        ryft::TracingContext<
-                            <ArrayIrValue<A> as ryft::ValueProjection<ArrayType>>::Projected,
-                            ArrayOperation<A>,
-                        >,
-                    >,
                 {
                     #[inline]
                     fn partially_evaluate<__D: ryft::PartialEvaluationDriver<__Context>>(
@@ -3823,13 +3806,8 @@ mod tests {
                                 <AddOperation<ArrayIrType> as ryft::PartiallyEvaluatableOperation<__Context>>::
                                     partially_evaluate(operation, context, driver, inputs)
                             },
-                            Self::Array(operation) => {
-                                context.partially_evaluate_projected_operation::<ArrayType, _, __D>(
-                                    self.clone(),
-                                    operation,
-                                    driver,
-                                    inputs,
-                                )
+                            Self::Array(..) => {
+                                context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
                             },
                             Self::Portable(..) => {
                                 context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)

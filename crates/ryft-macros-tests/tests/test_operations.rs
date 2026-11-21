@@ -135,6 +135,10 @@ impl<const ID: u8> Operation for ProbeOperation<ID> {
         true
     }
 
+    fn requires_fresh_storage(&self) -> bool {
+        true
+    }
+
     fn effects(&self) -> Cow<'_, Effects> {
         Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)))
     }
@@ -603,6 +607,7 @@ fn test_operation() {
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(operation.defers_reference_discharge());
+        assert!(operation.requires_fresh_storage());
         assert_eq!(operation.effects().into_owned(), Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)));
         assert_eq!(operation.to_string(), format!("probe [id={id}, indentation=0]"));
         let pruning = operation

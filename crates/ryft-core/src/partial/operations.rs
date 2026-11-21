@@ -466,12 +466,11 @@ where
 /// generated per-payload predicates transport that rule's value and context requirements to the enum's use site.
 /// Mixed and structural member variants instead use the enclosing enum's canonical fold-or-residualize path because
 /// member-side partial values cannot represent values belonging to other members of the heterogeneous universe. This
-/// preserves correct folding and residualization without a second projected partial-value protocol. Computational
-/// projected member variants also use that path, except that the rule of their payload decides whether an application
-/// with known inputs folds (refer to [`PartialEvaluationContext::partially_evaluate_projected_operation`]), so their
-/// payloads must implement this trait for a [`TracingContext`] over the member projection of the constant type of the
-/// enum. Variants that declare `#[ryft(family)]` use the default path, because the rule of a nested family belongs to
-/// programs over that family. Refer to the documentation of [`Operation`] for the full derive contract.
+/// preserves correct folding and residualization without a second projected partial-value protocol, including for
+/// payloads that require fresh storage (refer to [`Operation::requires_fresh_storage`]), which that path keeps residual
+/// under a context that does not allow copies to fold. Variants that declare `#[ryft(family)]` use the default path,
+/// because the rule of a nested family belongs to programs over that family. Refer to the documentation of
+/// [`Operation`] for the full derive contract.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses

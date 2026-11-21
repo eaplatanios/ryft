@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
-use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::ReplayTypeIdentities;
 use crate::macros::check_count;
 use crate::operations::GuardOperation;
@@ -24,18 +24,18 @@ use crate::partial::values::{
 };
 use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
-    AtomId, AttachedRegions, EffectClasses, EmptyRegionDriver, FlatProgram, InstructionId, Operation,
-    OperationPayloadProjection, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceAnalysis, ReferenceIdentity, RegionDriver, RegionRef,
-    RegionReplayMappings, RegionRole, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeRefinements,
-    Typed, Value, ValueDomainDispatch, ValueProjection,
+    AtomId, AttachedRegions, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
+    OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope,
+    ProvenanceState, ReferenceAnalysis, ReferenceIdentity, RegionDriver, RegionRef, RegionReplayMappings, RegionRole,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, TypeRefinements, Typed, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 
 /// Placement of _known_ reference operations when the known-side [`Context`] of a [`PartialEvaluationContext`] is
-/// eager. Under a [`StagingContext`] known side the two placements coincide, because folding stages an operation into
-/// the outer program instead of executing it, and both follow the ordering rules on [`PartialEvaluationContext`]: once
-/// an ordered effect is deferred, later ordered effects remain residual too.
+/// eager. Under a [`StagingContext`](crate::StagingContext) known side the two placements coincide, because folding
+/// stages an operation into the outer program instead of executing it, and both follow the ordering rules on
+/// [`PartialEvaluationContext`]: once an ordered effect is deferred, later ordered effects remain residual too.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReferencePlacement {
     /// Known reference operations fold like every other ordered effect. Under an eager known side they execute at
@@ -217,12 +217,15 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// which is what a single evaluation (e.g., linearization) needs. Nested partial evaluations and partitions of
     /// regions inherit this setting.
     ///
-    /// The setting reaches every route by which known work folds. Each operation decides it in its own partial
-    /// evaluation rule, including the projected members of heterogeneous operation families (refer to
-    /// [`Self::partially_evaluate_projected_operation`]). A region-carrying operation whose inputs are all known
-    /// folds its regions whole only when they hold no work that refuses to fold (refer to [`Self::can_fold_regions`]).
-    /// Splits on residual demand (refer to [`Self::partition_residual_demand`]) partition their regions with this
-    /// setting as well, so they only reach regions that fold whole under it, which can therefore not contain such
+    /// The setting reaches every route by which known work folds. [`Self::fold_or_residualize`] enforces it for every
+    /// operation, so that rules need not check it themselves. It keeps an application whose inputs are all known
+    /// residual when its operation, or an operation in one of its executable computation regions (including the
+    /// computation regions nested within them), requires fresh storage (refer to [`Operation::requires_fresh_storage`]).
+    /// This includes the members of heterogeneous operation families and region-carrying operations (e.g., `scan`,
+    /// `rematerialize`, or a composite call) whose regions it would otherwise evaluate whole. Dormant rule regions
+    /// (e.g., the transpose region of a `linear_call`) do not run when the application runs, so they do not keep it
+    /// residual. Splits on residual demand (refer to [`Self::partition_residual_demand`]) partition their regions with
+    /// this setting as well, so they only reach regions that fold whole under it, which can therefore not contain such
     /// work. Rules that retain partitions across partial evaluations must include this setting in their cache keys.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program or
@@ -516,51 +519,11 @@ impl<C: Context> PartialEvaluationContext<C> {
             && (!effects.contains_ordered_class() || !self.state.defer_ordered_effects.get())
     }
 
-    /// Returns whether an application whose inputs are all known may fold its computation `regions` whole (i.e.,
-    /// evaluate them outright in the known-side context through [`Self::fold_or_residualize`], as the rules of
-    /// region-carrying operations like `scan` and `while` do when all of their inputs are known). Folding an
-    /// application whole bypasses the partial evaluation rules of the operations in its regions. That is only sound
-    /// when none of them would refuse to fold under this context, which this function checks by partitioning every
-    /// region with all of its inputs known through `driver`, whose partitions consult those rules (including the rules
-    /// of nested region-carrying operations). The regions fold whole when no partition leaves work in its residual
-    /// program. An application that cannot fold whole must stay residual, so that the work of its regions runs every
-    /// time that the residual program runs.
-    ///
-    /// The only rules that refuse to fold work with known inputs beyond what [`Self::fold_or_residualize`] itself
-    /// checks for the whole application (e.g., effects, deferred work, and references) are those of operations whose
-    /// results must have storage of their own for every execution, which refuse only when this context does not allow
-    /// copies to fold (refer to [`Self::with_allow_copy_folding`]). Every region therefore folds whole without being
-    /// partitioned when copies may fold, which is the default.
-    ///
-    /// # Parameters
-    ///
-    ///   - `driver`: [`PartialEvaluationDriver`] of the application, which partitions its regions.
-    ///   - `regions`: Computation regions of the application. Dormant regions (e.g., derivative rules) do not run when
-    ///     the application runs and must not be included.
-    pub fn can_fold_regions<D: PartialEvaluationDriver<C>>(
-        &self,
-        driver: &D,
-        regions: &[RegionRef<'_, C::Constant, C::Operation>],
-    ) -> Result<bool, ProgramError> {
-        if self.allow_copy_folding() {
-            return Ok(true);
-        }
-
-        for &region in regions {
-            let partition = driver.partition_program(self, region, &vec![true; region.input_ids().len()])?;
-            if !partition.residual_program().instructions().is_empty() {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
     /// Applies the default partial evaluation policy to the provided `operation`. When all inputs are known, the
     /// operation is [`bind`](Context::bind)ed in the known-side [`Context`] (i.e., interpreting it under an eager
-    /// context and staging it into the outer program under a [`StagingContext`]), and its outputs become known trace
-    /// values. When any input is residual, all inputs are materialized into the residual program and the operation
-    /// is emitted unchanged.
+    /// context and staging it into the outer program under a [`StagingContext`](crate::StagingContext)), and its
+    /// outputs become known trace values. When any input is residual, all inputs are materialized into the residual
+    /// program and the operation is emitted unchanged.
     ///
     /// Before that execution policy, regionless operations without references can use [`Operation::fold`] to return
     /// existing inputs, even when unknown, or known constants determined by their inferred output types. Those
@@ -572,6 +535,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// transformation obligation (refer to the [Deferred Work](crate::Effects#deferred-work) section of the
     /// [`Effects`](crate::Effects) documentation). Dormant rule regions do not contribute deferred work.
     /// Rules that call this function therefore need not check deferred work themselves.
+    ///
+    /// The same holds for work that must produce storage of its own on every execution when this context does not
+    /// allow copies to fold (refer to [`Self::with_allow_copy_folding`]). An operation that requires fresh storage, or
+    /// one whose executable computation regions contain such an operation at any depth, is residualized, even when all
+    /// of its inputs are known, so that the work runs every time that the residual program runs. Dormant rule regions
+    /// are not inspected. Under the default setting, this costs a single branch per application.
     ///
     /// # Effect Placement Contract
     ///
@@ -706,11 +675,29 @@ impl<C: Context> PartialEvaluationContext<C> {
                     }))
         };
 
+        // Under a context that does not allow copies to fold, work that must produce storage of its own on every
+        // execution remains residual, so that it runs every time that the residual program runs. Folding a
+        // region-carrying application whole would bypass the rules of the operations in its regions, so those are
+        // inspected too. Dormant rule regions do not run when this operation runs.
+        let must_defer_copies = || {
+            !self.state.allow_copy_folding && operation.requires_fresh_storage()
+                || regions.regions().enumerate().any(|(index, region)| {
+                    operation.region_role(index) == Some(RegionRole::Computation)
+                        && region.computation_regions().any(|region| {
+                            region
+                                .instructions()
+                                .iter()
+                                .any(|instruction| instruction.operation().requires_fresh_storage())
+                        })
+                })
+        };
+
         // Deferred work always remains residual because folding it would discharge its transformation obligation.
         if !inputs.iter().all(PartialEvaluationValue::is_known)
             || summary.has_deferred_work()
             || !self.can_fold_effects(effects)
             || must_defer_references()
+            || must_defer_copies()
         {
             return self.residualize_with_effects(operation, regions, inputs, effects);
         }
@@ -927,71 +914,6 @@ impl<C: Context> PartialEvaluationContext<C> {
                 PartialEvaluationValue::variable(r#type, atom)
             })
             .collect())
-    }
-
-    /// Partially evaluates `operation`, an application of the projected member `member` of the operation family of this
-    /// context (refer to [`OperationProjection`](crate::OperationProjection)). The partial evaluation rule of `member`
-    /// belongs to programs over the member universe `T`, so it cannot consume the partial values of this context or
-    /// emit work into its residual program, and the application follows [`Self::fold_or_residualize`].
-    ///
-    /// The one exception is a context that does not allow copies to fold (refer to [`Self::with_allow_copy_folding`]),
-    /// such as that of specialization. There, the rule of `member` must be able to refuse to fold an application whose
-    /// inputs are all known (e.g., a placement that forces a copy), so this function asks the rule whether it folds
-    /// the application by evaluating it in a fresh staging context over `T`, whose inputs are all known and which does
-    /// not allow copies to fold either. The application then folds through [`Self::fold_or_residualize`] when the rule
-    /// makes every output known, and it stays residual otherwise. Only that decision crosses from the rule to this
-    /// context, so a rule that would replace the application with other work (e.g., a constant of its output type) or
-    /// keep some of its outputs known while others depend on an unknown input has the effect of the default rule here.
-    /// Under the default setting, which linearization and every other single evaluation use, the rule is not consulted,
-    /// because the only rules that refuse to fold work with known inputs beyond what [`Self::fold_or_residualize`]
-    /// checks are those of copies (refer to [`Self::can_fold_regions`]), so the application costs nothing beyond the
-    /// default path. An application with an unknown input, a region, or an application that the rule rejects follows
-    /// [`Self::fold_or_residualize`] directly, which reports any error. Operation families derived with
-    /// `#[ryft(dispatch(partial_evaluation))]` use this function for their computational projected
-    /// member variants.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Application in the operation family of this context, which holds `member`.
-    ///   - `member`: Projected member operation of `operation`.
-    ///   - `driver`: [`PartialEvaluationDriver`] of the application.
-    ///   - `inputs`: [`PartialEvaluationValue`] for each input of the application, in input order.
-    #[inline]
-    pub fn partially_evaluate_projected_operation<T: Type, O, D: PartialEvaluationDriver<C>>(
-        &self,
-        operation: C::Operation,
-        member: &O,
-        driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
-    where
-        O: Operation<Type = T>
-            + OperationProvider<T, GuardOperation<T>, Operation = O>
-            + PartiallyEvaluatableOperation<TracingContext<<C::Constant as ValueProjection<T>>::Projected, O>>,
-        C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-        for<'t> &'t T: TryFrom<&'t C::Type, Error = TypeError>,
-    {
-        if !self.allow_copy_folding()
-            && driver.region_count() == 0
-            && inputs.iter().all(PartialEvaluationValue::is_known)
-        {
-            let probe = TracingContext::<<C::Constant as ValueProjection<T>>::Projected, O>::new();
-            let probe_context = PartialEvaluationContext::new(probe.clone()).with_allow_copy_folding(false);
-            let probe_inputs = inputs
-                .iter()
-                .map(|input| {
-                    let r#type = <&T>::try_from(input.r#type().as_ref())?.clone();
-                    Ok(PartialEvaluationValue::known_input(probe.input(r#type)))
-                })
-                .collect::<Result<Vec<_>, TypeError>>();
-            if let Ok(probe_inputs) = probe_inputs
-                && let Ok(outputs) = member.partially_evaluate(&probe_context, &EmptyRegionDriver, &probe_inputs)
-                && !outputs.iter().all(PartialEvaluationValue::is_known)
-            {
-                return self.residualize(operation, driver.region_programs(), inputs);
-            }
-        }
-        self.fold_or_residualize(operation, driver.region_programs(), inputs)
     }
 
     /// Partitions `region` with every input known, like [`PartialEvaluationDriver::partition_program`], except that
@@ -1373,9 +1295,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
     /// folded loop-invariant carry spliced into a rebuilt `scan` body), where only a program constant can represent
     /// it (nested programs cannot reference atoms of the enclosing residual program or of the outer known-side
-    /// program). Under an eager known-side context this always succeeds. Under a [`StagingContext`] it succeeds
-    /// only for literal-backed values, and the caller must treat the error as "this rewrite is not available"
-    /// and fall back to a conservative alternative.
+    /// program). Under an eager known-side context this always succeeds. Under a
+    /// [`StagingContext`](crate::StagingContext) it succeeds only for literal-backed values, and the caller must treat
+    /// the error as "this rewrite is not available" and fall back to a conservative alternative.
     #[inline]
     pub fn known_constant(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
         self.state.parent.resolve(value).into_constant().ok_or_else(|| {
@@ -2854,40 +2776,6 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_can_fold_regions() {
-        // A region folds whole unless partitioning it with all of its inputs known leaves residual work, which only a
-        // copy that must not fold under the context does here. Contexts that allow copies to fold never partition.
-        let region = |copy: bool| {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-            let output = if copy {
-                let operation = ArrayOperation::from(PlaceOperation::new(None, None).with_may_alias(false));
-                builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0]
-            } else {
-                builder
-                    .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![input], None)
-                    .unwrap()[0]
-            };
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let (copy, negation) = (region(true), region(false));
-        let regions = AttachedRegions::<TestValue, TestOperation>::Callees(&[]);
-        let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
-        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
-        assert_eq!(context.can_fold_regions(&EmptyRegionDriver, &[copy.entry_region_ref()]), Ok(true));
-        let context = context.with_allow_copy_folding(false);
-        assert_eq!(context.can_fold_regions(&driver, &[negation.entry_region_ref()]), Ok(true));
-        assert_eq!(context.can_fold_regions(&driver, &[copy.entry_region_ref()]), Ok(false));
-        assert_eq!(
-            context.can_fold_regions(&driver, &[negation.entry_region_ref(), copy.entry_region_ref()]),
-            Ok(false)
-        );
-        assert_eq!(context.can_fold_regions(&driver, &[]), Ok(true));
-    }
-
-    #[test]
     fn test_partial_evaluation_context_fold_or_residualize() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
@@ -2911,6 +2799,86 @@ mod tests {
         assert_eq!(
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0).unwrap()]),
             Ok(vec![Array::scalar(-7.0).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_requires_fresh_storage() {
+        // A copy of a known input folds under the default setting. A context that does not allow copies to fold keeps
+        // it residual, also when a heterogeneous family holds it through a projected member, while a placement whose
+        // output may share storage with its input still folds.
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let known = PartialEvaluationValue::known(TestValue::Array(input.clone()));
+        let copy = TestOperation::Array(ArrayOperation::Place(PlaceOperation::new(None, None).with_may_alias(false)));
+        let alias = TestOperation::Array(ArrayOperation::Place(PlaceOperation::new(None, None)));
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let outputs = context.fold_or_residualize(copy.clone(), Vec::new(), std::slice::from_ref(&known)).unwrap();
+        assert_eq!(outputs[0].as_known(), Some(&TestValue::Array(input.clone())));
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        let context = context.with_allow_copy_folding(false);
+        let outputs = context.fold_or_residualize(alias, Vec::new(), std::slice::from_ref(&known)).unwrap();
+        assert_eq!(outputs[0].as_known(), Some(&TestValue::Array(input.clone())));
+        let outputs = context.fold_or_residualize(copy, Vec::new(), std::slice::from_ref(&known)).unwrap();
+        assert!(outputs[0].is_unknown());
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = place [may_alias=false] %0
+                in (%1)"
+            },
+        );
+
+        // A region-carrying application folds whole unless one of its executable computation regions copies. A copy in
+        // a dormant region (e.g., the transpose region of a `linear_call`), which a fold does not execute, does not
+        // keep it residual.
+        let region = |may_alias: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32));
+            let copy = PlaceOperation::new(None, None).with_may_alias(may_alias);
+            let output = builder.add_instruction(copy, Vec::new(), vec![input], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let input = Array::scalar(4.0f32).unwrap();
+        let known = PartialEvaluationValue::known(input.clone());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new())
+            .with_allow_copy_folding(false);
+        let outputs = context
+            .fold_or_residualize(
+                LinearCallOperation::new(0),
+                vec![region(true), region(false)],
+                std::slice::from_ref(&known),
+            )
+            .unwrap();
+        assert_eq!(outputs[0].as_known(), Some(&input));
+        let outputs = context
+            .fold_or_residualize(
+                LinearCallOperation::new(0),
+                vec![region(false), region(true)],
+                std::slice::from_ref(&known),
+            )
+            .unwrap();
+        assert!(outputs[0].is_unknown());
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = linear_call [residual_count=0] %0 [
+                    forward={
+                        lambda %0:f32[] .
+                        let %1:f32[] = place [may_alias=false] %0
+                        in (%1)
+                    },
+                    transpose={
+                        lambda %0:f32[] .
+                        let %1:f32[] = place %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"
+            },
         );
     }
 
@@ -3816,54 +3784,6 @@ mod tests {
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         assert!(context.state.builder.borrow().instructions().is_empty());
         assert_eq!(context.state.builder.borrow().regions.len(), 0);
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_partially_evaluate_projected_operation() {
-        // Under specialization, the rule of the projected array member decides whether an application with known
-        // inputs folds, so a copy stays residual when the context does not allow copies to fold, while a placement
-        // that may alias folds. Under the default setting, both follow the default path and fold as they did before.
-        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
-        let known = PartialEvaluationValue::known(TestValue::Array(input.clone()));
-        let copy = ArrayOperation::Place(PlaceOperation::new(None, None).with_may_alias(false));
-        let alias = ArrayOperation::Place(PlaceOperation::new(None, None));
-        let evaluate = |context: &PartialEvaluationContext<EagerContext<TestValue, TestOperation>>,
-                        member: &ArrayOperation<Array>| {
-            context
-                .partially_evaluate_projected_operation::<ArrayType, _, _>(
-                    TestOperation::Array(member.clone()),
-                    member,
-                    &EmptyRegionDriver,
-                    std::slice::from_ref(&known),
-                )
-                .unwrap()
-        };
-
-        // Contexts that allow copies to fold fold both placements exactly as the default rule does, without emitting
-        // residual work.
-        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
-        let default = context
-            .fold_or_residualize(TestOperation::Array(copy.clone()), Vec::new(), std::slice::from_ref(&known))
-            .unwrap();
-        assert_eq!(default[0].as_known(), Some(&TestValue::Array(input.clone())));
-        assert_eq!(evaluate(&context, &copy)[0].as_known(), default[0].as_known());
-        assert_eq!(evaluate(&context, &alias)[0].as_known(), Some(&TestValue::Array(input.clone())));
-        assert!(context.state.builder.borrow().instructions().is_empty());
-
-        // Contexts that do not allow copies to fold keep the copy residual.
-        let context = context.with_allow_copy_folding(false);
-        assert_eq!(evaluate(&context, &alias)[0].as_known(), Some(&TestValue::Array(input.clone())));
-        let outputs = evaluate(&context, &copy);
-        assert!(outputs[0].is_unknown());
-        let evaluation = context.into_evaluation(outputs).unwrap();
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-                lambda %0:f32[2] .
-                let %1:f32[2] = place [may_alias=false] %0
-                in (%1)"
-            },
-        );
     }
 
     #[test]

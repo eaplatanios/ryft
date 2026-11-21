@@ -107,7 +107,7 @@ pub enum ParameterError {
         match paths.as_deref() {
             None => "got more parameters than expected".to_string(),
             Some(paths) => format!(
-                "got more parameters than expected; unused parameter paths: {}",
+                "unused parameter paths: {}",
                 paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", "),
             ),
         }
@@ -119,7 +119,7 @@ pub enum ParameterError {
         match paths.as_deref() {
             None => format!("got fewer parameters than expected; expected at least {expected_count}"),
             Some(paths) => format!(
-                "got fewer parameters than expected; expected at least {expected_count}; missing parameter paths: {}",
+                "missing parameter paths: {}",
                 paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", "),
             ),
         }
@@ -134,6 +134,13 @@ pub enum ParameterError {
 
     #[error("mismatched parameter structures: {left_structure} and {right_structure}")]
     MismatchedParameterStructures { left_structure: String, right_structure: String },
+
+    #[error(
+        "got multiple nodes with the same parameter path; distinct map keys must have distinct `Debug` texts; \
+         duplicate parameter paths: {}",
+        paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", "),
+    )]
+    DuplicateParameterPaths { paths: Vec<String> },
 }
 
 /// Helper trait used to encode type equality constraints in the associated type bounds of [`Parameterized`].
@@ -211,7 +218,11 @@ pub enum ParameterPathSegment {
     /// Index/position in indexable containers (e.g., arrays and [`Vec`]).
     Index(usize),
 
-    /// [`Debug`]-formatted key of a map entry (e.g., [`HashMap`] or [`BTreeMap`]).
+    /// [`Debug`]-formatted key of a map entry (e.g., [`HashMap`] or [`BTreeMap`]). Paths identify keys by this text
+    /// only, and so the entries of two distinct keys of one map with the same [`Debug`] text have the same paths.
+    /// The functions that match parameters by path (e.g., [`Parameterized::from_named_parameters`] and
+    /// [`Parameterized::broadcast_to_parameter_structure`]) cannot tell such entries apart, and so they reject them
+    /// with a [`ParameterError::DuplicateParameterPaths`] error instead of matching one entry in place of the other.
     Key(String),
 }
 
@@ -474,11 +485,14 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// model checkpoints, etc. These _named_ parameter operation variants are exposed via the [`Self::named_parameters`],
 /// [`Self::named_parameters_mut`], [`Self::into_named_parameters`], [`Self::from_named_parameters`],
 /// [`Self::from_broadcasted_named_parameters`], [`Self::try_map_parameters`], [`Self::map_parameters`],
-/// [`Self::try_map_named_parameters`], and [`Self::map_named_parameters`] functions. Among them,
-/// [`Self::from_broadcasted_named_parameters`] and [`Self::broadcast_to_parameter_structure`] interpret a value as a
-/// tree prefix of the provided structure, whose leaves each cover all the nodes at and below their paths. Such a prefix
-/// is given by its leaves together with its nodes (refer to [`Self::paths`]), so that the nodes of both trees can
-/// be matched by path, including the containers without leaves, which have no leaf paths.
+/// [`Self::try_map_named_parameters`], and [`Self::map_named_parameters`] functions. Relatedly,
+/// [`Self::broadcast_to_parameter_structure`] interprets a value as a tree prefix of the provided structure, whose
+/// leaves each cover all the nodes at and below their paths. The nodes of both trees (refer to [`Self::paths`]) are
+/// matched by path, including the containers without leaves, which have no leaf paths. Every node of the prefix must
+/// therefore be a node of the structure, every node of the structure must be a node of the prefix or lie at or below
+/// one of its leaves, and the nodes that are matched by path must have distinct paths.
+/// [`Self::from_broadcasted_named_parameters`] broadcasts the named leaves of a prefix without its containers instead,
+/// and so it cannot check that the nodes of the structure without leaves are covered.
 ///
 /// Note that, the [`Parameterized`] trait also defines a bunch of additional functions that are implemented using the
 /// aforementioned core primitives like [`Self::partition_parameters`], [`Self::filter_parameters`], etc. You should
@@ -537,26 +551,25 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     (2_i64, BTreeMap::from([("a", vec![5_i64]), ("b", vec![6_i64, 7_i64])]), (7_i64,)),
 /// );
 ///
-/// // Unflattening from the broadcasted named parameters of a tree prefix:
+/// // Broadcasting a tree prefix:
 /// let prefix = (0, BTreeMap::from([("a", 10), ("b", 20)]), 50);
 /// assert_eq!(
-///     Value::from_broadcasted_named_parameters(
-///         value.parameter_structure(),
-///         prefix.clone().into_named_parameters(),
-///         prefix.paths(),
-///     )?,
+///     prefix.broadcast_to_parameter_structure::<Value>(value.parameter_structure())?,
 ///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![20, 20])]), (50,)),
 /// );
 ///
-/// // Unflattening from the broadcasted named parameters of a tree prefix whose leaves cover containers without leaves:
+/// // Broadcasting a tree prefix whose leaves cover containers without leaves:
 /// let prefix = (0, 10);
 /// assert_eq!(
-///     <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
-///         (Vec::new(), Placeholder),
-///         prefix.into_named_parameters(),
-///         prefix.paths(),
-///     )?,
+///     prefix.broadcast_to_parameter_structure::<(Vec<i32>, i32)>((Vec::new(), Placeholder))?,
 ///     (Vec::new(), 10),
+/// );
+///
+/// // Unflattening from the broadcasted named parameters of a tree prefix:
+/// let prefix = (0, BTreeMap::from([("a", 10), ("b", 20)]), 50);
+/// assert_eq!(
+///     Value::from_broadcasted_named_parameters(value.parameter_structure(), prefix.into_named_parameters())?,
+///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![20, 20])]), (50,)),
 /// );
 ///
 /// # Ok::<(), ryft_core::parameters::ParameterError>(())
@@ -899,34 +912,58 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
     /// from the provided `parameters` to populate its parameters. Unlike [`Self::from_broadcasted_named_parameters`],
     /// this function is strict in that keys in `parameters` must match exactly leaf [`ParameterPath`]s in `structure`,
-    /// and path prefix matching is not being used. If there are missing parameters preventing reconstruction from
-    /// being feasible, then this function will return a [`ParameterError::MissingParameters`] error. Furthermore,
-    /// if extra paths remain after reconstruction, then it will return an [`ParameterError::UnusedParameters`] error.
-    /// For fully worked examples, refer to the examples provided in the top-level documentation of the
-    /// [`Parameterized`] trait.
+    /// and path prefix matching is not being used. If two leaves of `structure` have the same path, or two entries of
+    /// `parameters` do, then this function will return a [`ParameterError::DuplicateParameterPaths`] error, because
+    /// the paths cannot tell them apart (e.g., the values of two map keys with the same [`Debug`] text, refer to
+    /// [`ParameterPathSegment::Key`]). If there are missing parameters preventing reconstruction from being feasible,
+    /// then this function will return a [`ParameterError::MissingParameters`] error. Furthermore, if extra paths
+    /// remain after reconstruction, then it will return an [`ParameterError::UnusedParameters`] error. For fully
+    /// worked examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
     fn from_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
     ) -> Result<Self, ParameterError> {
-        // We try to consume parameters in lockstep with `structure.named_parameters()` first. If we encounter any
-        // out-of-order parameters, we lazily materialize the remaining entries into a hash map and continue with
-        // keyed lookups.
-        let expected_count = structure.parameter_count();
-        let mut values = Vec::new();
-        values.reserve_exact(expected_count);
-        let mut matching_paths = Vec::new();
-        matching_paths.reserve_exact(expected_count);
+        // Collects the provided parameters that remain into a hash map for keyed lookups, and records the paths of
+        // those that repeat the path of a matched parameter or of another remaining parameter.
+        fn defer<P>(
+            parameters: impl Iterator<Item = (ParameterPath, P)>,
+            matched_paths: &[ParameterPath],
+            duplicate_paths: &mut Vec<String>,
+        ) -> HashMap<ParameterPath, P> {
+            let matched_paths = matched_paths.iter().collect::<HashSet<_>>();
+            let mut deferred = HashMap::with_capacity(parameters.size_hint().0);
+            for (path, parameter) in parameters {
+                if matched_paths.contains(&path) || deferred.contains_key(&path) {
+                    duplicate_paths.push(path.to_string());
+                } else {
+                    deferred.insert(path, parameter);
+                }
+            }
+            deferred
+        }
+
+        // Two leaves of `structure` with the same path would receive the provided parameters in provided order.
+        let expected_paths = structure.parameter_paths().collect::<Vec<_>>();
+        let mut duplicate_paths = find_duplicate_paths(&expected_paths);
+        if !duplicate_paths.is_empty() {
+            return Err(ParameterError::DuplicateParameterPaths { paths: duplicate_paths });
+        }
+
+        // We try to consume parameters in lockstep with the leaf paths of `structure` first, so that the matched
+        // paths are always the first `values.len()` expected paths. If we encounter any out-of-order parameters,
+        // we lazily materialize the remaining entries into a hash map and continue with keyed lookups.
+        let expected_count = expected_paths.len();
+        let mut values = Vec::with_capacity(expected_count);
         let mut missing_paths = Vec::new();
-        let mut deferred_parameters = None::<HashMap<_, _>>;
-        let mut matching_path_indices = None::<HashMap<ParameterPath, usize>>;
+        let mut deferred_parameters = None::<HashMap<ParameterPath, P>>;
         let mut parameters = parameters.into_iter();
         let mut next_parameter = parameters.next();
 
-        for (expected_path, _) in structure.named_parameters() {
+        for expected_path in &expected_paths {
             if let Some(deferred_parameters) = deferred_parameters.as_mut() {
                 // Once we fall back to deferred lookups, reconstruction is direct keyed removal
                 // for the remaining expected paths.
-                match deferred_parameters.remove(&expected_path) {
+                match deferred_parameters.remove(expected_path) {
                     Some(parameter) => values.push(parameter),
                     None => missing_paths.push(expected_path.to_string()),
                 }
@@ -934,41 +971,23 @@ pub trait Parameterized<P: Parameter>: Sized {
             }
 
             match next_parameter.take() {
-                Some((provided_path, parameter)) if provided_path == expected_path => {
+                Some((provided_path, parameter)) if &provided_path == expected_path => {
                     // As long as the provided parameter paths match the structure parameter paths that we are
                     // iterating over, we just consume the provided parameters without materializing a hash map.
                     values.push(parameter);
-                    matching_paths.push(expected_path);
                     next_parameter = parameters.next();
                 }
                 Some((provided_path, parameter)) => {
                     // Once there is a mismatch, we materialize the hash map and continue via keyed lookup.
-                    let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
-                    let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
-                        matching_paths
-                            .iter()
-                            .cloned()
-                            .enumerate()
-                            .map(|(index, path)| (path, index))
-                            .collect::<HashMap<_, _>>()
-                    });
-
-                    // For duplicate parameter paths, the last provided value wins. Duplicates targeting
-                    // already matched paths update `values` in place; all others remain deferred.
-                    let parameters = std::iter::once((provided_path, parameter)).chain(parameters.by_ref());
-                    for (provided_path, parameter) in parameters {
-                        if let Some(index) = matching_path_indices.get(&provided_path).copied() {
-                            values[index] = parameter;
-                        } else {
-                            deferred.insert(provided_path, parameter);
-                        }
-                    }
-
-                    match deferred.remove(&expected_path) {
+                    let mut deferred = defer(
+                        std::iter::once((provided_path, parameter)).chain(parameters.by_ref()),
+                        &expected_paths[..values.len()],
+                        &mut duplicate_paths,
+                    );
+                    match deferred.remove(expected_path) {
                         Some(parameter) => values.push(parameter),
                         None => missing_paths.push(expected_path.to_string()),
                     }
-
                     deferred_parameters = Some(deferred);
                 }
                 None => missing_paths.push(expected_path.to_string()),
@@ -979,30 +998,19 @@ pub trait Parameterized<P: Parameter>: Sized {
             && let Some((provided_path, parameter)) = next_parameter.take()
         {
             // No mismatch occurred during traversal, but additional parameters remain. We need to materialize
-            // the remaining parameters while still applying duplicate overrides for previously matched paths.
-            let mut deferred = HashMap::with_capacity(parameters.size_hint().0 + 1);
-            let matching_path_indices = matching_path_indices.get_or_insert_with(|| {
-                matching_paths
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(index, path)| (path, index))
-                    .collect::<HashMap<_, _>>()
-            });
-
-            let parameters = std::iter::once((provided_path, parameter)).chain(parameters);
-            for (provided_path, parameter) in parameters {
-                if let Some(index) = matching_path_indices.get(&provided_path).copied() {
-                    values[index] = parameter;
-                } else {
-                    deferred.insert(provided_path, parameter);
-                }
-            }
-
-            deferred_parameters = Some(deferred);
+            // the remaining parameters while still detecting those that repeat previously matched paths.
+            deferred_parameters = Some(defer(
+                std::iter::once((provided_path, parameter)).chain(parameters),
+                &expected_paths[..values.len()],
+                &mut duplicate_paths,
+            ));
         }
 
-        if !missing_paths.is_empty() {
+        if !duplicate_paths.is_empty() {
+            duplicate_paths.sort_unstable();
+            duplicate_paths.dedup();
+            Err(ParameterError::DuplicateParameterPaths { paths: duplicate_paths })
+        } else if !missing_paths.is_empty() {
             Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
         } else if deferred_parameters.is_some_and(|deferred_parameters| !deferred_parameters.is_empty()) {
             Err(ParameterError::UnusedParameters { paths: None })
@@ -1011,165 +1019,86 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
     }
 
-    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` from a tree prefix
-    /// of it, which is given as its leaves, `parameters`, and as its nodes, `paths` (i.e., the paths that
-    /// [`Self::paths`] returns for it). Unlike [`Self::from_named_parameters`], this function does not require
-    /// exact leaf paths, and each leaf of `structure` receives the value of its most specific prefix leaf (i.e., the
-    /// prefix leaf whose path is the longest prefix of its path). As in the tree prefix checks of JAX, the following
-    /// rules apply to the two trees:
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` from the leaves of a tree
+    /// prefix of it, `parameters`, each paired with its path. Unlike [`Self::from_named_parameters`], this function
+    /// does not require exact leaf paths, and each leaf of `structure` receives the value of its most specific prefix
+    /// leaf (i.e., the prefix leaf whose path is the longest prefix of its path). It applies the rules of
+    /// [`Self::broadcast_to_parameter_structure`] with the paths of the prefix leaves standing in for the nodes of the
+    /// prefix tree. Every leaf of `structure` must therefore have a prefix leaf whose path is equal to or a prefix of
+    /// its path, every prefix leaf path must be a node path of `structure` (e.g., the path of a container without
+    /// children, which the prefix leaf covers without populating any leaf), and distinct prefix leaves must have
+    /// distinct paths, and so must distinct nodes of `structure`, except strictly below a prefix leaf.
     ///
-    ///   - Every leaf of `structure` must have a prefix leaf whose path is equal to or a prefix of its path.
-    ///   - Every node path of the prefix tree must be a node path of `structure`.
-    ///   - Every node path of `structure` must be a node path of the prefix tree or lie at or below a prefix leaf.
-    ///
-    /// For example, `(a, b)` is a prefix of `(Vec::new(), x)`, a prefix with a single root leaf is a prefix of an empty
-    /// [`Vec`], `[a]` is a prefix of `[[x], []]`, and `[[], b]` is a prefix of `[[], y]`, whereas `[[a]]` is not a
-    /// prefix of `[[x], []]`, `[[a], []]` is not a prefix of `[[x]]`, and `[[]]` is not a prefix of `[]`. The paths
-    /// of the prefix leaves count as node paths of the prefix tree even when `paths` omits them. Note that since one
+    /// Since the containers of the prefix tree are not provided, this function cannot check that every node of
+    /// `structure` without leaves is a node of the prefix tree or lies below one of its leaves (e.g., it accepts
+    /// `[[a]]` as a prefix of `[[x], []]`, whose node `$[1]` the prefix tree lacks). Use
+    /// [`Self::broadcast_to_parameter_structure`] with the prefix tree itself for the full check. Note that since one
     /// prefix value may need to populate multiple leaves, this function requires `P: Clone`. For fully worked
     /// examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
     ///
-    /// Nodes are matched by their paths only, which is intended. A prefix tree of another type whose nodes have the
-    /// same paths (e.g., a derived struct with the same parameter fields as the one in `structure`, or an array for a
-    /// [`Vec`]) therefore matches, and so does a node of the same type whose static metadata (i.e., the values of its
-    /// non-parameter fields) differs, in which case the result takes that metadata from `structure`.
-    ///
     /// # Errors
     ///
-    /// Returns [`ParameterError::MissingParameters`] when `structure` has nodes that violate the first or the third
-    /// rule. The descendants of such a node violate them too, and so the error only lists the paths of the violating
-    /// nodes without violating children (e.g., the leaves without a prefix leaf and the containers without children
-    /// that the prefix tree does not reach), in the order of [`Self::paths`]. Otherwise, it returns
-    /// [`ParameterError::UnusedParameters`] when the prefix tree has nodes that violate the second rule, with the
-    /// sorted paths of the violating nodes without violating children (e.g., `$[0]` for the prefix `[[]]` of `[]`).
-    fn from_broadcasted_named_parameters<
-        I: IntoIterator<Item = (ParameterPath, P)>,
-        N: IntoIterator<Item = ParameterPath>,
-    >(
+    /// Returns [`ParameterError::DuplicateParameterPaths`] when two prefix leaves or, after them, two nodes of
+    /// `structure` that do not lie strictly below a prefix leaf have the same path, with the sorted duplicated paths.
+    /// Otherwise, it returns [`ParameterError::MissingParameters`] with the paths of the leaves of `structure` that
+    /// have no prefix leaf, in the order of [`Self::paths`]. Otherwise, it returns
+    /// [`ParameterError::UnusedParameters`] with the sorted paths of the prefix leaves that are not node paths of
+    /// `structure` and that have no such prefix leaf below them.
+    fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
-        paths: N,
     ) -> Result<Self, ParameterError>
     where
         P: Clone,
     {
-        // This function uses a small local prefix trie to resolve each path to the most specific prefix leaf (i.e.,
-        // the longest matching prefix) in path-depth time, instead of scanning all prefix leaves for every path.
-        // That is usually much faster when many prefix leaves are provided, at the cost of the additional trie
-        // construction/allocation overhead, which can be less favorable for very small prefix trees.
-
-        #[derive(Default)]
-        struct PrefixTrieNode {
-            children: HashMap<ParameterPathSegment, usize>,
-            selected_prefix_index: Option<usize>,
-        }
-
-        let prefix_parameters = parameters.into_iter().collect::<Vec<_>>();
-
-        // Build a trie of the prefix leaf paths so that each path can be resolved by walking segments instead of
-        // scanning all prefix leaves. This turns per-path prefix selection into a path-depth walk.
-        let mut prefix_trie = vec![PrefixTrieNode::default()];
-        for (prefix_index, (path, _)) in prefix_parameters.iter().enumerate() {
-            let mut node_index = 0usize;
-            for segment in path.segments() {
-                let child_index = if let Some(child_index) = prefix_trie[node_index].children.get(segment).copied() {
-                    child_index
-                } else {
-                    prefix_trie.push(PrefixTrieNode::default());
-                    let child_index = prefix_trie.len() - 1;
-                    prefix_trie[node_index].children.insert(segment.clone(), child_index);
-                    child_index
-                };
-                node_index = child_index;
-            }
-            prefix_trie[node_index].selected_prefix_index = Some(prefix_index);
-        }
-
-        // Returns the index of the most specific prefix leaf of `path`, if any. As we descend the trie, we track the
-        // deepest prefix leaf encountered, which is the "most specific" match.
-        let select_prefix_index = |path: &ParameterPath| {
-            let mut trie_node_index = 0usize;
-            let mut selected_prefix_index = prefix_trie[trie_node_index].selected_prefix_index;
-            for segment in path.segments() {
-                let Some(next_trie_node_index) = prefix_trie[trie_node_index].children.get(segment).copied() else {
-                    break;
-                };
-                trie_node_index = next_trie_node_index;
-                if let Some(prefix_index) = prefix_trie[trie_node_index].selected_prefix_index {
-                    selected_prefix_index = Some(prefix_index);
-                }
-            }
-            selected_prefix_index
-        };
-
-        // Returns the paths among `paths` that have no child among `paths`. The nodes that violate a rule are closed
-        // under taking descendants, and so these are the deepest violating nodes, whose paths imply all the others.
-        let deepest_paths = |paths: Vec<&ParameterPath>| {
-            let parent_paths = paths
-                .iter()
-                .filter(|path| !path.is_root())
-                .map(|path| ParameterPath { segments: path.segments[1..].to_vec() })
-                .collect::<HashSet<_>>();
-            paths
-                .into_iter()
-                .filter(|path| !parent_paths.contains(*path))
-                .map(ParameterPath::to_string)
-                .collect()
-        };
-
-        // Keep values in `structure.named_parameters()` order so that reconstruction can use `from_parameters`.
-        let expected_count = structure.parameter_count();
-        let mut values = Vec::with_capacity(expected_count);
-        let mut uncovered_parameter_paths = HashSet::new();
-        for (path, _) in structure.named_parameters() {
-            match select_prefix_index(&path) {
-                Some(prefix_index) => values.push(prefix_parameters[prefix_index].1.clone()),
-                None => {
-                    uncovered_parameter_paths.insert(path);
-                }
-            }
-        }
-
-        let prefix_paths = paths
-            .into_iter()
-            .chain(prefix_parameters.iter().map(|(path, _)| path.clone()))
-            .collect::<HashSet<_>>();
-        let structure_paths = structure.paths();
-        let missing_paths: Vec<String> = deepest_paths(
-            structure_paths
-                .iter()
-                .filter(|path| {
-                    uncovered_parameter_paths.contains(*path)
-                        || (!prefix_paths.contains(*path) && select_prefix_index(path).is_none())
-                })
-                .collect(),
-        );
-        if !missing_paths.is_empty() {
-            return Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) });
-        }
-
-        let structure_paths = structure_paths.iter().collect::<HashSet<_>>();
-        let mut unused_paths: Vec<String> =
-            deepest_paths(prefix_paths.iter().filter(|path| !structure_paths.contains(path)).collect());
-        if !unused_paths.is_empty() {
-            unused_paths.sort_unstable();
-            return Err(ParameterError::UnusedParameters { paths: Some(unused_paths) });
-        }
-
-        Self::from_parameters(structure, values)
+        broadcast_named_parameters(structure, parameters, None)
     }
 
-    /// Broadcasts this [`Parameterized`] value, as a tree prefix, into the provided target
-    /// `structure`, returning a new value of type `T`. This is a convenience wrapper around
-    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) that passes the named
-    /// parameters and the [`Self::paths`] of this value. As a result, each leaf path in `structure` receives the
-    /// value from the most specific matching current parameter path prefix (i.e., the longest shared prefix among the
-    /// existing parameter paths of this value). Furthermore, every node of this value must be a node of `structure`,
-    /// and every node of `structure` must be a node of this value or lie at or below one of its parameters. Nodes are
-    /// matched by their paths only, so this value may have another type than `T` and other static metadata. Refer to
-    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) for the errors that
-    /// this function returns. Since one current parameter may need to populate multiple leaves in `structure`, this
-    /// function requires `P: Clone`.
+    /// Broadcasts this [`Parameterized`] value, as a tree prefix, into the provided target `structure`, returning a new
+    /// value of type `T`. Each leaf of `structure` receives the value of its most specific prefix leaf (i.e., the leaf
+    /// of this value whose path is the longest prefix of its path). The nodes of both trees (refer to [`Self::paths`])
+    /// are matched by path, including the containers without leaves, and as in the tree prefix checks of JAX, the
+    /// following rules apply to them:
+    ///
+    ///   - Every leaf of `structure` must have a leaf of this value whose path is equal to or a prefix of its path.
+    ///   - Every node path of this value must be a node path of `structure`.
+    ///   - Every node path of `structure` must be a node path of this value or lie at or below a leaf of this value.
+    ///   - Distinct nodes of this value must have distinct paths, and so must distinct nodes of `structure`, except
+    ///     strictly below a leaf of this value, which gives the same value to all the nodes below it.
+    ///
+    /// For example, `(a, b)` is a prefix of `(Vec::new(), x)`, a single leaf is a prefix of an empty [`Vec`], `[a, b]`
+    /// is a prefix of `[[x], []]`, and `[[], b]` is a prefix of `[[], y]`. In contrast, `[a]` and `[[a]]` are not
+    /// prefixes of `[[x], []]`, which has the node `$[1]` that they lack and that none of their leaves covers, and
+    /// `[[a], []]` is not a prefix of `[[x]]`, nor is `[[]]` a prefix of `[]`, because each has a node (i.e., `$[1]`
+    /// and `$[0]`, respectively) that the structure lacks. These checks apply to containers without leaves in both
+    /// directions. [`Self::from_broadcasted_named_parameters`] broadcasts the named leaves of a tree prefix without
+    /// its containers instead, and so it cannot check the nodes of `structure` without leaves. Note that since one
+    /// leaf of this value may need to populate multiple leaves of `structure`, this function requires `P: Clone`. For
+    /// fully worked examples, refer to the examples provided in the top-level documentation of the [`Parameterized`]
+    /// trait.
+    ///
+    /// Map keys are identified by their [`Debug`] texts (refer to [`ParameterPathSegment::Key`]), and so the last rule
+    /// requires distinct keys of one map to have distinct [`Debug`] texts, unless a leaf of this value above that map
+    /// covers all of its entries. For instance, the entries of two keys that both print `[private]` share the path
+    /// `$[[private]]`, and an option map with one value for each of them would otherwise give one of the values to
+    /// both entries.
+    ///
+    /// Nodes are matched by their paths only, which is intended. This value may therefore have another type than `T`
+    /// whose nodes have the same paths (e.g., a derived struct with the same parameter fields as `T`, or an array for
+    /// a [`Vec`]), and a node of the same type whose static metadata (i.e., the values of its non-parameter fields)
+    /// differs also matches, in which case the result takes that metadata from `structure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParameterError::DuplicateParameterPaths`] when this value or, after it, `structure` has nodes that
+    /// violate the fourth rule, with the sorted duplicated paths. Otherwise, it returns
+    /// [`ParameterError::MissingParameters`] when `structure` has nodes that violate the first or the third rule. The
+    /// descendants of such a node violate them too, and so the error only lists the paths of the violating nodes
+    /// without violating children (e.g., the leaves without a leaf of this value above them and the containers
+    /// without children that this value does not reach, such as `$[1]` for the prefix `[[a]]` of `[[x], []]`), in the
+    /// order of [`Self::paths`]. Otherwise, it returns [`ParameterError::UnusedParameters`] when this value has nodes
+    /// that violate the second rule, with the sorted paths of the violating nodes without violating children (e.g.,
+    /// `$[0]` for the prefix `[[]]` of `[]`).
     fn broadcast_to_parameter_structure<T: Parameterized<P>>(
         &self,
         structure: T::ParameterStructure,
@@ -1177,10 +1106,10 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         P: Clone,
     {
-        T::from_broadcasted_named_parameters(
+        broadcast_named_parameters(
             structure,
             self.named_parameters().map(|(path, parameter)| (path, parameter.clone())),
-            self.paths(),
+            Some(self.paths()),
         )
     }
 
@@ -1238,14 +1167,16 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         Self::Family: ParameterizedFamily<T>,
     {
+        // The mapped parameters are reassembled by position rather than by path, so that parameters with the same
+        // path (e.g., the values of two map keys with the same `Debug` text) stay apart.
         let mut map_fn = map_fn;
-        let structure = self.parameter_structure();
-        let mut mapped_parameters = HashMap::with_capacity(structure.parameter_count());
-        for (path, parameter) in self.into_named_parameters() {
-            let mapped_parameter = map_fn(&path, parameter)?;
-            mapped_parameters.insert(path, mapped_parameter);
-        }
-        Self::To::<T>::from_named_parameters(structure, mapped_parameters).map_err(E::from)
+        Self::To::<T>::from_parameters(
+            self.parameter_structure(),
+            self.into_named_parameters()
+                .map(|(path, parameter)| map_fn(&path, parameter))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(E::from)
     }
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
@@ -1495,6 +1426,175 @@ pub trait Parameterized<P: Parameter>: Sized {
             Self::from_parameters(structure, replaced_parameters)
         }
     }
+}
+
+/// Returns the sorted [`Display`] texts of the [`ParameterPath`]s that occur more than once in `paths`, each once.
+fn find_duplicate_paths<'p>(paths: impl IntoIterator<Item = &'p ParameterPath>) -> Vec<String> {
+    let mut seen_paths = HashSet::new();
+    let mut duplicate_paths = paths
+        .into_iter()
+        .filter(|path| !seen_paths.insert(*path))
+        .map(ParameterPath::to_string)
+        .collect::<Vec<_>>();
+    duplicate_paths.sort_unstable();
+    duplicate_paths.dedup();
+    duplicate_paths
+}
+
+/// Reconstructs a value of type `T` having the provided `structure` from a tree prefix of it, which is
+/// given as its leaves, `parameters`, and optionally as its nodes, `prefix_node_paths` (i.e., the paths that
+/// [`Parameterized::paths`] returns for it, which include the paths of its leaves). This is the shared implementation
+/// of [`Parameterized::broadcast_to_parameter_structure`], which provides the node paths and applies all of its rules,
+/// and of [`Parameterized::from_broadcasted_named_parameters`], which does not provide them and so skips only the check
+/// that the nodes of `structure` without leaves are nodes of the prefix tree or lie below one of its leaves.
+fn broadcast_named_parameters<P: Clone + Parameter, T: Parameterized<P>>(
+    structure: T::ParameterStructure,
+    parameters: impl IntoIterator<Item = (ParameterPath, P)>,
+    prefix_node_paths: Option<Vec<ParameterPath>>,
+) -> Result<T, ParameterError> {
+    // This function uses a small local prefix trie to resolve each path to the most specific prefix leaf (i.e.,
+    // the longest matching prefix) in path-depth time, instead of scanning all prefix leaves for every path.
+    // That is usually much faster when many prefix leaves are provided, at the cost of the additional trie
+    // construction/allocation overhead, which can be less favorable for very small prefix trees.
+
+    #[derive(Default)]
+    struct PrefixTrieNode {
+        children: HashMap<ParameterPathSegment, usize>,
+        selected_prefix_index: Option<usize>,
+    }
+
+    // Distinct nodes of one tree that have the same path (e.g., the entries of two map keys with the same `Debug`
+    // text) cannot be told apart by path, and so the prefix tree must not have any. Its leaves and its node paths
+    // are checked separately because `prefix_node_paths` also contains the paths of the leaves.
+    let prefix_parameters = parameters.into_iter().collect::<Vec<_>>();
+    let mut duplicate_paths = find_duplicate_paths(prefix_parameters.iter().map(|(path, _)| path));
+    if let Some(prefix_node_paths) = &prefix_node_paths {
+        duplicate_paths.extend(find_duplicate_paths(prefix_node_paths));
+    }
+    if !duplicate_paths.is_empty() {
+        duplicate_paths.sort_unstable();
+        duplicate_paths.dedup();
+        return Err(ParameterError::DuplicateParameterPaths { paths: duplicate_paths });
+    }
+
+    // Build a trie of the prefix leaf paths so that each path can be resolved by walking segments instead of
+    // scanning all prefix leaves. This turns per-path prefix selection into a path-depth walk.
+    let mut prefix_trie = vec![PrefixTrieNode::default()];
+    for (prefix_index, (path, _)) in prefix_parameters.iter().enumerate() {
+        let mut node_index = 0usize;
+        for segment in path.segments() {
+            let child_index = if let Some(child_index) = prefix_trie[node_index].children.get(segment).copied() {
+                child_index
+            } else {
+                prefix_trie.push(PrefixTrieNode::default());
+                let child_index = prefix_trie.len() - 1;
+                prefix_trie[node_index].children.insert(segment.clone(), child_index);
+                child_index
+            };
+            node_index = child_index;
+        }
+        prefix_trie[node_index].selected_prefix_index = Some(prefix_index);
+    }
+
+    // Returns the index of the most specific prefix leaf of `path`, if any. As we descend the trie, we track the
+    // deepest prefix leaf encountered, which is the "most specific" match.
+    let select_prefix_index = |path: &ParameterPath| {
+        let mut trie_node_index = 0usize;
+        let mut selected_prefix_index = prefix_trie[trie_node_index].selected_prefix_index;
+        for segment in path.segments() {
+            let Some(next_trie_node_index) = prefix_trie[trie_node_index].children.get(segment).copied() else {
+                break;
+            };
+            trie_node_index = next_trie_node_index;
+            if let Some(prefix_index) = prefix_trie[trie_node_index].selected_prefix_index {
+                selected_prefix_index = Some(prefix_index);
+            }
+        }
+        selected_prefix_index
+    };
+
+    // Returns `true` if a prefix leaf path is a proper prefix of `path`, in which case that prefix leaf gives the
+    // same value to the node at `path` and to every other node with the same path.
+    let lies_below_prefix_leaf = |path: &ParameterPath| {
+        let mut trie_node_index = 0usize;
+        for segment in path.segments() {
+            if prefix_trie[trie_node_index].selected_prefix_index.is_some() {
+                return true;
+            }
+            let Some(next_trie_node_index) = prefix_trie[trie_node_index].children.get(segment).copied() else {
+                return false;
+            };
+            trie_node_index = next_trie_node_index;
+        }
+        false
+    };
+
+    // Nodes of `structure` with the same path are only told apart when the prefix tree reaches that path with its
+    // own nodes, which then match all of them alike.
+    let structure_paths = structure.paths();
+    let duplicate_paths = find_duplicate_paths(structure_paths.iter().filter(|path| !lies_below_prefix_leaf(path)));
+    if !duplicate_paths.is_empty() {
+        return Err(ParameterError::DuplicateParameterPaths { paths: duplicate_paths });
+    }
+
+    // Returns the paths among `paths` that have no child among `paths`. The nodes that violate a rule are closed
+    // under taking descendants, and so these are the deepest violating nodes, whose paths imply all the others.
+    let deepest_paths = |paths: Vec<&ParameterPath>| {
+        let parent_paths = paths
+            .iter()
+            .filter(|path| !path.is_root())
+            .map(|path| ParameterPath { segments: path.segments[1..].to_vec() })
+            .collect::<HashSet<_>>();
+        paths
+            .into_iter()
+            .filter(|path| !parent_paths.contains(*path))
+            .map(ParameterPath::to_string)
+            .collect()
+    };
+
+    // Keep values in `structure.named_parameters()` order so that reconstruction can use `from_parameters`.
+    let expected_count = structure.parameter_count();
+    let mut values = Vec::with_capacity(expected_count);
+    let mut uncovered_parameter_paths = HashSet::new();
+    for (path, _) in structure.named_parameters() {
+        match select_prefix_index(&path) {
+            Some(prefix_index) => values.push(prefix_parameters[prefix_index].1.clone()),
+            None => {
+                uncovered_parameter_paths.insert(path);
+            }
+        }
+    }
+
+    // Without the node paths of the prefix tree, the paths of its leaves stand in for its nodes, and so the nodes of
+    // `structure` without leaves cannot be checked for coverage.
+    let has_prefix_node_paths = prefix_node_paths.is_some();
+    let prefix_paths = prefix_node_paths
+        .into_iter()
+        .flatten()
+        .chain(prefix_parameters.iter().map(|(path, _)| path.clone()))
+        .collect::<HashSet<_>>();
+    let missing_paths: Vec<String> = deepest_paths(
+        structure_paths
+            .iter()
+            .filter(|path| {
+                uncovered_parameter_paths.contains(*path)
+                    || (has_prefix_node_paths && !prefix_paths.contains(*path) && select_prefix_index(path).is_none())
+            })
+            .collect(),
+    );
+    if !missing_paths.is_empty() {
+        return Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) });
+    }
+
+    let structure_paths = structure_paths.iter().collect::<HashSet<_>>();
+    let mut unused_paths: Vec<String> =
+        deepest_paths(prefix_paths.iter().filter(|path| !structure_paths.contains(path)).collect());
+    if !unused_paths.is_empty() {
+        unused_paths.sort_unstable();
+        return Err(ParameterError::UnusedParameters { paths: Some(unused_paths) });
+    }
+
+    T::from_parameters(structure, values)
 }
 
 /// Iterator adapter that prefixes each yielded [`ParameterPath`] with a stored [`ParameterPathSegment`]. This exists as
@@ -2764,6 +2864,16 @@ mod tests {
         }
     }
 
+    /// Map key whose [`Debug`] text hides its value, so that distinct keys produce the same [`ParameterPath`].
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct RedactedKey(u32);
+
+    impl Debug for RedactedKey {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "[private]")
+        }
+    }
+
     #[test]
     fn test_placeholder() {
         let placeholder = Placeholder;
@@ -3038,15 +3148,6 @@ mod tests {
                     (ParameterPath::root().field("controller").variant("Blend").field("branch").field("gain"), 20),
                     (ParameterPath::root().field("heads").index(1), 30),
                 ]),
-                vec![
-                    ParameterPath::root(),
-                    ParameterPath::root().field("controller"),
-                    ParameterPath::root().field("controller").variant("Blend"),
-                    ParameterPath::root().field("controller").variant("Blend").field("branch"),
-                    ParameterPath::root().field("controller").variant("Blend").field("branch").field("gain"),
-                    ParameterPath::root().field("heads"),
-                    ParameterPath::root().field("heads").index(1),
-                ],
             ),
             Ok(Network {
                 stem: Layer { weights: vec![1, 1], bias: 1, tag: "stem" },
@@ -3291,6 +3392,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parameterized_from_named_parameters_with_duplicate_paths() {
+        let root = ParameterPath::root;
+
+        // Two leaves of the structure with the same path would receive the provided parameters in provided order.
+        assert_eq!(
+            BTreeMap::<RedactedKey, i32>::from_named_parameters(
+                BTreeMap::from([(RedactedKey(3), Placeholder), (RedactedKey(7), Placeholder)]),
+                vec![(root().key(RedactedKey(7)), 2), (root().key(RedactedKey(3)), 1)],
+            ),
+            Err(ParameterError::DuplicateParameterPaths { paths: vec!["$[[private]]".to_string()] }),
+        );
+
+        // Two provided parameters with the same path are rejected, whether or not they arrive in structure order.
+        assert_eq!(
+            <(i32, i32)>::from_named_parameters(
+                (Placeholder, Placeholder),
+                vec![(root().tuple_index(0), 1), (root().tuple_index(1), 2), (root().tuple_index(0), 3)],
+            ),
+            Err(ParameterError::DuplicateParameterPaths { paths: vec!["$.0".to_string()] }),
+        );
+        assert_eq!(
+            <(i32, i32)>::from_named_parameters(
+                (Placeholder, Placeholder),
+                vec![(root().tuple_index(1), 2), (root().tuple_index(0), 1), (root().tuple_index(1), 3)],
+            ),
+            Err(ParameterError::DuplicateParameterPaths { paths: vec!["$.1".to_string()] }),
+        );
+    }
+
+    #[test]
     fn test_parameterized_from_broadcasted_named_parameters() {
         let root = ParameterPath::root;
 
@@ -3299,7 +3430,6 @@ mod tests {
             <(i32, (i32, i32))>::from_broadcasted_named_parameters(
                 (Placeholder, (Placeholder, Placeholder)),
                 vec![(root(), 1), (root().tuple_index(1).tuple_index(0), 2)],
-                vec![root(), root().tuple_index(1), root().tuple_index(1).tuple_index(0)],
             ),
             Ok((1, (2, 1))),
         );
@@ -3309,7 +3439,6 @@ mod tests {
             <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
                 (Vec::new(), Placeholder),
                 vec![(root().tuple_index(0), 1), (root().tuple_index(1), 2)],
-                vec![root(), root().tuple_index(0), root().tuple_index(1)],
             ),
             Ok((Vec::new(), 2)),
         );
@@ -3317,116 +3446,118 @@ mod tests {
             <((), ()) as Parameterized<i32>>::from_broadcasted_named_parameters(
                 ((), ()),
                 vec![(root().tuple_index(0), 1), (root().tuple_index(1), 2)],
-                vec![root(), root().tuple_index(0), root().tuple_index(1)],
             ),
             Ok(((), ())),
         );
         assert_eq!(
-            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
-                (Vec::new(), Placeholder),
-                vec![(root(), 1)],
-                vec![root()],
-            ),
+            <(Vec<i32>, i32)>::from_broadcasted_named_parameters((Vec::new(), Placeholder), vec![(root(), 1)]),
             Ok((Vec::new(), 1)),
         );
-        assert_eq!(
-            Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), vec![(root(), 1)], vec![root()]),
-            Ok(Vec::new()),
-        );
+        assert_eq!(Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), vec![(root(), 1)]), Ok(Vec::new()));
 
-        // A container without leaves of the prefix matches a node of the structure at the same path.
-        assert_eq!(
-            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
-                (Vec::new(), Placeholder),
-                vec![(root().tuple_index(1), 2)],
-                vec![root(), root().tuple_index(0), root().tuple_index(1)],
-            ),
-            Ok((Vec::new(), 2)),
-        );
-        assert_eq!(Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), Vec::new(), vec![root()]), Ok(Vec::new()));
-
-        // Nodes of the structure that are not nodes of the prefix and that no prefix leaf covers are missing. The
-        // error lists only the deepest of them.
+        // Leaves of the structure without a prefix leaf are missing.
         assert_eq!(
             <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
                 (Vec::new(), Placeholder),
                 vec![(root().tuple_index(0), 1)],
-                vec![root(), root().tuple_index(0)],
             ),
             Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$.1".to_string()]) }),
         );
         assert_eq!(
-            Vec::<Vec<i32>>::from_broadcasted_named_parameters(
-                vec![vec![Placeholder], Vec::new()],
-                vec![(root().index(0).index(0), 1)],
-                vec![root(), root().index(0), root().index(0).index(0)],
-            ),
-            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[1]".to_string()]) }),
-        );
-        assert_eq!(
-            Vec::<Vec<i32>>::from_broadcasted_named_parameters(vec![vec![Placeholder]], Vec::new(), vec![root()]),
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(vec![vec![Placeholder]], Vec::new()),
             Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[0][0]".to_string()]) }),
         );
 
-        // Nodes of the prefix that are not nodes of the structure are unused, including prefix nodes below a container
-        // without children of the structure. The error lists only the deepest of them.
+        // Prefix leaves whose paths are not node paths of the structure are unused, including prefix leaves below a
+        // container without children of the structure.
         assert_eq!(
             <(i32, i32)>::from_broadcasted_named_parameters(
                 (Placeholder, Placeholder),
                 vec![(root(), 1), (root().tuple_index(2), 2)],
-                vec![root(), root().tuple_index(2)],
             ),
             Err(ParameterError::UnusedParameters { paths: Some(vec!["$.2".to_string()]) }),
         );
         assert_eq!(
-            Vec::<i32>::from_broadcasted_named_parameters(
-                Vec::new(),
-                vec![(root().index(0), 1)],
-                vec![root(), root().index(0)],
-            ),
+            Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), vec![(root().index(0), 1)]),
             Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }),
         );
         assert_eq!(
-            Vec::<Vec<i32>>::from_broadcasted_named_parameters(
-                vec![vec![Placeholder]],
-                vec![(root().index(0).index(0), 1)],
-                vec![root(), root().index(0), root().index(0).index(0), root().index(1)],
-            ),
-            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[1]".to_string()]) }),
-        );
-        assert_eq!(
-            Vec::<Vec<i32>>::from_broadcasted_named_parameters(Vec::new(), Vec::new(), vec![root(), root().index(0)]),
-            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }),
-        );
-        assert_eq!(
-            <(Vec<i32>, Vec<i32>)>::from_broadcasted_named_parameters(
-                (Vec::new(), Vec::new()),
-                vec![(root().tuple_index(0), 1)],
-                vec![root(), root().tuple_index(0), root().tuple_index(1), root().tuple_index(2)],
-            ),
-            Err(ParameterError::UnusedParameters { paths: Some(vec!["$.2".to_string()]) }),
-        );
-        assert_eq!(
-            Vec::<i32>::from_broadcasted_named_parameters(
-                Vec::new(),
-                vec![(root().index(0).index(0), 1)],
-                vec![root(), root().index(0), root().index(0).index(0)],
-            ),
+            Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), vec![(root().index(0).index(0), 1)]),
             Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0][0]".to_string()]) }),
         );
 
-        // Missing paths are listed in the order of the nodes of the structure, and they take precedence over unused
-        // paths.
+        // The paths of the prefix leaves stand in for the nodes of the prefix tree, and so the nodes of the structure
+        // without leaves are not checked, whereas `Parameterized::broadcast_to_parameter_structure` rejects a prefix
+        // tree that lacks one of them.
+        let prefix = vec![vec![1_i32]];
+        let structure = vec![vec![Placeholder], Vec::new()];
         assert_eq!(
-            <(i32, Vec<i32>)>::from_broadcasted_named_parameters(
-                (Placeholder, Vec::new()),
-                vec![(root().tuple_index(2), 1)],
-                vec![root(), root().tuple_index(2), root().tuple_index(3)],
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(
+                structure.clone(),
+                prefix.clone().into_named_parameters(),
             ),
-            Err(ParameterError::MissingParameters {
-                expected_count: 1,
-                paths: Some(vec!["$.0".to_string(), "$.1".to_string()]),
-            }),
+            Ok(vec![vec![1], Vec::new()]),
+        );
+        assert_eq!(
+            prefix.broadcast_to_parameter_structure::<Vec<Vec<i32>>>(structure),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[1]".to_string()]) }),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_from_broadcasted_named_parameters_with_duplicate_paths() {
+        let structure = BTreeMap::from([(RedactedKey(3), Placeholder), (RedactedKey(7), Placeholder)]);
+        let duplicate_error = ParameterError::DuplicateParameterPaths { paths: vec!["$[[private]]".to_string()] };
+        assert_eq!(
+            duplicate_error.to_string(),
+            "got multiple nodes with the same parameter path; distinct map keys must have distinct `Debug` texts; \
+             duplicate parameter paths: `$[[private]]`",
+        );
+
+        // Prefix nodes with the same path cannot be told apart (e.g., an option that is requested only for the second
+        // of two keys with the same `Debug` text), and so they are rejected, including nodes without leaves.
+        assert_eq!(
+            BTreeMap::<RedactedKey, Option<i32>>::from_broadcasted_named_parameters(
+                structure.clone(),
+                BTreeMap::from([(RedactedKey(3), None), (RedactedKey(7), Some(1))]).into_named_parameters(),
+            ),
+            Err(duplicate_error.clone()),
+        );
+        assert_eq!(
+            BTreeMap::from([(RedactedKey(3), None), (RedactedKey(7), Some(1))])
+                .broadcast_to_parameter_structure::<BTreeMap<RedactedKey, Option<i32>>>(structure.clone()),
+            Err(duplicate_error.clone()),
+        );
+        assert_eq!(
+            BTreeMap::from([(RedactedKey(3), Vec::<i32>::new()), (RedactedKey(7), Vec::new())])
+                .broadcast_to_parameter_structure::<BTreeMap<RedactedKey, Vec<i32>>>(BTreeMap::from([
+                    (RedactedKey(3), Vec::new()),
+                    (RedactedKey(7), Vec::new()),
+                ])),
+            Err(duplicate_error.clone()),
+        );
+
+        // Structure nodes with the same path are rejected when the prefix tree reaches their path with its own nodes.
+        assert_eq!(
+            BTreeMap::from([(RedactedKey(3), 1)])
+                .broadcast_to_parameter_structure::<BTreeMap<RedactedKey, i32>>(structure.clone()),
+            Err(duplicate_error),
+        );
+
+        // Structure nodes with the same path below a prefix leaf all receive the value of that leaf.
+        assert_eq!(
+            5_i32.broadcast_to_parameter_structure::<BTreeMap<RedactedKey, i32>>(structure),
+            Ok(BTreeMap::from([(RedactedKey(3), 5), (RedactedKey(7), 5)])),
+        );
+        assert_eq!(
+            (1_i32, 2_i32).broadcast_to_parameter_structure::<(BTreeMap<RedactedKey, (i32, i32)>, i32)>((
+                BTreeMap::from([
+                    (RedactedKey(3), (Placeholder, Placeholder)),
+                    (RedactedKey(7), (Placeholder, Placeholder)),
+                ]),
+                Placeholder,
+            )),
+            Ok((BTreeMap::from([(RedactedKey(3), (1, 1)), (RedactedKey(7), (1, 1))]), 2)),
         );
     }
 
@@ -3457,6 +3588,7 @@ mod tests {
             (Vec::<i32>::new(), 1_i32).broadcast_to_parameter_structure::<(Vec<i32>, i32)>((Vec::new(), Placeholder)),
             Ok((Vec::new(), 1)),
         );
+        assert_eq!(Vec::<i32>::new().broadcast_to_parameter_structure::<Vec<i32>>(Vec::new()), Ok(Vec::new()));
         assert_eq!(
             (1_i32, 2_i32).broadcast_to_parameter_structure::<i32>(Placeholder),
             Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$".to_string()]) }),
@@ -3481,6 +3613,39 @@ mod tests {
             Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[0]".to_string()]) }),
         );
 
+        // The errors describe missing and unused nodes by their paths, including containers without leaves in both
+        // trees, and list only the deepest of them.
+        let missing_error =
+            ParameterError::MissingParameters { expected_count: 0, paths: Some(vec!["$[0]".to_string()]) };
+        assert_eq!(
+            Vec::<Vec<i32>>::new().broadcast_to_parameter_structure::<Vec<Vec<i32>>>(vec![Vec::new()]),
+            Err(missing_error.clone()),
+        );
+        assert_eq!(missing_error.to_string(), "missing parameter paths: `$[0]`");
+        assert_eq!(
+            (1_i32, Vec::<i32>::new(), Vec::<i32>::new())
+                .broadcast_to_parameter_structure::<(Vec<i32>, Vec<i32>)>((Vec::new(), Vec::new())),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$.2".to_string()]) }),
+        );
+        assert_eq!(
+            vec![vec![1_i32]].broadcast_to_parameter_structure::<Vec<i32>>(Vec::new()),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0][0]".to_string()]) }),
+        );
+        assert_eq!(
+            ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }.to_string(),
+            "unused parameter paths: `$[0]`",
+        );
+
+        // Missing paths are listed in the order of the nodes of the structure, and they take precedence over unused
+        // paths.
+        assert_eq!(
+            Right { value: 1_i32 }.broadcast_to_parameter_structure::<(i32, Vec<i32>)>((Placeholder, Vec::new())),
+            Err(ParameterError::MissingParameters {
+                expected_count: 1,
+                paths: Some(vec!["$.0".to_string(), "$.1".to_string()]),
+            }),
+        );
+
         // Matching is by path, so containers of different types with the same paths match, and so do nodes of the
         // same type with different static metadata.
         assert_eq!(
@@ -3500,6 +3665,27 @@ mod tests {
         assert_eq!(
             vec![Vec::<i32>::new()].broadcast_to_parameter_structure::<[Vec<i32>; 1]>([Vec::new()]),
             Ok([Vec::new()]),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_try_map_named_parameters_with_duplicate_paths() {
+        // Mapping keeps the position of every parameter, and so parameters with the same path stay apart, which also
+        // holds for the functions that are built on it.
+        let value = BTreeMap::from([(RedactedKey(3), 1_i32), (RedactedKey(7), 2_i32)]);
+        assert_eq!(
+            value.clone().try_map_named_parameters(|path, parameter| {
+                Ok::<_, TestMappingError>(format!("{path}") == "$[[private]]" && parameter == 2)
+            }),
+            Ok(BTreeMap::from([(RedactedKey(3), false), (RedactedKey(7), true)])),
+        );
+        assert_eq!(
+            value.clone().map_named_parameters(|_, parameter| i64::from(parameter) * 10),
+            Ok(BTreeMap::from([(RedactedKey(3), 10_i64), (RedactedKey(7), 20_i64)])),
+        );
+        assert_eq!(
+            value.filter_parameters(|_, parameter| *parameter == 2),
+            Ok(BTreeMap::from([(RedactedKey(3), None), (RedactedKey(7), Some(2))])),
         );
     }
 

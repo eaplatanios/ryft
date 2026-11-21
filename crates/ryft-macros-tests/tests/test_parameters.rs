@@ -399,7 +399,7 @@ fn test_struct_with_empty_containers() {
         ],
     );
 
-    // Prefix leaves may cover containers without leaves, and prefix nodes below a container without children are
+    // Prefix leaves may cover containers without leaves, and prefix leaves below a container without children are
     // unused.
     let structure = value.parameter_structure();
     assert_eq!(
@@ -411,13 +411,6 @@ fn test_struct_with_empty_containers() {
                 (ParameterPath::root().field("p_2"), 12i64),
                 (ParameterPath::root().field("p_3"), 13i64),
             ],
-            vec![
-                ParameterPath::root(),
-                ParameterPath::root().field("p_0"),
-                ParameterPath::root().field("p_1"),
-                ParameterPath::root().field("p_2"),
-                ParameterPath::root().field("p_3")
-            ],
         ),
         Ok(StructWithEmptyContainers { p_0: 10i64, p_1: vec![], p_2: (3, vec![]), p_3: None, np_0: 6 }),
     );
@@ -425,11 +418,6 @@ fn test_struct_with_empty_containers() {
         StructWithEmptyContainers::from_broadcasted_named_parameters(
             structure,
             vec![(ParameterPath::root(), 10i64), (ParameterPath::root().field("p_1").index(0), 11i64)],
-            vec![
-                ParameterPath::root(),
-                ParameterPath::root().field("p_1"),
-                ParameterPath::root().field("p_1").index(0)
-            ],
         ),
         Err(ParameterError::UnusedParameters { paths: Some(vec!["$.p_1[0]".to_string()]) }),
     );
@@ -565,7 +553,6 @@ fn test_simple_enum() {
         Enum::from_broadcasted_named_parameters(
             structure.clone(),
             vec![(ParameterPath::root().variant("NonParameter"), 42usize)],
-            vec![ParameterPath::root(), ParameterPath::root().variant("NonParameter")],
         ),
         Ok(Enum::NonParameter(4usize, 2usize)),
     );
