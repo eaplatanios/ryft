@@ -151,6 +151,8 @@ where
     /// program, so specialization does not read or mutate live reference state. With a staging context, folding records
     /// work in the parent program instead of executing it, so reference placement adds no restriction. Disabling effect
     /// folding retains all effectful operations in the residual program in either case; pure known work can still fold.
+    /// The residual program can be executed many times, so disabling copy folding retains operations whose results must
+    /// have storage of their own for every execution (e.g., a placement that forces a copy).
     ///
     /// # Parameters
     ///
@@ -159,6 +161,9 @@ where
     ///   - `allow_effect_folding`: Specifies whether effects may fold into the parent when input knownness, reference
     ///     placement, and execution order constraints permit it. When `false`, every effectful operation remains
     ///     residual.
+    ///   - `allow_copy_folding`: Specifies whether operations whose results must have storage of their own for every
+    ///     execution may fold (refer to [`PartialEvaluationContext::with_allow_copy_folding`]). Specialization passes
+    ///     `false`, and nested partial evaluations pass the setting of their enclosing context.
     ///
     /// # Errors
     ///
@@ -168,13 +173,15 @@ where
         context: &C,
         inputs: &[PartialValue<C::Value>],
         allow_effect_folding: bool,
+        allow_copy_folding: bool,
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
         O: PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
         let context = PartialEvaluationContext::new(context.clone())
             .with_reference_placement(ReferencePlacement::Stage)
-            .with_allow_effect_folding(allow_effect_folding);
+            .with_allow_effect_folding(allow_effect_folding)
+            .with_allow_copy_folding(allow_copy_folding);
         let seed = context.prepare_root_inputs(self, inputs)?;
         let outputs = context.inline_region(self, seed, &HashSet::new(), None, None)?;
         context.into_evaluation(outputs)
@@ -268,7 +275,7 @@ where
     where
         O: PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
-        self.entry_region_ref().partially_evaluate_in_context(context, inputs, true)
+        self.entry_region_ref().partially_evaluate_in_context(context, inputs, true, false)
     }
 }
 
@@ -452,6 +459,7 @@ mod tests {
             .partially_evaluate_in_context(
                 &outer,
                 &[PartialValue::Known(first.clone()), PartialValue::Known(second)],
+                false,
                 false,
             )
             .unwrap();

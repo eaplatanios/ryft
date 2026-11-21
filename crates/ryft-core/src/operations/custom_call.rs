@@ -3197,7 +3197,7 @@ mod tests {
         ));
         let evaluation = program
             .entry_region_ref()
-            .partially_evaluate_in_context(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[], false)
+            .partially_evaluate_in_context(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[], false, false)
             .unwrap();
         assert_eq!(
             evaluation.program().to_string(),

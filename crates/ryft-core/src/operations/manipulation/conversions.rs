@@ -5911,14 +5911,14 @@ mod tests {
         // fail before the operation can be omitted.
         let deferred = program
             .entry_region_ref()
-            .partially_evaluate_in_context(&context, &[PartialValue::Known(square.clone())], false)
+            .partially_evaluate_in_context(&context, &[PartialValue::Known(square.clone())], false, false)
             .unwrap();
         assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
         assert_eq!(deferred.interpret(&context, &[]), Ok(vec![square]));
         assert_eq!(
             program
                 .entry_region_ref()
-                .partially_evaluate_in_context(&context, &[PartialValue::Known(rectangular)], false)
+                .partially_evaluate_in_context(&context, &[PartialValue::Known(rectangular)], false, false)
                 .unwrap_err(),
             mismatch,
         );
@@ -6012,6 +6012,7 @@ mod tests {
                 &context,
                 &[PartialValue::Known(vector(2)), PartialValue::Known(vector(2))],
                 false,
+                false,
             )
             .unwrap();
         assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
@@ -6027,6 +6028,7 @@ mod tests {
                 .partially_evaluate_in_context(
                     &context,
                     &[PartialValue::Known(vector(2)), PartialValue::Known(vector(3))],
+                    false,
                     false,
                 )
                 .map(|_| ()),
@@ -6110,11 +6112,12 @@ mod tests {
         assert_eq!(residual.interpret(&context, &[unannotated]), Ok(vec![expected_value.clone(); 2]));
         let deferred_missing = program
             .entry_region_ref()
-            .partially_evaluate_in_context(&context, &unannotated_inputs, false)
+            .partially_evaluate_in_context(&context, &unannotated_inputs, false, false)
             .unwrap();
         assert_eq!(deferred_missing.program().to_string(), "lambda  .\nin ()");
         assert_eq!(deferred_missing.interpret(&context, &[]), Ok(vec![expected_value.clone(); 2]));
-        let deferred = program.entry_region_ref().partially_evaluate_in_context(&context, &known, false).unwrap();
+        let deferred =
+            program.entry_region_ref().partially_evaluate_in_context(&context, &known, false, false).unwrap();
         assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
         assert_eq!(deferred.interpret(&context, &[]), Ok(vec![expected_value; 2]));
     }
@@ -6152,7 +6155,8 @@ mod tests {
         let residual = program.to_flat_program().partially_evaluate(&[PartialValue::Unknown(plain)]).unwrap();
         assert_eq!(residual.program().to_string(), expected);
         assert_eq!(residual.interpret(&context, &[input]), Ok(vec![expected_value.clone()]));
-        let deferred = program.entry_region_ref().partially_evaluate_in_context(&context, &known, false).unwrap();
+        let deferred =
+            program.entry_region_ref().partially_evaluate_in_context(&context, &known, false, false).unwrap();
         assert_eq!(deferred.program().to_string(), "lambda  .\nin ()");
         assert_eq!(deferred.interpret(&context, &[]), Ok(vec![expected_value]));
     }

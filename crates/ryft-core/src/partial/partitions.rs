@@ -988,9 +988,9 @@ where
     ///   - `input_known`: Whether each source input is available to the known invocation, in input order.
     ///   - `allow_effect_folding`: Whether known effectful work may be recorded in the known program, subject to
     ///     ordering constraints. Pure known work can fold even when this is false.
-    ///   - `allow_copy_folding`: Whether known operations whose results must have storage of their own for every
-    ///     execution may be recorded in the known program (refer to
-    ///     [`PartialEvaluationContext::with_allow_copy_folding`]).
+    ///   - `allow_copy_folding`: Whether the known program may copy an already-known input. When `true`, later
+    ///     residual calls can reuse that copy. When `false`, a placement that requires a copy stays in the residual
+    ///     program so each call gets fresh storage. See [`PartialEvaluationContext::with_allow_copy_folding`].
     ///   - `repeated_residual`: Whether to analyze allocations for a known invocation followed by repeated residual
     ///     calls. When false, returns after one pass with no explicitly deferred instruction IDs.
     ///   - `required_known_outputs`: Output positions that repeated-call partitioning must keep known. When absent,

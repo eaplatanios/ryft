@@ -6837,7 +6837,7 @@ mod tests {
 
         let placement: Rc<dyn ResidualPlacement<TestValue, TestOperation>> = Rc::new(policy.clone());
         let split = |region: RegionRef<'_, TestValue, TestOperation>, index: usize, demanded_outputs: &[bool]| {
-            region.split_on_residual_demand(index, demanded_outputs, placement.clone())
+            region.split_on_residual_demand(index, demanded_outputs, true, placement.clone())
         };
         let recomputation = ResidualPlacement::<TestValue, TestOperation>::plan_recomputation(
             &policy,
@@ -7030,7 +7030,7 @@ mod tests {
             Rc::new(RoundedResidualPlacement::new(save_names(&["t"], &[]), Bfloat16Rounding));
         let (partition, _) = program
             .entry_region_ref()
-            .partition_with_configuration(&[true, true, false], true, false, None, Some(placement))
+            .partition_with_configuration(&[true, true, false], true, true, false, None, Some(placement))
             .unwrap();
         assert_eq!(
             partition.to_string(),

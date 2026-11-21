@@ -273,6 +273,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [family](#nested-families), and member variants instead use the enclosing operation's canonical
 ///     fold-or-residualize path, which also consults their [`Operation::fold`] rules without a second partial-value
 ///     protocol, because the partial evaluation rule of a member or nested family belongs to programs over that family.
+///     Computational projected payloads must still implement that rule for a [`TracingContext`](crate::TracingContext)
+///     over the member projection of the constant type, which a context that does not allow copies to fold consults
+///     through [`PartialEvaluationContext::partially_evaluate_projected_operation`](
+///     crate::PartialEvaluationContext::partially_evaluate_projected_operation).
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation and dispatches mixed variants in either role to the payload's parent-universe
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy

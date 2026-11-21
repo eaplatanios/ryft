@@ -311,7 +311,8 @@ where
         // Analyze a staged copy using only input knownness to discover allocations that must be fresh on each
         // residual invocation. Discard the staged programs as the replay below must use the caller's actual values.
         let knowledge = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
-        let (_, deferred_instructions) = region.partition_with_configuration(&knowledge, true, true, None, None)?;
+        let (_, deferred_instructions) =
+            region.partition_with_configuration(&knowledge, true, context.allow_copy_folding(), true, None, None)?;
 
         // Replay into the active context, explicitly deferring the discovered allocations. Source reference roots
         // let replay distinguish independent accesses while keeping accesses to the same state in order.
@@ -333,19 +334,26 @@ where
         // Unlike inlining a region, constructing a separate residual program needs fresh builder and ordering
         // state. Ordinary specialization still inherits the caller's permission to fold effectful work.
         if !self.repeated_residual {
-            return region.partially_evaluate_in_context(context.parent(), knowledge, context.allow_effect_folding());
+            return region.partially_evaluate_in_context(
+                context.parent(),
+                knowledge,
+                context.allow_effect_folding(),
+                context.allow_copy_folding(),
+            );
         }
 
         // Give the nested evaluation its own residual program while folding through the same known-side parent.
         // Stage placement keeps live reference operations residual when that parent is eager.
         let nested = PartialEvaluationContext::new(context.parent().clone())
             .with_reference_placement(ReferencePlacement::Stage)
+            .with_allow_copy_folding(context.allow_copy_folding())
             .with_residual_placement(context.residual_placement());
 
         // Repeated residual calls use their own allocation placement and reference-ordering analysis. Keep the
         // fresh context's effect folding enabled so that this analysis determines which effects must be deferred.
         let known = knowledge.iter().map(PartialValue::is_known).collect::<Vec<_>>();
-        let (_, deferred_instructions) = region.partition_with_configuration(&known, true, true, None, None)?;
+        let (_, deferred_instructions) =
+            region.partition_with_configuration(&known, true, context.allow_copy_folding(), true, None, None)?;
 
         // Retain actual known values and create residual inputs for unknowns. Their indices refer to the original
         // region inputs so the returned evaluation can reconstruct its residual arguments in the correct order.
@@ -380,16 +388,26 @@ where
         let residual_placement = context.residual_placement();
         if self.repeated_residual {
             // Let repeated-call allocation and reference-ordering analysis decide which effects can remain known,
-            // rather than inheriting a restriction intended for the caller's current residual program.
+            // rather than inheriting a restriction intended for the caller's current residual program. Copy folding
+            // still follows the caller, which decides whether a copy that is made once may be shared.
             region
-                .partition_with_configuration(input_known, true, true, None, residual_placement)
+                .partition_with_configuration(
+                    input_known,
+                    true,
+                    context.allow_copy_folding(),
+                    true,
+                    None,
+                    residual_placement,
+                )
                 .map(|(partition, _)| partition)
         } else {
-            // Ordinary specialization preserves the caller's effect-folding policy and uses a single partition pass.
+            // Ordinary specialization preserves the caller's effect and copy folding policies and uses a single
+            // partition pass.
             region
                 .partition_with_configuration(
                     input_known,
                     context.allow_effect_folding(),
+                    context.allow_copy_folding(),
                     false,
                     None,
                     residual_placement,
@@ -406,9 +424,12 @@ where
         demanded_outputs: &[bool],
     ) -> Result<Option<PartitionedProgram<C::Constant, C::Operation>>, ProgramError> {
         match context.residual_placement() {
-            Some(residual_placement) => {
-                region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement)
-            }
+            Some(residual_placement) => region.split_on_residual_demand(
+                instruction_index,
+                demanded_outputs,
+                context.allow_copy_folding(),
+                residual_placement,
+            ),
             None => Ok(None),
         }
     }
@@ -443,11 +464,14 @@ where
 /// The `#[derive(Operation)]` macro generates a [`PartiallyEvaluatableOperation`] implementation for operation enums
 /// that select `#[ryft(dispatch(partial_evaluation))]`. Native variants forward to their payload's own rule, and the
 /// generated per-payload predicates transport that rule's value and context requirements to the enum's use site.
-/// Declared member variants instead use the enclosing enum's canonical fold-or-residualize path because member-side
-/// partial values cannot represent values belonging to other members of the heterogeneous universe. This preserves
-/// correct folding and residualization without a second projected partial-value protocol. Variants that declare
-/// `#[ryft(family)]` use the same path, because the rule of a nested family belongs to programs over that family.
-/// Refer to the documentation of [`Operation`] for the full derive contract.
+/// Mixed and structural member variants instead use the enclosing enum's canonical fold-or-residualize path because
+/// member-side partial values cannot represent values belonging to other members of the heterogeneous universe. This
+/// preserves correct folding and residualization without a second projected partial-value protocol. Computational
+/// projected member variants also use that path, except that the rule of their payload decides whether an application
+/// with known inputs folds (refer to [`PartialEvaluationContext::partially_evaluate_projected_operation`]), so their
+/// payloads must implement this trait for a [`TracingContext`] over the member projection of the constant type of the
+/// enum. Variants that declare `#[ryft(family)]` use the default path, because the rule of a nested family belongs to
+/// programs over that family. Refer to the documentation of [`Operation`] for the full derive contract.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
