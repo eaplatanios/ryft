@@ -48,10 +48,11 @@ impl Array {
     /// positive one, and plain zero for the integer types and for the floating point types with a single zero. A data
     /// type without an additive identity (i.e., [`DataType::Boolean`], which does not support addition, and
     /// [`DataType::F8E8M0FNU`], whose every encoding is a nonzero number) cannot be split into summands, so it is
-    /// rejected before anything is uploaded whenever a device away from coordinate zero would receive a nonempty shard.
-    /// It is accepted when every unreduced axis has size one or when those shards are empty (e.g., for an array without
-    /// elements), because no identity is written then. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
-    /// every device receives its shard of the host value, which is its own extremum for every data type.
+    /// rejected before anything is uploaded whenever a device away from coordinate zero would receive a non-empty
+    /// shard. It is accepted when every unreduced axis has size one or when those shards are empty (e.g., for an
+    /// array without elements), because no identity is written then. With kind [`UnreducedKind::Max`] or
+    /// [`UnreducedKind::Min`], every device receives its shard of the host value, which is its own
+    /// extremum for every data type.
     ///
     /// # Parameters
     ///
@@ -736,8 +737,6 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here.
-
 /// Uploads of a dense row-major host buffer to the addressable shards of an [`Array`]. [`Array::from_host_buffer`]
 /// issues them right away and [`Array::from_host_buffer_in_background`] issues them once the bytes are available.
 struct HostBufferUploads {
@@ -762,8 +761,8 @@ struct HostBufferUploads {
 
 impl HostBufferUploads {
     /// Resolves the placement of a dense row-major host buffer and derives the bytes that each addressable shard
-    /// receives. Refer to [`Array::from_host_buffer`] for the meaning of the parameters. `byte_count` is the size of
-    /// the host buffer, which is validated against the type when it is already known.
+    /// receives. Refer to [`Array::from_host_buffer`] for the meaning of the parameters. `byte_count` is the size
+    /// of the host buffer, which is validated against the type when it is already known.
     fn new(
         session: &Session,
         r#type: ArrayType,
@@ -840,7 +839,7 @@ impl HostBufferUploads {
                 .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0))
         };
 
-        // The identity is needed only when some device, on this or another process, receives a nonempty shard that
+        // The identity is needed only when some device, on this or another process, receives a non-empty shard that
         // must hold it. An unreduced axis of size one or an array without elements writes none, so those placements
         // also accept data types without an identity. Deciding this from the global layout makes every process agree.
         let needs_identity = layout
@@ -881,6 +880,7 @@ impl HostBufferUploads {
         } else {
             Vec::new()
         };
+
         let mut shards = Vec::new();
         for shard in layout.descriptors() {
             let shard_device = shard.device();
@@ -903,6 +903,7 @@ impl HostBufferUploads {
             let shard_dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let shard_slice = shard.slice();
             let buffer_type = data_type.executable_buffer_type();
+
             // An empty shard that holds the identity receives no bytes, so its empty identity element is not read.
             let bytes = if holds_identity(shard) {
                 HostShardBytes::AdditiveIdentity {
@@ -1055,6 +1056,8 @@ impl HostShardBytes {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here.
 
 /// Dense row-major bytes of the addressable shards of a host upload, which [`Array::from_host_buffer_in_background`]
 /// prepares from one host buffer once that buffer is available. A shard that is contiguous in the host buffer is a
@@ -2612,6 +2615,27 @@ mod tests {
     }
 
     #[test]
+    fn test_array_copy_to_host_bytes_empty_remote_shard() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local_device, remote_device]).unwrap();
+        let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // A single element split over two devices leaves the remote shard without elements, so the local shard holds
+        // the whole value.
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let array =
+            Array::from_host_shards(&session, r#type, mesh, Some(sharding), [(local_device.id(), [7u8].as_slice())])
+                .unwrap();
+        assert_eq!(array.shards()[1].slice(), [1..1]);
+        array.validate_host_readback().unwrap();
+        assert_eq!(array.copy_to_host_bytes().unwrap(), vec![7]);
+    }
+
+    #[test]
     fn test_array_copy_to_host_bytes_reads_one_replica_per_tile() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -2763,6 +2787,73 @@ mod tests {
     }
 
     #[test]
+    fn test_array_copy_to_host_bytes_unreduced_canonical_order() {
+        let client = cpu_client(3);
+        let session = Session::builder().client(client).build().unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let local_devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let remote_process_index = client.process_index().unwrap() + 1;
+        let first_remote_id = local_devices.iter().map(Device::id).max().unwrap() + 1;
+        let remote_devices =
+            (0..3).map(|index| Device::new(first_remote_id + index, remote_process_index)).collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("r", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh.clone(), 0).with_unreduced_axes(["x"]).unwrap();
+        let summands = [1e20f32, -1e20, 1.];
+
+        // Every process holds one replica of each summand along `x`, but the processes hold replicas at different
+        // coordinates along `r`. Both orders of the local replicas sum the summands in the order of their coordinates
+        // along `x`, so every process reads back the same value, even though floating point addition does not
+        // associate (i.e., `(1e20 + 1) - 1e20` is zero).
+        let readback = |local_replica: usize| {
+            let mut local = local_devices.iter();
+            let mut remote = remote_devices.iter();
+            let mut shards = Vec::new();
+            let mesh_devices = (0..6)
+                .map(|index| {
+                    if index % 2 == local_replica {
+                        let device = *local.next().unwrap();
+                        shards.push((device.id(), summands[index % 3].to_ne_bytes().to_vec()));
+                        device
+                    } else {
+                        *remote.next().unwrap()
+                    }
+                })
+                .collect();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), mesh_devices).unwrap();
+            let r#type = ArrayType::scalar(DataType::F32);
+            let shards = shards.iter().map(|(device_id, bytes)| (*device_id, bytes.as_slice()));
+            let array = Array::from_host_shards(&session, r#type, mesh, Some(sharding.clone()), shards).unwrap();
+            array.copy_to_host_bytes().unwrap()
+        };
+        assert_eq!(readback(0), 1f32.to_ne_bytes());
+        assert_eq!(readback(1), 1f32.to_ne_bytes());
+    }
+
+    #[test]
+    fn test_array_copy_to_host_bytes_unreduced_boolean() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let readback = |first: [u8; 2], second: [u8; 2]| {
+            let shards = [(mesh.devices()[0].id(), first.as_slice()), (mesh.devices()[1].id(), second.as_slice())];
+            let r#type = ArrayType::new_static(DataType::Boolean, [2]);
+            Array::from_host_shards(&session, r#type, mesh.clone(), Some(sharding.clone()), shards)
+                .unwrap()
+                .copy_to_host_bytes()
+                .unwrap()
+        };
+
+        // Boolean summands combine with logical or, whose identity is `false`.
+        assert_eq!(readback([1, 0], [0, 0]), vec![1, 0]);
+        assert_eq!(readback([1, 0], [1, 1]), vec![1, 1]);
+    }
+
+    #[test]
     fn test_array_copy_to_host_bytes_preserves_producer_errors_without_payload() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -2779,6 +2870,61 @@ mod tests {
                     .with_execution_fence(ExecutionFence::new(vec![event]));
             assert_eq!(array.copy_to_host_bytes().unwrap_err().to_string(), "empty producer failed");
         }
+    }
+
+    #[test]
+    fn test_array_host_readback_fence() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+        let pending_array = |sharding: Sharding, dimensions: u64| {
+            let managers = client
+                .addressable_devices()
+                .unwrap()
+                .iter()
+                .map(|device| {
+                    let specification = BufferSpecification::new(BufferType::F32, [dimensions]);
+                    client
+                        .host_to_device_transfer_manager(vec![specification], device.default_memory().unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let buffers = managers.iter().map(|manager| manager.retrieve_buffer(0).unwrap()).collect();
+            let array =
+                Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), Some(sharding), buffers);
+            (array.unwrap(), managers)
+        };
+        let wait = |fence: ExecutionFence| {
+            let (sender, receiver) = mpsc::channel();
+            fence.on_ready(move |result| sender.send(result).unwrap());
+            receiver.recv_timeout(WAIT_TIMEOUT)
+        };
+
+        // A readback of a replicated array reads only its first replica, so the fence does not wait for the second.
+        let (replicated, managers) = pending_array(Sharding::replicated(mesh.logical_mesh().clone(), 1), 2);
+        assert_eq!(replicated.host_readback_fence().unwrap().is_ready(), Ok(false));
+        managers[0].transfer_data(0, Arc::new(bytes.clone()), 0, true).unwrap().r#await().unwrap();
+        assert_eq!(wait(replicated.host_readback_fence().unwrap()), Ok(Ok(())));
+        assert_eq!(replicated.copy_to_host_bytes().unwrap(), bytes);
+
+        // The fence still waits for the execution that produced the array.
+        let (event, promise) = client.event(()).unwrap();
+        let produced = replicated.with_execution_fence(ExecutionFence::new(vec![event]));
+        assert_eq!(produced.host_readback_fence().unwrap().is_ready(), Ok(false));
+        promise.set(None).unwrap();
+        assert_eq!(wait(produced.host_readback_fence().unwrap()), Ok(Ok(())));
+        managers[1].set_error(0, PjrtError::aborted("unused replica failed")).unwrap();
+
+        // A readback of a sharded array reads every tile, so the fence waits for both shards.
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let (sharded, managers) = pending_array(sharded, 1);
+        managers[0].transfer_data(0, Arc::new(bytes[..4].to_vec()), 0, true).unwrap().r#await().unwrap();
+        assert_eq!(sharded.host_readback_fence().unwrap().is_ready(), Ok(false));
+        managers[1].transfer_data(0, Arc::new(bytes[4..].to_vec()), 0, true).unwrap().r#await().unwrap();
+        assert_eq!(wait(sharded.host_readback_fence().unwrap()), Ok(Ok(())));
+        assert_eq!(sharded.copy_to_host_bytes().unwrap(), bytes);
     }
 
     #[test]
