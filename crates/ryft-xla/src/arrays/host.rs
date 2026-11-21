@@ -13,7 +13,7 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::metadata::resolve_placement;
-use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardLayout};
 use crate::arrays::{Array, ArrayError};
 use crate::devices::PjrtDeviceExtension;
 use crate::types::{ArrayTypeExtension, DataTypeExtension};
@@ -384,16 +384,17 @@ impl Array {
     /// It blocks the current thread until the copies and the whole execution that produced this array complete, so
     /// it also surfaces the errors of that execution.
     ///
-    /// When each tile occupies a contiguous byte range of the dense array, one replica of each tile is copied
-    /// directly into the destination. Otherwise, the shard copies are merged on the host. When the [`Sharding`]
-    /// has unreduced axes, every shard that this process holds is copied and the separate per-device values (e.g.,
-    /// summands) are combined with the [`UnreducedKind`] of the sharding, counting the replicas of each value
-    /// once. The values of each tile are combined in ascending order of their coordinates along the unreduced axes,
-    /// irrespective of which replicas this process holds, so every process that holds the whole value reads back the
-    /// same bytes. Sums of [`DataType::Boolean`] values combine with logical or. Tiles without elements contribute
-    /// nothing, so they need no replica in this process. Arrays with no elements and [`DataType::Zero`] arrays produce
-    /// no bytes and issue no copies. Use [`ArrayShard::copy_to_host_bytes`] to read the bytes that a single device
-    /// holds.
+    /// Only one replica of each distinct contribution to the value is copied (i.e., the first local replica of each
+    /// tile and, along unreduced axes, of each per-device value of a tile). The other replicas are neither read nor
+    /// compared with it, and the readback does not wait for them. When each tile occupies a contiguous byte range of
+    /// the dense array, each copy goes directly into the destination. Otherwise, the copies are assembled on the host.
+    /// When the [`Sharding`] has unreduced axes, the separate per-device values (e.g., summands) are combined with the
+    /// [`UnreducedKind`] of the sharding. The values of each tile are combined in ascending order of their coordinates
+    /// along the unreduced axes, irrespective of which replicas this process holds, so every process that holds the
+    /// whole value reads back the same bytes. Sums of [`DataType::Boolean`] values combine with logical or. Tiles
+    /// without elements contribute nothing, so they need no replica in this process. Arrays with no elements and
+    /// [`DataType::Zero`] arrays produce no bytes and issue no copies. Use [`ArrayShard::copy_to_host_bytes`] to
+    /// read the bytes that a single device holds.
     ///
     /// # Errors
     ///
@@ -517,7 +518,7 @@ impl Array {
         }
 
         // Wait for the copies, check their byte counts, and record which coordinates along unreduced axes each holds.
-        let shards = copies
+        let mut contributions = copies
             .into_iter()
             .map(|(shard, copy, expected_byte_count)| {
                 let bytes = copy.wait()?;
@@ -530,44 +531,26 @@ impl Array {
                     }));
                 }
                 let unreduced_coordinates = self.unreduced_coordinates(shard, unreduced_axis_indices.as_slice());
-                Ok((shard.index(), shard.slice().to_vec(), unreduced_coordinates, bytes))
+                Ok((shard.slice().to_vec(), unreduced_coordinates, bytes))
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
-        let mut shards = if shards.iter().all(|(_, _, unreduced_coordinates, _)| unreduced_coordinates.is_empty()) {
-            shards
-                .into_iter()
-                .map(|(shard_index, slices, _, bytes)| (shard_index, slices, bytes))
-                .collect::<Vec<_>>()
+        let mut tiles = if contributions.iter().all(|(_, unreduced_coordinates, _)| unreduced_coordinates.is_empty()) {
+            contributions.into_iter().map(|(slices, _, bytes)| (slices, bytes)).collect::<Vec<_>>()
         } else {
-            // Shards with the same slices and unreduced coordinates are replicas of one contribution to the tile.
-            // Check that the replicas agree before keeping just one copy of each contribution.
-            let mut contributions = Vec::<(Vec<Range<usize>>, Vec<usize>, ShardIndex, Vec<u8>)>::new();
-            for (shard_index, slices, unreduced_coordinates, bytes) in shards {
-                match contributions.iter().find(|(contribution_slices, contribution_coordinates, _, _)| {
-                    *contribution_slices == slices && *contribution_coordinates == unreduced_coordinates
-                }) {
-                    Some((_, _, _, contribution_bytes)) if *contribution_bytes != bytes => {
-                        return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
-                    }
-                    Some(_) => {}
-                    None => contributions.push((slices, unreduced_coordinates, shard_index, bytes)),
-                }
-            }
-
-            // Combine distinct contributions to each tile elementwise using the sharding's unreduced kind, in ascending
+            // Combine the contributions to each tile elementwise using the sharding's unreduced kind, in ascending
             // order of their unreduced coordinates. That order does not depend on which replica of each contribution
             // this process holds, so every process computes the same bytes even for floating point sums, which do not
             // associate. Boolean values do not support addition, so their sums combine with logical or instead, whose
             // identity is `false`.
-            contributions.sort_by(|(_, left, _, _), (_, right, _, _)| left.cmp(right));
+            contributions.sort_by(|(_, left, _), (_, right, _)| left.cmp(right));
             let unreduced_kind = self.sharding().unreduced_kind();
-            let mut tiles = Vec::<(ShardIndex, Vec<Range<usize>>, CoreArray)>::new();
-            for (slices, _, shard_index, bytes) in contributions {
+            let mut tiles = Vec::<(Vec<Range<usize>>, CoreArray)>::new();
+            for (slices, _, bytes) in contributions {
                 let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
                 let contribution = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
-                match tiles.iter_mut().find(|(_, tile_slices, _)| *tile_slices == slices) {
-                    Some((_, _, tile)) => {
+                match tiles.iter_mut().find(|(tile_slices, _)| *tile_slices == slices) {
+                    Some((_, tile)) => {
                         *tile = match unreduced_kind {
                             UnreducedKind::Sum if element_type == DataType::Boolean => Or::or(&*tile, &contribution)?,
                             UnreducedKind::Sum => Add::add(&*tile, &contribution)?,
@@ -575,19 +558,17 @@ impl Array {
                             UnreducedKind::Min => Min::min(&*tile, &contribution)?,
                         }
                     }
-                    None => tiles.push((shard_index, slices, contribution)),
+                    None => tiles.push((slices, contribution)),
                 }
             }
 
-            tiles
-                .into_iter()
-                .map(|(shard_index, slices, tile)| (shard_index, slices, tile.logical_bytes()))
-                .collect()
+            tiles.into_iter().map(|(slices, tile)| (slices, tile.logical_bytes())).collect()
         };
 
         // Reuse a single full tile's bytes when the copies and any reduction already produced the complete value.
-        if shards.len() == 1 {
-            let (shard_index, slices, bytes) = shards.pop().unwrap();
+        // A scalar array has a single tile, so it always returns here.
+        if tiles.len() == 1 {
+            let (slices, bytes) = tiles.pop().unwrap();
             let covers_global_shape = slices.len() == global_shape.rank()
                 && slices
                     .iter()
@@ -596,37 +577,26 @@ impl Array {
             if covers_global_shape && bytes.len() == total_byte_count {
                 return Ok(bytes);
             }
-            shards.push((shard_index, slices, bytes));
+            tiles.push((slices, bytes));
         }
 
-        // Merge tiles into the global buffer, recording written ranges to detect replicas with inconsistent data.
+        // Copy the tiles into the global buffer. They are disjoint, because the tiles of a sharding are either
+        // disjoint or identical and the selection holds one replica of each.
         let mut global_bytes = vec![0u8; total_byte_count];
-        let mut written_intervals = Vec::new();
-
-        // Shards have the array's rank. Every scalar shard occupies one byte range starting at zero.
-        if global_shape.rank() == 0 {
-            for (shard_index, _, bytes) in shards {
-                merge_shard_byte_segment(bytes.as_slice(), 0, shard_index, &mut global_bytes, &mut written_intervals)?;
-            }
-            return Ok(global_bytes);
-        }
-
-        for (shard_index, slices, bytes) in shards {
-            let shard_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-            let shard_strides = row_major_element_strides(shard_shape.as_slice(), element_type)?;
-            merge_dense_shard_bytes(
+        for (slices, bytes) in tiles {
+            let tile_shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
+            let tile_strides = row_major_element_strides(tile_shape.as_slice(), element_type)?;
+            copy_dense_shard_bytes(
                 bytes.as_slice(),
                 slices.as_slice(),
                 global_strides.as_slice(),
-                shard_strides.as_slice(),
+                tile_strides.as_slice(),
                 0,
                 0,
                 0,
                 element_size_in_bytes,
-                shard_index,
                 &mut global_bytes,
-                &mut written_intervals,
-            )?;
+            );
         }
 
         Ok(global_bytes)
@@ -647,10 +617,11 @@ impl Array {
     /// Returns an [`ExecutionFence`] that completes once [`Self::copy_to_host_bytes`] can read this array back without
     /// waiting for anything but its own copies (i.e., once the execution that produced this array and the buffers that
     /// the readback copies are ready), and that reports the first error among them. The fence waits for exactly the
-    /// buffers that the readback waits for, which [`Self::host_readback_shards`] selects for both, so it does not wait
-    /// for a replica that the readback does not read (e.g., a replica that a producer fills only once the result of
-    /// the upload that reads this array back is ready). A host upload that reads this array back waits for this fence
-    /// before it occupies a worker (refer to [`HostUploadWorkers`]).
+    /// buffers that the readback waits for, which [`Self::host_readback_shards`] selects for both (i.e., one local
+    /// replica of each distinct contribution to the value). It therefore does not wait for any other replica (e.g., a
+    /// replica that a producer fills only once the result of the upload that reads this array back is ready). A host
+    /// upload that reads this array back waits for this fence before it occupies a worker (refer to
+    /// [`HostUploadWorkers`]).
     ///
     /// # Errors
     ///
@@ -680,61 +651,47 @@ impl Array {
     /// Selects the shards that [`Self::copy_to_host_bytes`] of an array with elements copies, given the indices of the
     /// unreduced axes of the sharding within its mesh, and returns them together with whether they are tiles that the
     /// readback copies directly into the dense destination. [`Self::host_readback_fence`] waits for the same shards.
-    /// Without unreduced axes, every device holds its tile of the array itself, so one replica of each distinct tile
-    /// suffices. When every tile occupies one contiguous byte range of the dense representation (e.g., when only the
-    /// leading dimension is sharded, or for a replicated array), the selection is the first replica of each tile among
-    /// the shards of [`Self::readback_shards`], and the readback copies each of them into its range. Otherwise, the
-    /// selection is every shard of [`Self::readback_shards`], whose copies the readback merges on the host after
-    /// checking that the overlapping ones agree.
+    /// The selection is that of [`Self::readback_shards`] (i.e., one local replica of each distinct contribution to
+    /// the value). The readback copies the selected tiles directly when there are no unreduced axes and every tile
+    /// occupies one contiguous byte range of the dense representation (e.g., when only the leading dimension is
+    /// sharded, or for a replicated array). Otherwise, it assembles their copies on the host.
     fn host_readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<(Vec<&ArrayShard>, bool), Error> {
         let shards = self.readback_shards(unreduced_axis_indices)?;
-        if !unreduced_axis_indices.is_empty() {
-            return Ok((shards, false));
-        }
-
         let global_shape = self.shape();
-        let mut tiles = Vec::<&ArrayShard>::new();
-        for shard in &shards {
-            let slices = shard.slice();
-            if tiles.iter().any(|tile| tile.slice() == slices) {
-                continue;
-            }
 
-            // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
-            let first_non_unit_dimension = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
-            let trailing_dimensions_are_whole = slices
-                .iter()
-                .zip(global_shape.as_slice())
-                .skip(first_non_unit_dimension + 1)
-                .all(|(slice, extent)| slice.start == 0 && slice.end == *extent);
-            if !trailing_dimensions_are_whole {
-                return Ok((shards, false));
-            }
-            tiles.push(shard);
-        }
-        Ok((tiles, true))
+        // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
+        let contiguous_tiles = unreduced_axis_indices.is_empty()
+            && shards.iter().all(|shard| {
+                let slices = shard.slice();
+                let first_non_unit_dimension = slices.iter().position(|slice| slice.len() != 1).unwrap_or(slices.len());
+                slices
+                    .iter()
+                    .zip(global_shape.as_slice())
+                    .skip(first_non_unit_dimension + 1)
+                    .all(|(slice, extent)| slice.start == 0 && slice.end == *extent)
+            });
+        Ok((shards, contiguous_tiles))
     }
 
-    /// Selects the shards that [`Self::copy_to_host_bytes`] reads from, given the indices of the unreduced axes of
-    /// the sharding within its mesh. When this process holds every shard, all of them are selected. Otherwise, the
-    /// addressable shards suffice when they hold a replica of every distinct contribution to the value, which
-    /// the merge identifies by the tile of a shard and its coordinates along the unreduced axes (refer to
-    /// [`Self::unreduced_coordinates`]). The tiles of a sharding are either disjoint or identical, so this holds
-    /// exactly when the current process can assemble the whole value (e.g., for a replicated array, which JAX also
-    /// reads when the current process holds it in full, or for an unreduced array whose summands each have a local
-    /// replica). A tile without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no
-    /// local replica. Returns [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution
-    /// has no local replica.
+    /// Selects one local replica of each distinct contribution to the value of this array, which is what
+    /// [`Self::copy_to_host_bytes`] reads, given the indices of the unreduced axes of the sharding within its mesh.
+    /// A contribution is identified by the tile of a shard and its coordinates along the unreduced axes (refer to
+    /// [`Self::unreduced_coordinates`]), and its selected replica is the first addressable one in shard order, so the
+    /// selection is deterministic. The other replicas are not read, as in JAX. The tiles of a sharding are either
+    /// disjoint or identical, so the selection holds the whole value exactly when the current process can assemble
+    /// it (e.g., for a replicated array, or for an unreduced array whose summands each have a local replica). A tile
+    /// without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no local replica.
+    /// Returns [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution has no local
+    /// replica.
     fn readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<Vec<&ArrayShard>, Error> {
         let all_shards = self.shards();
-        if all_shards.iter().all(|shard| shard.buffer().is_some()) {
-            return Ok(all_shards.iter().collect());
-        }
-
-        let addressable = all_shards.iter().filter(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
         let contribution =
             |shard: &ArrayShard| (shard.slice().to_vec(), self.unreduced_coordinates(shard, unreduced_axis_indices));
-        let covered = addressable.iter().map(|shard| contribution(shard)).collect::<HashSet<_>>();
+        let mut covered = HashSet::new();
+        let selected = all_shards
+            .iter()
+            .filter(|shard| shard.buffer().is_some() && covered.insert(contribution(shard)))
+            .collect::<Vec<_>>();
         let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
         let missing = all_shards.iter().filter(required).find(|shard| !covered.contains(&contribution(shard)));
         if let Some(missing) = missing {
@@ -744,7 +701,7 @@ impl Array {
             }));
         }
 
-        Ok(addressable)
+        Ok(selected)
     }
 
     /// Returns the indices of the unreduced axes of the sharding of this array within its mesh, in mesh order.
@@ -1530,72 +1487,11 @@ fn row_major_element_strides(shape: &[usize], element_type: DataType) -> Result<
     Ok(strides)
 }
 
-/// Merges one contiguous segment of shard bytes into `global_bytes` at `global_byte_offset`
-/// and records the written range in `written_intervals`, which stays sorted and disjoint. Returns
-/// [`ArrayError::InconsistentOverlappingShardData`] when two overlapping shards disagree on the value of a byte.
-#[allow(clippy::single_range_in_vec_init)]
-fn merge_shard_byte_segment(
-    source_bytes: &[u8],
-    global_byte_offset: usize,
-    shard_index: ShardIndex,
-    global_bytes: &mut [u8],
-    written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), Error> {
-    // Shard slices with zero extents produce empty segments, and recording their degenerate `[x, x)` intervals would
-    // only bloat the overlap bookkeeping without ever contributing bytes.
-    if source_bytes.is_empty() {
-        return Ok(());
-    }
-
-    let range = global_byte_offset..global_byte_offset + source_bytes.len();
-    let insertion_index = written_intervals.partition_point(|written| written.start <= range.start);
-    let mut first_overlap = insertion_index.saturating_sub(1);
-    while first_overlap < written_intervals.len() && written_intervals[first_overlap].end <= range.start {
-        first_overlap += 1;
-    }
-
-    let mut overlap_index = first_overlap;
-    while overlap_index < written_intervals.len() && written_intervals[overlap_index].start < range.end {
-        let written = &written_intervals[overlap_index];
-        let overlap = written.start.max(range.start)..written.end.min(range.end);
-        if overlap.start < overlap.end {
-            let source_offset = overlap.start - range.start;
-            if global_bytes[overlap.clone()] != source_bytes[source_offset..source_offset + overlap.len()] {
-                return Err(Error::from(ArrayError::InconsistentOverlappingShardData { shard_index }));
-            }
-        }
-        overlap_index += 1;
-    }
-
-    global_bytes[range.clone()].copy_from_slice(source_bytes);
-
-    let mut merged_start = range.start;
-    let mut merged_end = range.end;
-    let mut remove_start = insertion_index;
-    if remove_start > 0 && written_intervals[remove_start - 1].end >= merged_start {
-        remove_start -= 1;
-        merged_start = merged_start.min(written_intervals[remove_start].start);
-        merged_end = merged_end.max(written_intervals[remove_start].end);
-    }
-
-    let mut remove_end = remove_start;
-    while remove_end < written_intervals.len() && written_intervals[remove_end].start <= merged_end {
-        merged_end = merged_end.max(written_intervals[remove_end].end);
-        remove_end += 1;
-    }
-
-    // The replacement is one interval, not the elements of a range.
-    written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
-
-    Ok(())
-}
-
-/// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
-/// element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are row-major element
-/// strides. [`merge_shard_byte_segment`] uses the sorted, disjoint byte ranges in `written_intervals` to detect
-/// inconsistent overlapping data.
+/// Recursively copies the row-major bytes of one tile into `global_bytes`, from dimension `dimension` onward and
+/// starting at the element offsets `base_global_element_offset` and `base_shard_element_offset`. The strides are
+/// row-major element strides. The tile must have at least one dimension.
 #[allow(clippy::too_many_arguments)]
-fn merge_dense_shard_bytes(
+fn copy_dense_shard_bytes(
     shard_bytes: &[u8],
     shard_slices: &[Range<usize>],
     global_strides: &[usize],
@@ -1604,10 +1500,8 @@ fn merge_dense_shard_bytes(
     base_global_element_offset: usize,
     base_shard_element_offset: usize,
     element_size_in_bytes: usize,
-    shard_index: ShardIndex,
     global_bytes: &mut [u8],
-    written_intervals: &mut Vec<Range<usize>>,
-) -> Result<(), Error> {
+) {
     let slice = &shard_slices[dimension];
     if dimension + 1 == shard_slices.len() {
         let global_element_offset =
@@ -1615,13 +1509,9 @@ fn merge_dense_shard_bytes(
         let global_byte_offset = global_element_offset.checked_mul(element_size_in_bytes).unwrap();
         let shard_byte_offset = base_shard_element_offset.checked_mul(element_size_in_bytes).unwrap();
         let byte_count = slice.len().checked_mul(element_size_in_bytes).unwrap();
-        return merge_shard_byte_segment(
-            &shard_bytes[shard_byte_offset..shard_byte_offset + byte_count],
-            global_byte_offset,
-            shard_index,
-            global_bytes,
-            written_intervals,
-        );
+        global_bytes[global_byte_offset..global_byte_offset + byte_count]
+            .copy_from_slice(&shard_bytes[shard_byte_offset..shard_byte_offset + byte_count]);
+        return;
     }
 
     for (local_index, global_index) in (slice.start..slice.end).enumerate() {
@@ -1629,7 +1519,7 @@ fn merge_dense_shard_bytes(
             base_global_element_offset + global_index.checked_mul(global_strides[dimension]).unwrap();
         let next_shard_element_offset =
             base_shard_element_offset + local_index.checked_mul(shard_strides[dimension]).unwrap();
-        merge_dense_shard_bytes(
+        copy_dense_shard_bytes(
             shard_bytes,
             shard_slices,
             global_strides,
@@ -1638,13 +1528,9 @@ fn merge_dense_shard_bytes(
             next_global_element_offset,
             next_shard_element_offset,
             element_size_in_bytes,
-            shard_index,
             global_bytes,
-            written_intervals,
-        )?;
+        );
     }
-
-    Ok(())
 }
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
@@ -1658,7 +1544,6 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-
     use ryft_core::{
         Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         ProgramError, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
@@ -2780,14 +2665,8 @@ mod tests {
         let second = [10f32, 20.];
         assert_eq!(readback([first, first, second, second]).unwrap(), values_to_bytes(&[11f32, 22.]));
 
-        // Shards at the same coordinate must agree before their contribution is combined with the others.
-        let error = readback([first, [1., 3.], second, second]).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Array(error)
-                if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 1 }),
-        ));
-        assert_eq!(error.to_string(), "array move found inconsistent overlapping data while materializing shard #1");
+        // Only the first replica of each summand is read, so the other replicas are not compared with it.
+        assert_eq!(readback([first, [1., 3.], second, [0., 0.]]).unwrap(), values_to_bytes(&[11f32, 22.]));
     }
 
     #[test]
@@ -2840,7 +2719,7 @@ mod tests {
             ));
             assert_eq!(
                 error.to_string(),
-                format!("array shard #2 on device {first_remote_id} has no addressable buffer")
+                format!("array shard #2 on device {first_remote_id} has no addressable buffer"),
             );
         }
     }
@@ -2929,6 +2808,47 @@ mod tests {
                     .with_execution_fence(ExecutionFence::new(vec![event]));
             assert_eq!(array.copy_to_host_bytes().unwrap_err().to_string(), "empty producer failed");
         }
+    }
+
+    #[test]
+    fn test_array_validate_host_readback() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let client_device = client.addressable_devices().unwrap().remove(0);
+        let local_device = Device::from_pjrt(&client_device).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local_device, remote_device]).unwrap();
+        let array = |sharding: Sharding, local_values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let dimensions = [local_values.len() as u64];
+            let bytes = values_to_bytes(local_values);
+            let buffer =
+                client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, client_device.clone(), None);
+            Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, vec![buffer.unwrap()]).unwrap()
+        };
+
+        // The local replica of a replicated array holds the whole value.
+        let replicated = array(Sharding::replicated(logical_mesh.clone(), 1), &[1., 2., 3., 4.]);
+        assert!(matches!(replicated.validate_host_readback(), Ok(())));
+
+        // The local shard of a sharded array holds only its own tile, so the readback is rejected before any copy.
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let error = array(sharded, &[1., 2.]).validate_host_readback().unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::MissingShardBuffer { shard_index: 1, device_id } if *device_id == remote_device.id(),
+            ),
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("array shard #1 on device {} has no addressable buffer", remote_device.id()),
+        );
+
+        // A readback without elements copies nothing, so it needs no shard.
+        let zero = Array::zero(&session, ArrayType::new_static(DataType::Zero, [4]), None, mesh).unwrap();
+        assert!(matches!(zero.validate_host_readback(), Ok(())));
     }
 
     #[test]
@@ -3072,6 +2992,132 @@ mod tests {
     }
 
     #[test]
+    fn test_array_host_readback_shards() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let selection = |dimensions: Vec<ShardingDimension>, unreduced: bool| {
+            let mut sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();
+            if unreduced {
+                sharding = sharding.with_unreduced_axes(["x"]).unwrap();
+            }
+            let r#type = ArrayType::new_static(DataType::U8, [2, 2]);
+            let array =
+                Array::from_host_buffer(&session, r#type, mesh.clone(), Some(sharding), [1u8, 2, 3, 4]).unwrap();
+            let (shards, direct) = array.host_readback_shards(array.unreduced_axis_indices().as_slice()).unwrap();
+            (shards.into_iter().map(ArrayShard::index).collect::<Vec<_>>(), direct)
+        };
+        let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
+        let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+        let columns = vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])];
+
+        // The first replica of each tile is selected, and tiles that are contiguous in the dense representation are
+        // copied directly into it.
+        assert_eq!(selection(replicated.clone(), false), (vec![0], true));
+        assert_eq!(selection(rows, false), (vec![0, 2], true));
+
+        // Column tiles are not contiguous, so their copies are assembled on the host.
+        assert_eq!(selection(columns, false), (vec![0, 2], false));
+
+        // Along the unreduced axis `x`, the devices at each coordinate hold replicas of one contribution, and the
+        // selected contributions are combined on the host.
+        assert_eq!(selection(replicated, true), (vec![0, 2], false));
+    }
+
+    #[test]
+    fn test_array_unreduced_axis_indices() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let indices = |unreduced_axes: &[&str]| {
+            let sharding = Sharding::replicated(logical_mesh.clone(), 1)
+                .with_unreduced_axes(unreduced_axes.iter().copied())
+                .unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [1]);
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(sharding), 1f32.to_ne_bytes());
+            array.unwrap().unreduced_axis_indices()
+        };
+
+        // The indices are those of the unreduced axes within the mesh, in mesh order.
+        assert_eq!(indices(&[]), Vec::<usize>::new());
+        assert_eq!(indices(&["y"]), vec![1]);
+        assert_eq!(indices(&["y", "x"]), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_array_unreduced_coordinates() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [1]);
+        let sharding = Sharding::replicated(logical_mesh, 1);
+        let array = Array::from_host_buffer(&session, r#type, mesh, Some(sharding), 1f32.to_ne_bytes()).unwrap();
+        let coordinates = |unreduced_axis_indices: &[usize]| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| array.unreduced_coordinates(shard, unreduced_axis_indices))
+                .collect::<Vec<_>>()
+        };
+
+        // The coordinates of the device of each shard are restricted to the requested mesh axes, in their order.
+        assert_eq!(coordinates(&[0, 1]), vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]]);
+        assert_eq!(coordinates(&[1]), vec![vec![0], vec![1], vec![0], vec![1]]);
+        assert_eq!(coordinates(&[]), vec![Vec::<usize>::new(); 4]);
+    }
+
+    #[test]
+    fn test_host_shard_source_to_dense_bytes() {
+        let host_bytes = [0u8, 1, 2, 3, 4, 5, 6, 7];
+
+        // An additive identity repeats the encoding of one element and reads nothing from the host buffer.
+        let identity = HostShardSource::AdditiveIdentity { element: vec![0, 128], count: 3 };
+        assert_eq!(identity.to_dense_bytes(&host_bytes, &[3], 2), vec![0, 128, 0, 128, 0, 128]);
+
+        // A contiguous window holds the dense bytes of its shard.
+        let contiguous = HostShardSource::Window { window: 4..8, byte_strides: None };
+        assert_eq!(contiguous.to_dense_bytes(&host_bytes, &[1, 4], 1), vec![4, 5, 6, 7]);
+
+        // The last two columns of a `[2, 4]` array start at its third element, and their rows are four bytes apart.
+        let strided = HostShardSource::Window { window: 2..8, byte_strides: Some(vec![4, 1]) };
+        assert_eq!(strided.to_dense_bytes(&host_bytes, &[2, 2], 1), vec![2, 3, 6, 7]);
+
+        // A strided shard without elements has no bytes, wherever its window starts.
+        let empty = HostShardSource::Window { window: 8..8, byte_strides: Some(vec![4, 1]) };
+        assert_eq!(empty.to_dense_bytes(&host_bytes, &[0, 2], 1), Vec::<u8>::new());
+    }
+
+    #[test]
     fn test_prepared_host_shards_bytes() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -3114,7 +3160,7 @@ mod tests {
         }
         assert_eq!(
             row_columns.iter().map(|bytes| bytes.range.clone()).collect::<Vec<_>>(),
-            [0..16, 16..32, 0..16, 16..32]
+            [0..16, 16..32, 0..16, 16..32],
         );
 
         // The replicas of a strided column tile share one gathered copy, and the tiles that differ have their own.
@@ -3149,9 +3195,53 @@ mod tests {
     }
 
     #[test]
+    fn test_host_buffer_slice_new() {
+        // A slice covers its range of the host bytes, and its clones share the allocation of those bytes.
+        let bytes = Arc::new(vec![1u8, 2, 3, 4]);
+        let slice = HostBufferSlice::new(Arc::clone(&bytes), 1..3);
+        assert_eq!(slice.as_ref(), [2, 3]);
+        assert!(Arc::ptr_eq(&slice.clone().bytes, &bytes));
+    }
+
+    #[test]
+    fn test_host_buffer_slice_from() {
+        // A slice that is created from owned bytes covers all of them.
+        let slice = HostBufferSlice::from(vec![1u8, 2, 3]);
+        assert_eq!(slice.range, 0..3);
+        assert_eq!(slice.as_ref(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_pending_host_upload_new() {
+        let client = cpu_client(1);
+        let devices = client.addressable_devices().unwrap();
+        let memory = devices[0].default_memory().unwrap();
+        let (upload, buffer) = PendingHostUpload::new(client, BufferType::F32, vec![2], memory, None).unwrap().unwrap();
+        assert_eq!(upload.buffer_type, BufferType::F32);
+        assert_eq!(upload.dimensions, vec![2]);
+
+        // The destination buffer is pending until its transfer manager fills it, and dropping the manager without
+        // filling the buffer poisons it, so that no reader of the buffer can wait forever.
+        assert_eq!(ExecutionFence::new(vec![buffer.ready().unwrap()]).is_ready(), Ok(false));
+        drop(upload);
+        assert!(buffer.ready().unwrap().r#await().is_err());
+    }
+
+    #[test]
+    fn test_host_upload_workers_new() {
+        // Workers start lazily, so a new set of workers only records its limit.
+        let workers = HostUploadWorkers::new(NonZeroUsize::new(3).unwrap());
+        assert_eq!(workers.state.worker_limit, 3);
+        let queue = workers.state.lock();
+        assert_eq!((queue.jobs.len(), queue.accepted_job_count, queue.worker_count, queue.shut_down), (0, 0, 0, false));
+    }
+
+    #[test]
     fn test_host_upload_workers_submit() {
         let workers = HostUploadWorkers::new(NonZeroUsize::new(2).unwrap());
         let (sender, receiver) = mpsc::channel();
+
+        // Every job whose sources are ready runs once, on a named worker thread.
         for index in 0..3 {
             let sender = sender.clone();
             workers
@@ -3223,8 +3313,8 @@ mod tests {
         let workers = HostUploadWorkers::new(NonZeroUsize::new(1).unwrap());
         let (sender, receiver) = mpsc::channel();
 
-        // A job whose sources are pending does not occupy the only worker, so a later job with ready sources runs first.
-        // The parked jobs run once their sources complete, including when the sources fail.
+        // A job whose sources are pending does not occupy the only worker, so a later job with ready sources runs
+        // first. The parked jobs run once their sources complete, including when the sources fail.
         let (succeeding, succeeding_promise) = client.event(()).unwrap();
         let (failing, failing_promise) = client.event(()).unwrap();
         let sources = [
@@ -3302,7 +3392,7 @@ mod tests {
 
     #[test]
     fn test_host_upload_workers_submit_panicking_job_with_panicking_payload() {
-        // Panic payload whose destructor panics as well.
+        /// Panic payload whose destructor panics as well.
         struct PanickingPayload;
 
         impl Drop for PanickingPayload {
@@ -3324,6 +3414,13 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(workers.state.lock().worker_count, 1);
+    }
+
+    #[test]
+    fn test_host_upload_workers_default() {
+        // The default limit follows the parallelism of the machine, with at least one worker and a fixed maximum.
+        let worker_limit = HostUploadWorkers::default().state.worker_limit;
+        assert!((1..=HostUploadWorkers::MAX_DEFAULT_WORKER_COUNT).contains(&worker_limit));
     }
 
     #[test]
@@ -3358,6 +3455,60 @@ mod tests {
     }
 
     #[test]
+    fn test_run_host_uploads() {
+        let client = cpu_client(2);
+        let devices = client.addressable_devices().unwrap();
+        let destinations = || {
+            devices
+                .iter()
+                .map(|device| {
+                    let memory = device.default_memory().unwrap();
+                    PendingHostUpload::new(client, BufferType::F32, vec![2], memory, None).unwrap().unwrap()
+                })
+                .unzip::<_, _, Vec<_>, Vec<_>>()
+        };
+        let read = |buffer: &Buffer<'static>| {
+            values_from_bytes::<f32>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice())
+        };
+
+        // Each destination buffer receives the bytes that are prepared for the index of its upload.
+        let (uploads, buffers) = destinations();
+        run_host_uploads(
+            uploads,
+            |index| Ok(HostBufferSlice::from(values_to_bytes(&[index as f32, 1.]))),
+            |error| PjrtError::internal(error.to_string()),
+        );
+        assert_eq!(buffers.iter().map(read).collect::<Vec<_>>(), vec![vec![0., 1.], vec![1., 1.]]);
+
+        // After the first failure no further bytes are prepared, the buffers that already received their bytes keep
+        // them, and the others report the error that is derived from the failure.
+        let (mut uploads, mut buffers) = destinations();
+        let (more_uploads, more_buffers) = destinations();
+        uploads.extend(more_uploads);
+        buffers.extend(more_buffers);
+        let mut prepared = Vec::new();
+        run_host_uploads(
+            uploads,
+            |index| {
+                prepared.push(index);
+                match index {
+                    0 => Ok(HostBufferSlice::from(values_to_bytes(&[1f32, 2.]))),
+                    _ => Err(PjrtError::cancelled("readback failed").into()),
+                }
+            },
+            |error| PjrtError::aborted(format!("upload failed: {error}")),
+        );
+        assert_eq!(prepared, vec![0, 1]);
+        assert_eq!(read(&buffers[0]), vec![1., 2.]);
+        for buffer in &buffers[1..] {
+            assert!(matches!(
+                buffer.ready().unwrap().r#await(),
+                Err(PjrtError::Aborted { message, .. }) if message == "upload failed: readback failed",
+            ));
+        }
+    }
+
+    #[test]
     fn test_row_major_element_strides() {
         assert_eq!(row_major_element_strides(&[2, 3, 4], DataType::F32).unwrap(), vec![12, 4, 1]);
         assert_eq!(row_major_element_strides(&[], DataType::F32).unwrap(), Vec::<usize>::new());
@@ -3375,40 +3526,10 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_shard_byte_segment() {
-        let mut global_bytes = vec![0u8; 6];
-        let mut written_intervals = Vec::new();
-
-        // Segments that do not touch are recorded as separate intervals.
-        merge_shard_byte_segment(&[1, 2], 0, 0, &mut global_bytes, &mut written_intervals).unwrap();
-        merge_shard_byte_segment(&[5, 6], 4, 1, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(written_intervals, vec![0..2, 4..6]);
-
-        // A segment that agrees with the bytes that it overlaps joins the intervals that it touches.
-        merge_shard_byte_segment(&[2, 3, 4, 5], 1, 2, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(written_intervals, vec![0..6]);
-
-        // Empty segments record nothing.
-        merge_shard_byte_segment(&[], 6, 3, &mut global_bytes, &mut written_intervals).unwrap();
-        assert_eq!(written_intervals, vec![0..6]);
-
-        // A segment that disagrees with the bytes that it overlaps is rejected.
-        let error = merge_shard_byte_segment(&[9], 2, 4, &mut global_bytes, &mut written_intervals).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Array(error)
-                if matches!(error.as_ref(), ArrayError::InconsistentOverlappingShardData { shard_index: 4 }),
-        ));
-        assert_eq!(global_bytes, vec![1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn test_merge_dense_shard_bytes() {
+    fn test_copy_dense_shard_bytes() {
         // The second column of a `[2, 2]` array occupies two separate byte ranges of its dense representation.
         let mut global_bytes = vec![0u8; 16];
-        let mut written_intervals = Vec::new();
-        merge_dense_shard_bytes(
+        copy_dense_shard_bytes(
             values_to_bytes(&[1f32, 2.]).as_slice(),
             &[0..2, 1..2],
             &[2, 1],
@@ -3417,12 +3538,8 @@ mod tests {
             0,
             0,
             size_of::<f32>(),
-            0,
             &mut global_bytes,
-            &mut written_intervals,
-        )
-        .unwrap();
+        );
         assert_eq!(values_from_bytes::<f32>(global_bytes.as_slice()), vec![0., 1., 0., 2.]);
-        assert_eq!(written_intervals, vec![4..8, 12..16]);
     }
 }

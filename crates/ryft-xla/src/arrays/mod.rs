@@ -168,9 +168,6 @@ pub enum ArrayError {
         #[source]
         source: DimensionError,
     },
-
-    #[error("array move found inconsistent overlapping data while materializing shard #{shard_index}")]
-    InconsistentOverlappingShardData { shard_index: ShardIndex },
 }
 
 /// Distributed array with a global [`StaticShape`] and element [`DataType`] as well as [`Sharding`] information.
@@ -567,6 +564,11 @@ impl Array {
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
     ///   - **Committed Inputs:** It is the result of an operation or of a compiled function that has a committed array
     ///     input, including the arrays that the function captures.
+    ///   - **Compiled Functions:** It is an output of a compiled function that was compiled for more than one device,
+    ///     or a public output of a compiled function that requests a placement explicitly anywhere (i.e., through a
+    ///     sharding override, a [`PlaceOperation`](ryft_core::PlaceOperation) with a target, or a sharding constraint),
+    ///     whether or not that request produces the output. The outputs of a function that was compiled for a single
+    ///     device without such requests are committed only when the function has a committed array input.
     ///
     /// Clones keep the commitment of their array, and so do the arrays that keep the storage of an array or
     /// copy it (e.g., a [`Session::place`] without a destination, also when it must not alias its input, and
