@@ -12,7 +12,7 @@ use ryft_pjrt::{
     ExecutionFence,
 };
 
-use crate::arrays::host::{PendingHostUpload, SharedHostBytes, submit_host_uploads};
+use crate::arrays::host::{PendingHostUpload, SharedHostBytes, run_host_uploads};
 use crate::arrays::placement::ArrayPlacement;
 use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::arrays::{Array, ArrayError};
@@ -415,19 +415,19 @@ impl Array {
                 // nothing else.
                 let source_events =
                     upload_sources.iter().map(|(source_buffer, _)| source_buffer.ready()).collect::<Result<_, _>>()?;
-                submit_host_uploads(
-                    session,
-                    ExecutionFence::new(source_events),
-                    uploads,
-                    move |index| {
-                        let (source_buffer, shape) = &upload_sources[index];
-                        read_shard_to_host(source_buffer, shape, Event::r#await).map(SharedHostBytes::from)
-                    },
-                    |error| match error {
-                        Error::Pjrt(error) => error,
-                        error => PjrtError::internal(error.to_string()),
-                    },
-                )?;
+                session.host_upload_workers().submit(ExecutionFence::new(source_events), move || {
+                    run_host_uploads(
+                        uploads,
+                        |index| {
+                            let (source_buffer, shape) = &upload_sources[index];
+                            read_shard_to_host(source_buffer, shape, Event::r#await).map(SharedHostBytes::from)
+                        },
+                        |error| match error {
+                            Error::Pjrt(error) => error,
+                            error => PjrtError::internal(error.to_string()),
+                        },
+                    )
+                })?;
                 for buffer in &upload_buffers {
                     work.track_buffer(buffer);
                     completion.track_buffer(buffer)?;
