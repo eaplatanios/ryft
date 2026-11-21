@@ -838,40 +838,37 @@ impl<
 // TODO(eaplatanios): Review from here onwards.
 
 /// Moves a value to a target [`Placement`], possibly on the devices of another [`DeviceMesh`](crate::DeviceMesh),
-/// without changing its
-/// elements, shape, or data type. This is the Ryft analogue of
+/// without changing its elements, shape, or data type. This is the Ryft analogue of
 /// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html), and like JAX's `device_put`
 /// primitive it works inside transformations, so that a value can be moved within staged programs and functions that
 /// are batched or differentiated. Its type records the target sharding (without its [`MeshAxisType::Auto`] mesh axes)
 /// and the target [`Memory`](crate::Memory) and [`Layout`](crate::Layout) when the target names them, while an omitted
-/// memory or
-/// layout keeps the
-/// value's current storage. Refer to [`PlaceOperation`] for the validation that the target and source go through.
+/// memory or layout keeps the value's current storage. Refer to [`PlaceOperation`] for the validation that the target
+/// and source go through.
 ///
 /// The source is informative. It states where the value is expected to live when the placement is created. Placement
 /// over auto mesh axes and devices are runtime state that types do not record, so transposition uses the source to move
 /// the cotangent back to those devices. [`PlaceOperation`] type inference checks the source against what the type of
 /// the value tracks, while backends that execute the placement on a concrete value move the value from wherever it
-/// actually lives without comparing that placement with the source. When the source is [`None`], each leaf uses
-/// the placement that it concretely lives on (refer to [`Placed`]) if it has one, so
-/// that concrete backend arrays record their actual placement, while staged values leave the source unknown. Reference
-/// [`Array`]s have no devices, so they record the output type that [`PlaceOperation`] type inference computes without
-/// changing their elements, and they re-encode their storage only for a target layout that differs from theirs. Unlike
-/// [`Reshard`](crate::Reshard), which redistributes a value over the mesh that it already lives on, this capability can
-/// express
-/// placements across meshes. Host scalar types have no placement and do not implement it.
+/// actually lives without comparing that placement with the source. When the source is [`None`], each leaf uses the
+/// placement that it concretely lives on (refer to [`Placed`]) if it has one, so that concrete backend arrays record
+/// their actual placement, while staged values leave the source unknown. Reference [`Array`]s have no devices, so they
+/// record the output type that [`PlaceOperation`] type inference computes without changing their elements, and they
+/// re-encode their storage only for a target layout that differs from theirs. Unlike [`Reshard`](crate::Reshard), which
+/// redistributes a value over the mesh that it already lives on, this capability can express placements across meshes.
+/// Host scalar types have no placement and do not implement it.
 ///
-/// Every placement through this capability uses the default copy policy of [`PlaceOperation`], so its results may
-/// share storage with its inputs (e.g., a reference [`Array`] keeps sharing its storage unless its layout changes).
-/// To place a leaf whose result must have storage of its own, call [`PlaceDispatch::place`] with `may_alias` set to
-/// `false` instead, which also forces that copy when the placement is staged and later executes on concrete values.
+/// Every placement through this capability uses the default copy policy of [`PlaceOperation`], so its results may share
+/// storage with its inputs (e.g., a reference [`Array`] keeps sharing its storage unless its layout changes). To place
+/// a leaf whose result must have storage of its own, call [`PlaceDispatch::place`] with `may_alias` set to `false`
+/// instead, which also forces that copy when the placement is staged and later executes on concrete values.
 /// [`PlaceDispatch::place`] also places a leaf without a target, which leaves it where it is.
 ///
-/// A single value accepts one target and an optional source. A [`Parameterized`] receiver accepts placements with
-/// the same ordered parameter paths and preserves its structure and static fields. The universe parameter `T` defaults
-/// to the [`Capability`] universe of a single-value receiver, which is [`ArrayType`] for homogeneous arrays and
-/// [`ArrayIrType`] for array IR values. The leaf parameter `P` defaults to `Self`, so single-value bounds can use
-/// `Place<T>`. A structured receiver implements `Place<T, P>` for the universe `T` of its leaves.
+/// A single value accepts one target and an optional source. A [`Parameterized`] receiver accepts placements with the
+/// same ordered parameter paths and preserves its structure and static fields. The universe parameter `T` defaults to
+/// the [`Capability`] universe of a single-value receiver, which is [`ArrayType`] for homogeneous arrays and
+/// [`ArrayIrType`] for array IR values. The leaf parameter `P` defaults to `Self`, so single-value bounds
+/// can use `Place<T>`. A structured receiver implements `Place<T, P>` for the universe `T` of its leaves.
 ///
 /// # Examples
 ///
@@ -923,8 +920,8 @@ pub trait Place<T = <Self as Capability>::Universe, P: Parameter + Capability = 
     ///
     /// Returns [`ProgramError::InvalidArgument`] before placing any leaf if the ordered parameter paths of the
     /// receiver, targets, or sources differ, and otherwise the first error that placing a leaf returns (refer to
-    /// [`PlaceDispatch::place`]), such as a [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects the
-    /// target or source of that leaf.
+    /// [`PlaceDispatch::place`]), such as a [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects
+    /// the target or source of that leaf.
     fn place_with_optional_sources(
         &self,
         targets: &<Self as Parameterized<P>>::To<Placement>,
