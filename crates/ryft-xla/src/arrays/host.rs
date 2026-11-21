@@ -1367,8 +1367,6 @@ impl Drop for HostUploadWorkers {
     }
 }
 
-// TODO(eaplatanios): Review from here.
-
 /// State that a [`HostUploadWorkers`] owner shares with its workers.
 struct HostUploadWorkersState {
     /// Queued jobs and the bookkeeping of the workers.
@@ -1389,18 +1387,23 @@ impl HostUploadWorkersState {
         let mut queue = self.lock();
         loop {
             if let Some(job) = queue.jobs.pop_front() {
+                // Unlock before running the job so other workers can take jobs and callbacks can enqueue them.
+                // The job can also drop the last session handle, which locks this queue during shutdown.
                 drop(queue);
+
                 // Unwinding drops what the job owns, and the panic itself has already been reported by the panic hook.
-                // The payload is dropped under its own guard, because a custom payload can panic in its destructor,
-                // which would otherwise stop this worker before it updates the counters below. Ordinary panic messages
-                // drop safely, and any other payload whose destructor panicked is forgotten instead of dropped again.
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(job))
+                    // Drop the payload inside a second `catch_unwind` because its destructor can panic. The worker
+                    // must still decrement the accepted job count and continue serving the queue.
                     && let Err(drop_panic) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
                     && !drop_panic.is::<&'static str>()
                     && !drop_panic.is::<String>()
                 {
+                    // String payloads drop safely. A custom payload from the second panic could itself panic on
+                    // drop, so leak that payload to keep the worker running.
                     std::mem::forget(drop_panic);
                 }
+
                 queue = self.lock();
                 queue.accepted_job_count -= 1;
                 if queue.shut_down && queue.accepted_job_count == 0 {
@@ -1445,21 +1448,20 @@ struct HostUploadQueue {
     shut_down: bool,
 }
 
-/// Fills the destination buffers of `uploads` on the current worker. For each upload in order, calls `prepare` with the
-/// index of the upload to obtain its dense row-major host bytes and hands them to PJRT, which converts them to the
+/// Fills the destination buffers of `uploads` on the current worker. For each upload in order, calls `prepare` with
+/// the index of the upload to obtain its dense row-major host bytes and hands them to PJRT, which converts them to the
 /// layout of the destination buffer. After the first failure, the job stops preparing bytes and sets the error that
 /// `poison` derives from that failure on every destination buffer that has not received its bytes yet. Awaiting or
-/// reading such a buffer then reports that error, so no reader of a destination buffer can wait forever.
-///
-/// The source fence passed to [`HostUploadWorkers::submit`] must cover everything that `prepare` waits for,
-/// apart from PJRT transfers that complete on their own, so that the job never holds a worker while it waits for
-/// another job or for an external producer (refer to [`HostUploadWorkers`] for why this guarantees progress). The job
-/// runs even when the fence reports an error, and `prepare` then reports that error itself (e.g., from the readback of
-/// a failed buffer). The job does not call back into PJRT from a PJRT callback. Transfer managers are [`Send`] but not
-/// [`Sync`], so the job takes ownership of them, uses them only from its worker, and drops them once every issued
-/// transfer has completed. Each transfer keeps its host bytes alive until PJRT has consumed them, and PJRT keeps each
-/// destination buffer alive independently of its manager, so callers may drop the destination buffers at any time. If
-/// submission fails or `prepare` panics, dropping the job's transfer managers makes PJRT poison the unfinished buffers.
+/// reading such a buffer then reports that error, so no reader of a destination buffer can wait forever. The source
+/// fence passed to [`HostUploadWorkers::submit`] must cover everything that `prepare` waits for, apart from PJRT
+/// transfers that complete on their own, so that the job never holds a worker while it waits for another job or for
+/// an external producer (refer to [`HostUploadWorkers`] for why this guarantees progress). The job runs even when the
+/// fence reports an error, and `prepare` then reports that error itself (e.g., from the readback of a failed buffer).
+/// The job does not call back into PJRT from a PJRT callback. Transfer managers are [`Send`] but not [`Sync`], so the
+/// job takes ownership of them, uses them only from its worker, and drops them once every issued transfer has
+/// completed. Each transfer keeps its host bytes alive until PJRT has consumed them, and PJRT keeps each destination
+/// buffer alive independently of its manager, so callers may drop the destination buffers at any time. If submission
+/// fails or `prepare` panics, dropping the job's transfer managers makes PJRT poison the unfinished buffers.
 pub(super) fn run_host_uploads<P, E>(uploads: Vec<PendingHostUpload>, mut prepare: P, poison: E)
 where
     P: FnMut(usize) -> Result<HostBufferSlice, Error>,
@@ -1484,8 +1486,8 @@ where
         }
     }
 
-    // Wait for the issued transfers before the transfer managers are dropped. A transfer that fails sets its error on
-    // its own destination buffer, so its error needs no further handling here.
+    // Wait for the issued transfers before the transfer managers are dropped. A transfer that fails sets its error
+    // on its own destination buffer, so its error needs no further handling here.
     let issued_count = events.len();
     for event in events {
         if let Err(error) = event.r#await() {
@@ -1506,8 +1508,6 @@ where
         }
     }
 }
-
-// TODO(eaplatanios): Review up to here.
 
 /// Returns row-major element strides for `shape`. `strides[i]` is the number of logical elements skipped when
 /// incrementing dimension `i` by one in a dense major-to-minor layout. `element_type` is only used in the error
@@ -2984,6 +2984,91 @@ mod tests {
         managers[1].transfer_data(0, Arc::new(bytes[4..].to_vec()), 0, true).unwrap().r#await().unwrap();
         assert_eq!(wait(sharded.host_readback_fence().unwrap()), Ok(Ok(())));
         assert_eq!(sharded.copy_to_host_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_array_host_readback_fence_column_replicas() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let managers = devices
+            .iter()
+            .map(|device| {
+                let specification = BufferSpecification::new(BufferType::U8, [2, 1]);
+                client
+                    .host_to_device_transfer_manager(vec![specification], device.default_memory().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let buffers = managers.iter().map(|manager| manager.retrieve_buffer(0).unwrap()).collect();
+        let sharding =
+            Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [2, 2]);
+        let array = Array::from_addressable_buffers(&session, r#type, mesh, Some(sharding), buffers).unwrap();
+
+        // The columns are not contiguous in the dense representation, and the devices along `y` hold replicas of
+        // each column. The readback reads only the first replica of each column, so the pending second replicas
+        // block neither the fence nor the readback.
+        managers[0].transfer_data(0, Arc::new(vec![1, 3]), 0, true).unwrap().r#await().unwrap();
+        managers[2].transfer_data(0, Arc::new(vec![2, 4]), 0, true).unwrap().r#await().unwrap();
+        let fence = array.host_readback_fence().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(fence.block_until_ready()).unwrap());
+        assert_eq!(receiver.recv_timeout(WAIT_TIMEOUT), Ok(Ok(())));
+        assert_eq!(array.copy_to_host_bytes().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_array_host_readback_fence_unreduced_replicas() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let managers = devices
+            .iter()
+            .map(|device| {
+                let specification = BufferSpecification::new(BufferType::F32, [2]);
+                client
+                    .host_to_device_transfer_manager(vec![specification], device.default_memory().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let buffers = managers.iter().map(|manager| manager.retrieve_buffer(0).unwrap()).collect();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let array = Array::from_addressable_buffers(&session, r#type, mesh, Some(sharding), buffers).unwrap();
+
+        // The devices along `y` hold replicas of the summand at their coordinate along `x`. The readback reads only
+        // the first replica of each summand, so the pending second replicas block neither the fence nor the readback.
+        let first = values_to_bytes(&[1f32, 2.]);
+        let second = values_to_bytes(&[10f32, 20.]);
+        managers[0].transfer_data(0, Arc::new(first), 0, true).unwrap().r#await().unwrap();
+        managers[2].transfer_data(0, Arc::new(second), 0, true).unwrap().r#await().unwrap();
+        let fence = array.host_readback_fence().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(fence.block_until_ready()).unwrap());
+        assert_eq!(receiver.recv_timeout(WAIT_TIMEOUT), Ok(Ok(())));
+        assert_eq!(array.copy_to_host_bytes().unwrap(), values_to_bytes(&[11f32, 22.]));
     }
 
     #[test]
