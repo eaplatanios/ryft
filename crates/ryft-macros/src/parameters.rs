@@ -133,7 +133,7 @@ impl ParameterizedCodeGenerator {
     ///         fn parameters_mut(&mut self) -> Self::ParameterIteratorMut<'_, P> { ... }
     ///         fn into_parameters(self) -> Self::ParameterIntoIterator<P> { ... }
     ///
-    ///         fn node_paths(&self) -> Vec<ryft::ParameterPath> { ... }
+    ///         fn paths(&self) -> Vec<ryft::ParameterPath> { ... }
     ///
     ///         fn from_parameters_with_remainder<__I: Iterator<Item = P>>(
     ///             structure: Self::To<ryft::Placeholder>,
@@ -205,7 +205,7 @@ impl ParameterizedCodeGenerator {
         let parameter_count = generator.generate_parameter_count_function();
         let parameter_structure = generator.generate_parameter_structure_function();
         let parameters_functions = generator.generate_parameters_functions();
-        let node_paths = generator.generate_node_paths_function();
+        let paths = generator.generate_paths_function();
         let from_parameters_with_remainder = generator.generate_from_parameters_with_remainder();
         let code = const_block(quote! {
             #[automatically_derived]
@@ -214,7 +214,7 @@ impl ParameterizedCodeGenerator {
                 #parameter_count
                 #parameter_structure
                 #parameters_functions
-                #node_paths
+                #paths
                 #from_parameters_with_remainder
             }
 
@@ -1584,14 +1584,14 @@ impl ParameterizedCodeGenerator {
         }
     }
 
-    /// Generates an implementation for the [`Parameterized::node_paths`] for the [`Data`] owned by this
+    /// Generates an implementation for the [`Parameterized::paths`] for the [`Data`] owned by this
     /// [`ParameterizedCodeGenerator`]. Note that this function returns a [`TokenStream`] with the complete function
     /// declaration and implementation but without the surrounding `impl` block. For example, the generated code may
     /// look something like this (with `...` substituted for generated code, of course, and the `ryft` crate possibly
     /// substituted as well):
     ///
     /// ```ignore
-    /// fn node_paths(&self) -> Vec<ryft::ParameterPath> { ... }
+    /// fn paths(&self) -> Vec<ryft::ParameterPath> { ... }
     /// ```
     ///
     /// Every node returns its own path (i.e., the root path, which its ancestors extend with their segments), followed
@@ -1602,7 +1602,7 @@ impl ParameterizedCodeGenerator {
     /// [`ParameterPathSegment::Variant`](ryft::ParameterPathSegment::Variant) segment. Non-parameter fields are not
     /// nodes, and so a node without parameter fields (e.g., an enum variant without parameter fields or a [`None`]
     /// value of a nested [`Option`]) returns only its own path.
-    fn generate_node_paths_function(&self) -> TokenStream {
+    fn generate_paths_function(&self) -> TokenStream {
         /// Helper that wraps `paths`, an expression that evaluates to a `Vec<ryft::ParameterPath>`, into an expression
         /// that evaluates to an iterator over the same paths with `segment` added on their root side. This adds the
         /// segment in the same way as the generated named parameter iterators, i.e., via
@@ -1614,7 +1614,7 @@ impl ParameterizedCodeGenerator {
             }
         }
 
-        /// Helper that generates the body portion of the [`Parameterized::node_paths`] function for the owner
+        /// Helper that generates the body portion of the [`Parameterized::paths`] function for the owner
         /// of the provided [`Field`]s. The resulting [`TokenStream`] contains an expression that evaluates to a
         /// `Vec<ryft::ParameterPath>` with the root path (i.e., the path of the owner) followed by the node paths
         /// of its parameter [`Field`]s, and that can be nested directly within the body of the owning function.
@@ -1648,7 +1648,7 @@ impl ParameterizedCodeGenerator {
                     };
                     let paths = match &field {
                         Field { is_parameter: false, .. } => return None,
-                        Field { fields: None, .. } => quote!(#receiver.node_paths()),
+                        Field { fields: None, .. } => quote!(#receiver.paths()),
                         Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
                             generate_body(generator, fields, Some(receiver))
                         }
@@ -1702,7 +1702,7 @@ impl ParameterizedCodeGenerator {
             }
         };
 
-        quote!(fn node_paths(&self) -> ::std::vec::Vec<#ryft::ParameterPath> { #body })
+        quote!(fn paths(&self) -> ::std::vec::Vec<#ryft::ParameterPath> { #body })
     }
 
     /// Generates an implementation for the [`Parameterized::from_parameters_with_remainder`] for the [`Data`] owned by
@@ -2642,7 +2642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_code_generator_generate_node_paths_function() {
+    fn test_code_generator_generate_paths_function() {
         let mut generator = ParameterizedCodeGenerator {
             ryft_crate: DEFAULT_RYFT_CRATE.into(),
             macro_parameter_lifetime: DEFAULT_MACRO_PARAMETER_LIFETIME.into(),
@@ -2667,18 +2667,18 @@ mod tests {
         generator.extract_parameter_type(&input);
         generator.extract_data(&input);
         assert_eq!(
-            generator.generate_node_paths_function().to_string(),
+            generator.generate_paths_function().to_string(),
             indoc! {"
-                fn node_paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
+                fn paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
                     :: std :: iter :: once (ryft :: ParameterPath :: root ()) \
                     . chain (ryft :: PathPrefixedParameterIterator :: new (\
-                        self . parameter . node_paths () . into_iter () . map (| path | (path , ())) , \
+                        self . parameter . paths () . into_iter () . map (| path | (path , ())) , \
                         ryft :: ParameterPathSegment :: Field (\"parameter\")\
                     ) . map (| (path , _) | path) \
                     . chain (ryft :: PathPrefixedParameterIterator :: new (\
                         :: std :: iter :: once (ryft :: ParameterPath :: root ()) \
                         . chain (ryft :: PathPrefixedParameterIterator :: new (\
-                            self . nested . 1 . node_paths () . into_iter () . map (| path | (path , ())) , \
+                            self . nested . 1 . paths () . into_iter () . map (| path | (path , ())) , \
                             ryft :: ParameterPathSegment :: TupleIndex (1usize)\
                         ) . map (| (path , _) | path)) \
                         . collect :: < :: std :: vec :: Vec < _ >> () \
@@ -2690,7 +2690,7 @@ mod tests {
                             || :: std :: vec ! [ryft :: ParameterPath :: root ()] , \
                             | value | :: std :: iter :: once (ryft :: ParameterPath :: root ()) \
                             . chain (ryft :: PathPrefixedParameterIterator :: new (\
-                                value . node_paths () . into_iter () . map (| path | (path , ())) , \
+                                value . paths () . into_iter () . map (| path | (path , ())) , \
                                 ryft :: ParameterPathSegment :: TupleIndex (0usize)\
                             ) . map (| (path , _) | path)) \
                             . collect :: < :: std :: vec :: Vec < _ >> () ,\
@@ -2712,8 +2712,8 @@ mod tests {
         generator.extract_parameter_type(&input);
         generator.extract_data(&input);
         assert_eq!(
-            generator.generate_node_paths_function().to_string(),
-            "fn node_paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
+            generator.generate_paths_function().to_string(),
+            "fn paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
                 :: std :: vec ! [ryft :: ParameterPath :: root ()] \
             }",
         );
@@ -2730,9 +2730,9 @@ mod tests {
         generator.extract_parameter_type(&input);
         generator.extract_data(&input);
         assert_eq!(
-            generator.generate_node_paths_function().to_string(),
+            generator.generate_paths_function().to_string(),
             indoc! {"
-                fn node_paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
+                fn paths (& self) -> :: std :: vec :: Vec < ryft :: ParameterPath > { \
                     match self { \
                         Container :: Unit => :: std :: iter :: once (ryft :: ParameterPath :: root ()) \
                         . chain (ryft :: PathPrefixedParameterIterator :: new (\
@@ -2751,7 +2751,7 @@ mod tests {
                         . chain (ryft :: PathPrefixedParameterIterator :: new (\
                             :: std :: iter :: once (ryft :: ParameterPath :: root ()) \
                             . chain (ryft :: PathPrefixedParameterIterator :: new (\
-                                value . node_paths () . into_iter () . map (| path | (path , ())) , \
+                                value . paths () . into_iter () . map (| path | (path , ())) , \
                                 ryft :: ParameterPathSegment :: Field (\"value\")\
                             ) . map (| (path , _) | path)) \
                             . collect :: < :: std :: vec :: Vec < _ >> () \

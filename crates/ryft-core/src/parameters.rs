@@ -87,7 +87,7 @@
 //! paths, a structure representation, reparameterized `To<Q>` forms, and exact reconstruction. Prefer the derived
 //! implementations for ordinary structs and enums when available.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
@@ -474,7 +474,11 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// model checkpoints, etc. These _named_ parameter operation variants are exposed via the [`Self::named_parameters`],
 /// [`Self::named_parameters_mut`], [`Self::into_named_parameters`], [`Self::from_named_parameters`],
 /// [`Self::from_broadcasted_named_parameters`], [`Self::try_map_parameters`], [`Self::map_parameters`],
-/// [`Self::try_map_named_parameters`], and [`Self::map_named_parameters`] functions.
+/// [`Self::try_map_named_parameters`], and [`Self::map_named_parameters`] functions. Among them,
+/// [`Self::from_broadcasted_named_parameters`] and [`Self::broadcast_to_parameter_structure`] interpret a value as a
+/// tree prefix of the provided structure, whose leaves each cover all the nodes at and below their paths. Such a prefix
+/// is given by its leaves together with its nodes (refer to [`Self::paths`]), so that the nodes of both trees can
+/// be matched by path, including the containers without leaves, which have no leaf paths.
 ///
 /// Note that, the [`Parameterized`] trait also defines a bunch of additional functions that are implemented using the
 /// aforementioned core primitives like [`Self::partition_parameters`], [`Self::filter_parameters`], etc. You should
@@ -533,23 +537,26 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 ///     (2_i64, BTreeMap::from([("a", vec![5_i64]), ("b", vec![6_i64, 7_i64])]), (7_i64,)),
 /// );
 ///
-/// // Unflattening from broadcasted named parameters:
+/// // Unflattening from the broadcasted named parameters of a tree prefix:
+/// let prefix = (0, BTreeMap::from([("a", 10), ("b", 20)]), 50);
 /// assert_eq!(
 ///     Value::from_broadcasted_named_parameters(
 ///         value.parameter_structure(),
-///         HashMap::from([
-///             (ParameterPath::root(), 0),
-///             (ParameterPath::root().with_segment(ParameterPathSegment::TupleIndex(1)), 10),
-///             (
-///                 ParameterPath::root()
-///                     .with_segment(ParameterPathSegment::TupleIndex(1))
-///                     .with_segment(ParameterPathSegment::Key(format!("{:?}", "b")))
-///                     .with_segment(ParameterPathSegment::Index(1)),
-///                 30,
-///             ),
-///         ]),
+///         prefix.clone().into_named_parameters(),
+///         prefix.paths(),
 ///     )?,
-///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![10, 30])]), (0,)),
+///     (0, BTreeMap::from([("a", vec![10]), ("b", vec![20, 20])]), (50,)),
+/// );
+///
+/// // Unflattening from the broadcasted named parameters of a tree prefix whose leaves cover containers without leaves:
+/// let prefix = (0, 10);
+/// assert_eq!(
+///     <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
+///         (Vec::new(), Placeholder),
+///         prefix.into_named_parameters(),
+///         prefix.paths(),
+///     )?,
+///     (Vec::new(), 10),
 /// );
 ///
 /// # Ok::<(), ryft_core::parameters::ParameterError>(())
@@ -810,6 +817,32 @@ pub trait Parameterized<P: Parameter>: Sized {
         self.named_parameters().map(|(path, _)| path)
     }
 
+    /// Returns the [`ParameterPath`]s of all nodes of the tree that this [`Parameterized`] value represents. The value
+    /// itself is the root node, and so the root path comes first. It is followed by the node paths of each child of the
+    /// value, in the order in which [`Self::named_parameters`] visits the children, each extended with the segment of
+    /// that child exactly as in [`Self::named_parameters`]. A leaf returns only the root path, and so does a container
+    /// without children (e.g., an empty [`Vec`], an empty [`BTreeMap`], a zero-length array, the unit tuple, a
+    /// [`PhantomData`], or a derived struct or enum variant without parameter fields). The leaf paths (i.e.,
+    /// [`Self::parameter_paths`]) are therefore a subset of the node paths, and the node paths additionally
+    /// describe the containers of the tree, including those without leaves, which have no leaf paths.
+    ///
+    /// The `#[derive(Parameterized)]` macro treats a struct as a node whose children are its parameter fields, and
+    /// an enum as a node whose only child is its current variant, whose children are in turn its parameter fields.
+    /// A derived enum thus returns the root path and the path of its variant (e.g., `$.blend` for a `Blend` variant),
+    /// followed by the node paths of the fields of that variant, matching the paths of [`Self::named_parameters`].
+    /// Fields that the derived implementation does not treat as parameter fields are not nodes. A nested [`Option`]
+    /// field is a node whose only child, when it is [`Some`], is its value (e.g., `$.maybe` and `$.maybe.0` for a
+    /// `maybe: Option<P>` field that is [`Some`], and only `$.maybe` when it is [`None`]).
+    ///
+    /// ```rust
+    /// # use ryft_core::parameters::*;
+    /// let paths = |paths: Vec<ParameterPath>| paths.iter().map(ParameterPath::to_string).collect::<Vec<_>>();
+    /// assert_eq!(paths((Vec::<f32>::new(), 1f32).paths()), vec!["$", "$.0", "$.1"]);
+    /// assert_eq!(paths(vec![(1, 2)].paths()), vec!["$", "$[0]", "$[0].0", "$[0].1"]);
+    /// assert_eq!(paths(Parameterized::<f32>::paths(&())), vec!["$"]);
+    /// ```
+    fn paths(&self) -> Vec<ParameterPath>;
+
     /// Validates that this [`Parameterized`] value has the parameter structure whose parameter paths are
     /// `expected_paths`. Two values that are paired parameter by parameter in flat order (e.g., inputs and their
     /// per-input options) must have the same structure, because a value with as many parameters but a different
@@ -978,26 +1011,52 @@ pub trait Parameterized<P: Parameter>: Sized {
         }
     }
 
-    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming named values
-    /// from the provided `parameters` to populate its parameters, where keys in `parameters` are interpreted as path
-    /// prefixes. Unlike [`Self::from_named_parameters`], this function does not require exact leaf paths, and each
-    /// leaf path in `structure` receives the value from the most specific matching path prefix (i.e., the longest
-    /// shared path prefix). If any leaf path is not covered by a provided prefix, then this function will return a
-    /// [`ParameterError::MissingParameters`] error. Furthermore, if there are any remaining [`ParameterPath`]s with no
-    /// match in `structure`, then it will return an [`ParameterError::UnusedParameters`] error. Note that since one
+    /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` from a tree prefix
+    /// of it, which is given as its leaves, `parameters`, and as its nodes, `paths` (i.e., the paths that
+    /// [`Self::paths`] returns for it). Unlike [`Self::from_named_parameters`], this function does not require
+    /// exact leaf paths, and each leaf of `structure` receives the value of its most specific prefix leaf (i.e., the
+    /// prefix leaf whose path is the longest prefix of its path). As in the tree prefix checks of JAX, the following
+    /// rules apply to the two trees:
+    ///
+    ///   - Every leaf of `structure` must have a prefix leaf whose path is equal to or a prefix of its path.
+    ///   - Every node path of the prefix tree must be a node path of `structure`.
+    ///   - Every node path of `structure` must be a node path of the prefix tree or lie at or below a prefix leaf.
+    ///
+    /// For example, `(a, b)` is a prefix of `(Vec::new(), x)`, a prefix with a single root leaf is a prefix of an empty
+    /// [`Vec`], `[a]` is a prefix of `[[x], []]`, and `[[], b]` is a prefix of `[[], y]`, whereas `[[a]]` is not a
+    /// prefix of `[[x], []]`, `[[a], []]` is not a prefix of `[[x]]`, and `[[]]` is not a prefix of `[]`. The paths
+    /// of the prefix leaves count as node paths of the prefix tree even when `paths` omits them. Note that since one
     /// prefix value may need to populate multiple leaves, this function requires `P: Clone`. For fully worked
     /// examples, refer to the examples provided in the top-level documentation of the [`Parameterized`] trait.
-    fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
+    ///
+    /// Nodes are matched by their paths only, which is intended. A prefix tree of another type whose nodes have the
+    /// same paths (e.g., a derived struct with the same parameter fields as the one in `structure`, or an array for a
+    /// [`Vec`]) therefore matches, and so does a node of the same type whose static metadata (i.e., the values of its
+    /// non-parameter fields) differs, in which case the result takes that metadata from `structure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParameterError::MissingParameters`] when `structure` has nodes that violate the first or the third
+    /// rule. The descendants of such a node violate them too, and so the error only lists the paths of the violating
+    /// nodes without violating children (e.g., the leaves without a prefix leaf and the containers without children
+    /// that the prefix tree does not reach), in the order of [`Self::paths`]. Otherwise, it returns
+    /// [`ParameterError::UnusedParameters`] when the prefix tree has nodes that violate the second rule, with the
+    /// sorted paths of the violating nodes without violating children (e.g., `$[0]` for the prefix `[[]]` of `[]`).
+    fn from_broadcasted_named_parameters<
+        I: IntoIterator<Item = (ParameterPath, P)>,
+        N: IntoIterator<Item = ParameterPath>,
+    >(
         structure: Self::ParameterStructure,
         parameters: I,
+        paths: N,
     ) -> Result<Self, ParameterError>
     where
         P: Clone,
     {
-        // This function uses a small local prefix trie to resolve each leaf parameter path to the most specific
-        // matching prefix (i.e., the longest matching prefix) in path-depth time, instead of scanning all prefixes
-        // for every leaf. That is usually much faster when many prefixes are provided, at the cost of the additional
-        // trie construction/allocation overhead, which can be less favorable for very small prefix sets.
+        // This function uses a small local prefix trie to resolve each path to the most specific prefix leaf (i.e.,
+        // the longest matching prefix) in path-depth time, instead of scanning all prefix leaves for every path.
+        // That is usually much faster when many prefix leaves are provided, at the cost of the additional trie
+        // construction/allocation overhead, which can be less favorable for very small prefix trees.
 
         #[derive(Default)]
         struct PrefixTrieNode {
@@ -1005,14 +1064,12 @@ pub trait Parameterized<P: Parameter>: Sized {
             selected_prefix_index: Option<usize>,
         }
 
-        let paths = structure.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
-        let expected_count = paths.len();
-        let mut path_prefixes = parameters.into_iter().map(|(path, value)| (path, value, 0usize)).collect::<Vec<_>>();
+        let prefix_parameters = parameters.into_iter().collect::<Vec<_>>();
 
-        // Build a trie of provided path prefixes so that each lef parameter path can be resolved by walking segments
-        // instead of scanning all prefixes. This turns per-path prefix selection into a path-depth walk.
+        // Build a trie of the prefix leaf paths so that each path can be resolved by walking segments instead of
+        // scanning all prefix leaves. This turns per-path prefix selection into a path-depth walk.
         let mut prefix_trie = vec![PrefixTrieNode::default()];
-        for (prefix_index, (path, _, _)) in path_prefixes.iter().enumerate() {
+        for (prefix_index, (path, _)) in prefix_parameters.iter().enumerate() {
             let mut node_index = 0usize;
             for segment in path.segments() {
                 let child_index = if let Some(child_index) = prefix_trie[node_index].children.get(segment).copied() {
@@ -1028,13 +1085,11 @@ pub trait Parameterized<P: Parameter>: Sized {
             prefix_trie[node_index].selected_prefix_index = Some(prefix_index);
         }
 
-        // Keep values in `structure.named_parameters()` order so that reconstruction can use `from_parameters`.
-        let mut values = Vec::with_capacity(expected_count);
-        let mut missing_paths = Vec::new();
-        for path in paths {
+        // Returns the index of the most specific prefix leaf of `path`, if any. As we descend the trie, we track the
+        // deepest prefix leaf encountered, which is the "most specific" match.
+        let select_prefix_index = |path: &ParameterPath| {
             let mut trie_node_index = 0usize;
             let mut selected_prefix_index = prefix_trie[trie_node_index].selected_prefix_index;
-            // As we descend the trie, track the deepest prefix node encountered. That is the "most specific" match.
             for segment in path.segments() {
                 let Some(next_trie_node_index) = prefix_trie[trie_node_index].children.get(segment).copied() else {
                     break;
@@ -1044,41 +1099,77 @@ pub trait Parameterized<P: Parameter>: Sized {
                     selected_prefix_index = Some(prefix_index);
                 }
             }
-            if let Some(selected_prefix_index) = selected_prefix_index {
-                let (_, value, matched_count) = &mut path_prefixes[selected_prefix_index];
-                values.push(value.clone());
-                *matched_count += 1;
-            } else {
-                missing_paths.push(path.to_string());
+            selected_prefix_index
+        };
+
+        // Returns the paths among `paths` that have no child among `paths`. The nodes that violate a rule are closed
+        // under taking descendants, and so these are the deepest violating nodes, whose paths imply all the others.
+        let deepest_paths = |paths: Vec<&ParameterPath>| {
+            let parent_paths = paths
+                .iter()
+                .filter(|path| !path.is_root())
+                .map(|path| ParameterPath { segments: path.segments[1..].to_vec() })
+                .collect::<HashSet<_>>();
+            paths
+                .into_iter()
+                .filter(|path| !parent_paths.contains(*path))
+                .map(ParameterPath::to_string)
+                .collect()
+        };
+
+        // Keep values in `structure.named_parameters()` order so that reconstruction can use `from_parameters`.
+        let expected_count = structure.parameter_count();
+        let mut values = Vec::with_capacity(expected_count);
+        let mut uncovered_parameter_paths = HashSet::new();
+        for (path, _) in structure.named_parameters() {
+            match select_prefix_index(&path) {
+                Some(prefix_index) => values.push(prefix_parameters[prefix_index].1.clone()),
+                None => {
+                    uncovered_parameter_paths.insert(path);
+                }
             }
         }
 
-        let mut unused_prefix_paths = path_prefixes
+        let prefix_paths = paths
             .into_iter()
-            .filter_map(|(path, _, matched_count)| if matched_count == 0 { Some(path.to_string()) } else { None })
-            .collect::<Vec<_>>();
-
+            .chain(prefix_parameters.iter().map(|(path, _)| path.clone()))
+            .collect::<HashSet<_>>();
+        let structure_paths = structure.paths();
+        let missing_paths: Vec<String> = deepest_paths(
+            structure_paths
+                .iter()
+                .filter(|path| {
+                    uncovered_parameter_paths.contains(*path)
+                        || (!prefix_paths.contains(*path) && select_prefix_index(path).is_none())
+                })
+                .collect(),
+        );
         if !missing_paths.is_empty() {
-            Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) })
-        } else if !unused_prefix_paths.is_empty() {
-            unused_prefix_paths.sort_unstable();
-            Err(ParameterError::UnusedParameters { paths: Some(unused_prefix_paths) })
-        } else {
-            Self::from_parameters(structure, values)
+            return Err(ParameterError::MissingParameters { expected_count, paths: Some(missing_paths) });
         }
+
+        let structure_paths = structure_paths.iter().collect::<HashSet<_>>();
+        let mut unused_paths: Vec<String> =
+            deepest_paths(prefix_paths.iter().filter(|path| !structure_paths.contains(path)).collect());
+        if !unused_paths.is_empty() {
+            unused_paths.sort_unstable();
+            return Err(ParameterError::UnusedParameters { paths: Some(unused_paths) });
+        }
+
+        Self::from_parameters(structure, values)
     }
 
-    /// Broadcasts the named parameters from this [`Parameterized`] value into the provided target `structure`,
-    /// returning a new value of type `T`. This is a convenience wrapper around
-    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) that pairs each
-    /// current parameter with its current leaf [`ParameterPath`] and uses those paths as prefixes for filling the
-    /// target structure. As a result, each leaf path in `structure` receives the value from the most specific matching
-    /// current parameter path prefix (i.e., the longest shared prefix among this value's existing parameter paths). If
-    /// the current parameter paths do not cover all target leaves, or if some current parameter paths match no target
-    /// leaf, then this function returns the corresponding [`ParameterError::MissingParameters`] or
-    /// [`ParameterError::UnusedParameters`] error from
-    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters). Since one current
-    /// parameter may need to populate multiple leaves in `structure`, this function requires `P: Clone`.
+    /// Broadcasts this [`Parameterized`] value, as a tree prefix, into the provided target
+    /// `structure`, returning a new value of type `T`. This is a convenience wrapper around
+    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) that passes the named
+    /// parameters and the [`Self::paths`] of this value. As a result, each leaf path in `structure` receives the
+    /// value from the most specific matching current parameter path prefix (i.e., the longest shared prefix among the
+    /// existing parameter paths of this value). Furthermore, every node of this value must be a node of `structure`,
+    /// and every node of `structure` must be a node of this value or lie at or below one of its parameters. Nodes are
+    /// matched by their paths only, so this value may have another type than `T` and other static metadata. Refer to
+    /// [`T::from_broadcasted_named_parameters`](Parameterized::from_broadcasted_named_parameters) for the errors that
+    /// this function returns. Since one current parameter may need to populate multiple leaves in `structure`, this
+    /// function requires `P: Clone`.
     fn broadcast_to_parameter_structure<T: Parameterized<P>>(
         &self,
         structure: T::ParameterStructure,
@@ -1089,6 +1180,7 @@ pub trait Parameterized<P: Parameter>: Sized {
         T::from_broadcasted_named_parameters(
             structure,
             self.named_parameters().map(|(path, parameter)| (path, parameter.clone())),
+            self.paths(),
         )
     }
 
@@ -1510,6 +1602,10 @@ impl<P: Parameter> Parameterized<P> for P {
         std::iter::once((ParameterPath::root(), self))
     }
 
+    fn paths(&self) -> Vec<ParameterPath> {
+        vec![ParameterPath::root()]
+    }
+
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         _structure: Self::ParameterStructure,
         parameters: &mut I,
@@ -1588,6 +1684,10 @@ impl<P: Parameter> Parameterized<P> for PhantomData<P> {
 
     fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
         std::iter::empty()
+    }
+
+    fn paths(&self) -> Vec<ParameterPath> {
+        vec![ParameterPath::root()]
     }
 
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
@@ -1704,6 +1804,11 @@ macro_rules! tuple_parameterized_impl {
                 fn into_named_parameters(self) -> Self::NamedParameterIntoIterator<P> {
                     let ($([<$T:lower>],)*) = self;
                     tuple_named_parameter_into_iterator!(P, ($([<$T:lower>]:$index,)*))
+                }
+
+                fn paths(&self) -> Vec<ParameterPath> {
+                    let ($([<$T:lower>],)*) = self;
+                    tuple_paths!(($([<$T:lower>]:$index,)*))
                 }
 
                 #[allow(unused_variables)]
@@ -1874,6 +1979,24 @@ macro_rules! tuple_named_parameter_into_iterator {
     }};
 }
 
+macro_rules! tuple_paths {
+    (()) => {
+        vec![ParameterPath::root()]
+    };
+
+    (($($value:ident:$index:tt,)+)) => {{
+        let mut paths = vec![ParameterPath::root()];
+        $(paths.extend(
+            PathPrefixedParameterIterator::new(
+                $value.paths().into_iter().map(|path| (path, ())),
+                ParameterPathSegment::TupleIndex($index),
+            )
+            .map(|(path, _)| path),
+        );)+
+        paths
+    }};
+}
+
 tuple_parameterized_impl!();
 tuple_parameterized_impl!(V0:0);
 tuple_parameterized_impl!(V0:0, V1:1);
@@ -1995,6 +2118,15 @@ impl<P: Parameter, V: Parameterized<P>, const N: usize> Parameterized<P> for [V;
         self.into_iter().enumerate().flat_map(|(index, value)| {
             PathPrefixedParameterIterator::new(value.into_named_parameters(), ParameterPathSegment::Index(index))
         })
+    }
+
+    fn paths(&self) -> Vec<ParameterPath> {
+        std::iter::once(ParameterPath::root())
+            .chain(self.iter().enumerate().flat_map(|(index, value)| {
+                let paths = value.paths().into_iter().map(|path| (path, ()));
+                PathPrefixedParameterIterator::new(paths, ParameterPathSegment::Index(index)).map(|(path, _)| path)
+            }))
+            .collect()
     }
 
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
@@ -2121,6 +2253,15 @@ impl<P: Parameter, V: Parameterized<P>> Parameterized<P> for Vec<V> {
         self.into_iter().enumerate().flat_map(|(index, value)| {
             PathPrefixedParameterIterator::new(value.into_named_parameters(), ParameterPathSegment::Index(index))
         })
+    }
+
+    fn paths(&self) -> Vec<ParameterPath> {
+        std::iter::once(ParameterPath::root())
+            .chain(self.iter().enumerate().flat_map(|(index, value)| {
+                let paths = value.paths().into_iter().map(|path| (path, ()));
+                PathPrefixedParameterIterator::new(paths, ParameterPathSegment::Index(index)).map(|(path, _)| path)
+            }))
+            .collect()
     }
 
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
@@ -2291,6 +2432,18 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: C
         })
     }
 
+    fn paths(&self) -> Vec<ParameterPath> {
+        let mut sorted_entries = self.iter().collect::<Vec<_>>();
+        sorted_entries.sort_unstable_by_key(|(l, _)| *l);
+        std::iter::once(ParameterPath::root())
+            .chain(sorted_entries.into_iter().flat_map(|(key, value)| {
+                let paths = value.paths().into_iter().map(|path| (path, ()));
+                PathPrefixedParameterIterator::new(paths, ParameterPathSegment::Key(format!("{key:?}")))
+                    .map(|(path, _)| path)
+            }))
+            .collect()
+    }
+
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
         structure: Self::ParameterStructure,
         parameters: &mut I,
@@ -2427,6 +2580,16 @@ impl<P: Parameter, K: Clone + Debug + Ord, V: Parameterized<P>> Parameterized<P>
                 ParameterPathSegment::Key(format!("{key:?}")),
             )
         })
+    }
+
+    fn paths(&self) -> Vec<ParameterPath> {
+        std::iter::once(ParameterPath::root())
+            .chain(self.iter().flat_map(|(key, value)| {
+                let paths = value.paths().into_iter().map(|path| (path, ()));
+                PathPrefixedParameterIterator::new(paths, ParameterPathSegment::Key(format!("{key:?}")))
+                    .map(|(path, _)| path)
+            }))
+            .collect()
     }
 
     fn from_parameters_with_remainder<I: Iterator<Item = P>>(
@@ -2771,6 +2934,60 @@ mod tests {
         // Test `Parameterized::parameter_paths`.
         assert_eq!(value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(), expected_parameter_paths);
 
+        // Test `Parameterized::paths`.
+        assert_eq!(
+            value.paths().iter().map(ParameterPath::to_string).collect::<Vec<_>>(),
+            vec![
+                "$",
+                "$.stem",
+                "$.stem.weights",
+                "$.stem.weights[0]",
+                "$.stem.weights[1]",
+                "$.stem.bias",
+                "$.controller",
+                "$.controller.blend",
+                "$.controller.blend.alpha",
+                "$.controller.blend.branch",
+                "$.controller.blend.branch.pair",
+                "$.controller.blend.branch.pair.0",
+                "$.controller.blend.branch.gain",
+                "$.heads",
+                "$.heads[0]",
+                "$.heads[0].pair",
+                "$.heads[0].pair.0",
+                "$.heads[0].gain",
+                "$.heads[1]",
+                "$.heads[1].pair",
+                "$.heads[1].pair.0",
+                "$.heads[1].gain",
+            ],
+        );
+        let value_with_empty_containers = Network {
+            stem: Layer { weights: Vec::new(), bias: 3, tag: "stem" },
+            controller: Controller::Identity,
+            ..value.clone()
+        };
+        assert_eq!(
+            value_with_empty_containers.paths().iter().map(ParameterPath::to_string).collect::<Vec<_>>(),
+            vec![
+                "$",
+                "$.stem",
+                "$.stem.weights",
+                "$.stem.bias",
+                "$.controller",
+                "$.controller.identity",
+                "$.heads",
+                "$.heads[0]",
+                "$.heads[0].pair",
+                "$.heads[0].pair.0",
+                "$.heads[0].gain",
+                "$.heads[1]",
+                "$.heads[1].pair",
+                "$.heads[1].pair.0",
+                "$.heads[1].gain",
+            ],
+        );
+
         // Test `Parameterized::from_parameters_with_remainder`.
         let mut parameters = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 500].into_iter();
         assert_eq!(
@@ -2820,7 +3037,16 @@ mod tests {
                     (ParameterPath::root().field("controller").variant("Blend").field("branch"), 10),
                     (ParameterPath::root().field("controller").variant("Blend").field("branch").field("gain"), 20),
                     (ParameterPath::root().field("heads").index(1), 30),
-                ])
+                ]),
+                vec![
+                    ParameterPath::root(),
+                    ParameterPath::root().field("controller"),
+                    ParameterPath::root().field("controller").variant("Blend"),
+                    ParameterPath::root().field("controller").variant("Blend").field("branch"),
+                    ParameterPath::root().field("controller").variant("Blend").field("branch").field("gain"),
+                    ParameterPath::root().field("heads"),
+                    ParameterPath::root().field("heads").index(1),
+                ],
             ),
             Ok(Network {
                 stem: Layer { weights: vec![1, 1], bias: 1, tag: "stem" },
@@ -2967,6 +3193,89 @@ mod tests {
     }
 
     #[test]
+    fn test_parameterized_paths() {
+        let root = ParameterPath::root;
+
+        // Leaves, `PhantomData`, and the unit tuple have no children, and so they return only their own path.
+        assert_eq!(7i32.paths(), vec![root()]);
+        assert_eq!(PhantomData::<i32>.paths(), vec![root()]);
+        assert_eq!(Parameterized::<i32>::paths(&()), vec![root()]);
+
+        // Tuples return their own path followed by the node paths of their elements.
+        assert_eq!((1i32, 2i32).paths(), vec![root(), root().tuple_index(0), root().tuple_index(1)]);
+        assert_eq!(
+            ((), 1i32, (Vec::<i32>::new(), [0i32; 0]), PhantomData::<i32>).paths(),
+            vec![
+                root(),
+                root().tuple_index(0),
+                root().tuple_index(1),
+                root().tuple_index(2),
+                root().tuple_index(2).tuple_index(0),
+                root().tuple_index(2).tuple_index(1),
+                root().tuple_index(3),
+            ],
+        );
+
+        // Arrays return their own path followed by the node paths of their elements.
+        assert_eq!([0i32; 0].paths(), vec![root()]);
+        assert_eq!([1i32, 2i32].paths(), vec![root(), root().index(0), root().index(1)]);
+        assert_eq!(
+            [Vec::new(), vec![1i32], Vec::new()].paths(),
+            vec![root(), root().index(0), root().index(1), root().index(1).index(0), root().index(2)],
+        );
+
+        // Vectors return their own path followed by the node paths of their elements.
+        assert_eq!(Vec::<i32>::new().paths(), vec![root()]);
+        assert_eq!(
+            vec![(1i32, 2i32)].paths(),
+            vec![root(), root().index(0), root().index(0).tuple_index(0), root().index(0).tuple_index(1)],
+        );
+        assert_eq!(vec![Vec::<i32>::new()].paths(), vec![root(), root().index(0)]);
+        assert_eq!(
+            vec![vec![vec![1i32]], vec![Vec::new(), vec![2i32]], Vec::new()].paths(),
+            vec![
+                root(),
+                root().index(0),
+                root().index(0).index(0),
+                root().index(0).index(0).index(0),
+                root().index(1),
+                root().index(1).index(0),
+                root().index(1).index(1),
+                root().index(1).index(1).index(0),
+                root().index(2),
+            ],
+        );
+
+        // Hash maps return their own path followed by the node paths of their values, in the order of their keys.
+        assert_eq!(HashMap::<&str, i32>::new().paths(), vec![root()]);
+        assert_eq!(
+            HashMap::from([("zeta", Vec::new()), ("alpha", Vec::new()), ("mu", vec![1i32])]).paths(),
+            vec![root(), root().key("alpha"), root().key("mu"), root().key("mu").index(0), root().key("zeta")],
+        );
+
+        // B-tree maps return their own path followed by the node paths of their values, each with the segment of its
+        // key on the root side of the path.
+        assert_eq!(BTreeMap::<&str, i32>::new().paths(), vec![root()]);
+        assert_eq!(
+            BTreeMap::from([("left", 1i32), ("right", 2i32)]).paths(),
+            vec![root(), root().key("left"), root().key("right")],
+        );
+        assert_eq!(
+            BTreeMap::from([("left", (1i32, Vec::new())), ("right", (2i32, vec![3i32]))]).paths(),
+            vec![
+                root(),
+                root().key("left"),
+                root().key("left").tuple_index(0),
+                root().key("left").tuple_index(1),
+                root().key("right"),
+                root().key("right").tuple_index(0),
+                root().key("right").tuple_index(1),
+                root().key("right").tuple_index(1).index(0),
+            ],
+        );
+    }
+
+    #[test]
     fn test_parameterized_validate_parameter_structure() {
         let expected_paths = (1, (2, 3)).parameter_paths().collect::<Vec<_>>();
         assert_eq!((4, (5, 6)).validate_parameter_structure(&expected_paths), Ok(()));
@@ -2978,6 +3287,219 @@ mod tests {
                 left_structure: "[$.0, $.1.0, $.1.1]".to_string(),
                 right_structure: "[$.0.0, $.0.1, $.1]".to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_from_broadcasted_named_parameters() {
+        let root = ParameterPath::root;
+
+        // Prefix leaves resolve leaves to the most specific matching prefix leaf.
+        assert_eq!(
+            <(i32, (i32, i32))>::from_broadcasted_named_parameters(
+                (Placeholder, (Placeholder, Placeholder)),
+                vec![(root(), 1), (root().tuple_index(1).tuple_index(0), 2)],
+                vec![root(), root().tuple_index(1), root().tuple_index(1).tuple_index(0)],
+            ),
+            Ok((1, (2, 1))),
+        );
+
+        // Prefix leaves may cover only containers without leaves, in which case they populate no leaf.
+        assert_eq!(
+            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
+                (Vec::new(), Placeholder),
+                vec![(root().tuple_index(0), 1), (root().tuple_index(1), 2)],
+                vec![root(), root().tuple_index(0), root().tuple_index(1)],
+            ),
+            Ok((Vec::new(), 2)),
+        );
+        assert_eq!(
+            <((), ()) as Parameterized<i32>>::from_broadcasted_named_parameters(
+                ((), ()),
+                vec![(root().tuple_index(0), 1), (root().tuple_index(1), 2)],
+                vec![root(), root().tuple_index(0), root().tuple_index(1)],
+            ),
+            Ok(((), ())),
+        );
+        assert_eq!(
+            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
+                (Vec::new(), Placeholder),
+                vec![(root(), 1)],
+                vec![root()],
+            ),
+            Ok((Vec::new(), 1)),
+        );
+        assert_eq!(
+            Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), vec![(root(), 1)], vec![root()]),
+            Ok(Vec::new()),
+        );
+
+        // A container without leaves of the prefix matches a node of the structure at the same path.
+        assert_eq!(
+            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
+                (Vec::new(), Placeholder),
+                vec![(root().tuple_index(1), 2)],
+                vec![root(), root().tuple_index(0), root().tuple_index(1)],
+            ),
+            Ok((Vec::new(), 2)),
+        );
+        assert_eq!(Vec::<i32>::from_broadcasted_named_parameters(Vec::new(), Vec::new(), vec![root()]), Ok(Vec::new()));
+
+        // Nodes of the structure that are not nodes of the prefix and that no prefix leaf covers are missing. The
+        // error lists only the deepest of them.
+        assert_eq!(
+            <(Vec<i32>, i32)>::from_broadcasted_named_parameters(
+                (Vec::new(), Placeholder),
+                vec![(root().tuple_index(0), 1)],
+                vec![root(), root().tuple_index(0)],
+            ),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$.1".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(
+                vec![vec![Placeholder], Vec::new()],
+                vec![(root().index(0).index(0), 1)],
+                vec![root(), root().index(0), root().index(0).index(0)],
+            ),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[1]".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(vec![vec![Placeholder]], Vec::new(), vec![root()]),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[0][0]".to_string()]) }),
+        );
+
+        // Nodes of the prefix that are not nodes of the structure are unused, including prefix nodes below a container
+        // without children of the structure. The error lists only the deepest of them.
+        assert_eq!(
+            <(i32, i32)>::from_broadcasted_named_parameters(
+                (Placeholder, Placeholder),
+                vec![(root(), 1), (root().tuple_index(2), 2)],
+                vec![root(), root().tuple_index(2)],
+            ),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$.2".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<i32>::from_broadcasted_named_parameters(
+                Vec::new(),
+                vec![(root().index(0), 1)],
+                vec![root(), root().index(0)],
+            ),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(
+                vec![vec![Placeholder]],
+                vec![(root().index(0).index(0), 1)],
+                vec![root(), root().index(0), root().index(0).index(0), root().index(1)],
+            ),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[1]".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<Vec<i32>>::from_broadcasted_named_parameters(Vec::new(), Vec::new(), vec![root(), root().index(0)]),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }),
+        );
+        assert_eq!(
+            <(Vec<i32>, Vec<i32>)>::from_broadcasted_named_parameters(
+                (Vec::new(), Vec::new()),
+                vec![(root().tuple_index(0), 1)],
+                vec![root(), root().tuple_index(0), root().tuple_index(1), root().tuple_index(2)],
+            ),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$.2".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<i32>::from_broadcasted_named_parameters(
+                Vec::new(),
+                vec![(root().index(0).index(0), 1)],
+                vec![root(), root().index(0), root().index(0).index(0)],
+            ),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0][0]".to_string()]) }),
+        );
+
+        // Missing paths are listed in the order of the nodes of the structure, and they take precedence over unused
+        // paths.
+        assert_eq!(
+            <(i32, Vec<i32>)>::from_broadcasted_named_parameters(
+                (Placeholder, Vec::new()),
+                vec![(root().tuple_index(2), 1)],
+                vec![root(), root().tuple_index(2), root().tuple_index(3)],
+            ),
+            Err(ParameterError::MissingParameters {
+                expected_count: 1,
+                paths: Some(vec!["$.0".to_string(), "$.1".to_string()]),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_broadcast_to_parameter_structure() {
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        struct Left<P: Parameter> {
+            value: P,
+            tag: &'static str,
+        }
+
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+        struct Right<P: Parameter> {
+            value: P,
+        }
+
+        // Prefix leaves broadcast over all the nodes below them, including the containers without leaves.
+        assert_eq!(
+            42_i32.broadcast_to_parameter_structure::<(i32, (i32, i32))>((Placeholder, (Placeholder, Placeholder))),
+            Ok((42, (42, 42)))
+        );
+        assert_eq!(
+            vec![1_i32, 2_i32]
+                .broadcast_to_parameter_structure::<Vec<Vec<i32>>>(vec![vec![Placeholder, Placeholder], Vec::new()]),
+            Ok(vec![vec![1, 1], Vec::new()]),
+        );
+        assert_eq!(
+            (Vec::<i32>::new(), 1_i32).broadcast_to_parameter_structure::<(Vec<i32>, i32)>((Vec::new(), Placeholder)),
+            Ok((Vec::new(), 1)),
+        );
+        assert_eq!(
+            (1_i32, 2_i32).broadcast_to_parameter_structure::<i32>(Placeholder),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$".to_string()]) }),
+        );
+
+        // Every node of the prefix must be a node of the structure, and every node of the structure must be a node of
+        // the prefix or lie at or below a prefix leaf.
+        assert_eq!(
+            vec![vec![1_i32]].broadcast_to_parameter_structure::<Vec<Vec<i32>>>(vec![vec![Placeholder], Vec::new()]),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[1]".to_string()]) }),
+        );
+        assert_eq!(
+            vec![vec![1_i32], Vec::new()].broadcast_to_parameter_structure::<Vec<Vec<i32>>>(vec![vec![Placeholder]]),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[1]".to_string()]) }),
+        );
+        assert_eq!(
+            vec![Vec::<i32>::new()].broadcast_to_parameter_structure::<Vec<Vec<i32>>>(Vec::new()),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[0]".to_string()]) }),
+        );
+        assert_eq!(
+            Vec::<i32>::new().broadcast_to_parameter_structure::<Vec<i32>>(vec![Placeholder]),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[0]".to_string()]) }),
+        );
+
+        // Matching is by path, so containers of different types with the same paths match, and so do nodes of the
+        // same type with different static metadata.
+        assert_eq!(
+            [1_i32, 2_i32].broadcast_to_parameter_structure::<Vec<i32>>(vec![Placeholder, Placeholder]),
+            Ok(vec![1, 2])
+        );
+        assert_eq!(
+            Right { value: 1_i32 }
+                .broadcast_to_parameter_structure::<Left<i32>>(Left { value: Placeholder, tag: "left" }),
+            Ok(Left { value: 1, tag: "left" }),
+        );
+        assert_eq!(
+            Left { value: 1_i32, tag: "source" }
+                .broadcast_to_parameter_structure::<Left<i32>>(Left { value: Placeholder, tag: "target" }),
+            Ok(Left { value: 1, tag: "target" }),
+        );
+        assert_eq!(
+            vec![Vec::<i32>::new()].broadcast_to_parameter_structure::<[Vec<i32>; 1]>([Vec::new()]),
+            Ok([Vec::new()]),
         );
     }
 

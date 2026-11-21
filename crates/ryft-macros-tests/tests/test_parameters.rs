@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::{Add, Mul};
 
-use ryft::{Parameter, ParameterError, Parameterized, Placeholder};
+use ryft::{Parameter, ParameterError, ParameterPath, Parameterized, Placeholder};
 
 /// Helper for asserting that a [`Parameterized`] type has a specific [`Parameterized::ParameterStructure`] type.
 fn assert_parameter_structure_type<P: Parameter, T: Parameterized<P, ParameterStructure = S>, S>() {}
@@ -139,6 +139,17 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut 2usize, &mut 0usize]);
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![2usize, 0usize]);
     assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().field("p_0"),
+            ParameterPath::root().field("p_0").tuple_index(0),
+            ParameterPath::root().field("p_0").tuple_index(0).tuple_index(1),
+            ParameterPath::root().field("p_0").tuple_index(0).tuple_index(1).tuple_index(1),
+            ParameterPath::root().field("p_0").tuple_index(0).tuple_index(1).tuple_index(3),
+        ],
+    );
+    assert_eq!(
         StructWithNestedOption::from_parameters(structure.clone(), Vec::<usize>::new()),
         missing_parameters_error,
     );
@@ -157,6 +168,7 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.parameter_structure(), structure);
     assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.paths(), vec![ParameterPath::root(), ParameterPath::root().field("p_0")]);
     assert_eq!(
         StructWithNestedOption::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(StructWithNestedOption::<i64> { p_0: None, np_0, np_1 }),
@@ -183,6 +195,15 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.named_parameters_mut().map(|(_, value)| *value).collect::<Vec<_>>(), vec![2usize, 4usize],);
     assert_eq!(value.clone().into_named_parameters().map(|(_, value)| value).collect::<Vec<_>>(), vec![2usize, 4usize],);
     assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().field("required"),
+            ParameterPath::root().field("optional"),
+            ParameterPath::root().field("optional").tuple_index(0)
+        ],
+    );
+    assert_eq!(
         StructWithOptionalParameter::from_parameters(structure, vec![3i64, 5i64]),
         Ok(StructWithOptionalParameter { required: 3i64, optional: Some(5i64) }),
     );
@@ -193,6 +214,10 @@ fn test_struct_with_nested_tuples_and_options() {
     assert_eq!(value.parameter_structure(), structure);
     assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&2usize]);
     assert_eq!(value.named_parameters().map(|(_, value)| *value).collect::<Vec<_>>(), vec![2usize]);
+    assert_eq!(
+        value.paths(),
+        vec![ParameterPath::root(), ParameterPath::root().field("required"), ParameterPath::root().field("optional")]
+    );
     assert_eq!(
         StructWithOptionalParameter::from_parameters(structure, vec![3i64]),
         Ok(StructWithOptionalParameter { required: 3i64, optional: None }),
@@ -275,6 +300,7 @@ fn test_empty_struct() {
     assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.paths(), vec![ParameterPath::root(), ParameterPath::root().field("_p")]);
     assert_eq!(
         EmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(EmptyStruct { _p: PhantomData::<i64> }),
@@ -304,6 +330,7 @@ fn test_non_empty_struct_with_no_parameters() {
     assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(value.paths(), vec![ParameterPath::root(), ParameterPath::root().field("_p")]);
     assert_eq!(
         NonEmptyStruct::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(NonEmptyStruct { np_0, np_1, _p: PhantomData::<i64> }),
@@ -311,6 +338,100 @@ fn test_non_empty_struct_with_no_parameters() {
     assert_eq!(
         NonEmptyStruct::from_parameters(structure, vec![4usize, 2usize]),
         Err(ParameterError::UnusedParameters { paths: None }),
+    );
+}
+
+#[test]
+fn test_struct_with_empty_containers() {
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    struct StructWithEmptyContainers<P: Parameter> {
+        p_0: P,
+        p_1: Vec<P>,
+        p_2: (usize, Vec<P>),
+        p_3: Option<Vec<P>>,
+        np_0: u64,
+    }
+
+    // The node paths include the paths of all containers, including the containers without leaves.
+    let value = StructWithEmptyContainers { p_0: 1usize, p_1: vec![2], p_2: (3, vec![4]), p_3: Some(vec![5]), np_0: 6 };
+    assert_eq!(
+        value.parameter_paths().map(|path| path.to_string()).collect::<Vec<_>>(),
+        vec!["$.p_0", "$.p_1[0]", "$.p_2.1[0]", "$.p_3.0[0]"],
+    );
+    assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().field("p_0"),
+            ParameterPath::root().field("p_1"),
+            ParameterPath::root().field("p_1").index(0),
+            ParameterPath::root().field("p_2"),
+            ParameterPath::root().field("p_2").tuple_index(1),
+            ParameterPath::root().field("p_2").tuple_index(1).index(0),
+            ParameterPath::root().field("p_3"),
+            ParameterPath::root().field("p_3").tuple_index(0),
+            ParameterPath::root().field("p_3").tuple_index(0).index(0),
+        ],
+    );
+    let value = StructWithEmptyContainers { p_0: 1usize, p_1: vec![], p_2: (3, vec![]), p_3: Some(vec![]), np_0: 6 };
+    assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().field("p_0"),
+            ParameterPath::root().field("p_1"),
+            ParameterPath::root().field("p_2"),
+            ParameterPath::root().field("p_2").tuple_index(1),
+            ParameterPath::root().field("p_3"),
+            ParameterPath::root().field("p_3").tuple_index(0),
+        ],
+    );
+    let value = StructWithEmptyContainers { p_0: 1usize, p_1: vec![], p_2: (3, vec![]), p_3: None, np_0: 6 };
+    assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().field("p_0"),
+            ParameterPath::root().field("p_1"),
+            ParameterPath::root().field("p_2"),
+            ParameterPath::root().field("p_2").tuple_index(1),
+            ParameterPath::root().field("p_3"),
+        ],
+    );
+
+    // Prefix leaves may cover containers without leaves, and prefix nodes below a container without children are
+    // unused.
+    let structure = value.parameter_structure();
+    assert_eq!(
+        StructWithEmptyContainers::from_broadcasted_named_parameters(
+            structure.clone(),
+            vec![
+                (ParameterPath::root().field("p_0"), 10i64),
+                (ParameterPath::root().field("p_1"), 11i64),
+                (ParameterPath::root().field("p_2"), 12i64),
+                (ParameterPath::root().field("p_3"), 13i64),
+            ],
+            vec![
+                ParameterPath::root(),
+                ParameterPath::root().field("p_0"),
+                ParameterPath::root().field("p_1"),
+                ParameterPath::root().field("p_2"),
+                ParameterPath::root().field("p_3")
+            ],
+        ),
+        Ok(StructWithEmptyContainers { p_0: 10i64, p_1: vec![], p_2: (3, vec![]), p_3: None, np_0: 6 }),
+    );
+    assert_eq!(
+        StructWithEmptyContainers::from_broadcasted_named_parameters(
+            structure,
+            vec![(ParameterPath::root(), 10i64), (ParameterPath::root().field("p_1").index(0), 11i64)],
+            vec![
+                ParameterPath::root(),
+                ParameterPath::root().field("p_1"),
+                ParameterPath::root().field("p_1").index(0)
+            ],
+        ),
+        Err(ParameterError::UnusedParameters { paths: Some(vec!["$.p_1[0]".to_string()]) }),
     );
 }
 
@@ -382,18 +503,28 @@ fn test_simple_enum() {
     assert_eq!(structure.parameter_count(), 0);
     assert_eq!(structure.parameter_structure(), structure);
     assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(structure.paths(), vec![ParameterPath::root(), ParameterPath::root().variant("Unit")]);
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = Enum::<Placeholder>::Empty();
     assert_eq!(structure.parameter_count(), 0);
     assert_eq!(structure.parameter_structure(), structure);
     assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(structure.paths(), vec![ParameterPath::root(), ParameterPath::root().variant("Empty")]);
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 
     let structure = Enum::Parameter0(Placeholder);
     assert_eq!(structure.parameter_count(), 1);
     assert_eq!(structure.parameter_structure(), structure);
     assert_eq!(structure.parameters().collect::<Vec<_>>(), vec![&Placeholder]);
+    assert_eq!(
+        structure.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().variant("Parameter0"),
+            ParameterPath::root().variant("Parameter0").tuple_index(0)
+        ],
+    );
     assert_eq!(Enum::from_parameters(structure.clone(), vec![42usize]), Ok(Enum::Parameter0(42usize)));
 
     let mut value = Enum::Parameter1 { field_0: (0usize, -42i64, 4usize), field_1: 2usize };
@@ -407,6 +538,15 @@ fn test_simple_enum() {
     assert_eq!(value.parameters().collect::<Vec<_>>(), vec![&-42i64]);
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), vec![&mut -42i64]);
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), vec![-42i64]);
+    assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().variant("Parameter1"),
+            ParameterPath::root().variant("Parameter1").field("field_0"),
+            ParameterPath::root().variant("Parameter1").field("field_0").tuple_index(1),
+        ],
+    );
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::<usize>::new()), missing_parameters_error);
     assert_eq!(
         Enum::from_parameters(structure.clone(), vec![42usize]),
@@ -418,6 +558,17 @@ fn test_simple_enum() {
     assert_eq!(structure.parameter_count(), 0);
     assert_eq!(structure.parameter_structure(), structure);
     assert_eq!(structure.parameters().collect::<Vec<_>>(), Vec::<&Placeholder>::new());
+    assert_eq!(structure.paths(), vec![ParameterPath::root(), ParameterPath::root().variant("NonParameter")]);
+
+    // A prefix may cover a variant without parameter fields.
+    assert_eq!(
+        Enum::from_broadcasted_named_parameters(
+            structure.clone(),
+            vec![(ParameterPath::root().variant("NonParameter"), 42usize)],
+            vec![ParameterPath::root(), ParameterPath::root().variant("NonParameter")],
+        ),
+        Ok(Enum::NonParameter(4usize, 2usize)),
+    );
     assert_eq!(Enum::from_parameters(structure.clone(), Vec::new()), Ok(structure));
 }
 
@@ -436,6 +587,14 @@ fn test_empty_enum() {
     assert_eq!(value.parameters().collect::<Vec<_>>(), Vec::<&usize>::new());
     assert_eq!(value.parameters_mut().collect::<Vec<_>>(), Vec::<&mut usize>::new());
     assert_eq!(value.clone().into_parameters().collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(
+        value.paths(),
+        vec![
+            ParameterPath::root(),
+            ParameterPath::root().variant("Phantom"),
+            ParameterPath::root().variant("Phantom").tuple_index(0)
+        ],
+    );
     assert_eq!(
         EmptyEnum::from_parameters(structure.clone(), Vec::<i64>::new()),
         Ok(EmptyEnum::Phantom(PhantomData::<i64>)),
@@ -782,6 +941,81 @@ fn test_generics() {
 
     value.parameters_mut().for_each(|parameter| *parameter *= 2);
     assert_eq!(value, Struct { p_0: 8usize, p_1: 4usize, np_0, np_1 })
+}
+
+#[allow(dead_code, non_snake_case, non_upper_case_globals, unused_macros)]
+#[test]
+fn test_scope_that_shadows_standard_library_names() {
+    // The generated code resolves the standard library names that it uses independently of the scope of the derived
+    // type, so these local items, which shadow the prelude, do not affect it.
+    struct Vec;
+
+    struct Option;
+
+    struct Result;
+
+    struct Iterator;
+
+    const None: () = ();
+
+    fn Some() {}
+
+    fn Ok() {}
+
+    macro_rules! vec {
+        ($($tokens:tt)*) => {
+            compile_error!("the shadowing `vec` macro was used")
+        };
+    }
+
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    struct Wrapper<P: Parameter> {
+        value: P,
+        maybe: ::std::option::Option<P>,
+        tag: u64,
+    }
+
+    #[derive(Parameterized, Debug, Clone, PartialEq, Eq)]
+    enum Choice<P: Parameter> {
+        Empty,
+        Value(P),
+    }
+
+    let value = Wrapper { value: 1i32, maybe: ::std::option::Option::None, tag: 7 };
+    assert_eq!(
+        value.paths(),
+        [ParameterPath::root(), ParameterPath::root().field("value"), ParameterPath::root().field("maybe")]
+    );
+    assert_eq!(
+        Wrapper::from_parameters(value.parameter_structure(), [2i64]),
+        ::std::result::Result::Ok(Wrapper { value: 2i64, maybe: ::std::option::Option::None, tag: 7 }),
+    );
+    let value = Wrapper { value: 1i32, maybe: ::std::option::Option::Some(2i32), tag: 7 };
+    assert_eq!(
+        value.paths(),
+        [
+            ParameterPath::root(),
+            ParameterPath::root().field("value"),
+            ParameterPath::root().field("maybe"),
+            ParameterPath::root().field("maybe").tuple_index(0)
+        ],
+    );
+    assert_eq!(value.parameters().copied().collect::<::std::vec::Vec<_>>(), [1, 2]);
+
+    assert_eq!(Choice::<i32>::Empty.paths(), [ParameterPath::root(), ParameterPath::root().variant("Empty")]);
+    assert_eq!(
+        Choice::Value(3i32).paths(),
+        [
+            ParameterPath::root(),
+            ParameterPath::root().variant("Value"),
+            ParameterPath::root().variant("Value").tuple_index(0)
+        ],
+    );
+    assert_eq!(
+        Choice::from_parameters(Choice::Value(Placeholder), [4i32]),
+        ::std::result::Result::Ok(Choice::Value(4i32)),
+    );
+    assert_eq!(Choice::Value(3i32).parameters().copied().collect::<::std::vec::Vec<_>>(), [3]);
 }
 
 #[test]
