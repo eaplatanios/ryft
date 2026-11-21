@@ -1,46 +1,26 @@
-# Ryft Inference: Architecture and Execution Plan
+# Ryft inference engine
 
-**Status:** proposed architecture
+**Design review, November 20, 2026.** The first milestone is an embedded engine that loads the released Inkling 2 Mini
+checkpoint, takes text and image inputs, streams generated text, and returns the scores needed for rollout replay.
+The companion inventory specifies the model math, artifact contract, differentiable reference and training kernels.
+[Model inventory](plan-inkling-2-mini.md) · [First milestone](#17-first-milestone-and-execution-plan) · [Benchmark and acceptance](#18-benchmark-and-acceptance-strategy)
 
-**Research snapshot:** 2026-08-14
+## 1. Architecture decision
 
-**Architecture review:** 2026-09-10; includes a targeted substrate and primary-source refresh
+Use one Rust scheduler around a small family of compiled Ryft/XLA model steps. Keep request admission, cancellation,
+streaming, state ownership and policy publication on the host. Keep the weights, physical page tables, active row
+metadata, expert routing and next-token feedback on device across steps. Compile profiles for bounded physical shapes
+and pass actual lengths and routing decisions as data. Reuse Ryft's kernel infrastructure for accelerator-specific providers.
 
-**Targeted research updates:** 2026-09-25, SkySynth and ZML/LLMD; 2026-10-20, DeepInfer; 2026-10-23, MAX
+Start with the ordinary full-sequence model that the trainer can differentiate. The same layer graph drives scoring,
+contiguous generation and paged execution. At a layer visit, the executor binds the attention and convolution history
+for that visit and the parameters for that physical layer. This lets an optimized worker share the learned model with
+the trainer while owning its own state layout. Numerical agreement between execution modes is an acceptance test.
 
-**Scope:** one inference system for agentic/RL rollouts, embedded use, and production online serving
-
-## 1. Executive decision
-
-Ryft should build an inference engine, but it should not build a Rust clone of vLLM and it should not try to turn one
-large XLA `while` program into a serving runtime.
-
-The proposed system is a **Rust-native dynamic inference runtime around a family of statically compiled Ryft/XLA
-executables**. Rust owns requests, admission, scheduling, page and weight ownership, prefix identity, cancellation,
-streaming, and distributed lifecycle. Ryft/XLA owns model computation, sharding, compilation, buffer planning, and
-portable fallbacks. Specialized paged-attention, cache-update, sampling, quantized GEMM, MoE, and communication kernels
-enter through capability-selected XLA FFI custom calls.
-
-The central abstraction should be a general **paged sequence-state service**, not only a KV cache. It must eventually
-hold transformer KV pages, recurrent/Mamba state, multimodal encoder state, speculative checkpoints, and other
-model-specific persistent state.
-
-This creates a credible differentiation thesis:
-
-> One typed, compiler-backed execution system spanning model development, training, RL rollout, embedded inference,
-> and production serving, with safe Rust resource state machines and workload-adaptive compiled execution profiles.
-
-Treat this thesis as a set of measurable hypotheses. The first architectural gate is a physical execution proof with
-real paged-attention kernels, persistent state, graph replay, and overlapped launches. Keep interfaces provisional until
-that proof passes, then build a minimal continuous Gemma engine before completing the broader lifecycle framework.
-State-of-the-art claims require both controlled numerical comparisons and quality-constrained comparisons against each
-baseline's best production configuration, with an attributable win on the declared workload.
-
-It is realistic to build something materially better on selected axes: RL/serving integration, correctness under
-concurrency, typed extensibility, agentic prefix reuse, CPU-side latency stability, portable compilation, and selected
-model/hardware/workload Pareto frontiers. It is not realistic to assume near-term universal throughput leadership over
-vLLM, SGLang, or TensorRT-LLM. Rust is a strong enabler for the host runtime; it is not a substitute for paged state,
-excellent GPU kernels, topology-aware communication, mature scheduling, model coverage, or production hardening.
+First generate from the real checkpoint, then bring the same path under continuous admission with paged state.
+In parallel, test the actual accelerator provider for buffer aliasing, workspace lifetime, graph replay and overlap.
+These proofs decide which optimizations the engine can advertise. Measure the online service by completions meeting
+latency objectives and the post-training system by useful rollouts accepted after each update.
 
 ## 2. Goals and non-goals
 
@@ -57,14 +37,14 @@ excellent GPU kernels, topology-aware communication, mature scheduling, model co
 - Versioned, deterministic, provenance-rich rollouts for synchronous and bounded-staleness agentic RL.
 - Quantization, structured generation, speculative decoding, LoRA/adapters, multimodality, and hybrid sequence models.
 - Production observability, overload behavior, graceful draining, hot model lifecycle, and failure containment.
-- Gemma 4 31B as the first production-model target, with a reduced-shape architecture-equivalent configuration for
-  routine correctness tests and the full published checkpoint as the milestone acceptance target.
+- Inkling 2 Mini as the first production model, with reduced fixtures for CI and the published mixed-format
+  checkpoint, a text prompt and an image-conditioned prompt required for milestone acceptance.
 
 ### Non-goals for the first usable release
 
 - Supporting every Hugging Face architecture, accelerator, quantization, and decoding feature.
-- Gemma 4 vision input, MTP speculation, training, and peak 256K-context operation in the first engine milestone. Keep
-  their interfaces representable, but validate the text decoder and ordinary autoregressive decoding first.
+- Peak 1,048,576-token operation, DSpark and distributed serving in the first engine milestone. The training
+  workstream supplies the shared model, importer and scorer from the start.
 - Replacing Kubernetes, a cluster scheduler, or an RL training framework.
 - Inventing all GPU kernels in Ryft before using proven vendor/community kernels behind stable interfaces.
 - Using bounded-dynamic XLA values on the decode hot path where they introduce synchronization or multi-device limits.
@@ -72,6 +52,9 @@ excellent GPU kernels, topology-aware communication, mature scheduling, model co
 - Claiming performance leadership without reproducible SLO-constrained comparisons.
 
 ## 3. What the leading systems teach us
+
+The initial survey dates to August 2026, with updates in September and October for SkySynth, ZML/LLMD, DeepInfer
+and MAX. The November review adds Baseten, recent post-training results, and model-matched Mini comparisons.
 
 Headline benchmark numbers below are not cross-system rankings. They use different dates, models, hardware, request
 distributions, feature sets, and SLOs. They are evidence for architectural mechanisms, not a basis for claiming one
@@ -125,8 +108,59 @@ The useful additions are confidence-aware verification budgets, explicit exact-v
 time-budgeted scheduling, and topology-aware MoE experiments. Existing async execution, portable provider, numerical
 contract, and state-service designs remain appropriate. DeepInfer's deployment guidance also motivates measuring cache
 lookup/fetch costs independently and comparing locality routing with shared storage. Its companion `deepseek-recipe`
-illustrates a separate protocol/conversation/token adapter boundary. None requires adding DeepSeek or a large MoE
-cluster to the initial Gemma milestone; the corresponding experiments below are gated on supported models and hardware.
+illustrates a separate protocol/conversation/token adapter boundary. Use those mechanisms where the measured Mini workload and deployment topology justify them.
+
+### Baseten DeepSeek Ultrafast and the cost of a decode step
+
+Baseten's November release specializes Rust and CUDA for DeepSeek-V4.1-Flash on Blackwell. Baseten reports 2,060
+output tokens/s on eight B300s at 2.71 ms per speculative verification step and about 5.6 emitted tokens/step. The
+decode test used one coding prompt with thinking disabled. A separate eight-GPU prefill processed 1M tokens in
+11.7 seconds. The public server runs one generation job per rank group at a time, fixes temperature and top-p at
+one, and rejects logprob requests. Use the release to study single-stream latency. Establish Mini throughput under
+concurrent arrivals and rollout scoring independently. The source is published under the Elastic License 2.0, which
+restricts providing its functionality as a managed service. Plan independent Ryft implementations.
+[Benchmark and method](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/README.md)
+· [Worker loop](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/crates/server/src/engine.rs#L205-L213)
+· [Server contract](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/docs/SERVER.md)
+· [License](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/LICENSE)
+
+- **Launches.** Baseten's separate optimization report describes fusion, CUDA Programmatic Dependent Launch (PDL),
+  and breaking variable-length prefill into capturable segments in SGLang. For each Mini profile, compare ordinary
+  compiled execution, full fixed-shape decode replay, and prefill segments split where attention metadata changes.
+  Try PDL only inside a provider that controls both kernels and their data dependency. Measure GPU idle time, launches,
+  workspace, TTFT, and inter-token stalls. Keep the simplest path that improves end-to-end performance. When adding a
+  drafter, report step time and verified tokens emitted per step separately from output rate and streaming burst size.
+  [Baseten optimization report](https://www.baseten.co/blog/how-to-make-flash-models-even-faster-optimizing-deepseek-v41-flash-1017-fast/)
+- **Resuming a conversation on another replica.** Ultrafast retains compressed DeepSeek state in host memory.
+  Redis records ownership with restart epochs, and replicas fetch compatible snapshots over host-to-host RDMA.
+  For Mini, measure the actual bytes for full-attention prefixes, local windows and convolution history. At readmission,
+  compare owner queue delay, remote lookup and transfer plus device upload, and local replay. Validate prefix identity,
+  state format, policy revision and ownership epoch before installing fetched state. Inject stale directory entries,
+  partial transfers and departed owners. A cache miss must permit replay from the recorded inputs. Enable transfer
+  only on measured wins after accounting for congestion and tail latency.
+  [Cache protocol](https://github.com/basetenlabs/deepseek-ultrafast/blob/76766a97308bfd1658fb055e835d0f92de737dc3/docs/SERVER.md)
+
+### A numerical contract for the rollout and learner
+
+Google's November Tunix prototype compared the sampled action's logprob at identical weights across incremental
+decode, serving prefill and the differentiated trainer forward. Its bitwise result covers Qwen3-8B on 64 v5p TPU
+chips, with MoE support under development. The technique fixes accumulation, casts, cross-shard summation and the
+scoring tail, then supplies backward rules for the shared forward. Baseten's Serverless Loops separately demonstrates
+publishing a trained adapter to both a sampler and a production endpoint, with an end-to-end RL evaluation alongside
+numerical tests. These sources motivate two implementation gates.
+[Tunix alignment method and evaluation](https://developers.googleblog.com/unlocking-stable-on-policy-rl-on-tpu-with-bitwise-zero-traininference-mismatch/)
+· [Serverless Loops](https://www.baseten.co/blog/introducing-serverless-loops/)
+
+1. Replay the exact recorded action and preceding token IDs, image inputs and masks through all three paths at one
+   immutable policy revision. Compare raw model and transformed behavior logprobs separately, including across mixed
+   batches, prefill chunks and cache hits. Record the first divergent layer, loop visit and expert choice. Offer a
+   bitwise mode only for a kernel and topology combination that passes byte comparisons. Report measured logprob error
+   and performance for each other supported mode. Measure weight lag separately by replaying the same actions under
+   the learner's current revision.
+2. Make a trainer update produce a typed snapshot with an immutable base and adapter or full-weight revision. Stage
+   and validate it on all participating workers before publishing. Test rollback after a partial install, old sessions
+   continuing on their pinned policy, and a new session seeing the updated weights. Measure time from optimizer step
+   to the first trainer-accepted rollout and useful action tokens per GPU-second under an explicit staleness bound.
 
 ### Durable conclusions
 
@@ -147,55 +181,47 @@ cluster to the initial Gemma milestone; the corresponding experiments below are 
 8. **Performance is a Pareto surface.** Report TTFT, TPOT/ITL, E2E latency, goodput, tokens/GPU, memory, energy, and
    cost under an explicit trace and SLO—not one peak tokens/second number.
 
-## 4. Ryft today: unusually strong substrate, missing inference runtime
+## 4. What Ryft can run today
 
-The repository audit found that Ryft is much closer at the compiler/device layer than a greenfield inference project,
-but has almost none of the serving control plane.
+The current checkout has enough machinery to start a differentiable reference model and a contiguous decode path.
+The first full Inkling run also needs a checkpoint importer, the released processor and token conventions, a model
+implementation, and persistent sequence state. These are separate deliverables from tuning or production serving.
 
-### Existing foundations to reuse
-
-| Capability | Current evidence | Inference use |
+| Reusable today | Where it helps | Evidence |
 |---|---|---|
-| Typed, backend-neutral programs and transformations | `crates/ryft-core/src/contexts.rs`, `crates/ryft-core/src/programs/programs.rs`, `crates/ryft-core/src/parameters.rs` | Shared model/state code, structured weights, reference execution, JIT, vmap, autodiff, checkpoint mapping. |
-| Broad inference primitives | `crates/ryft-core/src/operations`, `.tasks/plan_tier1_inference_primitives.md`, `.tasks/plan_inference_completeness.md` | Dot/quantized dot, control flow, RNG, sampling building blocks, dynamic slice/update, fused attention, custom calls, collectives. |
-| Real decode expressibility | Tiny greedy/top-k/custom-attention compiled decode-loop tests in `crates/ryft-xla/src/compilation.rs` | Excellent correctness fixture and useful fixed-horizon RL path; not a continuous server. |
-| Retained and persistent compilation | `crates/ryft-core/src/compilation`, `crates/ryft-xla/src/domains` | Precompiled profile families, single-flight compilation, AOT warmup, validated executable restore, distributed artifact exchange. |
-| Static and bounded symbolic dimensions | `ryft-core` array dimensions plus `ryft_xla::InputBoundBucketing` | Prefill profile bucketing and model polymorphism, subject to the current dynamic-boundary restrictions. |
-| Async PJRT execution | `crates/ryft-pjrt/src/events.rs`, `crates/ryft-pjrt/src/programs.rs`; `ryft_xla::CompiledFunction::interpret_async` | Enqueue model steps without waiting, chain pending buffers, attach completion fences. |
-| Async external-reference execution | `crates/ryft-xla/src/compilation.rs`; `execute_statefully` | Existing read leases, pending mutation generations, and completion failure handling inform the serving protocol; they do not guarantee physical in-place state. |
-| Device-buffer lifecycle and interop | `crates/ryft-pjrt/src/buffers.rs`, `crates/ryft-pjrt/src/transfers.rs` | Uninitialized buffers, donation, aliases, DMA/pinned staging, external device pointers, zero-copy interop, asynchronous transfers. |
-| Stateful custom-kernel escape hatch | typed XLA FFI, GPU custom calls, Triton extension, Mosaic GPU bindings | Paged attention, cache writes, fused sampling, quantized kernels, MoE, custom communication. |
-| Explicit custom-call aliasing/effects | `crates/ryft-core/src/operations/custom_call.rs` and XLA lowering | In-place serving state transitions with compiler-visible output/input aliases. |
-| Dense fused attention | `crates/ryft-core/src/operations/attention`; `crates/ryft-xla/src/experimental/lowering/attention.rs` | Correct portable reference plus fast CUDA dense prefill/training path with GQA, masks, windows, bias, dropout, and backward. |
-| Sharding and collectives | logical meshes, `shard_map`, all-reduce/gather/scatter/all-to-all/permute | Tensor and other SPMD parallel execution without model-specific communication code. |
-| Multi-host substrate | PJRT distributed runtime, cross-host transfers, topology, stream extension | Worker-group startup, rank-local buffers, future P/D state transfers and artifact distribution. |
-| Profiling and adaptive recompilation | PJRT profiler, executable analysis, `crates/ryft-xla/src/profile_guided.rs` | Observe real profiles, produce compatible optimized replacements, and atomically install them. |
+| Typed, traversable parameter trees, reverse-mode AD and loss operations | Share weights between training, scoring and decoding. An MLP example trains with gradient descent. A synthetic F32 GPT benchmark passes weights as runtime inputs to a compiled forward pass. | [Parameter trees](crates/ryft-core/src/parameters.rs), [losses](crates/ryft-core/src/operations/softmax.rs), [MLP](crates/ryft/examples/mlp.rs), [transformer benchmark](crates/ryft/examples/transformer_benchmark.rs) |
+| Reference attention, selected cuDNN forward/backward paths and sampling primitives | Build an oracle from dense math. A CPU fixture compiles a fixed decode loop and compares greedy, top-k and custom-call attention paths to a reference. The cuDNN configuration uses dense state, with one segment per row. | [Attention semantics](crates/ryft-core/src/operations/attention.rs), [cuDNN eligibility and ABI](crates/ryft-xla/src/operations/attention.rs), [decode fixture](crates/ryft-xla/tests/test_decode_loop.rs) |
+| Rank-local array I/O, resharding and collectives | Load each process's checkpoint slices into its addressable shards using `Array::from_host_shards`. Await local uploads before publication. Reuse the mesh and ragged all-to-all contracts when qualifying expert parallelism. | [Host shard I/O](crates/ryft-xla/src/arrays/host.rs), [resharding](crates/ryft-xla/src/arrays/resharding.rs), [collectives](crates/ryft-core/src/operations/collectives/mod.rs), [distributed runtime](crates/ryft-xla/src/distributed.rs) |
+| Retained compilation, executable persistence, distributed artifact exchange and profile-guided recompilation | Prewarm physical profiles. `CompiledFunction::batch` compiles a wrapper with an explicit static batch extent. `ExecutableFunction::execute_async` returns outputs and a whole-invocation fence. | [Compiled functions](crates/ryft-xla/src/compilation/functions.rs), [persistence](crates/ryft-xla/src/compilation/persistence.rs), [artifact exchange](crates/ryft-core/src/compilation/exchange.rs), [profile-guided replacement](crates/ryft-xla/src/compilation/profile_guided.rs) |
+| Kernel authoring, host verification, explicit derivative rules, AOT artifacts and schedule tuning | Stage a verified kernel with a VJP or portable fallback. Select and qualify a provider for each model shape, precision and mode. Existing compiler adapters have different supported operation sets. | [Kernel contracts](crates/ryft-kernels/src/lib.rs), [XLA staging](crates/ryft-xla/src/kernels/staging.rs), [AOT](crates/ryft-xla/src/kernels/aot.rs), [tuning](crates/ryft-xla/src/kernels/tuning.rs) |
+| PJRT buffers, transfers, completion events, custom-call aliases and runtime extensions | Pass native resources through an execution context and retain their owners until completion. Use these contracts to prototype paged attention and a sequence-state pool. | [Buffers](crates/ryft-pjrt/src/buffers.rs), [transfers](crates/ryft-pjrt/src/transfers.rs), [events](crates/ryft-pjrt/src/events.rs), [custom calls](crates/ryft-core/src/operations/custom_call.rs), [runtime extensions](crates/ryft-xla/src/sessions/runtimes.rs) |
 
-### Important current constraints
+### Constraints on a serving executor
 
-- `Array` is a functional distributed value, not a durable mutable resource arena.
-- Dense attention explicitly emits `is_paged_attention: false`; no block table or paged kernel exists.
-- No model/checkpoint/tokenizer crate exists, and model plan files remain prospective.
-- No request scheduler, page allocator, prefix index, sampler runtime, grammar engine, adapter manager, or server exists.
-- XLA bounded-dynamic input/output boundaries can synchronize with the host, and retained bound bucketing is currently
-  single-device because the dynamic path is incompatible with the Shardy path.
-- `ryft_xla::CompiledFunction::batch` is currently unsupported. Serving batches must be assembled explicitly and dispatched to
-  an already compiled profile; the design must not assume post-compilation vmap.
-- Requested donation may be downgraded when a buffer has another shared owner. Donation can remain an ordinary tensor
-  optimization, but it must not be the correctness mechanism for shared sequence state.
-- The current external-reference ABI explicitly uses non-semantic may-alias hints and never donates reference-state
-  inputs. It commits returned final values and dependency-chains mutations to the same reference. This preserves
-  functional snapshots, but does not establish stable arena addresses, absence of pool-sized copies, or independence
-  of disjoint pages. Its admitted mutable boundary is static state on a fully addressable single-process mesh.
-- The high-level XLA execution wrapper does not yet expose the low-level launch IDs, incarnations, callbacks, execution
-  contexts, device overrides, or multi-slice configuration needed for robust serving-oriented multi-host launches.
-- Existing telemetry is compiler/array-oriented, not request/page/SLO-oriented.
+- **Batch construction.** The host must map admitted requests to slots in a precompiled profile. Bounded-dynamic
+  arrays can cause host readback or repadding. Retained input-bound bucketing currently requires a single device.
+  Use static physical buffers plus device lengths and active masks for the multi-device hot path.
+  [Bucketing options](crates/ryft-xla/src/compilation/options.rs) and [execution](crates/ryft-xla/src/execution.rs).
+- **State ownership.** An external reference uses read leases and pending mutation generations. Mutations commit
+  returned final values. The reference input is never donated and its output alias is a reuse hint. Ordinary array
+  donation can also be downgraded when any shard buffer is shared. Static references support sharded multi-process
+  meshes, with independent local commits and no cross-rank rollback. Bounded-dynamic reference inputs require
+  read-only replicated state on a fully addressable single-process mesh. Prove arena address stability, copy volume
+  and safe disjoint-page overlap with the chosen kernel before depending on them.
+  [External reference ABI](crates/ryft-xla/src/compilation/functions.rs) and [execution](crates/ryft-xla/src/execution.rs).
+- **Distributed launches.** The XLA execution wrapper forwards the extension-provided context and retains resources
+  on the fence. It currently submits launch ID zero and defaults for device override and incarnations. The serving
+  executor needs rank-consistent launches, error propagation and a single publication decision after all ranks are ready.
+  [XLA submission](crates/ryft-xla/src/execution.rs) and [PJRT executable API](crates/ryft-pjrt/src/programs.rs).
+- **Missing product surfaces.** The workspace has no released-model importer, Inkling renderer/image processor,
+  resumable optimizer/training-checkpoint workflow, or transactional weight publisher. Continuous admission, paged
+  attention and allocation, prefix accounting, request-local sampling and stopping, streaming and rollout provenance
+  also require implementation. Adaptive replacement of a compiled executable concerns its code, independently of the
+  model weights bound to an invocation. [Workspace](Cargo.toml) and [profile-guided compilation](crates/ryft-xla/src/compilation/profile_guided.rs).
 
-### Architectural consequence
-
-Do not overload `ryft-core::Array` or move a KV allocator into the mathematical IR. Add an inference-owned resource
-layer. Its public types represent safe leases and state transitions; its XLA implementation uses stable PJRT buffers,
-explicit FFI aliases, completion fences, and device-resident metadata internally.
+Keep page leases, logical sequence versions and cancellation in the inference runtime. The executor binds a validated
+weight snapshot and state leases to compiled Ryft programs, tracks the resulting fences, and publishes or discards
+each step's logical state. The model and trainer can then use the same math with ordinary arrays.
 
 ## 5. Target system architecture
 
@@ -252,11 +278,10 @@ manager, batch builder, model runner, and distributed router simultaneously.
 
 ## 6. Proposed crate boundaries
 
-The following names describe logical ownership boundaries, not six crates to create immediately. Start with
-`ryft-models` and an embedded `ryft-inference` crate whose core, XLA executor, and kernel integration are internal
-modules. Extract the proposed crates only when optional dependencies, independent consumers, or provider distribution
-justify the split. Keep internal Rust interfaces evolvable; version the external provider ABI and persisted artifact
-formats that actually need independent compatibility.
+Start with a model package and one embedded inference package. Keep scheduler, state and XLA executor as internal
+modules until they have independent consumers. Extend the existing [kernel crate](crates/ryft-kernels/src/lib.rs)
+and its [XLA integration](crates/ryft-xla/src/kernels) for serving providers. The names below describe ownership.
+Version independently distributed provider ABIs and persisted formats.
 
 ### `ryft-models`
 
@@ -297,9 +322,9 @@ not have a backward kernel when training uses the same semantic operation's diff
 - Kernel-provider registration and XLA custom-call lowering integration.
 - XLA implementation of sequence-state buffers without exposing raw buffers to policy code.
 - A tiny XLA conformance model that uses the production physical ABI, aliases, buffers, profiles, and completion path
-  without requiring Gemma 4 kernels or weights.
+  with controlled state transitions and failure injection.
 
-### `ryft-kernels`
+### Serving providers using the existing `ryft-kernels`
 
 - Stable semantic operation requests and versioned FFI ABIs.
 - Provider registry, capability declarations, artifact loading, selection, tuning, and fallback chain.
@@ -356,8 +381,9 @@ Each request records at least:
 `WeightVersion` is monotonically increasing within a model lineage and identifies an immutable snapshot. A request
 binds to one version. Bounded staleness permits an older pinned version within a declared lag limit; it does not permit
 changing weights mid-sequence while retaining state produced by the old weights. Moving a continuation to a new version
-requires rebuilding its state from tokens and recording the policy boundary. Sequence-state cache keys include the
-model lineage and weight version; the default APIs make reuse across weight updates impossible.
+requires replay of token IDs and immutable, resolvable media inputs at their original positions. Re-encode images if
+encoder weights or preprocessing changed. Record the policy boundary. If inputs have expired, return an explicit
+expired continuation. A request and its prefix cache bind to a model lineage and immutable weight version.
 
 A weight update is transactional:
 
@@ -368,12 +394,18 @@ A weight update is transactional:
 5. drain or retain old-version requests according to policy;
 6. reclaim the old snapshot only after all requests and asynchronous launches release it.
 
-Use double buffering first where the declared memory envelope supports it. Approximately 31 billion BF16 parameters
-require 62 GB for one snapshot and 124 GB for two, before state, workspaces, activations, and transfer staging. These
-are decimal estimates, to be replaced by the pinned checkpoint's measured allocation sizes. Budget old-version
-state and paused requests as well as weights. If this does not fit, bring tensor parallelism forward or explicitly
-measure a drain/offload/load policy and its update pause. Optimize to delta/LoRA or in-place refit only with explicit
-correctness and memory evidence.
+For Mini, the main mixed-format checkpoint is about 19.5 GB on disk. Two such images are about 39 GB before runtime
+packing, workspaces, state and staging. At 2 bytes per parameter, a hypothetical 26.4B all-BF16 representation costs
+about 52.8 GB per copy. Actual mixed-dtype resident bytes depend on the loader and providers. Budget the overlap of
+old and new weights, both versions' live state, quantization/repacking, any graph-bound addresses, activations and
+transfer buffers. Validate against measured peaks on each rank. Prefer atomic snapshot swapping when it fits, share
+immutable base weights for adapters, and otherwise measure drain/offload/reload. A changed weight address may require
+graph rebind or recapture even when the compiled program is reusable.
+
+Make each update idempotent by lineage, revision and content digest. Stage against an expected parent and abort a
+partial installation before admission sees it. Publish only after all participating ranks acknowledge the same
+manifest. An uncertain rank stays out of service until recovery reconciles its epoch. Requests, graphs in flight and
+paused sessions hold leases on the old snapshot until completion or explicit reconstruction.
 
 ## 8. Paged sequence-state service
 
@@ -402,12 +434,28 @@ Prefix eligibility is the latest common token boundary reconstructible across al
 retention and recurrent checkpoints must not falsely advertise an arbitrary historical prefix. Test these contracts
 early with append-only, sliding-window, and tiny recurrent conformance state; production Qwen kernels can remain later.
 
+### Inkling state layout
+
+Index weights by physical layer and state by the logical visit in the fixed 48-visit schedule. The 40 local visits
+retain bounded KV and the eight full visits retain their full prefixes. All 48 visits also require the appropriate
+causal convolution tails. Keep loop messages and attention-residual block summaries in token-step or prefill-chunk
+workspace with the lifetime required by the graph. They do not grow with the decoded history. Immutable image features
+may have their own cache. Include pixel-content identity, preprocessing revision, insertion positions, and encoder
+weight version when reusing them or any downstream prefix. Partition prefix reuse by the authorized sharing domain.
+
+For head dimension 128, eight KV heads and BF16 state, each visit stores 4,096 KV bytes per retained token per sequence.
+Ideal KV bytes at length L are 4,096 × (8L + 40 min(L, 1,024)). At L = 4,096 this is 288 MiB, and at the published
+maximum it is 32 GiB + 160 MiB. Add conv tails, page rounding, provisional writes, tables, allocator reserve and COW.
+A context-length claim alone cannot set the admission limit. A publishable prefix or transfer is one coherent
+frontier across global pages, each local window and its matching tails. Forks can share immutable pages. Capture or
+replay the bounded histories before their next overwrite. [Visit and cache semantics](https://vllm.ai/blog/2026-11-20-inkling2-mini)
+
 ### Reconstruction semantics
 
 A reconstruction strategy declares whether it restores exact model state or changes the computation. Exact suffix
 replay requires a valid starting checkpoint and all dependencies; a sliding-window size alone does not bound the
 receptive field through multiple layers. DeepInfer's SWA bounded replay truncates attention within the replayed segment
-and is explicitly approximate. Do not transplant its window or checkpoint constants into Gemma or recurrent models.
+and is explicitly approximate. For Mini, measure the cost of restoring each visit’s full prefix, local window and convolution history.
 
 Keep exact restoration as the default. Any approximate strategy is an opt-in model capability with a named quality
 policy, cache/provenance identity, and separate acceptance results. Reconstructed approximate state cannot enter an
@@ -429,8 +477,9 @@ Validate wraparound and partial acceptance at checkpoint boundaries, including d
 - `PageLease`: shared or exclusive ownership of allocated pages or fixed state slots tied to completion dependencies.
 - `SequenceCheckpoint`: a coherent boundary across state groups, with an explicit snapshot/restore/replay strategy and
   cost for speculative decoding and branching agents.
-- `PrefixKey`: hash over tokens plus model, weight version, adapter, position policy, state layout, and relevant model
-  configuration.
+- `PrefixKey` includes the authorized sharing domain, token IDs and positions, inserted media digests and spans,
+  processor/renderer revisions, model, weight and adapter revisions, state layout and numerical configuration.
+  Encoder and prefix-state hits are validated independently.
 - `StateTransaction`: a resource transition with separate reservation, submission, completion, publication, and
   reclamation states, covering append, fork, truncate, restore, transfer, and eviction.
 
@@ -594,7 +643,7 @@ Inactive lanes have defined semantics and never mutate state or emit tokens. Out
 capacity with device-resident valid counts, acceptance lengths, and status; these can be consumed by dependent device
 work or read asynchronously. This avoids shape-dependent allocation and preserves graph/profile reuse without assuming
 speculative output cardinality is known before execution. Compile profile keys include model architecture,
-weight format, state layout, phase, token and sequence buckets, topology/sharding, kernel selections, speculation mode,
+weight format and layer-visit schedule, state layout, phase, token and sequence buckets, topology/sharding, kernel selections, speculation mode,
 determinism mode, compiler identity, and relevant XLA flags.
 
 Start with a small geometric profile family. Collect misses and padding waste, then tune bucket boundaries from traces.
@@ -605,6 +654,16 @@ shared-prefix length, group occupancy, suffix lengths, and supported masks/layou
 and logical lengths remain runtime metadata within bounded capacities; request identities and prefix contents do not
 become compilation keys. Choose among warmed variants and ordinary paged fallback as traffic changes. Charge grouping,
 provider planning, scratch space, and metadata upload to the optimization; reject per-prefix or per-token compilation.
+
+### Profile selection for serving and rollouts
+
+Use aggregated execution, one rank and ordinary autoregressive decode first. Warm a batch-one decode profile to favor
+inter-token latency, larger packed profiles for throughput, and a teacher-forced score profile that gathers only the
+requested action scores. Share weights and immutable compatible state across requests on the same revision. Give
+interactive requests a deadline and rollout work a bounded token/time quota. Fill spare slots with rollout work only
+when the predicted step meets the online deadline. With separate pools, measure the cost of replica duplication.
+For bulk rollouts, compare a bounded device-resident multi-step loop against continuous steps, charging wasted work
+at stop/tool boundaries and the delay before publication of the next policy.
 
 ### Command buffers/graphs
 
@@ -663,7 +722,9 @@ Never reuse query-dependent attention outputs across requests or average partiti
 
 The scheduler supplies group-to-query mappings and partition/page boundaries from valid, version-compatible cache
 entries. Locality remains subordinate to deadlines and bounded starvation. Validate positions, causal/window masks,
-GQA, softcapping, and Gemma's different layer attention patterns; only genuinely common visible KV regions qualify.
+GQA, Mini's position-dependent logits, and the visible region for each logical visit. Merge the query-dependent
+sink exactly once across all partitions and use global query/key positions when constructing relative bias. Test
+against ordinary unpartitioned attention, including the transition out of the local window.
 Retain ordinary paged attention for unsupported semantics or unfavorable occupancy/suffix lengths. Include empty and
 fully masked partitions in correctness coverage. Measure KV traffic and complete step latency alongside serving
 outcomes: fewer prefix reads do not guarantee a win when weight traffic or dense computation dominates.
@@ -744,7 +805,11 @@ must not materialize these features. Feature buffers follow the same accepted-fr
 reclamation rules as draft state. Pin draft/target checkpoint compatibility and invalidate stale features on weight
 changes; an RL update may require disabling or recalibrating the drafter.
 
-After basic speculative rollback works, compare a compatible Gemma DFlash checkpoint with MTP and no speculation.
+For Mini, use ordinary target decode as the control and qualify its supplied three-layer DSpark drafter after M1.
+Capture the running partial block residual immediately before logical visits 5, 23 and 41 (zero-based) and the final
+normalized hidden state at boundary 48. Rebuild or invalidate draft feature state on policy changes and fork/rollback.
+Use block proposals and target verification with fixed budgets first. [Target tap locations](https://github.com/vllm-project/vllm/blob/4c616217b466d94c2dcce8fd2d0c346cc48a2bed/vllm/models/inkling2/nvidia/loop.py#L347-L397) · [Release integration](https://huggingface.co/blog/inkling2mini#speculative-decoding)
+
 Prove the verifier's declared greedy or stochastic distribution contract, including grammar/logits processing; do not
 infer stochastic exactness from greedy agreement or from a method's headline claim. Charge feature extraction,
 draft weights/state, verification, rejected work, and reduced serving capacity to effective speedup. Adapt block size
@@ -798,8 +863,25 @@ Support two deployment modes:
 Define synchronous on-policy barriers first. Add bounded-staleness asynchronous training only after every token can be
 attributed to a policy version and stale sequence state is rejected across refits.
 
-The strongest Ryft opportunity is sharing model definitions, parameter trees, sharding, and numerical tests between the
-trainer and rollout engine while retaining inference-specific compiled profiles and kernels.
+A rollout carries an append-only transcript of token IDs, image bytes or immutable references and digests,
+preprocessing revision and insertion positions, action mask, stop/truncation reason, old policy revision, numerical profile and per-action scores. Preserve tool/environment observations as inputs
+with zero action weight. Retokenizing streamed text can change boundaries. Keep independent slots for behavior, raw
+old-policy, current learner and optional reference-policy logprobs. The trainer owns rewards, advantages, objectives
+and gradient steps. The engine returns replayable inputs to SFT/distillation scoring and sampled continuations for RL.
+
+At unchanged weights replay the very same actions through incremental decode, batched score and the differentiated
+trainer forward. Compare action-aligned logprobs and first divergence by visit, routing and numerical mode. Check
+importance ratios against one for matching distributions before an update. After a real update, test expected changes,
+old-session isolation and policy-lag limits. Budget colocation on simultaneous trainer and worker peaks, including
+moments, activation checkpoints, old weights and live state. Explicitly fence sleep, release and wake transitions.
+
+Qualify optional router replay with expert IDs per token **per logical visit**. For replay of top-k/top-p sampling,
+retain the chosen support, ordering and transforms to reproduce the behavior-policy probability. A current-policy
+importance ratio uses the current policy's own support and normalizer. An old sampled action outside the current
+support has zero current probability. Newly admitted actions lack coverage under the old policy. Label a deliberately
+fixed-support or forced-route diagnostic separately. Charge replay metadata to storage, memory and transfer budgets. Use
+SkyRL's published Mini BF16 full-tuning, adapter and quantized-rollout configurations as direct comparison cases.
+[SkyRL Mini integration](https://docs.skyrl.ai/docs/models/inkling2#inkling-2-mini)
 
 ### Weight churn and session retention
 
@@ -826,7 +908,8 @@ use the existing ordered XLA artifact-exchange protocol as a service-discovery o
 
 ### MoE topology and expert placement
 
-When an MoE model is selected, evaluate attention data parallelism with expert parallelism and phase-specific layouts.
+Mini requires top-8 routing and grouped expert computation on the first worker. Evaluate attention data parallelism
+with expert parallelism and phase-specific layouts once observed capacity, expert skew or throughput justifies another rank.
 Sweep group size within the actual fabric; a larger expert group can improve expert batches while increasing dispatch,
 synchronization, and failure-domain costs. Compare specialized fused dispatch/compute/combine providers with unfused
 paths, including graph compatibility and simultaneous communication/workspace memory. Reuse semantic provider contracts.
@@ -872,7 +955,7 @@ workload demonstrate better SLO goodput.
 - Python bindings wrap the Rust API; they do not become an internal execution plane.
 
 Keep protocol conversion, a canonical conversation representation, model-specific prompt/token encoding, and streamed
-output parsing separate from execution. Use `deepseek-recipe` as a design reference, not a Gemma template dependency.
+output parsing separate from execution. Use the pinned Inkling renderer and image processor for the first model.
 Version templates with the tokenizer; test tool/reasoning boundaries, stop sequences split across chunks, token usage,
 and round-trip protocol fixtures. User text resembling control tokens must remain text unless explicitly encoded as
 trusted structure. Rendering a schema in a prompt does not enforce it: structured decoding remains an engine contract.
@@ -883,7 +966,7 @@ Use a small model-source interface for local files and later Hugging Face/object
 checkpoint/tokenizer revisions before loading; verify tensor names, shapes, dtypes, and shard completeness before
 publication. Bound host staging and concurrent reads, load required shards directly where supported, and make partial
 loads cancellable and reclaimable. Remote access still transfers bytes; distinguish avoided intermediate copies from
-network, host-to-device, resharding, and conversion costs. Reuse the existing versioned weight-publication protocol.
+network, host-to-device, resharding, and conversion costs. Use the weight-publication protocol specified in section 7.
 
 Ship target-specific runtime/provider artifacts with pinned compiler, PJRT, kernel, and driver compatibility metadata.
 Document compilation and warmup requirements separately from binary packaging; a self-contained server does not imply
@@ -915,7 +998,10 @@ payloads.
 The underlying PJRT layer already implements many useful low-level capabilities. Reuse them, but treat serving arena
 ownership, overlapped execution, and failure-safe state publication as new contracts that require physical proof.
 
-### P0: physical feasibility and first competitive engine
+### P0 — physical feasibility and first competitive profiles
+
+Sections 16 and 17 use different gates. Correct model output and safe state publication qualify an execution path for
+M1. Graph replay, lookahead, and copy/idle budgets qualify a profile for competitive performance.
 
 - [ ] Prototype the smallest semantic kernel/provider ABI needed for the feasibility probe; stabilize only after the
       actual provider and state boundary pass. Version independently distributed providers and persisted artifacts.
@@ -937,154 +1023,93 @@ ownership, overlapped execution, and failure-safe state publication as new contr
 - [ ] Surface rank-consistent launch IDs, device selection, and error handling before the first multi-GPU gate whenever
       the initial model or weight-update memory envelope requires tensor parallelism.
 
-### P1: production scale
+### P1 — production scale
 
 - [ ] Extend the proven local execution protocol with distributed execution contexts, worker incarnation IDs, and
       rank-consistent recovery; callbacks and completion-safe cancellation are already P0 prerequisites.
 - [ ] Complete multi-slice execution configuration and rank-consistent error propagation.
 - [ ] Build sharded hot weight replacement and adapter updates without recompiling unchanged executable profiles.
-- [ ] Add fused/page-aware quantized KV, low-bit GEMM, MoE, sampling, and collective providers.
+- [ ] Optimize Mini’s mixed NVFP4/MXFP8 grouped expert path, then evaluate quantized KV, fused sampling and collectives.
 - [ ] Add layerwise/streaming state transfer with compute/communication overlap for P/D deployments.
 - [ ] Extend or avoid multi-device bounded bucketing based on evidence; fixed physical profiles remain the default.
 - [ ] Expose per-operation/profile tracing and scheduler-consumable cost observations.
 
-### P2: differentiation
+### P2 — additional platforms and tuning
 
 - [ ] Capability-parity plans for CUDA, ROCm, TPU, CPU, Metal/other PJRT targets.
 - [ ] Profile-guided background retuning and compatible executable replacement using real serving traces.
 - [ ] Automated kernel/profile regression isolation and safe rollback.
-- [ ] Optional compiled-function batching if it simplifies homogeneous offline RL; do not make online serving depend on
-      it.
+- [ ] Evaluate the existing static compiled-function batching wrapper for homogeneous offline rollout profiles.
 
 ## 17. First milestone and execution plan
 
-Each stage has an exit gate. Do not advance because APIs exist; advance when correctness and performance evidence pass.
+**M1 is end-to-end Inkling 2 Mini inference on the released checkpoint.** A caller supplies messages (including an
+image), receives streamed tokens through the embedded Rust engine, and can score the generated continuation. The first
+slice is single-request text generation. The M1 exit adds image input and continuous batching on one worker group.
+Target ordinary autoregressive generation with the published expert quantization semantics. DSpark, HTTP, long-context
+leadership, expert parallelism, and a complete RL system have their own gates.
 
-### First production-model decision
+Use the full checkpoint identified in the [model and training plan](plan-inkling-2-mini.md). Its importer, renderer,
+fixed visit schedule, vision encoder, parameters and teacher-forced scorer are shared with the trainer. Reduced fixtures
+shrink widths/expert counts and sequence lengths while preserving all three passes, the six-layer attention pattern,
+independent histories, four message reads, both expert formats, and image insertion.
 
-The first real-model target is the **Gemma 4 31B dense instruction model**. The first milestone covers its text decoder,
-ordinary autoregressive prefill/decode, tokenization/chat template, BF16 numerical reference, paged state, continuous
-batching, and embedded streaming API. Vision input, training, MTP-based speculation, peak 256K-context operation, and
-production quantization remain representable but are not required for the first integrated engine.
+Use the pinned Transformers implementation for structure and compatible intermediate tensors and NeMo for BF16
+training gradients. For M1 record teacher-forced and incremental target scores from a pinned release-numerics vLLM
+or SGLang build, or a reference whose rounding has been validated against it. Their route-weight placement can differ
+in floating paths. Freeze container digests, settings and fixtures. [Model reference contracts](plan-inkling-2-mini.md#artifact-import-and-training-numerics)
 
-Validation uses two sizes without creating two model implementations:
+### Phase 0 — model bring-up and physical feasibility in parallel
 
-- a reduced-shape configuration derived from the 31B architecture, retaining GQA/QK-norm, partial RoPE, local/global
-  attention, per-layer-input embeddings, KV-sharing relationships, normalization placement, and soft-capping semantics;
-- the complete published Gemma 4 31B checkpoint as the milestone acceptance target.
+- [ ] Start the model plan's differentiable reference and import work immediately. Run a reduced token-to-loss step
+      and materialize a full-checkpoint first-token fixture. Stage the renderer, preprocessing code and small fixtures
+      with the same revision as the weights.
+- [ ] Start on one NVIDIA Blackwell worker in aggregated mode. Proposed first experiment is one B200, at most four
+      sequences, 4,096 combined positions per sequence, including image tokens, with generation capped at 128. Budget
+      pool capacity from the actual live groups and lengths. Record precise hardware, available memory, topology, and
+      software before the first run. Expand beyond this envelope only with measured headroom.
+- [ ] Register separate parity, interactive-serving, saturated and rollout traces and section 18's thresholds before
+      tuning. Pin the supported vLLM and SGLang Mini recipes. Include unsupported precision/feature combinations in the
+      report. A DeepSeek-only implementation supplies mechanism experiments.
+- [ ] Exercise provisional contracts with a deterministic Rust executor, virtual clock, out-of-order completions and
+      cancellation. A tiny compiled XLA model exercises real aliases, immutable per-launch metadata, fences and device
+      token feedback. Both use the same admission and completion code as the full model.
+- [ ] Probe an actual paged CUDA attention provider with Mini's 24:8 head layout, learned relative scores and sink,
+      local and global visits, mixed lengths and conv-state updates. A composition can supply missing semantics during
+      bring-up. Inspect HLO, buffer assignment and GPU traces across repeated launches and profile changes. Test
+      disjoint pages and dependent uses, ring wrap, partial writes, cancellation after submission, and unknown device
+      quiescence. Measure hidden copies, whole-pool serialization, graph compatibility and metadata-slot lifetime.
 
-The reduced configuration is for fast layer/model parity, generated cases, sanitizer runs, scheduler integration, and
-CI. It is never used for performance claims. Full-checkpoint tests pin the exact checkpoint revision, tokenizer, chat
-template, numerical mode, hardware topology, and reference implementation.
+Start with functional contiguous buffers and serialized completion wherever necessary to obtain correct tokens.
+Stabilizing a shared mutable arena requires a proven physical ownership and completion mechanism. Adding overlap,
+graph replay or a performance claim requires the corresponding trace and fault evidence. These experiments can
+continue while the reference model generates its first tokens.
 
-Qwen3.6 27B is the planned second production-model extensibility test. Its hybrid Gated DeltaNet/full-attention kernels
-should be added only after Gemma passes the first milestone. Validate recurrent snapshot/restore/replay and hybrid
-retention semantics with tiny conformance state before stabilizing contracts; Qwen then tests those same contracts at
-production scale without requiring a scheduler or lifecycle fork.
+### Phase 1 — full-checkpoint generation, then continuous serving
 
-### Conformance executors
+| Integration gate | Deliverable | Acceptance |
+|---|---|---|
+| I1. Full-sequence reference | One model definition, trainable reduced instance, full released weights, renderer and scorer. | Match layer taps, selected experts, loop boundaries and next-token scores against pinned fixtures. Import the tensors by physical layer exactly once. |
+| I2. First generated text | Render a conversation, prefill contiguous state, decode, sample, detokenize and stop via the public embedded entry point. | Match incremental scores to full teacher forcing after every token on margin-separated greedy fixtures. Cross a chunk split and the local window. Distinguish the three core visits by deliberately changing a single visit in a negative test. |
+| I3. Image-conditioned output | Preprocess a real image, encode it, map patch outputs to the rendered positions and run I2 on the combined prompt. | Match visual embeddings, rendered IDs/positions and scores to an independent implementation. Change the pixels with fixed placeholder/token IDs and check the expected change in scores. Stream a complete answer to a held-out prompt. |
+| I4. Paged execution | Bind a state bundle to each sequence. Install the same model behind paged append/decode and fixed-capacity profiles. | Match I2/I3 across chunking, partial pages, local eviction, mixed prompt lengths and batches. Include convolution histories in checkpoint/cancellation tests. Suppress rejected or failed writes and reclaim after the last fence. |
+| I5. Continuous stream and score | Admit a second request during decode, interleave bounded prefill and decode, stream completed tokens, cancel one request and score the other's exact token history. | Run real text and image fixtures on the full checkpoint. Show bounded memory, stop reasons, independent output-token counts, no per-token compile, and correct reuse of a cancelled slot. Measure TTFT, ITL, HBM, compute, state traffic and idle time. Record performance gaps. |
 
-Scheduler and state experiments can proceed alongside Gemma model bring-up. Build two deliberately production-shaped
-conformance implementations behind the same `ModelExecutor`/profile/state contracts used by Gemma. They complement
-the actual-provider feasibility probe; passing a synthetic executor cannot substitute for that probe.
-
-1. **Pure-Rust conformance executor.** Fast deterministic execution with a virtual clock, configurable per-phase/token
-   costs, controllable completion order, and fault/resource injection. It supports exhaustive state-machine and policy
-   testing without a device.
-2. **XLA conformance model.** A tiny compiled stateful model using the production static physical ABI, device buffers,
-   page tables, aliases, profile selection, enqueue path, and completion fences. It validates the physical integration
-   without requiring Gemma weights. Its state boundary must use the ownership and execution mechanism proven by the
-   actual-provider probe, including the same completion and metadata lifecycle.
-
-Begin with deterministic prefill/decode/mixed behavior, variable lengths, append-only pages, and a tiny overwritten
-recurrent accumulator with bounded sliding-window history. Before contract stabilization, demonstrate coherent hybrid
-checkpointing, accepting a prefix of speculative work, snapshot restoration or replay, delayed completion, and failure
-after possible writes. Exercise cancellation after submission, metadata-slot reuse, device future-token dependencies,
-and resource exhaustion. The Rust executor uses virtual time rather than wall-clock sleeps.
-
-Extend both executors alongside each production feature with score/verify, prefix sharing and partial-page COW,
-fork/commit/rollback, pause/resume, weight-dependent outputs, and version retention. Maintain deterministic event-log
-reconstruction of every allocation, lease, transition, and reclamation. The entire eventual feature matrix is not a
-prerequisite for the first real Gemma execution path.
-
-The scheduler may not inspect a conformance-model type, install conformance-specific branches, bypass page leases, or
-use a different completion path. Replacing a conformance executor with Gemma is executor/profile substitution only.
-
-### Phase 0 — physical feasibility and benchmark laboratory
-
-Deliverables:
-
-- [ ] Pin the Gemma 4 31B checkpoint revision, reduced configuration, tokenizer/template, first NVIDIA target, initial
-      context/batch envelope, numerical contract, and full memory budget, including two weight snapshots. Decide whether
-      tensor parallelism is needed for the first generation or weight-update gate and schedule it accordingly.
-- [ ] Register the primary workload, performance hypotheses, baseline configurations, quantitative acceptance targets,
-      quality tolerances, and cost budgets from section 18 before tuning Ryft. Pin vLLM, SGLang, and TensorRT-LLM
-      versions and supported configurations on the same hardware, documenting any unsupported baseline.
-- [ ] Prototype minimal request, state-group, transaction, profile, and executor contracts without freezing them.
-      Validate append-only, sliding-window, and overwritten recurrent conformance behavior and failure semantics.
-- [ ] Build a physical probe using an actual candidate paged-attention CUDA provider with Gemma-compatible shapes,
-      cache writes, device sampling, persistent state, fixed-capacity outputs, and real per-batch planning metadata.
-- [ ] Prove repeated calls and profile changes preserve state addresses without pool-sized copies or hidden host waits.
-      Validate graph capture/replay, workspace lifetime, future-token feedback, and bounded metadata-buffer reuse.
-      For tensor-parallel probes, include captured collectives under memory pressure and buffer retirement/reallocation.
-- [ ] Exercise outstanding launches touching disjoint pages in one pool and dependent launches touching shared state.
-      Identify whole-buffer serialization; prove safe access and measure whether the design meets overlap budgets.
-- [ ] Inject cancellation after submission, partial writes, asynchronous failure, and delayed completion; verify no
-      premature publication or reclamation. Define quarantine/recovery when device quiescence cannot be established.
-- [ ] Define Gemma numerical oracles against the official JAX implementation and an external serving engine. Build
-      minimal trace replay and reporting for controlled and quality-constrained baseline comparisons.
-- [ ] Add adversarial harness checks: real first-token delivery, independently reconciled generated token IDs/counts,
-      long-prefix information dependence, and optimized-path numerical checks. Freeze correctness requirements separately
-      from tuning objectives; include dynamic arrivals, growing suffixes, cancellation, and weight-version changes.
-
-Exit gate: the actual-provider probe proves the state/graph/overlap mechanism on the declared topology, or the design
-is revised and retested before engine interfaces stabilize. Keep HLO/buffer-assignment evidence, address checks, device
-traces, allocation/copy accounting, and fault-test results. A synthetic model or successful enqueue alone cannot pass.
-Baseline fixtures and the performance contract must be reproducible; numeric targets cannot remain unspecified.
-
-### Phase 1 — minimal continuous Gemma engine
-
-After physical feasibility, model bring-up, minimal engine work, and provider integration can proceed concurrently
-against the same provisional contracts. Stabilize only the interfaces exercised by the real-model path. Shared changes
-receive joint review; do not build the complete future lifecycle framework before integrating Gemma.
-
-Deliverables:
-
-- [ ] Implement the Gemma configuration, `Parameterized` weights, checkpoint importer, tokenizer/chat template, and
-      shared model semantics. Compare reduced-shape and full-checkpoint layers, logits, tokens, and logprobs under the
-      declared numerical contract, using contiguous state as the initial reference.
-- [ ] Keep weights as explicit resident versioned snapshots. Compile prefill/decode and representative mixed profiles;
-      validate persistent reload and the same architecture code across contiguous and paged execution.
-- [ ] Implement minimal admission, request FSM, required/in-flight/completed/accepted frontiers, batch construction,
-      completion reactor, bounded streaming, cancellation, and backpressure.
-- [ ] Implement HBM pools/tables, metadata slots, leases, and completion-safe reclamation using the proven state ABI.
-      Integrate paged attention/cache append, device sampling, and a portable numerical fallback.
-- [ ] Extend both conformance executors for this exact slice, with event-log reconstruction and deterministic faults.
-- [ ] Implement tensor-parallel weights/state and rank-consistent launch/error handling here if Phase 0 requires it.
-      Add full-step capture and overlap validation on that topology before declaring its execution path accepted.
-
-Ordered integration gates within this phase:
-
-1. **I1 — minimal engine semantics.** Admission, generation, completion, cancellation, and backpressure pass against
-   Rust conformance with no leaks or invalid transitions, including submitted cancellation and failed writes.
-2. **I2 — physical execution.** The same engine passes XLA conformance using the proven arena, metadata, and completion
-   path; overlap traces show no unintended waits, copies, or early reuse.
-3. **I3 — real model, contiguous state.** Reduced and full Gemma configurations share one implementation and satisfy
-   the declared reference tolerances; exact-token fixtures and statistical sampling tests have explicit scope.
-4. **I4 — real model, paged state.** Substitute paged execution without a scheduler fork; validate state updates and
-   numerical agreement, cancellation, profile changes, and reclamation under repeated launches.
-5. **I5 — minimal continuous Gemma engine.** Dynamic arrivals, bounded prompt chunks, decode, streaming, and device
-   sampling run on the full checkpoint with stable memory and no per-token compilation. Measure homogeneous and
-   mixed execution, lookahead enabled/disabled, GPU idle gaps, and end-to-end latency against pinned baselines.
-
-Phase exit: a usable embedded Gemma engine with an explained performance breakdown. It may trail mature engines; record
-each material gap against the budgets rather than describing correctness as competitive performance. Prefix retention,
-advanced policy, and the complete lifecycle matrix are not prerequisites for this integration gate.
+An instrumented or emulated computation qualifies for numerical validation only when it preserves the selected
+activation/weight rounding and all nonlinearities. Record emulation, storage expansion and transfers. Native
+mixed-format providers enter when they pass the same fixtures and win on the intended shapes. Capture/replay,
+prefix reuse, DSpark, a sharded trainer and production service packaging each have separate acceptance criteria.
+A BF16 dequantized pass is a diagnostic until release-format forward parity passes. M1 depends on the forward portion
+of model phase T4, including a verified emulation if needed. T2's full tuning and T4's fast backward can proceed
+independently. Run the first real generate/score/update cycle once I2 and a training checkpoint exist. It can progress alongside
+I3–I5 and the serving optimization work below.
 
 ### Phase 2 — prefix reuse, mixed scheduling, and retention
 
 Deliverables:
 
+- [ ] Compare whole decode graphs, segmented prefill graphs and uncaptured execution. Try dependent launch for
+      eligible linked kernels only. Ablate fusion and graph replay separately on low-latency and saturated workloads.
 - [ ] Add prefix publication/indexing, partial-page COW, eviction, preemption/replay, and completion-safe reclamation.
 - [ ] Evaluate grouped cascade decode attention with reusable runtime group metadata, ordinary paged fallback, and
       deadline/fairness bounds. Start with independent groups; gate hierarchy on measured benefit.
@@ -1100,13 +1125,18 @@ Deliverables:
       prefix/suffix lengths, and independent/nested roots. Charge grouping/planning costs and measure KV traffic.
       Diagnose padding, launch, kernel, and state-memory costs against the registered budgets.
 
-Phase exit: the first full Gemma workload/SLO envelope is reproducible against pinned baselines with bounded starvation,
+Phase exit: the first full Mini workload/SLO envelope is reproducible against pinned baselines with bounded starvation,
 stable memory, and attributable latency and goodput. State and request invariants remain shared across executors.
 
-### Phase 3 — early weight-update and rollout cycle
+### Phase 3 — weight updates and rollout qualification
+
+Start this work at I2 with the model plan’s first resumable update. Phase 2 retention optimizations can ship
+independently. A complete post-training qualification includes the full-checkpoint round trip below.
 
 Deliverables:
 
+- [ ] Change image bytes with identical placeholder IDs and repeat a continuation after an encoder refit. Verify
+      reconstruction from the pinned media and confirm old image features and prefix pages cannot satisfy the new key.
 - [ ] Add snapshot prepare/validate/publish/drain/reclaim, version-aware cache invalidation, and bounded old-version
       retention. Use the Phase 0 memory policy and add tensor parallelism now if required for double buffering.
 - [ ] Implement trainer-to-engine disk or colocated transfer first. Demonstrate a real synchronous generate/score/update
@@ -1119,7 +1149,7 @@ Deliverables:
 - [ ] Benchmark update cadence jointly with session retention, tool pauses, cache rebuild, and useful rollout yield.
       Include end-to-end agent latency and snapshot-to-accepted-rollout time under fixed memory/staleness budgets.
 
-Exit gate: real weight updates and Gemma rollouts repeat without process restart, stale-cache reuse, unbounded memory,
+Exit gate: real weight updates and Mini rollouts repeat without process restart, stale-cache reuse, unbounded memory,
 or unexplained probability mismatch. Demonstrate or reject the registered integration hypothesis after charging all
 update, retention, and reconstruction costs. Run this before broad decoding, portability, or service expansion.
 
@@ -1127,26 +1157,26 @@ update, retention, and reconstruction costs. Run this before broad decoding, por
 
 Deliverables:
 
-- [ ] Expand tensor-parallel Gemma performance/topology coverage; initial support has already shipped if earlier memory
+- [ ] Expand tensor-parallel Mini performance/topology coverage; initial support has already shipped if earlier memory
       or SLO gates required it. Complete multi-rank failure handling before accepting each new topology.
-- [ ] Add pipeline, context, and/or attention data parallelism only where the target envelope requires it; defer expert
-      parallelism until an MoE model is selected.
+- [ ] Compare larger batches on one worker, independent replicas, TP and EP for actual expert occupancy and fabric.
+      Add pipeline/context sharding when the memory or latency envelope warrants it.
 - [ ] Add production fork/checkpoint/rollback for best-of-N/tree rollouts and richer speculative state strategies.
 - [ ] Add sleep/offload/wake, colocated role arbitration, and collective/RDMA weight transfer where measured demand
       justifies them. Complete conformance coverage alongside each feature.
 - [ ] Add grammar compilation/masking and deterministic-span fast forwarding.
-- [ ] Add n-gram speculation, then compare compatible Gemma MTP and DFlash proposers with adaptive enablement/depth
-      or block size. Validate feature-buffer ownership, target/draft compatibility, and sampling semantics before use.
-      Evaluate confidence-aware variable verification separately where calibrated signals exist; test determinism
-      combinations and charge padding/packing costs. No DSpark-specific model integration is required for Gemma.
-- [ ] Add quantized weights/KV and adapter/LoRA registry based on measured demand.
+- [ ] Compare Mini's supplied DSpark drafter with ordinary decoding at low and high concurrency, with explicit
+      verification/rollback for KV, conv state and feature taps. Add adaptive depth only after a calibrated fixed-depth
+      baseline preserves the declared sampling distribution.
+- [ ] Expand the adapter registry and evaluate quantized KV independently of the released expert formats.
+
 - [ ] Bring up Qwen3.6 27B as the second model, including hybrid recurrent/attention state behind the existing
       `SequenceState` and scheduler contracts.
-- [ ] If an MoE model is selected, benchmark phase-specific attention-DP/EP layouts, fused expert providers, and skew.
+- [ ] Benchmark phase-specific attention-DP/EP layouts, fused expert providers, packing and skew on Mini.
       Gate redundant expert placement/rebalancing on measured benefit and coherent map/weight publication.
 - [ ] Reach CUDA/ROCm provider parity for the supported feature slice or publish explicit capability degradation.
 
-Exit gate: multi-rank failures fail coherently; Gemma performance scales predictably; Qwen requires no scheduler or
+Exit gate: multi-rank failures fail coherently; Mini performance scales predictably; Qwen requires no scheduler or
 request-lifecycle fork; advanced features improve their target traces without unacceptable default-workload regressions.
 
 ### Phase 5 — service hardening
@@ -1176,6 +1206,9 @@ Deliverables:
       account for lookup/fetch/swap-in stalls and retention economics, and test partial-tier misses and storage failures.
 - [ ] Balance decode request counts and attention work separately; size prefill/decode capacity from measured demand.
       Include spare-capacity cost and drain/migration tails in scaling and failure tests.
+- [ ] Replay identical resumptions with worker affinity, epoch-checked host-state transfer, and local reconstruction.
+      Log directory hit, full and windowed KV bytes, conv tails, network/device-copy latency, owner queue delay and
+      retry cost. A destination validates and fences the entire bundle before advertising it.
 - [ ] Multi-node rolling upgrade, drain, retry, and partition behavior.
 
 Exit gate: disaggregation beats aggregated serving on a declared workload/SLO/fabric after charging transfer and control
@@ -1203,7 +1236,7 @@ but Python weight-reload support does not establish an equivalent native refit p
 
 Evaluate incrementally, without committing to broad backend coverage:
 
-- [ ] Benchmark pinned MAX Serve on the full Gemma workload using section 18's numerical, resource, and SLO contracts.
+- [ ] Benchmark pinned MAX Serve if a release supports the full Mini workload and section 18's comparison contracts.
       Attribute results to the complete engine; do not infer compiler superiority from server-level throughput.
 - [ ] Before adopting a distributable dependency, review the exact component licenses and native API stability.
       Newly released internals use the source-available MAX License; separately licensed Apache components retain
@@ -1231,9 +1264,20 @@ expand their exit gates. No MAX performance result has been reproduced as part o
 
 ## 18. Benchmark and acceptance strategy
 
+### Reproducible Mini baseline
+
+Reproduce the launch team's SGLang test if a B300 is available, with 1,024 input and 1,024 output tokens, concurrency
+1, 4, 16 and 64, TP1 and both ordinary and DSpark decoding. Record the exact image, flags, page size, attention and
+expert backend. Re-run the same cases for Ryft and a pinned Mini-capable vLLM build on the *same* device. Keep the
+B200 M1 measurements in their own hardware row. Then add heterogeneous lengths spanning the local window, image
+prefixes, tool waits, routing skew, open-loop arrivals and dynamic policy versions. Compare selected-action scores and
+matched output quality. Include encoder and draft time and HBM. Report single-stream latency, SLO goodput and
+throughput on identical generated-token accounting. [SGLang launch commands and results](https://huggingface.co/blog/inkling2mini#speculative-decoding)
+and [vLLM Mini serving recipe](https://recipes.vllm.ai/thinkingmachines/Inkling-2-Mini)
+
 ### Primary envelope and performance hypotheses
 
-The primary serving workload is full-checkpoint Gemma 4 31B text generation for multi-turn coding agents with long
+The primary serving workload is full-checkpoint Inkling 2 Mini text generation for multi-turn coding agents with long
 prefixes, tool pauses, bursty resumptions, and concurrent new arrivals on one NVIDIA worker group. Measure fixed-version
 serving first, then the same session distribution under weight churn. Short interactive chat and low-reuse traffic are
 regression controls; saturated generation is a separate throughput surface. This choice does not imply that retention
@@ -1242,8 +1286,8 @@ or mixed execution will win before they are measured.
 Before Phase 0 exits, commit an experiment manifest containing exact hardware/device count/interconnect, checkpoint
 and tokenizer revisions, context/output-length distributions, arrival process, concurrency, pause/reuse distributions,
 sampling and quality policy, TTFT/ITL/E2E SLOs, fairness bound, and memory limits. For RL include update cadence,
-maximum policy lag, retained-version count, and trainer/transfer topology. Hardware and absolute latency values remain
-unselected in this proposal; choose and record them before implementation tuning, not after seeing favorable results.
+maximum policy lag, retained-version count, and trainer/transfer topology. Section 17 proposes a first single-worker test envelope. Record the actual hardware
+and choose absolute latency bounds from the intended service before tuning.
 
 Register and test four mechanisms independently and together:
 
@@ -1286,7 +1330,7 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
 
 ### Workload matrix
 
-- pinned full-checkpoint Gemma 4 31B text generation as the first acceptance surface;
+- pinned full-checkpoint Inkling 2 Mini text generation as the first acceptance surface;
 - short interactive chat;
 - long prompt/short answer;
 - long-context multi-turn coding agent with high prefix reuse;
@@ -1297,7 +1341,7 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
 - asynchronous multi-turn agentic RL with bounded staleness;
 - joint weight-churn/retention sweeps, including expiry, cold-prefix reconstruction, and old-version drain bursts;
 - speculative-friendly and speculation-hostile traces;
-- MoE and dense models; one multimodal trace after the text engine is stable.
+- multimodal requests within the first milestone, plus dense and recurrent models for later extensibility checks.
 
 ### Metrics
 
@@ -1326,7 +1370,7 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
   Publish quality tests, tolerances, output-length differences, and all configuration differences. Do not equate BF16
   parity with leadership over optimized production configurations or accept speedups caused by degraded outputs.
 - Reduced-shape and conformance models are correctness/development tools and never support competitive performance
-  claims; external-engine comparisons use the complete pinned Gemma 4 31B checkpoint.
+  claims; external-engine comparisons use the complete pinned Inkling 2 Mini checkpoint.
 - Warm and cold results are separate; compilation, model load, and prefix-cache warmup are reported.
 - Compare optimized supported configurations, not deliberately weak defaults.
 - Publish Pareto curves across concurrency/profile choices and all failure/unsupported cases.
@@ -1337,9 +1381,9 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
   validation. Include cold/low-reuse controls and component ablations so benchmark-specific tuning is visible.
 - Independently validate output counts; SSE chunks and server-reported usage alone are not token oracles. TTFT starts
   at request submission and ends at delivery of a real accepted output token. Count unfinished and failed work.
-- A Qwen3-4B/L4 SkySynth-shaped reproduction is optional diagnostic work, separate from Gemma acceptance. Random-token
+- A Qwen3-4B/L4 SkySynth-shaped reproduction is optional diagnostic work, separate from Mini acceptance. Random-token
   shared-prefix bursts complement held-out real agent traces; they cannot replace semantic or realistic workload tests.
-- For DFlash/MTP, compare no-speculation and optimized baselines across concurrency and block sizes under the same
+- For Mini DSpark, compare no-speculation and optimized baselines across concurrency and block sizes under the same
   total device-memory budget. Measure streaming stalls and SLO goodput, not only acceptance or average tokens/user.
 - Separate directly counted accepted-token throughput from capacity estimates derived from step rate and assumed
   acceptance. DeepInfer's pinned sweep/plot path applies a supplied acceptance factor; its benchmark filters expert
@@ -1370,67 +1414,35 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
 | BF16-only comparisons overstate competitiveness | Good reference parity but weak production economics | Controlled numerical and best quality-constrained comparison tracks with registered targets. |
 | P/D transfer costs exceed benefit | Worse latency and utilization | Workload/topology simulator; aggregated default; evidence-gated disaggregation. |
 | Broad compatibility delays a useful engine | Never reaches competitive quality | Narrow beachhead and explicit capability matrix; expand only after milestone gates. |
-| Conformance model creates unrealistic shortcuts | Gemma integration forces a scheduler or state rewrite | Same executor/profile/state contracts, a real-XLA conformance path, prohibited type checks/special cases, and ordered substitution gates. |
+| Conformance model creates unrealistic shortcuts | Mini integration forces a scheduler or state rewrite | Same executor/profile/state contracts, a real-XLA conformance path, prohibited type checks/special cases, and ordered substitution gates. |
 | Rust creates false confidence | Safe host code but slow kernels/poor scheduling | Measure GPU, memory, launch, network, and queue behavior independently; compare Pareto frontiers. |
 | External ecosystem moves faster | Permanent feature catch-up | Stable semantic provider APIs; reuse external kernels/protocol adapters; focus Ryft differentiation. |
 
-## 20. Feasibility assessment
+## 20. Feasibility and sequencing
 
-### Why optimism is justified
+The shortest path to a useful engine runs through the full checkpoint, one aggregated worker, and one model shared
+with the trainer. I2 exercises the renderer, quantization, loop schedule and incremental state on real tokens. I5
+establishes the first operating envelope with streaming, cancellation and a measured memory budget. Correctness here
+is valuable even before the optimized profiles reach competitive throughput.
 
-Ryft does not start where most inference-engine projects start. It already has a coherent typed program model,
-structured parameters, transformations, symbolic dimensions, sharding, broad inference primitives, async PJRT,
-buffer interop, explicit aliasing, persistent/distributed executable caches, custom FFI kernels, collectives, profiling,
-and adaptive recompilation. The repository's tiny decode loop proves that model state, sampling, and a foreign attention
-kernel can already be expressed through the public stack.
-
-Rust is especially valuable for the part that remains: scheduler concurrency, page ownership, state transitions,
-cancellation, versioning, transfer leases, low-overhead embedding, and operational reliability. Ryft's common compiler
-and parameter architecture creates a real opportunity to eliminate the duplicated model/sharding/weight semantics that
-RL systems currently bridge between trainers and separate Python inference engines.
-
-That opportunity requires one architecture implementation with context-selected attention/state semantics and explicit
-numerical tests across training, scoring, and serving. SGLang-JAX already combines JIT execution, specialized kernels,
-and serving; compiler-backed execution itself is not unique. Ryft must demonstrate the benefit of its shared semantics
-and resource protocol through the registered serving and rollout experiments.
-
-### Why expectations must remain disciplined
-
-The missing work is precisely the moat of mature inference systems: model import and coverage, paged state, highly tuned
-attention/GEMM/MoE/sampling kernels, continuous scheduling, quantization, speculative/structured decoding, distributed
-transfer, service APIs, failure handling, and years of workload tuning. XLA's static buffer planning is helpful for model
-activations and graph replay, but it does not solve a shared dynamically growing cache. Rust cannot improve GPU memory
-bandwidth, Tensor Core utilization, collective overlap, or prefix hit rate by itself. Dynamo already uses Rust in its
-distributed runtime, and TokenSpeed uses C++ in its scheduler; the language is an implementation advantage, not a moat.
-
-### Realistic target
-
-The right ambition is:
-
-1. match a mature engine on the pinned Gemma 4 31B checkpoint/hardware/feature/SLO slice;
-2. demonstrate a registered, attributable win on that beachhead through overlapped execution, state-aware agent serving,
-   or shared-model rollout integration; measure frequent updates and prefix retention jointly rather than assuming
-   their benefits add together;
-3. preserve architectural coherence while adding models, kernels, platforms, and deployment modes;
-4. add Qwen3.6 27B without forking scheduler or lifecycle semantics, validating hybrid persistent state;
-5. claim broader superiority only as the benchmark matrix earns it.
-
-On that definition, building something **much better** is realistic. Building something immediately and universally
-faster, more complete, and more production-proven is not.
+The highest-risk performance questions are whether the executor preserves page-pool aliases and overlaps independent
+work, whether specialized attention and grouped experts improve a complete step, and whether policy publication plus
+prefix reconstruction leaves enough time and memory for useful rollouts. Measure each against a controlled fallback.
+For production compare same-model SLO goodput on matched hardware. For post-training compare time to accepted
+rollouts at fixed policy lag and quality. Bring up a second architecture after these contracts survive Mini.
 
 ## 21. Decisions to validate early
 
-- [x] Select Gemma 4 31B dense instruction as the first production-model target and Qwen3.6 27B as the second-model
-      extensibility test.
+- [x] Select the fixed-loop Inkling 2 Mini checkpoint for M1. Retain Qwen3.6 27B as a later hybrid-state test.
 - [x] Use pure-Rust and real-XLA conformance executors to unblock engine work while preserving production contracts.
 - [ ] Prove the physical state/provider/graph/overlap mechanism before stabilizing executor and state interfaces.
 - [ ] Validate append-only, sliding-window, and overwritten recurrent state, including checkpoint/replay costs and
       coherent hybrid-prefix boundaries, in the initial conformance slice.
-- [ ] Pin the exact Gemma checkpoint revision, tokenizer/template revision, NVIDIA hardware topology, BF16 context/batch
-      envelope, complete peak memory budget, and serving/RL traces. Decide when tensor parallelism is required.
+- [ ] Freeze the model plan’s pinned Mini artifact, renderer and reference versions in the benchmark manifest,
+      together with device topology, numerical mode, memory limits and serving/RL traces. Measure when TP is required.
 - [ ] Ratify quantitative leadership/competitive targets, control-trace guardrails, quality tolerances, and cost budgets
       before tuning; record baseline uncertainty and controlled versus production comparison configurations.
-- [ ] Specify the reduced-shape Gemma 4 31B-derived configuration and parity fixtures.
+- [ ] Generate Mini fixtures that preserve the fixed visit schedule, routing, two expert formats and image path.
 - [ ] Decide whether the first paged-attention provider wraps FlashInfer/vendor code or is Ryft-native.
 - [ ] Validate that XLA preserves the required state-pool aliases without hidden copy protection.
 - [ ] Validate disjoint-page access with outstanding launches, immutable metadata slots, device token feedback, mixed
@@ -1447,11 +1459,12 @@ faster, more complete, and more production-proven is not.
 
 ## 22. Primary sources
 
-### Beachhead models
+### First milestone and subsequent models
 
-- [Gemma 4 overview](https://deepmind.google/models/gemma/gemma-4/)
-- [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4)
-- [Google DeepMind Gemma JAX reference](https://github.com/google-deepmind/gemma)
+- [Thinking Machines Lab’s Inkling 2 Mini release](https://thinkingmachines.ai/news/inkling-2-mini/)
+- [Pinned model configuration and artifacts](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7)
+- [Model inventory, training kernels and acceptance fixtures](plan-inkling-2-mini.md)
+
 - [Qwen3.6 27B model card](https://huggingface.co/Qwen/Qwen3.6-27B)
 - [Qwen3.5/3.6 hybrid architecture documentation](https://huggingface.co/docs/transformers/model_doc/qwen3_5)
 
