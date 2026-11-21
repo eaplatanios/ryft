@@ -104,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     Program Multiple Data (SPMD) computations and `auto_axes` and `explicit_axes` for switching the types of mesh
     axes within a function. `Place` moves a value to a `Placement`, possibly on the devices of another mesh, and values
     report where they concretely live via `Placed`, so that reverse mode differentiation moves cotangents back to where
-    their primals came from.
+    their primals came from. `Place::place(sources, targets)` accepts `None` to infer every source, `Some(&sources)`
+    for a fully explicit source tree, or a borrowed tree of optional placements to infer individual leaves.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
     are created via `composite` and support custom JVP, VJP, and batching rules. Composites can also be named (i.e.,

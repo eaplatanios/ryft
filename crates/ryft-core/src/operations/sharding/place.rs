@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
-    ArrayType, Dimension, MeshAxisType, Placement, Sharding, ShardingDimension, ShardingError,
+    ArrayType, Dimension, MeshAxisType, Placement, Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
@@ -447,9 +447,19 @@ where
                 });
             }
 
-            let batched = |placement: &Placement, batch_sharding: ShardingDimension| {
+            let batched = |placement: &Placement, batch_sharding: ShardingDimension| -> Result<_, BatchingError> {
                 let sharding = placement.sharding().batched(batch_axis, batch_sharding)?;
-                Ok::<_, BatchingError>(placement_with_sharding(placement, sharding).map_err(TypeError::from)?)
+                let mut result = Placement::new(placement.mesh().clone(), sharding).map_err(TypeError::from)?;
+                if let Some(memory) = placement.memory() {
+                    result = result.with_memory(memory);
+                }
+                if let Some(layout) = placement.layout() {
+                    result = result.with_layout(layout.clone());
+                }
+                for enclosing in placement.batch_shardings() {
+                    result = result.with_batch_sharding(enclosing.clone()).map_err(TypeError::from)?;
+                }
+                Ok(result)
             };
 
             if let Some(placement) = &target {
@@ -535,8 +545,11 @@ impl_differentiable_operation! {
             let input_type = inputs[0].r#type();
             let input_cotangent_type = input_type.cotangent()?;
             let cotangent_placement = |placement: &Placement| -> Result<Placement, TypeError> {
-                let result = Placement::new(placement.mesh().clone(), placement.sharding().cotangent()?)?;
-                Ok(placement_with_batch_shardings(result, placement.batch_shardings())?)
+                let mut result = Placement::new(placement.mesh().clone(), placement.sharding().cotangent()?)?;
+                for enclosing in placement.batch_shardings() {
+                    result = result.with_batch_sharding(enclosing.clone())?;
+                }
+                Ok(result)
             };
 
             let transposed = match (operation.source(), operation.target()) {
@@ -569,9 +582,10 @@ impl_differentiable_operation! {
                         }
                         None => target.sharding().cotangent().map_err(TypeError::from)?,
                     };
-                    let placement = Placement::new(target.mesh().clone(), sharding)
-                        .and_then(|placement| placement_with_batch_shardings(placement, target.batch_shardings()))
-                        .map_err(TypeError::from)?;
+                    let mut placement = Placement::new(target.mesh().clone(), sharding).map_err(TypeError::from)?;
+                    for enclosing in target.batch_shardings() {
+                        placement = placement.with_batch_sharding(enclosing.clone()).map_err(TypeError::from)?;
+                    }
                     PlaceOperation::new(None, placement.with_memory(input_type.memory()))
                 }
                 (Some(source), None) => {
@@ -977,8 +991,6 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the placement of the batch items of a packed value that lives on `placement` and whose batch dimension is
 /// at position `batch_axis`, or [`None`] if the sharding of `placement` has no such dimension. The batch dimension is
 /// removed from the sharding, because its placement describes how the batch is distributed rather than how each batch
@@ -1003,23 +1015,10 @@ fn unbatched_placement(placement: Placement, batch_axis: Option<usize>) -> Optio
     if let Some(memory) = placement.memory() {
         result = result.with_memory(memory);
     }
-    placement_with_batch_shardings(result, placement.batch_shardings())
-        .ok()?
-        .with_batch_sharding(batch_sharding)
-        .ok()
-}
-
-/// Returns `placement` with its sharding replaced by `sharding`, keeping its mesh, memory, layout, and recorded batch
-/// shardings.
-fn placement_with_sharding(placement: &Placement, sharding: Sharding) -> Result<Placement, ShardingError> {
-    let mut result = Placement::new(placement.mesh().clone(), sharding)?;
-    if let Some(memory) = placement.memory() {
-        result = result.with_memory(memory);
+    for enclosing in placement.batch_shardings() {
+        result = result.with_batch_sharding(enclosing.clone()).ok()?;
     }
-    if let Some(layout) = placement.layout() {
-        result = result.with_layout(layout.clone());
-    }
-    placement_with_batch_shardings(result, placement.batch_shardings())
+    result.with_batch_sharding(batch_sharding).ok()
 }
 
 /// Returns `placement` without its layout, keeping its mesh, sharding, memory, and recorded batch shardings.
@@ -1030,18 +1029,10 @@ fn placement_without_layout(placement: &Placement) -> Placement {
     }
 
     // The batch shardings were recorded over the same sharding, so recording them again cannot fail.
-    placement_with_batch_shardings(result, placement.batch_shardings()).unwrap()
-}
-
-/// Returns `placement` with `batch_shardings` recorded after the batch shardings that it already records, from the
-/// outermost to the innermost one (refer to [`Placement::with_batch_sharding`]).
-fn placement_with_batch_shardings(
-    placement: Placement,
-    batch_shardings: &[ShardingDimension],
-) -> Result<Placement, ShardingError> {
-    batch_shardings
-        .iter()
-        .try_fold(placement, |placement, batch_sharding| placement.with_batch_sharding(batch_sharding.clone()))
+    for enclosing in placement.batch_shardings() {
+        result = result.with_batch_sharding(enclosing.clone()).unwrap();
+    }
+    result
 }
 
 #[cfg(test)]

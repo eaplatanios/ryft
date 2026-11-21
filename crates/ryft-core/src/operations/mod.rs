@@ -190,8 +190,8 @@ pub use rounding::{
 pub use sharding::{
     AxisTypesError, CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch,
     ConstrainShardingOperation, LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue,
-    PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, RESHARD_OPERATION_NAME, Reshard,
-    ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapError,
+    PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, PlacementSources, RESHARD_OPERATION_NAME,
+    Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapError,
     ShardMapOperation, ShardMapOptions, ShardMapValueKind, ShardingOperations, auto_axes, explicit_axes, shard_map,
     shard_map_along, shard_map_with_inferred_input_shardings,
 };

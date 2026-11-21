@@ -4,7 +4,10 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use ryft_macros::Parameter;
+
 use crate::arrays::sharding::ShardingError;
+use crate::parameters::Parameter;
 
 /// [`MeshAxis`] type which controls sharding constraint propagation. Each axis in a [`LogicalMesh`] can be tagged with
 /// a [`MeshAxisType`] that tells the compiler (e.g., Shardy or [GSPMD](https://arxiv.org/abs/2105.04663)) how to treat
@@ -296,7 +299,7 @@ pub type ProcessIndex = usize;
 
 /// Device that belongs to a mesh topology. This type separates global device identity that is described by a
 /// [`DeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Device {
     /// Globally (i.e., across all hosts/processes) unique [`DeviceId`].
     id: DeviceId,
