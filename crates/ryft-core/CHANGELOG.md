@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added `Parameterized::try_map_parameters`, `Parameterized::try_map_named_parameters`, and
-  `Parameterized::broadcast_to_parameter_structure`.
+- Added `Parameterized::try_map_parameters`, `Parameterized::try_map_named_parameters`,
+  `Parameterized::broadcast_to_parameter_structure`, and `Parameterized::node_paths` (i.e., the paths of all nodes of
+  a tree, which `Parameterized::from_broadcasted_named_parameters` now also takes for the prefix tree, so that it
+  matches the nodes of both trees by path, including the containers without leaves).
 - Added a backend-neutral, typed program representation (i.e., an intermediate representation or IR) in
   `ryft_core::programs`:
   - `Program`s are immutable graphs of `Instruction`s over typed `Atom`s, organized into sealed `Region`s that model
@@ -105,7 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     axes within a function. `Place` moves a value to a `Placement`, possibly on the devices of another mesh, and values
     report where they concretely live via `Placed`, so that reverse mode differentiation moves cotangents back to where
     their primals came from. `Place::place(targets, sources)` accepts `None` to infer every source, `Some(&sources)`
-    for a fully explicit source tree, or a borrowed tree of optional placements to infer individual leaves.
+    for a fully explicit source tree, or a borrowed tree of optional placements to infer individual leaves. A
+    `PlaceOperation` can also target a single device (i.e., a `PlaceTarget::Device`), which keeps the tracked sharding
+    of its input and which backends resolve against the value or the device mesh of a compiled program, so that a
+    value whose devices are not known while it is traced can still be placed on a device.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
     are created via `composite` and support custom JVP, VJP, and batching rules. Composites can also be named (i.e.,
