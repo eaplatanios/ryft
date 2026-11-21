@@ -1082,14 +1082,19 @@ impl Context for Session {
         // cache key, and the mesh that `Self::device_mesh_for` selects, sees the inputs after the move.
         let moved_array_inputs = self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())?;
         let moved_inputs = if let Some(moved_array_inputs) = moved_array_inputs {
-            // `array_inputs` contains exactly the array slots of `inputs`, in order. Placement preserves that
-            // order, so each replacement goes back into its original slot.
+            // Placement returns one replacement for each array in `inputs`, in order. Splitting at those slots
+            // gives one run of non-array inputs before each replacement and one trailing run.
             check_count!("input", moved_array_inputs, array_inputs.len(), ProgramError);
-            let mut moved_inputs = inputs.to_vec();
-            let array_slots = moved_inputs.iter_mut().filter(|input| matches!(input, Value::Array(_)));
-            for (slot, array) in array_slots.zip(&moved_array_inputs) {
-                *slot = Value::Array(array.clone());
+
+            let mut moved_inputs = Vec::with_capacity(inputs.len());
+            let mut non_array_inputs = inputs.split(|input| matches!(input, Value::Array(_)));
+            for (preceding_inputs, array) in
+                non_array_inputs.by_ref().take(moved_array_inputs.len()).zip(&moved_array_inputs)
+            {
+                moved_inputs.extend_from_slice(preceding_inputs);
+                moved_inputs.push(Value::Array(array.clone()));
             }
+            moved_inputs.extend(non_array_inputs.flatten().cloned());
             array_inputs = moved_array_inputs;
             Some(moved_inputs)
         } else {
@@ -2988,18 +2993,18 @@ pub(crate) mod tests {
 
         // The array moves to the device of the target mesh, and its type is the one that type inference returns.
         let target = Placement::new(second_mesh.clone(), replicated.clone()).unwrap();
-        let moved = input.place(&target, None).unwrap();
+        let moved = input.place(None, &target).unwrap();
         assert_eq!(moved.mesh(), &second_mesh);
         assert_eq!(moved.sharding(), &replicated);
         assert_eq!(
             vec![moved.r#type().into_owned()],
-            output_type(PlaceOperation::new(target.clone(), Some(source.clone()))).unwrap(),
+            output_type(PlaceOperation::new(Some(source.clone()), target.clone())).unwrap(),
         );
         assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
 
         // A target memory is recorded in the type of the result and selects the memory of its buffers.
         let memory = Memory::Host { pinned: true };
-        let pinned = input.place(&target.clone().with_memory(memory), None).unwrap();
+        let pinned = input.place(None, &target.clone().with_memory(memory)).unwrap();
         assert_eq!(pinned.r#type().memory(), memory);
         assert_eq!(pinned.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
         assert_eq!(pinned.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
@@ -3007,7 +3012,7 @@ pub(crate) mod tests {
         // A target over both devices replicates the array on them.
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
-        let replicated = input.place(&target, None).unwrap();
+        let replicated = input.place(None, &target).unwrap();
         assert_eq!(replicated.mesh(), &mesh);
         assert_eq!(read_first_shard::<f32>(client, &replicated), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(replicated.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
@@ -3017,8 +3022,8 @@ pub(crate) mod tests {
 
         // The array is moved from where it actually lives, whatever devices the source names.
         let other_source = Placement::new(second_mesh.clone(), source.sharding().clone()).unwrap();
-        assert_eq!(input.place(&target, Some(&other_source)).unwrap().mesh(), &mesh);
-        assert_eq!(input.place(&target, Some(&source)).unwrap().mesh(), &mesh);
+        assert_eq!(input.place(Some(&other_source), &target).unwrap().mesh(), &mesh);
+        assert_eq!(input.place(Some(&source), &target).unwrap().mesh(), &mesh);
 
         // A layout that the target omits is kept, also when the shards themselves change.
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
@@ -3033,12 +3038,12 @@ pub(crate) mod tests {
         .unwrap();
         let target =
             Placement::new(first_mesh.clone(), Sharding::replicated(first_mesh.logical_mesh().clone(), 1)).unwrap();
-        let gathered = sharded.place(&target, None).unwrap();
+        let gathered = sharded.place(None, &target).unwrap();
         assert_eq!(gathered.mesh(), &first_mesh);
         assert_eq!(gathered.layout(), Some(&layout));
         assert_eq!(
             vec![gathered.r#type().into_owned()],
-            PlaceOperation::new(target, Some(Placement::new(mesh, sharding).unwrap().with_layout(layout)))
+            PlaceOperation::new(Some(Placement::new(mesh, sharding).unwrap().with_layout(layout)), target)
                 .infer_output_types(&[sharded.r#type().into_owned()], &[])
                 .unwrap(),
         );
@@ -3059,16 +3064,14 @@ pub(crate) mod tests {
         assert!(!input.is_committed());
 
         // A placement with a target commits its result, even one that leaves the array where it is.
-        assert!(place(PlaceOperation::new(target.clone(), None), &input).is_committed());
-        assert!(place(PlaceOperation::new(target, None).with_may_alias(false), &input).is_committed());
+        assert!(place(PlaceOperation::new(None, target.clone()), &input).is_committed());
+        assert!(place(PlaceOperation::new(None, target).with_may_alias(false), &input).is_committed());
 
         // A placement without a target keeps the commitment of its input, also when it copies the input.
-        assert!(!place(PlaceOperation::new(Option::<Placement>::None, None), &input).is_committed());
-        assert!(
-            !place(PlaceOperation::new(Option::<Placement>::None, None).with_may_alias(false), &input).is_committed()
-        );
+        assert!(!place(PlaceOperation::new(None, None), &input).is_committed());
+        assert!(!place(PlaceOperation::new(None, None).with_may_alias(false), &input).is_committed());
         let committed = input.with_committed(true);
-        assert!(place(PlaceOperation::new(Option::<Placement>::None, None), &committed).is_committed());
+        assert!(place(PlaceOperation::new(None, None), &committed).is_committed());
     }
 
     #[test]
@@ -3080,7 +3083,7 @@ pub(crate) mod tests {
         let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![mesh.devices()[0]]).unwrap();
         let input = f32_vector(&session, &first_mesh, &[1.0, 2.0, 3.0, 4.0]);
         let place = |target: &Placement, may_alias: bool| {
-            <Array as CoreValue>::Dispatch::place(&input, Some(target), None, may_alias).unwrap()
+            <Array as CoreValue>::Dispatch::place(&input, None, Some(target), may_alias).unwrap()
         };
         let shares_input_buffer = |array: &Array| {
             array
@@ -3123,7 +3126,7 @@ pub(crate) mod tests {
         let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
         let input = f32_vector(&other_session, &other_mesh, &[1.0, 2.0]);
         assert_eq!(
-            session.bind(PlaceOperation::new(target, None), Vec::new(), &[Value::Array(input)]),
+            session.bind(PlaceOperation::new(None, target), Vec::new(), &[Value::Array(input)]),
             Err(ProgramError::InvalidArgument {
                 message: "received incompatible devices for eager XLA execution: input #0 is owned by a different \
                           PJRT client than this session's client"
