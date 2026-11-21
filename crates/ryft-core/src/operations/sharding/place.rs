@@ -983,8 +983,7 @@ fn place_with_inferred_source<V: Value<Dispatch: PlaceDispatch<V::Type, V>> + Pl
     target: Option<&Placement>,
     may_alias: bool,
 ) -> Result<V, ProgramError> {
-    let source = source.cloned().or_else(|| input.placement());
-    V::Dispatch::place(input, source, target, may_alias)
+    V::Dispatch::place(input, source.cloned().or_else(|| input.placement()), target, may_alias)
 }
 
 /// Returns the placement of the batch items of a packed value that lives on `placement` and whose batch dimension is
