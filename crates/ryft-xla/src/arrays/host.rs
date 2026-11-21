@@ -1057,8 +1057,6 @@ impl HostShardBytes {
     }
 }
 
-// TODO(eaplatanios): Review from here.
-
 /// Dense row-major bytes of the addressable shards of a host upload, which [`Array::from_host_buffer_in_background`]
 /// prepares from one host buffer once that buffer is available. A shard that is contiguous in the host buffer is a
 /// window of it, so it shares the allocation of the host buffer without a copy (e.g., every replica of a fully
@@ -1086,8 +1084,8 @@ impl PreparedHostShards {
     }
 
     /// Returns the dense row-major bytes of the shard at `index` within the host buffer `host_bytes`, which must be
-    /// the same buffer in every call. They share the allocation of `host_bytes` when the shard is contiguous in it, and
-    /// otherwise the allocation prepared for the first shard with the same dimensions and bytes.
+    /// the same buffer in every call. They share the allocation of `host_bytes` when the shard is contiguous in it,
+    /// and otherwise the allocation prepared for the first shard with the same dimensions and bytes.
     fn bytes(&mut self, host_bytes: &Arc<Vec<u8>>, index: usize) -> SharedHostBytes {
         let (dimensions, bytes) = &self.shards[index];
         if let HostShardBytes::Window { window, byte_strides: None } = bytes {
@@ -1098,13 +1096,18 @@ impl PreparedHostShards {
             Some(prepared) if self.shards[other] == self.shards[index] => Some(prepared.clone()),
             _ => None,
         });
+
         let shared = shared.unwrap_or_else(|| {
             SharedHostBytes::from(bytes.to_dense_bytes(host_bytes, dimensions, self.element_size_in_bytes))
         });
+
         self.prepared[index] = Some(shared.clone());
+
         shared
     }
 }
+
+// TODO(eaplatanios): Review from here.
 
 /// Contiguous window of a host allocation that several host to device transfers can share (refer to
 /// [`HostToDeviceTransferManager::transfer_literal`], which retains its own handle of the data until PJRT has read it).
@@ -1856,27 +1859,34 @@ mod tests {
             assert_eq!(array.copy_to_host_bytes().unwrap(), negative_zero);
         }
 
-        // Every encoding of `F8E8M0FNU` is a nonzero number, and Boolean values cannot be added, so neither can be
-        // split into summands.
-        for data_type in [DataType::F8E8M0FNU, DataType::Boolean] {
-            let message = format!(
-                "type `{data_type}` has no additive identity to split a host value into summands along unreduced axes",
-            );
-            let blocking = upload(data_type, vec![0]).map(|_| ());
-            let background = upload_in_background(data_type, vec![0]).map(|_| ());
-            for result in [blocking, background] {
-                assert!(matches!(
-                    &result,
-                    Err(Error::Array(error))
-                        if matches!(error.as_ref(), ArrayError::MissingUnreducedSumIdentity { data_type: actual }
-                            if *actual == data_type),
-                ));
-                assert_eq!(result.unwrap_err().to_string(), message);
-            }
+        // Boolean summands combine with logical or, so the summands that do not hold the host value hold `false`.
+        for array in [
+            upload(DataType::Boolean, vec![1]).unwrap(),
+            upload_in_background(DataType::Boolean, vec![1]).unwrap().unwrap(),
+        ] {
+            assert_eq!(device_bits(&array), vec![vec![1], vec![0]]);
+            assert_eq!(array.copy_to_host_bytes().unwrap(), vec![1]);
+        }
+
+        // Every encoding of `F8E8M0FNU` is a nonzero number, so it cannot be split into summands.
+        let data_type = DataType::F8E8M0FNU;
+        let message = format!(
+            "type `{data_type}` has no additive identity to split a host value into summands along unreduced axes"
+        );
+        let blocking = upload(data_type, vec![0]).map(|_| ());
+        let background = upload_in_background(data_type, vec![0]).map(|_| ());
+        for result in [blocking, background] {
+            assert!(matches!(
+                &result,
+                Err(Error::Array(error))
+                    if matches!(error.as_ref(), ArrayError::MissingUnreducedSumIdentity { data_type: actual }
+                        if *actual == data_type),
+            ));
+            assert_eq!(result.unwrap_err().to_string(), message);
         }
 
         // No identity is written when the unreduced axis has size one or when every shard is empty, so such placements
-        // of those types succeed.
+        // of that type succeed.
         let singleton_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![mesh.devices()[0]],
@@ -1885,29 +1895,27 @@ mod tests {
         let singleton =
             Sharding::replicated(singleton_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let empty = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        for (data_type, bytes) in [(DataType::F8E8M0FNU, vec![0x7f, 0x80]), (DataType::Boolean, vec![1, 0])] {
-            let cases = [
-                (ArrayType::new_static(data_type, [2]), singleton_mesh.clone(), singleton.clone(), bytes.clone()),
-                (ArrayType::new_static(data_type, [0]), mesh.clone(), empty.clone(), Vec::new()),
-            ];
-            for (r#type, mesh, sharding, bytes) in cases {
-                let expected_shards = vec![bytes.clone(); mesh.devices().len()];
-                let blocking =
-                    Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), Some(sharding.clone()), &bytes);
-                let readback = bytes.clone();
-                let background = Array::from_host_buffer_in_background(
-                    &session,
-                    r#type,
-                    mesh,
-                    sharding,
-                    ExecutionFence::new(Vec::new()),
-                    move || Ok(readback),
-                    |error| PjrtError::internal(error.to_string()),
-                );
-                for array in [blocking.unwrap(), background.unwrap().unwrap()] {
-                    assert_eq!(device_bits(&array), expected_shards);
-                    assert_eq!(array.copy_to_host_bytes().unwrap(), bytes);
-                }
+        let cases = [
+            (ArrayType::new_static(data_type, [2]), singleton_mesh.clone(), singleton, vec![0x7f, 0x80]),
+            (ArrayType::new_static(data_type, [0]), mesh.clone(), empty, Vec::new()),
+        ];
+        for (r#type, mesh, sharding, bytes) in cases {
+            let expected_shards = vec![bytes.clone(); mesh.devices().len()];
+            let blocking =
+                Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), Some(sharding.clone()), &bytes);
+            let readback = bytes.clone();
+            let background = Array::from_host_buffer_in_background(
+                &session,
+                r#type,
+                mesh,
+                sharding,
+                ExecutionFence::new(Vec::new()),
+                move || Ok(readback),
+                |error| PjrtError::internal(error.to_string()),
+            );
+            for array in [blocking.unwrap(), background.unwrap().unwrap()] {
+                assert_eq!(device_bits(&array), expected_shards);
+                assert_eq!(array.copy_to_host_bytes().unwrap(), bytes);
             }
         }
         session.synchronize().unwrap();
@@ -2304,12 +2312,17 @@ mod tests {
         for (manager, values) in managers.iter().zip([[0f32, 1.], [2., 3.]]) {
             manager.transfer_data(0, Arc::new(values_to_bytes(&values)), 0, true).unwrap().r#await().unwrap();
         }
+
+        // Wait for the end of the chain with a deadline, so that a chain that stalls fails instead of hanging.
+        let (sender, receiver) = mpsc::channel();
+        let chain_session = session.clone();
+        thread::spawn(move || {
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            chain_session.synchronize().unwrap();
+            sender.send(values).unwrap();
+        });
         let offset = chain_length as f32;
-        assert_eq!(
-            array.copy_to_host().unwrap().elements::<f32>().unwrap(),
-            vec![offset, 1. + offset, 2. + offset, 3. + offset],
-        );
-        session.synchronize().unwrap();
+        assert_eq!(receiver.recv_timeout(WAIT_TIMEOUT), Ok(vec![offset, 1. + offset, 2. + offset, 3. + offset]));
     }
 
     #[test]
@@ -2955,6 +2968,24 @@ mod tests {
             assert_eq!(bytes.range, 0..32);
         }
 
+        // A column tile of a single row is contiguous in the host bytes even though it does not span its trailing
+        // dimension, so it is a window of them as well.
+        let row_columns = prepare(
+            ArrayType::new_static(DataType::F32, [1, 8]),
+            Sharding::new(
+                mesh.logical_mesh().clone(),
+                vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+            )
+            .unwrap(),
+        );
+        for bytes in &row_columns {
+            assert!(Arc::ptr_eq(&bytes.bytes, &host_bytes));
+        }
+        assert_eq!(
+            row_columns.iter().map(|bytes| bytes.range.clone()).collect::<Vec<_>>(),
+            [0..16, 16..32, 0..16, 16..32]
+        );
+
         // The replicas of a strided column tile share one gathered copy, and the tiles that differ have their own.
         let columns = prepare(
             ArrayType::new_static(DataType::F32, [2, 4]),
@@ -3136,6 +3167,32 @@ mod tests {
         assert_eq!(owned_receiver.recv_timeout(WAIT_TIMEOUT), Ok(()));
         assert_eq!(owned_receiver.recv_timeout(WAIT_TIMEOUT), Err(RecvTimeoutError::Disconnected));
         assert_eq!(threads.recv_timeout(WAIT_TIMEOUT), Ok(worker));
+    }
+
+    #[test]
+    fn test_host_upload_workers_submit_panicking_job_with_panicking_payload() {
+        // Panic payload whose destructor panics as well.
+        struct PanickingPayload;
+
+        impl Drop for PanickingPayload {
+            fn drop(&mut self) {
+                panic!("host upload panic payload failed");
+            }
+        }
+
+        let workers = HostUploadWorkers::new(NonZeroUsize::new(1).unwrap());
+        let (sender, receiver) = mpsc::channel();
+        workers.submit(ExecutionFence::new(Vec::new()), || std::panic::panic_any(PanickingPayload)).unwrap();
+        workers.submit(ExecutionFence::new(Vec::new()), move || sender.send(()).unwrap()).unwrap();
+
+        // The panic of the payload destructor neither stops the only worker nor skips the bookkeeping of the job.
+        assert_eq!(receiver.recv_timeout(WAIT_TIMEOUT), Ok(()));
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        while workers.state.lock().accepted_job_count > 0 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(workers.state.lock().worker_count, 1);
     }
 
     #[test]
