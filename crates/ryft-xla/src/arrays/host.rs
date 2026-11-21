@@ -1170,12 +1170,10 @@ impl AsRef<[u8]> for HostBufferSlice {
     }
 }
 
-// TODO(eaplatanios): Review from here.
-
 /// Destination buffer of an upload from host memory whose bytes become available only after the buffer has been
 /// handed out, together with the PJRT [`HostToDeviceTransferManager`] that fills it. The manager is created for the
-/// memory of one device, so an upload to several devices needs several managers. It borrows the `'static` client of a
-/// [`Session`], so the upload job can move the manager to a background worker.
+/// memory of one device, so an upload to several devices needs several managers. It borrows the `'static` client of
+/// a [`Session`], so the upload job can move the manager to a background worker.
 pub(super) struct PendingHostUpload {
     /// Transfer manager that created the destination buffer, at index zero, and fills it.
     manager: HostToDeviceTransferManager<'static>,
@@ -1192,8 +1190,8 @@ impl PendingHostUpload {
     /// not yet defined. With [`None`] for `layout`, the PJRT plugin chooses the default device layout of the buffer
     /// when it creates the manager, so this function does not need the plugin to report that layout.
     ///
-    /// Returns [`None`] when the PJRT plugin does not implement transfer managers, or when its transfer managers do not
-    /// support [literal transfers](HostToDeviceTransferManager::transfer_literal), which [`run_host_uploads`] uses
+    /// Returns [`None`] when the PJRT plugin does not implement transfer managers, or when its transfer managers do
+    /// not support [literal transfers](HostToDeviceTransferManager::transfer_literal), which [`run_host_uploads`] uses
     /// to convert the dense row-major host bytes to the layout of the buffer. Both are checked before the buffer is
     /// retrieved from the manager, so that no caller can hand out a buffer that could never receive its bytes. The
     /// caller can then upload the bytes once they are available instead (e.g., with [`Client::buffer`]).
@@ -1222,36 +1220,39 @@ impl PendingHostUpload {
                 memory,
             ),
         };
+
         let manager = match manager {
             Ok(manager) => manager,
             Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
 
-        // Dropping a manager whose buffer was never retrieved releases that buffer, so declining here leaves nothing
-        // behind.
+        // Dropping a manager whose buffer was never retrieved releases that buffer,
+        // so declining here leaves nothing behind.
         if !manager.supports_transfer_literal() {
             return Ok(None);
         }
+
         let buffer = manager.retrieve_buffer(0)?;
+
         Ok(Some((Self { manager, buffer_type, dimensions }, buffer)))
     }
 }
 
 /// Bounded set of named background threads (i.e., workers) that run the jobs of host uploads whose destination buffers
-/// have already been handed out (refer to [`run_host_uploads`]). Every [`Session`] owns one, which all handles of
-/// that session share like its other resources, so the threads that pending host uploads occupy are bounded per
-/// session instead of growing with the number of uploads whose producers have stalled.
+/// have already been handed out (refer to [`run_host_uploads`]). Every [`Session`] owns one, which all handles of that
+/// session share like its other resources, so the threads that pending host uploads occupy are bounded per session
+/// instead of growing with the number of uploads whose producers have stalled.
 ///
 /// # Jobs
 ///
-/// Each job comes with an [`ExecutionFence`] of its sources (i.e., of everything that it waits for, such as the
-/// arrays that it reads back). [`Self::submit`] accepts the job right away, but the job is parked outside the workers
-/// until that fence is ready, and only then does it join the queue that the workers take jobs from, even when the
-/// fence reports an error, which the job itself then reports (e.g., as the error of its readback). The readiness
-/// callback that queues the job may run on a PJRT thread, so it only moves the job into the queue and wakes a worker.
-/// When PJRT cannot register a callback for the events of a fence, [`ExecutionFence`] waits for those events on the
-/// thread that builds the fence instead, which still queues the job once they complete.
+/// Each job comes with an [`ExecutionFence`] of its sources (i.e., of everything that it waits for, such as the arrays
+/// that it reads back). [`Self::submit`] accepts the job right away, but the job is parked outside the workers until
+/// that fence is ready, and only then does it join the queue that the workers take jobs from, even when the fence
+/// reports an error, which the job itself then reports (e.g., as the error of its readback). The readiness callback
+/// that queues the job may run on a PJRT thread, so it only moves the job into the queue and wakes a worker. When PJRT
+/// cannot register a callback for the events of a fence, [`ExecutionFence`] waits for those events on the thread that
+/// builds the fence instead, which still queues the job once they complete.
 ///
 /// # Workers
 ///
@@ -1270,8 +1271,8 @@ impl PendingHostUpload {
 /// running while a job is accepted. A job that depends on another one (e.g., because it reads back an array whose
 /// buffers that job fills) is ordered after it by its fence, which completes only once that job has filled those
 /// buffers, so dependent chains complete in dependency order with any number of workers. A job whose sources stay
-/// pending (e.g., on a buffer that a transfer manager fills only later) stays parked without holding a worker, so it
-/// does not delay independent jobs. Workers take queued jobs in the order in which their sources became ready.
+/// pending (e.g., on a buffer that a transfer manager fills only later) stays parked without holding a worker, so
+/// it does not delay independent jobs. Workers take queued jobs in the order in which their sources became ready.
 ///
 /// # Shutdown
 ///
@@ -1296,15 +1297,16 @@ impl HostUploadWorkers {
     /// the number of threads of a session small irrespective of the size of the machine.
     const MAX_DEFAULT_WORKER_COUNT: usize = 4;
 
-    /// Creates a set of workers that runs at most `worker_limit` threads, none of which start before the first job is
-    /// submitted.
+    /// Creates a set of workers that runs at most `worker_limit` threads, none of which start before the first job
+    /// is submitted.
     fn new(worker_limit: NonZeroUsize) -> Self {
-        let state = HostUploadWorkersState {
-            queue: Mutex::new(HostUploadQueue::default()),
-            available: Condvar::new(),
-            worker_limit: worker_limit.get(),
-        };
-        Self { state: Arc::new(state) }
+        Self {
+            state: Arc::new(HostUploadWorkersState {
+                queue: Mutex::new(HostUploadQueue::default()),
+                available: Condvar::new(),
+                worker_limit: worker_limit.get(),
+            }),
+        }
     }
 
     /// Accepts `job`, which runs on one of the workers once `sources` is ready, and starts a new worker when fewer run
@@ -1323,25 +1325,26 @@ impl HostUploadWorkers {
         if queue.worker_count < queue.accepted_job_count.min(self.state.worker_limit) {
             let state = Arc::clone(&self.state);
             match std::thread::Builder::new().name("ryft-host-upload".to_string()).spawn(move || state.run()) {
-                // The worker is detached. It exits on its own once the owner is gone and no accepted job remains.
-                Ok(worker) => {
-                    drop(worker);
-                    queue.worker_count += 1;
+                Ok(_) => {
+                    // Dropping the handle detaches the worker. It exits once the owner is gone and all jobs finish.
+                    queue.worker_count += 1
                 }
                 Err(error) if queue.worker_count == 0 => {
-                    // Drop the job after releasing the lock, because dropping it releases what it owns.
+                    // Returning drops the local queue guard before the job parameter, so the job releases its
+                    // captured resources outside the lock.
                     queue.accepted_job_count -= 1;
-                    drop(queue);
-                    drop(job);
                     return Err(error.into());
                 }
-                // A running worker takes the job once it is queued and that worker is free, so the job still runs.
-                Err(error) => drop(error),
+                Err(_) => {
+                    // A running worker takes the job once it is queued and that worker is free, so the job still runs.
+                }
             }
         }
+
+        // Release the lock before registering the callback. If the fence is already ready, `on_ready` calls
+        // `enqueue` inline, which would deadlock trying to lock the same queue.
         drop(queue);
 
-        // The callback runs inline when `sources` is already ready, and otherwise on the thread that completes it.
         let state = Arc::clone(&self.state);
         sources.on_ready(move |_| state.enqueue(Box::new(job)));
         Ok(())
@@ -1363,6 +1366,8 @@ impl Drop for HostUploadWorkers {
         self.state.available.notify_all();
     }
 }
+
+// TODO(eaplatanios): Review from here.
 
 /// State that a [`HostUploadWorkers`] owner shares with its workers.
 struct HostUploadWorkersState {
