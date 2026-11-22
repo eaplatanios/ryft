@@ -56,10 +56,10 @@ use half::{bf16, f16};
 use ryft_core::{
     Array as CoreArray, ArrayType, BatchingPolicy, BatchingTracer, Complex, Context, Device, DeviceMesh,
     DifferentiationPolicy, DifferentiationTracer, Dimension, LogicalMesh, PLACE_OPERATION_NAME, Parameter,
-    Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placed, Placement,
-    PlacementRequest, PlacementRequestParameter, ProjectedValue, Shape, Sharding, ShardingDimension, Tracer, TypeError,
-    Typed, UnreducedKind, Value as CoreValue, decode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
-    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    ParameterError, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placed,
+    Placement, PlacementRequest, PlacementRequestParameter, ProjectedValue, Shape, Sharding, ShardingDimension, Tracer,
+    TypeError, Typed, UnreducedKind, Value as CoreValue, decode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4,
+    f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Error as PjrtError};
@@ -72,18 +72,33 @@ use crate::{Error, FromPjrt, Session, Value};
 
 /// Options of [`Session::place`].
 ///
-/// Each field follows JAX's tree prefix semantics, so when a field is present, its structure is broadcast over the
-/// input tree and applied leafwise. Destination and source prefixes accept [`PlacementRequestParameter`]s, including
-/// [`Placement`], [`PlacementRequest`], and their optional forms. Aliasing prefixes accept leaves that convert into
-/// `Option<bool>`, including `bool` and `Option<bool>`. Each prefix has one leaf type. To mix resolved placements
-/// and requests within the same prefix, convert the resolved leaves with [`PlacementRequest::from`].
+/// The four type parameters describe whole tree prefixes. Each option can be a single value that applies to the
+/// entire input, or a tuple or other parameterized tree that sets different values for different branches.
+/// [`Session::place`] broadcasts these prefixes over the input and applies the resulting options leafwise.
+///
+///   - `Target` specifies the destination, and `Source` describes the expected input placement. Their leaves
+///     implement [`PlacementRequestParameter`]. To mix resolved placements and requests in one prefix, convert the
+///     resolved placements with [`PlacementRequest::from`].
+///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the result when
+///     donation is possible.
+///   - `MayAlias` has leaves that convert into `Option<bool>`. A `false` or `Some(false)` leaf requests a copy,
+///     `true` or `Some(true)` permits sharing, and `None` leaves the policy unspecified for that branch.
+///
+/// Each field is optional, so `None` can omit an entire prefix. Omitting `donate` disables donation, and omitting
+/// `may_alias` leaves the policy unspecified. `Donate` and `MayAlias` both default to the single-leaf type `bool`,
+/// giving both fields type `Option<bool>` by default. An explicit aliasing tree can use `Option<bool>` leaves to set
+/// a policy for some branches and leave others unspecified.
+///
+/// For a two-element input, these options request donation of the first element and a copy of the second.
+///
+/// ```rust
+/// # use ryft_xla::PlacementOptions;
+/// let options = PlacementOptions::defaults()
+///     .with_donate((true, false))
+///     .with_may_alias((None, Some(false)));
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlacementOptions<
-    Target = PlacementRequest,
-    Source = PlacementRequest,
-    Donate = bool,
-    MayAlias = Option<bool>,
-> {
+pub struct PlacementOptions<Target = PlacementRequest, Source = PlacementRequest, Donate = bool, MayAlias = bool> {
     /// Destination placement tree prefix. When absent, host leaves are uploaded to the default local device without
     /// being [committed](Array::is_committed) to it, and [`Array`] leaves and traced leaves preserve their current
     /// placement and commitment.
@@ -117,12 +132,6 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
         may_alias: Option<MayAlias>,
     ) -> Self {
         Self { target, source, donate, may_alias }
-    }
-
-    /// Creates a new [`PlacementOptions`] with all fields unset.
-    #[inline]
-    pub fn empty() -> Self {
-        Self::new(None, None, None, None)
     }
 
     /// Returns these options with the destination tree prefix replaced by `target`, which can have another type than
@@ -194,19 +203,20 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
 
 impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Source, Donate, MayAlias> {
     fn default() -> Self {
-        Self::empty()
+        Self::new(None, None, None, None)
     }
 }
 
-impl PlacementOptions<PlacementRequest, PlacementRequest, bool, Option<bool>> {
-    /// Creates default [`Session::place`] options without requiring generic type inference.
+impl PlacementOptions {
+    /// Creates [`Session::place`] options with the standard prefix types and all fields unset. Use this when the
+    /// call site leaves the prefix types unconstrained (e.g., `session.place(value, PlacementOptions::defaults())`).
     #[inline]
     pub fn defaults() -> Self {
-        Self::empty()
+        Self::default()
     }
 }
 
-impl<Target> PlacementOptions<Target, PlacementRequest, bool, Option<bool>> {
+impl<Target> PlacementOptions<Target> {
     /// Creates [`Session::place`] options with only the destination tree prefix `target` (e.g., a [`Device`], a
     /// [`Memory`](ryft_core::Memory), a [`PlacementRequest`], or a tuple of optional placements). The other options
     /// are unset and their types follow [`Self::defaults`], so this needs no generic type annotations.
@@ -576,9 +586,12 @@ impl Placeable for HostOrArray {
 }
 
 impl Array {
-    /// Returns an array with the type, the placement, and the commitment of this array whose addressable shard buffers
-    /// no other handle holds. This is how a placement whose result must not alias its input (i.e., a placement with
-    /// `may_alias` set to `false`) gives that result buffers of its own. Each buffer that another handle also holds
+    /// Returns a new array (refer to the identity rules of [`RetainedArray`](crate::RetainedArray)) with the type, the
+    /// placement, and the commitment of this array whose addressable shard buffers no other handle holds. This is how
+    /// a placement whose result must not alias its input (i.e., a placement with `may_alias` set to `false`) gives that
+    /// result buffers of its own, and the result is a new array on every process, including a process that holds no
+    /// buffer of this array or holds each of them alone, because it then has no buffer to copy (refer to
+    /// [`Self::with_new_identity`]). Each buffer that another handle also holds
     /// (e.g., the input of a placement that keeps a shard on its device, which the caller still holds) is replaced with
     /// a copy on the same device and in the same memory, and each buffer that only this array holds (e.g., one that the
     /// placement created) is kept. A clone of this array holds all of its buffers, so it makes this function copy every
@@ -592,7 +605,7 @@ impl Array {
         let has_clones = Arc::strong_count(&self.parts) != 1;
         let is_shared = |buffer: &Arc<Buffer<'static>>| has_clones || Arc::strong_count(buffer) != 1;
         if !self.addressable_shards().filter_map(ArrayShard::buffer).any(is_shared) {
-            return Ok(self);
+            return Ok(self.with_new_identity());
         }
         self.with_copied_shard_buffers(session, is_shared)
     }
@@ -791,52 +804,34 @@ impl Session {
         let parameter_count = structure.parameter_count();
         let (target, source, donate, may_alias) = options.into_parts();
 
-        // An option tree that is one leaf at its root covers every node of the input by construction, so its value is
-        // repeated for every leaf of the input without building and matching the paths of the input, which would
-        // otherwise dominate the cost of placing a large tree. Every other option tree is broadcast over the input.
-        let target_values = match target {
-            Some(target) if is_root_parameter(&target) => {
-                vec![target.into_parameters().next().unwrap().into_optional_placement_request(); parameter_count]
-            }
-            Some(target) => target
-                .map_parameters(PlacementRequestParameter::into_optional_placement_request)?
-                .broadcast_to_parameter_structure::<Input::To<Option<PlacementRequest>>>(structure.clone())?
-                .into_parameters()
-                .collect::<Vec<_>>(),
-            None => vec![None; parameter_count],
-        };
-        let source_values = match source {
-            Some(source) if is_root_parameter(&source) => {
-                vec![source.into_parameters().next().unwrap().into_optional_placement_request(); parameter_count]
-            }
-            Some(source) => source
-                .map_parameters(PlacementRequestParameter::into_optional_placement_request)?
-                .broadcast_to_parameter_structure::<Input::To<Option<PlacementRequest>>>(structure.clone())?
-                .into_parameters()
-                .collect::<Vec<_>>(),
-            None => vec![None; parameter_count],
-        };
-        let donate_values = match donate {
-            Some(donate) if is_root_parameter(&donate) => {
-                vec![donate.into_parameters().next().unwrap(); parameter_count]
-            }
-            Some(donate) => donate
-                .broadcast_to_parameter_structure::<Input::To<bool>>(structure.clone())?
-                .into_parameters()
-                .collect::<Vec<_>>(),
-            None => vec![false; parameter_count],
-        };
-        let may_alias_values = match may_alias {
-            Some(may_alias) if is_root_parameter(&may_alias) => {
-                vec![may_alias.into_parameters().next().unwrap().into(); parameter_count]
-            }
-            Some(may_alias) => may_alias
-                .map_parameters(Into::into)?
-                .broadcast_to_parameter_structure::<Input::To<Option<bool>>>(structure.clone())?
-                .into_parameters()
-                .collect::<Vec<_>>(),
-            None => vec![None; parameter_count],
-        };
+        let target_values = broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(
+            target,
+            &structure,
+            parameter_count,
+            PlacementRequestParameter::into_optional_placement_request,
+            Parameterized::map_parameters,
+        )?;
+        let source_values = broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(
+            source,
+            &structure,
+            parameter_count,
+            PlacementRequestParameter::into_optional_placement_request,
+            Parameterized::map_parameters,
+        )?;
+        let donate_values = broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(
+            donate,
+            &structure,
+            parameter_count,
+            std::convert::identity,
+            |prefix, _| Ok(prefix),
+        )?;
+        let may_alias_values = broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(
+            may_alias,
+            &structure,
+            parameter_count,
+            Into::into,
+            Parameterized::map_parameters,
+        )?;
 
         // Validate the options that can be rejected before looking at any leaf. Check the source before the target,
         // as the type rule and traced values do. Other source checks wait until placement, because host leaves
@@ -1169,10 +1164,35 @@ fn place_traced<V: Placed + ConcreteArrays + CoreValue<Type = ArrayType, Dispatc
     Ok(V::Dispatch::place(&value, target.as_ref(), source, may_alias != Some(false))?)
 }
 
-/// Returns whether `tree` is one leaf at its root (e.g., a bare [`Device`] as the destination of a whole input tree),
-/// as opposed to a container, even one with a single leaf, whose leaves lie below the root.
-fn is_root_parameter<P: Parameter, T: Parameterized<P>>(tree: &T) -> bool {
-    tree.parameter_count() == 1 && tree.named_parameters().next().is_some_and(|(path, _)| path.is_root())
+/// Expands an optional placement prefix into one value per input leaf. An omitted prefix supplies the default value.
+/// A prefix with one leaf at the root covers the whole input, so it needs no path matching or structure cloning.
+/// For other prefixes, `map_prefix` converts the leaves before broadcasting. Donation flags can use their original
+/// prefix because their leaves already have the required type.
+fn broadcast_placement_option<
+    Output: Parameterized<Value>,
+    Leaf: Parameter,
+    Value: Clone + Default + Parameter,
+    Prefix: Parameterized<Leaf>,
+    MappedPrefix: Parameterized<Value>,
+    Convert: FnMut(Leaf) -> Value,
+>(
+    prefix: Option<Prefix>,
+    structure: &Output::ParameterStructure,
+    parameter_count: usize,
+    mut convert: Convert,
+    map_prefix: impl FnOnce(Prefix, Convert) -> Result<MappedPrefix, ParameterError>,
+) -> Result<Vec<Value>, ParameterError> {
+    let Some(prefix) = prefix else {
+        return Ok(vec![Value::default(); parameter_count]);
+    };
+    if prefix.parameter_count() == 1 && prefix.named_parameters().next().is_some_and(|(path, _)| path.is_root()) {
+        let value = convert(prefix.into_parameters().next().unwrap());
+        return Ok(vec![value; parameter_count]);
+    }
+    Ok(map_prefix(prefix, convert)?
+        .broadcast_to_parameter_structure::<Output>(structure.clone())?
+        .into_parameters()
+        .collect())
 }
 
 #[cfg(test)]
@@ -1421,25 +1441,19 @@ mod tests {
     #[test]
     fn test_placement_options_new() {
         let target = PlacementRequest::from(Device::new(3, 0));
-        let options = PlacementOptions::new(
-            Some(target.clone()),
-            Option::<PlacementRequest>::None,
-            Some(true),
-            Some(Some(false)),
-        );
+        let options: PlacementOptions = PlacementOptions::new(Some(target.clone()), None, Some(true), Some(false));
         assert_eq!(options.target(), Some(&target));
         assert_eq!(options.source(), None);
         assert_eq!(options.donate(), Some(&true));
-        assert_eq!(options.may_alias(), Some(&Some(false)));
-        assert_eq!(options.into_parts(), (Some(target), None, Some(true), Some(Some(false))));
+        assert_eq!(options.may_alias(), Some(&false));
+        assert_eq!(options.into_parts(), (Some(target), None, Some(true), Some(false)));
     }
 
     #[test]
-    fn test_placement_options_empty() {
-        let options = PlacementOptions::<PlacementRequest, PlacementRequest, bool, Option<bool>>::empty();
-        assert_eq!(options.into_parts(), (None, None, None, None));
-        assert_eq!(PlacementOptions::defaults(), PlacementOptions::empty());
+    fn test_placement_options_defaults() {
+        assert_eq!(PlacementOptions::defaults().into_parts(), (None, None, None, None));
         assert_eq!(PlacementOptions::default(), PlacementOptions::defaults());
+        assert_eq!(PlacementOptions::<Device>::default().into_parts(), (None, None, None, None));
     }
 
     #[test]
@@ -1547,6 +1561,12 @@ mod tests {
         assert!(!shares_buffer(&copied));
         assert_eq!(shard_values(&copied), vec![vec![2.5]]);
         assert!(shares_buffer(&kept));
+
+        // An optional leaf can leave its branch unspecified while the other branch requests a copy.
+        let options = PlacementOptions::defaults().with_may_alias((None, Some(false)));
+        let (kept, copied) = session.place((array.clone(), array.clone()), options).unwrap();
+        assert!(shares_buffer(&kept));
+        assert!(!shares_buffer(&copied));
     }
 
     #[test]

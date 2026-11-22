@@ -802,7 +802,7 @@ mod tests {
         let after = |operation| block.operations_after(&operation).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(after(op_0), vec![op_1, op_2]);
         assert_eq!(after(op_1), vec![op_2]);
-        assert_eq!(after(op_2), vec![]);
+        assert!(after(op_2).is_empty());
 
         // An operation of another block is rejected.
         let mut other = context.block_with_no_arguments();

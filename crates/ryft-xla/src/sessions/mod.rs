@@ -2106,8 +2106,8 @@ pub(crate) mod tests {
         ReferenceReadOperation, ReferenceType, ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary,
         ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin,
         StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation,
-        ZeroOperation, batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
-        shard_map_with_inferred_input_shardings,
+        WhileOptions, ZeroOperation, batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings, r#while,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -3015,6 +3015,78 @@ pub(crate) mod tests {
         assert!(!output(unplaced));
         let constrained = input.constrain_sharding(target.sharding()).unwrap();
         assert!(!output(constrained));
+    }
+
+    #[test]
+    fn test_session_bind_runs_regions_on_the_devices_that_they_request() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let upload = |r#type: ArrayType, bytes: Vec<u8>| {
+            Value::Array(Array::from_host_buffer(&session, r#type, None, None, bytes).unwrap())
+        };
+        let scalar = |value: f32| upload(ArrayType::scalar(DataType::F32), value.to_ne_bytes().to_vec());
+        let input = scalar(7.0);
+        let predicate = upload(ArrayType::scalar(DataType::Boolean), vec![1]);
+        let devices = program_array(&input).mesh().devices().to_vec();
+        assert_eq!(devices, vec![session.device_mesh().unwrap().devices()[0]]);
+        assert!(!program_array(&input).is_committed());
+        let other_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let target_on = |device: Device| {
+            let array = program_array(&input);
+            let mesh = DeviceMesh::new(array.mesh().logical_mesh().clone(), vec![device]).unwrap();
+            Placement::new(mesh, array.sharding().clone()).unwrap()
+        };
+        let target = target_on(other_device);
+        let read = |value: &Value| {
+            let array = program_array(value);
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            (array.mesh().devices().to_vec(), array.is_committed(), values)
+        };
+        let expected = (vec![other_device], true, vec![7.0]);
+
+        // Without committed operands, an operation whose regions place a value onto other devices runs on them, as
+        // JAX runs a `lax.cond` over an uncommitted predicate and value whose branches both `device_put` the value
+        // onto another device, and commits its results there.
+        let placed = predicate
+            .condition(|value| value.place(&target, None), |value| value.place(&target, None), input.clone())
+            .unwrap();
+        assert_eq!(read(&placed), expected);
+        let (placed, ()) = scan(
+            |_, carry, ()| Ok((carry.place(&target, None)?, ())),
+            input.clone(),
+            (),
+            ScanOptions::new().with_iteration_count(2usize),
+        )
+        .unwrap();
+        assert_eq!(read(&placed), expected);
+        let (count, _, placed) = r#while(
+            |(count, limit, _)| count.less_than(&limit),
+            |(count, limit, value)| Ok((count.add(&count)?, limit, value.place(&target, None)?)),
+            (scalar(1.0), scalar(2.0), input.clone()),
+            WhileOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(read(&placed), expected);
+        assert_eq!(read(&count), (vec![other_device], true, vec![2.0]));
+
+        // Committed operands keep deciding where the operation runs, so a region that places a value elsewhere is
+        // rejected when the operation is compiled.
+        let committed_input = Value::Array(program_array(&input).clone().with_committed(true));
+        let committed_predicate = Value::Array(program_array(&predicate).clone().with_committed(true));
+        let error = committed_predicate
+            .condition(|value| value.place(&target, None), |value| value.place(&target, None), committed_input)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "");
+
+        // Regions that request placements onto devices that do not form one mesh are rejected.
+        let error = predicate
+            .condition(
+                |value| value.place(&target, None),
+                |value| value.place(&target_on(devices[0]), None),
+                input.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "");
     }
 
     #[test]
