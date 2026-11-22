@@ -45,6 +45,7 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
+use crate::arrays::host::validate_mesh_device_processes;
 use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
@@ -60,7 +61,8 @@ pub mod shards;
 pub mod statistics;
 
 pub use placement::{
-    ArrayPlacement, ArrayPlacementTarget, HostOrArray, Placeable, PlaceableParameter, PlacementOptions,
+    AliasingParameter, ArrayPlacement, ArrayPlacementTarget, HostOrArray, Placeable, PlaceableParameter,
+    PlacementOptions,
 };
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
@@ -82,23 +84,6 @@ pub enum ArrayError {
         "array type sharding `{type_sharding}` does not match the placement `{sharding}` over the non-auto mesh axes"
     )]
     PlacementTypeMismatch { type_sharding: Sharding, sharding: Sharding },
-
-    #[error(
-        "expected source mesh `{expected_mesh:?}` with sharding `{expected_sharding:?}` does not match the array's \
-         current mesh `{actual_mesh:?}` with sharding `{actual_sharding:?}`"
-    )]
-    SourcePlacementMismatch {
-        expected_mesh: DeviceMesh,
-        expected_sharding: Sharding,
-        actual_mesh: DeviceMesh,
-        actual_sharding: Sharding,
-    },
-
-    #[error("expected source memory `{expected}` but the array uses `{actual}`")]
-    SourceMemoryMismatch { expected: Memory, actual: Memory },
-
-    #[error("expected source layout `{expected}` but the array declares `{actual:?}`")]
-    SourceLayoutMismatch { expected: Layout, actual: Option<Layout> },
 
     #[error("array `{path}` cannot be donated while `may_alias` is `Some(true)`")]
     DonatedArrayMayAlias { path: ParameterPath },
@@ -198,7 +183,12 @@ pub struct Array {
 
     /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
     /// each shard buffer's ready event because it also retains errors from zero-output effects and other device work
-    /// associated with the launch. Cloned output arrays share the same fence.
+    /// associated with the launch. Cloned output arrays share the same fence. The result of a placement joins the
+    /// fence of its source with the readiness of every buffer that the placement created and with the fences of the
+    /// programs that it ran, because readbacks wait for this fence but read only one replica of each tile. Plain host
+    /// uploads leave it empty, because every replica receives the same host bytes. The uploads of placements set it
+    /// whether they run in the background or, when the PJRT plugin lacks host to device transfer managers, on the
+    /// calling thread (refer to [`Self::with_upload_completion`]).
     execution_fence: Option<ExecutionFence>,
 
     /// Completion fence of the PJRT cross-host sends that the placement which produced this array issued from the
@@ -220,6 +210,10 @@ pub struct Array {
 
     /// Whether this array is committed to its devices. Refer to [`Self::is_committed`] for more information.
     committed: bool,
+
+    /// Whether this process chose the devices of this array independently of the other processes.
+    /// Refer to [`Self::is_locally_assigned`] for more information.
+    locally_assigned: bool,
 }
 
 impl Array {
@@ -238,8 +232,15 @@ impl Array {
     ///
     /// Each [`Buffer`] is assigned to a global shard based on the [`DeviceId`] of its owning device. Failures use
     /// [`Error::Array`] with [`ArrayError::MultipleBuffersOnDevice`] when multiple buffers belong to the same device,
-    /// [`ArrayError::DeviceNotInMesh`] when a buffer's device is absent from `mesh`, and
-    /// [`ArrayError::DeviceProcessIndexMismatch`] when a buffer's process differs from the corresponding mesh device.
+    /// [`ArrayError::DeviceNotInMesh`] when a buffer's device is absent from `mesh`,
+    /// [`ArrayError::DeviceProcessIndexMismatch`] when a buffer's process differs from the corresponding mesh device or
+    /// when the PJRT client reports another process for a device of `mesh` than the one that `mesh` assigns to it, and
+    /// [`ArrayError::NonAddressableDevice`] when `mesh` assigns a device to this process that the PJRT client does not
+    /// address. Both device checks apply whether or not a buffer is supplied for that device, because no process would
+    /// then hold the buffer of its shard, so a partial import accepts the same meshes as a host upload. A device that
+    /// the client does not list keeps the process that `mesh` assigns to it, because it can belong to a process whose
+    /// devices the client cannot see. A layout of `r#type` that does not address the shape of each shard is rejected
+    /// with the [`TypeError`](ryft_core::TypeError) of [`ArrayType::validate_layout`], even without buffers.
     /// [`ArrayError::BufferTypeMismatch`] reports a data type or static shape that differs from the shard type derived
     /// from `r#type`, `mesh`, and the effective sharding. A buffer whose physical memory differs from `r#type.memory()`
     /// produces [`ArrayError::BufferMemoryMismatch`]. [`Memory::Device`] denotes the owning device's default memory.
@@ -297,19 +298,28 @@ impl Array {
         )
     }
 
-    /// Implements addressable buffer construction with optional validation of private zero-space carrier payloads.
-    /// The buffers may be ones that other arrays also hold. Sharing is safe because arrays never mutate their buffers
-    /// and because donation skips arrays whose buffers are shared (refer to [`Self::has_unique_shard_buffers`]).
+    /// Implements addressable buffer construction. The buffers may be ones that other arrays also hold. Sharing is safe
+    /// because arrays never mutate their buffers and because donation skips arrays whose buffers are shared (refer to
+    /// [`Self::has_unique_shard_buffers`]). When `imported` is set, the buffers and the mesh come from outside of Ryft
+    /// (i.e., through [`Self::from_addressable_buffers`]), so this function also validates the private zero-space
+    /// carrier payloads of the buffers and the processes that the mesh assigns to its devices, as a host upload does.
+    /// The mesh describes every device, whether or not a buffer is supplied for it, so a device of this process that
+    /// the mesh assigns to another process, or a device that the mesh assigns to this process but that this process
+    /// does not address, would otherwise leave its shard without a buffer on any process. The other constructors build
+    /// their meshes and buffers from ones that were validated already.
     fn from_addressable_buffers_internal(
         session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
         buffers: Vec<Arc<Buffer<'static>>>,
-        validate_zero_carriers: bool,
+        imported: bool,
     ) -> Result<Self, Error> {
         // Derive the metadata and the global shard descriptors implied by the runtime placement and the device mesh.
         let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh)?;
+        if imported {
+            validate_mesh_device_processes(session.client(), metadata.mesh())?;
+        }
 
         // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device and
         // buffers that the session's client does not own.
@@ -321,7 +331,7 @@ impl Array {
                 &descriptors,
                 metadata.shard_index_by_device(),
                 &buffer,
-                validate_zero_carriers,
+                imported,
             )?;
             if buffers_by_device.contains_key(&device_id) {
                 return Err(Error::from(ArrayError::MultipleBuffersOnDevice { device_id }));
@@ -350,6 +360,7 @@ impl Array {
             send_fence: None,
             session: session.clone(),
             committed: true,
+            locally_assigned: false,
         })
     }
 
@@ -398,6 +409,7 @@ impl Array {
             send_fence: None,
             session: session.clone(),
             committed: true,
+            locally_assigned: false,
         })
     }
 
@@ -464,6 +476,7 @@ impl Array {
             send_fence: None,
             session: session.clone(),
             committed: true,
+            locally_assigned: false,
         }
     }
 
@@ -489,6 +502,28 @@ impl Array {
     #[inline]
     pub(crate) fn with_committed(mut self, committed: bool) -> Self {
         self.committed = committed;
+        self
+    }
+
+    /// Returns this [`Array`], which an eager operation, an eager reshard, or a host upload produced, committed to its
+    /// devices when `committed` is `true` or when it lives on more than one device, and uncommitted otherwise (refer to
+    /// [`Self::is_committed`]). `committed` is the commitment that its operands give it (i.e., the result of
+    /// [`Session::commits_placement`] and the commitment of the captured arrays for an eager operation, the commitment
+    /// of the source for a reshard, and whether a mesh was chosen for an upload through [`Self::from_host_buffer`]).
+    /// This is the one rule that decides the commitment of eager results and uploads, and it keeps every uncommitted
+    /// one on a single device, as in JAX, where an uncommitted array always lives on one device. The outputs of
+    /// compiled functions that run on more than one device are committed for the same reason.
+    #[inline]
+    pub(crate) fn commit_if(self, committed: bool) -> Self {
+        let committed = committed || self.mesh().devices().len() > 1;
+        self.with_committed(committed)
+    }
+
+    /// Sets whether this array is [locally assigned](Self::is_locally_assigned). An array with a shard on another
+    /// process always clears the flag, because this process could not have chosen all its devices independently.
+    #[inline]
+    pub(crate) fn with_locally_assigned(mut self, locally_assigned: bool) -> Self {
+        self.locally_assigned = locally_assigned && self.shards().iter().all(ArrayShard::is_addressable);
         self
     }
 
@@ -559,17 +594,18 @@ impl Array {
     ///     [default mesh](Session::device_mesh), which then decides its placement. This covers
     ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the results of eager operations without
     ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, such arrays are uncommitted,
-    ///     unless they are eager results on more than one device. In particular, [`Self::from_host_buffer`] without
-    ///     a mesh lays the logical mesh of a sharding out over the first addressable devices and leaves the upload
-    ///     uncommitted even when that spans more than one device.
+    ///     unless they live on more than one device (e.g., when [`Self::from_host_buffer`] without a mesh lays the
+    ///     logical mesh of a sharding out over the first addressable devices).
     ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
     ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
-    ///   - **Committed Inputs:** It is the result of an operation or of a compiled function that has a committed array
-    ///     input, including the arrays that the function captures.
-    ///   - **Eager Results on Several Devices:** It is the result of an eager operation, or of a reshard that moves an
-    ///     array to the devices that an eager operation runs on, and it lives on more than one device. An uncommitted
-    ///     eager result therefore always lives on a single device.
+    ///   - **Committed Inputs:** It is the result of an operation with a committed array input. Direct execution of a
+    ///     compiled function counts its captured arrays as inputs. An unpinned call through
+    ///     [`CompiledFunction::call`](crate::compilation::CompiledFunction::call) counts its public arguments.
+    ///   - **Eager Results on Several Devices:** It is the result of an eager operation, of a host upload through
+    ///     [`Self::from_host_buffer`], or of a reshard that moves an array to the devices that an eager operation runs
+    ///     on, and it lives on more than one device. An uncommitted eager result or upload therefore always lives on a
+    ///     single device.
     ///   - **Compiled Functions:** It is an output of a compiled function that was compiled for more than one device,
     ///     or a public output of a compiled function that requests a placement explicitly anywhere (i.e., through a
     ///     sharding override, a [`PlaceOperation`](ryft_core::PlaceOperation) with a target, or a sharding constraint),
@@ -596,6 +632,70 @@ impl Array {
     #[inline]
     pub fn is_committed(&self) -> bool {
         self.committed
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns whether this process chose the devices of this [`Array`] independently of the other processes.
+    /// Each process may hold the same value on devices of its own choice. A destination that names only a memory or
+    /// a layout sets [commitment](Self::is_committed) while preserving the original device assignment.
+    ///
+    /// An array is locally assigned when no destination that names devices was ever given for it or for the
+    /// arrays that it derives from. That is the case for the following arrays, and for no others.
+    ///
+    ///   - **Default Uploads:** It is a host value that was uploaded without a mesh by a [`Session`] without a
+    ///     [default mesh](Session::device_mesh) (e.g., through [`Self::from_host_buffer`]), or a host value that
+    ///     [`Session::place`] uploaded without a destination or with a destination that names only a memory or a
+    ///     layout, which lands on the first addressable device of the client whether or not the session has a default
+    ///     mesh.
+    ///   - **Storage Placements:** It is the result of a placement of such an array that names only a memory or a
+    ///     layout, or a copy of such an array on its own devices.
+    ///   - **Eager Results:** It is the result of an eager operation whose array inputs are all locally assigned,
+    ///     or of one without array inputs that runs where such an upload would (refer to
+    ///     [`Self::operands_are_locally_assigned`]).
+    ///
+    /// A placement onto a device, a mesh, or a sharding, a construction on a mesh that the caller provides (e.g.,
+    /// through [`Self::from_addressable_buffers`]), and direct execution of a compiled function all produce arrays
+    /// whose devices every process knows. A call with no placement request follows its public arguments. Clones and
+    /// [`RetainedArray`]s preserve local assignment. It is excluded from retained-array identity.
+    ///
+    /// Every process of a distributed program that applies the same functions to the same kinds of inputs therefore
+    /// computes the same fact for its own array, which is what lets every process choose the same strategy when it
+    /// places such an array on devices of several processes (refer to [`crate::arrays::resharding`]).
+    ///
+    /// An array without the fact is treated as one whose devices every process knows, which holds only when every
+    /// process of a distributed run names the same devices wherever a program names devices (e.g., the default mesh of
+    /// a [`Session`], the mesh of a construction, or the device of an [`ArrayPlacement::device`] request). No process
+    /// can check that, because each one sees only its own request, so it is a precondition. A choice of devices that
+    /// differs between processes is expressible only by naming no device, which leaves the choice to each process and
+    /// gives the result this fact. For example, an array that each process placed on its own first addressable device
+    /// with [`ArrayPlacement::device`] does not have the fact, and a later placement of it over the devices of every
+    /// process makes each process send its value from its own device while none of them receives.
+    #[inline]
+    pub(crate) fn is_locally_assigned(&self) -> bool {
+        self.locally_assigned
+    }
+
+    // TODO(eaplatanios): Should this be moved?
+    /// Returns whether the results of an eager operation that `session` applies to the array inputs `inputs` and the
+    /// captured arrays `captures` live on devices that this process chose on its own (refer to
+    /// [`Self::is_locally_assigned`]). The operation runs on the devices of its array inputs, so its results
+    /// are locally assigned exactly when all of those inputs are. Without array inputs, it runs on the
+    /// devices of its first committed capture, whose fact its results take, or otherwise on the
+    /// [default mesh](Session::device_mesh) of `session`, which is information that every process shares, or, without
+    /// one, on the first device of the client, which this process chose on its own, as for a default upload.
+    pub(crate) fn operands_are_locally_assigned<'a>(
+        session: &Session,
+        inputs: impl IntoIterator<Item = &'a Array>,
+        captures: &[RetainedArray],
+    ) -> bool {
+        let mut inputs = inputs.into_iter().peekable();
+        if inputs.peek().is_some() {
+            return inputs.all(Self::is_locally_assigned);
+        }
+        match captures.iter().find(|capture| capture.is_committed()) {
+            Some(capture) => capture.is_locally_assigned(),
+            None => !session.commits_placement(&[]),
+        }
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
@@ -1181,9 +1281,10 @@ mod tests {
 
     use ryft_core::{
         Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Neg, Placed, Placement, ProgramError, Reference, Shape, Sharding,
-        ShardingDimension, StaticShape, TiledLayout, TypeError, Typed, UnreducedKind, Value, WhilePredicate,
+        DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Error as CoreError,
+        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, Placed, Placement, ProgramError, Reference, Shape,
+        Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed, UnreducedKind, Value,
+        WhilePredicate,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1233,9 +1334,10 @@ mod tests {
     }
 
     /// Builds a rank-1 `f32` array whose only shard is on a device of another process, so that it has no storage in
-    /// this process.
+    /// this process. The device is one that the client of `session` does not list, as a device of another process is.
     fn remote_array(session: &Session) -> Array {
-        let local = Device::from_pjrt(&session.client().addressable_devices().unwrap()[0]).unwrap();
+        let devices = session.client().addressable_devices().unwrap();
+        let local = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).max_by_key(Device::id).unwrap();
         let remote = Device::new(local.id() + 1, local.process_index() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote]).unwrap();
@@ -1418,6 +1520,94 @@ mod tests {
                 device.id().unwrap(),
             ),
         );
+    }
+
+    #[test]
+    fn test_array_from_addressable_buffers_rejects_invalid_layout() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let rank_two = Layout::Strided(StridedLayout::new(vec![4, 4]));
+        let message = "strided layout rank 2 does not match array rank 1";
+
+        // An import without buffers meets no buffer that would reject a layout which cannot address the shape of its
+        // type, so the layout is validated with the type, for the zero data type and for ordinary data types alike.
+        for data_type in [DataType::Zero, DataType::F32] {
+            let r#type = ArrayType::new_static(data_type, [4]).with_layout(rank_two.clone());
+            let error = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, Vec::new()).unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Core(error) if **error == CoreError::Type(TypeError::invalid(message)),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn test_array_from_addressable_buffers_rejects_misattributed_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let misattributed = Device::new(devices[1].id(), devices[1].process_index() + 1);
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0], misattributed]).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let upload = || client.buffer([7u8].as_slice(), BufferType::U8, [1u64], None, client_devices[0].clone(), None);
+
+        // The mesh assigns the second device of this process to another process. No process would hold its replica,
+        // whether or not a buffer is supplied for it, so the import is rejected as a host upload to that mesh is.
+        let message = format!(
+            "device {} reports process index {}, but expected {}",
+            devices[1].id(),
+            devices[1].process_index(),
+            devices[1].process_index() + 1,
+        );
+        for buffers in [vec![upload().unwrap()], Vec::new()] {
+            let error =
+                Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, buffers).unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(
+                    error.as_ref(),
+                    ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }
+                        if *device_id == devices[1].id()
+                            && *expected == devices[1].process_index() + 1
+                            && *actual == devices[1].process_index(),
+                ),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+
+        // A device that the mesh assigns to this process must be one that the client addresses, whether or not a buffer
+        // is supplied for it, because its shard would otherwise have no buffer in any process, as for a host upload.
+        let missing = Device::new(devices[1].id() + 999, devices[1].process_index());
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0], missing]).unwrap();
+        let (missing_id, missing_process) = (missing.id(), missing.process_index());
+        let message = format!("device {missing_id} is not addressable by the PJRT client in process {missing_process}");
+        for buffers in [vec![upload().unwrap()], Vec::new()] {
+            let error =
+                Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, buffers).unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(
+                    error.as_ref(),
+                    ArrayError::NonAddressableDevice { device_id, process_index }
+                        if *device_id == missing.id() && *process_index == missing.process_index(),
+                ),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+
+        // A device that the client does not know can belong to a process whose devices it cannot see, so its shard is
+        // described without a buffer.
+        let remote = Device::new(devices[1].id() + 1, devices[1].process_index() + 1);
+        let mesh = DeviceMesh::new(logical_mesh, vec![devices[0], remote]).unwrap();
+        let array = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![upload().unwrap()]).unwrap();
+        assert_eq!(array.addressable_shards().count(), 1);
+        assert!(!array.shards()[1].is_addressable());
+        assert!(array.shards()[1].buffer().is_none());
+        assert_eq!(array.copy_to_host_bytes().unwrap(), [7]);
     }
 
     #[test]
@@ -1817,6 +2007,24 @@ mod tests {
     }
 
     #[test]
+    fn test_array_with_locally_assigned() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let uploaded = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        assert!(uploaded.is_locally_assigned());
+
+        // The fact can be cleared and set again on an array whose shards this process addresses, and the commitment
+        // of the array stays as it is.
+        let cleared = uploaded.with_locally_assigned(false);
+        assert!(!cleared.is_locally_assigned());
+        assert!(!cleared.is_committed());
+        assert!(cleared.with_locally_assigned(true).is_locally_assigned());
+
+        // The devices of another process are never ones that this process chose on its own.
+        assert!(!remote_array(&session).with_locally_assigned(true).is_locally_assigned());
+    }
+
+    #[test]
     fn test_array_with_session() {
         let client = cpu_client(1);
         let other_client = other_cpu_client(1);
@@ -1959,6 +2167,77 @@ mod tests {
         assert!(!RetainedArray::new(&uploaded).to_array(&meshed_session).unwrap().is_committed());
         assert!(!uploaded.clone().with_committed(true).with_committed(false).is_committed());
         assert!(uploaded.with_committed(true).is_committed());
+    }
+
+    #[test]
+    fn test_array_is_locally_assigned() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 2));
+        let mesh = domain_mesh(client, "x", 2);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+
+        // A host upload without a mesh of the caller or of the session lives on devices that this process chose on its
+        // own, also when its sharding lays it out over two devices, which commits it to them.
+        let uploaded = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        assert!(uploaded.is_locally_assigned());
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split = Array::from_host_buffer(&session, r#type.clone(), None, Some(sharding), bytes.as_slice()).unwrap();
+        assert!(split.is_committed());
+        assert!(split.is_locally_assigned());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        let zero = Array::from_host_buffer(&session, zero_type.clone(), None, None, []).unwrap();
+        assert!(zero.is_locally_assigned());
+
+        // A mesh of the caller or of the session names the devices, which every process then knows.
+        let on_mesh = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, bytes.as_slice()).unwrap();
+        assert!(!on_mesh.is_locally_assigned());
+        let zero = Array::from_host_buffer(&session, zero_type, mesh.clone(), None, []).unwrap();
+        assert!(!zero.is_locally_assigned());
+        let shards = mesh.devices().iter().map(|device| (device.id(), bytes.as_slice()));
+        let from_shards = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), None, shards).unwrap();
+        assert!(!from_shards.is_locally_assigned());
+        let wrapped = Array::from_addressable_buffers(&session, r#type.clone(), mesh, None, Vec::new()).unwrap();
+        assert!(!wrapped.is_locally_assigned());
+        let meshed = Array::from_host_buffer(&meshed_session, r#type, None, None, bytes.as_slice()).unwrap();
+        assert!(!meshed.is_locally_assigned());
+
+        // Clones, handles of other sessions, and retained arrays keep the fact of their array.
+        assert!(uploaded.clone().is_locally_assigned());
+        assert!(uploaded.clone().with_session(&meshed_session).unwrap().is_locally_assigned());
+        assert!(RetainedArray::new(&uploaded).to_array(&meshed_session).unwrap().is_locally_assigned());
+        assert!(!RetainedArray::new(&on_mesh).to_array(&session).unwrap().is_locally_assigned());
+    }
+
+    #[test]
+    fn test_array_operands_are_locally_assigned() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 1));
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+        let local = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        let shared = Array::from_host_buffer(&session, r#type, domain_mesh(client, "x", 1), None, bytes).unwrap();
+
+        // An operation runs on the devices of its array inputs, so its results are locally assigned exactly when all of
+        // them are, whatever the mesh of the session.
+        assert!(Array::operands_are_locally_assigned(&meshed_session, &[local.clone()], &[]));
+        assert!(Array::operands_are_locally_assigned(
+            &session,
+            &[local.clone(), local.clone()],
+            &[RetainedArray::new(&shared)]
+        ));
+        assert!(!Array::operands_are_locally_assigned(&session, &[local.clone(), shared.clone()], &[]));
+
+        // Without array inputs, the first committed capture decides where it runs, and otherwise the session does,
+        // which chooses the first device of its client on its own only when it has no mesh.
+        assert!(Array::operands_are_locally_assigned(&session, &[], &[]));
+        assert!(!Array::operands_are_locally_assigned(&meshed_session, &[], &[]));
+        assert!(!Array::operands_are_locally_assigned(&meshed_session, &[], &[RetainedArray::new(&local)]));
+        let committed_local = RetainedArray::new(&local.with_committed(true));
+        assert!(Array::operands_are_locally_assigned(&meshed_session, &[], &[committed_local.clone()]));
+        assert!(!Array::operands_are_locally_assigned(&session, &[], &[RetainedArray::new(&shared), committed_local]));
     }
 
     #[test]
@@ -2142,7 +2421,8 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
+        // The device belongs to another process, whose devices the client does not list.
+        let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(1, 1)]).unwrap();
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, shape);
@@ -2159,7 +2439,7 @@ mod tests {
                 "varying_manual_axes: {} }), memory: Device }, ",
                 "sharding: Sharding { mesh: LogicalMesh { axes: [MeshAxis { name: \"x\", size: 1, type: Auto }] }, ",
                 "dimensions: [Sharded([\"x\"])], unreduced_axes: {}, unreduced_kind: Sum, reduced_axes: {}, ",
-                "varying_manual_axes: {} }, shards: [ArrayShard { index: 0, device_id: 0, process_index: 1, ",
+                "varying_manual_axes: {} }, shards: [ArrayShard { index: 0, device_id: 1, process_index: 1, ",
                 "shape: StaticShape { dimensions: [2] }, is_addressable: false }] }",
             ),
         );
