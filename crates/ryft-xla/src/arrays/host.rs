@@ -1,3 +1,59 @@
+//! Transfers between host memory and the device buffers of an [`Array`].
+//!
+//! Host values enter through two constructors. [`Array::from_host_buffer`] takes the dense row-major bytes of the
+//! whole logical value, derives the shard of every device from the type, mesh, and sharding, and uploads only the
+//! shards of the devices of this process, so every process of a distributed array passes the same value.
+//! [`Array::from_host_shards`] instead takes the bytes of each local shard, which may differ between processes and
+//! between the devices along unreduced axes. [`Session::place`] also accepts host values and uploads them through
+//! [`Array::from_host_buffer`]. Along unreduced axes of kind [`UnreducedKind::Sum`], a full host value is split into
+//! the value itself at coordinate zero and additive identities elsewhere, so the summands add up to the value. Each
+//! process uploads only the shards of the devices that the mesh assigns to it, so both constructors reject a device of
+//! this process that the mesh assigns to another process with [`ArrayError::DeviceProcessIndexMismatch`] and a device
+//! that the mesh assigns to this process but that its PJRT client does not address with
+//! [`ArrayError::NonAddressableDevice`], because no process would upload its shard, as imports of buffers and
+//! placements onto a mesh do. A device that the PJRT client does not list keeps the process that the mesh assigns to
+//! it, because it can belong to a process whose devices the client cannot see. Both constructors also reject a layout
+//! that does not address the shape of every shard and host bytes that do not encode valid elements of the data type
+//! (e.g., a [`DataType::Boolean`] byte other than `0` or `1`) before they upload anything, because a typed readback
+//! of the array would fail otherwise. They validate the bytes of every upload, including the storage of a
+//! [`ryft_core::Array`], which its safe mutable view can make invalid.
+//!
+//! Values leave through [`Array::copy_to_host`] and [`Array::copy_to_host_bytes`], which assemble the dense row-major
+//! value from one local replica of each distinct contribution (i.e., of each tile and, along unreduced axes, of each
+//! per-device value of a tile), combine the contributions along unreduced axes, and skip tiles without elements. They
+//! fail with [`ArrayError::MissingShardBuffer`] before issuing any copy when this process does not hold the whole
+//! value, and they reject an array whose devices can hold different values of one tile along a varying manual mesh
+//! axis, which one host value cannot represent. [`ArrayShard::copy_to_host_bytes`] reads the value of one device.
+//!
+//! # Completion
+//!
+//! Uploads return as soon as PJRT has accepted them, so the returned arrays can hold pending buffers. Readbacks are
+//! synchronization boundaries, and the observations of an array report the following failures:
+//!
+//!   - [`Array::ready`] and [`Array::block_until_ready`] report the failures of every addressable buffer, of the
+//!     execution fence of the array (i.e., of the work that produced it), and of the cross-host sends of the placement
+//!     that produced it, if any.
+//!   - [`Array::copy_to_host`] and [`Array::copy_to_host_bytes`] block until their copies and the execution fence
+//!     complete and report the errors of both. They never wait for the replicas or empty tiles that they do not read,
+//!     nor for cross-host sends. An array without elements copies nothing and waits for its execution fence, or for
+//!     every addressable buffer when it has none.
+//!   - [`Session::synchronize`] reports the failures of every upload, copy, transfer, and execution that the session
+//!     registered, including the uploads of replicas that no readback reads.
+//!
+//! [`Array::from_host_buffer`] and [`Array::from_host_shards`] give the array no execution fence, so a readback does
+//! not report the failed upload of a replica that it skips. Every replica of an upload receives the same host bytes,
+//! so such a failure never changes the value that the readback returns, and the other observations report it. The
+//! uploads that a placement makes join their readiness into the execution fence of its result instead (e.g., the
+//! uploads of its host fallback, in the background or on the calling thread), because the replicas of a placement
+//! can come from different sources, so its readbacks also report a failed replica that they skip.
+//!
+//! Placements that read an array back and upload it again (e.g., the host fallback and the host relayouts of
+//! [`Array::to_placement`]) hand out their destination buffers first and finish the work on the background upload
+//! workers of the session, which a failure of that work poisons. Such a placement blocks on the readback only when the
+//! PJRT plugin lacks host to device transfer managers or their literal transfers. A process that holds no destination
+//! buffer of such a placement has no upload to report the work that produces the value, so the execution fence of its
+//! result is the fence of that work instead.
+
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -5,7 +61,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayType, DataType, DeviceMesh, Max, Min, Or, Sharding, Typed, UnreducedKind,
+    Add, Array as CoreArray, ArrayAddressing, ArrayType, DataType, DeviceMesh, Max, Min, Or, ProgramError, Sharding,
+    Typed, UnreducedKind,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
@@ -34,9 +91,14 @@ impl Array {
     ///
     /// Passing [`None`] for `mesh` uses the mesh configured on `session` if present. Otherwise, the logical mesh
     /// from the runtime or type sharding is laid out over the client's addressable devices in enumeration order.
-    /// Without sharding, the first addressable device forms a mesh with a single axis `x`. The result is
-    /// [committed](Self::is_committed) to its devices when `mesh` or the mesh of `session` selected them,
-    /// and it is uncommitted when they are only this default.
+    /// Without sharding, the first addressable device forms the canonical mesh of one device, whose only axis is named
+    /// `device` (refer to [`LogicalMesh::single_device`](ryft_core::LogicalMesh::single_device)). The result is
+    /// [committed](Self::is_committed) to its devices when `mesh` or the mesh of `session` selected them, or when it
+    /// lives on more than one device, like every eager result. It is uncommitted only when its devices are this default
+    /// and it lives on a single device, so an uncommitted array always lives on a single device. Whether committed or
+    /// not, devices that neither `mesh` nor the mesh of `session` selected are ones that this process chose on its own,
+    /// which a later placement onto devices of several processes takes into account (refer to
+    /// [`crate::arrays::resharding`]).
     ///
     /// When the destination mesh spans several processes, each process uploads only the shards of its own devices,
     /// so every process must call this function with the same host value. Nothing compares the values across processes,
@@ -61,6 +123,12 @@ impl Array {
     /// identity is written then. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`], every device receives
     /// its shard of the host value, which is its own extremum for every data type.
     ///
+    /// The bytes must encode valid elements of the data type, as for a [`ryft_core::Array`], whose typed readback
+    /// would otherwise fail. Only the data types whose valid encodings are a strict subset of their storage bytes can
+    /// be invalid (i.e., [`DataType::Boolean`], whose bytes must be `0` or `1`, and the data types narrower than a
+    /// byte, whose bits above their width must be zero), so only their bytes are validated, and every process validates
+    /// the whole host value before it uploads anything.
+    ///
     /// # Parameters
     ///
     ///   - `session`: [`Session`] the constructed array belongs to. Its client transfers the local addressable shard
@@ -72,9 +140,12 @@ impl Array {
     ///
     /// # Errors
     ///
-    /// Returns an error if placement cannot be resolved, the bytes do not match the type, or a device upload fails, and
-    /// [`ArrayError::MissingUnreducedSumIdentity`] if the sharding sums along unreduced axes a data type without an
-    /// additive identity and some device would have to hold that identity.
+    /// Returns an error if placement cannot be resolved, the layout of `r#type` does not address its shape, the bytes
+    /// do not match the type, or a device upload fails, an [`Error::Core`] that names the data type and the first
+    /// element whose bytes do not encode a value of that data type, [`ArrayError::MissingUnreducedSumIdentity`] if the
+    /// sharding sums along unreduced axes a data type without an additive identity and some device would have to hold
+    /// that identity, and [`ArrayError::DeviceProcessIndexMismatch`] if the PJRT client reports another process for a
+    /// device than the one that the mesh assigns to it.
     pub fn from_host_buffer<M: Into<Option<DeviceMesh>>, B: AsRef<[u8]>>(
         session: &Session,
         r#type: ArrayType,
@@ -82,13 +153,16 @@ impl Array {
         sharding: Option<Sharding>,
         buffer: B,
     ) -> Result<Self, Error> {
-        let buffer = buffer.as_ref();
-        let mesh = mesh.into();
-        let committed = mesh.is_some() || session.commits_placement(&[]);
+        let (mesh, buffer) = (mesh.into(), buffer.as_ref());
+
+        // Without a mesh of the caller or of `session`, this process chooses the devices on its own.
+        let committed = mesh.is_some() || session.commits_placement(&[], &[]);
         let uploads = HostBufferUploads::new(session, r#type, mesh, sharding, Some(buffer.len()))?;
         let HostBufferUploads { r#type, sharding, mesh, device_layout, shards, .. } = uploads;
+        validate_host_element_encodings(r#type.data_type(), buffer)?;
         if r#type.data_type().is_zero() {
-            return Ok(Self::zero(session, r#type, Some(sharding), mesh)?.with_committed(committed));
+            let array = Self::zero(session, r#type, Some(sharding), mesh)?;
+            return Ok(array.commit_if(committed).with_locally_assigned(!committed));
         }
 
         // Transfer only the shards owned by this process. Remote shards remain represented by metadata when
@@ -131,8 +205,9 @@ impl Array {
         }
 
         // Reuse the buffer constructor for final buffer validation and global sharding metadata assembly.
-        Ok(Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, addressable_buffers)?
-            .with_committed(committed))
+        let array =
+            Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, addressable_buffers)?;
+        Ok(array.commit_if(committed).with_locally_assigned(!committed))
     }
 
     /// Creates an [`Array`] like [`Self::from_host_buffer`] does, but from host bytes that `readback` produces later.
@@ -147,11 +222,16 @@ impl Array {
     /// uploaded from one shared copy (refer to [`PreparedHostShards`]).
     ///
     /// The destination buffers are registered with the work tracking of `session` before this function returns, so
-    /// [`Session::synchronize`] waits for the uploads. When `readback` fails, returns bytes of the wrong size, or an
-    /// upload cannot be issued, the background job sets the error that `poison` derives from that failure on every
-    /// destination buffer that has not received its bytes. The execution fence of the returned array joins the
-    /// readiness of every destination buffer, so its readiness functions and readbacks all report that error, even
-    /// a readback that reads only one replica of each tile or that reads no bytes because the array has no elements.
+    /// [`Session::synchronize`] waits for the uploads. When `readback` fails, returns bytes of the wrong size or bytes
+    /// that do not encode valid elements of the data type (refer to [`Self::from_host_buffer`]), or an upload cannot be
+    /// issued, the background job sets the error that `poison` derives from that failure on every destination buffer
+    /// that has not received its bytes. The execution fence of the returned array joins the readiness of every
+    /// destination buffer, so its readiness functions and readbacks all report that error, even a readback that reads
+    /// only one replica of each tile or that reads no bytes because the array has no elements. When no device of `mesh`
+    /// belongs to this process, there is nothing to upload, so this function submits no job and never calls `readback`.
+    /// No destination buffer could report the work that produces the value either, so the execution fence of the
+    /// returned array is `sources` instead, and the array still waits for and reports that work, as the uploads
+    /// of the processes that hold its shards do.
     ///
     /// Returns [`None`] without calling `readback` when the PJRT plugin lacks host to device transfer managers or their
     /// literal transfers (refer to [`PendingHostUpload::new`]), or when `r#type` has [`DataType::Zero`] (i.e., when
@@ -221,9 +301,19 @@ impl Array {
         }
         let (r#type, sharding, mesh, byte_count) = (uploads.r#type, uploads.sharding, uploads.mesh, uploads.byte_count);
 
+        // A process without destination buffers has nothing to upload, so it submits no job, which would only retain
+        // `readback` (and whatever it reads) until `sources` completes. No destination buffer could report the work
+        // that produces the value either, so the result waits for and reports `sources` instead.
+        if buffers.is_empty() {
+            let output = Self::from_canonical_addressable_buffers(session, r#type, Some(sharding), mesh, buffers)?;
+            return Ok(Some(output.with_execution_fence(sources)));
+        }
+
         // The background job reads the host value back once, before it prepares the bytes of the first shard, so that
-        // a failed readback poisons every destination buffer. The readback moves into a shared allocation without a
-        // copy, and the shards that are windows of it transfer straight from that allocation.
+        // a failed readback or a readback with invalid element encodings poisons every destination buffer. The readback
+        // moves into a shared allocation without a copy, and the shards that are windows of it transfer straight from
+        // that allocation.
+        let data_type = r#type.data_type();
         let mut readback = Some(readback);
         let mut host_bytes = Arc::new(Vec::new());
         let mut shards = PreparedHostShards::new(shards, element_size_in_bytes);
@@ -236,6 +326,7 @@ impl Array {
                         actual: bytes.len(),
                     }));
                 }
+                validate_host_element_encodings(data_type, &bytes)?;
                 host_bytes = Arc::new(bytes);
             }
             Ok(shards.bytes(&host_bytes, index))
@@ -266,7 +357,13 @@ impl Array {
     /// Creates an [`Array`] by uploading the dense row-major bytes for each shard owned by this process. The type
     /// describes the global array. Every process supplies bytes only for its own devices and uses the same global
     /// type, mesh, and placement. Each replica needs its own entry, and along unreduced axes the bytes represent
-    /// the partial value of that device. Shards of [`DataType::Zero`] take empty buffers and require no upload.
+    /// the partial value of that device. The replicas of one contribution (i.e., the devices that hold the same slice
+    /// and, along unreduced axes, the same coordinates) must receive equal bytes, on this process and across processes,
+    /// as for [`Self::from_addressable_buffers`]. Nothing compares them, and a readback reads only one of them, so
+    /// differing bytes make the value that the array reads back depend on which replica a readback or a later
+    /// placement selects. Shards of [`DataType::Zero`] take empty buffers and require no upload. The bytes of every
+    /// shard must encode valid elements of the data type, as for [`Self::from_host_buffer`], and are validated before
+    /// anything is uploaded.
     ///
     /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and replicates the
     /// array across `mesh` otherwise. A supplied sharding can place the array over auto mesh axes. After
@@ -287,9 +384,12 @@ impl Array {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Array`] if the type has a dynamic shape, the type and runtime sharding disagree, or
-    /// the host shards have missing or duplicate entries, unexpected devices, or incorrect byte counts. Other
-    /// placement and PJRT errors propagate from the layout and upload.
+    /// Returns [`Error::Array`] if the type has a dynamic shape, the type and runtime sharding disagree, the PJRT
+    /// client reports another process for a device than the one that the mesh assigns to it, or the host shards have
+    /// missing or duplicate entries, unexpected devices, or incorrect byte counts. Returns an [`Error::Core`] if the
+    /// layout of `r#type` does not address its shape, or one that names the data type and the first element within a
+    /// shard whose bytes do not encode a value of that data type. Other placement and PJRT errors propagate from the
+    /// layout and upload.
     pub fn from_host_shards<B: AsRef<[u8]> + HostBuffer, S: IntoIterator<Item = (DeviceId, B)>>(
         session: &Session,
         r#type: ArrayType,
@@ -303,6 +403,7 @@ impl Array {
             .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: r#type.shape().clone() }))?;
         let layout = ShardLayout::new(&shape, &mesh, &sharding)?;
         let client = session.client();
+        validate_mesh_device_processes(client, &mesh)?;
         let process_index = client.process_index()?;
         let mut devices = HashMap::new();
         for device in client.addressable_devices()? {
@@ -340,6 +441,7 @@ impl Array {
             if actual != expected {
                 return Err(ArrayError::HostShardByteCountMismatch { device_id, expected, actual }.into());
             }
+            validate_host_element_encodings(data_type, bytes.as_ref())?;
 
             if !data_type.is_zero() {
                 let memory = device.memory(r#type.memory())?;
@@ -404,9 +506,11 @@ impl Array {
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] when the current process does not hold the whole value (i.e., when
-    /// some tile, or along unreduced axes some per-device value of a tile, has no replica in this process). This is
-    /// checked before issuing any copies. PJRT transfer failures and the errors of the producing execution are
-    /// returned unchanged.
+    /// some tile, or along unreduced axes some per-device value of a tile, has no replica in this process), and
+    /// [`ProgramError::InvalidArgument`] when two devices that differ along a varying manual mesh axis hold one tile
+    /// (refer to [`Sharding::varying_manual_axes`]), because they can hold different values that one host value cannot
+    /// represent. Both are checked before issuing any copies. PJRT transfer failures and the errors of the producing
+    /// execution are returned unchanged.
     pub fn copy_to_host_bytes(&self) -> Result<Vec<u8>, Error> {
         let completion = self.execution_fence();
         let global_shape = self.shape();
@@ -608,8 +712,9 @@ impl Array {
     }
 
     /// Returns the error that [`Self::copy_to_host_bytes`] reports before it issues any copy when the current process
-    /// does not hold the whole value of this array (i.e., [`ArrayError::MissingShardBuffer`]), so that a caller which
-    /// reads the value back later can report that error right away.
+    /// does not hold the whole value of this array (i.e., [`ArrayError::MissingShardBuffer`]) or when the devices of
+    /// this array can hold different values of one tile along a varying manual mesh axis, so that a caller which reads
+    /// the value back later can report that error right away.
     pub(super) fn validate_host_readback(&self) -> Result<(), Error> {
         let global_shape = self.shape();
         if self.data_type().is_zero() || global_shape.as_slice().contains(&0) {
@@ -685,19 +790,60 @@ impl Array {
     /// selection is deterministic. The other replicas are not read, as in JAX. The tiles of a sharding are either
     /// disjoint or identical, so the selection holds the whole value exactly when the current process can assemble
     /// it (e.g., for a replicated array, or for an unreduced array whose summands each have a local replica). A tile
-    /// without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no local replica.
-    /// Returns [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution has no local
-    /// replica.
+    /// without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no local replica and
+    /// is never selected, even when this process holds one. The readback and its fence therefore never wait for the
+    /// buffer of such a tile, which the separate execution fence of the producer still covers. Returns
+    /// [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution has no local replica.
+    ///
+    /// Devices whose coordinates differ along a varying manual mesh axis (refer to [`Sharding::varying_manual_axes`])
+    /// can hold different values for one contribution, which one host value cannot represent. The selection rejects
+    /// such an array with [`ProgramError::InvalidArgument`] when two shards with elements share a contribution but
+    /// not their coordinates along those axes, which is the case for a varying axis that does not split the array.
+    /// The check reads only the metadata of every shard, so it rejects the same arrays in every process.
     fn readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<Vec<&ArrayShard>, Error> {
         let all_shards = self.shards();
         let contribution =
             |shard: &ArrayShard| (shard.slice().to_vec(), self.unreduced_coordinates(shard, unreduced_axis_indices));
+        let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
+
+        let varying_manual_axes = self.sharding().varying_manual_axes();
+        if !varying_manual_axes.is_empty() {
+            let varying_axis_indices = self
+                .mesh()
+                .logical_mesh()
+                .axes()
+                .iter()
+                .enumerate()
+                .filter(|(_, axis)| varying_manual_axes.contains(axis.name()))
+                .map(|(axis_index, _)| axis_index)
+                .collect::<Vec<_>>();
+            let mut first_shards = HashMap::new();
+            for shard in all_shards.iter().filter(required) {
+                let coordinates = self.unreduced_coordinates(shard, varying_axis_indices.as_slice());
+                let (first_index, first_coordinates) =
+                    first_shards.entry(contribution(shard)).or_insert((shard.index(), coordinates.clone()));
+                if *first_coordinates != coordinates {
+                    let axes = varying_manual_axes.iter().map(|axis| format!("`{axis}`")).collect::<Vec<_>>();
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "cannot read back an array that varies along the manual mesh axes {} as one host value, \
+                             because shards #{first_index} and #{} can hold different values of the same slice",
+                            axes.join(", "),
+                            shard.index(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
         let mut covered = HashSet::new();
         let selected = all_shards
             .iter()
+            .filter(required)
             .filter(|shard| shard.buffer().is_some() && covered.insert(contribution(shard)))
             .collect::<Vec<_>>();
-        let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
+
         let missing = all_shards.iter().filter(required).find(|shard| !covered.contains(&contribution(shard)));
         if let Some(missing) = missing {
             return Err(Error::from(ArrayError::MissingShardBuffer {
@@ -721,12 +867,12 @@ impl Array {
             .collect()
     }
 
-    /// Returns the coordinates of the device of `shard` along the unreduced axes at `unreduced_axis_indices` (refer
-    /// to [`Self::unreduced_axis_indices`]). Shards with the same tile and the same coordinates hold replicas of one
-    /// contribution to the value (e.g., one summand), which a readback needs only once.
-    fn unreduced_coordinates(&self, shard: &ArrayShard, unreduced_axis_indices: &[usize]) -> Vec<usize> {
+    /// Returns the coordinates of the device of `shard` along the mesh axes at `axis_indices` (e.g., the unreduced
+    /// axes of [`Self::unreduced_axis_indices`]). Shards with the same tile and the same coordinates along unreduced
+    /// axes hold replicas of one contribution to the value (e.g., one summand), which a readback needs only once.
+    fn unreduced_coordinates(&self, shard: &ArrayShard, axis_indices: &[usize]) -> Vec<usize> {
         match self.mesh().device_coordinates(shard.index()) {
-            Some(coordinates) => unreduced_axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
+            Some(coordinates) => axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
             None => Vec::new(),
         }
     }
@@ -786,6 +932,11 @@ impl HostBufferUploads {
             }));
         }
 
+        // Each process uploads only the shards of the devices that the mesh assigns to it, so a device of this process
+        // that the mesh assigns to another process would receive no buffer at all.
+        let client = session.client();
+        validate_mesh_device_processes(client, &mesh)?;
+
         if r#type.data_type().is_zero() {
             return Ok(Self {
                 r#type,
@@ -798,7 +949,6 @@ impl HostBufferUploads {
         }
 
         // Build a lookup table for the PJRT devices that this process can upload to directly.
-        let client = session.client();
         let client_process_index = client.process_index()?;
         let addressable_devices = client.addressable_devices()?;
         let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
@@ -1471,6 +1621,82 @@ where
     }
 }
 
+/// Validates that every device of `mesh` belongs to the process that the mesh assigns to it, as far as `client` can
+/// tell. Each process uploads, copies, or receives only the shards of the devices that the mesh assigns to it, so
+/// every array constructor (i.e., imports, uploads, and the placements onto a mesh) checks the devices of its mesh
+/// here, whether or not it holds a buffer for them, and they all reject the same meshes:
+///
+///   - **Devices of This Process:** Every device that the mesh assigns to this process must be an addressable device
+///     of `client`, because its shard would otherwise have no buffer in any process, also when this process supplies
+///     no buffer for it (e.g., for a partial import of buffers or an array of the zero data type).
+///   - **Devices of Other Processes:** A device that the mesh assigns to another process must not be a device that
+///     `client` lists for a different process (e.g., device 0 of a single process client as `Device::new(0, 1)`),
+///     which would otherwise silently receive no buffer in any process. A device that `client` does not list keeps the
+///     process that the mesh assigns to it, because it can belong to a process whose devices `client` cannot see.
+///
+/// # Errors
+///
+/// Returns [`ArrayError::NonAddressableDevice`] for the first device that the mesh assigns to this process and that
+/// `client` cannot address, [`ArrayError::DeviceProcessIndexMismatch`] for the first device that the mesh assigns to
+/// another process and whose process index differs from the one that `client` reports, and the PJRT errors of
+/// querying the devices of `client`.
+pub(super) fn validate_mesh_device_processes(client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+    let process_index = client.process_index()?;
+    if mesh.devices().iter().any(|device| device.process_index() == process_index) {
+        let addressable_device_ids =
+            client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
+        for device in mesh.devices().iter().filter(|device| device.process_index() == process_index) {
+            if !addressable_device_ids.contains(&device.id()) {
+                return Err(ArrayError::NonAddressableDevice { device_id: device.id(), process_index }.into());
+            }
+        }
+    }
+
+    let mut process_indices = None;
+    for device in mesh.devices().iter().filter(|device| device.process_index() != process_index) {
+        let process_indices = match &mut process_indices {
+            Some(process_indices) => process_indices,
+            None => process_indices.insert(
+                client
+                    .devices()?
+                    .iter()
+                    .map(|device| Ok((device.id()?, device.process_index()?)))
+                    .collect::<Result<HashMap<_, _>, PjrtError>>()?,
+            ),
+        };
+
+        if let Some(&actual) = process_indices.get(&device.id())
+            && actual != device.process_index()
+        {
+            return Err(ArrayError::DeviceProcessIndexMismatch {
+                device_id: device.id(),
+                expected: device.process_index(),
+                actual,
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates that `bytes`, which hold dense row-major elements of `data_type`, encode valid values of that data type,
+/// as the constructors of a [`ryft_core::Array`] do with [`ArrayAddressing::validate_storage_bytes`]. Only the data
+/// types whose valid encodings are a strict subset of their storage bytes can be invalid (i.e., [`DataType::Boolean`],
+/// whose bytes must be `0` or `1`, and the data types narrower than a byte, each of whose elements occupies one byte
+/// whose bits above its width must be zero), so the bytes of every other data type are not scanned.
+///
+/// # Errors
+///
+/// Returns the [`ProgramError`] of [`ArrayAddressing::validate_storage_bytes`], which names `data_type` and the
+/// row-major index of the first invalid element within `bytes`.
+fn validate_host_element_encodings(data_type: DataType, bytes: &[u8]) -> Result<(), Error> {
+    if data_type == DataType::Boolean || (1..8).contains(&data_type.bit_width()) {
+        ArrayAddressing::new(ArrayType::new_static(data_type, [bytes.len()]))?.validate_storage_bytes(bytes)?;
+    }
+    Ok(())
+}
+
 /// Returns row-major element strides for `shape`. `strides[i]` is the number of logical elements skipped when
 /// incrementing dimension `i` by one in a dense major-to-minor layout. `element_type` is only used in the error
 /// that reports a stride that overflows [`usize`].
@@ -1549,9 +1775,10 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
         Device, DeviceMesh, Dimension, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        ProgramError, Shape, Sharding, ShardingDimension, StaticShape, TiledLayout,
+        ProgramError, Shape, Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
@@ -1571,8 +1798,9 @@ mod tests {
         let r#type = ArrayType::new_static(DataType::F32, [2]);
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0]);
 
-        // Without a configured mesh or sharding, the first addressable device forms the default mesh.
-        let default_mesh = domain_mesh(client, "x", 1);
+        // Without a configured mesh or sharding, the first addressable device forms the default mesh, whose logical
+        // mesh is the single device mesh.
+        let default_mesh = domain_mesh(client, "device", 1);
         let array = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
         assert_eq!(array.r#type().into_owned(), replicated_vector_type(&default_mesh, 2));
         assert_eq!(array.mesh(), &default_mesh);
@@ -1897,6 +2125,211 @@ mod tests {
         assert!(array.shards()[0].buffer().is_none());
         assert!(!array.shards()[1].is_addressable());
         assert!(array.shards()[1].buffer().is_none());
+    }
+
+    #[test]
+    fn test_array_from_host_buffer_rejects_misattributed_devices() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let (device_id, process_index) = (local_device.id(), local_device.process_index());
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = |device: Device| DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let r#type = ArrayType::scalar(DataType::F32);
+        let bytes = values_to_bytes(&[7f32]);
+
+        // The mesh assigns the device of this process to another process, so no process would upload its shard. Both
+        // the blocking and the background upload reject it before they upload anything.
+        let misattributed = mesh(Device::new(device_id, process_index + 1));
+        let message =
+            format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1);
+        let errors = [
+            Array::from_host_buffer(&session, r#type.clone(), misattributed.clone(), None, bytes.as_slice())
+                .unwrap_err(),
+            Array::from_host_buffer_in_background(
+                &session,
+                r#type.clone(),
+                misattributed.clone(),
+                Sharding::replicated(logical_mesh.clone(), 0),
+                ExecutionFence::new(Vec::new()),
+                move || Ok(values_to_bytes(&[7f32])),
+                |error| PjrtError::internal(error.to_string()),
+            )
+            .err()
+            .unwrap(),
+        ];
+        for error in errors {
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(
+                    error.as_ref(),
+                    ArrayError::DeviceProcessIndexMismatch { device_id: id, expected, actual }
+                        if *id == device_id && *expected == process_index + 1 && *actual == process_index,
+                ),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+        session.synchronize().unwrap();
+
+        // A device that the mesh assigns to this process must be one that the client addresses, because no process
+        // would upload its shard otherwise. Every upload rejects it, including one of the zero data type, which
+        // uploads no buffer at all.
+        let missing = mesh(Device::new(device_id + 999, process_index));
+        let message =
+            format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 999);
+        let errors = [
+            Array::from_host_buffer(&session, r#type.clone(), missing.clone(), None, bytes.as_slice()).unwrap_err(),
+            Array::from_host_buffer(&session, ArrayType::scalar(DataType::Zero), missing.clone(), None, [])
+                .unwrap_err(),
+            Array::from_host_shards(&session, r#type.clone(), missing.clone(), None, Vec::<(DeviceId, &[u8])>::new())
+                .unwrap_err(),
+            Array::from_host_buffer_in_background(
+                &session,
+                r#type.clone(),
+                missing,
+                Sharding::replicated(logical_mesh.clone(), 0),
+                ExecutionFence::new(Vec::new()),
+                move || Ok(values_to_bytes(&[7f32])),
+                |error| PjrtError::internal(error.to_string()),
+            )
+            .err()
+            .unwrap(),
+        ];
+        for error in errors {
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(
+                    error.as_ref(),
+                    ArrayError::NonAddressableDevice { device_id: id, process_index: index }
+                        if *id == device_id + 999 && *index == process_index,
+                ),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+        session.synchronize().unwrap();
+
+        // A device that the client does not know can belong to a process whose devices it cannot see, so its shard is
+        // described without a buffer.
+        let remote_device = Device::new(device_id + 1, process_index + 1);
+        let remote = Array::from_host_buffer(&session, r#type, mesh(remote_device), None, bytes.as_slice()).unwrap();
+        assert_eq!(remote.mesh().devices(), [remote_device]);
+        assert_eq!(remote.addressable_shards().count(), 0);
+        assert!(remote.shards()[0].buffer().is_none());
+        assert!(remote.is_committed());
+    }
+
+    #[test]
+    fn test_array_from_host_buffer_rejects_invalid_layout() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, local_device.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let local_mesh = DeviceMesh::new(logical_mesh.clone(), vec![local_device]).unwrap();
+        let remote_mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote_device]).unwrap();
+        let rank_two = Layout::Strided(StridedLayout::new(vec![4, 4]));
+        let message = "strided layout rank 2 does not match array rank 1";
+
+        // A rank-2 layout cannot address a rank-1 shape. The blocking and the background upload reject it alike for
+        // the zero data type, whose arrays have no buffer that would reject it, and on a process that holds no shard of
+        // the array, so every process gives the same answer as the one that holds the shards.
+        let cases = [
+            (DataType::Zero, 2, local_mesh.clone(), Vec::new()),
+            (DataType::F32, 2, local_mesh, values_to_bytes(&[1f32, 2.])),
+            (DataType::F32, 2, remote_mesh.clone(), values_to_bytes(&[1f32, 2.])),
+            (DataType::F32, 0, remote_mesh, Vec::new()),
+        ];
+        for (data_type, extent, mesh, bytes) in cases {
+            let r#type = ArrayType::new_static(data_type, [extent]).with_layout(rank_two.clone());
+            let blocking = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, bytes.as_slice());
+            let background = Array::from_host_buffer_in_background(
+                &session,
+                r#type,
+                mesh,
+                Sharding::replicated(logical_mesh.clone(), 1),
+                ExecutionFence::new(Vec::new()),
+                move || Ok(bytes),
+                |error| PjrtError::internal(error.to_string()),
+            );
+            for error in [blocking.err().unwrap(), background.err().unwrap()] {
+                assert!(matches!(
+                    &error,
+                    Error::Core(error) if **error == CoreError::Type(TypeError::invalid(message)),
+                ));
+                assert_eq!(error.to_string(), message);
+            }
+        }
+        session.synchronize().unwrap();
+    }
+
+    #[test]
+    fn test_array_from_host_buffer_rejects_invalid_element_encodings() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let invalid = |data_type: DataType, element: usize, byte: u8| {
+            CoreError::Program(ProgramError::Type(TypeError::invalid(format!(
+                "array element {element} has invalid `{data_type}` byte encoding [{byte}]",
+            ))))
+        };
+
+        // A Boolean byte must be `0` or `1`, and the bits of a sub-byte element above its width must be zero, as for a
+        // host array of the reference backend, because a typed readback of the array would fail otherwise. Every
+        // process validates the whole host value, so all of them reject it alike.
+        let cases = [
+            (DataType::Boolean, vec![1, 2], 1, 2),
+            (DataType::I1, vec![2, 0], 0, 2),
+            (DataType::U1, vec![0, 2], 1, 2),
+            (DataType::U4, vec![0x0f, 0xf7], 1, 0xf7),
+            (DataType::F4E2M1FN, vec![0x10, 0x0f], 0, 0x10),
+        ];
+        for (data_type, bytes, element, byte) in cases {
+            let r#type = ArrayType::new_static(data_type, [2]);
+            assert!(matches!(
+                Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes),
+                Err(Error::Core(error)) if *error == invalid(data_type, element, byte),
+            ));
+        }
+
+        // The background upload reads its bytes only once it runs, so its validation failure poisons the buffers of
+        // the array that it already returned.
+        let background = Array::from_host_buffer_in_background(
+            &session,
+            ArrayType::new_static(DataType::Boolean, [2]),
+            mesh.clone(),
+            Sharding::replicated(mesh.logical_mesh().clone(), 1),
+            ExecutionFence::new(Vec::new()),
+            || Ok(vec![1, 2]),
+            |error| PjrtError::internal(error.to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        let message = invalid(DataType::Boolean, 1, 2).to_string();
+        assert!(matches!(
+            background.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Internal { message: actual, .. })) if actual == message,
+        ));
+
+        // Valid encodings upload and read back unchanged, and the data types whose every byte pattern is valid accept
+        // any byte.
+        let cases = [
+            (DataType::Boolean, vec![1, 0]),
+            (DataType::I1, vec![1, 0]),
+            (DataType::U4, vec![0x0f, 0x07]),
+            (DataType::U8, vec![0xff, 0xf7]),
+            (DataType::F8E4M3FN, vec![0xff, 0x80]),
+        ];
+        for (data_type, bytes) in cases {
+            let r#type = ArrayType::new_static(data_type, [2]);
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes.clone()).unwrap();
+            assert_eq!(array.copy_to_host_bytes().unwrap(), bytes);
+            assert_eq!(array.copy_to_host().unwrap().storage_bytes(), bytes.as_slice());
+        }
+        assert!(matches!(
+            session.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if failures.iter().map(|(_, error)| error.to_string()).collect::<Vec<_>>() == [message.as_str()],
+        ));
     }
 
     #[test]
@@ -2262,6 +2695,48 @@ mod tests {
     }
 
     #[test]
+    fn test_array_from_host_buffer_in_background_without_local_devices() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, local_device.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote_device]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1);
+
+        // No device of the mesh belongs to this process, so there is nothing to upload. No job retains the readback
+        // (and whatever it reads) until the sources complete, and the result waits for and reports those sources.
+        let (event, producer) = client.event(()).unwrap();
+        let retained = Arc::new(());
+        let readback_retained = Arc::clone(&retained);
+        let placed = Array::from_host_buffer_in_background(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            mesh.clone(),
+            sharding.clone(),
+            ExecutionFence::new(vec![event]),
+            move || -> Result<Vec<u8>, Error> {
+                let _retained = readback_retained;
+                panic!("a process without destination devices must not read the value back")
+            },
+            |error| PjrtError::aborted(format!("upload failed: {error}")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(Arc::strong_count(&retained), 1);
+        assert_eq!(placed.mesh(), &mesh);
+        assert_eq!(placed.sharding(), &sharding);
+        assert_eq!(placed.addressable_shards().count(), 0);
+        assert_eq!(placed.execution_fence().unwrap().is_ready(), Ok(false));
+        producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
+        assert!(matches!(
+            placed.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "producer failed",
+        ));
+        session.synchronize().unwrap();
+    }
+
+    #[test]
     fn test_array_from_host_buffer_in_background_pending_sources() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -2352,6 +2827,59 @@ mod tests {
             failures.iter().map(|(_, error)| error.to_string()).collect::<Vec<_>>(),
             vec!["upload failed: source failed", "source failed"],
         );
+    }
+
+    #[test]
+    fn test_array_from_host_buffer_in_background_without_local_shards() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, local_device.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote_device]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1);
+        let upload = |sources: ExecutionFence| {
+            Array::from_host_buffer_in_background(
+                &session,
+                ArrayType::new_static(DataType::F32, [2]),
+                mesh.clone(),
+                sharding.clone(),
+                sources,
+                || Ok(values_to_bytes(&[1f32, 2.])),
+                |error| PjrtError::internal(error.to_string()),
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        // This process holds no destination shard, so no upload of its own can report the producer of the value. The
+        // result waits for the sources instead, as the uploads of the processes that hold the shards do.
+        let (event, producer) = client.event(()).unwrap();
+        let array = upload(ExecutionFence::new(vec![event]));
+        assert_eq!(array.mesh(), &mesh);
+        assert_eq!(array.sharding(), &sharding);
+        assert_eq!(array.addressable_shards().count(), 0);
+        assert!(array.shards()[0].buffer().is_none());
+        assert!(matches!(array.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false))));
+        producer.set(None).unwrap();
+        assert_eq!(array.block_until_ready().map_err(|error| error.to_string()), Ok(()));
+        assert!(matches!(
+            array.copy_to_host_bytes(),
+            Err(Error::Array(error)) if matches!(
+                error.as_ref(),
+                ArrayError::MissingShardBuffer { shard_index: 0, device_id } if *device_id == remote_device.id(),
+            ),
+        ));
+
+        // A failed producer fails the readiness of the result.
+        let (event, producer) = client.event(()).unwrap();
+        let array = upload(ExecutionFence::new(vec![event]));
+        producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
+        assert!(matches!(
+            array.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "producer failed",
+        ));
+        session.synchronize().unwrap();
     }
 
     #[test]
@@ -2484,6 +3012,118 @@ mod tests {
     }
 
     #[test]
+    fn test_array_from_host_shards_rejects_misattributed_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let misattributed = Device::new(devices[1].id(), devices[1].process_index() + 1);
+        let mesh = DeviceMesh::new(logical_mesh, vec![devices[0], misattributed]).unwrap();
+
+        // The mesh assigns the second device of this process to another process, so this process would upload only
+        // the shard of the first one, and no process would upload the shard of the second.
+        let error = Array::from_host_shards(
+            &session,
+            ArrayType::new_static(DataType::U8, [1]),
+            mesh,
+            None,
+            [(devices[0].id(), [7u8].as_slice())],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }
+                    if *device_id == devices[1].id()
+                        && *expected == devices[1].process_index() + 1
+                        && *actual == devices[1].process_index(),
+            ),
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "device {} reports process index {}, but expected {}",
+                devices[1].id(),
+                devices[1].process_index(),
+                devices[1].process_index() + 1,
+            ),
+        );
+        session.synchronize().unwrap();
+    }
+
+    #[test]
+    fn test_array_from_host_shards_rejects_invalid_layout() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote_device = Device::new(local_device.id() + 1, local_device.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let local_mesh = DeviceMesh::new(logical_mesh.clone(), vec![local_device]).unwrap();
+        let remote_mesh = DeviceMesh::new(logical_mesh, vec![remote_device]).unwrap();
+        let rank_two = Layout::Strided(StridedLayout::new(vec![4, 4]));
+        let message = "strided layout rank 2 does not match array rank 1";
+
+        // A rank-2 layout cannot address a rank-1 shape, which is rejected for the zero data type, whose shards take no
+        // buffer, and on a process that holds no shard of the array, as on the process that holds them.
+        let cases = [
+            (DataType::Zero, local_mesh.clone(), vec![(local_device.id(), Arc::<[u8]>::from([]))]),
+            (DataType::F32, local_mesh, vec![(local_device.id(), Arc::from(values_to_bytes(&[1f32, 2.])))]),
+            (DataType::F32, remote_mesh, Vec::new()),
+        ];
+        for (data_type, mesh, shards) in cases {
+            let r#type = ArrayType::new_static(data_type, [2]).with_layout(rank_two.clone());
+            let error = Array::from_host_shards(&session, r#type, mesh, None, shards).unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Core(error) if **error == CoreError::Type(TypeError::invalid(message)),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+        session.synchronize().unwrap();
+    }
+
+    #[test]
+    fn test_array_from_host_shards_rejects_invalid_element_encodings() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices =
+            client.addressable_devices().unwrap().iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // The element of a shard that does not encode a value of the data type is rejected before anything is uploaded,
+        // and the error names its position within that shard.
+        let cases = [
+            (DataType::Boolean, [[1u8, 0], [0, 2]], 1, 2),
+            (DataType::I1, [[3, 0], [0, 1]], 0, 3),
+            (DataType::U4, [[0x0f, 0x07], [0xf7, 0x00]], 0, 0xf7),
+        ];
+        for (data_type, [first, second], element, byte) in cases {
+            let r#type = ArrayType::new_static(data_type, [4]);
+            let shards = [(devices[0], Arc::<[u8]>::from(first)), (devices[1], Arc::from(second))];
+            assert!(matches!(
+                Array::from_host_shards(&session, r#type, mesh.clone(), Some(sharding.clone()), shards),
+                Err(Error::Core(error)) if *error == CoreError::Program(ProgramError::Type(TypeError::invalid(
+                    format!("array element {element} has invalid `{data_type}` byte encoding [{byte}]"),
+                ))),
+            ));
+        }
+        session.synchronize().unwrap();
+
+        // Valid encodings upload and read back unchanged.
+        let r#type = ArrayType::new_static(DataType::U4, [4]);
+        let shards = [(devices[0], Arc::<[u8]>::from([0x0f, 0x07])), (devices[1], Arc::from([0x00, 0x01]))];
+        let array = Array::from_host_shards(&session, r#type, mesh, Some(sharding), shards).unwrap();
+        assert_eq!(array.copy_to_host_bytes().unwrap(), [0x0f, 0x07, 0x00, 0x01]);
+    }
+
+    #[test]
     fn test_array_copy_to_host() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -2582,6 +3222,44 @@ mod tests {
         assert_eq!(array.shards()[1].slice(), [1..1]);
         array.validate_host_readback().unwrap();
         assert_eq!(array.copy_to_host_bytes().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn test_array_copy_to_host_bytes_empty_local_shard() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // A single element split over two devices leaves the second shard without elements. Its buffer stays pending
+        // and then fails, but the first shard holds the whole value, so the readback neither waits for nor reports it.
+        let first = client.buffer([7u8].as_slice(), BufferType::U8, [1u64], None, devices[0].clone(), None).unwrap();
+        let specification = BufferSpecification::new(BufferType::U8, [0u64]);
+        let manager = client
+            .host_to_device_transfer_manager(vec![specification], devices[1].default_memory().unwrap())
+            .unwrap();
+        let empty = manager.retrieve_buffer(0).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let array =
+            Array::from_addressable_buffers(&session, r#type, mesh, Some(sharding), vec![first, empty]).unwrap();
+        assert_eq!(array.shards()[1].slice(), [1..1]);
+        assert!(!array.shards()[1].buffer().unwrap().ready().unwrap().ready().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let readback = array.clone();
+        let reader = thread::spawn(move || sender.send(readback.copy_to_host_bytes().unwrap()).unwrap());
+        assert_eq!(receiver.recv_timeout(WAIT_TIMEOUT).unwrap(), vec![7]);
+        reader.join().unwrap();
+        array.host_readback_fence().unwrap().block_until_ready().unwrap();
+
+        // The failure of the empty buffer still surfaces through the readiness of the array, which waits for every
+        // buffer, but not through the readback.
+        manager.set_error(0, PjrtError::aborted("empty shard failed")).unwrap();
+        assert_eq!(array.copy_to_host_bytes().unwrap(), vec![7]);
+        assert!(matches!(
+            array.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "empty shard failed",
+        ));
     }
 
     #[test]
@@ -2794,6 +3472,54 @@ mod tests {
         // Boolean summands combine with logical or, whose identity is `false`.
         assert_eq!(readback([1, 0], [0, 0]), vec![1, 0]);
         assert_eq!(readback([1, 0], [1, 1]), vec![1, 1]);
+    }
+
+    #[test]
+    fn test_array_copy_to_host_bytes_rejects_varying_manual_axes() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let upload = |sharding: Sharding, shape: [usize; 1]| {
+            let shards = [(devices[0].id(), [1u8].as_slice()), (devices[1].id(), [2u8].as_slice())];
+            let r#type = ArrayType::new_static(DataType::U8, shape);
+            Array::from_host_shards(&session, r#type, mesh.clone(), Some(sharding), shards).unwrap()
+        };
+
+        // The two devices hold different values of the same slice, which one dense host value cannot represent, so
+        // the readback is rejected before any copy, while each shard stays readable on its own.
+        let varying = Sharding::replicated(logical_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let array = upload(varying.clone(), [1]);
+        assert_eq!(array.sharding(), &varying);
+        assert_eq!(
+            array.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
+            [[1], [2]],
+        );
+        let message = "cannot read back an array that varies along the manual mesh axes `m` as one host value, because \
+                       shards #0 and #1 can hold different values of the same slice";
+        for error in [array.copy_to_host_bytes().unwrap_err(), array.validate_host_readback().unwrap_err()] {
+            assert!(matches!(
+                &error,
+                Error::Core(error) if **error == CoreError::Program(ProgramError::InvalidArgument {
+                    message: message.to_string(),
+                }),
+            ));
+            assert_eq!(error.to_string(), message);
+        }
+        assert_eq!(array.host_readback_fence().err().map(|error| error.to_string()), Some(message.to_string()));
+
+        // Shards that vary along a manual axis that splits the array hold distinct slices, so they read back densely.
+        let split = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["m"])])
+            .unwrap()
+            .with_varying_manual_axes(["m"])
+            .unwrap();
+        assert_eq!(upload(split, [2]).copy_to_host_bytes().unwrap(), [1, 2]);
     }
 
     #[test]

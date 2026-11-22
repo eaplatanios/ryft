@@ -15,6 +15,11 @@ crate is an umbrella crate that re-exports functionality from a few different cr
 - **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
 - **`ryft-kernels`:** Portable kernel authoring, verification, and interpretation over `ryft-core` programs, plus the
   `KernelCompiler` contract that native kernel compilers implement. The compiler adapters live in the backend crates.
+- **`ryft-models`:** Model definitions over the backend-independent array capabilities of `ryft-core`, together with
+  checkpoint readers and importers, codecs for packed low precision weights, tokenizers, and conversation renderers.
+- **`ryft-optimizers`:** Composable gradient-based optimizers over `ryft-core` parameter structures (e.g., AdamW).
+- **`ryft-experiments`:** End-to-end experiments that combine the models and optimizers with the XLA backend. This
+  crate is not re-exported by `ryft`.
 - **Backends:**
   - **`ryft-xla`:** XLA backend for `ryft`.
 - **Runtimes:**
