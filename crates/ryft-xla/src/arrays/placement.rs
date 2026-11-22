@@ -68,28 +68,27 @@ use crate::arrays::shards::ArrayShard;
 use crate::arrays::{Array, ArrayError};
 use crate::{Error, FromPjrt, Session, Value};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Options of [`Session::place`].
+/// Options of [`Session::place`]. The four type parameters describe whole tree prefixes. Each option can be a single
+/// value that applies to the entire input, or a tuple or other parameterized tree that sets different values for
+/// different branches. [`Session::place`] broadcasts these prefixes over the input and applies the resulting options
+/// leafwise:
 ///
-/// The four type parameters describe whole tree prefixes. Each option can be a single value that applies to the
-/// entire input, or a tuple or other parameterized tree that sets different values for different branches.
-/// [`Session::place`] broadcasts these prefixes over the input and applies the resulting options leafwise.
-///
-///   - `Target` specifies the destination, and `Source` describes the expected input placement. Their leaves
-///     implement [`PlacementRequestParameter`]. To mix resolved placements and requests in one prefix, convert the
-///     resolved placements with [`PlacementRequest::from`].
-///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the result when
-///     donation is possible.
-///   - `MayAlias` has leaves that convert into `Option<bool>`. A `false` or `Some(false)` leaf requests a copy,
-///     `true` or `Some(true)` permits sharing, and `None` leaves the policy unspecified for that branch.
+///   - `Target` specifies the destination, and `Source` describes the expected input placement. Their leaves implement
+///     [`PlacementRequestParameter`]. To mix resolved placements and requests in one prefix, convert the resolved
+///     placements with [`PlacementRequest::from`].
+///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the result when donation
+///     is possible.
+///   - `MayAlias` has leaves that convert into `Option<bool>`. A `false` or `Some(false)` leaf requests a copy, `true`
+///     or `Some(true)` permits sharing, and `None` leaves the policy unspecified for that branch.
 ///
 /// Each field is optional, so `None` can omit an entire prefix. Omitting `donate` disables donation, and omitting
 /// `may_alias` leaves the policy unspecified. `Donate` and `MayAlias` both default to the single-leaf type `bool`,
 /// giving both fields type `Option<bool>` by default. An explicit aliasing tree can use `Option<bool>` leaves to set
 /// a policy for some branches and leave others unspecified.
 ///
-/// For a two-element input, these options request donation of the first element and a copy of the second.
+/// # Example
+///
+/// For a two-element input, these options request donation of the first element and a copy of the second:
 ///
 /// ```rust
 /// # use ryft_xla::PlacementOptions;
@@ -121,6 +120,8 @@ pub struct PlacementOptions<Target = PlacementRequest, Source = PlacementRequest
     /// it, because their uploads never share buffers. Refer to [`Session::place`] for more information.
     may_alias: Option<MayAlias>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, MayAlias> {
     /// Creates a new [`PlacementOptions`].
@@ -408,7 +409,7 @@ impl Placeable for Array {
         // so that `into_unaliased` copies exactly those, and not the buffers that the placement created.
         if may_alias == Some(false) {
             let _buffers = buffers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            output.into_unaliased(session)
+            output.into_unaliased()
         } else {
             Ok(output)
         }
@@ -600,14 +601,14 @@ impl Array {
     /// [`Self::with_copied_shard_buffers`], so the execution fence of the result joins the readiness of every copy with
     /// the fence of this array, because a readback reads only one replica of each tile and would otherwise succeed with
     /// a replica whose copy did not fail.
-    pub(crate) fn into_unaliased(self, session: &Session) -> Result<Self, Error> {
+    pub(crate) fn into_unaliased(self) -> Result<Self, Error> {
         // Clones of this array share its parts, and with them every one of its buffers.
         let has_clones = Arc::strong_count(&self.parts) != 1;
         let is_shared = |buffer: &Arc<Buffer<'static>>| has_clones || Arc::strong_count(buffer) != 1;
         if !self.addressable_shards().filter_map(ArrayShard::buffer).any(is_shared) {
             return Ok(self.with_new_identity());
         }
-        self.with_copied_shard_buffers(session, is_shared)
+        self.with_copied_shard_buffers(is_shared)
     }
 }
 
@@ -1698,7 +1699,7 @@ mod tests {
         // An array that is the only handle of its buffers is returned as it is.
         let array = upload();
         let addresses = buffer_addresses(&array);
-        let unaliased = array.into_unaliased(&session).unwrap();
+        let unaliased = array.into_unaliased().unwrap();
         assert_eq!(buffer_addresses(&unaliased), addresses);
 
         // Only the buffers that another handle shares are copied, and the others are kept.
@@ -1706,7 +1707,7 @@ mod tests {
         let addresses = buffer_addresses(&array);
         let native_addresses = native_buffer_addresses(&array);
         let held = Arc::clone(array.shards()[0].buffer().unwrap());
-        let unaliased = array.into_unaliased(&session).unwrap();
+        let unaliased = array.into_unaliased().unwrap();
         assert!(!Arc::ptr_eq(unaliased.shards()[0].buffer().unwrap(), &held));
         assert_ne!(native_buffer_addresses(&unaliased)[0], native_addresses[0]);
         assert_eq!(buffer_addresses(&unaliased)[1], addresses[1]);
@@ -1715,7 +1716,7 @@ mod tests {
 
         // A clone shares every buffer, so all of them are copied.
         let array = upload();
-        let unaliased = array.clone().into_unaliased(&session).unwrap();
+        let unaliased = array.clone().into_unaliased().unwrap();
         for (unaliased_shard, shard) in unaliased.shards().iter().zip(array.shards()) {
             assert!(!Arc::ptr_eq(unaliased_shard.buffer().unwrap(), shard.buffer().unwrap()));
         }
@@ -1731,9 +1732,9 @@ mod tests {
 
         // The copies keep the commitment of the array.
         let array = upload().with_committed(false);
-        let unaliased = array.clone().into_unaliased(&session).unwrap();
+        let unaliased = array.clone().into_unaliased().unwrap();
         assert!(!unaliased.is_committed());
-        assert!(array.into_unaliased(&session).unwrap().with_committed(true).is_committed());
+        assert!(array.into_unaliased().unwrap().with_committed(true).is_committed());
     }
 
     #[test]
