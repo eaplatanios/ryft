@@ -1597,7 +1597,6 @@ pub(crate) fn placement_request<O: LowerableOperationFamily>(operation: &O) -> O
 ///
 /// Returns [`LoweringError::UnsupportedOperation`] when two requests name different devices, which no single mesh
 /// runs, and the error of forming the mesh of a device target.
-#[cfg_attr(not(test), expect(dead_code, reason = "eager dispatch of operations with regions is about to call it"))]
 pub(crate) fn requested_placement_mesh<'r, V: Value<Type = Type> + Typed + 'r, O: LowerableOperationFamily + 'r>(
     regions: impl IntoIterator<Item = RegionRef<'r, V, O>>,
 ) -> Result<Option<Cow<'r, DeviceMesh>>, Error> {
@@ -6104,10 +6103,13 @@ pub(crate) mod tests {
             let mut builder = ArrayIrProgramBuilder::new();
             let mut value = builder.add_input(vector_type.clone().into());
             for target in targets {
-                value = builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![value], None).unwrap()
-                    [0];
+                value = builder
+                    .add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![value], None)
+                    .unwrap()[0];
             }
-            builder.build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap()
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+                .unwrap()
         };
         let requested = |program: &FlatProgram| {
             requested_placement_mesh(program.entry_region_ref().computation_regions())

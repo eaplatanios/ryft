@@ -45,6 +45,36 @@ use crate::arrays::{Array, ArrayParts};
 /// a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither
 /// would ever be released, including the device buffers.
 ///
+/// # Logical Identity
+///
+/// Two retained arrays are equal when they retain the same logical array with the same commitment. Lowering passes
+/// each distinct retained array of a program as one hidden argument of its executable, and the identity of a program
+/// and its cache keys include its constants, so every process of a distributed program must decide alike whether two
+/// retained arrays are equal. The logical identity of an array is therefore decided by the operation that produced it,
+/// never by whether this process held buffers to copy or to reuse, and every function that returns an array from
+/// another array follows these rules on every process:
+///
+///   - **Same Array:** A clone, a change of the session of an array (e.g., [`Session::place`] of an [`Array`] without
+///     a destination and without a forced copy), and a placement whose destination is the mesh, the sharding, the
+///     memory, and the layout that the array already has, including an in-place destination that names its current
+///     storage, return the array itself, unless the array has locally assigned devices and the destination names
+///     devices. Whether a destination is the placement of an array reads only its type and placement metadata, which
+///     every process shares for an array whose devices it did not choose on its own. A change of commitment keeps the
+///     array as well, and retaining it then gives another retained array, because commitment is part of the identity
+///     of a retained array (refer to [`RetainedArray`]).
+///   - **New Array:** A forced copy (i.e., a placement with `may_alias` set to `false` of [`Session::place`] or of a
+///     staged [`PlaceOperation`](ryft_core::PlaceOperation)), also on a process that holds no buffer of its input or
+///     holds every one of them alone, a placement of an array with locally assigned devices on a destination that
+///     names devices, also on a process whose devices already hold that destination, every other placement (e.g., one
+///     that changes the devices, the sharding, the memory, or the layout, whether it shares, copies, transfers, or
+///     uploads buffers, and on a process that holds no buffer of its result), the move of an input to the devices that
+///     an operation runs on, and an array that a retained array is turned back into ([`RetainedArray::to_array`]) are
+///     new arrays.
+///
+/// Donation never changes these rules, because it only consumes the input. An operation whose result is a new array
+/// but that would return the storage of its input on some process gets storage of its own from one function,
+/// `Array::with_new_identity`.
+///
 /// # Ownership
 ///
 /// A retained array owns its shards, and its clones share them. The programs, regions, derivative rules, and caches
@@ -237,10 +267,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DataType, DimensionBounds, DimensionVariable, ShardingDimension};
+    use ryft_core::{DataType, Device, DimensionBounds, DimensionVariable, Memory, ShardingDimension};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::sessions::tests::{domain_mesh, f32_scalar, replicated_scalar_type, shares_effect_scope};
     use crate::tests::{cpu_client, execution_client, hash_of, other_cpu_client, values_to_bytes};
+    use crate::{FromPjrt, PlacementOptions};
 
     use super::*;
 
@@ -426,6 +458,116 @@ mod tests {
         assert_eq!(retained, RetainedArray::new(&first));
         assert_ne!(retained, RetainedArray::new(&second));
         assert_ne!(retained, RetainedArray::new(&first.with_committed(true)));
+    }
+
+    #[test]
+    fn test_retained_array_eq_follows_the_producing_operation_on_every_process() {
+        // Two single-device clients stand for two processes. Each places a scalar on the device of process 0, so that
+        // only process 0 holds a buffer of it, and derives arrays from it with every function that returns an array
+        // from an array. Whether a result is the same retained array as its input must follow from the function alone.
+        let clients = [0, 1].map(|process| {
+            let options = CpuClientOptions { device_count: Some(1), process_id: Some(process) };
+            let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+            let client: &'static Client<'static> = Box::leak(Box::new(client));
+            client
+        });
+        let device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
+        let rows = clients.map(|client| {
+            let session = Session::builder().client(client).build().unwrap();
+            let local = session.place(4f32, PlacementOptions::defaults()).unwrap();
+            let array = session.place(local.clone(), PlacementOptions::to(device)).unwrap();
+            let holds_buffer = client.process_index().unwrap() == 0;
+            assert_eq!(array.addressable_shards().count(), usize::from(holds_buffer));
+            let copy = PlacementOptions::defaults().with_may_alias(false);
+            let copy_on_device = PlacementOptions::to(device).with_may_alias(false);
+            let donated_copy = PlacementOptions::defaults().with_donate(true).with_may_alias(false);
+
+            // Commitment is part of the identity of a retained array but not of the logical array, so the input is
+            // compared with the commitment of each result.
+            let same = |input: &Array, output: &Array| {
+                RetainedArray::new(output) == RetainedArray::new(&input.clone().with_committed(output.is_committed()))
+            };
+            let mut rows = vec![
+                ("clone", same(&array, &array.clone())),
+                (
+                    "place without a destination",
+                    same(&array, &session.place(array.clone(), PlacementOptions::defaults()).unwrap()),
+                ),
+                (
+                    "place on its own placement",
+                    same(&array, &session.place(array.clone(), PlacementOptions::to(device)).unwrap()),
+                ),
+                ("to_placement on its own placement", same(&array, &array.to_placement(&session, device).unwrap())),
+                (
+                    "into_placement on its own placement",
+                    same(&array, &array.clone().into_placement(&session, device).unwrap()),
+                ),
+                (
+                    "in-place placement in its own memory",
+                    same(&array, &array.to_placement(&session, Memory::Device).unwrap()),
+                ),
+                (
+                    "in-place placement of a locally assigned array",
+                    same(&local, &local.to_placement(&session, Memory::Device).unwrap()),
+                ),
+                ("forced copy", same(&array, &session.place(array.clone(), copy.clone()).unwrap())),
+                (
+                    "forced copy on its own placement",
+                    same(&array, &session.place(array.clone(), copy_on_device).unwrap()),
+                ),
+                ("donated forced copy", same(&array, &session.place(array.clone(), donated_copy).unwrap())),
+                ("unaliased", same(&array, &array.clone().into_unaliased(&session).unwrap())),
+                ("copied shard buffers", same(&array, &array.with_copied_shard_buffers(&session, |_| true).unwrap())),
+                (
+                    "reshard on its own devices",
+                    same(
+                        &array,
+                        &array.clone().reshard_on_devices(&session, array.mesh(), array.sharding(), false).unwrap(),
+                    ),
+                ),
+                ("restored retained array", same(&array, &RetainedArray::new(&array).to_array(&session).unwrap())),
+                (
+                    "place of a locally assigned array",
+                    same(&local, &session.place(local.clone(), PlacementOptions::to(device)).unwrap()),
+                ),
+                (
+                    "to_placement of a locally assigned array",
+                    same(&local, &local.to_placement(&session, device).unwrap()),
+                ),
+            ];
+
+            // A forced copy of the only handle of an array is a new array as well, when a retained array refers to it.
+            let retained = RetainedArray::new(&array);
+            rows.push((
+                "forced copy of the only handle",
+                retained == RetainedArray::new(&session.place(array, copy).unwrap()),
+            ));
+            rows
+        });
+
+        assert_eq!(rows[0], rows[1]);
+        assert_eq!(
+            rows[0],
+            vec![
+                ("clone", true),
+                ("place without a destination", true),
+                ("place on its own placement", true),
+                ("to_placement on its own placement", true),
+                ("into_placement on its own placement", true),
+                ("in-place placement in its own memory", true),
+                ("in-place placement of a locally assigned array", true),
+                ("forced copy", false),
+                ("forced copy on its own placement", false),
+                ("donated forced copy", false),
+                ("unaliased", false),
+                ("copied shard buffers", false),
+                ("reshard on its own devices", false),
+                ("restored retained array", false),
+                ("place of a locally assigned array", false),
+                ("to_placement of a locally assigned array", false),
+                ("forced copy of the only handle", false),
+            ],
+        );
     }
 
     #[test]

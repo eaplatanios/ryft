@@ -119,6 +119,7 @@ use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plu
 use crate::arrays::host::HostUploadWorkers;
 use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
+use crate::lowering::requested_placement_mesh;
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
@@ -765,10 +766,16 @@ impl Session {
     /// axes (e.g., one that partitions a dimension along an axis of size one). An uncommitted input on more than one
     /// device only arises from crate internals that clear the commitment of an array explicitly, and the rules above
     /// still apply to it.
+    ///
+    /// `requested` is the mesh that the regions of an operation without committed operands request placements onto
+    /// (refer to [`requested_placement_mesh`]), which is then the target mesh instead, so that every uncommitted input
+    /// that lives elsewhere moves there by the rules above, as the uncommitted arguments of an eager call of a function
+    /// that names devices move onto its mesh.
     fn place_uncommitted_inputs(
         &self,
         inputs: &[Array],
         captures: &[RetainedArray],
+        requested: Option<&DeviceMesh>,
     ) -> Result<Option<Vec<Array>>, ProgramError> {
         // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
         // equality settles the common case without comparing meshes.
@@ -777,8 +784,13 @@ impl Session {
         };
 
         let first_mesh = first.mesh();
+        let shares_mesh = |mesh: &DeviceMesh, other: &DeviceMesh| std::ptr::eq(mesh, other) || mesh == other;
         let operand_meshes = || inputs.iter().skip(1).map(Array::mesh).chain(captures.iter().map(RetainedArray::mesh));
-        if operand_meshes().all(|mesh| std::ptr::eq(mesh, first_mesh) || mesh == first_mesh) {
+        let stays = match requested {
+            Some(requested) => inputs.iter().all(|input| shares_mesh(input.mesh(), requested)),
+            None => operand_meshes().all(|mesh| shares_mesh(mesh, first_mesh)),
+        };
+        if stays {
             return Ok(None);
         }
 
@@ -795,15 +807,16 @@ impl Session {
             .map(Array::mesh)
             .chain(captures.iter().filter(|capture| capture.is_committed()).map(RetainedArray::mesh));
         let default_mesh;
-        let target = match committed_meshes.next() {
-            Some(target) => {
+        let target = match (requested, committed_meshes.next()) {
+            (Some(requested), _) => requested,
+            (None, Some(target)) => {
                 let target_device_ids = device_ids(target);
                 if committed_meshes.any(|mesh| device_ids(mesh) != target_device_ids) {
                     return Ok(None);
                 }
                 target
             }
-            None => {
+            (None, None) => {
                 let first_device_ids = device_ids(first_mesh);
                 if operand_meshes().all(|mesh| device_ids(mesh) == first_device_ids) {
                     return Ok(None);
@@ -1153,10 +1166,28 @@ impl Context for Session {
                 .collect::<Vec<_>>()
         };
 
+        // An operation with regions whose regions request placements onto devices names those devices, as a compiled
+        // function that names devices does (refer to `requested_placement_mesh`), so without committed operands it
+        // runs on them. Committed operands decide the mesh instead, and the compilation of the program rejects a
+        // region that places a value onto other devices. An operation without regions, which is the common case, pays
+        // for the first test alone, and one whose regions request no devices behaves as if they requested none.
+        let requested_mesh = if has_regions
+            && !is_call
+            && !array_inputs.iter().any(Array::is_committed)
+            && !captures.iter().any(RetainedArray::is_committed)
+        {
+            requested_placement_mesh(computation_regions())
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+                .map(Cow::into_owned)
+        } else {
+            None
+        };
+
         // Uncommitted inputs follow committed inputs and captures, so they are moved to the mesh of those before
         // anything observes their placement. Everything that follows, including type inference, the eager dispatch
         // cache key, and the mesh that `Self::device_mesh_for` selects, sees the inputs after the move.
-        let moved_array_inputs = self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice())?;
+        let moved_array_inputs =
+            self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice(), requested_mesh.as_ref())?;
         let moved_inputs = if let Some(moved_array_inputs) = moved_array_inputs {
             // Placement returns one replacement for each array in `inputs`, in order. Splitting at those slots
             // gives one run of non-array inputs before each replacement and one trailing run.
@@ -1386,8 +1417,8 @@ impl Context for Session {
 
         // The program runs on the mesh of its first array input. Without array inputs, a committed capture decides
         // where it runs, like a committed input would, except for a call, whose captures take no part. A call with
-        // a boundary runs on the mesh of that boundary.
-        let operand_mesh = call_mesh.as_ref().or_else(|| {
+        // a boundary runs on the mesh of that boundary, and an operation whose regions request devices runs on them.
+        let operand_mesh = call_mesh.as_ref().or(requested_mesh.as_ref()).or_else(|| {
             array_inputs
                 .first()
                 .map(Array::mesh)
@@ -4927,7 +4958,10 @@ pub(crate) mod tests {
         let uncommitted = session.place(2f32, PlacementOptions::defaults()).unwrap();
         assert_ne!(uncommitted.mesh(), &mesh);
         assert_eq!(uncommitted.mesh().devices(), mesh.devices());
-        let moved = session.place_uncommitted_inputs(&[uncommitted.clone(), committed.clone()], &[]).unwrap().unwrap();
+        let moved = session
+            .place_uncommitted_inputs(&[uncommitted.clone(), committed.clone()], &[], None)
+            .unwrap()
+            .unwrap();
         assert_eq!(moved[0].mesh(), &mesh);
         assert!(!moved[0].is_committed());
         assert!(Arc::ptr_eq(moved[0].shards()[0].buffer().unwrap(), uncommitted.shards()[0].buffer().unwrap()));
