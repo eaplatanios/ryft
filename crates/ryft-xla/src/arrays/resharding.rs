@@ -1160,7 +1160,7 @@ impl Array {
             Arc::new(staged)
         };
         let current_layout = buffer.specification()?.layout;
-        let exactly_sized = holds_exact_shape(&buffer, &shard.shape())?;
+        let exactly_sized = holds_exact_shape(&buffer, shard.shape().as_slice())?;
         if exactly_sized && current_layout == *layout {
             return Ok(buffer);
         }
@@ -1363,14 +1363,18 @@ impl Array {
 
     /// Plans the moves of the regions that place this array according to `layout`, which are the nonempty
     /// intersections of its shards with the destination shards, for every process. Identical source slices are
-    /// replicas, and each region moves from the replica that [`preferred_source_shard`] chooses. The moves are in
+    /// replicas, and each region moves from the replica that [`SourceReplicas::preferred`] chooses. The moves are in
     /// destination shard order, and the regions of each destination shard are in the order of their starting
     /// coordinates, which [`Self::assemble_shard_regions`] needs.
     fn plan_shard_regions(&self, layout: &ShardLayout) -> Result<ShardMovePlan, Error> {
-        let mut replicas = HashMap::<&[Range<usize>], Vec<&ShardDescriptor>>::new();
+        let mut shards_by_slices = HashMap::<&[Range<usize>], Vec<&ShardDescriptor>>::new();
         for shard in self.shards() {
-            replicas.entry(shard.slice()).or_default().push(shard.descriptor());
+            shards_by_slices.entry(shard.slice()).or_default().push(shard.descriptor());
         }
+        let replicas = shards_by_slices
+            .into_iter()
+            .map(|(slice, shards)| (slice, SourceReplicas::new(shards.as_slice())))
+            .collect::<HashMap<_, _>>();
         let destinations = layout.descriptors();
         let mut moves = Vec::new();
         for destination in destinations {
@@ -1388,7 +1392,7 @@ impl Array {
                     .zip(destination.slice())
                     .map(|(source, destination)| source.start.max(destination.start)..source.end.min(destination.end))
                     .collect::<Vec<_>>();
-                regions.push((preferred_source_shard(source_shards, destination), slice));
+                regions.push((source_shards.preferred(destination), slice));
             }
             regions.sort_unstable_by(|(_, left), (_, right)| {
                 left.iter().map(|range| range.start).cmp(right.iter().map(|range| range.start))
@@ -2505,16 +2509,20 @@ fn plan_exact_shard_put<'o>(
     for shard in source_shards {
         source_shards_by_slices.entry(shard.slice()).or_default().push(shard);
     }
+    let replicas_by_slices = source_shards_by_slices
+        .into_iter()
+        .map(|(slice, shards)| (slice, SourceReplicas::new(shards.as_slice())))
+        .collect::<HashMap<_, _>>();
 
     let destination_layout = ShardLayout::new(shape, mesh, sharding)?;
     let destination_shards = destination_layout.descriptors();
     let destination_shard_count = destination_shards.len();
     let mut moves = Vec::with_capacity(destination_shard_count);
     for destination_shard in destination_shards {
-        let Some(source_shards) = source_shards_by_slices.get(destination_shard.slice()) else {
+        let Some(replicas) = replicas_by_slices.get(destination_shard.slice()) else {
             return Ok(None);
         };
-        let source_shard = preferred_source_shard(source_shards.as_slice(), destination_shard);
+        let source_shard = replicas.preferred(destination_shard);
         moves.push(ShardMove::new(
             source_shard.index(),
             source_shard.device(),
@@ -2696,34 +2704,59 @@ fn holds_one_value_per_slice(sharding: &Sharding) -> bool {
     sharding.unreduced_axes().is_empty() && sharding.varying_manual_axes().is_empty()
 }
 
-/// Returns the preferred replica among `source_shards` that cover the same slice.
+/// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
+/// replica for each destination shard without scanning all of them again (e.g., when a replicated array moves to
+/// another mesh, where every destination shard has the slice of every source shard).
 ///
 /// The preference is deterministic and depends only on global shard metadata, so that every process chooses the same
-/// source shard for a given destination shard. It prefers a source shard on the process of the destination shard,
-/// then a source shard on the device of the destination shard, and finally breaks ties by device ID and shard index.
-fn preferred_source_shard<'o>(
-    source_shards: &[&'o ShardDescriptor],
-    destination_shard: &ShardDescriptor,
-) -> &'o ShardDescriptor {
-    source_shards
-        .iter()
-        .min_by_key(|source_shard| {
-            let source_device = source_shard.device();
-            let destination_device = destination_shard.device();
-            (
-                source_device.process_index() != destination_device.process_index(),
-                source_device.id() != destination_device.id(),
-                source_device.id(),
-                source_shard.index(),
-            )
-        })
-        .copied()
-        .unwrap()
+/// source shard for a given destination shard. It prefers a source shard on the device of the destination shard, then
+/// a source shard on the process of the destination shard, and finally breaks ties by device ID and shard index.
+struct SourceReplicas<'o> {
+    /// Replica with the lowest shard index on each device.
+    by_device: HashMap<Device, &'o ShardDescriptor>,
+
+    /// Replica with the lowest device ID, and then the lowest shard index, of each process.
+    by_process: HashMap<usize, &'o ShardDescriptor>,
+
+    /// Replica with the lowest device ID, and then the lowest shard index, of all processes.
+    lowest: &'o ShardDescriptor,
+}
+
+impl<'o> SourceReplicas<'o> {
+    /// Indexes `replicas`, which must not be empty.
+    fn new(replicas: &[&'o ShardDescriptor]) -> Self {
+        let order = |shard: &&ShardDescriptor| (shard.device().id(), shard.index());
+        let mut by_device = HashMap::<Device, &ShardDescriptor>::new();
+        let mut by_process = HashMap::<usize, &ShardDescriptor>::new();
+        for &replica in replicas {
+            let device = replica.device();
+            let preferred = by_device.entry(device).or_insert(replica);
+            if replica.index() < preferred.index() {
+                *preferred = replica;
+            }
+            let preferred = by_process.entry(device.process_index()).or_insert(replica);
+            if order(&replica) < order(preferred) {
+                *preferred = replica;
+            }
+        }
+        let lowest = replicas.iter().copied().min_by_key(order).unwrap();
+        Self { by_device, by_process, lowest }
+    }
+
+    /// Returns the preferred replica for `destination_shard`.
+    fn preferred(&self, destination_shard: &ShardDescriptor) -> &'o ShardDescriptor {
+        let device = destination_shard.device();
+        self.by_device
+            .get(&device)
+            .or_else(|| self.by_process.get(&device.process_index()))
+            .copied()
+            .unwrap_or(self.lowest)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::{Mutex, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -2734,7 +2767,10 @@ mod tests {
         CompilationCache, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Error as CoreError,
         Layout, LogicalMesh, Memory, MeshAxis, Shape, ShardingDimension, StridedLayout, TiledLayout,
     };
-    use ryft_pjrt::{BufferSpecification, BufferType, ExecutionFence, HostToDeviceTransferManager};
+    use ryft_pjrt::{
+        BufferSpecification, BufferType, ClientOptions, CpuClientOptions, ExecutionFence, HostToDeviceTransferManager,
+        load_cpu_plugin,
+    };
 
     use crate::sessions::tests::{domain_mesh, two_device_mesh};
     use crate::tests::{
@@ -4757,6 +4793,65 @@ mod tests {
     }
 
     #[test]
+    fn test_array_to_placement_compiled_reshard_shares_artifact_without_process_zero() {
+        // Compilation artifact exchange of process 1 of three that records its calls and never receives an artifact.
+        struct RecordingExchange(Mutex<Vec<String>>);
+
+        impl CompilationArtifactExchange for RecordingExchange {
+            fn process_index(&self) -> usize {
+                1
+            }
+
+            fn process_count(&self) -> usize {
+                3
+            }
+
+            fn validate_compatibility(
+                &self,
+                _key: &[u8],
+                leader: usize,
+                _timeout: Duration,
+            ) -> Result<(), CompilationArtifactExchangeError> {
+                self.0.lock().unwrap().push(format!("validate with leader {leader}"));
+                Ok(())
+            }
+
+            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
+                self.0.lock().unwrap().push("publish".to_string());
+                Ok(())
+            }
+
+            fn receive(&self, _: &[u8], _: Duration) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
+                self.0.lock().unwrap().push("receive".to_string());
+                Ok(None)
+            }
+        }
+
+        // This client is process 1 of a job of three processes, and both of its devices form the mesh of the source
+        // and of the destination, so it runs the compiled reshard, as process 2 would on a mesh that spans the devices
+        // of both, while process 0 owns no device of that mesh and compiles nothing. Process 1 is therefore the leader
+        // of the compilation, which compiles and publishes the program rather than waiting for process 0.
+        let options = CpuClientOptions { device_count: Some(2), process_id: Some(1) };
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+        let client: &'static ryft_pjrt::Client<'static> = Box::leak(Box::new(client));
+        let exchange = Arc::new(RecordingExchange(Mutex::new(Vec::new())));
+        let cache = CompilationCache::new().with_artifact_exchange(
+            Arc::clone(&exchange) as Arc<dyn CompilationArtifactExchange>,
+            CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_millis(10) },
+        );
+        let session = Session::builder().client(client).compilation_cache(cache).build().unwrap();
+        let mesh = two_device_sub_mesh_x(client);
+        assert_eq!(mesh.devices().iter().map(Device::process_index).collect::<Vec<_>>(), [1, 1]);
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let source =
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]));
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let placed = source.unwrap().to_placement(&session, Placement::new(mesh, sharded).unwrap()).unwrap();
+        assert_eq!(shard_values(&placed), [vec![1., 2.], vec![3., 4.]]);
+        assert_eq!(*exchange.0.lock().unwrap(), ["validate with leader 1", "publish"]);
+    }
+
+    #[test]
     fn test_array_to_placement_moves_only_required_cross_mesh_regions() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -5162,8 +5257,9 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let target = ArrayPlacement::mesh(mesh.clone(), replicated.clone()).unwrap();
         let specification = BufferSpecification::new(BufferType::F32, [2u64]);
-        let memory = client.addressable_devices().unwrap()[0].default_memory().unwrap();
-        let manager = client.host_to_device_transfer_manager(vec![specification], memory).unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let manager = client.host_to_device_transfer_manager(vec![specification], devices[0].default_memory().unwrap());
+        let manager = manager.unwrap();
         let source_mesh = domain_mesh(client, "x", 1);
         let r#type = ArrayType::new_static(DataType::F32, [2]);
         let buffers = vec![manager.retrieve_buffer(0).unwrap()];
@@ -6508,6 +6604,48 @@ mod tests {
         assert_eq!(
             cross_host_default_layout(client, BufferType::Predicate, 0, &StaticShape::new(vec![4])).unwrap(),
             Some(Layout::Tiled(TiledLayout::new(vec![0], vec![])).to_pjrt().unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_source_replicas_preferred() {
+        let logical_mesh =
+            |size| LogicalMesh::new(vec![MeshAxis::new("x", size, MeshAxisType::Auto).unwrap()]).unwrap();
+        let replicated_shards = |devices: Vec<Device>| {
+            let mesh = DeviceMesh::new(logical_mesh(devices.len()), devices).unwrap();
+            ShardLayout::new(&StaticShape::new(vec![2]), &mesh, &Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap()
+        };
+
+        // Two replicas on each of two processes, listed out of device order.
+        let sources =
+            replicated_shards(vec![Device::new(1, 0), Device::new(0, 0), Device::new(3, 1), Device::new(2, 1)]);
+        let sources = sources.descriptors().iter().collect::<Vec<_>>();
+        let replicas = SourceReplicas::new(sources.as_slice());
+
+        // A destination prefers the replica on its own device, then the one with the lowest device ID on its process,
+        // and then the one with the lowest device ID of all processes.
+        let destinations = replicated_shards(vec![
+            Device::new(1, 0),
+            Device::new(2, 1),
+            Device::new(5, 0),
+            Device::new(7, 1),
+            Device::new(9, 2),
+        ]);
+        let preferred = destinations
+            .descriptors()
+            .iter()
+            .map(|destination| (replicas.preferred(destination).device(), replicas.preferred(destination).index()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preferred,
+            [
+                (Device::new(1, 0), 0),
+                (Device::new(2, 1), 3),
+                (Device::new(0, 0), 1),
+                (Device::new(2, 1), 3),
+                (Device::new(0, 0), 1),
+            ],
         );
     }
 

@@ -599,9 +599,10 @@ impl Array {
     ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
     ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
-    ///   - **Committed Inputs:** It is the result of an operation with a committed array input. Direct execution of a
-    ///     compiled function counts its captured arrays as inputs. An unpinned call through
-    ///     [`CompiledFunction::call`](crate::compilation::CompiledFunction::call) counts its public arguments.
+    ///   - **Committed Inputs:** It is the result of an eager operation with a committed array input or a committed
+    ///     array that the operation captures, or an output of a compiled function with a committed public argument.
+    ///     The arrays that a compiled function captures never commit its outputs, whether it is executed directly or
+    ///     called through [`CompiledFunction::call`](crate::CompiledFunction::call).
     ///   - **Eager Results on Several Devices:** It is the result of an eager operation, of a host upload through
     ///     [`Self::from_host_buffer`], or of a reshard that moves an array to the devices that an eager operation runs
     ///     on, and it lives on more than one device. An uncommitted eager result or upload therefore always lives on a
@@ -610,7 +611,11 @@ impl Array {
     ///     or a public output of a compiled function that requests a placement explicitly anywhere (i.e., through a
     ///     sharding override, a [`PlaceOperation`](ryft_core::PlaceOperation) with a target, or a sharding constraint),
     ///     whether or not that request produces the output. The outputs of a function that was compiled for a single
-    ///     device without such requests are committed only when the function has a committed array input.
+    ///     device without such requests are committed only when the function has a committed public argument. The
+    ///     same holds for the results of an eager operation with regions (e.g., a condition, a scan, or a loop), which
+    ///     are committed when a region requests a placement explicitly, as the results of a compiled function with that
+    ///     region would be. An eager operation without regions that is itself such a request (e.g., a sharding
+    ///     constraint) leaves the commitment of its results to its inputs.
     ///
     /// Clones keep the commitment of their array, and so do the arrays that keep the storage of an array or
     /// copy it (e.g., a [`Session::place`] without a destination, also when it must not alias its input, and
@@ -626,7 +631,10 @@ impl Array {
     /// their devices. The operation still fails when two committed inputs live on different devices and when an
     /// uncommitted input cannot be moved (i.e., when it is sharded over another logical mesh, or when it or its
     /// destination is not fully addressable from this process). Compiled functions always run on the devices that
-    /// they were compiled for and move every input there, whatever its commitment.
+    /// they were compiled for. They move their captures and their uncommitted public arguments there, and they reject a
+    /// public argument that is committed to other devices (i.e., to other physical devices or to the same ones in
+    /// another order) with
+    /// [`ExecutionError::CommittedInputDeviceMismatch`](crate::ExecutionError::CommittedInputDeviceMismatch).
     ///
     /// [jax-placement]: https://docs.jax.dev/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
     #[inline]
@@ -735,9 +743,9 @@ impl Array {
     /// Returns whether this array has no clones and every addressable shard buffer is uniquely owned by it. An array
     /// without any shard buffers (e.g., a bufferless zero-space array) is never reported as uniquely owned, so it is
     /// never donated. Donation is all or nothing across shards, so any shared buffer disables donation for the complete
-    /// logical input. The check is sound, rather than a heuristic, when the caller owns `self` by value, because a
-    /// strong count of one means that this array holds the only reference to the buffer, so no concurrent clone can
-    /// appear between this check and the buffer's consumption.
+    /// logical input. The answer can change after this function returns, because a [`Weak`](std::sync::Weak) handle
+    /// of a shard buffer can still be upgraded, so it only selects the arrays that
+    /// [`Self::into_exclusive_shard_buffers`] then tries to take exclusively.
     pub(crate) fn has_unique_shard_buffers(&self) -> bool {
         let mut buffer_count = 0usize;
 
@@ -754,6 +762,48 @@ impl Array {
         }
 
         buffer_count > 0
+    }
+
+    /// Consumes this array and returns the buffers of its shards in shard order, with [`None`] for a shard without
+    /// one, together with whether the caller now holds every buffer exclusively, which is what donating them requires.
+    /// That is the case only when this array has no clones and no other handle shares any of its buffers (refer to
+    /// [`Self::has_unique_shard_buffers`]). Each buffer is then moved out of its shared allocation into a new one,
+    /// which fails when another handle holds the buffer, and which a [`Weak`](std::sync::Weak) handle of the old
+    /// allocation (e.g., one that a caller derived from [`ArrayShard::buffer`]) can no longer reach, so that no other
+    /// handle can observe a buffer that an execution invalidates by donation. The decision and the hand-over are
+    /// therefore one step. Otherwise, the buffers stay in their allocations, and the result is not exclusive. That is
+    /// also the case when another handle upgrades a weak handle of a buffer while this function takes them, in which
+    /// case the buffers that it took before that one have already left their allocations.
+    pub(crate) fn into_exclusive_shard_buffers(self) -> (Vec<Option<Arc<Buffer<'static>>>>, bool) {
+        if !self.has_unique_shard_buffers() {
+            return (self.parts.shards.iter().map(|shard| shard.buffer().cloned()).collect(), false);
+        }
+
+        let parts = match Arc::try_unwrap(self.parts) {
+            Ok(parts) => parts,
+            Err(parts) => return (parts.shards.iter().map(|shard| shard.buffer().cloned()).collect(), false),
+        };
+
+        let mut exclusive = true;
+        let buffers = parts
+            .shards
+            .into_iter()
+            .map(|shard| {
+                let buffer = shard.into_buffer()?;
+                if !exclusive {
+                    return Some(buffer);
+                }
+                match Arc::try_unwrap(buffer) {
+                    Ok(buffer) => Some(Arc::new(buffer)),
+                    Err(buffer) => {
+                        exclusive = false;
+                        Some(buffer)
+                    }
+                }
+            })
+            .collect();
+
+        (buffers, exclusive)
     }
 
     /// Waits asynchronously for every addressable shard buffer to become ready, then for the whole-execution fence
