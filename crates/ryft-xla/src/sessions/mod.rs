@@ -1576,17 +1576,15 @@ impl Context for Session {
         // keep executing in the same session and effect scope. Arrays of session constants precede the inputs. The
         // outputs are committed when the mesh was chosen on purpose, when an array that this application captures is
         // committed, as JAX commits the result of an eager operation on a committed array, or when the program runs on
-        // more than one device (refer to `Array::commit_if`). The captures of this application decide that rather than
-        // the session constants of the cached program, which may come from other handles of the same arrays, so the
-        // commitment of the outputs depends neither on the order of the captures nor on the cache. The results of an
-        // operation with regions are also committed when the compiled program commits them (i.e., when a region
-        // requests a placement, refer to `CompiledProgram::committed_outputs`), as an execution of a compiled function
-        // commits them and as JAX commits the result of a `lax.cond` whose branches place their values. The results of
-        // a call are committed as an execution of its callee commits them instead, which is when a public argument is
-        // committed or when the compiled program commits them, so that neither the mesh of this session nor a capture
-        // commits them. The commitment of the results of an operation without regions follows its inputs alone, even
-        // when the operation is itself a placement request (e.g., a sharding constraint). An unpinned call inherits
-        // local assignment from its public arguments.
+        // more than one device (refer to `Array::commit_if`). Capture order and cache hits preserve that commitment.
+        // An operation with regions also commits its results when a region requests a placement (refer to
+        // `CompiledProgram::committed_outputs`), as an execution of a compiled function commits them and as JAX commits
+        // the result of a `lax.cond` whose branches place their values. The results of a call are committed as an
+        // execution of its callee commits them instead, which is when a public argument is committed or when the
+        // compiled program commits them, so that neither the mesh of this session nor a capture commits them. The
+        // commitment of the results of an operation without regions follows its inputs alone, even when the operation
+        // is itself a placement request (e.g., a sharding constraint). An unpinned call inherits local assignment from
+        // its public arguments.
         let mut arguments =
             compiled.constants.iter().map(|constant| constant.to_array(self)).collect::<Result<Vec<_>, _>>()?;
         let committed = if is_call {
@@ -5110,8 +5108,7 @@ pub(crate) mod tests {
         let committed = input.clone().with_committed(true);
         assert!(!input.is_committed());
 
-        // An uncommitted array and its committed alias are one session constant, and a result that uses both is
-        // committed in either capture order.
+        // Capturing an uncommitted array and its committed alias commits the result in either capture order.
         let output = add_captures(&input, &[input.clone(), committed.clone()]).unwrap();
         assert!(output.is_committed());
         assert_eq!(read_sharded_f32_array(&output), vec![3.0]);
@@ -5119,14 +5116,14 @@ pub(crate) mod tests {
         assert!(output.is_committed());
         assert_eq!(read_sharded_f32_array(&output), vec![3.0]);
 
-        // Applications that differ only in the commitment of their captured arrays share one cached program, and the
-        // commitment of each result follows the arrays that its own application captures.
+        // Capture commitment distinguishes eager dispatch entries. Both entries lower to the same executable, and
+        // repeating the original capture hits its eager entry.
         session.clear_cache();
         let hits = session.eager_dispatch_statistics().hits;
         assert!(!add_captures(&input, std::slice::from_ref(&input)).unwrap().is_committed());
         assert!(add_captures(&input, std::slice::from_ref(&committed)).unwrap().is_committed());
         assert!(!add_captures(&input, std::slice::from_ref(&input)).unwrap().is_committed());
-        assert_eq!(session.eager_dispatch_statistics().hits, hits + 2);
+        assert_eq!(session.eager_dispatch_statistics().hits, hits + 1);
         assert_eq!(session.cached_program_count(), 1);
     }
 
