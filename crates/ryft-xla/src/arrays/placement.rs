@@ -29,9 +29,9 @@
 //!     or resolved placements through [`PlacementOptions`].
 //!   - [`Array::to_placement`] and [`Array::into_placement`] move one runtime [`Array`], the latter donating its
 //!     buffers.
-//!   - The core [`Place`] capability places any value that implements it, including traced values in every context,
-//!     with targets and sources of every form of [`PlacementRequest`] (e.g., resolved [`Placement`]s, [`Device`]s,
-//!     and [`Memory`] spaces), which it records without resolving them against a session.
+//!   - The core [`Place`](ryft_core::Place) capability places any value that implements it, including traced values
+//!     in every context. It records each form of [`PlacementRequest`] as a target or source without resolving it
+//!     against a session, including requests given as a [`Placement`], [`Device`], or [`Memory`](ryft_core::Memory).
 //!
 //! The destination, source, donation, and aliasing options of [`Session::place`] are each a tree prefix of the input,
 //! which is broadcast over the subtree under each of its leaves, so one destination can place a whole tree. A [`None`]
@@ -68,26 +68,7 @@ use crate::arrays::shards::ArrayShard;
 use crate::arrays::{Array, ArrayError};
 use crate::{Error, FromPjrt, Session, Value};
 
-#[cfg(doc)]
-use ryft_core::{Layout, Memory, Place};
-
 // TODO(eaplatanios): Review from here onwards.
-
-/// A destination or source leaf in the tree prefixes of [`PlacementOptions`]. A [`PlacementRequest`], a resolved
-/// [`Placement`], a [`Device`], a [`Memory`] space, and their [`Option`]s are accepted as destinations and sources.
-/// A bare memory as a source states the memory in which a value is expected (refer to [`PlacementRequest::InPlace`]).
-/// A [`None`] leaf omits the option for its branch of the input tree.
-pub trait PlaceableParameter: Parameter {
-    /// Returns the placement to apply to this branch, if any.
-    fn into_optional_placement(self) -> Option<PlacementRequest>;
-}
-
-impl<P: PlacementRequestParameter> PlaceableParameter for P {
-    #[inline]
-    fn into_optional_placement(self) -> Option<PlacementRequest> {
-        self.into_optional_placement_request()
-    }
-}
 
 /// An aliasing leaf in the tree prefix of [`PlacementOptions`]. A `bool` leaf states whether the results of its branch
 /// of the input tree may share buffers with other arrays, and so does an `Option<bool>` leaf, which can also leave the
@@ -115,7 +96,7 @@ impl AliasingParameter for Option<bool> {
 /// Options of [`Session::place`].
 ///
 /// Each field follows JAX's tree prefix semantics, so when a field is present, its structure is broadcast over the
-/// input tree and applied leafwise. Destination and source prefixes accept [`PlaceableParameter`]s, including
+/// input tree and applied leafwise. Destination and source prefixes accept [`PlacementRequestParameter`]s, including
 /// [`Placement`], [`PlacementRequest`], and their optional forms, and aliasing prefixes accept [`AliasingParameter`]s
 /// (i.e., `bool` and `Option<bool>`). Each prefix has one leaf type. To mix resolved placements and requests within the
 /// same prefix, convert the resolved leaves with [`PlacementRequest::from`].
@@ -250,8 +231,8 @@ impl PlacementOptions<PlacementRequest, PlacementRequest, bool, Option<bool>> {
 
 impl<Target> PlacementOptions<Target, PlacementRequest, bool, Option<bool>> {
     /// Creates [`Session::place`] options with only the destination tree prefix `target` (e.g., a [`Device`], a
-    /// [`Memory`], a [`PlacementRequest`], or a tuple of optional placements). The other options are unset, and their
-    /// types are fixed as in [`Self::defaults`], so that this needs no generic type annotations.
+    /// [`Memory`](ryft_core::Memory), a [`PlacementRequest`], or a tuple of optional placements). The other options
+    /// are unset and their types follow [`Self::defaults`], so this needs no generic type annotations.
     #[inline]
     pub fn to(target: Target) -> Self {
         Self::new(Some(target), None, None, None)
@@ -269,7 +250,7 @@ impl<Target> PlacementOptions<Target, PlacementRequest, bool, Option<bool>> {
 /// (i.e., [`Tracer`], [`PartialTracer`], [`DifferentiationTracer`], [`BatchingTracer`], and [`ProjectedValue`] over
 /// [`ArrayType`], which covers [`CompileTracer`](crate::CompileTracer)), so that the same call works inside compiled
 /// functions, differentiation, and batching. A traced leaf stays traced and records its placement through the
-/// [`PlaceDispatch`] primitive of the [`Place`] capability (i.e., by staging a
+/// [`PlaceDispatch`] primitive of the [`Place`](ryft_core::Place) capability (i.e., by staging a
 /// [`PlaceOperation`] whose copy policy follows the `may_alias` option of the leaf), and
 /// without a destination, that operation has no target and leaves the leaf where it is. Those implementations require
 /// the values that the traced values wrap to be ones whose concrete arrays this crate can find (i.e., [`Array`]s,
@@ -278,8 +259,8 @@ impl<Target> PlacementOptions<Target, PlacementRequest, bool, Option<bool>> {
 ///
 /// [`Placeable::place`] is the per-leaf primitive of [`Session::place`], like
 /// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding. It takes the leaf as an
-/// ordinary first argument instead of a receiver, so that it does not shadow the [`Place::place`] function of the
-/// traced values that also implement [`Place`]. Call it as `P::place(leaf, session, ...)`.
+/// ordinary first argument instead of a receiver, so that it does not shadow [`Place::place`](ryft_core::Place::place)
+/// on traced values. Call it as `P::place(leaf, session, ...)`.
 pub trait Placeable: Parameter {
     /// Leaf type that placing this leaf produces, which is [`Array`] for host values and runtime arrays, and the leaf
     /// type itself for traced values.
@@ -686,9 +667,9 @@ impl Session {
     /// destination keeps the layout of a leaf only while it still describes each shard of the result, and the result
     /// declares no layout otherwise (refer to [`PlacementRequest`]).
     ///
-    /// A [`PlacementRequest::InPlace`] destination (e.g., a bare [`Memory`]) leaves every leaf on its devices
-    /// with its sharding and changes only its memory and layout, as its documentation describes for concrete, traced,
-    /// and host leaves. This is how a traced leaf whose devices are not known while it is traced (e.g., the input of a
+    /// A [`PlacementRequest::InPlace`] destination (e.g., a bare [`Memory`](ryft_core::Memory)) leaves every leaf on
+    /// its devices with its sharding and changes only its memory and [`Layout`](ryft_core::Layout) for concrete,
+    /// traced, and host leaves. This is how a traced leaf whose devices are not known while it is traced (e.g., the input of a
     /// function that is compiled for a mesh without knowing how that input is split along auto mesh axes) moves to
     /// another memory. Its results are committed like those of every other destination, as JAX commits the result of
     /// `device_put` onto a memory space, eagerly and inside `jit`.
@@ -700,10 +681,10 @@ impl Session {
     ///
     /// Traced leaves (e.g., the inputs of a function that is compiled, differentiated, or batched) stay traced, and
     /// their placement requests are padded to the leaf's rank and recorded through the [`PlaceDispatch`] primitive
-    /// of the [`Place`] capability, so the same call works inside those transformations. Every leaf follows the type
-    /// rule of [`PlaceOperation`], an [`Array`] leaf and a host leaf included, which validate their requests as given
-    /// with that rule (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]) before they move or
-    /// upload anything. A host leaf is validated as the placement of a value without a tracked sharding in device
+    /// of the [`Place`](ryft_core::Place) capability, so the same call works inside those transformations. Every leaf
+    /// follows the type rule of [`PlaceOperation`]. An [`Array`] leaf and a host leaf validate their requests as given
+    /// (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]) before they move or upload anything.
+    /// A host leaf is validated as the placement of a value without a tracked sharding in device
     /// memory, which is how it is uploaded without a destination, and it ignores its source. So no placement changes
     /// the reduction state of a value or moves a value inside a manual region or into one, and every leaf reports the
     /// error that the type rule reports first. A destination must restate the unreduced and reduced axes of a leaf
@@ -809,9 +790,9 @@ impl Session {
     pub fn place<
         P: Placeable,
         Input: Parameterized<P>,
-        TargetPlacement: PlaceableParameter,
+        TargetPlacement: PlacementRequestParameter,
         Target: Parameterized<TargetPlacement>,
-        SourcePlacement: PlaceableParameter,
+        SourcePlacement: PlacementRequestParameter,
         Source: Parameterized<SourcePlacement>,
         Donate: Parameterized<bool>,
         Aliasing: AliasingParameter,
@@ -839,10 +820,10 @@ impl Session {
         // otherwise dominate the cost of placing a large tree. Every other option tree is broadcast over the input.
         let target_values = match target {
             Some(target) if is_root_parameter(&target) => {
-                vec![target.into_parameters().next().unwrap().into_optional_placement(); parameter_count]
+                vec![target.into_parameters().next().unwrap().into_optional_placement_request(); parameter_count]
             }
             Some(target) => target
-                .map_parameters(|placement| placement.into_optional_placement())?
+                .map_parameters(PlacementRequestParameter::into_optional_placement_request)?
                 .broadcast_to_parameter_structure::<Input::To<Option<PlacementRequest>>>(structure.clone())?
                 .into_parameters()
                 .collect::<Vec<_>>(),
@@ -850,10 +831,10 @@ impl Session {
         };
         let source_values = match source {
             Some(source) if is_root_parameter(&source) => {
-                vec![source.into_parameters().next().unwrap().into_optional_placement(); parameter_count]
+                vec![source.into_parameters().next().unwrap().into_optional_placement_request(); parameter_count]
             }
             Some(source) => source
-                .map_parameters(|placement| placement.into_optional_placement())?
+                .map_parameters(PlacementRequestParameter::into_optional_placement_request)?
                 .broadcast_to_parameter_structure::<Input::To<Option<PlacementRequest>>>(structure.clone())?
                 .into_parameters()
                 .collect::<Vec<_>>(),
