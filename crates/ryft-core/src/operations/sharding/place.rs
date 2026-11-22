@@ -803,7 +803,11 @@ impl PlaceOperation {
         // into one whole shard), in which case backends store it in their default layout. The sharding of a placement
         // target describes every mesh axis, and the output of a device target lives on one device, while the output of
         // an in-place target is distributed like its input, which may also be split along the auto axes that its type
-        // omits unless its concrete sharding is known.
+        // omits. A target layout of an in-place target is therefore checked against the concrete sharding when it is
+        // known, whereas the decision to keep the layout of the input uses the type of the input alone, so that the
+        // output type never depends on the concrete sharding. Both agree for every concrete value, whose layout already
+        // addresses its own shards, which an in-place target keeps (e.g., backends validate the layout of an array
+        // against its shards when they construct it).
         let (sharding, is_complete) = match destination {
             PlacementRequest::Resolved(placement) => (Some(placement.sharding()), true),
             PlacementRequest::Device { .. } => (output.sharding(), true),
@@ -817,10 +821,16 @@ impl PlaceOperation {
                 })?;
                 output = output.with_layout(layout.clone());
             }
-            (None, Some(layout)) if validate_shard_layout(&output, layout, sharding, is_complete).is_err() => {
-                output = output.with_layout(None::<Layout>);
+            (None, Some(layout)) => {
+                let (sharding, is_complete) = match destination {
+                    PlacementRequest::InPlace { .. } => (input.sharding(), false),
+                    _ => (sharding, is_complete),
+                };
+                if validate_shard_layout(&output, layout, sharding, is_complete).is_err() {
+                    output = output.with_layout(None::<Layout>);
+                }
             }
-            (None, _) => {}
+            (None, None) => {}
         }
 
         Ok(output)
@@ -3704,6 +3714,23 @@ mod tests {
             PlaceOperation::infer_output_type_allowing_uneven_splits(&auto_type, None, None, Some(&in_place)),
             Ok(auto_type.clone())
         );
+
+        // Without a target layout, whether an in-place output keeps the layout of its input depends on the type of the
+        // input alone, so the output type is the same with and without the concrete sharding (which here describes
+        // shards that the layout of the input would overlap, which no concrete value has).
+        let strided_auto_type = auto_type.clone().with_layout(overlapping.clone());
+        let to_pinned = PlacementRequest::InPlace { memory: Some(PINNED_HOST), layout: None };
+        for concrete_sharding in [Some(&concrete), None] {
+            assert_eq!(
+                PlaceOperation::infer_output_type_allowing_uneven_splits(
+                    &strided_auto_type,
+                    concrete_sharding,
+                    Some(&to_pinned),
+                    None,
+                ),
+                Ok(strided_auto_type.clone().with_memory(PINNED_HOST)),
+            );
+        }
     }
 
     #[test]
@@ -6565,7 +6592,10 @@ mod tests {
                 )
             }),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message.starts_with("`place` device source names one device"),
+                if message == format!(
+                    "`{PLACE_OPERATION_NAME}` device source names one device, but the input type `{input_type}` is \
+                     tracked over 2 devices",
+                ),
         ));
         let error = format!(
             "cannot transpose `{PLACE_OPERATION_NAME}` onto a single device for a value that lives on more than one \
