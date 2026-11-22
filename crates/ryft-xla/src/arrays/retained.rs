@@ -32,9 +32,9 @@ use crate::arrays::{Array, ArrayParts};
 ///   - **No Session:** An [`Array`] carries the [`Session`] that it belongs to, which is what lets operations on it
 ///     find their execution context. A retained array carries none, so it must first be turned back into an array
 ///     by lifting its constant in a session, which is also the session that the new array belongs to.
-///   - **Usable as a Key:** A retained array implements [`Eq`] and [`Hash`] by the identity of the storage that it
-///     was created from and by its type, so retaining one array twice yields equal values and programs that refer to
-///     the same array share their compiled forms.
+///   - **Usable as a Key:** A retained array implements [`Eq`] and [`Hash`] by its storage identity, declared type,
+///     and commitment. Retaining the same array twice yields equal constants. Handles with different commitment
+///     remain distinct because commitment affects device selection when a program uses the constant.
 ///
 /// The first difference is what makes it safe to store in a program. Programs live in the caches of a session, so
 /// a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither
@@ -72,11 +72,11 @@ pub struct RetainedArray {
     send_fence: Option<ExecutionFence>,
 
     /// Whether the retained array is committed to its devices, which the arrays that [`Self::to_array`] creates keep.
-    /// It is not part of the identity of this retained array. Refer to [`Array::is_committed`] for more information.
+    /// It is part of the identity of this constant. Refer to [`Array::is_committed`] for more information.
     committed: bool,
 
     /// Whether the process chose the devices of the retained array on its own, which the arrays that [`Self::to_array`]
-    /// creates keep. Like [`Self::committed`], it is not part of the identity of this retained array. Refer to
+    /// creates keep. Local assignment is excluded from the identity of this retained array. Refer to
     /// [`Array::is_locally_assigned`] for more information.
     locally_assigned: bool,
 
@@ -179,12 +179,12 @@ impl RetainedArray {
 impl Debug for RetainedArray {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The shards have no useful `Debug` representation, so retained arrays are described by their type and by the
-        // identity of the array storage that they were created from, which is what distinguishes them.
+        // Show the fields that distinguish retained constants. The shards themselves have no useful debug format.
         formatter
             .debug_struct("RetainedArray")
             .field("type", &self.declared_type)
             .field("storage", &self.identity.as_ptr())
+            .field("committed", &self.committed)
             .finish()
     }
 }
@@ -199,10 +199,10 @@ impl Display for RetainedArray {
 impl PartialEq for RetainedArray {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Retained arrays are identified by the array storage that they were created from and by their type. The
-        // identity of that storage stays reserved for as long as any of them holds it, so equal identities always
-        // mean the same array.
-        Weak::ptr_eq(&self.identity, &other.identity) && self.declared_type == other.declared_type
+        // The weak handle keeps the storage address reserved for the lifetime of the constant.
+        Weak::ptr_eq(&self.identity, &other.identity)
+            && self.declared_type == other.declared_type
+            && self.committed == other.committed
     }
 }
 
@@ -213,6 +213,7 @@ impl Hash for RetainedArray {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.identity.as_ptr().hash(state);
         self.declared_type.hash(state);
+        self.committed.hash(state);
     }
 }
 
@@ -304,7 +305,7 @@ mod tests {
         let retained = RetainedArray::new(&array);
         assert!(retained.is_locally_assigned());
 
-        // The fact is not part of the identity of a retained array, like its commitment.
+        // Local assignment is preserved independently of retained-array identity.
         let cleared = RetainedArray::new(&array.with_locally_assigned(false));
         assert!(!cleared.is_locally_assigned());
         assert_eq!(cleared, retained);
@@ -387,7 +388,7 @@ mod tests {
         assert_eq!(
             format!("{:?}", RetainedArray::new(&array)),
             format!(
-                "RetainedArray {{ type: {:?}, storage: {:?} }}",
+                "RetainedArray {{ type: {:?}, storage: {:?}, committed: false }}",
                 array.parts.metadata.r#type(),
                 Arc::as_ptr(&array.parts),
             ),
@@ -419,6 +420,7 @@ mod tests {
         assert_eq!(retained, retained.clone());
         assert_eq!(retained, RetainedArray::new(&first));
         assert_ne!(retained, RetainedArray::new(&second));
+        assert_ne!(retained, RetainedArray::new(&first.with_committed(true)));
     }
 
     #[test]
@@ -434,12 +436,16 @@ mod tests {
         let other = RetainedArray::new(&second);
         assert_eq!(hash_of(&retained), hash_of(&RetainedArray::new(&first)));
         assert_ne!(hash_of(&retained), hash_of(&other));
+        let committed = RetainedArray::new(&first.clone().with_committed(true));
+        assert_ne!(hash_of(&retained), hash_of(&committed));
 
-        // Retained arrays hash and compare by storage identity and declared type. Both stay stable as keys.
+        // Commitment distinguishes keys even when they share their storage and declared type.
         #[allow(clippy::mutable_key_type)]
-        let constants = HashMap::from([(retained, "first"), (other.clone(), "second")]);
+        let constants =
+            HashMap::from([(retained, "first"), (other.clone(), "second"), (committed.clone(), "committed")]);
         assert_eq!(constants.get(&RetainedArray::new(&first)), Some(&"first"));
         assert_eq!(constants.get(&other), Some(&"second"));
+        assert_eq!(constants.get(&committed), Some(&"committed"));
     }
 
     #[test]
