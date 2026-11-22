@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use ryft_core::{ArrayType, DeviceId, DeviceMesh, Sharding};
+use ryft_core::{ArrayType, DeviceId, DeviceMesh, Sharding, StaticShape, TypeError};
 
 use crate::Error;
 use crate::arrays::ArrayError;
@@ -43,9 +43,10 @@ impl ArrayMetadata {
     ///
     /// # Errors
     ///
-    /// Returns [`ArrayError::PlacementTypeMismatch`] if `sharding` disagrees with the sharding of `r#type` over the
-    /// non-auto mesh axes, [`ArrayError::DynamicShape`] if `r#type` does not have a static shape, and the errors of
-    /// [`ShardLayout::new`] if the placement is not valid on `mesh`.
+    /// Returns [`ArrayError::PlacementTypeMismatch`] if `sharding` disagrees with the sharding of `r#type` over
+    /// the non-auto mesh axes, a [`TypeError`] if the layout of `r#type` does not address the shape of each shard,
+    /// [`ArrayError::DynamicShape`] if `r#type` does not have a static shape, and the errors of [`ShardLayout::new`]
+    /// if the placement is not valid on `mesh`.
     pub(crate) fn new(
         r#type: ArrayType,
         sharding: Option<Sharding>,
@@ -149,6 +150,19 @@ impl ArrayOutputPlan {
 /// the optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type carries
 /// the placement without its auto mesh axes. Without `sharding`, the placement is the sharding of `r#type` if present
 /// and replication over `mesh` otherwise.
+///
+/// The layout of `r#type`, if any, is the physical layout of each device shard, so it must address the shape of every
+/// shard of the placement (refer to [`validate_shard_layout`]). Every constructor of an array resolves its placement
+/// here before it looks at buffers or at the process that it runs in, so every process and every constructor reject
+/// such a layout alike, including the constructors of arrays that need no buffer (e.g., of
+/// [`DataType::Zero`](ryft_core::DataType::Zero)) and the processes that hold no shard of an array.
+///
+/// # Errors
+///
+/// Returns [`ArrayError::PlacementTypeMismatch`] if `sharding` disagrees with the sharding of `r#type` over the
+/// non-auto mesh axes, the errors of [`ShardLayout::new`] if the type has a layout and the placement is not valid on
+/// `mesh`, and the [`TypeError`] of [`validate_shard_layout`] if the layout of `r#type` does not address the shape of
+/// a shard.
 pub(super) fn resolve_placement(
     r#type: ArrayType,
     sharding: Option<Sharding>,
@@ -165,8 +179,60 @@ pub(super) fn resolve_placement(
         (None, Some(type_sharding)) => type_sharding.clone(),
         (None, None) => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
     };
+
     let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
+    if r#type.layout().is_some() {
+        match r#type.static_shape() {
+            Some(shape) => {
+                let layout = ShardLayout::new(&shape, mesh, &sharding)?;
+                validate_shard_layout(&r#type, layout.descriptors().iter().map(ShardDescriptor::shape))?;
+            }
+            None => {
+                // A type without a static shape has no shards, and the constructors reject it right
+                // after this function.
+                r#type.validate_layout()?
+            }
+        }
+    }
+
     Ok((r#type, sharding))
+}
+
+/// Validates the layout of `r#type`, if any, against `shard_shapes`, which are the shapes of the device shards of an
+/// array of that type. A layout of an array describes the physical storage of each of its device shards, and never of
+/// the global value, because uploads give every shard buffer that layout, placements convert every shard buffer to it,
+/// and a readback reads every shard buffer through it. The layout must therefore address the shape of every shard
+/// (refer to [`ArrayType::validate_layout`]), which is checked once for each distinct shard shape.
+///
+///   - **Tiled Layouts:** A tiled layout is a permutation of the dimensions with tiles, which is valid for the shape
+///     of a shard exactly when it is valid for the global shape, because both have the same rank.
+///   - **Strided Layouts:** A strided layout holds byte strides, which must keep the elements of the shape that they
+///     address apart, so they depend on the extents of a shard. For example, the strides `[8, 4]` describe each dense
+///     `f32[4, 2]` column shard of a global `f32[4, 4]` value, while they would overlap the rows of the global shape.
+///
+/// A layout of the wrong rank addresses no shard, so every constructor and every process rejects it, also when its
+/// array has no shard on this process.
+///
+/// # Errors
+///
+/// Returns the [`TypeError`] of [`ArrayType::validate_layout`] for the first shard shape that the layout does not
+/// address.
+pub(super) fn validate_shard_layout(
+    r#type: &ArrayType,
+    shard_shapes: impl IntoIterator<Item = StaticShape>,
+) -> Result<(), TypeError> {
+    let Some(layout) = r#type.layout() else {
+        return Ok(());
+    };
+
+    let mut validated = HashSet::new();
+    for shape in shard_shapes {
+        if validated.insert(shape.clone()) {
+            ArrayType::new(r#type.data_type(), shape.into()).with_layout(layout.clone()).validate_layout()?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -174,8 +240,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        DataType, Device, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        ShardingDimension, StaticShape,
+        DataType, Device, Dimension, DimensionBounds, DimensionVariable, Error as CoreError, Layout, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError,
     };
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2};
@@ -228,6 +294,67 @@ mod tests {
     }
 
     #[test]
+    fn test_array_metadata_rejects_invalid_layout() {
+        // A layout that does not address the shape of the type is rejected whatever the data type, including for the
+        // zero data type, whose arrays have no buffer that would reject it, and for a mesh whose devices all belong to
+        // another process.
+        let rank_two = Layout::Strided(StridedLayout::new(vec![4, 4]));
+        let remote_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(7, 3)],
+        )
+        .unwrap();
+        for (data_type, mesh) in [(DataType::Zero, device_mesh_2x2()), (DataType::F32, remote_mesh)] {
+            let r#type = ArrayType::new_static(data_type, [4]).with_layout(rank_two.clone());
+            assert!(matches!(
+                ArrayMetadata::new(r#type, None, mesh),
+                Err(Error::Core(error))
+                    if *error == CoreError::Type(TypeError::invalid("strided layout rank 2 does not match array rank 1")),
+            ));
+        }
+
+        // A layout that addresses the shape is accepted.
+        let r#type =
+            ArrayType::new_static(DataType::F32, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let (metadata, _) = ArrayMetadata::new(r#type.clone(), None, device_mesh_2x2()).unwrap();
+        assert_eq!(metadata.r#type().layout(), r#type.layout());
+    }
+
+    #[test]
+    fn test_array_metadata_validates_layout_of_each_shard() {
+        let mesh = device_mesh_2x2();
+        let columns = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let strided = |strides: Vec<isize>| {
+            ArrayType::new_static(DataType::F32, [4, 4]).with_layout(Layout::Strided(StridedLayout::new(strides)))
+        };
+
+        // The byte strides `[8, 4]` describe each dense `f32[4, 2]` column shard of a global `f32[4, 4]` value, while
+        // they would overlap the rows of the global shape, so the shards accept them and a replicated value does not.
+        let (metadata, descriptors) =
+            ArrayMetadata::new(strided(vec![8, 4]), Some(columns.clone()), mesh.clone()).unwrap();
+        assert_eq!(metadata.r#type().layout(), strided(vec![8, 4]).layout());
+        assert!(descriptors.iter().all(|descriptor| descriptor.shape() == StaticShape::new(vec![4, 2])));
+        let overlapping = "strided layout stride 8 on axis 0 is smaller than the 16-byte span occupied by more minor \
+                           axes and may alias array elements";
+        assert!(matches!(
+            ArrayMetadata::new(strided(vec![8, 4]), None, mesh.clone()),
+            Err(Error::Core(error)) if *error == CoreError::Type(TypeError::invalid(overlapping)),
+        ));
+
+        // Strides that overlap the elements of a shard are rejected for that shard.
+        let overlapping = "strided layout stride 8 on axis 1 is smaller than the 16-byte span occupied by more minor \
+                           axes and may alias array elements";
+        assert!(matches!(
+            ArrayMetadata::new(strided(vec![4, 8]), Some(columns), mesh),
+            Err(Error::Core(error)) if *error == CoreError::Type(TypeError::invalid(overlapping)),
+        ));
+    }
+
+    #[test]
     fn test_array_output_plan_new() {
         let mesh = DeviceMesh::new(
             logical_mesh_2x2(),
@@ -248,5 +375,34 @@ mod tests {
         let addressable_device_ids = [devices[3].id(), 42, devices[2].id(), devices[3].id()];
         let plan = ArrayOutputPlan::new(r#type, None, &mesh, &addressable_device_ids).unwrap();
         assert_eq!(plan.buffer_positions(), &[None, None, Some(2), Some(0)]);
+    }
+
+    #[test]
+    fn test_validate_shard_layout() {
+        let r#type = ArrayType::new_static(DataType::F32, [4, 4]);
+        let shards = || [StaticShape::new(vec![4, 2]), StaticShape::new(vec![4, 2])];
+
+        // A type without a layout and a layout that addresses every shard shape are accepted, and so is a tiled
+        // layout, which is a permutation of the dimensions and is valid for every shape of its rank.
+        assert_eq!(validate_shard_layout(&r#type, shards()), Ok(()));
+        let strided = r#type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])));
+        assert_eq!(validate_shard_layout(&strided, shards()), Ok(()));
+        let column_major = r#type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        assert_eq!(validate_shard_layout(&column_major, shards()), Ok(()));
+
+        // A layout must address every shard shape, including the shards of an uneven split, and its rank must match.
+        let uneven = [StaticShape::new(vec![4, 2]), StaticShape::new(vec![4, 5])];
+        assert_eq!(
+            validate_shard_layout(&strided, uneven),
+            Err(TypeError::invalid(
+                "strided layout stride 8 on axis 0 is smaller than the 20-byte span occupied by more minor axes and \
+                 may alias array elements",
+            )),
+        );
+        let rank_one = r#type.with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        assert_eq!(
+            validate_shard_layout(&rank_one, shards()),
+            Err(TypeError::invalid("strided layout rank 1 does not match array rank 2")),
+        );
     }
 }

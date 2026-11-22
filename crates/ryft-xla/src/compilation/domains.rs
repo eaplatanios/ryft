@@ -1100,31 +1100,34 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// devices error when an input is committed to other devices. The devices of a Ryft program are fixed by its mesh
 /// before lowering, so a target on other devices is rejected instead. A device target (i.e., a
 /// [`PlacementRequest::Device`]) keeps the sharding of its input, so it is accepted exactly when `mesh` consists of
-/// that device alone, in which case it lowers to its layout and memory only. A device source is accepted exactly when
-/// the same device target would be, with or without a target, because transposition turns it into the destination of
-/// the cotangent, so that a program whose derivative could not be compiled is rejected when the program itself is
-/// compiled, whereas JAX elides the devices of a `device_put` source inside `jit` and accepts it. Unlike JAX, which
-/// leaves a value that a bare device places inside `jit` uncommitted and on the devices that it occupies, a function
-/// with such a target commits its outputs, as an explicit device commits an array eagerly. An in-place target (i.e., a
+/// that device alone, in which case it lowers to its layout and memory only. Unlike JAX, which leaves a value that a
+/// bare device places inside `jit` uncommitted and on the devices that it occupies, a function with such a target
+/// commits its outputs, as an explicit device commits an array eagerly. An in-place target (i.e., a
 /// [`PlacementRequest::InPlace`]) leaves its input on the devices where it lives, which are those of `mesh`, so it has
-/// nothing to validate and lowers to its layout and memory only. Without the Shardy partitioner (i.e., for
-/// bounded dynamic programs), the compiler runs one fully replicated replica of the program on each device and ignores
-/// sharding constraints, so it would silently ignore a `place` whose target is not replicated. A `place` without a
-/// target leaves its input where it is and lowers to nothing, so only a device source of it is checked. Regions that
-/// lowering never reaches (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not
-/// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
-/// for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices
-/// and do not run it.
+/// nothing to validate and lowers to its layout and memory only. Without the Shardy partitioner (i.e., for bounded
+/// dynamic programs), the compiler runs one fully replicated replica of the program on each device and ignores sharding
+/// constraints, so it would silently ignore a `place` whose target is not replicated.
+///
+/// A source of either form is validated exactly like the same target, with or without a target, because transposition
+/// turns it into the destination of the cotangent, so that a program whose derivative could not be compiled is
+/// rejected when the program itself is compiled, whereas JAX elides the devices of a `device_put` source inside `jit`
+/// and accepts it. This includes the fully replicated requirement of bounded dynamic programs, which the transposed
+/// placement of a split source would violate. A `place` without a target leaves its input where it is and lowers to
+/// nothing, so only its source is checked. Regions that lowering never reaches (e.g., the rule regions of composites or
+/// the transpose region of a `linear_call`) are not checked, because they are not part of the compiled program. Entry
+/// points that lower a program without compiling it for a device mesh (e.g.,
+/// [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices and do not run it.
 ///
 /// # Errors
 ///
 /// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
 /// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`]
-/// for the first `place` whose device target or device source is not the only device of `mesh`,
+/// for the first `place` whose device target is not the only device of `mesh`,
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
-/// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose
-/// boundary override is not fully replicated (refer to [`Sharding::is_replicated`]) when `use_shardy_partitioner` is
-/// not set and `mesh` has more than one device.
+/// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose source would be rejected as such a
+/// target, as the source is no destination of the forward program, and for the first `place` whose target or source
+/// sharding or `jit_call` whose boundary override is not fully replicated (refer to [`Sharding::is_replicated`]) when
+/// `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
     for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
