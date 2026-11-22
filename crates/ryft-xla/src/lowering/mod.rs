@@ -25,7 +25,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -38,13 +38,14 @@ use ryft_core::{
     OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
     Provenance, RegionId, RegionRef, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
     ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation,
-    TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
+    TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value, ZeroLikeOperation,
+    ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
-    Module, Operation as MlirOperation, OperationPrintingFlags, OperationResultRef, Region, Type as MlirType,
-    TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder, WalkResult,
+    Module, OpRef, Operation as MlirOperation, OperationPrintingFlags, OperationRef, OperationResultRef, Region,
+    TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::devices::MemoryExtension;
@@ -2040,27 +2041,267 @@ where
         .with_captured_values(captured_values)
         .with_effect_tokens(*effect_tokens)
         .with_collective_state(collective_state.clone());
-    let mut outputs =
-        instruction
-            .operation()
-            .lower(&mut lowerer, input_values, input_types.as_slice(), output_types.as_slice())?;
+    let outputs = lower_instruction_operation(
+        instruction.operation(),
+        &mut lowerer,
+        input_values,
+        input_types.as_slice(),
+        output_types.as_slice(),
+    )?;
     if lowerer.effect_tokens.ordered_assertion.is_some() {
         collective_state.has_assertions.set(true);
     }
     *effect_tokens = lowerer.effect_tokens;
-    constrain_unreduced_outputs(&mut outputs, &output_types, collective_state, block, location)?;
     Ok(outputs)
 }
 
+/// Lowers `operation`, applied by one instruction to `input_values` of `input_types` with outputs of `output_types`,
+/// with `lowerer`, and constrains every emitted value that carries a pending reduction over a mesh axis that no
+/// enclosing manual region binds. Every path that lowers an instruction (i.e., [`lower_instruction`] and the inline
+/// lowering of nested regions) goes through this function, which owns the following rule.
+///
+/// Shardy rejects an operation whose result drops an unreduced axis of its operands, unless a blessed operation (e.g.,
+/// `sdy.sharding_constraint`) performs that transition, and its propagation does not carry unreduced axes through most
+/// operations (e.g., `stablehlo.add` or `stablehlo.broadcast_in_dim`). JAX constrains the result of every operation
+/// on a mesh with explicit axes for that reason. Here, the values that the lowering of an instruction emits are
+/// constrained in two steps:
+///
+///   - Intermediate values, with [`constrain_unreduced_intermediates`]. The reduction state of each emitted value
+///     follows the dataflow of the emitted operations from the inputs of the instruction, and is never copied from its
+///     output types, because a value that is replicated in fact (e.g., a constant, an iota, or a broadcast of a
+///     replicated operand) and declared unreduced would be counted once per device when the reduction completes.
+///   - Outputs, with [`constrain_unreduced_outputs`], which constrains each output to the tracked sharding of its type.
+///
+/// Only an instruction with an input that carries a pending reduction can emit an intermediate value with one, so any
+/// other instruction pays one scan of its input types and of its output types, without allocating or walking the
+/// emitted operations. The constraints are emitted for every target, and lowering removes them, with every other
+/// Shardy operation, for a target without the Shardy dialect (refer to [`remove_shardy_operations`]).
+pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    operation: &O,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[Type],
+    output_types: &[Type],
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let mut block = lowerer.block();
+    let location = lowerer.location();
+    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+    let has_pending_reduction = input_types.iter().any(|input_type| match input_type {
+        Type::Array(input_type) => input_type.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis)),
+        Type::Dimension(_) | Type::Reference(_) => false,
+    });
+    // The lowering only appends operations to the block, so the operations that follow the last one before the
+    // lowering are those that the lowering emits into this block.
+    let previous_operation =
+        if false && has_pending_reduction { Some(block.operations()?.last().transpose()?) } else { None };
+    let mut outputs = operation.lower(lowerer, input_values, input_types, output_types)?;
+    let collective_state = lowerer.collective_state();
+    if let Some(previous_operation) = previous_operation {
+        constrain_unreduced_intermediates(
+            previous_operation,
+            input_values,
+            input_types,
+            &outputs,
+            collective_state,
+            &mut block,
+            location,
+        )?;
+    }
+    constrain_unreduced_outputs(&mut outputs, output_types, collective_state, &mut block, location)?;
+    Ok(outputs)
+}
+
+/// Pending reduction of a value: the mesh axes, excluding those that an enclosing manual region binds, along which the
+/// value holds one contribution per device, and the kind of the reduction that combines those contributions.
+#[derive(Clone)]
+struct PendingReduction {
+    axes: BTreeSet<String>,
+    kind: UnreducedKind,
+}
+
+impl PendingReduction {
+    /// Returns the pending reduction of a value of type `r#type`, if it has one over an axis that is not one of the
+    /// `bound_manual_axes`.
+    fn of_type(r#type: &Type, bound_manual_axes: &[String]) -> Option<Self> {
+        let Type::Array(r#type) = r#type else {
+            return None;
+        };
+        let axes = r#type
+            .unreduced_axes()
+            .iter()
+            .filter(|axis| !bound_manual_axes.contains(axis))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        (!axes.is_empty()).then(|| Self { axes, kind: r#type.unreduced_kind() })
+    }
+
+    /// Returns the pending reduction that a `sdy.sharding_constraint` operation declares for its result, if any.
+    fn of_constraint<'o, 'c: 'o, 't: 'c>(operation: OperationRef<'o, 'c, 't>) -> Result<Option<Self>, Error> {
+        let Some(constraint) = (unsafe { operation.cast::<shardy::ShardingConstraintOperationRef>() }) else {
+            return Ok(None);
+        };
+        let sharding = shardy::ShardingConstraintOperation::sharding(&constraint)?;
+        let axes = sharding
+            .unreduced_axes()
+            .iter()
+            .map(|axis| axis.name().as_str().map(str::to_string))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let kind = match sharding.reduction_operation()? {
+            shardy::ReductionOperation::Sum => UnreducedKind::Sum,
+            shardy::ReductionOperation::Max => UnreducedKind::Max,
+            shardy::ReductionOperation::Min => UnreducedKind::Min,
+        };
+        Ok((!axes.is_empty()).then_some(Self { axes, kind }))
+    }
+
+    /// Returns the replicated sharding of rank `rank` over `mesh` that declares this pending reduction.
+    fn sharding(&self, mesh: &LogicalMesh, rank: usize) -> Result<Sharding, Error> {
+        Sharding::replicated(mesh.clone(), rank)
+            .with_unreduced_axes(self.axes.iter().cloned())
+            .and_then(|sharding| sharding.with_unreduced_kind(self.kind))
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }.into())
+    }
+}
+
+/// Constrains the intermediate values that the lowering of one instruction emitted into `block` after
+/// `previous_operation` (or from the start of `block`, when it is [`None`]) and that carry a pending reduction, for
+/// [`lower_instruction_operation`]. The `outputs` of the instruction are left to [`constrain_unreduced_outputs`].
+///
+/// The pending reductions follow the dataflow of the emitted operations, in their order in `block`:
+///
+///   - The `input_values` of the instruction carry the pending reductions of their `input_types`.
+///   - A `sdy.sharding_constraint` result carries the pending reduction that the constraint declares (e.g., none for a
+///     constraint that completes the reduction). The results of the other Shardy operations, of `func.call`, and of
+///     `stablehlo.case` and `stablehlo.if` carry none here, because their shardings are declared by the operation or
+///     by the callee, and the values computed in their regions or callees are constrained by the lowering of the
+///     instructions there.
+///   - Result `i` of `stablehlo.while` carries the pending reduction of its operand `i`, which is how Shardy relates
+///     the two, and the body of the loop is constrained by the lowering of its own instructions.
+///   - Every result of any other operation (e.g., `stablehlo.compare`, `stablehlo.convert`, `stablehlo.reduce`, or a
+///     `stablehlo.broadcast_in_dim` of a scalar) that has an operand with a pending reduction carries the pending
+///     reduction of its operands, because each device computes the operation on its own contribution. Shardy requires
+///     such a result to keep the unreduced axes of its operands with the same kind, whatever its element type (e.g.,
+///     the Boolean result of a comparison of maximum-unreduced values is maximum-unreduced, and the `f32` copy of a
+///     `bf16` sum-unreduced value is sum-unreduced), and all results of an operation with several results to have the
+///     same unreduced axes. The declaration does not move any data, so it does not change the values. The reduction
+///     is only completed where an output type of the instruction or a placement says so, and the core type rules make
+///     each such output type the reduction state of the values that the operation computes. Operands without a
+///     pending reduction (e.g., a constant, or an operand that the core rules require to be reduced, like the
+///     denominator of a `div`) do not contribute to it. The core rules reject operands that carry pending
+///     reductions of different kinds, which no single Shardy sharding can declare, so such an operation is rejected
+///     with [`LoweringError::UnsupportedOperation`]. Operands that are unreduced over different axes (e.g., the
+///     factors of a `mul`) give a result that is unreduced over the union of those axes, like the core rules.
+///
+/// Each constrained value is a `sdy.sharding_constraint` placed right after the operation that produces it, with a
+/// sharding of its rank that is replicated in every dimension and declares its pending reduction, and it replaces
+/// every later use of that value. Operations nested in the regions of emitted operations are not visited, because
+/// their region arguments carry no sharding of their own (e.g., the scalar arguments of a `stablehlo.reduce` body).
+fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
+    previous_operation: Option<OperationRef<'b, 'c, 't>>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[Type],
+    outputs: &[ValueRef<'b, 'c, 't>],
+    collective_state: &CollectiveLoweringState,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let bound_manual_axes = collective_state.bound_manual_axes();
+    let mut pending_reductions = input_values
+        .iter()
+        .zip(input_types)
+        .filter_map(|(value, r#type)| Some((*value, PendingReduction::of_type(r#type, bound_manual_axes)?)))
+        .collect::<Vec<_>>();
+    // Every value of a lowered program is placed over the same mesh, which is the one of any input with a pending
+    // reduction.
+    let Some(mesh) = input_types.iter().zip(input_values).find_map(|(input_type, value)| match input_type {
+        Type::Array(input_type) if pending_reductions.iter().any(|(candidate, _)| candidate == value) => {
+            input_type.sharding().map(Sharding::mesh)
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let mut operations = block.operations()?;
+    if let Some(previous_operation) = previous_operation {
+        for operation in operations.by_ref() {
+            if operation? == previous_operation {
+                break;
+            }
+        }
+    }
+    // The emitted operations are collected before any constraint is inserted, so that the constraints are not visited.
+    let operations = operations.collect::<Result<Vec<_>, _>>()?;
+    for operation in operations {
+        let name = operation.name();
+        let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let pending_reduction_of = |value: ValueRef<'b, 'c, 't>, pending_reductions: &[(ValueRef<'b, 'c, 't>, PendingReduction)]| {
+            pending_reductions.iter().find(|(candidate, _)| *candidate == value).map(|(_, reduction)| reduction.clone())
+        };
+        let result_reductions = if name == "sdy.sharding_constraint" {
+            vec![PendingReduction::of_constraint(operation)?]
+        } else if name.starts_with("sdy.") || matches!(name, "func.call" | "stablehlo.case" | "stablehlo.if") {
+            continue;
+        } else if name == "stablehlo.while" {
+            operation
+                .operand_values()
+                .map(|operand| Ok(pending_reduction_of(operand?, &pending_reductions)))
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            let mut merged = None::<PendingReduction>;
+            for operand in operation.operand_values() {
+                let Some(reduction) = pending_reduction_of(operand?, &pending_reductions) else {
+                    continue;
+                };
+                match &mut merged {
+                    None => merged = Some(reduction),
+                    Some(merged) if merged.kind == reduction.kind => merged.axes.extend(reduction.axes),
+                    Some(merged) => {
+                        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                            operation: name.to_string(),
+                            reason: format!(
+                                "operands with pending reductions of the different kinds `{}` and `{}`",
+                                merged.kind, reduction.kind,
+                            ),
+                        }));
+                    }
+                }
+            }
+            if merged.is_none() {
+                continue;
+            }
+            vec![merged; operation.result_count()]
+        };
+        let constrains = name != "sdy.sharding_constraint";
+        let mut anchor = operation;
+        for (index, reduction) in result_reductions.into_iter().enumerate() {
+            let Some(reduction) = reduction else {
+                continue;
+            };
+            let result = operation.result(index)?.as_ref();
+            let rank = result.r#type()?.cast::<TensorTypeRef>().map(|r#type| r#type.rank());
+            let (Some(rank), true) = (rank, constrains && !outputs.contains(&result)) else {
+                pending_reductions.push((result, reduction));
+                continue;
+            };
+            let sharding = reduction.sharding(mesh, rank)?;
+            let constrained = lower_sharding_constraint(&[result], &sharding, bound_manual_axes, block, location)?[0];
+            let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
+            // The constraint is appended to the block, and moved right after the operation that produces its operand
+            // (or after the constraint of the previous result), so that it dominates every later use of that operand.
+            anchor = unsafe { constraint.move_after(&anchor) };
+            result.replace_uses_except(constrained, &[&anchor]);
+            pending_reductions.push((constrained, reduction));
+        }
+    }
+    Ok(())
+}
+
 /// Constrains every lowered instruction output in `outputs` whose type in `output_types` is unreduced over a mesh axis
-/// that no enclosing manual region binds to its tracked sharding. Shardy rejects an operation whose result drops an
-/// unreduced axis of its inputs, and its propagation does not carry unreduced axes through most operations (e.g.,
-/// `stablehlo.add` or `stablehlo.broadcast_in_dim`), so these outputs must declare them, like JAX constrains the result
-/// of every operation on a mesh with explicit axes. An output that a Shardy operation produces (e.g., the
-/// `sdy.sharding_constraint` of a placement transition or the `sdy.manual_computation` of a `shard_map`) already
-/// declares its sharding and is left as it is. Every path that lowers an instruction calls this function once on its
-/// outputs.
-pub(crate) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
+/// that no enclosing manual region binds to its tracked sharding, for [`lower_instruction_operation`]. An output that
+/// a Shardy operation produces (e.g., the `sdy.sharding_constraint` of a placement transition or the
+/// `sdy.manual_computation` of a `shard_map`) already declares its sharding and is left as it is.
+fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
     outputs: &mut [ValueRef<'b, 'c, 't>],
     output_types: &[Type],
     collective_state: &CollectiveLoweringState,
@@ -2937,16 +3178,16 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation, ConstantOperation,
+        AddOperation, Array, ArrayOperations, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation, ConstantOperation,
         Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation, DimensionType,
         DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses,
         Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneLike,
         ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation, Program,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation, ReductionKind,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
-        ReferenceWriteOperation, ReshapeOperation, ReverseModeDifferentiate, ShardMap, ShardMapOperation,
-        ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, ZeroLike, i1, i2, i4, shard_map, u1,
-        u2, u4,
+        ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions, ShardMap, ShardMapOperation,
+        ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, UnreducedKind, ValueProjection,
+        ZeroLike, i1, i2, i4, scan, shard_map, u1, u2, u4,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -2960,10 +3201,10 @@ pub(crate) mod tests {
     use crate::lowering::regions::tests::lower_plain_program_outputs;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::{domain_mesh, f32_scalar};
-    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        ArrayTracer, FlatProgram, JitCallOperation, ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram,
-        trace, trace_with_context,
+        ArrayTracer, CompileTracer, CompiledFunction, FlatProgram, FromPjrt, JitCallOperation, Options,
+        ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram, compile, trace, trace_with_context,
     };
 
     use super::*;
@@ -3421,6 +3662,158 @@ pub(crate) mod tests {
         dimensions: Vec<usize>,
     ) -> Result<String, Error> {
         lowered_unary_module(ArrayOperation::Reduce(ReduceOperation::new(axes, kind)), data_type, dimensions)
+    }
+
+    /// Operation that [`lower_unreduced_application`] applies both to values with reduction state, which it stages and
+    /// executes on two devices, and to the values without reduction state of each device contribution.
+    pub(crate) trait UnreducedApplication {
+        /// Applies this operation to `inputs`.
+        fn apply<V: ArrayOperations>(&self, inputs: &[V]) -> Result<V, ProgramError>;
+    }
+
+    /// Input of [`lower_unreduced_application`], with its type over a mesh with the axis `x` of size two and the bytes
+    /// of the contribution of each of the two devices along that axis.
+    pub(crate) struct UnreducedInput {
+        pub(crate) r#type: ArrayType,
+        pub(crate) contributions: [Vec<u8>; 2],
+    }
+
+    impl UnreducedInput {
+        /// Creates an input of `data_type` and `dimensions` over the explicit mesh axis `x` of size two, whose sharding
+        /// is replicated and unreduced over `x` with `kind` when `kind` is present, and whose devices contribute the
+        /// `values` of `contributions`.
+        pub(crate) fn new<T: Copy>(
+            data_type: DataType,
+            dimensions: &[usize],
+            kind: Option<UnreducedKind>,
+            contributions: [&[T]; 2],
+        ) -> Self {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let mut sharding = Sharding::replicated(mesh, dimensions.len());
+            if let Some(kind) = kind {
+                sharding = sharding.with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+            }
+            let r#type = ArrayType::new_static(data_type, dimensions.to_vec()).with_sharding(sharding).unwrap();
+            Self { r#type, contributions: contributions.map(values_to_bytes) }
+        }
+
+        /// Returns this input with its sharding reduced over `x`, which every device must then contribute equally.
+        pub(crate) fn reduced(mut self) -> Self {
+            let sharding = self.r#type.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap();
+            self.r#type = self.r#type.with_sharding(sharding).unwrap();
+            self
+        }
+    }
+
+    /// Lowering and executions of [`lower_unreduced_application`].
+    pub(crate) struct UnreducedLowering {
+        /// Lowered module of the operation at the top level of a compiled function.
+        pub(crate) module: String,
+
+        /// Output type and shard bytes of each execution, one line per context.
+        pub(crate) outcomes: String,
+
+        /// Expected [`Self::outcomes`], with the type that staging infers and, for each device, the bytes of the
+        /// operation applied to the device contributions without reduction state.
+        pub(crate) expected_outcomes: String,
+    }
+
+    /// Stages `application` of `inputs` on a two-device CPU mesh at the top level of a compiled function, in the body of
+    /// a `scan`, and in a called compiled function, executes each of them, and applies `application` to the values
+    /// without reduction state of the contributions of each device on one device, so that callers compare each device
+    /// shard with the same operation on plain values. Returns the error message of staging, lowering, compilation, or
+    /// execution when one fails (e.g., when the core type rule of the operation rejects the inputs).
+    pub(crate) fn lower_unreduced_application<A: UnreducedApplication>(
+        application: &A,
+        inputs: &[UnreducedInput],
+    ) -> Result<UnreducedLowering, String> {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let devices = pjrt_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let logical_mesh = inputs[0].r#type.sharding().unwrap().mesh().clone();
+        let mesh = DeviceMesh::new(logical_mesh, devices.clone()).unwrap();
+        let single_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[0]],
+        )
+        .unwrap();
+        let types = inputs.iter().map(|input| input.r#type.clone()).collect::<Vec<_>>();
+        let error = RefCell::new(None::<String>);
+        let apply = |inputs: Vec<CompileTracer>| match application.apply(&inputs) {
+            Ok(output) => output,
+            Err(staging_error) => {
+                error.borrow_mut().get_or_insert(staging_error.to_string());
+                inputs[0].clone()
+            }
+        };
+        let staged = crate::stage::<_, Vec<ArrayType>, ArrayType>(apply, types.clone(), Options::new(mesh.clone()));
+        if let Some(error) = error.borrow_mut().take() {
+            return Err(error);
+        }
+        let lowered = staged.map_err(|error| error.to_string())?.into_inner().lower(&session);
+        let module = lowered.map_err(|error| error.to_string())?.lowered_program().stable_hlo().to_string();
+        let top_level: CompiledFunction<Vec<ArrayType>, ArrayType> =
+            compile(apply, types.clone(), &session, mesh.clone()).map_err(|error| error.to_string())?;
+        let output_type = <&ArrayType>::try_from(&top_level.output_types()[0]).unwrap().clone();
+        let scanned: CompiledFunction<Vec<ArrayType>, ArrayType> = compile(
+            |inputs: Vec<CompileTracer>| {
+                let carry = inputs.into_iter().map(CompileTracer::into_value).collect::<Vec<_>>();
+                let (_, outputs) = scan(
+                    |_, carry: Vec<_>, ()| {
+                        let inputs = carry
+                            .iter()
+                            .map(|input| ValueProjection::<ArrayType>::into_projected(input.clone()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let output = application.apply(&inputs)?;
+                        Ok((carry, output.into_value()))
+                    },
+                    carry,
+                    (),
+                    ScanOptions::new().with_iteration_count(1usize),
+                )
+                .unwrap();
+                let outputs = ValueProjection::<ArrayType>::into_projected(outputs).unwrap();
+                outputs.reshape(output_type.shape().clone()).unwrap()
+            },
+            types.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let called: CompiledFunction<Vec<ArrayType>, ArrayType> =
+            compile(|inputs| top_level.call(inputs).unwrap(), types, &session, mesh.clone())
+                .map_err(|error| error.to_string())?;
+        let arrays = inputs
+            .iter()
+            .map(|input| {
+                let shards = devices.iter().zip(&input.contributions).map(|(device, bytes)| (device.id(), bytes.as_slice()));
+                crate::Array::from_host_shards(&session, input.r#type.clone(), mesh.clone(), None, shards)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let expected_shards = (0..2)
+            .map(|device| {
+                let plain = inputs
+                    .iter()
+                    .map(|input| {
+                        let dimensions = input.r#type.static_shape().unwrap().dimensions().to_vec();
+                        let bytes = input.contributions[device].as_slice();
+                        replicated_array(&session, &single_device_mesh, input.r#type.data_type(), &dimensions, bytes)
+                    })
+                    .collect::<Vec<_>>();
+                application.apply(&plain).unwrap().copy_to_host_bytes().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut outcomes = Vec::new();
+        let mut expected_outcomes = Vec::new();
+        for (context, function) in [("top level", &top_level), ("scan body", &scanned), ("called function", &called)] {
+            let output = function.executable().execute(&session, arrays.clone()).map_err(|error| error.to_string())?;
+            let shards = output.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+            outcomes.push(format!("{context}: {} {shards:?}", output.r#type()));
+            expected_outcomes.push(format!("{context}: {output_type} {expected_shards:?}"));
+        }
+        Ok(UnreducedLowering { module, outcomes: outcomes.join("\n"), expected_outcomes: expected_outcomes.join("\n") })
     }
 
     /// Computes `f(x, y) = x * y + sin(x)` for the pair `inputs` of `(x, y)`.
@@ -4317,6 +4710,30 @@ pub(crate) mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_instruction_constrains_unreduced_intermediates() {
+        // The mean of a `bf16` vector converts it to `f32`, reduces it, divides it by the element count, and converts it
+        // back.
+        struct Mean;
+
+        impl UnreducedApplication for Mean {
+            fn apply<V: ArrayOperations>(&self, inputs: &[V]) -> Result<V, ProgramError> {
+                inputs[0].reduce_mean(&[0])
+            }
+        }
+
+        // The `bf16` bits of 1, 2, 3, and 4, and of -1, 0.5, 4, and 2.
+        let input = UnreducedInput::new(
+            DataType::BF16,
+            &[4],
+            Some(UnreducedKind::Sum),
+            [&[0x3f80u16, 0x4000, 0x4040, 0x4080], &[0xbf80u16, 0x3f00, 0x4080, 0x4000]],
+        );
+        let lowering = lower_unreduced_application(&Mean, &[input]).unwrap();
+        assert_eq!(lowering.outcomes, lowering.expected_outcomes);
+        assert_eq!(lowering.module, "");
     }
 
     #[test]

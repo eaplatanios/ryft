@@ -841,7 +841,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
-        ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
+        ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform, Concatenate, ReductionKind, UnreducedKind,
         ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
         BatchingContext, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
         CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, Cos,
@@ -863,7 +863,8 @@ mod tests {
     };
 
     use crate::lowering::tests::{
-        PlainProgram, ProgramBuilder as PlainProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program,
+        PlainProgram, ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput,
+        lower_unreduced_application, lowered_unary_module, to_mlir_module_for_plain_program,
     };
     use crate::operations::jit_call::JitCallOperation;
     use crate::sessions::tests::domain_mesh;
@@ -1914,5 +1915,221 @@ mod tests {
                 assert!((tanh - expected).abs() <= 1e-6, "{accuracy:?}: {tanh} vs {expected}");
             }
         }
+    }
+
+    /// Operation of [`UnreducedRow`], which [`lower_unreduced_application`] applies to values with and without
+    /// reduction state.
+    #[derive(Clone, Copy, Debug)]
+    enum UnreducedOperation {
+        Neg,
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Max,
+        Min,
+        Clamp,
+        Abs,
+        Exp,
+        ConvertToF64,
+        Reduce(ReductionKind),
+        ArgMax,
+        Reshape,
+        Transpose,
+        Slice,
+        Reverse,
+        Concatenate,
+        Select,
+        Pad,
+        CumulativeSum,
+        CumulativeMax,
+        Compare,
+        Not,
+    }
+
+    /// Inputs of [`UnreducedRow`], each over the mesh axis `x` of size two. Values "with the kind" are unreduced over
+    /// `x` with the kind of the row, and the other values are replicated, with equal contributions of both devices.
+    #[derive(Clone, Copy, Debug)]
+    enum UnreducedOperands {
+        /// One `f32` vector with the kind.
+        Vector,
+
+        /// Two `f32` vectors with the kind.
+        Vectors,
+
+        /// Three `f32` vectors with the kind.
+        ThreeVectors,
+
+        /// An `f32` vector and an `f32` scalar, both with the kind.
+        VectorAndScalar,
+
+        /// An `f32` vector and an `f64` vector, both with the kind.
+        VectorAndF64Vector,
+
+        /// An `f32` vector with the kind and an `f32` vector that is reduced over `x`.
+        VectorAndReduced,
+
+        /// An `f32` vector with the kind and a replicated `f32` vector.
+        VectorAndReplicated,
+
+        /// A replicated Boolean vector and two `f32` vectors with the kind.
+        ConditionAndVectors,
+
+        /// A Boolean vector with the kind.
+        BooleanVector,
+    }
+
+    impl UnreducedOperands {
+        /// Returns these inputs, unreduced with `kind`.
+        fn inputs(self, kind: UnreducedKind) -> Vec<UnreducedInput> {
+            let vector = || UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[1f32, 5.0, -0.0, 0.5], &[3f32, -1.0, 4.0, 0.0]]);
+            let other = || UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[2f32, -3.0, 0.0, 7.0], &[0.5f32, 6.0, -2.0, 1.0]]);
+            let replicated = [2f32, 4.0, -1.0, 0.5];
+            match self {
+                Self::Vector => vec![vector()],
+                Self::Vectors => vec![vector(), other()],
+                Self::ThreeVectors => vec![
+                    vector(),
+                    other(),
+                    UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[4f32, 0.0, 2.0, -1.0], &[1f32, 2.0, 3.0, 4.0]]),
+                ],
+                Self::VectorAndScalar => {
+                    vec![vector(), UnreducedInput::new(DataType::F32, &[], Some(kind), [&[1.5f32], &[-2f32]])]
+                }
+                Self::VectorAndF64Vector => vec![
+                    vector(),
+                    UnreducedInput::new(DataType::F64, &[4], Some(kind), [&[2f64, -3.0, 0.0, 7.0], &[0.5f64, 6.0, -2.0, 1.0]]),
+                ],
+                Self::VectorAndReduced => {
+                    vec![vector(), UnreducedInput::new(DataType::F32, &[4], None, [&replicated, &replicated]).reduced()]
+                }
+                Self::VectorAndReplicated => {
+                    vec![vector(), UnreducedInput::new(DataType::F32, &[4], None, [&replicated, &replicated])]
+                }
+                Self::ConditionAndVectors => vec![
+                    UnreducedInput::new(DataType::Boolean, &[4], None, [&[true, false, false, true]; 2]),
+                    vector(),
+                    other(),
+                ],
+                Self::BooleanVector => vec![UnreducedInput::new(
+                    DataType::Boolean,
+                    &[4],
+                    Some(kind),
+                    [&[true, false, true, false], &[false, false, true, true]],
+                )],
+            }
+        }
+    }
+
+    /// Row of the tests of the lowering of operations over unreduced values.
+    #[derive(Clone, Copy, Debug)]
+    struct UnreducedRow(UnreducedOperation, UnreducedOperands);
+
+    impl UnreducedApplication for UnreducedRow {
+        fn apply<V: ArrayOperations>(&self, inputs: &[V]) -> Result<V, ProgramError> {
+            match self.0 {
+                UnreducedOperation::Neg => ryft_core::Neg::neg(&inputs[0]),
+                UnreducedOperation::Add => ryft_core::Add::add(&inputs[0], &inputs[1]),
+                UnreducedOperation::Sub => ryft_core::Sub::sub(&inputs[0], &inputs[1]),
+                UnreducedOperation::Mul => ryft_core::Mul::mul(&inputs[0], &inputs[1]),
+                UnreducedOperation::Div => ryft_core::Div::div(&inputs[0], &inputs[1]),
+                UnreducedOperation::Max => inputs[0].max(&inputs[1]),
+                UnreducedOperation::Min => inputs[0].min(&inputs[1]),
+                UnreducedOperation::Clamp => inputs[0].clamp(&inputs[1], &inputs[2]),
+                UnreducedOperation::Abs => inputs[0].abs(),
+                UnreducedOperation::Exp => inputs[0].exp(),
+                UnreducedOperation::ConvertToF64 => inputs[0].convert_element_type(DataType::F64),
+                UnreducedOperation::Reduce(kind) => inputs[0].reduce(&[0], kind),
+                UnreducedOperation::ArgMax => inputs[0].argmax(0),
+                UnreducedOperation::Reshape => inputs[0].reshape([2, 2]),
+                UnreducedOperation::Transpose => inputs[0].reshape([2, 2])?.transpose(vec![1, 0]),
+                UnreducedOperation::Slice => inputs[0].slice(&[1], &[3], &[1]),
+                UnreducedOperation::Reverse => inputs[0].reverse([0]),
+                UnreducedOperation::Concatenate => <V as Concatenate>::concatenate([&inputs[0], &inputs[1]], 0),
+                UnreducedOperation::Select => inputs[0].select(&inputs[1], &inputs[2]),
+                UnreducedOperation::Pad => inputs[0].pad(&inputs[1], &[1], &[2], &[0]),
+                UnreducedOperation::CumulativeSum => inputs[0].cumulative_sum(0),
+                UnreducedOperation::CumulativeMax => inputs[0].cumulative_max(0),
+                UnreducedOperation::Compare => inputs[0].compare(&inputs[1], ComparisonDirection::LessThan),
+                UnreducedOperation::Not => inputs[0].not(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_binary_elementwise_operands_lower_unreduced_values() {
+        // A scalar operand is broadcast to the shape of the vector, and an `f32` operand is converted to `f64`, before
+        // the operation. Both are computed by each device on its own contribution, so they are unreduced like the
+        // operands of the operation.
+        let mut modules = Vec::new();
+        for (operation, operands, kind) in [
+            (UnreducedOperation::Max, UnreducedOperands::VectorAndScalar, UnreducedKind::Max),
+            (UnreducedOperation::Min, UnreducedOperands::VectorAndScalar, UnreducedKind::Min),
+            (UnreducedOperation::Add, UnreducedOperands::VectorAndScalar, UnreducedKind::Sum),
+            (UnreducedOperation::Add, UnreducedOperands::VectorAndF64Vector, UnreducedKind::Sum),
+        ] {
+            let lowering =
+                lower_unreduced_application(&UnreducedRow(operation, operands), &operands.inputs(kind)).unwrap();
+            assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{operation:?} of {operands:?} with {kind}");
+            modules.push(lowering.module);
+        }
+        assert_eq!(modules.join("\n"), "");
+    }
+
+    #[test]
+    fn test_operations_lower_unreduced_values() {
+        // Every operation that accepts unreduced inputs, with every kind of pending reduction, at the top level of a
+        // compiled function, in the body of a `scan`, and in a called function, executes on each device what the same
+        // operation computes for the contribution of that device. The core type rules reject the other combinations.
+        let rows = [
+            UnreducedRow(UnreducedOperation::Neg, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndReplicated),
+            UnreducedRow(UnreducedOperation::Sub, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Mul, UnreducedOperands::VectorAndReduced),
+            UnreducedRow(UnreducedOperation::Mul, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Div, UnreducedOperands::VectorAndReduced),
+            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Clamp, UnreducedOperands::ThreeVectors),
+            UnreducedRow(UnreducedOperation::Abs, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Exp, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::ConvertToF64, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Sum), UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Mean), UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Max), UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Min), UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Product), UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::ArgMax, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reshape, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Transpose, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Slice, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Reverse, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Concatenate, UnreducedOperands::VectorAndReplicated),
+            UnreducedRow(UnreducedOperation::Select, UnreducedOperands::ConditionAndVectors),
+            UnreducedRow(UnreducedOperation::Pad, UnreducedOperands::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::CumulativeSum, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::CumulativeMax, UnreducedOperands::Vector),
+            UnreducedRow(UnreducedOperation::Compare, UnreducedOperands::Vectors),
+            UnreducedRow(UnreducedOperation::Not, UnreducedOperands::BooleanVector),
+        ];
+        let mut outcomes = Vec::new();
+        for row in rows {
+            for kind in [UnreducedKind::Sum, UnreducedKind::Max, UnreducedKind::Min] {
+                let outcome = match lower_unreduced_application(&row, &row.1.inputs(kind)) {
+                    Ok(lowering) if lowering.outcomes == lowering.expected_outcomes => "lowered".to_string(),
+                    Ok(lowering) => format!("{}\n  expected {}", lowering.outcomes, lowering.expected_outcomes),
+                    Err(error) => error.lines().next().unwrap_or_default().to_string(),
+                };
+                outcomes.push(format!("{:?} of {:?} with {kind}: {outcome}", row.0, row.1));
+            }
+        }
+        assert_eq!(outcomes.join("\n"), "");
     }
 }

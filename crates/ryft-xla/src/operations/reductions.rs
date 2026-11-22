@@ -947,17 +947,17 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArgMax, ArgMin, ArrayOperation, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh, Dimension,
+        ArgMax, ArgMin, ArrayOperation, ArrayOperations, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh, Dimension,
         DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding, ShardingDimension, Sub,
-        composite,
+        UnreducedKind, composite,
     };
     use ryft_mlir::Location;
 
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
-        ProgramBuilder, lowered_reduce_module, lowered_unary_module, to_mlir_module_for_plain_program,
-        unproject_plain_program,
+        ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
+        lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
@@ -2705,5 +2705,42 @@ mod tests {
                 "{values:?}",
             );
         }
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_unreduced_values() {
+        // Reduction of one vector, of the kind that commutes with the pending reduction of the vector.
+        struct Reduction(ReductionKind);
+
+        impl UnreducedApplication for Reduction {
+            fn apply<V: ArrayOperations>(&self, inputs: &[V]) -> Result<V, ProgramError> {
+                inputs[0].reduce(&[0], self.0)
+            }
+        }
+
+        // Each device contributes a vector whose reduction differs from that of the other device, with signed zeros
+        // for the extrema. The `f32` maxima and minima reduce the integer keys of the total order, the mean divides
+        // the sum by the element count, and the `bf16` sum accumulates in `f32`.
+        let left = [1f32, 5.0, -0.0, 0.5];
+        let right = [3f32, -1.0, 4.0, 0.0];
+        let bf16_left = left.map(bf16::from_f32);
+        let bf16_right = right.map(bf16::from_f32);
+        let mut modules = Vec::new();
+        for (kind, data_type, unreduced_kind) in [
+            (ReductionKind::Max, DataType::F32, UnreducedKind::Max),
+            (ReductionKind::Min, DataType::F32, UnreducedKind::Min),
+            (ReductionKind::Mean, DataType::F32, UnreducedKind::Sum),
+            (ReductionKind::Sum, DataType::BF16, UnreducedKind::Sum),
+        ] {
+            let input = if data_type == DataType::BF16 {
+                UnreducedInput::new(data_type, &[4], Some(unreduced_kind), [&bf16_left, &bf16_right])
+            } else {
+                UnreducedInput::new(data_type, &[4], Some(unreduced_kind), [&left, &right])
+            };
+            let lowering = lower_unreduced_application(&Reduction(kind), &[input]).unwrap();
+            assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{kind} over {data_type}");
+            modules.push(lowering.module);
+        }
+        assert_eq!(modules.join("\n"), "");
     }
 }

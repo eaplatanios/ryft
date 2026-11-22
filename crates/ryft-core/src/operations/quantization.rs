@@ -2964,98 +2964,88 @@ where
     let forward_configuration = configuration.clone();
     let backward_configuration = configuration.clone();
 
-    // TODO(eaplatanios): Can we inline the following closures?
-    let primal = move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
-        DomainTracer<D>,
-        DomainTracer<D>,
-        [Vec<DomainTracer<D>>; 4],
-    )|
-          -> Result<_, ProgramError> {
-        // The primal quantizes the left-hand side and right-hand side inputs and contracts them using their optional
-        // global scales. The gradient global scale and random state affect only the backward rule.
-        BlockScaledDotRules::new(&primal_configuration, &lhs.r#type(), &rhs.r#type())?.forward(
-            &lhs,
-            &rhs,
-            lhs_global_scale.first(),
-            rhs_global_scale.first(),
-        )
-    };
-
-    let forward = move |(lhs, rhs, optional_inputs): (
-        DomainTracer<D>,
-        DomainTracer<D>,
-        [Vec<DomainTracer<D>>; 4],
-    )|
-          -> Result<_, ProgramError> {
-        // Keep either the original inputs or their quantized representations as residuals alongside the primal
-        // output, together with the optional scales and random state. The backward rule needs the original inputs for
-        // unquantized contractions and clipping masks, and can contract the quantized representations otherwise.
-        let lhs_type = lhs.r#type().into_owned();
-        let rhs_type = rhs.r#type().into_owned();
-        let rules = BlockScaledDotRules::new(&forward_configuration, &lhs_type, &rhs_type)?;
-        let [lhs_global_scale, rhs_global_scale, _, _] = &optional_inputs;
-        let (lhs_quantized, rhs_quantized) =
-            rules.quantize_inputs(&lhs, &rhs, lhs_global_scale.first(), rhs_global_scale.first())?;
-        let output = rules.contract_inputs(&lhs_quantized, &rhs_quantized)?;
-        let (inputs, quantized_inputs) = match forward_configuration.residual_policy {
-            BlockScaledDotResidualPolicy::Inputs => (vec![lhs, rhs], Vec::new()),
-            BlockScaledDotResidualPolicy::Quantized => (Vec::new(), vec![lhs_quantized, rhs_quantized]),
-        };
-        Ok((
-            output,
-            BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs },
-        ))
-    };
-
-    let backward = move |residuals: BlockScaledDotResiduals<DomainTracer<D>>,
-                         seed: MaybeZero<DomainTracer<D>>|
-          -> Result<_, ProgramError> {
-        // Start with structural zeros in the parameter structure of the inputs. Global scales and the random state
-        // retain these zeros because only the left-hand side and right-hand side inputs are differentiable.
-        let BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs } = residuals;
-        let mut cotangents = (
-            MaybeZero::Zero(lhs_type.cotangent()?),
-            MaybeZero::Zero(rhs_type.cotangent()?),
-            optional_inputs
-                .clone()
-                .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?,
-        );
-
-        // A structural zero seed needs no backward contraction. For a value seed, apply the configured backward
-        // policy and replace only the left-hand side and right-hand side input cotangents.
-        if let MaybeZero::Value(seed) = seed {
-            let [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state] = &optional_inputs;
-            let backward_inputs = match (inputs.as_slice(), quantized_inputs.as_slice()) {
-                ([lhs, rhs], []) => BlockScaledDotBackwardInputs::Inputs {
-                    lhs,
-                    rhs,
-                    lhs_global_scale: lhs_global_scale.first(),
-                    rhs_global_scale: rhs_global_scale.first(),
-                },
-                ([], [lhs, rhs]) => BlockScaledDotBackwardInputs::Quantized { lhs, rhs },
-                _ => {
-                    return Err(TypeError::invalid(format!(
-                        "`{BLOCK_SCALED_DOT_NAME}` residuals must hold both inputs or both quantized inputs",
-                    ))
-                    .into());
-                }
+    let function = composite(
+        move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
+            DomainTracer<D>,
+            DomainTracer<D>,
+            [Vec<DomainTracer<D>>; 4],
+        )| {
+            // The primal quantizes and contracts both inputs using their optional global scales. The gradient global
+            // scale and random state affect only the backward rule.
+            BlockScaledDotRules::new(&primal_configuration, &lhs.r#type(), &rhs.r#type())?.forward(
+                &lhs,
+                &rhs,
+                lhs_global_scale.first(),
+                rhs_global_scale.first(),
+            )
+        },
+    )
+    .with_symbolic_zero_vjp(
+        move |(lhs, rhs, optional_inputs)| {
+            // Keep either the original inputs or their quantized representations as residuals alongside the primal
+            // output, together with the optional scales and random state. The backward rule needs the original inputs
+            // for unquantized contractions and clipping masks, and can contract the quantized representations
+            // otherwise.
+            let lhs_type = lhs.r#type().into_owned();
+            let rhs_type = rhs.r#type().into_owned();
+            let rules = BlockScaledDotRules::new(&forward_configuration, &lhs_type, &rhs_type)?;
+            let [lhs_global_scale, rhs_global_scale, _, _] = &optional_inputs;
+            let (lhs_quantized, rhs_quantized) =
+                rules.quantize_inputs(&lhs, &rhs, lhs_global_scale.first(), rhs_global_scale.first())?;
+            let output = rules.contract_inputs(&lhs_quantized, &rhs_quantized)?;
+            let (inputs, quantized_inputs) = match forward_configuration.residual_policy {
+                BlockScaledDotResidualPolicy::Inputs => (vec![lhs, rhs], Vec::new()),
+                BlockScaledDotResidualPolicy::Quantized => (Vec::new(), vec![lhs_quantized, rhs_quantized]),
             };
-            let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(
-                &backward_configuration,
-                &lhs_type,
-                &rhs_type,
-            )?
-            .backward(backward_inputs, gradient_global_scale.first(), random_state.first(), &seed)?;
-            cotangents.0 = MaybeZero::Value(lhs_cotangent);
-            cotangents.1 = MaybeZero::Value(rhs_cotangent);
-        }
-        Ok(cotangents)
-    };
+            Ok((output, BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs }))
+        },
+        move |residuals, seed| {
+            // Start with structural zeros in the parameter structure of the inputs. Global scales and the random state
+            // retain these zeros because only the left-hand side and right-hand side inputs are differentiable.
+            let BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs } = residuals;
+            let mut cotangents = (
+                MaybeZero::Zero(lhs_type.cotangent()?),
+                MaybeZero::Zero(rhs_type.cotangent()?),
+                optional_inputs
+                    .clone()
+                    .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?,
+            );
 
-    Ok(BlockScaledDot {
-        configuration,
-        function: composite(primal).with_symbolic_zero_vjp(forward, backward).with_name(BLOCK_SCALED_DOT_NAME),
-    })
+            // A structural zero seed needs no backward contraction. For a value seed, apply the configured backward
+            // policy and replace only the left-hand side and right-hand side input cotangents.
+            if let MaybeZero::Value(seed) = seed {
+                let [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state] = &optional_inputs;
+                let backward_inputs = match (inputs.as_slice(), quantized_inputs.as_slice()) {
+                    ([lhs, rhs], []) => BlockScaledDotBackwardInputs::Inputs {
+                        lhs,
+                        rhs,
+                        lhs_global_scale: lhs_global_scale.first(),
+                        rhs_global_scale: rhs_global_scale.first(),
+                    },
+                    ([], [lhs, rhs]) => BlockScaledDotBackwardInputs::Quantized { lhs, rhs },
+                    _ => {
+                        return Err(TypeError::invalid(format!(
+                            "`{BLOCK_SCALED_DOT_NAME}` residuals must hold both inputs or both quantized inputs",
+                        ))
+                        .into());
+                    }
+                };
+                let (lhs_cotangent, rhs_cotangent) =
+                    BlockScaledDotRules::new(&backward_configuration, &lhs_type, &rhs_type)?.backward(
+                        backward_inputs,
+                        gradient_global_scale.first(),
+                        random_state.first(),
+                        &seed,
+                    )?;
+                cotangents.0 = MaybeZero::Value(lhs_cotangent);
+                cotangents.1 = MaybeZero::Value(rhs_cotangent);
+            }
+            Ok(cotangents)
+        },
+    )
+    .with_name(BLOCK_SCALED_DOT_NAME);
+
+    Ok(BlockScaledDot { configuration, function })
 }
 
 /// Grid parameters of a block-scaled element data type.
@@ -3138,6 +3128,12 @@ struct BlockScaledDotRules<'o> {
     /// Floating-point data type used for quantization and intermediate arithmetic.
     computation_type: DataType,
 
+    /// Data type of the cotangent of the left-hand side input.
+    lhs_cotangent_type: DataType,
+
+    /// Data type of the cotangent of the right-hand side input.
+    rhs_cotangent_type: DataType,
+
     /// Permutation of the left-hand side input dimensions into batch, free, and contracting order.
     lhs_permutation: Vec<usize>,
 
@@ -3158,13 +3154,6 @@ struct BlockScaledDotRules<'o> {
 
     /// Static shape of the output, which lists the batch, left free, and right free dimensions.
     output_shape: Vec<usize>,
-
-    // TODO(eaplatanios): The following two fields should be moved to right after the `computation_type` field.
-    /// Data type of the cotangent of the left-hand side input.
-    lhs_cotangent_type: DataType,
-
-    /// Data type of the cotangent of the right-hand side input.
-    rhs_cotangent_type: DataType,
 }
 
 impl<'o> BlockScaledDotRules<'o> {
@@ -3267,6 +3256,8 @@ impl<'o> BlockScaledDotRules<'o> {
         let rules = Self {
             configuration,
             computation_type,
+            lhs_cotangent_type: lhs_type.cotangent()?.data_type(),
+            rhs_cotangent_type: rhs_type.cotangent()?.data_type(),
             lhs_permutation,
             rhs_permutation,
             lhs_shape,
@@ -3274,8 +3265,6 @@ impl<'o> BlockScaledDotRules<'o> {
             lhs_canonical_shape: [batch, lhs_free, contracting],
             rhs_canonical_shape: [batch, rhs_free, contracting],
             output_shape,
-            lhs_cotangent_type: lhs_type.cotangent()?.data_type(),
-            rhs_cotangent_type: rhs_type.cotangent()?.data_type(),
         };
 
         // Check the extents blocked by the forward rule here. Backward contractions can block different dimensions,

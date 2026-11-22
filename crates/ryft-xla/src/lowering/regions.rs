@@ -11,8 +11,8 @@ use ryft_mlir::{
 
 use crate::lowering::types::lower_constant;
 use crate::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, constrain_unreduced_outputs,
-    lower_instruction,
+    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction,
+    lower_instruction_operation,
 };
 use crate::operations::composites::lowers_without_regions;
 use crate::operations::jit_call::JitCallFunctionMap;
@@ -209,15 +209,17 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
                 .with_captured_values(captured_values)
                 .with_effect_tokens(*effect_tokens)
                 .with_collective_state(collective_state.clone());
-            let mut outputs =
-                instruction
-                    .operation()
-                    .lower(&mut lowerer, inputs, input_types.as_slice(), output_types.as_slice())?;
+            let outputs = lower_instruction_operation(
+                instruction.operation(),
+                &mut lowerer,
+                inputs,
+                input_types.as_slice(),
+                output_types.as_slice(),
+            )?;
             if lowerer.effect_tokens.ordered_assertion.is_some() {
                 collective_state.has_assertions.set(true);
             }
             *effect_tokens = lowerer.effect_tokens;
-            constrain_unreduced_outputs(&mut outputs, &output_types, collective_state, block, location)?;
             Ok(outputs)
         },
     )
