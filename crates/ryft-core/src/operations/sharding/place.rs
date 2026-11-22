@@ -40,10 +40,10 @@
 //! differentiation) records the [`Placed`] placement of that value instead, so concrete backend arrays record where
 //! they actually live, while staged values leave the source unknown, and a source that names only a memory or a layout
 //! is completed with that placement (refer to [`PlacementRequest::resolve_source`]) after the placement is validated
-//! as it is given (refer to [`PlaceOperation::infer_output_type`]). Inside batched functions, the placement of a batch
-//! item also records how its batch is distributed (refer to [`Placement::batch_shardings`]), so a source inferred from
-//! a batch item is lifted back to where the packed value lives, an explicit target places every batch item where it
-//! says, and a placement without a target leaves the packed value where it is.
+//! as it is given (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]). Inside batched functions,
+//! the placement of a batch item also records how its batch is distributed (refer to [`Placement::batch_shardings`]),
+//! so a source inferred from a batch item is lifted back to where the packed value lives, an explicit target places
+//! every batch item where it says, and a placement without a target leaves the packed value where it is.
 
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
@@ -97,8 +97,8 @@ use crate::tracing::Tracer;
 /// does to the type of a value, and executing a placement must produce a value of exactly that type, so that eager
 /// execution, the replay of a staged program, compilation, and the transformations of a placement agree. In particular,
 /// a request never changes the reduction state of a value on any path, a concrete value included (refer to
-/// [`PlaceOperation::infer_output_type`]), so a value whose reduction is pending or complete must be reduced or
-/// resharded by the operations that own reductions before a request can drop that state.
+/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so a value whose reduction is pending or complete
+/// must be reduced or resharded by the operations that own reductions before a request can drop that state.
 ///
 /// # Device Targets
 ///
@@ -234,14 +234,13 @@ impl PlacementRequest {
     /// Returns the [`Memory`] space that this request names, or [`None`] if it names none. A source that names a memory
     /// states that the value is expected in it, and [`Self::target_memory`] returns the memory that a target selects.
     #[inline]
-    pub fn memory(&self) -> Option<Memory> {
+    pub fn explicit_memory(&self) -> Option<Memory> {
         match self {
             Self::Resolved(placement) => placement.memory(),
             Self::Device { memory, .. } | Self::InPlace { memory, .. } => *memory,
         }
     }
 
-    // TODO(eaplatanios): I don't fully understand the difference between this and `PlacementRequest::memory`.
     /// Returns the [`Memory`] space that this request selects as the target of a placement, or [`None`] if the output
     /// keeps the memory of the value. A [`PlacementRequest::Device`] without a memory selects the default memory of its
     /// device (i.e., [`Memory::Device`]), as JAX's eager `device_put` does for a bare device, so that it moves a value
@@ -252,7 +251,7 @@ impl PlacementRequest {
     pub fn target_memory(&self) -> Option<Memory> {
         match self {
             Self::Device { memory, .. } => Some(memory.unwrap_or(Memory::Device)),
-            Self::Resolved(_) | Self::InPlace { .. } => self.memory(),
+            Self::Resolved(_) | Self::InPlace { .. } => self.explicit_memory(),
         }
     }
 
@@ -281,8 +280,9 @@ impl PlacementRequest {
     /// devices to which the cotangent returns, which the concrete placement alone tells. The rules of
     /// [`PlaceOperation`] that place a value with a concrete placement (i.e., interpretation, batching, and
     /// differentiation) record their sources through this function, and only after they validate the placement as it
-    /// is given (refer to [`PlaceOperation::infer_output_type`]), because a completed source can hide a request that
-    /// the type rule rejects (e.g., an in-place source that names nothing becomes a valid placement).
+    /// is given (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), because a completed source
+    /// can hide a request that the type rule rejects (e.g., an in-place source that names nothing becomes a valid
+    /// placement).
     pub fn resolve_source(source: Option<Self>, placement: Option<Placement>) -> Option<Self> {
         match (source, placement) {
             (Some(Self::InPlace { memory, layout }), Some(placement)) => {
@@ -446,15 +446,15 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// mesh. A placement still changes only where a value lives and never its reduction state, so the target sharding must
 /// restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the
 /// target mesh must define each of those axes with the same size and type as the input's mesh (refer to
-/// [`Self::infer_output_type`], through which backends also apply every check of this rule but the even split below
-/// to the concrete values that they place outside a program). Every shard of a partitioned dimension of the output
-/// has the same extent, so for each dimension that the target sharding partitions, the number of shards along it (i.e.,
-/// the product of the sizes of the mesh axes that shard it, [`MeshAxisType::Auto`] axes included) must divide its
-/// static extent, on every path that this operation takes (i.e., its eager execution through [`Place`], the replay of
-/// a staged program, its transformations, and compilation), as JAX's `device_put` requires eagerly and inside `jit`.
-/// Unlike JAX, a backend may still split a concrete value unevenly when it places that value outside this operation. A
-/// dynamic extent is only known when a backend places a concrete value, so type inference accepts any split of it and
-/// backends check it when they place the value.
+/// [`Self::infer_output_type_allowing_uneven_splits`], through which backends also apply every check of this rule but
+/// the even split below to the concrete values that they place outside a program). Every shard of a partitioned
+/// dimension of the output has the same extent, so for each dimension that the target sharding partitions, the number
+/// of shards along it (i.e., the product of the sizes of the mesh axes that shard it, [`MeshAxisType::Auto`] axes
+/// included) must divide its static extent, on every path that this operation takes (i.e., its eager execution through
+/// [`Place`], the replay of a staged program, its transformations, and compilation), as JAX's `device_put` requires
+/// eagerly and inside `jit`. Unlike JAX, a backend may still split a concrete value unevenly when it places that value
+/// outside this operation. A dynamic extent is only known when a backend places a concrete value, so type inference
+/// accepts any split of it and backends check it when they place the value.
 ///
 /// A value inside a manual region lives on the devices of that region, so it cannot be moved, and nothing can be moved
 /// into such a region either. Types show such values through their variation along [`MeshAxisType::Manual`] mesh axes
@@ -626,7 +626,7 @@ impl PlaceOperation {
     /// Returns a [`TypeError`] for every request that [`Operation::infer_output_types`] rejects, except for a target
     /// that splits a static extent unevenly, and for every request that the concrete sharding shows to change the
     /// reduction state of the value or to have a layout that does not address its shards.
-    pub fn infer_output_type(
+    pub fn infer_output_type_allowing_uneven_splits(
         input: &ArrayType,
         concrete_sharding: Option<&Sharding>,
         target: Option<&PlacementRequest>,
@@ -735,7 +735,7 @@ impl PlaceOperation {
         // check of a source, so no path compares a source with the physical layouts of concrete buffers, which a type
         // that declares no layout does not describe and which no staged, compiled, or transformed path could inspect.
         if let Some(source) = source_request {
-            if let Some(memory) = source.memory()
+            if let Some(memory) = source.explicit_memory()
                 && memory != input.memory()
             {
                 return Err(TypeError::invalid(format!(
@@ -828,29 +828,31 @@ impl PlaceOperation {
 
     /// Validates this operation for a concrete value of type `input` whose sharding over every mesh axis is
     /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule
-    /// of this operation (i.e., [`Self::infer_output_type`] followed by the check that the target splits each static
-    /// extent evenly), made with the concrete sharding of the value, so it is what a backend calls when it executes
-    /// this operation on a concrete value (e.g., when an eager context binds it), where the reduction state and the
-    /// shards of the value are known more precisely than its type records them.
+    /// of this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the
+    /// target splits each static extent evenly), made with the concrete sharding of the value, so it is what a backend
+    /// calls when it executes this operation on a concrete value (e.g., when an eager context binds it), where the
+    /// reduction state and the shards of the value are known more precisely than its type records them.
     ///
     /// # Errors
     ///
-    /// Returns the [`TypeError`] of [`Self::infer_output_type`], and one for a target that splits a static extent
-    /// of the value unevenly.
-    pub fn infer_placed_output_type(
+    /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], and one for a target that
+    /// splits a static extent of the value unevenly.
+    pub fn infer_output_type_requiring_even_splits(
         &self,
         input: &ArrayType,
         concrete_sharding: Option<&Sharding>,
     ) -> Result<ArrayType, TypeError> {
-        let output = Self::infer_output_type(input, concrete_sharding, self.target(), self.source())?;
+        let output =
+            Self::infer_output_type_allowing_uneven_splits(input, concrete_sharding, self.target(), self.source())?;
         Self::validate_even_splits(input, self.target())?;
         Ok(output)
     }
 
     /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, leaves the reduction state of the value unchanged. This is the part of the type rule of
-    /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type`], through which backends
-    /// also apply it to the placement of a concrete value outside a program), so that no path changes reduction state.
+    /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type_allowing_uneven_splits`],
+    /// through which backends also apply it to the placement of a concrete value outside a program), so that no path
+    /// changes reduction state.
     ///
     /// Reduction state records pending (i.e., unreduced) or completed (i.e., reduced) cross-device reductions, and a
     /// placement changes where a value lives but never that state. The sharding of a [`Placement`] target therefore
@@ -868,8 +870,9 @@ impl PlaceOperation {
     /// The reduction state of `input` is that of `input_sharding`, which is the concrete sharding of the value
     /// when it is known, and which then also records the reduction state over auto mesh axes that the type omits,
     /// as `is_complete` states, and the sharding that the type of `input` tracks otherwise (refer to
-    /// [`Self::infer_output_type`]). A source is compared over the axes that `input_sharding` records, so without a
-    /// concrete sharding its reduction state over auto axes is not checked, as its split along them is not.
+    /// [`Self::infer_output_type_allowing_uneven_splits`]). A source is compared over the axes that `input_sharding`
+    /// records, so without a concrete sharding its reduction state over auto axes is not checked, as its split along
+    /// them is not.
     ///
     /// # Errors
     ///
@@ -946,13 +949,14 @@ impl PlaceOperation {
         Ok(())
     }
 
-    /// Validates that a placement of a value of type `input` onto `target` splits each static extent of the value
-    /// evenly, which is the one check of the type rule of [`PlaceOperation`] that [`Self::infer_output_type`] does not
-    /// make. Every shard of a partitioned dimension of a value has the same extent, so for each dimension that the
-    /// target sharding partitions, the number of shards along it (i.e., the product of the sizes of the mesh axes that
-    /// shard it, which includes auto axes, which the output type does not record but along which the value is still
-    /// split) must divide its static extent. A dynamic extent is only known when a backend places a concrete value,
-    /// which is when it is checked. Only a [`Placement`] target partitions dimensions.
+    /// Validates that a placement of a value of type `input` onto `target` splits each static
+    /// extent of the value evenly, which is the one check of the type rule of [`PlaceOperation`] that
+    /// [`Self::infer_output_type_allowing_uneven_splits`] does not make. Every shard of a partitioned dimension of a
+    /// value has the same extent, so for each dimension that the target sharding partitions, the number of shards along
+    /// it (i.e., the product of the sizes of the mesh axes that shard it, which includes auto axes, which the output
+    /// type does not record but along which the value is still split) must divide its static extent. A dynamic extent
+    /// is only known when a backend places a concrete value, which is when it is checked. Only a [`Placement`] target
+    /// partitions dimensions.
     fn validate_even_splits(input: &ArrayType, target: Option<&PlacementRequest>) -> Result<(), TypeError> {
         let Some(target) = target.and_then(PlacementRequest::placement).map(Placement::sharding) else {
             return Ok(());
@@ -1015,7 +1019,7 @@ impl Operation for PlaceOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        Ok(vec![self.infer_placed_output_type(&input_types[0], None)?])
+        Ok(vec![self.infer_output_type_requiring_even_splits(&input_types[0], None)?])
     }
 
     #[inline]
@@ -1066,7 +1070,12 @@ where
         let placement = input.placement();
         if let Some(placement) = &placement {
             // Validate the stated source before completing it with the concrete placement.
-            Self::infer_output_type(&input.r#type(), Some(placement.sharding()), self.target(), self.source())?;
+            Self::infer_output_type_allowing_uneven_splits(
+                &input.r#type(),
+                Some(placement.sharding()),
+                self.target(),
+                self.source(),
+            )?;
         }
 
         let source = PlacementRequest::resolve_source(self.source.clone(), placement);
@@ -1198,7 +1207,12 @@ where
         let packed = input.value();
         let placement = packed.placement();
         if let Some(placement) = &placement {
-            Self::infer_output_type(&packed.r#type(), Some(placement.sharding()), target.as_ref(), source.as_ref())?;
+            Self::infer_output_type_allowing_uneven_splits(
+                &packed.r#type(),
+                Some(placement.sharding()),
+                target.as_ref(),
+                source.as_ref(),
+            )?;
         }
         let source = PlacementRequest::resolve_source(source, placement);
         let output = <C::Value as Value>::Dispatch::place(packed, target.as_ref(), source, self.may_alias)?;
@@ -1230,7 +1244,12 @@ impl_differentiable_operation! {
             let placement = input.placement();
             if let Some(placement) = &placement {
                 let sharding = Some(placement.sharding());
-                PlaceOperation::infer_output_type(&input.r#type(), sharding, operation.target(), operation.source())?;
+                PlaceOperation::infer_output_type_allowing_uneven_splits(
+                    &input.r#type(),
+                    sharding,
+                    operation.target(),
+                    operation.source(),
+                )?;
             }
             let source = PlacementRequest::resolve_source(operation.source().cloned(), placement);
             let primal = <C::Value as Value>::Dispatch::place(input, operation.target(), source.clone(), may_alias)?;
@@ -1247,7 +1266,12 @@ impl_differentiable_operation! {
                     if let Some(placement) = &placement {
                         let r#type = tangent.r#type();
                         let sharding = Some(placement.sharding());
-                        PlaceOperation::infer_output_type(&r#type, sharding, target.as_ref(), source.as_ref())?;
+                        PlaceOperation::infer_output_type_allowing_uneven_splits(
+                            &r#type,
+                            sharding,
+                            target.as_ref(),
+                            source.as_ref(),
+                        )?;
                     }
                     let source = PlacementRequest::resolve_source(source, placement);
                     MaybeZero::Value(<C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?)
@@ -2254,7 +2278,7 @@ mod tests {
         let target = PlacementRequest::from(target_placement.clone());
         assert_eq!(target, PlacementRequest::Resolved(target_placement.clone()));
         assert_eq!(target.placement(), Some(&target_placement));
-        assert_eq!(target.memory(), Some(PINNED_HOST));
+        assert_eq!(target.explicit_memory(), Some(PINNED_HOST));
         assert_eq!(target.layout(), Some(&layout));
         assert_eq!(target.to_string(), target_placement.to_string());
 
@@ -2263,12 +2287,12 @@ mod tests {
         let target = PlacementRequest::from(device);
         assert_eq!(target, PlacementRequest::Device { device, memory: None, layout: None });
         assert_eq!(target.placement(), None);
-        assert_eq!(target.memory(), None);
+        assert_eq!(target.explicit_memory(), None);
         assert_eq!(target.layout(), None);
         assert_eq!(target.to_string(), "device(3)");
         let target = PlacementRequest::Device { device, memory: Some(PINNED_HOST), layout: Some(layout.clone()) };
         assert_eq!(target.placement(), None);
-        assert_eq!(target.memory(), Some(PINNED_HOST));
+        assert_eq!(target.explicit_memory(), Some(PINNED_HOST));
         assert_eq!(target.layout(), Some(&layout));
         assert_eq!(target.to_string(), "device(3, memory=Host[Pinned], layout=tiled{0})");
 
@@ -2276,16 +2300,16 @@ mod tests {
         let target = PlacementRequest::from(PINNED_HOST);
         assert_eq!(target, PlacementRequest::InPlace { memory: Some(PINNED_HOST), layout: None });
         assert_eq!(target.placement(), None);
-        assert_eq!(target.memory(), Some(PINNED_HOST));
+        assert_eq!(target.explicit_memory(), Some(PINNED_HOST));
         assert_eq!(target.layout(), None);
         assert_eq!(target.to_string(), "in_place(memory=Host[Pinned])");
         let target = PlacementRequest::InPlace { memory: Some(PINNED_HOST), layout: Some(layout.clone()) };
         assert_eq!(target.placement(), None);
-        assert_eq!(target.memory(), Some(PINNED_HOST));
+        assert_eq!(target.explicit_memory(), Some(PINNED_HOST));
         assert_eq!(target.layout(), Some(&layout));
         assert_eq!(target.to_string(), "in_place(memory=Host[Pinned], layout=tiled{0})");
         let target = PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) };
-        assert_eq!(target.memory(), None);
+        assert_eq!(target.explicit_memory(), None);
         assert_eq!(target.to_string(), "in_place(layout=tiled{0})");
     }
 
@@ -2322,7 +2346,7 @@ mod tests {
         let device = Device::new(0, 0);
         let resolved = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
         assert_eq!(PlacementRequest::from(device).target_memory(), Some(Memory::Device));
-        assert_eq!(PlacementRequest::from(device).memory(), None);
+        assert_eq!(PlacementRequest::from(device).explicit_memory(), None);
         assert_eq!(
             PlacementRequest::Device { device, memory: Some(PINNED_HOST), layout: None }.target_memory(),
             Some(PINNED_HOST),
@@ -3653,14 +3677,27 @@ mod tests {
             )))
         };
         assert_eq!(
-            PlaceOperation::infer_output_type(&auto_type, Some(&concrete), Some(&in_place), None),
+            PlaceOperation::infer_output_type_allowing_uneven_splits(
+                &auto_type,
+                Some(&concrete),
+                Some(&in_place),
+                None
+            ),
             invalid("target")
         );
         assert_eq!(
-            PlaceOperation::infer_output_type(&auto_type, Some(&concrete), None, Some(&in_place)),
+            PlaceOperation::infer_output_type_allowing_uneven_splits(
+                &auto_type,
+                Some(&concrete),
+                None,
+                Some(&in_place)
+            ),
             invalid("source")
         );
-        assert_eq!(PlaceOperation::infer_output_type(&auto_type, None, None, Some(&in_place)), Ok(auto_type.clone()));
+        assert_eq!(
+            PlaceOperation::infer_output_type_allowing_uneven_splits(&auto_type, None, None, Some(&in_place)),
+            Ok(auto_type.clone())
+        );
     }
 
     #[test]
@@ -3689,7 +3726,12 @@ mod tests {
             let device = PlacementRequest::from(Device::new(0, 0));
             let infer =
                 |concrete_sharding: Option<&Sharding>, target: &PlacementRequest, source: Option<&PlacementRequest>| {
-                    PlaceOperation::infer_output_type(&input_type, concrete_sharding, Some(target), source)
+                    PlaceOperation::infer_output_type_allowing_uneven_splits(
+                        &input_type,
+                        concrete_sharding,
+                        Some(target),
+                        source,
+                    )
                 };
             assert_eq!(infer(Some(&concrete), &identity, None), Ok(input_type.clone()), "{state}");
             assert_eq!(infer(Some(&concrete), &identity, Some(&identity)), Ok(input_type.clone()), "{state}");
@@ -3835,12 +3877,11 @@ mod tests {
             }],
         );
 
-        // The even split is the one check of the type rule that `PlaceOperation::infer_output_type` does not make, so
-        // that backends can split a concrete value unevenly, and it is made after every other check.
+        // Backends can split a concrete value unevenly. The full type rule checks even splits after every other check.
         let input_type = ArrayType::new_static(DataType::I32, [5]);
         let target = PlacementRequest::Resolved(placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]));
         assert_eq!(
-            PlaceOperation::infer_output_type(&input_type, None, Some(&target), None),
+            PlaceOperation::infer_output_type_allowing_uneven_splits(&input_type, None, Some(&target), None),
             Ok(input_type.clone().with_sharding(target.placement().unwrap().sharding().clone()).unwrap()),
         );
         let target =

@@ -430,7 +430,7 @@ pub enum ArrayPlacementTarget {
     ///   - A completed reduction and a pending reduction over mesh axes of size one are complete on one device, so the
     ///     value loses its unreduced and reduced state. A value with a pending reduction over a larger mesh axis is
     ///     rejected, an [`Array`] leaf included, because a placement does not combine the contributions of several
-    ///     devices (refer to [`PlaceOperation::infer_output_type`]), so such a value must be reduced first.
+    ///     devices (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so such a value must be reduced first.
     ///   - A value inside a manual region cannot be moved.
     ///
     /// A traced value stages a [`PlacementRequest::Device`], whether or not it wraps a concrete array, which resolves
@@ -722,7 +722,7 @@ pub trait Placeable: Parameter {
     /// concrete and traced leaves), a `target` or `source` that cannot be resolved against `session` (e.g.,
     /// [`SessionError::MissingMesh`](crate::SessionError::MissingMesh) for a sharding without a default mesh), a
     /// `target` or `source` that the type rule of [`PlaceOperation`] rejects for a concrete leaf, except for an uneven
-    /// split (i.e., a [`TypeError`] of [`PlaceOperation::infer_output_type`]), and a placement that fails to execute or
+    /// split (i.e., a [`TypeError`] of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement that fails to execute or
     /// to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`] reject for a traced leaf).
     /// The leaf is consumed either way, and [`Session::place`] returns the first error of any leaf as its own, after
     /// the leaves before it were placed.
@@ -764,7 +764,7 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
         if let Some(target) = &target {
             let request = target.clone().into_request(session, shape.len())?;
             let r#type = ArrayType::new_static(element_type, shape.clone());
-            PlaceOperation::infer_output_type(&r#type, Some(&request), None)?;
+            PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, None, Some(&request), None)?;
         }
         // The upload takes dense row-major bytes, which is how a host array without a layout is stored, so only an
         // array with a layout is decoded into a copy. Its storage can be mutated safely, so the decoding and the upload
@@ -1102,7 +1102,7 @@ impl Session {
     /// their placements resolve against this session and are recorded through the [`PlaceDispatch`] primitive of the
     /// [`Place`] capability, so the same call works inside those transformations. Every leaf follows the type rule of
     /// [`PlaceOperation`], an [`Array`] leaf and a host leaf included, which validate their requests as they are given
-    /// with that rule (refer to [`PlaceOperation::infer_output_type`]) before they move or upload anything. A host leaf
+    /// with that rule (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]) before they move or upload anything. A host leaf
     /// is validated as the placement of a value without a tracked sharding in device memory, which is how it is
     /// uploaded without a destination, and it ignores its source. So no placement changes the reduction state of a
     /// value or moves a value inside a manual region or into one, and every leaf reports the error that the type rule
@@ -1171,14 +1171,17 @@ impl Session {
     /// The source option states where a leaf is expected to live. Its devices are informative on every path, as in
     /// JAX, so they are never compared with the devices that a leaf actually lives on, and reverse mode
     /// differentiation sends the cotangent to the devices that it names. Its sharding, memory, and layout are checked
-    /// by the type rule of [`PlaceOperation`] against the type of an [`Array`] leaf exactly as they are for a traced
-    /// leaf (refer to [`PlacementRequest`]), as it is given. A traced leaf that wraps a concrete array then completes a
-    /// source that names only a memory or a layout with the concrete placement of that array (refer to
-    /// [`PlacementRequest::resolve_source`]), so that transposition returns the cotangent to its devices. An expected
-    /// layout must therefore address the shape of each shard of the leaf as far as its type determines its shards, and
-    /// it must equal the layout that the type of the leaf declares, if any. The type rule is the only check of a
-    /// source, so the physical layouts of the buffers of a leaf whose type declares no layout are not inspected on any
-    /// path.
+    /// by the type rule of [`PlaceOperation`] against the type of an [`Array`] leaf and its runtime sharding, which
+    /// records its reduction state and its shards along auto mesh axes that its type omits, exactly as they are for a
+    /// traced leaf that wraps a concrete array (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as it is given. A
+    /// traced leaf that wraps a concrete array then completes a source that names only a memory or a layout with the
+    /// concrete placement of that array (refer to [`PlacementRequest::resolve_source`]), so that transposition returns
+    /// the cotangent to its devices. An expected layout must therefore address the shape of each shard of the leaf as
+    /// far as its runtime sharding (or, for a staged leaf, its type) determines its shards, and it must equal the
+    /// layout that the type of the leaf declares, if any. The type rule is the only check of a source, so the physical
+    /// layouts of the buffers of a leaf whose type declares no layout are not inspected on any path. A target that
+    /// restates a pending or completed reduction of an [`Array`] leaf over an auto axis (e.g., its own placement) is
+    /// accepted and changes nothing, and one that drops it is rejected, as for any other reduction state.
     ///
     /// In a run with more than one process, every process must make the same call with trees of the same structure
     /// and the same options, because the placements of the leaves communicate across processes in the order of the
@@ -1466,13 +1469,20 @@ impl<V: ConcreteArrays> ConcreteArrays for ProjectedValue<ArrayType, V> {
 
 /// Validates the destination `target` and the expected `source` of the [`Array`] leaf `array` of [`Session::place`]
 /// against the type of `array` with the type rule of [`PlaceOperation`] (refer to
-/// [`PlaceOperation::infer_output_type`]), as given and before anything is moved, so that [`Session::place`] rejects
+/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as given and before anything is moved, so that [`Session::place`] rejects
 /// every request that the type rule rejects, with the error that the type rule reports first, as every path that stages
 /// or executes a placement does. This includes the reduction state of `array`, which the placement never changes (e.g.,
 /// it never sums pending contributions onto one device), which only [`Array::to_placement`], the physical primitive
 /// that it runs on, does when its destination requires it, and a value inside a manual region, which it never moves.
 /// The one check of the type rule that it does not make is that the target splits each dimension evenly, which an
 /// [`Array`] does not have to (refer to [`Session::place`]).
+///
+/// The type of `array` omits its placement along auto mesh axes, including a pending or completed reduction over them,
+/// which its runtime sharding records, so the request is validated with that runtime sharding as the concrete sharding
+/// of the input (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as the rules of [`PlaceOperation`] that place a
+/// concrete value do. A target that restates the reduction state of `array` over an auto axis (e.g., its own placement)
+/// is therefore accepted and changes nothing, while a target that drops it is rejected, and a source layout and an
+/// in-place target layout are checked against the shards that the runtime sharding determines.
 ///
 /// The source is validated as it is given, as the core [`Place`] capability validates it, and it is not completed with
 /// the placement of `array` (refer to [`PlacementRequest::resolve_source`]), because the placement of a concrete array
@@ -1490,7 +1500,7 @@ fn validate_array_request(
     let rank = r#type.rank();
     let target = target.map(|target| target.clone().into_request(session, rank)).transpose()?;
     let source = source.map(|source| source.into_request(session, rank)).transpose()?;
-    PlaceOperation::infer_output_type(&r#type, target.as_ref(), source.as_ref())?;
+    PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, Some(array.sharding()), target.as_ref(), source.as_ref())?;
     Ok(())
 }
 
@@ -1502,7 +1512,7 @@ fn validate_array_request(
 /// it also rejects placements that the physical primitives support (e.g., uneven splits).
 fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(), Error> {
     if placement.sharding().rank() != r#type.rank() {
-        PlaceOperation::infer_output_type(r#type, Some(&PlacementRequest::Resolved(placement.clone())), None)?;
+        PlaceOperation::infer_output_type_allowing_uneven_splits(r#type, None, Some(&PlacementRequest::Resolved(placement.clone())), None)?;
     }
     Ok(())
 }
@@ -5654,7 +5664,9 @@ mod tests {
                     // the type that the type rule infers for the request as it is given.
                     if let (Ok(eager), Ok(target), Ok(source)) = (&eager, request(target), request(source)) {
                         let r#type = input.r#type();
-                        let inferred = PlaceOperation::infer_output_type(&r#type, target.as_ref(), source.as_ref());
+                        let sharding = Some(input.sharding());
+                        let inferred =
+                            PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, sharding, target.as_ref(), source.as_ref());
                         if inferred.as_ref() != Ok(&eager.r#type) {
                             disagreements.push(format!("{cell}, type rule: {inferred:?} != eager: {:?}", eager.r#type));
                         }
@@ -5926,9 +5938,204 @@ mod tests {
             }
         }
 
+        // The type of an array omits its reduction state over auto mesh axes, which its runtime sharding records (e.g.,
+        // a scalar that is imported as the contributions 1 and 2 of a pending sum over `'x'=2:auto`, or that is reduced
+        // over that axis), so the eager placement, the core `Place` capability, and forward mode validate a concrete
+        // array against its runtime sharding. A target that restates that state (i.e., the placement of the array, or
+        // the same state over other devices) is accepted and keeps the value, whereas a target that drops it and a
+        // device target of a pending sum over a larger axis are rejected, as for the same state over an explicit axis.
+        // The type rule with the runtime sharding of the array agrees with the eager placement on every cell. A staged
+        // value has only its type, so the replay of a staged program rejects the targets that restate a state over an
+        // auto axis when it is traced, and it agrees with the eager placement on every other target.
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let auto = DeviceMesh::new(auto_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let other_auto = DeviceMesh::new(auto_mesh.clone(), devices[2..].to_vec()).unwrap();
+        let auto_replicated = Sharding::replicated(auto_mesh.clone(), 0);
+        let scalar = ArrayType::scalar(DataType::F32);
+        let changed = format!(
+            "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding collective) \
+             instead",
+        );
+        let unreduced_auto = auto_replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let reduced_auto = auto_replicated.clone().with_reduced_axes(["x"]).unwrap();
+        let auto_inputs = [
+            (
+                "unreduced over an auto axis",
+                Array::from_host_shards(
+                    &session,
+                    scalar.clone(),
+                    auto.clone(),
+                    Some(unreduced_auto.clone()),
+                    [
+                        (devices[0].id(), values_to_bytes(&[1f32]).as_slice()),
+                        (devices[1].id(), values_to_bytes(&[2f32]).as_slice()),
+                    ],
+                )
+                .unwrap(),
+            ),
+            (
+                "reduced over an auto axis",
+                Array::from_host_buffer(
+                    &session,
+                    scalar.clone(),
+                    auto.clone(),
+                    Some(reduced_auto),
+                    values_to_bytes(&[3f32]),
+                )
+                .unwrap(),
+            ),
+        ];
+        for (input_name, input) in auto_inputs {
+            assert_eq!(
+                (observe(&input).values, input.r#type().into_owned()),
+                (vec![3.], scalar.clone().with_sharding(auto_replicated.clone()).unwrap())
+            );
+            let state = input.sharding().clone();
+            let is_unreduced = !state.unreduced_axes().is_empty();
+            let targets = [
+                ("identity", Some(ArrayPlacement::mesh(auto.clone(), state.clone()).unwrap()), None),
+                ("other devices", Some(ArrayPlacement::mesh(other_auto.clone(), state.clone()).unwrap()), None),
+                (
+                    "replicated",
+                    Some(ArrayPlacement::mesh(auto.clone(), auto_replicated.clone()).unwrap()),
+                    Some(changed.clone()),
+                ),
+                (
+                    "device",
+                    Some(ArrayPlacement::device(devices[2])),
+                    is_unreduced.then(|| {
+                        format!(
+                            "`{PLACE_OPERATION_NAME}` cannot move a value with reduction state over mesh axes larger \
+                             than one (i.e., `x`) onto a single device; use a reduction (or the corresponding \
+                             collective) first",
+                        )
+                    }),
+                ),
+                ("memory", Some(ArrayPlacement::from(pinned)), None),
+                ("none", None, None),
+            ];
+            for (target_name, target, rejection) in targets {
+                let cell = format!("{input_name}, target {target_name}");
+                let options =
+                    || PlacementOptions::new(target.clone(), None::<ArrayPlacement>, None::<bool>, None::<bool>);
+                let error = RefCell::new(None::<String>);
+                let eager = session.place(input.clone(), options()).map(|output| observe(&output));
+                let eager = eager.map_err(|error| error.to_string());
+                match (&rejection, &eager) {
+                    (Some(rejection), _) if eager.as_ref().err() != Some(rejection) => {
+                        disagreements.push(format!("{cell}, eager: {eager:?} != rejection: {rejection:?}"));
+                    }
+                    (None, Err(_)) => disagreements.push(format!("{cell}, eager: {eager:?}")),
+                    (None, Ok(output)) if output.values != vec![3.] => {
+                        disagreements.push(format!("{cell}, eager values: {:?} != [3.0]", output.values));
+                    }
+                    (None, Ok(output)) if target_name == "identity" && output.sharding != state => {
+                        disagreements.push(format!("{cell}, eager sharding: {} != {state}", output.sharding));
+                    }
+                    _ => {}
+                }
+
+                let request = target.clone().map(|target| target.into_request(&session, 0)).transpose().unwrap();
+                let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&input.r#type(), Some(&state), request.as_ref(), None);
+                let inferred = inferred.map_err(|error| Error::from(error).to_string());
+                if inferred != eager.clone().map(|output| output.r#type) {
+                    disagreements.push(format!("{cell}, type rule: {inferred:?} != eager: {eager:?}"));
+                }
+
+                let core = input.place(&request, None).map(|output| observe(&output));
+                let core = core.map_err(|error| Error::from(error).to_string());
+                let jvp = differentiate_at(input.clone())
+                    .jvp(input.clone(), |x| record(&error, session.place(x, options())))
+                    .map(|(primal, _)| observe(&primal))
+                    .map_err(|other| error.take().unwrap_or(other.to_string()));
+                let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
+                    |x: ArrayTracer| record(&error, session.place(x.clone(), options())).unwrap_or(x),
+                    input.r#type().into_owned(),
+                );
+                let staged = match (error.take(), traced) {
+                    (Some(message), _) => Err(message),
+                    (None, Err(error)) => Err(error.to_string()),
+                    (None, Ok(traced)) => {
+                        match traced.program().interpret_in_context(&session, Value::Array(input.clone())) {
+                            Ok(Value::Array(output)) => Ok(observe(&output)),
+                            Ok(_) => Err("placing an array must produce an array".to_string()),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                };
+                let expected_staged = match target_name {
+                    "identity" | "other devices" => Err(changed.clone()),
+                    _ => eager.clone(),
+                };
+                for (path, result, expected) in
+                    [("core", core, &eager), ("jvp", jvp, &eager), ("staged", staged, &expected_staged)]
+                {
+                    if &result != expected {
+                        disagreements.push(format!("{cell}, {path}: {result:?} != {expected:?}"));
+                    }
+                }
+            }
+        }
+
+        // The runtime sharding of an array replicated along an auto axis determines its shards, which its type does
+        // not, so an expected source layout that overlaps them is rejected by the eager placement as forward mode
+        // rejects it after it completes the source with that runtime placement, with the error of the type rule.
+        let auto_matrix = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4, 4]),
+            auto.clone(),
+            Some(Sharding::replicated(auto_mesh.clone(), 2)),
+            values_to_bytes(&[42f32; 16]),
+        )
+        .unwrap();
+        let source = ArrayPlacement::in_place().with_layout(Layout::Strided(StridedLayout::new(vec![8, 4])));
+        let options = || PlacementOptions::defaults().with_source(source.clone());
+        let source_request = source.clone().into_request(&session, 2).unwrap();
+        let error = RefCell::new(None::<String>);
+        let invalid = Err(format!(
+            "`{PLACE_OPERATION_NAME}` source layout is invalid: strided layout stride 8 on axis 0 is smaller than the \
+             16-byte span occupied by more minor axes and may alias array elements",
+        ));
+        let results = [
+            ("eager", session.place(auto_matrix.clone(), options()).map(|_| ()).map_err(|error| error.to_string())),
+            (
+                "type rule",
+                PlaceOperation::infer_output_type_allowing_uneven_splits(
+                    &auto_matrix.r#type(),
+                    Some(auto_matrix.sharding()),
+                    None,
+                    Some(&source_request),
+                )
+                .map(|_| ())
+                .map_err(|error| Error::from(error).to_string()),
+            ),
+            (
+                "core",
+                auto_matrix
+                    .place(&None::<PlacementRequest>, &Some(source_request.clone()))
+                    .map(|_| ())
+                    .map_err(|error| Error::from(error).to_string()),
+            ),
+            (
+                "jvp",
+                differentiate_at(auto_matrix.clone())
+                    .jvp(auto_matrix.clone(), |x| record(&error, session.place(x, options())))
+                    .map(|_| ())
+                    .map_err(|other| error.take().unwrap_or(other.to_string())),
+            ),
+        ];
+        for (path, result) in results {
+            if result != invalid {
+                disagreements.push(format!("auto source layout, {path}: {result:?} != {invalid:?}"));
+            }
+        }
+
         // A layout describes each shard, so the byte strides `[8, 4]` of a dense `f32[4, 2]` column shard of an
-        // `f32[4, 4]` value that is split into two column shards pass the type rule on every path, although they would
-        // overlap the rows of the whole value, and every path then reports what the runtime makes of them.
+        // `f32[4, 4]` value that is split into two column shards pass the type rule (also with the runtime sharding of
+        // the array), although they would overlap the rows of the whole value. No backend here can execute the accepted
+        // type, and each says why: the CPU plugin cannot create strided buffers, which every path that places the array
+        // reports alike, and the reference backend stores a whole value in one buffer, which it reports as a shard
+        // layout that it cannot materialize.
         let columns =
             Sharding::new(double_mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
                 .unwrap();
@@ -5963,15 +6170,29 @@ mod tests {
             .jvp(input.clone(), |x| record(&error, session.place(x, options())))
             .map(|(primal, _)| observe(&primal))
             .map_err(|other| error.take().unwrap_or(other.to_string()));
-        for (path, result) in [("staged", &staged), ("jvp", &jvp)] {
-            if result != &eager {
-                disagreements.push(format!("per-shard layout, {path}: {result:?} != eager: {eager:?}"));
+        let request = ArrayPlacement::in_place().with_layout(layout.clone()).into_request(&session, 2).unwrap();
+        let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&input.r#type(), Some(input.sharding()), Some(&request), None);
+        let output_type = input.r#type().into_owned().with_layout(layout.clone());
+        if inferred.as_ref() != Ok(&output_type) {
+            disagreements.push(format!("per-shard layout, type rule: {inferred:?} != {output_type:?}"));
+        }
+        let unsupported =
+            Err("PJRT_Buffer_MemoryLayout_Type_Strides is not supported to be converted to a xla::Layout.".to_string());
+        for (path, result) in [("eager", &eager), ("staged", &staged), ("jvp", &jvp)] {
+            if result != &unsupported {
+                disagreements.push(format!("per-shard layout, {path}: {result:?} != {unsupported:?}"));
             }
         }
-        if let Err(message) = &eager
-            && message.contains("layout is invalid")
-        {
-            disagreements.push(format!("per-shard layout, eager: the type rule rejects it: {message}"));
+        let values = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
+        let reference = CoreArray::from_elements(input.r#type().into_owned(), &values).unwrap();
+        let reference = reference.place(&request, None).map_err(|error| error.to_string());
+        let whole_value = Err(format!(
+            "the reference `Array` backend stores a whole value in one buffer, so it cannot materialize the shard \
+             layout of `{output_type}` for it: strided layout stride 8 on axis 0 is smaller than the 16-byte span occupied by \
+             more minor axes and may alias array elements",
+        ));
+        if reference != whole_value {
+            disagreements.push(format!("per-shard layout, reference: {reference:?} != {whole_value:?}"));
         }
 
         // Without a layout, a destination keeps the layout of a value while it still describes each destination shard,
@@ -6201,7 +6422,7 @@ mod tests {
                 disagreements.push(format!("{cell}: {host:?} != array: {array:?}"));
             }
             let request = target.clone().into_request(&session, 1).unwrap();
-            let inferred = PlaceOperation::infer_output_type(&host_type, Some(&request), None);
+            let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&host_type, None, Some(&request), None);
             let inferred = inferred.map_err(|error| Error::from(error).to_string());
             if let (Err(host), Err(inferred)) = (&host, &inferred)
                 && host != inferred
@@ -6233,13 +6454,16 @@ mod tests {
 
         // Inside a `shard_map` body, a source that names devices (i.e., the placement of the local value over the
         // devices of the region, or the sole device of a region of one device) would become the target of the
-        // transposed placement, which would move the cotangent of a value of the region, so it is rejected when the
-        // function is compiled forward or applied eagerly, and the program of reverse mode, which keeps only the
-        // transposed placement, is rejected for its target. Every other source compiles and executes on every path.
+        // transposed placement of an invariant local value (i.e., one that does not vary along the manual axis), which
+        // would move its cotangent, so it is rejected when the function is compiled forward or applied eagerly, and the
+        // program of reverse mode, which keeps only the transposed placement, is rejected for its target. The cotangent
+        // of a varying local value stays where it lives (refer to `PlaceOperation::transposes_in_place`), so every
+        // source compiles and executes on every path for it, as does every other source for an invariant value.
         let pinned_seed = |r#type: &ArrayType| r#type.clone().with_memory(pinned);
         let source_error = format!(
-            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices, \
-             because transposition would move the cotangent of that value to them",
+            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices \
+             unless the placement moves nothing and the value varies along the manual axes of the region or carries \
+             reduction state over them, because transposition would move the cotangent of that value to them",
         );
         let moved_error = format!(
             "cannot lower `{PLACE_OPERATION_NAME}`: a value inside a manual region cannot be moved to another \
@@ -6251,99 +6475,122 @@ mod tests {
             let program_mesh = DeviceMesh::new(program_logical_mesh.clone(), devices[..count].to_vec()).unwrap();
             let region_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Manual).unwrap()]).unwrap();
             let region_devices = DeviceMesh::new(region_mesh.clone(), devices[..count].to_vec()).unwrap();
-            let specification = Sharding::replicated(region_mesh.clone(), 1);
             let r#type = ArrayType::new_static(DataType::F32, [4])
-                .with_sharding(Sharding::replicated(program_logical_mesh, 1))
+                .with_sharding(Sharding::replicated(program_logical_mesh.clone(), 1))
                 .unwrap();
-            let mut sources = vec![
-                ("none", None, false),
-                ("memory", Some(ArrayPlacement::from(Memory::Device)), false),
-                (
-                    "layout",
-                    Some(ArrayPlacement::in_place().with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])))),
-                    false,
-                ),
-                ("resolved", Some(ArrayPlacement::mesh(region_devices, specification.clone()).unwrap()), true),
-            ];
-            if count == 1 {
-                sources.push(("device", Some(ArrayPlacement::device(devices[0])), true));
-            }
-            for (source_name, source, is_rejected) in sources {
-                for (target_name, target) in [("memory", Some(ArrayPlacement::from(pinned))), ("none", None)] {
-                    let cell = format!("`shard_map` over {count} devices, target {target_name}, source {source_name}");
-                    let options = || PlacementOptions::new(target.clone(), source.clone(), None::<bool>, None::<bool>);
-                    let body = |local| record(&RefCell::new(None), session.place(local, options()));
-                    let forward: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
-                        |x: CompileTracer| {
-                            let options = ShardMapOptions::new();
-                            shard_map(
-                                body,
-                                x,
-                                region_mesh.clone(),
-                                specification.clone(),
-                                specification.clone(),
-                                options,
-                            )
-                            .unwrap()
-                        },
-                        r#type.clone(),
-                        &session,
-                        program_mesh.clone(),
-                    );
-                    let seed_type = if target.is_some() { pinned_seed(&r#type) } else { r#type.clone() };
-                    let reverse: Result<CompiledFunction<(ArrayType, ArrayType), ArrayType>, _> = compile(
-                        |(x, seed): (CompileTracer, CompileTracer)| {
-                            let (_, pullback) = differentiate_at(x.into_value())
-                                .vjp(|x| {
-                                    let x = ValueProjection::<ArrayType>::into_projected(x)?;
-                                    let output = shard_map(
-                                        |local| record(&RefCell::new(None), session.place(local, options())),
-                                        x,
-                                        region_mesh.clone(),
-                                        specification.clone(),
-                                        specification.clone(),
-                                        ShardMapOptions::new(),
-                                    )
-                                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                                    Ok(output.into_value())
-                                })
-                                .unwrap();
-                            let cotangent = pullback.apply_materialized(seed.into_value()).unwrap();
-                            ValueProjection::<ArrayType>::into_projected(cotangent).unwrap()
-                        },
-                        (r#type.clone(), seed_type),
-                        &session,
-                        program_mesh.clone(),
-                    );
-                    let input = Array::from_host_buffer(
-                        &session,
-                        r#type.clone(),
-                        program_mesh.clone(),
-                        None,
-                        values_to_bytes(&[1f32, 2., 3., 4.]),
-                    )
-                    .unwrap();
-                    let eager = shard_map(
-                        |local| record(&RefCell::new(None), session.place(local, options())),
-                        input,
-                        region_mesh.clone(),
-                        specification.clone(),
-                        specification.clone(),
-                        ShardMapOptions::new(),
-                    );
-                    let results = [
-                        ("forward", forward.map(|_| ()).map_err(|error| error.to_string())),
-                        ("reverse", reverse.map(|_| ()).map_err(|error| error.to_string())),
-                        ("eager", eager.map(|_| ()).map_err(|error| error.to_string())),
-                    ];
-                    for (path, result) in results {
-                        let expected = match (is_rejected, path) {
-                            (false, _) => Ok(()),
-                            (true, "reverse") => Err(moved_error.clone()),
-                            (true, _) => Err(source_error.clone()),
-                        };
-                        if result != expected {
-                            disagreements.push(format!("{cell}, {path}: {result:?} != {expected:?}"));
+            for is_varying in [false, true] {
+                // A specification that splits the value along the manual axis makes the local value vary along it.
+                let (specification, local_sharding, output_type) = if is_varying {
+                    let split =
+                        |mesh: &LogicalMesh| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]);
+                    let varying = Sharding::replicated(region_mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+                    let output_type = r#type.clone().with_sharding(split(&program_logical_mesh).unwrap()).unwrap();
+                    (split(&region_mesh).unwrap(), varying, output_type)
+                } else {
+                    let specification = Sharding::replicated(region_mesh.clone(), 1);
+                    (specification.clone(), specification, r#type.clone())
+                };
+                let mut sources = vec![
+                    ("none", None, false),
+                    ("memory", Some(ArrayPlacement::from(Memory::Device)), false),
+                    (
+                        "layout",
+                        Some(ArrayPlacement::in_place().with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])))),
+                        false,
+                    ),
+                    (
+                        "resolved",
+                        Some(ArrayPlacement::mesh(region_devices.clone(), local_sharding.clone()).unwrap()),
+                        !is_varying,
+                    ),
+                ];
+                if count == 1 {
+                    sources.push(("device", Some(ArrayPlacement::device(devices[0])), !is_varying));
+                }
+                for (source_name, source, is_rejected) in sources {
+                    for (target_name, target) in [("memory", Some(ArrayPlacement::from(pinned))), ("none", None)] {
+                        let input_name = if is_varying { "varying" } else { "invariant" };
+                        let cell = format!(
+                            "`shard_map` over {count} devices, {input_name} value, target {target_name}, source \
+                             {source_name}",
+                        );
+                        let options =
+                            || PlacementOptions::new(target.clone(), source.clone(), None::<bool>, None::<bool>);
+                        let body = |local| record(&RefCell::new(None), session.place(local, options()));
+                        let forward: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
+                            |x: CompileTracer| {
+                                let options = ShardMapOptions::new();
+                                shard_map(
+                                    body,
+                                    x,
+                                    region_mesh.clone(),
+                                    specification.clone(),
+                                    specification.clone(),
+                                    options,
+                                )
+                                .unwrap()
+                            },
+                            r#type.clone(),
+                            &session,
+                            program_mesh.clone(),
+                        );
+                        let seed_type = if target.is_some() { pinned_seed(&output_type) } else { output_type.clone() };
+                        let reverse: Result<CompiledFunction<(ArrayType, ArrayType), ArrayType>, _> = compile(
+                            |(x, seed): (CompileTracer, CompileTracer)| {
+                                let (_, pullback) = differentiate_at(x.into_value())
+                                    .vjp(|x| {
+                                        let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                                        let output = shard_map(
+                                            |local| record(&RefCell::new(None), session.place(local, options())),
+                                            x,
+                                            region_mesh.clone(),
+                                            specification.clone(),
+                                            specification.clone(),
+                                            ShardMapOptions::new(),
+                                        )
+                                        .map_err(|error| {
+                                            ProgramError::InvalidArgument { message: error.to_string() }
+                                        })?;
+                                        Ok(output.into_value())
+                                    })
+                                    .unwrap();
+                                let cotangent = pullback.apply_materialized(seed.into_value()).unwrap();
+                                ValueProjection::<ArrayType>::into_projected(cotangent).unwrap()
+                            },
+                            (r#type.clone(), seed_type),
+                            &session,
+                            program_mesh.clone(),
+                        );
+                        let input = Array::from_host_buffer(
+                            &session,
+                            r#type.clone(),
+                            program_mesh.clone(),
+                            None,
+                            values_to_bytes(&[1f32, 2., 3., 4.]),
+                        )
+                        .unwrap();
+                        let eager = shard_map(
+                            |local| record(&RefCell::new(None), session.place(local, options())),
+                            input,
+                            region_mesh.clone(),
+                            specification.clone(),
+                            specification.clone(),
+                            ShardMapOptions::new(),
+                        );
+                        let results = [
+                            ("forward", forward.map(|_| ()).map_err(|error| error.to_string())),
+                            ("reverse", reverse.map(|_| ()).map_err(|error| error.to_string())),
+                            ("eager", eager.map(|_| ()).map_err(|error| error.to_string())),
+                        ];
+                        for (path, result) in results {
+                            let expected = match (is_rejected, path) {
+                                (false, _) => Ok(()),
+                                (true, "reverse") => Err(moved_error.clone()),
+                                (true, _) => Err(source_error.clone()),
+                            };
+                            if result != expected {
+                                disagreements.push(format!("{cell}, {path}: {result:?} != {expected:?}"));
+                            }
                         }
                     }
                 }

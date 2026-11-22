@@ -1261,7 +1261,11 @@ impl Context for Session {
                 // array only while that layout still describes each shard of the result, as the type rule does.
                 check_count!("input", inputs, 1, ProgramError);
                 let array = <Value as ValueProjection<ArrayType>>::into_projected(inputs[0].clone())?;
-                operation.infer_output_types(&[array.r#type().into_owned()], &[])?;
+
+                // The runtime sharding of the array records its placement along auto mesh axes, including a pending
+                // reduction over them, which its type omits, so the type rule is applied with it, as the placement of
+                // an array through `Session::place` applies it.
+                operation.infer_output_type_requiring_even_splits(&array.r#type(), Some(array.sharding()))?;
 
                 // The result belongs to this session, so its buffers must belong to the client of this session. An
                 // array of another client is therefore rejected like the inputs of any other operation, even when it
