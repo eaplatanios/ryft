@@ -562,7 +562,7 @@ mod tests {
                 &session,
                 program_mesh.clone(),
             );
-            let seed_type = match target.as_ref().and_then(PlacementRequest::memory) {
+            let seed_type = match target.as_ref().and_then(PlacementRequest::explicit_memory) {
                 Some(memory) => r#type.clone().with_memory(memory),
                 None => r#type.clone(),
             };

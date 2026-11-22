@@ -1139,8 +1139,14 @@ where
         // item before this rule rewrites them for the packed value (e.g., before it drops the layout of a source, or
         // broadcasts an unmapped input along a new batch dimension, whose type no longer has the layout of the item),
         // so that the batched placement rejects every request that the placement of a batch item rejects with the same
-        // error. An unmapped input is its own batch item.
-        self.infer_output_types(&[inputs[0].unbatched_type()], &[])?;
+        // error. An unmapped input is its own batch item. A concrete batch reports the placement of a batch item, whose
+        // sharding records what the type of the item omits (e.g., a pending reduction over an auto mesh axis), so the
+        // rule is applied with it, as the interpretation and differentiation rules apply it.
+        let item_placement = inputs[0].placement();
+        self.infer_output_type_requiring_even_splits(
+            &inputs[0].unbatched_type(),
+            item_placement.as_ref().map(Placement::sharding),
+        )?;
 
         let mut target = self.target.clone();
         let mut source = self.source.clone();

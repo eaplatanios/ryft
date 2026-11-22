@@ -430,7 +430,8 @@ pub enum ArrayPlacementTarget {
     ///   - A completed reduction and a pending reduction over mesh axes of size one are complete on one device, so the
     ///     value loses its unreduced and reduced state. A value with a pending reduction over a larger mesh axis is
     ///     rejected, an [`Array`] leaf included, because a placement does not combine the contributions of several
-    ///     devices (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so such a value must be reduced first.
+    ///     devices (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so such a value must be
+    ///     reduced first.
     ///   - A value inside a manual region cannot be moved.
     ///
     /// A traced value stages a [`PlacementRequest::Device`], whether or not it wraps a concrete array, which resolves
@@ -722,10 +723,10 @@ pub trait Placeable: Parameter {
     /// concrete and traced leaves), a `target` or `source` that cannot be resolved against `session` (e.g.,
     /// [`SessionError::MissingMesh`](crate::SessionError::MissingMesh) for a sharding without a default mesh), a
     /// `target` or `source` that the type rule of [`PlaceOperation`] rejects for a concrete leaf, except for an uneven
-    /// split (i.e., a [`TypeError`] of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement that fails to execute or
-    /// to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`] reject for a traced leaf).
-    /// The leaf is consumed either way, and [`Session::place`] returns the first error of any leaf as its own, after
-    /// the leaves before it were placed.
+    /// split (i.e., a [`TypeError`] of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement
+    /// that fails to execute or to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`]
+    /// reject for a traced leaf). The leaf is consumed either way, and [`Session::place`] returns the first error of
+    /// any leaf as its own, after the leaves before it were placed.
     fn place(
         value: Self,
         session: &Session,
@@ -1102,16 +1103,16 @@ impl Session {
     /// their placements resolve against this session and are recorded through the [`PlaceDispatch`] primitive of the
     /// [`Place`] capability, so the same call works inside those transformations. Every leaf follows the type rule of
     /// [`PlaceOperation`], an [`Array`] leaf and a host leaf included, which validate their requests as they are given
-    /// with that rule (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]) before they move or upload anything. A host leaf
-    /// is validated as the placement of a value without a tracked sharding in device memory, which is how it is
-    /// uploaded without a destination, and it ignores its source. So no placement changes the reduction state of a
-    /// value or moves a value inside a manual region or into one, and every leaf reports the error that the type rule
-    /// reports first. A destination must restate the unreduced and
-    /// reduced axes of a leaf over a mesh that defines them identically, so a placement never combines the values of
-    /// several devices along unreduced axes, and a host leaf, which has no reduction state, cannot be uploaded onto an
-    /// unreduced or reduced destination. The one exception to the restatement is a device destination, which completes
-    /// reduction state over mesh axes of size one and accepts or rejects reduction state over larger axes as the
-    /// contract of [`PlacementRequest::Device`] describes. [`Array::to_placement`] is the physical primitive below this
+    /// with that rule (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]) before they move or
+    /// upload anything. A host leaf is validated as the placement of a value without a tracked sharding in device
+    /// memory, which is how it is uploaded without a destination, and it ignores its source. So no placement changes
+    /// the reduction state of a value or moves a value inside a manual region or into one, and every leaf reports the
+    /// error that the type rule reports first. A destination must restate the unreduced and reduced axes of a leaf
+    /// over a mesh that defines them identically, so a placement never combines the values of several devices along
+    /// unreduced axes, and a host leaf, which has no reduction state, cannot be uploaded onto an unreduced or reduced
+    /// destination. The one exception to the restatement is a device destination, which completes reduction state
+    /// over mesh axes of size one and accepts or rejects reduction state over larger axes as the contract of
+    /// [`PlacementRequest::Device`] describes. [`Array::to_placement`] is the physical primitive below this
     /// function, which combines contributions and drops reduction state when its destination requires it. JAX rejects a
     /// `device_put` that makes a concrete value unreduced too, whereas it accepts one that makes such a value reduced,
     /// which Ryft rejects, and inside `jit` it lowers a change of reduction state to a sharding constraint that
@@ -1173,15 +1174,15 @@ impl Session {
     /// differentiation sends the cotangent to the devices that it names. Its sharding, memory, and layout are checked
     /// by the type rule of [`PlaceOperation`] against the type of an [`Array`] leaf and its runtime sharding, which
     /// records its reduction state and its shards along auto mesh axes that its type omits, exactly as they are for a
-    /// traced leaf that wraps a concrete array (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as it is given. A
-    /// traced leaf that wraps a concrete array then completes a source that names only a memory or a layout with the
-    /// concrete placement of that array (refer to [`PlacementRequest::resolve_source`]), so that transposition returns
-    /// the cotangent to its devices. An expected layout must therefore address the shape of each shard of the leaf as
-    /// far as its runtime sharding (or, for a staged leaf, its type) determines its shards, and it must equal the
-    /// layout that the type of the leaf declares, if any. The type rule is the only check of a source, so the physical
-    /// layouts of the buffers of a leaf whose type declares no layout are not inspected on any path. A target that
-    /// restates a pending or completed reduction of an [`Array`] leaf over an auto axis (e.g., its own placement) is
-    /// accepted and changes nothing, and one that drops it is rejected, as for any other reduction state.
+    /// traced leaf that wraps a concrete array (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]),
+    /// as it is given. A traced leaf that wraps a concrete array then completes a source that names only a memory or
+    /// a layout with the concrete placement of that array (refer to [`PlacementRequest::resolve_source`]), so that
+    /// transposition returns the cotangent to its devices. An expected layout must therefore address the shape of
+    /// each shard of the leaf as far as its runtime sharding (or, for a staged leaf, its type) determines its shards.
+    /// It must equal the layout that the type of the leaf declares, if any. The type rule is the only check of a
+    /// source, so the physical layouts of the buffers of a leaf whose type declares no layout are not inspected.
+    /// A target that restates a pending or completed reduction of an [`Array`] leaf over an auto axis (e.g., its own
+    /// placement) is accepted and changes nothing, and one that drops it is rejected, as for any other reduction state.
     ///
     /// In a run with more than one process, every process must make the same call with trees of the same structure
     /// and the same options, because the placements of the leaves communicate across processes in the order of the
@@ -1469,20 +1470,21 @@ impl<V: ConcreteArrays> ConcreteArrays for ProjectedValue<ArrayType, V> {
 
 /// Validates the destination `target` and the expected `source` of the [`Array`] leaf `array` of [`Session::place`]
 /// against the type of `array` with the type rule of [`PlaceOperation`] (refer to
-/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as given and before anything is moved, so that [`Session::place`] rejects
-/// every request that the type rule rejects, with the error that the type rule reports first, as every path that stages
-/// or executes a placement does. This includes the reduction state of `array`, which the placement never changes (e.g.,
-/// it never sums pending contributions onto one device), which only [`Array::to_placement`], the physical primitive
-/// that it runs on, does when its destination requires it, and a value inside a manual region, which it never moves.
+/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as given and before anything is moved, so that
+/// [`Session::place`] reports the same first error as every path that stages or executes a placement. This includes
+/// the reduction state of `array`, which the placement never changes (e.g., it never sums pending contributions onto
+/// one device), which only [`Array::to_placement`], the physical primitive that it runs on, does when its destination
+/// requires it, and a value inside a manual region, which it never moves.
 /// The one check of the type rule that it does not make is that the target splits each dimension evenly, which an
 /// [`Array`] does not have to (refer to [`Session::place`]).
 ///
 /// The type of `array` omits its placement along auto mesh axes, including a pending or completed reduction over them,
 /// which its runtime sharding records, so the request is validated with that runtime sharding as the concrete sharding
-/// of the input (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), as the rules of [`PlaceOperation`] that place a
-/// concrete value do. A target that restates the reduction state of `array` over an auto axis (e.g., its own placement)
-/// is therefore accepted and changes nothing, while a target that drops it is rejected, and a source layout and an
-/// in-place target layout are checked against the shards that the runtime sharding determines.
+/// of the input, as the rules of [`PlaceOperation`] that place a concrete value do (refer to
+/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]). A target that restates the reduction state of `array`
+/// over an auto axis (e.g., its own placement) is therefore accepted and changes nothing, while a target that drops
+/// it is rejected, and a source layout and an in-place target layout are checked against the shards that the runtime
+/// sharding determines.
 ///
 /// The source is validated as it is given, as the core [`Place`] capability validates it, and it is not completed with
 /// the placement of `array` (refer to [`PlacementRequest::resolve_source`]), because the placement of a concrete array
@@ -1500,7 +1502,12 @@ fn validate_array_request(
     let rank = r#type.rank();
     let target = target.map(|target| target.clone().into_request(session, rank)).transpose()?;
     let source = source.map(|source| source.into_request(session, rank)).transpose()?;
-    PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, Some(array.sharding()), target.as_ref(), source.as_ref())?;
+    PlaceOperation::infer_output_type_allowing_uneven_splits(
+        &r#type,
+        Some(array.sharding()),
+        target.as_ref(),
+        source.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -1512,7 +1519,12 @@ fn validate_array_request(
 /// it also rejects placements that the physical primitives support (e.g., uneven splits).
 fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(), Error> {
     if placement.sharding().rank() != r#type.rank() {
-        PlaceOperation::infer_output_type_allowing_uneven_splits(r#type, None, Some(&PlacementRequest::Resolved(placement.clone())), None)?;
+        PlaceOperation::infer_output_type_allowing_uneven_splits(
+            r#type,
+            None,
+            Some(&PlacementRequest::Resolved(placement.clone())),
+            None,
+        )?;
     }
     Ok(())
 }
@@ -5665,8 +5677,12 @@ mod tests {
                     if let (Ok(eager), Ok(target), Ok(source)) = (&eager, request(target), request(source)) {
                         let r#type = input.r#type();
                         let sharding = Some(input.sharding());
-                        let inferred =
-                            PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, sharding, target.as_ref(), source.as_ref());
+                        let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(
+                            &r#type,
+                            sharding,
+                            target.as_ref(),
+                            source.as_ref(),
+                        );
                         if inferred.as_ref() != Ok(&eager.r#type) {
                             disagreements.push(format!("{cell}, type rule: {inferred:?} != eager: {:?}", eager.r#type));
                         }
@@ -6036,7 +6052,12 @@ mod tests {
                 }
 
                 let request = target.clone().map(|target| target.into_request(&session, 0)).transpose().unwrap();
-                let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&input.r#type(), Some(&state), request.as_ref(), None);
+                let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(
+                    &input.r#type(),
+                    Some(&state),
+                    request.as_ref(),
+                    None,
+                );
                 let inferred = inferred.map_err(|error| Error::from(error).to_string());
                 if inferred != eager.clone().map(|output| output.r#type) {
                     disagreements.push(format!("{cell}, type rule: {inferred:?} != eager: {eager:?}"));
@@ -6171,7 +6192,12 @@ mod tests {
             .map(|(primal, _)| observe(&primal))
             .map_err(|other| error.take().unwrap_or(other.to_string()));
         let request = ArrayPlacement::in_place().with_layout(layout.clone()).into_request(&session, 2).unwrap();
-        let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&input.r#type(), Some(input.sharding()), Some(&request), None);
+        let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(
+            &input.r#type(),
+            Some(input.sharding()),
+            Some(&request),
+            None,
+        );
         let output_type = input.r#type().into_owned().with_layout(layout.clone());
         if inferred.as_ref() != Ok(&output_type) {
             disagreements.push(format!("per-shard layout, type rule: {inferred:?} != {output_type:?}"));
@@ -6422,7 +6448,8 @@ mod tests {
                 disagreements.push(format!("{cell}: {host:?} != array: {array:?}"));
             }
             let request = target.clone().into_request(&session, 1).unwrap();
-            let inferred = PlaceOperation::infer_output_type_allowing_uneven_splits(&host_type, None, Some(&request), None);
+            let inferred =
+                PlaceOperation::infer_output_type_allowing_uneven_splits(&host_type, None, Some(&request), None);
             let inferred = inferred.map_err(|error| Error::from(error).to_string());
             if let (Err(host), Err(inferred)) = (&host, &inferred)
                 && host != inferred
