@@ -1120,11 +1120,11 @@ mod tests {
         Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, Cast, ConditionOperation,
         ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalar,
         DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, Error as CoreError,
-        GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder, Placement,
-        PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision, ScanOperation,
-        Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile,
-        TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection,
-        WhileOperation,
+        GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder,
+        Placement, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision,
+        ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape,
+        StridedLayout, Tile, TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed,
+        ValueProjection, WhileOperation,
     };
     use ryft_mlir::{Location, OperationResultRef};
     use ryft_pjrt::extensions::ffi::{
@@ -3509,8 +3509,11 @@ mod tests {
             let moved = output
                 .to_placement(
                     &session,
-                    Placement::new(destination_mesh.clone(),
-                        Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),).unwrap(),
+                    Placement::new(
+                        destination_mesh.clone(),
+                        Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             assert_eq!(moved.layout(), Some(&layout));

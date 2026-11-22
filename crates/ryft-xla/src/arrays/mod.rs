@@ -60,7 +60,7 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{AliasingParameter, ArrayPlacement, HostOrArray, Placeable, PlaceableParameter, PlacementOptions};
+pub use placement::{AliasingParameter, HostOrArray, Placeable, PlaceableParameter, PlacementOptions};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
@@ -667,13 +667,12 @@ impl Array {
     /// places such an array on devices of several processes (refer to [`resharding`]).
     ///
     /// An array without the fact is treated as one whose devices every process knows, which holds only when every
-    /// process of a distributed run names the same devices wherever a program names devices (e.g., the default mesh of
-    /// a [`Session`], the mesh of a construction, or the device of an [`ArrayPlacement::device`] request). No process
-    /// can check that, because each one sees only its own request, so it is a precondition. A choice of devices that
-    /// differs between processes is expressible only by naming no device, which leaves the choice to each process and
-    /// gives the result this fact. For example, an array that each process placed on its own first addressable device
-    /// with [`ArrayPlacement::device`] does not have the fact, and a later placement of it over the devices of every
-    /// process makes each process send its value from its own device while none of them receives.
+    /// process of a distributed run names the same devices wherever a program names devices (e.g., the default mesh
+    /// of a [`Session`], the mesh of a construction, or a [`Device`](ryft_core::Device) target). No process can check
+    /// that, because each one sees only its own request, so it is a precondition. A choice of devices that differs
+    /// between processes is expressible only by letting each process choose its own devices. For example, an array that
+    /// each process placed on its own first addressable device with an explicit device target does not have the fact.
+    /// A later placement over every process's devices then makes each process send its own value without any receiver.
     #[inline]
     pub(crate) fn is_locally_assigned(&self) -> bool {
         self.locally_assigned

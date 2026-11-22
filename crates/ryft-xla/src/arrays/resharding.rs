@@ -3255,8 +3255,11 @@ mod tests {
 
         // The identity placement and the placement that copies whole shards both return arrays of the receiving
         // session, which has a default mesh that the session of the input lacks.
-        let unchanged = Placement::new(first_device_mesh.clone(),
-            Sharding::replicated(first_device_mesh.logical_mesh().clone(), 1),).unwrap();
+        let unchanged = Placement::new(
+            first_device_mesh.clone(),
+            Sharding::replicated(first_device_mesh.logical_mesh().clone(), 1),
+        )
+        .unwrap();
         let copied = Placement::new(mesh.clone(), replicated).unwrap();
         for target in [unchanged, copied] {
             let placed = array.to_placement(&meshed_session, target.clone()).unwrap();
@@ -3335,7 +3338,10 @@ mod tests {
             source
                 .to_placement(
                     &session,
-                    PlacementRequest::InPlace { memory: None, layout: Some(Layout::Tiled(TiledLayout::new(vec![0], vec![]))) },
+                    PlacementRequest::InPlace {
+                        memory: None,
+                        layout: Some(Layout::Tiled(TiledLayout::new(vec![0], vec![]))),
+                    },
                 )
                 .unwrap(),
         ] {
@@ -3347,8 +3353,11 @@ mod tests {
         // A destination that names devices or a sharding names the devices of the result, even when they are the
         // devices of the source.
         let same_devices = Placement::new(own_mesh.clone(), source.sharding().clone()).unwrap();
-        let other_devices = Placement::new(two_device_sub_mesh_x(client),
-            Sharding::replicated(two_device_sub_mesh_x(client).logical_mesh().clone(), 1),).unwrap();
+        let other_devices = Placement::new(
+            two_device_sub_mesh_x(client),
+            Sharding::replicated(two_device_sub_mesh_x(client).logical_mesh().clone(), 1),
+        )
+        .unwrap();
         for target in [same_devices.into(), other_devices.into(), PlacementRequest::from(own_mesh.devices()[0])] {
             let placed = source.to_placement(&session, target.clone()).unwrap();
             assert!(!placed.is_locally_assigned());
@@ -3610,8 +3619,7 @@ mod tests {
             .collect();
         let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(unreduced.clone()).unwrap();
         let summands = Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap();
-        let reduced =
-            summands.to_placement(&session, Placement::new(mesh.clone(), tiled.clone()).unwrap()).unwrap();
+        let reduced = summands.to_placement(&session, Placement::new(mesh.clone(), tiled.clone()).unwrap()).unwrap();
         assert_eq!(reduced.sharding(), &tiled);
         assert_eq!(shard_values(&reduced), vec![vec![11., 22.], vec![33., 44.], vec![11., 22.], vec![33., 44.]]);
 
@@ -3695,9 +3703,8 @@ mod tests {
             assert_eq!(placed.r#type().memory(), memory);
             assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
             assert_eq!(shard_values(&placed), tiles);
-            let placed = source
-                .into_placement(&session, Placement::new(mesh.clone(), sharded(&mesh)).unwrap())
-                .unwrap();
+            let placed =
+                source.into_placement(&session, Placement::new(mesh.clone(), sharded(&mesh)).unwrap()).unwrap();
             assert_eq!(placed.r#type().memory(), memory);
             assert_eq!(shard_memory_kinds(&placed), vec![kind; 4]);
             assert_eq!(shard_values(&placed), tiles);
@@ -4011,10 +4018,7 @@ mod tests {
             Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding.clone()), buffers).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let placed = source
-            .to_placement(
-                &session,
-                Placement::new(mesh.clone(), sharding.clone()).unwrap().with_layout(layout.clone()),
-            )
+            .to_placement(&session, Placement::new(mesh.clone(), sharding.clone()).unwrap().with_layout(layout.clone()))
             .unwrap();
 
         // The placement returns the destination buffers before their uploads complete.
@@ -4067,9 +4071,8 @@ mod tests {
         let source =
             Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding.clone()), buffers).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let placed = source
-            .to_placement(&session, Placement::new(mesh, sharding).unwrap().with_layout(layout))
-            .unwrap();
+        let placed =
+            source.to_placement(&session, Placement::new(mesh, sharding).unwrap().with_layout(layout)).unwrap();
 
         // The readback of the first shard fails, which poisons its destination buffer with its error, while the
         // independent relayout of the second shard completes. The result reports the failure through its fence.
@@ -4175,9 +4178,8 @@ mod tests {
         let source =
             Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding.clone()), buffers).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let placed = source
-            .to_placement(&session, Placement::new(mesh, sharding).unwrap().with_layout(layout))
-            .unwrap();
+        let placed =
+            source.to_placement(&session, Placement::new(mesh, sharding).unwrap().with_layout(layout)).unwrap();
 
         // The relayout of the first shard completes while the source of the second one is still pending, so that a
         // producer of that source may depend on the first destination shard.
@@ -4428,9 +4430,8 @@ mod tests {
 
         let sharded_target =
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let resharded = source_array
-            .to_placement(&session, Placement::new(mesh.clone(), sharded_target).unwrap())
-            .unwrap();
+        let resharded =
+            source_array.to_placement(&session, Placement::new(mesh.clone(), sharded_target).unwrap()).unwrap();
 
         assert_eq!(resharded.addressable_shards().count(), 4);
         assert_eq!(shard_values(&resharded), vec![vec![10.0], vec![11.0], vec![12.0], vec![13.0]]);
@@ -4557,9 +4558,8 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let resharded = source_array
-            .to_placement(&session, Placement::new(mesh.clone(), sharded_along_y).unwrap())
-            .unwrap();
+        let resharded =
+            source_array.to_placement(&session, Placement::new(mesh.clone(), sharded_along_y).unwrap()).unwrap();
         assert_eq!(resharded.addressable_shards().count(), 4);
 
         // Every device holds two whole columns, and the devices along `x` hold copies of the same columns.
@@ -4608,9 +4608,8 @@ mod tests {
 
         let sharded_target =
             Sharding::new(explicit_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let resharded = source_array
-            .to_placement(&session, Placement::new(explicit_mesh, sharded_target).unwrap())
-            .unwrap();
+        let resharded =
+            source_array.to_placement(&session, Placement::new(explicit_mesh, sharded_target).unwrap()).unwrap();
         assert_eq!(resharded.addressable_shards().count(), 4);
         assert_eq!(shard_values(&resharded), vec![vec![400.0], vec![401.0], vec![402.0], vec![403.0]]);
     }
@@ -4926,8 +4925,7 @@ mod tests {
         assert!(cross_host_layouts.is_empty());
         assert_eq!(plan, regions);
 
-        let output =
-            source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()).unwrap();
+        let output = source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()).unwrap();
         output.block_until_ready().unwrap();
         assert_ne!(session.eager_dispatch_statistics().misses, 0);
         assert!(output.execution_fence().is_some());
@@ -4966,9 +4964,8 @@ mod tests {
             .to_placement(&session, Placement::new(mesh.clone(), sharded_target.clone()).unwrap())
             .unwrap();
         let after_first = session.cached_program_count();
-        let second = source_array
-            .to_placement(&session, Placement::new(mesh.clone(), sharded_target).unwrap())
-            .unwrap();
+        let second =
+            source_array.to_placement(&session, Placement::new(mesh.clone(), sharded_target).unwrap()).unwrap();
         let after_second = session.cached_program_count();
 
         assert_eq!(first.addressable_shards().count(), 4);
@@ -5010,9 +5007,7 @@ mod tests {
         let cold_elapsed = cold_start.elapsed();
 
         let warm_start = std::time::Instant::now();
-        let _ = source_array
-            .to_placement(&session, Placement::new(mesh.clone(), target_sharding).unwrap())
-            .unwrap();
+        let _ = source_array.to_placement(&session, Placement::new(mesh.clone(), target_sharding).unwrap()).unwrap();
         let warm_elapsed = warm_start.elapsed();
 
         eprintln!("cold reshard (trace+lower+compile+execute): {cold_elapsed:?}");
@@ -5056,8 +5051,7 @@ mod tests {
         .unwrap();
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
-        let result =
-            source_array.to_placement(&session, Placement::new(target_mesh.clone(), target_sharding).unwrap());
+        let result = source_array.to_placement(&session, Placement::new(target_mesh.clone(), target_sharding).unwrap());
         assert!(matches!(
             result,
             Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
@@ -5309,8 +5303,7 @@ mod tests {
         let (device_id, process_index) = (local_device.id(), local_device.process_index());
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let misattributed = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(device_id, process_index + 1)]);
-        let target =
-            Placement::new(misattributed.unwrap(), Sharding::replicated(logical_mesh.clone(), 0)).unwrap();
+        let target = Placement::new(misattributed.unwrap(), Sharding::replicated(logical_mesh.clone(), 0)).unwrap();
         let bytes = values_to_bytes(&[7f32]);
         let source = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, bytes).unwrap();
 
@@ -5437,7 +5430,10 @@ mod tests {
         .unwrap();
         let memory = Memory::Host { pinned: true };
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let target = Placement::new(mesh.clone(), sharding.clone()).unwrap().with_memory(memory).with_layout(layout.clone());
+        let target = Placement::new(mesh.clone(), sharding.clone())
+            .unwrap()
+            .with_memory(memory)
+            .with_layout(layout.clone());
         let placed = source.to_placement(&session, target).unwrap();
         assert_eq!(placed.data_type(), DataType::F32);
         assert_eq!(placed.shape(), StaticShape::new(vec![2, 4]));

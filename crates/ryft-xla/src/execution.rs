@@ -1883,10 +1883,9 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options,
-        PRINT_CUSTOM_CALL_TARGET, Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension,
-        RuntimeExtensions, RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully,
-        compile_statefully_with_captures,
+        Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET,
+        Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions,
+        RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully, compile_statefully_with_captures,
     };
 
     use super::*;

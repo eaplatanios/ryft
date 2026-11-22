@@ -34,7 +34,12 @@ use crate::arrays::{Array, ArrayParts};
 ///     by lifting its constant in a session, which is also the session that the new array belongs to.
 ///   - **Usable as a Key:** A retained array implements [`Eq`] and [`Hash`] by its storage identity, declared type,
 ///     and commitment. Retaining the same array twice yields equal constants. Handles with different commitment
-///     remain distinct because commitment affects device selection when a program uses the constant.
+///     remain distinct because an eager operation whose regions use the constant (e.g., an eager `condition`) runs
+///     where a committed constant is, as it runs where a committed operand is, whereas a call of a compiled function
+///     never runs where the arrays that its callee captures are, nor commits its results because of them, committed or
+///     not. Commitment is therefore part of the identity of a program that holds the constant and of its cache keys,
+///     so two programs that differ only in the commitment of a constant compile separately, which costs compilations
+///     but never changes results.
 ///
 /// The first difference is what makes it safe to store in a program. Programs live in the caches of a session, so
 /// a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither

@@ -557,14 +557,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType,
-        Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, Placement, ProjectedValue,
+        Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, ProjectedValue,
         ReductionKind, ReferenceType, ShardMapOptions, Sharding, ShardingDimension, UnreducedKind, ValueProjection,
         batch, shard_map,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_core::{
         CompilationArtifactExchangePolicy, CompilationCache, Dimension, DimensionBounds, DimensionVariable, Layout,
-        Memory, ParallelBroadcast, Shape, TiledLayout, Typed,
+        Memory, ParallelBroadcast, Placement, Shape, TiledLayout, Typed,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{
@@ -2078,8 +2078,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             )
             .unwrap();
-            let placed =
-                source.to_placement(&session, Placement::new(destination_mesh.clone(), rows.clone()).unwrap());
+            let placed = source.to_placement(&session, Placement::new(destination_mesh.clone(), rows.clone()).unwrap());
             let placed = placed.unwrap();
             placed.block_until_ready().unwrap();
             assert_eq!(placed.mesh(), &destination_mesh);
@@ -2508,8 +2507,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             // never leaves the sender waiting, and both ranks finish every placement. A placement that left a transfer
             // unmatched would make the next one between the same devices read stale values.
             for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
-                let target =
-                    Placement::new(destination_mesh.clone(), replicated.clone()).unwrap().with_memory(memory);
+                let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap().with_memory(memory);
                 probe_placement(rank, &format!("{memory:?}"), &session, &source, target);
             }
         });
