@@ -596,7 +596,6 @@ impl PlaceOperation {
             && (self.source.is_none() || input.sharding().is_some_and(is_manual_region_sharding))
     }
 
-    // TODO(eaplatanios): Why is this function public? Does it need to be?
     /// Validates a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, and returns the type of the placed value. This is the type rule of [`PlaceOperation`] (refer to
     /// [`Operation::infer_output_types`]) except for one check, which is that a [`Placement`] target splits each static
@@ -827,30 +826,6 @@ impl PlaceOperation {
         Ok(output)
     }
 
-    // TODO(eaplatanios): Only one caller? Can we inline?
-    /// Returns the type of the output of this placement for an input of type `input` whose concrete sharding is
-    /// `concrete_sharding`, if it is known, which is the type rule of [`PlaceOperation`] (refer to
-    /// [`Operation::infer_output_types`], which calls it without a concrete sharding). It makes every check of
-    /// [`Self::infer_output_type`], with `concrete_sharding`, and then checks that a [`Placement`] target splits each
-    /// static extent evenly. Backends that execute a staged placement on a concrete value (e.g., a session that binds
-    /// it eagerly) call it with the sharding of that value over every mesh axis, so that they validate the reduction
-    /// state and the shards that the value has along auto mesh axes, which its type omits, as the rules of
-    /// [`PlaceOperation`] that place a concrete value do.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] for every request that [`Self::infer_output_type`] rejects and for a target that splits
-    /// a static extent unevenly.
-    pub fn infer_placed_output_type(
-        &self,
-        input: &ArrayType,
-        concrete_sharding: Option<&Sharding>,
-    ) -> Result<ArrayType, TypeError> {
-        let output = Self::infer_output_type(input, concrete_sharding, self.target.as_ref(), self.source.as_ref())?;
-        Self::validate_even_splits(input, self.target.as_ref())?;
-        Ok(output)
-    }
-
     /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, leaves the reduction state of the value unchanged. This is the part of the type rule of
     /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type`], through which backends
@@ -1019,7 +994,10 @@ impl Operation for PlaceOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        Ok(vec![self.infer_placed_output_type(&input_types[0], None)?])
+        let input = &input_types[0];
+        let output = Self::infer_output_type(input, None, self.target(), self.source())?;
+        Self::validate_even_splits(input, self.target())?;
+        Ok(vec![output])
     }
 
     #[inline]
@@ -7669,10 +7647,10 @@ mod tests {
 
     #[test]
     fn test_place_dispatch_shard_layouts() {
-        // A layout describes each shard, so the type rule accepts the byte strides `[8, 4]` of a dense `f32[4, 2]` column
-        // shard for an `f32[4, 4]` value that is split into two column shards. A reference array stores the whole value
-        // in one buffer, which those strides would overlap, so it rejects them with an error that says so, eagerly and
-        // when partial evaluation folds the placement of a known input through the same interpreter.
+        // A layout describes each shard, so the type rule accepts the byte strides `[8, 4]` of a dense `f32[4, 2]`
+        // column shard for an `f32[4, 4]` value that is split into two column shards. A reference array stores the
+        // whole value in one buffer, which those strides would overlap, so it rejects them with an error that says so,
+        // eagerly and when the program that partial evaluation specializes on a known input executes.
         let columns = Sharding::new(
             mesh_x().logical_mesh().clone(),
             vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
@@ -7728,7 +7706,7 @@ mod tests {
             PlacementRequest::InPlace { memory: None, layout: Some(Layout::Strided(StridedLayout::new(vec![-1]))) };
         assert_eq!(
             ValueDirectDispatch::place(&input, Some(&reversed), None, true).map_err(|error| error.to_string()),
-            Err(decode_logical_bytes(&input.r#type(), input.storage_bytes()).unwrap_err().to_string()),
+            Err("array element 0 has invalid `bool` byte encoding [2]".to_string()),
         );
     }
 
