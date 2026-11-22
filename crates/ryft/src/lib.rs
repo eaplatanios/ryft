@@ -1,4 +1,6 @@
-pub use {ryft_core as core, ryft_kernels as kernels, ryft_macros as macros};
+pub use ryft_core as core;
+pub use ryft_kernels as kernels;
+pub use ryft_macros as macros;
 
 #[cfg(feature = "ryft-mlir")]
 pub use ryft_mlir as mlir;

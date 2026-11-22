@@ -57,7 +57,8 @@ impl CompilationDomain for Session {
     // device mesh that the function names, refer to `JitCallOperation::with_boundary`), because the callee cannot show
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
     // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when it
-    // requests a placement (refer to `requests_placement`). Otherwise public arguments or the enclosing caller
+    // requests a placement that names devices (refer to `requests_placement`), which a request that only moves a value
+    // to another memory does not. Otherwise public arguments or the enclosing caller
     // select the devices, even for a function with committed captures. A dispatcher without input overrides also
     // keeps each argument's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
     // (refer to `dispatch_signature`). Core constructs the call operation once for each staged function.
@@ -69,7 +70,7 @@ impl CompilationDomain for Session {
                     .chain(options.input_shardings().into_iter().flatten().cloned().map(Some))
                     .collect();
                 let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
-                let mesh = requests_placement(callee, options).then(|| options.mesh());
+                let mesh = requests_placement(callee, options, false).then(|| options.mesh());
                 let call = call.with_boundary(mesh, input_shardings, output_shardings);
                 let call = if dispatched && options.input_shardings().is_none() {
                     call.with_kept_input_placements()
@@ -512,7 +513,7 @@ impl Session {
         // returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
         // operations and compiled reshards set the commitment of their results themselves, so these flags do not
         // reach them.
-        let requests_placement = requests_placement(program, options);
+        let requests_placement = requests_placement(program, options, true);
         let runs_on_multiple_devices = options.mesh().devices().len() > 1;
         let committed_outputs = (0..output_types.len())
             .map(|index| runs_on_multiple_devices || index < output_count && requests_placement)
@@ -731,6 +732,15 @@ impl CompilationCacheDomain for Session {
         Some(key.canonical_bytes().to_vec())
     }
 
+    /// Returns the lowest index of a process that owns a device of the mesh of `program`, which is the exchange leader
+    /// of its compilation, because exactly the processes that own those devices compile it. Every one of them computes
+    /// the same index from the mesh, which they all share, and a program whose mesh includes a device of process zero
+    /// is led by process zero, as every program was before.
+    #[inline]
+    fn artifact_exchange_leader(&self, program: &Self::LoweredProgram) -> usize {
+        program.mesh().devices().iter().map(Device::process_index).min().unwrap_or(0)
+    }
+
     #[inline]
     fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
         program.serialize()
@@ -850,13 +860,19 @@ pub(crate) fn jit_compilation_options(
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a
 /// value explicitly, through an input or output sharding override or anywhere in its program (refer to
-/// [`has_placement_requests`]), which commits every public output of its executions. Such a function names the devices
-/// of the mesh of `options`, which every execution and every call of it runs on whatever its inputs. Any other function
-/// has a program that is agnostic of devices, and the inputs of a call decide where the call runs. The arrays that the
-/// function captures are not among them, whether they are committed or not, as JAX ignores where the arrays that a
-/// `jit` function closes over live (refer to `JitCallOperation`).
-fn requests_placement(program: &FlatProgram, options: &Options) -> bool {
-    options.input_shardings().is_some() || options.output_shardings().is_some() || has_placement_requests(program)
+/// [`has_placement_requests`]), with or without the requests that only move a value to another memory, as
+/// `includes_memory_requests` selects. Every request commits every public output of the executions of the function,
+/// so commitment counts them all. A request that names devices (i.e., every request except one that only moves a
+/// value to another memory) also makes the function name the devices of the mesh of `options`, which every execution
+/// and every call of it runs on whatever its inputs. Any other function has a program that is agnostic of devices, and
+/// the inputs of a call decide where the call runs, as JAX runs a `jit` function whose body only moves a value to
+/// another memory where its arguments are. The arrays that the function captures are not among them, whether they are
+/// committed or not, as JAX ignores where the arrays that a `jit` function closes over live (refer to
+/// `JitCallOperation`).
+fn requests_placement(program: &FlatProgram, options: &Options, includes_memory_requests: bool) -> bool {
+    options.input_shardings().is_some()
+        || options.output_shardings().is_some()
+        || has_placement_requests(program, includes_memory_requests)
 }
 
 /// Validates that the staged `output_types` carry the output sharding overrides of `options` (i.e.,
@@ -1123,7 +1139,8 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
 /// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose source would be rejected as such a
 /// target, as the source is no destination of the forward program, and for the first `place` whose target or source
-/// sharding or `jit_call` whose boundary override is not fully replicated (refer to [`Sharding::is_replicated`]), once
+/// sharding or `jit_call` whose effective boundary sharding (i.e., an override or a declared input sharding, refer to
+/// [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
 /// its unconstrained dimensions are read as replicated (refer to [`entry_boundary_sharding`]), when
 /// `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
@@ -1143,12 +1160,27 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                     }));
                 }
                 if !use_shardy_partitioner && mesh.devices().len() > 1 {
-                    for sharding in call.boundary_shardings() {
+                    // The effective boundary of an input is its override or otherwise its declared sharding.
+                    let callee = region.with_id(instruction.regions()[0])?;
+                    let mut shardings = Vec::new();
+                    for (index, (input, declared)) in
+                        instruction.inputs().iter().zip(callee.input_types().iter()).enumerate()
+                    {
+                        if let Type::Array(actual) = region.atoms()[input.index()].r#type().as_ref()
+                            && let Some(sharding) = call.boundary_input_sharding(index, actual, declared)
+                        {
+                            shardings.push(sharding.clone());
+                        }
+                    }
+                    shardings.extend(
+                        (0..instruction.outputs().len()).filter_map(|index| call.output_sharding(index).cloned()),
+                    );
+                    for sharding in &shardings {
                         if !entry_boundary_sharding(sharding)?.is_replicated() {
                             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                                 operation: JIT_CALL_OPERATION_NAME.to_string(),
                                 reason: "bounded-dynamic multi-device programs currently require fully replicated \
-                                         sharding overrides of called functions because Shardy rejects dynamic \
+                                         boundary shardings of called functions because Shardy rejects dynamic \
                                          tensors"
                                     .to_string(),
                             }));
@@ -2422,8 +2454,8 @@ mod tests {
             session.lower_program(&program(&mesh, &sharded, &dynamic_type), 0, &Options::new(mesh.clone())),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
                 if operation == JIT_CALL_OPERATION_NAME
-                    && reason == "bounded-dynamic multi-device programs currently require fully replicated sharding \
-                                  overrides of called functions because Shardy rejects dynamic tensors",
+                    && reason == "bounded-dynamic multi-device programs currently require fully replicated boundary \
+                                  shardings of called functions because Shardy rejects dynamic tensors",
         ));
         assert!(
             session

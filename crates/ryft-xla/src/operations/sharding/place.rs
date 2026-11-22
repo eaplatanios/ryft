@@ -37,12 +37,19 @@ impl LowerableOperation for PlaceOperation {
         // Transposition turns the source of a placement into the target of the transposed placement, which moves the
         // cotangent there, so a source that names devices (i.e., a placement or a device) inside a manual region would
         // move a value of that region in reverse mode, which the target rule below rejects. A program whose derivative
-        // could not be compiled is rejected when it is compiled itself, so such a source is rejected here, whatever the
-        // target is. An in-place source names only the storage of the value, so it is lowered there like anywhere else.
+        // could not be compiled is rejected when it is compiled itself, so such a source is rejected here, unless the
+        // transposition leaves the cotangent where it lives (i.e., the placement moves nothing and its input varies
+        // along the manual axes of the region or carries reduction state over them, refer to
+        // `PlaceOperation::transposes_in_place`). An in-place source names only the storage of the value, so it is
+        // lowered there like anywhere else.
         let is_inside_manual_region = !lowerer.collective_state().bound_manual_axes().is_empty();
-        if is_inside_manual_region && self.source().is_some_and(PlacementRequest::moves) {
-            let reason = "the source of a value inside a manual region cannot name devices, because transposition \
-                          would move the cotangent of that value to them";
+        if is_inside_manual_region
+            && self.source().is_some_and(PlacementRequest::moves)
+            && !self.transposes_in_place(&input_types[0])
+        {
+            let reason = "the source of a value inside a manual region cannot name devices unless the placement moves \
+                          nothing and the value varies along the manual axes of the region or carries reduction state \
+                          over them, because transposition would move the cotangent of that value to them";
             return Err(LoweringError::UnsupportedOperation {
                 operation: PLACE_OPERATION_NAME.to_string(),
                 reason: reason.to_string(),
@@ -525,8 +532,9 @@ mod tests {
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let error = format!(
-            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices, \
-             because transposition would move the cotangent of that value to them",
+            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices \
+             unless the placement moves nothing and the value varies along the manual axes of the region or carries \
+             reduction state over them, because transposition would move the cotangent of that value to them",
         );
         let moved_error = format!(
             "cannot lower `{PLACE_OPERATION_NAME}`: a value inside a manual region cannot be moved to another \
@@ -602,9 +610,11 @@ mod tests {
         };
 
         // A source that names devices (i.e., the placement of the value over the devices of the region, or the sole
-        // device of a region of one device) would become the target of the transposed placement, which would move the
-        // cotangent of a value of the region, so it is rejected forward and eagerly, whatever the target is. The
-        // program of reverse mode keeps only the transposed placement, whose target is rejected.
+        // device of a region of one device) would become the target of the transposed placement of this invariant
+        // value, which would move its cotangent, so it is rejected forward and eagerly, whatever the target is. The
+        // program of reverse mode keeps only the transposed placement, whose target is rejected. The same sources of a
+        // value that varies along the manual axis are accepted on every path (refer to
+        // `test_session_place_agrees_across_paths_for_manual_regions_and_host_values`).
         let pinned = Some(PlacementRequest::from(Memory::Host { pinned: true }));
         for count in [1, 2] {
             let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Manual).unwrap()]).unwrap();

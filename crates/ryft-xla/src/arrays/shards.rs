@@ -57,7 +57,10 @@ impl ArrayShard {
     }
 
     /// Returns the [`Buffer`] underlying this [`ArrayShard`]. This is `None` if the shard is remote or is an
-    /// addressable bufferless [`DataType::Zero`]-valued shard.
+    /// addressable bufferless [`DataType::Zero`]-valued shard. Note that a clone of the returned [`Arc`] shares the
+    /// buffer, and so an execution that is asked to donate the array of this shard passes it without donation while the
+    /// clone exists. A [`Weak`](std::sync::Weak) handle of it does not prevent the donation, and it no longer upgrades
+    /// once the execution has taken the buffer for donation.
     #[inline]
     pub fn buffer(&self) -> Option<&Arc<Buffer<'static>>> {
         match &self.storage {
@@ -137,6 +140,15 @@ impl ArrayShard {
         // Request row-major bytes explicitly, because the device buffer may have another physical layout.
         let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
         Ok(copy.r#await()?)
+    }
+
+    /// Consumes this [`ArrayShard`] and returns its [`Buffer`], which is `None` in the cases of [`Self::buffer`].
+    #[inline]
+    pub(crate) fn into_buffer(self) -> Option<Arc<Buffer<'static>>> {
+        match self.storage {
+            ArrayShardStorage::Buffer(buffer) => Some(buffer),
+            ArrayShardStorage::Remote | ArrayShardStorage::Zero => None,
+        }
     }
 }
 

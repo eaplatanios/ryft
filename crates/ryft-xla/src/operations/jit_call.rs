@@ -23,9 +23,9 @@ use ryft_core::{
     Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
     RematerializationOptimizationBarrier, ReshardOperation, ResidualDemandSplit, ResidualInputSource,
     ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension, StagedCallOperation, TangentActivity,
-    Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
-    UnreducedKind, Value as CoreValue, ValueProjection, Zero,
+    Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TransposedProgramCotangent,
+    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
+    Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -36,7 +36,9 @@ use ryft_mlir::{
 use crate::execution::validate_committed_input_devices;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::lower_array_ir_type;
-use crate::lowering::{CollectiveLoweringState, EffectTokens, collect_session_constants, entry_boundary_sharding};
+use crate::lowering::{
+    CollectiveLoweringState, EffectTokens, collect_session_constants, entry_boundary_sharding, has_untracked_auto_axes,
+};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
@@ -397,10 +399,11 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// # Calls of compiled functions
 ///
 /// A call stages the callee's source in its caller. When an input or output has a sharding override, or the body
-/// requests placement through a targeted `place`, a `constrain_sharding`, or a nested call that names devices, the
-/// call uses the callee's mesh. Otherwise it runs on the devices of its caller or public arguments. Lifted captures
-/// follow those devices, even when the original array is committed. Executing the retained executable directly always
-/// uses the mesh it was compiled for.
+/// requests placement through a `place` whose target names devices, a `constrain_sharding`, or a nested call that names
+/// devices, the call uses the callee's mesh. Otherwise it runs on the devices of its caller or public arguments, also
+/// when its body only moves a value to another memory, as JAX runs such a `jit` function where its arguments are.
+/// Lifted captures follow those devices, even when the original array is committed. Executing the retained executable
+/// directly always uses the mesh it was compiled for.
 ///
 /// A call therefore carries the boundary of its callee as that function was compiled (refer to `with_boundary`), which
 /// is the sharding override of each of its inputs and outputs, if any, together with the device mesh that the function
@@ -426,7 +429,8 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     callee input type, which an execution would reshard where it can, because a call does not reshard its inputs.
 ///     An input of a `shard_map` body may vary along manual mesh axes that the callee input type does not declare,
 ///     and every output of the call then varies along them too.
-///   - A call commits its results when it names devices, runs on multiple devices, or has a committed public input.
+///   - A call commits its results when it names devices, when its callee requests any placement (including one that
+///     only moves a value to another memory), runs on multiple devices, or has a committed public input.
 ///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with the
 ///     device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
 ///     evaluation split, or a batched call), and partial evaluation treats a call as forwarding one of its inputs only
@@ -501,7 +505,8 @@ impl<T: CoreType> JitCallOperation<T> {
     /// Returns this call with the boundary of its callee, made of `mesh`, the device mesh that the callee was compiled
     /// for when it names devices, and of the sharding override of each callee input and output, by position, where
     /// [`None`] marks a position without one. A callee names devices when it has a sharding override or its program
-    /// requests a placement (refer to `has_placement_requests`), so `mesh` must be present whenever an override is.
+    /// requests a placement that names devices (refer to `has_placement_requests`), so `mesh` must be present whenever
+    /// an override is.
     /// A missing override is implicit past the end of either list. A list without overrides is stored as absent.
     pub(crate) fn with_boundary(
         mut self,
@@ -767,10 +772,25 @@ impl JitCallOperation<Type> {
             return Ok(Cow::Owned(placed));
         }
 
+        // Committed public arguments fix the devices of the call, so they must agree on them, as an execution of the
+        // callee requires of the arguments that it receives.
+        let mut committed = inputs.iter().skip(self.capture_count).filter_map(|input| match input {
+            Value::Array(array) if array.is_committed() => Some(array),
+            _ => None,
+        });
+        if let Some(first) = committed.next() {
+            for (index, input) in inputs.iter().skip(self.capture_count).enumerate() {
+                if let Value::Array(array) = input {
+                    validate_committed_input_devices(array, index, first.mesh())?;
+                }
+            }
+        }
         let mut prepared = self.capture_inputs(session, inputs)?;
         for (index, declared) in declared.iter().enumerate().skip(self.capture_count) {
             let Some(Value::Array(array)) = prepared.get(index) else { continue };
-            if let Some(sharding) = self.declared_input_sharding(index, &array.r#type(), declared) {
+            if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared)
+                && array.sharding() != sharding
+            {
                 let mesh = DeviceMesh::new(sharding.mesh().clone(), array.mesh().devices().to_vec())?;
                 let placed = array.clone().reshard_on_devices(session, &mesh, sharding, false)?;
                 prepared.to_mut()[index] = Value::Array(placed);
@@ -779,23 +799,34 @@ impl JitCallOperation<Type> {
         Ok(prepared)
     }
 
-    /// Returns the sharding declared for a public input when the actual type refines it except for placement and
-    /// both carry the same manual variation. Explicit overrides take precedence, and dispatchers specialize on the
-    /// supplied input placements.
-    fn declared_input_sharding<'d>(
-        &self,
+    /// Returns the effective boundary sharding of callee input `index`, an input of type `actual` for a callee input of
+    /// type `declared`, which is where an execution of the callee places that input. This is the sharding override of
+    /// the input when the callee has one, which replaces its declared sharding, and otherwise the sharding of the
+    /// declared input type, which the executable of a function compiled for its input types places the input as,
+    /// including over the auto mesh axes that the type does not record (e.g., a declared replicated input stays
+    /// replicated over them). There is none for an input of the lifted capture prefix, for an input that a call of a
+    /// `jit` dispatcher keeps placed as it is (refer to [`Self::with_kept_input_placements`]), for a declared input
+    /// type without a sharding, and for an input that varies along manual mesh axes that the declared type does not
+    /// declare, which the declared sharding does not describe. Eager calls, region replay, call lowering, the result
+    /// placements of compiled programs, and the admission of bounded dynamic callers all consult this function, so that
+    /// they agree on where a call places its inputs.
+    pub(crate) fn boundary_input_sharding<'s>(
+        &'s self,
         index: usize,
         actual: &ArrayType,
-        declared: &'d Type,
-    ) -> Option<&'d Sharding> {
-        if index < self.capture_count || self.keeps_input_placements || self.input_sharding(index).is_some() {
+        declared: &'s Type,
+    ) -> Option<&'s Sharding> {
+        if index < self.capture_count {
+            return None;
+        }
+        if let Some(sharding) = self.input_sharding(index) {
+            return Some(sharding);
+        }
+        if self.keeps_input_placements {
             return None;
         }
         let Type::Array(declared) = declared else { return None };
         let sharding = declared.sharding()?;
-        if actual.sharding() == Some(sharding) {
-            return None;
-        }
         call_input_variation(declared, actual).is_some_and(|axes| axes.is_empty()).then_some(sharding)
     }
 
@@ -809,10 +840,10 @@ impl JitCallOperation<Type> {
         self.mesh.is_none() && session.assigns_placement_locally(operands, &[])
     }
 
-    /// Places an input on the boundary's devices after all committed public arguments have passed the device check.
-    /// An explicit override selects the sharding first, followed by a sharding required by the declared input type.
-    /// Otherwise the array keeps its sharding when the mesh topologies agree and is replicated when they differ.
-    /// The input keeps its commitment.
+    /// Places an input on the boundary's devices after all committed public arguments have passed the device check,
+    /// as its effective boundary sharding requests (refer to [`Self::boundary_input_sharding`]). An input without one
+    /// keeps its sharding when the mesh topologies agree and is replicated when they differ. The input keeps its
+    /// commitment.
     ///
     /// # Errors
     ///
@@ -825,10 +856,7 @@ impl JitCallOperation<Type> {
         array: Array,
         declared: &Type,
     ) -> Result<Array, Error> {
-        let sharding = match self
-            .input_sharding(index)
-            .or_else(|| self.declared_input_sharding(index, &array.r#type(), declared))
-        {
+        let sharding = match self.boundary_input_sharding(index, &array.r#type(), declared) {
             Some(sharding) => sharding.clone(),
             None if array.sharding().mesh().has_same_topology(mesh.logical_mesh()) => array.sharding().clone(),
             None => Sharding::replicated(mesh.logical_mesh().clone(), array.r#type().shape().rank()),
@@ -1375,18 +1403,27 @@ where
         values.extend(inputs.iter().map(|input| input.value().clone()));
         let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
         let operation = Self { keeps_input_placements: self.keeps_input_placements, ..operation };
-        // The boundary shardings gain a replicated batch dimension, and the leading extent input has none.
+        // The boundary shardings gain the batch dimension of each batched value (refer to `batched_boundary_sharding`),
+        // and the leading extent input has none.
         let operation = if let Some(mesh) = self.mesh() {
-            let input_shardings =
-                std::iter::once(None)
-                    .chain(inputs.iter().enumerate().map(|(index, input)| {
-                        batched_boundary_sharding(self.input_sharding(index), &input.batch_axis())
-                    }))
-                    .collect();
+            let array_type = |r#type: &Type| match r#type {
+                Type::Array(r#type) => Some(r#type.clone()),
+                _ => None,
+            };
+            let input_shardings = std::iter::once(None)
+                .chain(inputs.iter().enumerate().map(|(index, input)| {
+                    let packed = array_type(&input.value().r#type());
+                    batched_boundary_sharding(self.input_sharding(index), &input.batch_axis(), packed.as_ref())
+                }))
+                .collect();
+            let output_types = callee.output_types();
             let output_shardings = axes
                 .iter()
                 .enumerate()
-                .map(|(index, axis)| batched_boundary_sharding(self.output_sharding(index), axis))
+                .map(|(index, axis)| {
+                    let packed = output_types.get(index).and_then(array_type);
+                    batched_boundary_sharding(self.output_sharding(index), axis, packed.as_ref())
+                })
                 .collect();
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
         } else {
@@ -1451,21 +1488,25 @@ where
         };
         let operation = Self::new(self.capture_count()).with_callee_region(batched_callee.entry_region_ref())?;
         let operation = Self { keeps_input_placements: self.keeps_input_placements, ..operation };
-        // The boundary shardings gain a replicated batch dimension at the batch axis of each mapped value.
+        // The boundary shardings gain the batch dimension of each mapped value at its batch axis (refer to
+        // `batched_boundary_sharding`).
         let operation = if let Some(mesh) = self.mesh() {
             let input_shardings = inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| {
                     let axis = BatchAxis::from_optional_position(input.batch_axis_position());
-                    batched_boundary_sharding(self.input_sharding(index), &axis)
+                    let packed = input.value().r#type();
+                    batched_boundary_sharding(self.input_sharding(index), &axis, Some(packed.as_ref()))
                 })
                 .collect();
+            let output_types = batched_callee.output_types();
             let output_shardings = output_axes
                 .iter()
                 .enumerate()
                 .map(|(index, axis)| {
-                    batched_boundary_sharding(self.output_sharding(index), &BatchAxis::from_optional_position(*axis))
+                    let axis = BatchAxis::from_optional_position(*axis);
+                    batched_boundary_sharding(self.output_sharding(index), &axis, output_types.get(index))
                 })
                 .collect();
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
@@ -1851,8 +1892,8 @@ pub fn transpose_primal_jit_call<
     // traced through fresh-root contexts.
     // Each output cotangent has the boundary sharding of its output and each known input value that of its input, and
     // the cotangent references have none, as JAX's `_pjit_transpose` gives the cotangents the shardings of their
-    // primals. The linear input cotangents have the shardings of their inputs when the transposed callee returns one
-    // per linear input.
+    // primals. Each returned linear input cotangent has the sharding of its input, whichever other inputs have a
+    // structurally zero or absent cotangent, which returns nothing (refer to `TransposedProgramCotangent`).
     let mut transposed_call =
         JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
     transposed_call.keeps_input_placements = operation.keeps_input_placements();
@@ -1871,11 +1912,12 @@ pub fn transpose_primal_jit_call<
             .map(|(index, _)| operation.input_sharding(index).cloned());
         let input_shardings =
             output_cotangent_shardings.chain(reference_shardings).chain(known_input_shardings).collect();
-        let output_shardings = if transposed_callee.program().output_count() == input_indices.len() {
-            input_indices.iter().map(|&index| operation.input_sharding(index).cloned()).collect()
-        } else {
-            Vec::new()
-        };
+        let output_shardings = input_indices
+            .iter()
+            .zip(transposed_callee.cotangents())
+            .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
+            .map(|(&index, _)| operation.input_sharding(index).cloned())
+            .collect();
         transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
     }
     let transposed_call = Operation::JitCall(transposed_call);
@@ -1970,8 +2012,19 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
             .into_owned();
         let commits_outputs = self.mesh.is_some()
             || inputs.iter().any(|input| matches!(input, Value::Array(array) if array.is_committed()));
+        // A call that names devices runs its callee on them, so the operations of the callee that take no array input
+        // (e.g., a `fill`) are replayed on its mesh rather than on the default mesh of the session, as an execution of
+        // the callee places them.
+        let pinned_session;
+        let session = match &self.mesh {
+            Some(mesh) => {
+                pinned_session = context.with_device_mesh(mesh.clone());
+                &pinned_session
+            }
+            None => context,
+        };
         driver
-            .interpret_region(context, 0, inputs)?
+            .interpret_region(session, 0, inputs)?
             .iter()
             .enumerate()
             .map(|(index, value)| match value.rename_type_identities(&renaming)? {
@@ -1986,14 +2039,16 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
     }
 }
 
-// A call of a compiled function places the values that cross the boundary of its callee as the sharding overrides of
-// that boundary request (refer to `JitCallOperation::with_boundary`), as an execution of the function places
-// its arguments and results. The overrides are applied at the call site, as constraints on the operands and on the
-// results of the call, rather than as annotations of the callee, because the callee may be inlined or shared with
-// calls that carry other overrides. Each constraint is the sharding with which the function annotates its own
-// boundary (refer to `entry_boundary_sharding`), and it is closed over auto mesh axes, so that a replicated override
-// stops the compiler from splitting the value, like the replicated result of an execution. An input sharding from
-// the callee's declared type constrains only the placement tracked by that type.
+// A call of a compiled function places the values that cross the boundary of its callee as the effective boundary
+// shardings of that boundary request (i.e., its sharding overrides, refer to `JitCallOperation::with_boundary`, and the
+// declared shardings of the inputs without one, refer to `JitCallOperation::boundary_input_sharding`), as an execution
+// of the function places its arguments and results. The overrides are applied at the call site, as constraints on the
+// operands and on the results of the call, rather than as annotations of the callee, because the callee may be inlined
+// or shared with calls that carry other overrides. Each constraint is the sharding with which the function annotates
+// its own boundary (refer to `entry_boundary_sharding`), and it is closed over auto mesh axes, so that a replicated
+// override stops the compiler from splitting the value, like the replicated result of an execution. A declared input
+// sharding that the operand type already has is not constrained again, unless the mesh has auto axes, along which the
+// operand type cannot show where the operand is.
 impl LowerableOperation for JitCallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -2008,19 +2063,22 @@ impl LowerableOperation for JitCallOperation<Type> {
             .zip(input_types)
             .enumerate()
             .map(|(index, (&value, ty))| {
-                if let Some(sharding) = self.input_sharding(index) {
-                    return lower_boundary_constraint(lowerer, value, ty, sharding);
-                }
-                if let Type::Array(actual) = ty
-                    && let declared = &lowerer.regions()[0].entry_region_ref().interface().input_types()[index]
-                    && let Some(sharding) = self.declared_input_sharding(index, actual, declared)
-                {
-                    let types = std::slice::from_ref(actual);
-                    return Ok(ReshardOperation::new(sharding.clone())
-                        .lower(lowerer, &[value], types, types)?
-                        .remove(0));
-                }
-                Ok(value)
+                let Type::Array(actual) = ty else { return Ok(value) };
+                let callee = lowerer.regions()[0].entry_region_ref();
+                let sharding =
+                    match self.boundary_input_sharding(index, actual, &callee.interface().input_types()[index]) {
+                        // A declared sharding that the operand type already tracks needs no constraint, unless the
+                        // mesh has auto axes, along which the type cannot show where the operand is placed.
+                        Some(sharding)
+                            if self.input_sharding(index).is_some()
+                                || actual.sharding() != Some(sharding)
+                                || has_untracked_auto_axes(sharding) =>
+                        {
+                            sharding.clone()
+                        }
+                        _ => return Ok(value),
+                    };
+                lower_boundary_constraint(lowerer, value, ty, &sharding)
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
@@ -2695,6 +2753,12 @@ where
 /// and its lowering constrains the operand to the override, so the derivative returns to the type of the caller input.
 /// The cast only stops tracking the placement of the value, which a type without a sharding states nothing about, and
 /// keeps its values and buffers.
+///
+/// A value whose type differs from `refined` only in the placement that its sharding tracks over a mesh of the same
+/// topology (e.g., the cotangent of a replicated argument of a callee that declares that input split, which the call
+/// places as the declared type does, refer to [`JitCallOperation::boundary_input_sharding`]) is resharded to `refined`,
+/// so that it combines with the other cotangents of that argument, as JAX returns the cotangent of a `jit` argument
+/// with the sharding of that argument.
 fn refined_derived_value<C, V>(
     context: &C,
     mesh: Option<&DeviceMesh>,
@@ -2721,6 +2785,20 @@ where
         let sharding = Sharding::replicated(canonical_mesh.logical_mesh().clone(), refined.rank());
         let target = Placement::new(canonical_mesh, sharding).map_err(TypeError::from)?.with_memory(refined.memory());
         return Ok(context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0));
+    }
+    if let (Type::Array(declared), Type::Array(refined)) = (&declared, &refined)
+        && let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding())
+        && !moves_devices
+        && declared_sharding != refined_sharding
+        && !replicates_unconstrained_dimensions(declared_sharding, refined_sharding)
+        && declared_sharding.mesh().has_same_topology(refined_sharding.mesh())
+        && declared_sharding.unreduced_axes() == refined_sharding.unreduced_axes()
+        && declared_sharding.reduced_axes() == refined_sharding.reduced_axes()
+        && declared_sharding.varying_manual_axes() == refined_sharding.varying_manual_axes()
+        && declared.clone().with_sharding(refined_sharding.clone()).is_ok_and(|declared| &declared == refined)
+    {
+        let reshard = ReshardOperation::new(refined_sharding.clone());
+        return Ok(context.bind(reshard, Vec::new(), &[value])?.remove(0));
     }
     if moves_devices
         || refined.is_interchangeable_with(&declared)
@@ -2817,10 +2895,17 @@ where
     })
 }
 
-/// Returns `sharding`, the boundary sharding of a value that batching maps along `axis`, with a replicated batch
+/// Returns `sharding`, the boundary sharding of each item of a value that batching maps along `axis`, with the batch
 /// dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding or when
-/// the batch dimension cannot be inserted.
-fn batched_boundary_sharding(sharding: Option<&Sharding>, axis: &BatchAxis) -> Option<Sharding> {
+/// the batch dimension cannot be inserted. The per-item override states nothing about the batch dimension, because an
+/// explicit placement under batching applies to each batch item, so the batch dimension keeps the placement that
+/// `packed`, the type of the batched value, records for it (e.g., split along a mesh axis by the batch specification),
+/// and is replicated when that type records none (e.g., over auto mesh axes, which types never record).
+fn batched_boundary_sharding(
+    sharding: Option<&Sharding>,
+    axis: &BatchAxis,
+    packed: Option<&ArrayType>,
+) -> Option<Sharding> {
     let sharding = sharding?;
     let Some(axis) = axis.axis() else {
         return Some(sharding.clone());
@@ -2828,8 +2913,12 @@ fn batched_boundary_sharding(sharding: Option<&Sharding>, axis: &BatchAxis) -> O
     let rank = sharding.dimensions().len() as i128 + 1;
     let position = if axis.value() < 0 { axis.value() + rank } else { axis.value() };
     let position = usize::try_from(position).ok().filter(|&position| (position as i128) < rank)?;
+    let batch_dimension = packed
+        .and_then(ArrayType::sharding)
+        .filter(|packed| packed.rank() as i128 == rank && packed.mesh().has_same_topology(sharding.mesh()))
+        .map_or(ShardingDimension::Replicated, |packed| packed.dimensions()[position].clone());
     let mut dimensions = sharding.dimensions().to_vec();
-    dimensions.insert(position, ShardingDimension::Replicated);
+    dimensions.insert(position, batch_dimension);
     sharding.with_dimensions(dimensions).ok()
 }
 
@@ -3258,9 +3347,10 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     )
 }
 
-/// Constrains `value`, an operand or a result of type `r#type` of a `jit_call`, to `sharding`, the sharding override of
-/// the corresponding position of the boundary of its callee, and returns the constrained value. The constraint is the
-/// sharding with which the called function annotates that position of its own boundary (refer to
+/// Constrains `value`, an operand or a result of type `r#type` of a `jit_call`, to `sharding`, the effective boundary
+/// sharding of the corresponding position of the boundary of its callee (i.e., its override, or the declared sharding
+/// of an input without one, refer to [`JitCallOperation::boundary_input_sharding`]), and returns the constrained value.
+/// The constraint is the sharding with which the called function annotates that position of its own boundary (refer to
 /// [`entry_boundary_sharding`]), closed over auto mesh axes. Values that are not arrays are returned unchanged.
 fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -3295,18 +3385,18 @@ mod tests {
         CustomRuleRegistration, DataType, Device, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
         DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EagerInterpretationDriver,
-        EffectClass, EffectClasses, InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero,
+        EffectClass, EffectClasses, Fill, InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero,
         MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, NoStorage, NothingSavable,
         Operation as CoreOperation, OutputRegionProvenance, PartialEvaluation, PartialEvaluationContext,
-        PartialEvaluationInput, PartialEvaluationOutput, PartialValue, PlaceOperation, Placeholder, PrintOperation,
-        ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
-        RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
-        ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames, ScanOperation, Shape,
-        Sharding, ShardingDimension, Sin, SinOperation, StagingContext, TagOperation, Tracer, TracingContext,
-        TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver, TypeError,
-        TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
+        PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Place, PlaceOperation, Placeholder,
+        PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, Reduce,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface,
+        RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision,
+        ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames,
+        ScanOperation, Shape, Sharding, ShardingDimension, Sin, SinOperation, StagingContext, TagOperation, Tracer,
+        TracingContext, TransposeOperation, TransposedProgram, TransposedProgramCotangent, TranspositionDriver,
+        TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
     use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -3323,8 +3413,9 @@ mod tests {
         cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes, vector_type,
     };
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, CustomCallOperationExtension, Options, RuntimeRequirement,
-        StagedFunction, ToPjrt, Type, Value, compile, stage, to_mlir_module_for_program,
+        Array, ArrayConstant, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, ExecutionError,
+        FromPjrt, Options, RuntimeRequirement, StagedFunction, ToPjrt, Type, Value, compile, compile_with_options,
+        stage, to_mlir_module_for_program,
     };
 
     use super::*;
@@ -8871,6 +8962,49 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_operation_transpose_keeps_the_input_overrides_of_returned_cotangents() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let types = (vector_type.clone(), vector_type.clone());
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![split.clone(), replicated.clone()]);
+        let inner: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compile_with_options(|(x, y)| (x, y), types.clone(), &session, options).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            vector_type,
+            mesh.clone(),
+            Some(replicated.clone()),
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
+
+        // The cotangent of the first input of the call keeps the split of its input override, as JAX keeps the input
+        // sharding of a `jit` function on the cotangent of that input, whether the second input has a cotangent or a
+        // structurally zero one, which the transposed callee does not return.
+        for sums_both_outputs in [false, true] {
+            let outer: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
+                |(x, y): (CompileTracer, CompileTracer)| {
+                    let (x, y) = inner.call((x, y)).unwrap();
+                    let output = if sums_both_outputs { x + y } else { x };
+                    output.reduce_sum(&[0], None).unwrap()
+                },
+                types.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let gradient = outer.gradient(&session).unwrap();
+            let (first, _) = gradient.executable().execute(&session, (input.clone(), input.clone())).unwrap();
+            assert_eq!(first.sharding(), &split);
+            assert_eq!(first.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0; 4]);
+        }
+    }
+
+    #[test]
     fn test_jit_call_operation_interpret() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
@@ -8893,9 +9027,11 @@ mod tests {
             values_to_bytes(&[1i32, 2, 3, 4]),
         )
         .unwrap();
+        // The callee declares no sharding for its input, which would be the placement of that input at its boundary
+        // (refer to `JitCallOperation::boundary_input_sharding`).
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(Type::Array(input.r#type().into_owned()));
+            let input = builder.add_input(Type::Array(ArrayType::new_static(DataType::I32, [4])));
             Arc::new(
                 builder
                     .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -8976,6 +9112,100 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_operation_interpret_runs_the_callee_on_the_devices_of_the_call() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let second_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![second_device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let upload = |mesh: Option<&DeviceMesh>| {
+            Array::from_host_buffer(&session, vector_type.clone(), mesh.cloned(), None, values_to_bytes(&[0f32; 4]))
+                .unwrap()
+        };
+        let interpret = |function: &CompiledFunction<_, _>, inputs: &[Value]| {
+            let caller: CompiledFunction<ArrayType, (ArrayType, ArrayType)> =
+                compile(|x| function.call(x).unwrap(), vector_type.clone(), &session, second_mesh.clone()).unwrap();
+            let program = caller.source_program().program();
+            let region = program.entry_region_ref();
+            let call = region
+                .instructions()
+                .iter()
+                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .unwrap();
+            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let callee = Arc::new(region.with_id(call.regions()[0]).unwrap().to_program());
+            let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+            operation.interpret(&session, &EagerInterpretationDriver::new(&regions), inputs)
+        };
+
+        // A callee compiled for the second device that places its input there and fills a value that depends on no
+        // input returns both on that device, committed, when the call is replayed operation by operation, as an
+        // execution of the callee returns them, rather than filling the value on the default device of the session.
+        let function: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
+            |x: CompileTracer| (x.place(&second_device, None).unwrap(), x.domain().fill(&vector_type, 17f32).unwrap()),
+            vector_type.clone(),
+            &session,
+            second_mesh.clone(),
+        )
+        .unwrap();
+        let input = upload(None);
+        let executed = function.executable().execute(&session, input.clone()).unwrap();
+        let outputs = interpret(&function, &[Value::Array(input)]).unwrap();
+        let placements = outputs
+            .iter()
+            .map(|output| match output {
+                Value::Array(array) => (array.mesh().devices().to_vec(), array.is_committed()),
+                _ => panic!("expected an array"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(placements, vec![(vec![second_device], true); 2]);
+        assert_eq!(
+            [executed.0.mesh().devices(), executed.1.mesh().devices()],
+            [std::slice::from_ref(&second_device); 2],
+        );
+
+        // A call of a callee that names no devices rejects committed arguments on different devices before it runs its
+        // callee, as an execution of the callee does.
+        let pair: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compile(|(x, y)| (x, y), (vector_type.clone(), vector_type.clone()), &session, second_mesh.clone())
+                .unwrap();
+        let first_mesh = DeviceMesh::new(
+            LogicalMesh::single_device(),
+            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
+        )
+        .unwrap();
+        let (first, second) = (upload(Some(&first_mesh)), upload(Some(&second_mesh)));
+        let caller: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(x, y)| pair.call((x, y)).unwrap(),
+            (vector_type.clone(), vector_type.clone()),
+            &session,
+            second_mesh.clone(),
+        )
+        .unwrap();
+        let program = caller.source_program().program();
+        let region = program.entry_region_ref();
+        let call = region.instructions().iter().find(|i| matches!(i.operation(), Operation::JitCall(_))).unwrap();
+        let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+        let callee = Arc::new(region.with_id(call.regions()[0]).unwrap().to_program());
+        let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+        let error = ExecutionError::CommittedInputDeviceMismatch {
+            index: 1,
+            actual: vec![second_device.id()],
+            expected: vec![first_mesh.devices()[0].id()],
+        };
+        assert_eq!(
+            operation
+                .interpret(
+                    &session,
+                    &EagerInterpretationDriver::new(&regions),
+                    &[Value::Array(first), Value::Array(second)]
+                )
+                .unwrap_err(),
+            ProgramError::InvalidArgument { message: error.to_string() },
+        );
+    }
+
+    #[test]
     fn test_jit_call_operation_lower_constrains_boundary_shardings() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -9012,7 +9242,10 @@ mod tests {
 
         // Each operand and result of a call that its callee boundary overrides is constrained to the override where
         // the call executes, closed over auto mesh axes and with unconstrained dimensions replicated, as an execution
-        // of the called function annotates its own boundary. The shared callee itself carries no override.
+        // of the called function annotates its own boundary. An operand without an input override is constrained to
+        // the replicated sharding that the callee declares for it, because its type cannot show its placement along
+        // the auto axis (refer to `JitCallOperation::boundary_input_sharding`). The shared callee itself carries no
+        // override.
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         let shardings = [replicated];
@@ -9039,9 +9272,10 @@ mod tests {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<4xf32>
                     %1 = call @jit_call_0(%0) : (tensor<4xf32>) -> tensor<4xf32>
                     %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<4xf32>
-                    %3 = call @jit_call_0(%2) : (tensor<4xf32>) -> tensor<4xf32>
-                    %4 = sdy.sharding_constraint %3 <@mesh, [{}]> : tensor<4xf32>
-                    return %4 : tensor<4xf32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{}]> : tensor<4xf32>
+                    %4 = call @jit_call_0(%3) : (tensor<4xf32>) -> tensor<4xf32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{}]> : tensor<4xf32>
+                    return %5 : tensor<4xf32>
                   }
                 }
             "#},

@@ -24,10 +24,13 @@ use std::cell::RefCell;
 
 use ryft_core::{
     ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, ProgramError, ProgramStatistics,
-    ProjectedValue, Sharding, ValueProjection,
+    ProjectedValue, Sharding, Typed, ValueProjection,
 };
 
-use crate::lowering::{entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings};
+use crate::lowering::{
+    collect_session_constants, entry_boundary_sharding, entry_open_results, entry_result_placements,
+    entry_result_shardings,
+};
 use crate::{Constant, Error, Program, Session, Tracer, Type};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
@@ -200,7 +203,9 @@ where
     /// it (refer to `entry_open_results` for what this export can and cannot know). Unlike that path, which places a
     /// value without either as replicated because it lowers for concrete placed arrays, such a value is left
     /// unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
-    /// shardings).
+    /// shardings). Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
+    /// arguments that precede the inputs and are annotated with the placements of those arrays, as compilation for a
+    /// [`Session`] passes them.
     ///
     /// The traced program is pruned before lowering (refer to
     /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), which drops dead outputs of instructions that carry
@@ -234,9 +239,15 @@ where
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => self.global_input_types.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
-        let argument_annotations = argument_shardings
+        // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
+        // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
+        let session_constants = collect_session_constants(&simplified_program);
+        let capture_types = session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
+        let argument_annotations = session_constants
             .iter()
-            .map(|sharding| sharding.as_ref().map(entry_boundary_sharding).transpose())
+            .map(|constant| Some(constant.sharding()))
+            .chain(argument_shardings.iter().map(Option::as_ref))
+            .map(|sharding| sharding.map(entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = self.global_output_types.parameters().cloned().collect::<Vec<_>>();
         let placements = entry_result_placements(&simplified_program, output_types.len());
@@ -245,7 +256,7 @@ where
         let open_results = entry_open_results(&output_types, result_shardings, &placements, &result_annotations);
         Ok(super::lowering::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
-            &[],
+            &capture_types,
             &self.global_input_types,
             &self.global_output_types,
             function_name,
@@ -265,15 +276,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ConstrainSharding, DataType, Device, DeviceMesh, Dimension, EffectClass, Error as CoreError, LogicalMesh,
-        MeshAxis, MeshAxisType, Place, Placement, Print, RegionRole, Reshape, Reshard, Shape, ShardMapOptions,
-        Sharding, ShardingDimension, Sin, StopGradient, shard_map,
+        ConstrainSharding, DataType, Device, DeviceMesh, Dimension, EffectClass, Error as CoreError, ImportingContext,
+        LogicalMesh, MeshAxis, MeshAxisType, Place, Placement, Print, RegionRole, Reshape, Reshard, Shape,
+        ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
 
     use crate::lowering::tests::test_sharding;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ensure_print_handler_registered, with_captured_prints};
+    use crate::{Array, ThroughSession, Value, ensure_print_handler_registered, with_captured_prints};
 
     use super::*;
 
@@ -529,6 +540,37 @@ mod tests {
                   func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_traced_program_to_mlir_module_passes_imported_arrays_as_arguments() {
+        // An array that the traced function imports becomes a session constant, which enters the module as a hidden
+        // argument that precedes the inputs and is annotated as the array is placed, as compilation passes it.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 4f32.to_ne_bytes())
+            .unwrap();
+        let device = array.mesh().devices()[0];
+        let traced = trace_with_context::<_, (), ArrayType>(
+            |context, ()| {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
+                ValueProjection::<ArrayType>::into_projected(imported)?.place(&device, None)
+            },
+            (),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["device"=1]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    return %arg0 : tensor<f32>
                   }
                 }
             "#},

@@ -500,8 +500,8 @@ impl Session {
 
     /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with the fence of
     /// the whole execution, which also reports a failure of the producer of an input (refer to
-    /// `Self::execute_pjrt_buffers`). Programs with external reference state must flow through the stateful call surface
-    /// instead, which owns the reference transaction and the hidden outputs that carry final reference states.
+    /// `Self::execute_pjrt_buffers`). Programs with external reference state must flow through the stateful call
+    /// surface instead, which owns the reference transaction and the hidden outputs that carry final reference states.
     ///
     /// The backend may execute inline or return pending arrays and a completion fence. This function adds no wait
     /// solely because public outputs are empty. Bounded dynamic boundaries can introduce additional waits. Inputs
@@ -2939,7 +2939,8 @@ mod tests {
         let committed = uncommitted.to_placement(&session, placement).unwrap();
         assert!(!uncommitted.is_committed());
         assert!(committed.is_committed());
-        assert_eq!(RetainedArray::new(&uncommitted), RetainedArray::new(&committed));
+        assert_ne!(RetainedArray::new(&uncommitted), RetainedArray::new(&committed));
+        assert!(Arc::ptr_eq(uncommitted.shards()[0].buffer().unwrap(), committed.shards()[0].buffer().unwrap()));
         let execute = |first: &Array, second: &Array| {
             let (first, second) = (RetainedArray::new(first), RetainedArray::new(second));
             let staged = crate::stage::<_, ArrayType, ArrayType>(
@@ -3450,25 +3451,36 @@ mod tests {
             ));
         }
 
-        // Direct, asynchronous, and eager calls of a compiled function reject the argument the same way.
-        let double = crate::compile::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            scalar_type.clone(),
+        // Direct and asynchronous executions of a compiled function reject the argument the same way. An eager call runs
+        // in the session of its first argument, so the argument of the other client comes second, and the eager
+        // dispatch of the session rejects it before it reaches the execution.
+        let add = crate::compile::<_, (ArrayType, ArrayType), ArrayType>(
+            |(left, right)| left + right,
+            (scalar_type.clone(), scalar_type.clone()),
             &session,
             mesh.clone(),
         )
         .unwrap();
+        let second_error = ExecutionError::ArgumentClientMismatch { index: 1 };
         assert_eq!(
-            double.executable().execute(&session, foreign.clone()).unwrap_err().to_string(),
-            argument_error.to_string(),
+            add.executable().execute(&session, (local.clone(), foreign.clone())).unwrap_err().to_string(),
+            second_error.to_string(),
         );
         assert_eq!(
-            double.executable().execute_async(&session, foreign.clone()).err().unwrap().to_string(),
-            argument_error.to_string(),
+            add.executable()
+                .execute_async(&session, (local.clone(), foreign.clone()))
+                .err()
+                .unwrap()
+                .to_string(),
+            second_error.to_string(),
         );
         assert_eq!(
-            double.call(foreign.clone()).unwrap_err(),
-            ProgramError::InvalidArgument { message: argument_error.to_string() },
+            add.call((local.clone(), foreign.clone())).unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "received incompatible devices for eager XLA execution: input #1 is owned by a different \
+                          PJRT client than this session's client"
+                    .to_string(),
+            },
         );
 
         // A stateful execution rejects a public argument of the other client before it binds its references, which
@@ -3747,7 +3759,10 @@ mod tests {
             .with_execution_fence(ExecutionFence::new(vec![producer]));
             (input, producer_promise)
         };
-        let is_producer_failure = |result: Result<(), Error>| matches!(result, Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed");
+        let is_producer_failure = |result: Result<(), Error>| match result {
+            Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) => message == "producer failed",
+            _ => false,
+        };
 
         // The synchronous path returns outputs whose readiness and readback report the failure.
         let (input, producer_promise) = failing_input();
@@ -3788,7 +3803,10 @@ mod tests {
             execution.r#await(),
             Err(Error::Execution(ExecutionError::AsynchronousFailure { reason })) if &*reason == "producer failed",
         ));
-        assert!(is_producer_failure(holder.read().unwrap().block_until_ready()));
+        assert!(matches!(
+            holder.read().unwrap_err().downcast_custom::<ReferenceError>(),
+            Some(ReferenceError::ExecutionPoisoned { reason }) if reason == "producer failed",
+        ));
     }
 
     #[test]

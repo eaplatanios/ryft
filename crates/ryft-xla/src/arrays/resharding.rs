@@ -145,8 +145,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, Cast, CastOperation, Concatenate, DataType, Device, DeviceMesh, DimensionError, Layout, Memory,
-    MeshAxisType, PLACE_OPERATION_NAME, Placeholder, Placement, Sharding, Slice, StaticShape, TypeError, Typed,
+    ArrayType, CastOperation, Concatenate, DataType, Device, DeviceMesh, DimensionError, Layout, Memory, MeshAxisType,
+    PLACE_OPERATION_NAME, Placeholder, Placement, Sharding, Slice, StaticShape, TypeError, Typed,
 };
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{
@@ -158,7 +158,7 @@ use crate::arrays::host::{HostBufferSlice, PendingHostUpload, run_host_uploads, 
 use crate::arrays::metadata::validate_shard_layout;
 use crate::arrays::placement::{ArrayPlacement, ArrayPlacementTarget};
 use crate::arrays::shards::{ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
-use crate::arrays::{Array, ArrayError};
+use crate::arrays::{Array, ArrayError, ArrayParts};
 use crate::devices::PjrtDeviceExtension;
 use crate::types::DataTypeExtension;
 use crate::{
@@ -172,8 +172,10 @@ impl Array {
     /// [`Array`] remains fully usable after the call returns. This is the `ryft` analogue of JAX's
     /// `jax.device_put(arr, sharding, donate=False)`.
     ///
-    /// When the resolved placement and requested storage match this array, returns a cheap clone of `self`.
-    /// A change of devices or sharding tries the following strategies in order.
+    /// When the placement and storage already match, the result shares this array's device buffers. If each process
+    /// chose its input devices independently, placing that input on named devices creates a distinct logical array on
+    /// every process, so independent placements remain distinct when captured. A change of devices or sharding tries
+    /// the following strategies in order.
     ///
     ///   1. **Exact Shards:** When every destination shard has the slices of one source shard, each destination shard
     ///      shares the buffer of its source shard on the same device, or is filled by a copy between devices or by a
@@ -297,7 +299,16 @@ impl Array {
         let in_place = matches!(request.target(), ArrayPlacementTarget::InPlace);
         let locally_assigned = in_place && self.is_locally_assigned();
         let target = request.resolve_for(session, &self)?;
-        Ok(self.run_placement_dispatch(session, &target, donate)?.with_locally_assigned(locally_assigned))
+        // A named destination can already hold this process's local input while another process must move its input.
+        // Give each such placement its own logical array on every process so that retaining two independent results
+        // gives them distinct executable arguments everywhere. A weak handle keeps donation possible.
+        let local_source = (!in_place && self.is_locally_assigned()).then(|| Arc::downgrade(&self.parts));
+        let mut output = self.run_placement_dispatch(session, &target, donate)?;
+        if local_source.is_some_and(|source| source.as_ptr() == Arc::as_ptr(&output.parts)) {
+            output.parts =
+                Arc::new(ArrayParts::new(session, Arc::clone(&output.parts.metadata), output.parts.shards.clone()));
+        }
+        Ok(output.with_locally_assigned(locally_assigned))
     }
 
     /// Places this array on `mesh` according to `sharding` with device work only (i.e., without copying its contents
@@ -1450,8 +1461,9 @@ impl Array {
     /// `source` on its device, on that device, using the default PJRT layout for a remote transfer. A region that a
     /// remote transfer sends is also exactly sized, because a cross-host send moves the whole allocation of its buffer
     /// (refer to [`Self::cross_host_send_buffer`]), so a whole source shard whose buffer is padded (e.g., a
-    /// bounded-dynamic result) is converted as a buffer in another layout is. `completion` records the fences of the
-    /// programs that produce it.
+    /// bounded-dynamic result) is converted as a buffer in another layout is, with a compiled conversion on its device
+    /// or, when that conversion does not compile, through host memory. `completion` records the fences of the programs
+    /// and the readiness of the buffers that produce it.
     fn prepare_shard_region(
         session: &Session,
         data_type: DataType,
@@ -1482,15 +1494,34 @@ impl Array {
             Arc::clone(output.shards()[0].buffer().unwrap())
         };
         // A receive declares the region's shape and uses the plugin's default device layout.
+        // An eager cast to the type of its input returns that input, so a padded buffer in the default layout is
+        // converted by a compiled conversion, as `Self::cross_host_send_buffer` converts it, or through host memory.
         if let Some(layout) = remote_layout {
-            let shape = slice.iter().map(Range::len).collect::<Vec<_>>();
-            if buffer.specification()?.layout != *layout || !holds_exact_shape(&buffer, &shape)? {
-                let r#type = ArrayType::new(data_type, StaticShape::new(shape).into());
-                let input = Self::wrap_device_buffer(session, r#type, source.device(), Arc::clone(&buffer))?;
-                let r#type = input.r#type().into_owned().with_layout(Layout::from_pjrt(layout.clone())?);
-                let output = input.cast(r#type, &[])?;
-                completion.track_fence(output.execution_fence());
-                buffer = Arc::clone(output.shards()[0].buffer().unwrap());
+            let shape = StaticShape::new(slice.iter().map(Range::len).collect::<Vec<_>>());
+            let current_layout = buffer.specification()?.layout;
+            if current_layout != *layout || !holds_exact_shape(&buffer, shape.as_slice())? {
+                let input_type =
+                    ArrayType::new(data_type, shape.clone().into()).with_layout(Layout::from_pjrt(current_layout)?);
+                let target_layout = Layout::from_pjrt(layout.clone())?;
+                let converted = Self::try_relayout_shard_on_device(
+                    session,
+                    source.device(),
+                    Arc::clone(&buffer),
+                    input_type,
+                    &target_layout,
+                )?;
+                buffer = match converted {
+                    Some(converted) => {
+                        completion.track_fence(converted.execution_fence());
+                        Arc::clone(converted.shards()[0].buffer().unwrap())
+                    }
+                    None => {
+                        let buffer_type = data_type.executable_buffer_type();
+                        let memory = buffer.memory()?;
+                        let layout = Some(layout.clone());
+                        Self::copy_shard_through_host(session, &buffer, shape, buffer_type, memory, layout, completion)?
+                    }
+                };
             }
         }
         Ok(buffer)
@@ -5919,7 +5950,8 @@ mod tests {
 
         // The only shard of the source is sent to both remote devices. It is staged in device memory and converted to
         // the layout of the receives once, and both sends read the same buffer. The CPU plugin lacks the cross-host
-        // transfers extension, so the first send fails once every buffer that the sends read is prepared.
+        // transfers extension, so the first send fails once every buffer that the sends read is prepared. The result
+        // would wait for the readiness of the sent shard and of its staged copy and for the fence of the conversion.
         let mut completion = PlacementCompletion::default();
         let error = source.exact_shard_buffers(&session, &plan, &cross_host_layouts, memory, &mut completion).err();
         assert!(matches!(
@@ -5927,7 +5959,7 @@ mod tests {
             Some(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                 if message == "the cross-host transfers extension is not provided by the PJRT plugin",
         ));
-        assert_eq!((completion.events.len(), completion.fences.len()), (1, 1));
+        assert_eq!((completion.events.len(), completion.fences.len()), (2, 1));
         assert_eq!(session.cached_program_count(), 1);
         completion.join(None).unwrap().block_until_ready().unwrap();
     }

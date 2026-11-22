@@ -196,18 +196,21 @@ impl DistributedRuntime {
     /// programs that their in-memory caches already hold, or compile programs that no other process compiles (e.g.,
     /// eager operations that only process zero runs).
     ///
-    /// Before process zero compiles a program, [`CompilationArtifactExchange::validate_compatibility`] announces the
-    /// persistent compilation key and the process count without waiting for any other process. A follower that misses
-    /// its in-memory cache waits for that announcement before it waits for the artifact, and rejects a process count
-    /// that disagrees with its own. The XLA persistent key includes platform and plugin versions, compiler identity,
-    /// and logical topology, so a follower whose compatibility properties differ from those of process zero never
-    /// observes an announcement for its key. Its compatibility validation then times out, and the configured exchange
-    /// policy decides whether it compiles locally.
+    /// The leader of each compilation is the process that the compilation names (refer to
+    /// [`CompilationCacheDomain::artifact_exchange_leader`](ryft_core::CompilationCacheDomain::artifact_exchange_leader)),
+    /// which for a [`Session`](crate::Session) is the lowest index of the processes that own a device of the mesh of
+    /// the program. Before the leader compiles a program, [`CompilationArtifactExchange::validate_compatibility`]
+    /// announces the persistent compilation key and the process count without waiting for any other process. A
+    /// follower that misses its in-memory cache waits for that announcement before it waits for the artifact, and
+    /// rejects a process count that disagrees with its own. The XLA persistent key includes platform and plugin
+    /// versions, compiler identity, and logical topology, so a follower whose compatibility properties differ from
+    /// those of its leader never observes an announcement for its key. Its compatibility validation then times out,
+    /// and the configured exchange policy decides whether it compiles locally.
     ///
     /// # Parameters
     ///
-    ///   - `process_index`: Index of this process in the exchange. Process zero is the leader that compiles and
-    ///     publishes artifacts. This is not checked against the index of this process in the runtime.
+    ///   - `process_index`: Index of this process in the exchange, which must be its index in the runtime, because the
+    ///     leader of a compilation is named by the index of a process that owns its devices. This is not checked.
     ///   - `process_count`: Number of processes that participate in the exchange.
     pub fn compilation_artifact_exchange(
         &self,
@@ -287,7 +290,7 @@ struct DistributedCompilationArtifactExchange {
     /// Shared runtime state that owns the key-value store and keeps the client and service alive.
     runtime: Arc<DistributedRuntimeState>,
 
-    /// Index of this process in the exchange, where process zero is the leader.
+    /// Index of this process in the exchange.
     process_index: usize,
 
     /// Number of processes that participate in the exchange.
@@ -349,11 +352,18 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         self.process_count
     }
 
-    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationArtifactExchangeError> {
+    fn validate_compatibility(
+        &self,
+        key: &[u8],
+        leader: usize,
+        timeout: Duration,
+    ) -> Result<(), CompilationArtifactExchangeError> {
         // Address compatibility validation by the compilation key because each process validates only compilations
-        // that miss its own in-memory cache. The leader announces every key that it is about to compile without
-        // waiting for anyone, and each follower waits for the announcement of its own key.
-        if self.process_count == 0 || self.process_index >= self.process_count {
+        // that miss its own in-memory cache. The leader of a key announces it before it compiles the program without
+        // waiting for anyone, and each follower waits for the announcement of its own key. Every process that takes
+        // part in a compilation names the same leader for its key, which need not be process zero (e.g., for a program
+        // that runs only on devices of other processes).
+        if self.process_count == 0 || self.process_index >= self.process_count || leader >= self.process_count {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process coordinates are invalid".to_string(),
             });
@@ -368,7 +378,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             });
         }
 
-        if self.process_index == 0 {
+        if self.process_index == leader {
             let manifest = CompilationCompatibilityManifest {
                 schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
                 process_count: self.process_count as u64,
@@ -397,7 +407,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
-                    "process 0 uses compilation artifact exchange schema {}, but this process uses schema {}",
+                    "process {leader} uses compilation artifact exchange schema {}, but this process uses schema {}",
                     manifest.schema_version, ARTIFACT_EXCHANGE_SCHEMA_VERSION,
                 ),
             });
@@ -405,14 +415,16 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
         if manifest.process_count != self.process_count as u64 {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
-                    "process 0 expects {} processes, but this process expects {}",
+                    "process {leader} expects {} processes, but this process expects {}",
                     manifest.process_count, self.process_count,
                 ),
             });
         }
         if get(b"preflight/key")?.as_slice() != key {
             return Err(CompilationArtifactExchangeError::Incompatible {
-                message: "process 0 announced a different persistent compilation key with the same digest".to_string(),
+                message: format!(
+                    "process {leader} announced a different persistent compilation key with the same digest"
+                ),
             });
         }
         Ok(())
@@ -551,7 +563,8 @@ mod tests {
     };
     #[cfg(feature = "cuda-13")]
     use ryft_core::{
-        CompilationArtifactExchangePolicy, CompilationCache, Layout, Memory, ParallelBroadcast, TiledLayout, Typed,
+        CompilationArtifactExchangePolicy, CompilationCache, Dimension, DimensionBounds, DimensionVariable, Layout,
+        Memory, ParallelBroadcast, Shape, TiledLayout, Typed,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{
@@ -1084,10 +1097,10 @@ mod tests {
         let invalid_coordinates = Err(CompilationArtifactExchangeError::Incompatible {
             message: "exchange process coordinates are invalid".to_string(),
         });
-        assert_eq!(exchange(0, 0).validate_compatibility(b"key", Duration::from_secs(1)), invalid_coordinates);
-        assert_eq!(exchange(2, 2).validate_compatibility(b"key", Duration::from_secs(1)), invalid_coordinates);
+        assert_eq!(exchange(0, 0).validate_compatibility(b"key", 0, Duration::from_secs(1)), invalid_coordinates);
+        assert_eq!(exchange(2, 2).validate_compatibility(b"key", 0, Duration::from_secs(1)), invalid_coordinates);
         assert_eq!(
-            exchange(0, 2).validate_compatibility(b"oversized", Duration::from_secs(1)),
+            exchange(0, 2).validate_compatibility(b"oversized", 0, Duration::from_secs(1)),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "persistent compilation key size 9 exceeds configured compatibility validation maximum 4"
                     .to_string(),
@@ -1110,13 +1123,13 @@ mod tests {
             let producer_calls = Arc::clone(&producer_calls);
             let leader = Arc::clone(&leader);
             let producer = scope.spawn(move || {
-                leader.validate_compatibility(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
+                leader.validate_compatibility(b"complete-xla-persistent-key", 0, Duration::from_secs(1)).unwrap();
                 producer_calls.fetch_add(1, Ordering::Relaxed);
                 leader.publish(b"complete-xla-persistent-key", b"serialized-executable").unwrap();
             });
             let follower = Arc::clone(&follower);
             let consumer = scope.spawn(move || {
-                follower.validate_compatibility(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap();
+                follower.validate_compatibility(b"complete-xla-persistent-key", 0, Duration::from_secs(1)).unwrap();
                 follower.receive(b"complete-xla-persistent-key", Duration::from_secs(1)).unwrap().unwrap()
             });
 
@@ -1124,6 +1137,32 @@ mod tests {
             assert_eq!(consumer.join().unwrap(), b"serialized-executable");
         });
         assert_eq!(producer_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_compilation_artifact_exchange_validate_compatibility_with_leader_other_than_process_zero() {
+        let Some(address) = loopback_address() else {
+            return;
+        };
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap();
+        let leader = runtime.compilation_artifact_exchange(1, 3);
+        let follower = runtime.compilation_artifact_exchange(2, 3);
+
+        // Processes 1 and 2 of three compile a program that runs only on their devices, so process 1 leads it, and
+        // process 0 takes no part. The leader announces the key without waiting, the follower accepts that
+        // announcement, and an announcement that names a leader index outside the exchange is rejected.
+        assert_eq!(leader.validate_compatibility(b"submesh-key", 1, Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.validate_compatibility(b"submesh-key", 1, Duration::from_secs(1)), Ok(()));
+        leader.publish(b"submesh-key", b"submesh-executable").unwrap();
+        let received = follower.receive(b"submesh-key", Duration::from_secs(1)).unwrap();
+        assert_eq!(received, Some(b"submesh-executable".to_vec()));
+        assert_eq!(
+            follower.validate_compatibility(b"submesh-key", 3, Duration::from_secs(1)),
+            Err(CompilationArtifactExchangeError::Incompatible {
+                message: "exchange process coordinates are invalid".to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -1137,9 +1176,9 @@ mod tests {
         let follower = runtime.compilation_artifact_exchange(1, 2);
 
         // The leader never waits, while a follower whose key differs never observes an announcement for its key.
-        assert_eq!(leader.validate_compatibility(b"first-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(leader.validate_compatibility(b"first-key", 0, Duration::from_secs(1)), Ok(()));
         assert_eq!(
-            follower.validate_compatibility(b"second-key", Duration::from_millis(20)),
+            follower.validate_compatibility(b"second-key", 0, Duration::from_millis(20)),
             Err(CompilationArtifactExchangeError::TimedOut),
         );
     }
@@ -1158,10 +1197,10 @@ mod tests {
         // compiles one program twice (e.g., after evicting it), and the follower validates compatibility in a different
         // order.
         for key in [b"first-key".as_slice(), b"second-key", b"third-key", b"first-key"] {
-            assert_eq!(leader.validate_compatibility(key, Duration::from_secs(1)), Ok(()));
+            assert_eq!(leader.validate_compatibility(key, 0, Duration::from_secs(1)), Ok(()));
         }
-        assert_eq!(follower.validate_compatibility(b"third-key", Duration::from_secs(1)), Ok(()));
-        assert_eq!(follower.validate_compatibility(b"first-key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.validate_compatibility(b"third-key", 0, Duration::from_secs(1)), Ok(()));
+        assert_eq!(follower.validate_compatibility(b"first-key", 0, Duration::from_secs(1)), Ok(()));
 
         // Publishing an already published artifact again is a no-op that keeps the first artifact.
         leader.publish(b"first-key", b"first-executable").unwrap();
@@ -1196,9 +1235,9 @@ mod tests {
         let leader = runtime.compilation_artifact_exchange(0, 2);
         let follower = runtime.compilation_artifact_exchange(1, 3);
 
-        assert_eq!(leader.validate_compatibility(b"key", Duration::from_secs(1)), Ok(()));
+        assert_eq!(leader.validate_compatibility(b"key", 0, Duration::from_secs(1)), Ok(()));
         assert_eq!(
-            follower.validate_compatibility(b"key", Duration::from_secs(1)),
+            follower.validate_compatibility(b"key", 0, Duration::from_secs(1)),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "process 0 expects 2 processes, but this process expects 3".to_string(),
             }),
@@ -1216,9 +1255,9 @@ mod tests {
         let follower = runtime.compilation_artifact_exchange(1, 2);
 
         thread::scope(|scope| {
-            let leader = scope.spawn(move || leader.validate_compatibility(b"key", Duration::from_secs(1)));
+            let leader = scope.spawn(move || leader.validate_compatibility(b"key", 0, Duration::from_secs(1)));
             let follower = scope.spawn(move || {
-                follower.validate_compatibility(b"key", Duration::from_secs(1)).unwrap();
+                follower.validate_compatibility(b"key", 0, Duration::from_secs(1)).unwrap();
                 follower.receive(b"key", Duration::from_millis(20))
             });
             leader.join().unwrap().unwrap();
@@ -1284,7 +1323,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process_index as u32).unwrap();
         let exchange = runtime.compilation_artifact_exchange(process_index, 2);
-        exchange.validate_compatibility(b"multi-process-key", Duration::from_secs(5)).unwrap();
+        exchange.validate_compatibility(b"multi-process-key", 0, Duration::from_secs(5)).unwrap();
 
         if process_index == 0 {
             let mut producers =
@@ -2327,6 +2366,115 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 rank 0 Host { pinned: false }: [] ready
                 rank 1 Host { pinned: true }: [("pinned_host", [1.0, 2.0, 3.0, 4.0])] ready
                 rank 1 Host { pinned: false }: [("unpinned_host", [1.0, 2.0, 3.0, 4.0])] ready"#},
+        );
+    }
+
+    // Worker of `test_array_to_placement_sends_padded_bounded_dynamic_shard_on_two_cuda_processes`, which returns
+    // immediately unless that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_sends_padded_bounded_dynamic_shard_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+            let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+            let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
+
+            // Rank 0 runs a bounded-dynamic identity on `[11, 22]`, whose result buffer is padded to the bound of its
+            // dimension, and rank 1 holds only the metadata of that result. The CUDA plugin sends as many bytes as the
+            // allocation of the sender holds, while the receiver allocates the two elements of the shard, so rank 0
+            // must send an exactly sized copy for rank 1 to receive the two values in a buffer of eight bytes.
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            let source = if rank == 0 {
+                let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(1024)).unwrap());
+                let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+                let identity: crate::CompiledFunction<ArrayType, ArrayType> = crate::compile_with_options(
+                    |input| input,
+                    dynamic_type,
+                    &session,
+                    Options::new(source_mesh.clone()),
+                )
+                .unwrap_or_else(|error| panic!("rank {rank} failed to compile the bounded-dynamic identity: {error}"));
+                let input = Array::from_host_buffer(
+                    &session,
+                    r#type.clone(),
+                    source_mesh.clone(),
+                    Some(replicated.clone()),
+                    values_to_bytes(&[11f32, 22.]),
+                )
+                .unwrap();
+                let padded = identity
+                    .executable()
+                    .execute(&session, input)
+                    .unwrap_or_else(|error| panic!("rank {rank} failed to run the bounded-dynamic identity: {error}"));
+                let buffer = padded.shards()[0].buffer().unwrap();
+                println!(
+                    "probe: rank {rank} source: unpadded={:?} padded={}",
+                    buffer.unpadded_dimensions().unwrap(),
+                    buffer.on_device_size_in_bytes().unwrap() > 8,
+                );
+                padded
+            } else {
+                let sharding = Some(replicated.clone());
+                Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), sharding, Vec::new()).unwrap()
+            };
+            let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap();
+            let placed = source
+                .to_placement(&session, target)
+                .and_then(|placed| placed.block_until_ready().map(|()| placed))
+                .unwrap_or_else(|error| panic!("rank {rank} failed to send the padded shard: {error}"));
+            let shards = placed
+                .addressable_shards()
+                .map(|shard| {
+                    let buffer = shard.buffer().unwrap();
+                    let bytes = shard
+                        .copy_to_host_bytes()
+                        .unwrap_or_else(|error| panic!("rank {rank} failed to read the received shard: {error}"));
+                    (
+                        buffer.dimensions().unwrap().to_vec(),
+                        buffer.on_device_size_in_bytes().unwrap(),
+                        values_from_bytes::<f32>(&bytes),
+                    )
+                })
+                .collect::<Vec<_>>();
+            println!("probe: rank {rank} placed: {shards:?}");
+            session
+                .synchronize()
+                .unwrap_or_else(|error| panic!("rank {rank} failed to synchronize after the transfer: {error}"));
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_sends_padded_bounded_dynamic_shard_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair(
+            "distributed::tests::test_array_to_placement_sends_padded_bounded_dynamic_shard_cuda_process_helper",
+        ) else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {r#"
+                rank 0 source: unpadded=[2] padded=true
+                rank 0 placed: []
+                rank 1 placed: [([2], 8, [11.0, 22.0])]"#},
         );
     }
 

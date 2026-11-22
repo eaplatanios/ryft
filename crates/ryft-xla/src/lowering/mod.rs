@@ -38,8 +38,8 @@ use ryft_core::{
     OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
     Provenance, RegionId, RegionRef, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
     ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation,
-    TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value, ZeroLikeOperation,
-    ZeroOperation,
+    TagOperation, TransferToMemoryOperation, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value,
+    ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -1492,7 +1492,7 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    let mut session_constants = Vec::<RetainedArray>::new();
+    let mut session_constants = Vec::new();
     for region in program.entry_region_ref().computation_regions() {
         for atom in region.atoms() {
             if let Some(Constant::Session(constant)) = atom.as_constant()
@@ -1521,8 +1521,15 @@ where
 /// destinations `jaxpr_transfer_mem_kinds` in `jax._src.interpreters.pxla` collects and `lower_sharding_computation`
 /// counts among the reasons to commit. A `reshard` is not counted, because JAX does not count its own `reshard` among
 /// these requests either.
+///
+/// With `includes_memory_requests` unset, an in-place target is not counted, because it names no devices. This is how
+/// a compiled function decides whether it names the devices of its mesh (refer to `requests_placement` in
+/// `crate::compilation::domains`), since JAX runs a `jit` function whose body only moves a value to another memory
+/// (e.g., `jax.device_put(x, jax.memory.Space.Host)`) where its arguments are, directly and nested in another `jit`
+/// function alike, and commits its outputs there.
 pub(crate) fn has_placement_requests<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
+    includes_memory_requests: bool,
 ) -> bool
 where
     ProgramInput: Parameterized<Constant>,
@@ -1531,10 +1538,10 @@ where
     program.entry_region_ref().computation_regions().any(|region| {
         region.instructions().iter().any(|instruction| {
             let operation = instruction.operation();
-            operation
-                .projected_payload::<PlaceOperation>()
-                .is_some_and(|operation| operation.target().is_some())
-                || operation.projected_payload::<ConstrainShardingOperation>().is_some()
+            operation.projected_payload::<PlaceOperation>().is_some_and(|operation| match operation.target() {
+                Some(PlacementRequest::InPlace { .. }) => includes_memory_requests,
+                target => target.is_some(),
+            }) || operation.projected_payload::<ConstrainShardingOperation>().is_some()
                 || operation.projected_payload::<JitCallOperation<Type>>().is_some_and(|call| call.mesh().is_some())
         })
     })
@@ -1563,19 +1570,21 @@ pub(crate) enum EntryResultPlacement {
 /// Operations that return the value of an input together with its placement are followed back to that input, so that a
 /// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
 /// target, which leaves its input where it is, a `place` with a device target, which keeps the sharding of its input
-/// on the only device of the program mesh, and `stop_gradient` and `tag`, which only mark values for program
-/// transforms and lower to nothing. A device target that completes a pending reduction over mesh axes of size one
+/// on the only device of the program mesh, `transfer_to_memory`, which only changes the memory of its input as a
+/// `place` with an in-place target does, and `stop_gradient` and `tag`, which only mark values for program transforms
+/// and lower to nothing. A device target that completes a pending reduction over mesh axes of size one
 /// gives its result another sharding than its input, so such a result is placed as its type states instead. A
 /// `jit_call` always runs its callee, whose results are the results of the call, so a result of a call has the
 /// placement that the callee gives the corresponding callee result, and a callee result that returns a callee input is
-/// followed back to the corresponding input of the call. A sharding override of the boundary of the callee that the
-/// call carries (i.e., of a compiled function that it calls) takes precedence, because the callee body cannot always
-/// show it, so a result of the call that such an output override covers, or that returns a callee input that such an
-/// input override covers, is placed as that override. Lowering constrains that result or operand of the call to the
-/// override as well, so that the call places it alike whether a program returns it or consumes it (refer to the
-/// lowering of [`JitCallOperation`]). Other operations that return a value equal to an input are not followed, because
-/// they change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
-/// results differently (e.g., the `optimization_barrier` of rematerialization).
+/// followed back to the corresponding input of the call. The boundary of the callee takes precedence, because the
+/// callee body cannot always show it, so a result of the call that a sharding override of a callee output covers is
+/// placed as that override, and one that returns a callee input with an effective boundary sharding (i.e., its override
+/// or otherwise the sharding of its declared type, refer to [`JitCallOperation::boundary_input_sharding`]) is placed as
+/// that sharding. Lowering constrains that result or operand of the call to that sharding as well, so that the call
+/// places it alike whether a program returns it or consumes it (refer to the lowering of [`JitCallOperation`]). Other
+/// operations that return a value equal to an input are not followed, because they change its placement (e.g.,
+/// `reshard` and `constrain_sharding`) or because the compiler is free to place their results differently (e.g., the
+/// `optimization_barrier` of rematerialization).
 pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     output_count: usize,
@@ -1687,7 +1696,7 @@ pub(crate) fn entry_open_results(
             result_shardings.is_none()
                 && placement.is_none()
                 && annotation.as_ref().is_some_and(|sharding| {
-                    sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
+                    has_untracked_auto_axes(sharding)
                         && sharding.unreduced_axes().is_empty()
                         && sharding.reduced_axes().is_empty()
                         && sharding.varying_manual_axes().is_empty()
@@ -1697,6 +1706,13 @@ pub(crate) fn entry_open_results(
                     .is_some_and(|sharding| sharding.dimensions().contains(&ShardingDimension::Unconstrained))
         })
         .collect()
+}
+
+/// Returns whether the mesh of `sharding` has an auto axis larger than one (i.e., one along which the compiler has a
+/// choice), along which an array type never records a placement (refer to [`ArrayType::with_sharding`]), so that a
+/// value with the type of `sharding` may be placed along it in more than one way.
+pub(crate) fn has_untracked_auto_axes(sharding: &Sharding) -> bool {
+    sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
 }
 
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
@@ -3015,8 +3031,10 @@ fn region_result_placements<O: LowerableOperationFamily>(
                 }
             } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
                 || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
+                || operation.projected_payload::<TransferToMemoryOperation>().is_some()
             {
-                // Both operations return each of their inputs as the output at the same position.
+                // These operations return each of their inputs as the output at the same position, and a memory
+                // transfer keeps the devices and the sharding of its input like an in-place `place` target does.
                 output_index
             } else if let Some(call) = operation.projected_payload::<JitCallOperation<Type>>() {
                 // The inputs of the callee receive the inputs of the call positionally, and the results of the call
@@ -3039,10 +3057,20 @@ fn region_result_placements<O: LowerableOperationFamily>(
                     EntryResultPlacement::Target(sharding) => {
                         return Some(EntryResultPlacement::Target(sharding.clone()));
                     }
-                    EntryResultPlacement::Argument(index) => match call.input_sharding(*index) {
-                        Some(sharding) => return Some(EntryResultPlacement::Target(sharding.clone())),
-                        None => *index,
-                    },
+                    EntryResultPlacement::Argument(index) => {
+                        let actual = region.atoms()[instruction.inputs().get(*index)?.index()].r#type();
+                        let callee = region.with_id(callee).ok()?;
+                        let declared = callee.input_types();
+                        match (actual.as_ref(), declared.get(*index)?) {
+                            (Type::Array(actual), declared) => {
+                                match call.boundary_input_sharding(*index, actual, declared) {
+                                    Some(sharding) => return Some(EntryResultPlacement::Target(sharding.clone())),
+                                    None => *index,
+                                }
+                            }
+                            _ => *index,
+                        }
+                    }
                 }
             } else {
                 return None;
@@ -3198,12 +3226,13 @@ pub(crate) mod tests {
         ConstantOperation, Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext,
         EffectClasses, Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation,
-        NegOperation, OneLike, ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation, Program,
-        ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation, ReductionKind,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
-        ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions, ShardMap,
-        ShardMapOperation, ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, UnreducedKind,
-        ValueProjection, ZeroLike, i1, i2, i4, scan, shard_map, u1, u2, u4,
+        NegOperation, OneLike, ParallelReduce, ParameterizedFamily, Place, Placeholder, Placement, PrintOperation,
+        Program, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation,
+        ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
+        ReferenceType, ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions,
+        ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout, Tag, TiledLayout,
+        TransferToMemory, Transpose, TypedProgram, UnreducedKind, ValueProjection, ZeroLike, i1, i2, i4, scan,
+        shard_map, u1, u2, u4,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -3211,16 +3240,20 @@ pub(crate) mod tests {
         Attribute, DialectHandle, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize,
     };
     use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
-    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
+    use ryft_pjrt::{
+        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+        load_cpu_plugin,
+    };
 
     use crate::lowering::LoweringError;
     use crate::lowering::regions::tests::lower_plain_program_outputs;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::sessions::tests::{domain_mesh, f32_scalar};
+    use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
     use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         ArrayTracer, CompileTracer, CompiledFunction, FlatProgram, FromPjrt, JitCallOperation, Options,
-        ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram, compile, trace, trace_with_context,
+        PlacementOptions, ProgramBuilder as ArrayIrProgramBuilder, Session, TracedProgram, compile, trace,
+        trace_with_context,
     };
 
     use super::*;
@@ -5643,6 +5676,97 @@ pub(crate) mod tests {
                     %3 = stablehlo.add %1, %2 : tensor<f64>
                     %4 = stablehlo.multiply %arg0, %cst : tensor<f64>
                     return %3, %4 : tensor<f64>, tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_entry_result_placements_follow_operations_that_keep_the_placement_of_their_input() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let input = crate::Array::from_host_buffer(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            Some(replicated),
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
+        let target = Placement::new(mesh.clone(), split.clone()).unwrap();
+
+        // Every operation that returns its input together with its placement keeps the split that a preceding `place`
+        // gives its input along an auto mesh axis, which the type of the result does not record, so that the result
+        // of the program is split as well (refer to `entry_result_placements`).
+        let operations: [(&str, fn(CompileTracer) -> CompileTracer); 5] = [
+            ("place without a target", |x| x.place(&None::<Placement>, None).unwrap()),
+            ("place with an in-place target", |x| x.place(&Memory::Host { pinned: true }, None).unwrap()),
+            ("transfer_to_memory", |x| x.transfer_to_memory(Memory::Host { pinned: true }).unwrap()),
+            ("stop_gradient", |x| x.stop_gradient().unwrap()),
+            ("tag", |x| x.tag("tagged").unwrap()),
+        ];
+        for (name, operation) in operations {
+            let function: CompiledFunction<ArrayType, ArrayType> = compile(
+                |x: CompileTracer| operation(x.place(&target, None).unwrap()),
+                vector_type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let output = function.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!((name, output.sharding()), (name, &split));
+        }
+    }
+
+    #[test]
+    fn test_collect_session_constants_assigns_the_same_arguments_on_every_process() {
+        // Two single-device clients stand for two processes. Each independently places its default scalar on global
+        // device 0 twice. Only the owner can reuse the original device buffer.
+        let clients = [0, 1].map(|process| {
+            let options = CpuClientOptions { device_count: Some(1), process_id: Some(process) };
+            let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+            let client: &'static ryft_pjrt::Client<'static> = Box::leak(Box::new(client));
+            client
+        });
+        let first_device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
+        let modules = clients.map(|client| {
+            let session = Session::builder().client(client).build().unwrap();
+            let scalar = session.place(4f32, PlacementOptions::defaults()).unwrap();
+            let first = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
+            let second = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
+            if client.process_index().unwrap() == 0 {
+                let buffer = scalar.shards()[0].buffer().unwrap();
+                assert!(Arc::ptr_eq(first.shards()[0].buffer().unwrap(), buffer));
+                assert!(Arc::ptr_eq(second.shards()[0].buffer().unwrap(), buffer));
+            } else {
+                assert_eq!(first.addressable_shards().count(), 0);
+                assert_eq!(second.addressable_shards().count(), 0);
+            }
+            let mut builder = ArrayIrProgramBuilder::new();
+            let first_clone = first.clone();
+            let outputs = [&scalar, &first, &second, &first_clone]
+                .map(|array| builder.add_constant(Constant::Session(RetainedArray::new(array))))
+                .to_vec();
+            let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 4]).unwrap();
+            let constants = collect_session_constants(&program);
+            assert_eq!(constants, [&scalar, &first, &second].map(RetainedArray::new));
+            let captures = constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
+            let output_types = vec![scalar.r#type().into_owned(); 4];
+            to_mlir_module_for_program(&program, &captures, &(), &output_types, "main", None, None).unwrap()
+        });
+
+        assert_eq!(modules[0], modules[1]);
+        assert_eq!(
+            modules[0],
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<f32>) -> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>) {
+                    return %arg0, %arg1, %arg2, %arg1 : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
                   }
                 }
             "#},

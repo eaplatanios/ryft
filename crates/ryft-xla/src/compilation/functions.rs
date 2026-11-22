@@ -2093,6 +2093,39 @@ where
     session.compile_staged_function(staged)
 }
 
+/// Returns `capture`, the array at `index` among the captures of a function that is staged for `mesh`, placed where the
+/// function runs. A capture never decides where a function runs, and the executable of the function receives it on
+/// `mesh` as it receives a public argument. A capture over a logical mesh of the topology of `mesh` is returned as it
+/// is, because an execution moves it onto the devices of `mesh` with its placement. A capture over a logical mesh of
+/// another topology is replicated over `mesh` here, once, when its type records it as replicated (e.g., a capture that
+/// is split along auto mesh axes only, which types never record), because the function is traced with the type of the
+/// capture, which would otherwise name a mesh that the function does not run on. This is how JAX runs a `jit` function
+/// on the devices of its arguments whatever the devices of the arrays that it closes over.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::InvalidArgument`] for a capture over a logical mesh of another topology whose type records a
+/// placement other than replication (i.e., a split, a pending reduction, or manual variation over that mesh), which
+/// the function computes with and which no placement over `mesh` can keep, and the error of moving a capture.
+fn placed_capture(index: usize, capture: Array, mesh: &DeviceMesh) -> Result<Array, Error> {
+    if capture.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
+        return Ok(capture);
+    }
+    if !capture.r#type().sharding().is_none_or(Sharding::is_replicated) {
+        return Err(Error::from(ProgramError::InvalidArgument {
+            message: format!(
+                "capture #{index} has the type `{}` over a mesh of another topology than the mesh `{}` that the \
+                 function is compiled for, whose placement it cannot keep",
+                capture.r#type(),
+                mesh.logical_mesh(),
+            ),
+        }));
+    }
+    let sharding = Sharding::replicated(mesh.logical_mesh().clone(), capture.r#type().rank());
+    let session = capture.session().clone();
+    capture.reshard_on_devices(&session, mesh, &sharding, false)
+}
+
 /// Traces `function` into a [`StagedFunction`] over the internal array IR type family. The closure sees public
 /// [`CompileTracer`]s, and its outputs receive the output sharding overrides of `options` (refer to `place_outputs`).
 /// This is the shared implementation of [`stage`], [`stage_with_captures`], and [`compile_with_flat_captures`].
@@ -2128,7 +2161,11 @@ where
     ProgramParameterValues<Out, StatefulCompileTracer>:
         Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
-    let captures = captures.into_iter().map(Value::Array).collect();
+    let captures = captures
+        .into_iter()
+        .enumerate()
+        .map(|(index, capture)| placed_capture(index, capture, options.mesh()).map(Value::Array))
+        .collect::<Result<Vec<_>, Error>>()?;
     let input_structure = input_types.parameter_structure();
     let input_types =
         ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(Type::from))
@@ -4421,6 +4458,102 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_with_captures_places_captures_where_the_function_runs() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let values = [0f32, 1.0, 2.0, 3.0];
+        let input = Array::from_host_buffer(
+            &session,
+            vector_type.clone(),
+            single_device_mesh.clone(),
+            None,
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let compile_capturing = |axis_type: MeshAxisType| {
+            let mesh = two_device_mesh(client, axis_type);
+            let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let capture =
+                Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(split), values_to_bytes(&values))
+                    .unwrap();
+            compile_with_captures(
+                |captures, _: CompileTracer| captures[0].clone(),
+                vec![capture],
+                vector_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+        };
+
+        // A capture that is split along the auto axis of a mesh of two devices, which its type does not record,
+        // follows the function onto its single device, as JAX returns such a capture of a `jit` function on the
+        // device of the function.
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_capturing(MeshAxisType::Auto).unwrap();
+        let output = function.executable().execute(&session, input).unwrap();
+        assert_eq!(output.mesh(), &single_device_mesh);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        // A capture whose type records a split over such a mesh cannot keep it on a single device.
+        assert_eq!(
+            compile_capturing(MeshAxisType::Explicit)
+                .map(|_: CompiledFunction<ArrayType, ArrayType>| ())
+                .unwrap_err()
+                .to_string(),
+            "capture #0 has the type `f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]` over a mesh of another \
+             topology than the mesh `['device'=1:auto]` that the function is compiled for, whose placement it cannot \
+             keep",
+        );
+    }
+
+    #[test]
+    fn test_compiled_function_call_of_a_memory_placement_runs_where_its_caller_runs() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let pinned_host = Memory::Host { pinned: true };
+        let function: CompiledFunction<ArrayType, ArrayType> = compile(
+            |x: CompileTracer| x.place(&pinned_host, None).unwrap(),
+            vector_type.clone(),
+            &session,
+            mesh(devices[0]),
+        )
+        .unwrap();
+        let caller: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| function.call(x).unwrap(), vector_type.clone(), &session, mesh(devices[1])).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            vector_type,
+            mesh(devices[1]),
+            None,
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+        )
+        .unwrap()
+        .with_committed(true);
+
+        // A function whose body only moves its value to another memory names no devices, so a call of it runs where
+        // its committed argument or its caller runs and commits its result there, in the memory that it requests, as
+        // JAX runs a `jit` function whose body only calls `jax.device_put(x, jax.memory.Space.Host)` where its argument
+        // is, directly and nested in another `jit` function alike. Only a direct execution of the function runs on the
+        // device that it was compiled for.
+        for output in [function.call(input.clone()).unwrap(), caller.executable().execute(&session, input).unwrap()] {
+            assert_eq!(output.mesh().devices(), [devices[1]]);
+            assert_eq!(output.r#type().memory(), pinned_host);
+            assert!(output.is_committed());
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+
+    #[test]
     fn test_compiled_function_call_agrees_with_execution_at_every_entry_point() {
         // What an entry point observes of the result of a callee.
         #[derive(Debug, PartialEq)]
@@ -4500,6 +4633,10 @@ mod tests {
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
+        let explicit_mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let explicit_split =
+            Sharding::new(explicit_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let explicit_replicated = Sharding::replicated(explicit_mesh.logical_mesh().clone(), 1);
         let second_replicated = Sharding::replicated(second_mesh.logical_mesh().clone(), 1);
         let second_placement = Placement::new(second_mesh.clone(), second_replicated.clone()).unwrap();
         let unconstrained_placement = Placement::new(mesh.clone(), unconstrained.clone()).unwrap();
@@ -4510,6 +4647,9 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length)]));
+        let split_type = vector_type.clone().with_sharding(explicit_split.clone()).unwrap();
+        let explicit_replicated_type = vector_type.clone().with_sharding(explicit_replicated.clone()).unwrap();
+        let replicated_type = vector_type.clone().with_sharding(replicated.clone()).unwrap();
         let upload = |r#type: &ArrayType, mesh: Option<&DeviceMesh>, sharding: Option<&Sharding>, values: &[f32]| {
             Array::from_host_buffer(&session, r#type.clone(), mesh.cloned(), sharding.cloned(), values_to_bytes(values))
                 .unwrap()
@@ -4753,6 +4893,34 @@ mod tests {
                 caller_mesh: second_mesh.clone(),
             },
             Row {
+                name: "declared split input of a replicated argument",
+                input_type: explicit_replicated_type.clone(),
+                callee: compiled(&split_type, Options::new(explicit_mesh.clone())),
+                input: upload(&explicit_replicated_type, Some(&explicit_mesh), None, &values),
+                caller_mesh: explicit_mesh.clone(),
+            },
+            Row {
+                name: "declared split input of a split argument",
+                input_type: split_type.clone(),
+                callee: compiled(&split_type, Options::new(explicit_mesh.clone())),
+                input: upload(&split_type, Some(&explicit_mesh), None, &values),
+                caller_mesh: explicit_mesh.clone(),
+            },
+            Row {
+                name: "declared replicated input over auto axes of a split argument",
+                input_type: vector_type.clone(),
+                callee: compiled(&replicated_type, Options::new(mesh.clone())),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "declared replicated input over auto axes of a replicated argument",
+                input_type: vector_type.clone(),
+                callee: compiled(&replicated_type, Options::new(mesh.clone())),
+                input: upload(&vector_type, Some(&mesh), None, &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
                 name: "dispatcher with an unconstrained input override",
                 input_type: vector_type.clone(),
                 callee: Callee::Dispatcher(jit_with_options(
@@ -4782,6 +4950,13 @@ mod tests {
                 caller_mesh: mesh.clone(),
             },
         ];
+
+        // A function whose declared input type is replicated over auto mesh axes, and a placement that splits a value
+        // along them, which the type of the value does not record.
+        let replicated_callee: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| x, replicated_type.clone(), &session, mesh.clone()).unwrap();
+        let split_placement = Placement::new(mesh.clone(), split.clone()).unwrap();
+        let split_input = upload(&vector_type, Some(&mesh), Some(&split), &values);
 
         let observe = |array: &Array, negated: bool| {
             array.block_until_ready().unwrap();
@@ -5143,7 +5318,7 @@ mod tests {
             `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
         let split_replicas = "fails with `cannot lower `jit_call`: bounded-dynamic multi-device programs currently \
-                              require fully replicated sharding overrides of called functions because Shardy rejects \
+                              require fully replicated boundary shardings of called functions because Shardy rejects \
                               dynamic tensors`";
         let replicated = "is placed as `{mesh<['x'=2:auto]>, [{}]}` instead of `{mesh<['x'=2:auto]>, [{'x'}]}`";
         let rematerialized_replay = "fails with ``rematerialize` body input type signature mismatch: expected \
@@ -5162,6 +5337,8 @@ mod tests {
                 "fails with ``neg` does not support input data type `zero``",
             ),
             ("bufferless result", "caller with a bounded dynamic argument", split_replicas),
+            ("declared split input of a replicated argument", "caller with a bounded dynamic argument", split_replicas),
+            ("declared split input of a split argument", "caller with a bounded dynamic argument", split_replicas),
             ("bufferless result", "caller with a scan", replicated),
             ("bufferless result", "caller with a condition", replicated),
             ("bufferless result", "caller with a while loop", replicated),
@@ -5188,8 +5365,12 @@ mod tests {
         // whose boundary leaves a dimension unconstrained keeps that dimension unconstrained in its sharding and type,
         // as the result of the call does, and stores it replicated, while the cotangent of its input takes the type of
         // that input, as a cotangent of a replicated input override does, because both store the dimension replicated.
-        // A compiled gradient follows the eager cotangent, except where a caller compiled for other devices calls the
-        // callee and where the sum of a bufferless value does not lower.
+        // The tangent of a call whose callee declares a split input that it returns is split like the result of the
+        // call, and the cotangent of the replicated argument is resharded back to the placement of that argument, as
+        // JAX returns the cotangent of a `jit` argument with the sharding of the argument. A callee that declares a
+        // replicated input over auto axes replicates the tangent and the cotangent of a split argument, as an input
+        // override does. A compiled gradient follows the eager cotangent, except where a caller compiled for other
+        // devices calls the callee and where the sum of a bufferless value does not lower.
         let differences = |fields: &[(&str, &str, &str)]| {
             let fields = fields
                 .iter()
@@ -5211,6 +5392,9 @@ mod tests {
             ])
         };
         let unconstrained = "{mesh<['x'=2:auto]>, [{?}]}";
+        let (explicit_replicated_text, explicit_split_text) =
+            ("{mesh<['x'=2:explicit]>, [{}]}", "{mesh<['x'=2:explicit]>, [{'x'}]}");
+        let explicit_typed = |sharding: &str| format!("f32[4][sharding={sharding}]");
         let unconstrained_tangent = |input: &str| {
             differences(&[("sharding", unconstrained, input), ("type", &typed(unconstrained), &typed(replicated))])
         };
@@ -5241,6 +5425,24 @@ mod tests {
             ("split output override", "eager VJP cotangent", differences(&[("sharding", split, replicated)])),
             ("split output override", "compiled gradient", differences(&[("sharding", split, replicated)])),
             ("input override", "eager JVP tangent", differences(&[("sharding", replicated, split)])),
+            (
+                "declared split input of a replicated argument",
+                "eager JVP tangent",
+                differences(&[
+                    ("sharding", explicit_split_text, explicit_replicated_text),
+                    ("type", &explicit_typed(explicit_split_text), &explicit_typed(explicit_replicated_text)),
+                ]),
+            ),
+            (
+                "declared replicated input over auto axes of a split argument",
+                "eager JVP tangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
+            (
+                "declared replicated input over auto axes of a split argument",
+                "eager VJP cotangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
             ("input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
             ("other single device", "eager JVP tangent", moved(second)),
             (
@@ -5323,6 +5525,21 @@ mod tests {
         assert_eq!(
             observe(&caller.execute((), input.clone()).unwrap(), false),
             observe(&dispatcher.execute((), input.clone()).unwrap(), false),
+        );
+
+        // A caller that splits a value along auto mesh axes before it calls a function whose declared input type is
+        // replicated gets the replicated result that an execution of the function returns, because the call places its
+        // operand as the declared input type of the callee does, along the auto axes that the type does not record.
+        let caller: CompiledFunction<ArrayType, ArrayType> = compile(
+            |x: CompileTracer| replicated_callee.call(x.place(&split_placement, None).unwrap()).unwrap(),
+            vector_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe(&caller.executable().execute(&session, split_input.clone()).unwrap(), false),
+            observe(&replicated_callee.executable().execute(&session, split_input).unwrap(), false),
         );
     }
 
@@ -7401,20 +7618,6 @@ mod tests {
             values_to_bytes::<f32>(&[0.0, 0.5, 1.0, 1.5, 2.0, 2.5]).as_slice(),
         )
         .unwrap();
-        let function: CompiledFunction<ArrayType, ArrayType> =
-            compile(|x| x.sin().unwrap(), vector_type, &engine, mesh.clone()).unwrap();
-
-        // The requested placement splits the batch items across `x`, exactly like uncompiled batching of an input
-        // whose batch dimension is sharded along `x`.
-        let batched = function
-            .batch(
-                &engine,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxisSpecification::default().with_extent(2).with_sharding(ShardingDimension::sharded(["x"])),
-            )
-            .unwrap();
-        assert_eq!(batched.output_types(), std::slice::from_ref(&matrix_type));
         let uncompiled = batch(
             |x| x.sin(),
             Value::Array(matrix.clone()),
@@ -7424,9 +7627,33 @@ mod tests {
         )
         .unwrap();
         let uncompiled = ValueProjection::<ArrayType>::into_projected(uncompiled).unwrap();
-        let executed = batched.executable().execute(&engine, matrix).unwrap();
-        assert_eq!(executed.r#type(), uncompiled.r#type());
-        assert_eq!(read_sharded_f32_array(&executed), read_sharded_f32_array(&uncompiled));
+
+        // The requested placement splits the batch items across `x`, exactly like uncompiled batching of an input
+        // whose batch dimension is sharded along `x`. A replicated input or output override of the function places
+        // each batch item as its replicated type does and says nothing about the batch dimension, so it changes
+        // nothing.
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let options = Options::new(mesh.clone());
+        for options in [
+            options.clone(),
+            options.clone().with_output_shardings(vec![replicated.clone()]),
+            options.with_input_shardings(vec![replicated]),
+        ] {
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile_with_options(|x| x.sin().unwrap(), vector_type.clone(), &engine, options).unwrap();
+            let batched = function
+                .batch(
+                    &engine,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default().with_extent(2).with_sharding(ShardingDimension::sharded(["x"])),
+                )
+                .unwrap();
+            assert_eq!(batched.output_types(), std::slice::from_ref(&matrix_type));
+            let executed = batched.executable().execute(&engine, matrix.clone()).unwrap();
+            assert_eq!(executed.r#type(), uncompiled.r#type());
+            assert_eq!(read_sharded_f32_array(&executed), read_sharded_f32_array(&uncompiled));
+        }
     }
 
     #[test]
