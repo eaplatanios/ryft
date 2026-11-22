@@ -77,19 +77,17 @@ use crate::{Error, FromPjrt, Session, Value};
 #[cfg(doc)]
 use ryft_core::Place;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Placement of an [`Array`] on devices. It specifies a destination for [`Session::place`],
-/// [`Array::to_placement`], and [`Array::into_placement`], or an expected source in [`PlacementOptions`]. Its
-/// [`ArrayPlacementTarget`] selects the devices and the sharding, and its optional memory and layout select the
-/// storage of each shard. Destination and source trees in [`PlacementOptions`] can use `Some(placement)` and
-/// `None` together. A `None` leaf omits the option for its branch.
+/// Placement of an [`Array`] on devices. It specifies a destination for [`Session::place`], [`Array::to_placement`],
+/// and [`Array::into_placement`], or an expected source in [`PlacementOptions`]. Its [`ArrayPlacementTarget`] selects
+/// the devices and the sharding, and its optional memory and layout select the storage of each shard. Destination and
+/// source trees in [`PlacementOptions`] can use `Some(placement)` and `None` together. A `None` leaf omits the option
+/// for its branch.
 ///
 /// An [`ArrayPlacement`] is a request that may depend on a [`Session`] (e.g., on its default mesh) and on the array
 /// that it applies to. It resolves against them to a [`Placement`], which names the concrete devices, the sharding
-/// over them, and the selected memory and layout, and which is what a [`PlaceOperation`]
-/// records. A sharding with fewer dimensions than the array leaves the omitted trailing dimensions replicated, as a
-/// short JAX partition specification does, so one request can place arrays of different ranks.
+/// over them, and the selected memory and layout, and which is what a [`PlaceOperation`] records. A sharding with fewer
+/// dimensions than the array leaves the omitted trailing dimensions replicated, as a short JAX partition specification
+/// does, so one request can place arrays of different ranks.
 ///
 /// Use [`Self::with_layout`] and [`Self::with_memory`] to select the storage of each shard. Host uploads use device
 /// memory and the backend's default layout when these options are omitted. A destination that is a bare device without
@@ -114,6 +112,8 @@ pub struct ArrayPlacement {
     /// innermost one (refer to [`Self::batch_shardings`]).
     batch_shardings: Vec<ShardingDimension>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ArrayPlacement {
     /// Creates a placement on `target` with its layout and memory unspecified.
