@@ -116,19 +116,19 @@ pub mod place;
 pub mod reshard;
 pub mod shard_map;
 
-pub use axis_types::{AxisTypesError, auto_axes, explicit_axes};
+pub use axis_types::{auto_axes, explicit_axes, AxisTypesError};
 pub use constrain_sharding::{
-    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
+    ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, CONSTRAIN_SHARDING_OPERATION_NAME,
 };
 pub use place::{
-    IntoPlacementRequest, PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, PlacementRequest,
-    PlacementRequestParameter, PlacementSources,
+    Place, PlaceDispatch, PlaceOperation, Placed, PlacementRequest, PlacementRequestParameter, PlacementSources,
+    PLACE_OPERATION_NAME,
 };
-pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
+pub use reshard::{Reshard, ReshardDispatch, ReshardOperation, RESHARD_OPERATION_NAME};
 pub use shard_map::{
-    LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, SHARD_MAP_OPERATION_NAME, ShardMap,
-    ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapValueKind, shard_map, shard_map_along,
-    shard_map_with_inferred_input_shardings,
+    shard_map, shard_map_along, shard_map_with_inferred_input_shardings, LockstepDeviceGrid, LockstepDomain,
+    LockstepOperation, LockstepValue, ShardMap, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
+    ShardMapValueKind, SHARD_MAP_OPERATION_NAME,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically

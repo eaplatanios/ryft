@@ -54,7 +54,7 @@ use ryft_macros::Parameter;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
     ArrayType, Device, DeviceMesh, Dimension, Layout, LogicalMesh, Memory, MeshAxisType, Placement, Shape, Sharding,
-    ShardingDimension, UnreducedKind,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -585,167 +585,6 @@ impl PlaceOperation {
         self.may_alias
     }
 
-    /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
-    /// on `source`, leaves the reduction state of the value unchanged. This is the part of the type rule of
-    /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type`], through which backends
-    /// also apply it to the placement of a concrete value outside a program), so that no path changes reduction state.
-    ///
-    /// Reduction state records pending (i.e., unreduced) or completed (i.e., reduced) cross-device reductions, and a
-    /// placement changes where a value lives but never that state. The sharding of a [`Placement`] target therefore
-    /// restates the unreduced axes, the reduced axes, and the unreduced kind of `input` exactly, and so does the
-    /// sharding of a [`Placement`] source, which describes the input. The state is restated by axis name, so the target
-    /// and source meshes must also define every axis that carries it identically (e.g., an explicit unreduced axis must
-    /// not become an auto axis, over which array types record no reduction state, so that the output would silently
-    /// lose its pending reduction, nor an axis of another size). A [`PlacementRequest::Device`] target leaves a value
-    /// that lives wholly on one device, which completes a reduced axis of any size and an unreduced axis of size one,
-    /// whereas an unreduced axis of a larger size describes contributions on more devices than one, which a placement
-    /// does not combine, so such an input must be reduced first. A [`PlacementRequest::InPlace`] target keeps the
-    /// sharding of `input` exactly, so it restates its reduction state by construction. An input without a tracked
-    /// sharding has no reduction state.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] for a target or source mesh that does not define an axis that carries reduction state of
-    /// `input` identically, for a source or a placement target whose sharding does not restate the reduction state of
-    /// `input`, and for a device target of an input that is unreduced over a mesh axis larger than one.
-    fn validate_reduction_state(
-        input: &ArrayType,
-        target: Option<&PlacementRequest>,
-        source: Option<&PlacementRequest>,
-    ) -> Result<(), TypeError> {
-        let target_sharding = target.and_then(PlacementRequest::placement).map(Placement::sharding);
-        let source_sharding = source.and_then(PlacementRequest::placement).map(Placement::sharding);
-        if let Some(input_sharding) = input.sharding() {
-            let reduction_axes = || input_sharding.unreduced_axes().iter().chain(input_sharding.reduced_axes());
-            for mesh in source_sharding.into_iter().chain(target_sharding).map(Sharding::mesh) {
-                validate_preserved_mesh_axes(PLACE_OPERATION_NAME, input_sharding.mesh(), reduction_axes(), mesh)?;
-            }
-        }
-
-        let (unreduced_axes, reduced_axes) = match input.sharding() {
-            Some(sharding) => (sharding.unreduced_axes().clone(), sharding.reduced_axes().clone()),
-            None => Default::default(),
-        };
-
-        let has_input_reduction_state = |sharding: &Sharding| {
-            sharding.unreduced_axes() == &unreduced_axes
-                && sharding.reduced_axes() == &reduced_axes
-                && sharding.unreduced_kind() == input.unreduced_kind()
-        };
-
-        if let Some(source) = source_sharding
-            && !has_input_reduction_state(source)
-        {
-            return Err(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` source sharding `{source}` does not match the reduction state of the input \
-                 type `{input}`",
-            )));
-        }
-
-        if target_sharding.is_some_and(|target| !has_input_reduction_state(target)) {
-            return Err(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding \
-                 collective) instead",
-            )));
-        }
-
-        // Reduction state over manual axes describes a value inside a manual region, which the type rule rejects
-        // for a device target before it validates reduction state, whatever the sizes of those axes.
-        if let (Some(PlacementRequest::Device { .. }), Some(input_sharding)) = (target, input.sharding()) {
-            let larger_axes = input_sharding
-                .unreduced_axes()
-                .iter()
-                .filter(|axis| input_sharding.mesh().axis_size(axis).is_some_and(|size| size > 1))
-                .map(|axis| format!("`{axis}`"))
-                .collect::<Vec<_>>();
-            if !larger_axes.is_empty() {
-                return Err(TypeError::invalid(format!(
-                    "`{}` cannot move a value with reduction state over mesh axes larger than one (i.e., {}) \
-                     onto a single device; use a reduction (or the corresponding collective) first",
-                    PLACE_OPERATION_NAME,
-                    larger_axes.join(", "),
-                )));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Display for PlaceOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl Hash for PlaceOperation {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // A source or a target that is a placement, or that is absent, hashes exactly like an `Option<Placement>`,
-        // so that the hashes (and with them the digests) of programs without the other forms do not depend on their
-        // representation. A device or an in-place form hashes as a whole after the discriminant of `Some`, and the
-        // derived hash of a request starts with the discriminant of its form, which tells the two forms apart.
-        let hash = |end: &Option<PlacementRequest>, state: &mut H| match end {
-            None => Option::<&Placement>::None.hash(state),
-            Some(PlacementRequest::Resolved(placement)) => Some(placement).hash(state),
-            Some(end @ (PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. })) => Some(end).hash(state),
-        };
-        hash(&self.source, state);
-        hash(&self.target, state);
-        self.may_alias.hash(state);
-    }
-}
-
-impl Operation for PlaceOperation {
-    type Type = ArrayType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        PLACE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        let output = Self::infer_output_type(&input_types[0], self.target.as_ref(), self.source.as_ref())?;
-        Self::validate_even_splits(&input_types[0], self.target.as_ref())?;
-        Ok(vec![output])
-    }
-
-    #[inline]
-    fn requires_fresh_storage(&self) -> bool {
-        !self.may_alias
-    }
-
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // An omitted source or target is not rendered, and neither is the default copy policy, so that the rendering
-        // of a placement stays compact. An identity placement therefore renders as its name alone.
-        let formatter = OperationFormatter::new(formatter, indentation, self.name())?;
-        if self.source.is_none() && self.target.is_none() && self.may_alias {
-            return Ok(());
-        }
-        formatter.bracketed(|operation| {
-            if let Some(source) = &self.source {
-                operation.field("source", source)?;
-            }
-            if let Some(target) = &self.target {
-                operation.field("target", target)?;
-            }
-            if !self.may_alias {
-                operation.field("may_alias", false)?;
-            }
-            Ok(())
-        })
-    }
-}
-
-impl PlaceOperation {
-    // TODO(eaplatanios): Move to right above `PlaceOperation::validate_reduction_state`.
     /// Validates a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, and returns the type of the placed value. This is the type rule of [`PlaceOperation`] (refer to
     /// [`Operation::infer_output_types`]) except for one check, which is that a [`Placement`] target splits each static
@@ -907,12 +746,11 @@ impl PlaceOperation {
             // that it does not complete). A value on a mesh of more devices is gathered onto the device, so it can no
             // longer be distributed over that mesh, and it is replicated over the canonical mesh of one device instead,
             // which is also where backends place it when the placement executes.
-            let sharding = if input_sharding.mesh().device_count() > 1 {
-                Sharding::replicated(LogicalMesh::single_device(), input.rank())
+            output = if input_sharding.mesh().device_count() > 1 {
+                output.with_sharding(Sharding::replicated(LogicalMesh::single_device(), input.rank()))?
             } else {
-                without_reduction_state(input_sharding.clone())?
+                input.without_reduction_axes()
             };
-            output = output.with_sharding(sharding).map_err(TypeError::from)?;
         }
 
         if let Some(target) = target {
@@ -953,7 +791,92 @@ impl PlaceOperation {
         Ok(output)
     }
 
-    // TODO(eaplatanios): Move to right under `PlaceOperation::validate_reduction_state`.
+    /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
+    /// on `source`, leaves the reduction state of the value unchanged. This is the part of the type rule of
+    /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type`], through which backends
+    /// also apply it to the placement of a concrete value outside a program), so that no path changes reduction state.
+    ///
+    /// Reduction state records pending (i.e., unreduced) or completed (i.e., reduced) cross-device reductions, and a
+    /// placement changes where a value lives but never that state. The sharding of a [`Placement`] target therefore
+    /// restates the unreduced axes, the reduced axes, and the unreduced kind of `input` exactly, and so does the
+    /// sharding of a [`Placement`] source, which describes the input. The state is restated by axis name, so the target
+    /// and source meshes must also define every axis that carries it identically (e.g., an explicit unreduced axis must
+    /// not become an auto axis, over which array types record no reduction state, so that the output would silently
+    /// lose its pending reduction, nor an axis of another size). A [`PlacementRequest::Device`] target leaves a value
+    /// that lives wholly on one device, which completes a reduced axis of any size and an unreduced axis of size one,
+    /// whereas an unreduced axis of a larger size describes contributions on more devices than one, which a placement
+    /// does not combine, so such an input must be reduced first. A [`PlacementRequest::InPlace`] target keeps the
+    /// sharding of `input` exactly, so it restates its reduction state by construction. An input without a tracked
+    /// sharding has no reduction state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] for a target or source mesh that does not define an axis that carries reduction state of
+    /// `input` identically, for a source or a placement target whose sharding does not restate the reduction state of
+    /// `input`, and for a device target of an input that is unreduced over a mesh axis larger than one.
+    fn validate_reduction_state(
+        input: &ArrayType,
+        target: Option<&PlacementRequest>,
+        source: Option<&PlacementRequest>,
+    ) -> Result<(), TypeError> {
+        let target_sharding = target.and_then(PlacementRequest::placement).map(Placement::sharding);
+        let source_sharding = source.and_then(PlacementRequest::placement).map(Placement::sharding);
+        if let Some(input_sharding) = input.sharding() {
+            let reduction_axes = || input_sharding.unreduced_axes().iter().chain(input_sharding.reduced_axes());
+            for mesh in source_sharding.into_iter().chain(target_sharding).map(Sharding::mesh) {
+                validate_preserved_mesh_axes(PLACE_OPERATION_NAME, input_sharding.mesh(), reduction_axes(), mesh)?;
+            }
+        }
+
+        let (unreduced_axes, reduced_axes) = match input.sharding() {
+            Some(sharding) => (sharding.unreduced_axes().clone(), sharding.reduced_axes().clone()),
+            None => Default::default(),
+        };
+
+        let has_input_reduction_state = |sharding: &Sharding| {
+            sharding.unreduced_axes() == &unreduced_axes
+                && sharding.reduced_axes() == &reduced_axes
+                && sharding.unreduced_kind() == input.unreduced_kind()
+        };
+
+        if let Some(source) = source_sharding
+            && !has_input_reduction_state(source)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{PLACE_OPERATION_NAME}` source sharding `{source}` does not match the reduction state of the input \
+                 type `{input}`",
+            )));
+        }
+
+        if target_sharding.is_some_and(|target| !has_input_reduction_state(target)) {
+            return Err(TypeError::invalid(format!(
+                "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding \
+                 collective) instead",
+            )));
+        }
+
+        // Reduction state over manual axes describes a value inside a manual region, which the type rule rejects
+        // for a device target before it validates reduction state, whatever the sizes of those axes.
+        if let (Some(PlacementRequest::Device { .. }), Some(input_sharding)) = (target, input.sharding()) {
+            let larger_axes = input_sharding
+                .unreduced_axes()
+                .iter()
+                .filter(|axis| input_sharding.mesh().axis_size(axis).is_some_and(|size| size > 1))
+                .map(|axis| format!("`{axis}`"))
+                .collect::<Vec<_>>();
+            if !larger_axes.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` cannot move a value with reduction state over mesh axes larger than one (i.e., {}) \
+                     onto a single device; use a reduction (or the corresponding collective) first",
+                    PLACE_OPERATION_NAME,
+                    larger_axes.join(", "),
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validates that a placement of a value of type `input` onto `target` splits each static extent of the value
     /// evenly, which is the one check of the type rule of [`PlaceOperation`] that [`Self::infer_output_type`] does not
     /// make. Every shard of a partitioned dimension of a value has the same extent, so for each dimension that the
@@ -982,24 +905,77 @@ impl PlaceOperation {
         }
         Ok(())
     }
+}
 
-    // TODO(eaplatanios): Inline this function.
-    /// Returns the source that a placement of a value of type `input` onto `target` records when the value concretely
-    /// lives on `placement`, if anywhere, given the `source` that the placement states (refer to
-    /// [`PlacementRequest::resolve_source`]). The placement is first validated as it is given (refer to
-    /// [`Self::infer_output_type`]), so that completing its source never makes the type rule accept a request that it
-    /// rejects (e.g., an in-place source that names nothing). A value without a concrete placement keeps its source,
-    /// which the type rule validates where the placement is bound, so it is not validated here.
-    fn resolve_source(
-        input: &ArrayType,
-        target: Option<&PlacementRequest>,
-        source: Option<PlacementRequest>,
-        placement: Option<Placement>,
-    ) -> Result<Option<PlacementRequest>, TypeError> {
-        if placement.is_some() {
-            Self::infer_output_type(input, target, source.as_ref())?;
+impl Display for PlaceOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Hash for PlaceOperation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // A source or a target that is a placement, or that is absent, hashes exactly like an `Option<Placement>`,
+        // so that the hashes (and with them the digests) of programs without the other forms do not depend on their
+        // representation. A device or an in-place form hashes as a whole after the discriminant of `Some`, and the
+        // derived hash of a request starts with the discriminant of its form, which tells the two forms apart.
+        let hash = |end: &Option<PlacementRequest>, state: &mut H| match end {
+            None => Option::<&Placement>::None.hash(state),
+            Some(PlacementRequest::Resolved(placement)) => Some(placement).hash(state),
+            Some(end @ (PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. })) => Some(end).hash(state),
+        };
+        hash(&self.source, state);
+        hash(&self.target, state);
+        self.may_alias.hash(state);
+    }
+}
+
+impl Operation for PlaceOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        PLACE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let output = Self::infer_output_type(&input_types[0], self.target.as_ref(), self.source.as_ref())?;
+        Self::validate_even_splits(&input_types[0], self.target.as_ref())?;
+        Ok(vec![output])
+    }
+
+    #[inline]
+    fn requires_fresh_storage(&self) -> bool {
+        !self.may_alias
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // An omitted source or target is not rendered, and neither is the default copy policy, so that the rendering
+        // of a placement stays compact. An identity placement therefore renders as its name alone.
+        let formatter = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.source.is_none() && self.target.is_none() && self.may_alias {
+            return Ok(());
         }
-        Ok(PlacementRequest::resolve_source(source, placement))
+        formatter.bracketed(|operation| {
+            if let Some(source) = &self.source {
+                operation.field("source", source)?;
+            }
+            if let Some(target) = &self.target {
+                operation.field("target", target)?;
+            }
+            if !self.may_alias {
+                operation.field("may_alias", false)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1019,8 +995,14 @@ where
         // them, while concrete values move to the target or stay where they are without one.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
-        let source =
-            Self::resolve_source(&input.r#type(), self.target.as_ref(), self.source.clone(), input.placement())?;
+
+        let placement = input.placement();
+        if placement.is_some() {
+            // Validate the stated source before completing it with the concrete placement.
+            Self::infer_output_type(&input.r#type(), self.target(), self.source())?;
+        }
+
+        let source = PlacementRequest::resolve_source(self.source.clone(), placement);
         Ok(vec![<C::Value as Value>::Dispatch::place(input, self.target.as_ref(), source, self.may_alias)?])
     }
 }
@@ -1145,7 +1127,11 @@ where
         // Placement changes preserve the packed shape and mapped batch axis, and the copy policy applies to the packed
         // value unchanged.
         let packed = input.value();
-        let source = Self::resolve_source(&packed.r#type(), target.as_ref(), source, packed.placement())?;
+        let placement = packed.placement();
+        if placement.is_some() {
+            Self::infer_output_type(&packed.r#type(), target.as_ref(), source.as_ref())?;
+        }
+        let source = PlacementRequest::resolve_source(source, placement);
         let output = <C::Value as Value>::Dispatch::place(packed, target.as_ref(), source, self.may_alias)?;
         Ok(vec![ArrayBatch::new(output, input.batch_axis())?])
     }
@@ -1172,12 +1158,11 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let may_alias = operation.may_alias();
             let input = inputs[0].primal();
-            let source = PlaceOperation::resolve_source(
-                &input.r#type(),
-                operation.target(),
-                operation.source().cloned(),
-                input.placement(),
-            )?;
+            let placement = input.placement();
+            if placement.is_some() {
+                PlaceOperation::infer_output_type(&input.r#type(), operation.target(), operation.source())?;
+            }
+            let source = PlacementRequest::resolve_source(operation.source().cloned(), placement);
             let primal = <C::Value as Value>::Dispatch::place(input, operation.target(), source.clone(), may_alias)?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
@@ -1188,12 +1173,11 @@ impl_differentiable_operation! {
                     let target = operation.target().cloned().map(PlacementRequest::without_layout);
                     let target = target.filter(|target| !names_nothing(target));
                     let source = source.map(PlacementRequest::without_layout).filter(|source| !names_nothing(source));
-                    let source = PlaceOperation::resolve_source(
-                        &tangent.r#type(),
-                        target.as_ref(),
-                        source,
-                        tangent.placement(),
-                    )?;
+                    let placement = tangent.placement();
+                    if placement.is_some() {
+                        PlaceOperation::infer_output_type(&tangent.r#type(), target.as_ref(), source.as_ref())?;
+                    }
+                    let source = PlacementRequest::resolve_source(source, placement);
                     MaybeZero::Value(<C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?)
                 }
             };
@@ -1333,27 +1317,35 @@ impl_differentiable_operation! {
                     let memory = Some(input_type.memory());
                     let transposed_target = match source {
                         PlacementRequest::Resolved(placement) => {
-                            let sharding = placement.sharding().cotangent().map_err(TypeError::from)?;
-                            let sharding =
-                                if has_device_target { without_reduction_state(sharding)? } else { sharding };
+                            let mut sharding = placement.sharding().cotangent().map_err(TypeError::from)?;
+                            if has_device_target {
+                                sharding = sharding
+                                    .with_unreduced_axes(Vec::<String>::new())
+                                    .and_then(|sharding| sharding.with_reduced_axes(Vec::<String>::new()))
+                                    .map_err(TypeError::from)?;
+                            }
                             let placement = placement.clone().with_sharding(sharding).map_err(TypeError::from)?;
                             PlacementRequest::Resolved(placement.without_layout().with_memory(input_type.memory()))
                         }
-                        PlacementRequest::Device { device, .. } => match input_cotangent_type.sharding() {
+                        PlacementRequest::Device { device, .. } => {
+                            let target_type = if has_device_target {
+                                input_cotangent_type.without_reduction_axes()
+                            } else {
+                                input_cotangent_type.clone()
+                            };
+
                             // The type rule accepts a device source only for an input that its type tracks over a mesh
                             // of one device, so the device and the logical mesh of the input together name where the
                             // input lived, and the cotangent returns there whatever mesh the output cotangent lives on.
-                            Some(sharding) => {
+                            if let Some(sharding) = target_type.sharding() {
                                 let mesh =
                                     DeviceMesh::new(sharding.mesh().clone(), vec![*device]).map_err(TypeError::from)?;
-                                let sharding = sharding.clone();
-                                let sharding =
-                                    if has_device_target { without_reduction_state(sharding)? } else { sharding };
-                                let placement = Placement::new(mesh, sharding).map_err(TypeError::from)?;
+                                let placement = Placement::new(mesh, sharding.clone()).map_err(TypeError::from)?;
                                 PlacementRequest::Resolved(placement.with_memory(input_type.memory()))
+                            } else {
+                                PlacementRequest::Device { device: *device, memory, layout: None }
                             }
-                            None => PlacementRequest::Device { device: *device, memory, layout: None },
-                        },
+                        }
                         PlacementRequest::InPlace { .. } if is_gathered => return Err(gathered_error().into()),
                         PlacementRequest::InPlace { .. } if crosses_meshes => return Err(cross_mesh_error().into()),
                         PlacementRequest::InPlace { .. } => PlacementRequest::InPlace { memory, layout: None },
@@ -1806,7 +1798,7 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
             .map(|(input, target)| {
                 // The source is placed as it is given, and the rule that executes the placement on a value that
                 // concretely lives somewhere completes it with that placement after it validates it (refer to
-                // `PlaceOperation::resolve_source`), so that this capability never accepts a request that the type
+                // `PlacementRequest::resolve_source`), so that this capability never accepts a request that the type
                 // rule rejects.
                 let source = sources.next().and_then(|source| source.clone().into_optional_placement_request());
                 let target = target.clone().into_optional_placement_request();
@@ -1880,16 +1872,6 @@ fn is_manual_region_sharding(sharding: &Sharding) -> bool {
             .iter()
             .chain(sharding.reduced_axes())
             .any(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
-}
-
-// TODO(eaplatanios): Inline this helper.
-/// Returns `sharding` without reduction state (i.e., without unreduced and reduced axes, and with the unreduced kind
-/// of a sharding without unreduced axes), which is how a value that lives wholly on one device is sharded.
-fn without_reduction_state(sharding: Sharding) -> Result<Sharding, TypeError> {
-    Ok(sharding
-        .with_unreduced_axes(Vec::<String>::new())
-        .and_then(|sharding| sharding.with_unreduced_kind(UnreducedKind::Sum))
-        .and_then(|sharding| sharding.with_reduced_axes(Vec::<String>::new()))?)
 }
 
 /// Returns the placement of the batch items of a packed value that lives on `placement` and whose batch dimension is

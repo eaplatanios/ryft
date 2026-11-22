@@ -841,25 +841,26 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
-        ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform, Concatenate, ReductionKind, UnreducedKind,
+        ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
         BatchingContext, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
-        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, Cos,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension, DimensionBounds,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate, ConditionOperation, Context,
+        Cos, CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension, DimensionBounds,
         DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionOperations, DimensionType,
         DimensionValue, DimensionVariable, DivOperation, DomainTracingContext, DotsSavable,
         DotsWithNoBatchDimensionsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver,
         ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, LiftedCustomRules, Log, MaybeZero, Memory,
         MulOperation, NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation,
         OperationPayloadProjection, OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder,
-        ProgramError, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
-        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
+        ProgramError, ReductionKind, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
         ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
         ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
         Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
-        TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
+        TypedProgram, UnreducedKind, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation,
+        rematerialize,
     };
 
     use crate::lowering::tests::{
@@ -1982,8 +1983,17 @@ mod tests {
     impl UnreducedOperands {
         /// Returns these inputs, unreduced with `kind`.
         fn inputs(self, kind: UnreducedKind) -> Vec<UnreducedInput> {
-            let vector = || UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[1f32, 5.0, -0.0, 0.5], &[3f32, -1.0, 4.0, 0.0]]);
-            let other = || UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[2f32, -3.0, 0.0, 7.0], &[0.5f32, 6.0, -2.0, 1.0]]);
+            let vector = || {
+                UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[1f32, 5.0, -0.0, 0.5], &[3f32, -1.0, 4.0, 0.0]])
+            };
+            let other = || {
+                UnreducedInput::new(
+                    DataType::F32,
+                    &[4],
+                    Some(kind),
+                    [&[2f32, -3.0, 0.0, 7.0], &[0.5f32, 6.0, -2.0, 1.0]],
+                )
+            };
             let replicated = [2f32, 4.0, -1.0, 0.5];
             match self {
                 Self::Vector => vec![vector()],
@@ -1991,14 +2001,24 @@ mod tests {
                 Self::ThreeVectors => vec![
                     vector(),
                     other(),
-                    UnreducedInput::new(DataType::F32, &[4], Some(kind), [&[4f32, 0.0, 2.0, -1.0], &[1f32, 2.0, 3.0, 4.0]]),
+                    UnreducedInput::new(
+                        DataType::F32,
+                        &[4],
+                        Some(kind),
+                        [&[4f32, 0.0, 2.0, -1.0], &[1f32, 2.0, 3.0, 4.0]],
+                    ),
                 ],
                 Self::VectorAndScalar => {
                     vec![vector(), UnreducedInput::new(DataType::F32, &[], Some(kind), [&[1.5f32], &[-2f32]])]
                 }
                 Self::VectorAndF64Vector => vec![
                     vector(),
-                    UnreducedInput::new(DataType::F64, &[4], Some(kind), [&[2f64, -3.0, 0.0, 7.0], &[0.5f64, 6.0, -2.0, 1.0]]),
+                    UnreducedInput::new(
+                        DataType::F64,
+                        &[4],
+                        Some(kind),
+                        [&[2f64, -3.0, 0.0, 7.0], &[0.5f64, 6.0, -2.0, 1.0]],
+                    ),
                 ],
                 Self::VectorAndReduced => {
                     vec![vector(), UnreducedInput::new(DataType::F32, &[4], None, [&replicated, &replicated]).reduced()]
@@ -2073,7 +2093,105 @@ mod tests {
             assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{operation:?} of {operands:?} with {kind}");
             modules.push(lowering.module);
         }
-        assert_eq!(modules.join("\n"), "");
+        assert_eq!(
+            modules,
+            [
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>}, %arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=max{"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>}) {
+                        %0 = stablehlo.broadcast_in_dim %arg1, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %2 = stablehlo.compare GT, %arg0, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %4 = stablehlo.select %3, %arg0, %1 : tensor<4xi1>, tensor<4xf32>
+                        %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %6 = stablehlo.negate %arg0 : tensor<4xf32>
+                        %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %8 = stablehlo.compare EQ, %arg0, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %10 = stablehlo.compare EQ, %arg0, %7, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %12 = stablehlo.and %9, %11 : tensor<4xi1>
+                        %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %14 = stablehlo.add %arg0, %1 : tensor<4xf32>
+                        %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %16 = stablehlo.select %13, %15, %5 : tensor<4xi1>, tensor<4xf32>
+                        %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %18 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %19 = sdy.sharding_constraint %18 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %20 = stablehlo.compare NE, %1, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %21 = sdy.sharding_constraint %20 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %22 = stablehlo.select %21, %1, %17 : tensor<4xi1>, tensor<4xf32>
+                        %23 = sdy.sharding_constraint %22 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        %24 = stablehlo.select %19, %arg0, %23 : tensor<4xi1>, tensor<4xf32>
+                        %25 = sdy.sharding_constraint %24 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xf32>
+                        return %25 : tensor<4xf32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>}, %arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=min{"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>}) {
+                        %0 = stablehlo.broadcast_in_dim %arg1, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %2 = stablehlo.compare LT, %arg0, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %4 = stablehlo.select %3, %arg0, %1 : tensor<4xi1>, tensor<4xf32>
+                        %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %6 = stablehlo.negate %arg0 : tensor<4xf32>
+                        %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %8 = stablehlo.compare EQ, %arg0, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %10 = stablehlo.compare EQ, %arg0, %7, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %12 = stablehlo.and %9, %11 : tensor<4xi1>
+                        %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %14 = stablehlo.subtract %7, %1 : tensor<4xf32>
+                        %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %16 = stablehlo.negate %15 : tensor<4xf32>
+                        %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %18 = stablehlo.select %13, %17, %5 : tensor<4xi1>, tensor<4xf32>
+                        %19 = sdy.sharding_constraint %18 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %20 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %21 = sdy.sharding_constraint %20 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %22 = stablehlo.compare NE, %1, %1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %23 = sdy.sharding_constraint %22 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %24 = stablehlo.select %23, %1, %19 : tensor<4xi1>, tensor<4xf32>
+                        %25 = sdy.sharding_constraint %24 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        %26 = stablehlo.select %21, %arg0, %25 : tensor<4xi1>, tensor<4xf32>
+                        %27 = sdy.sharding_constraint %26 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xf32>
+                        return %27 : tensor<4xf32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}, %arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) {
+                        %0 = stablehlo.broadcast_in_dim %arg1, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={"x"}> : tensor<4xf32>
+                        %2 = stablehlo.add %arg0, %1 : tensor<4xf32>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced={"x"}> : tensor<4xf32>
+                        return %3 : tensor<4xf32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}, %arg1: tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) -> (tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) {
+                        %0 = stablehlo.convert %arg0 : (tensor<4xf32>) -> tensor<4xf64>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={"x"}> : tensor<4xf64>
+                        %2 = stablehlo.add %1, %arg1 : tensor<4xf64>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced={"x"}> : tensor<4xf64>
+                        return %3 : tensor<4xf64>
+                      }
+                    }
+                "#},
+            ],
+        );
     }
 
     #[test]
@@ -2127,9 +2245,121 @@ mod tests {
                     Ok(lowering) => format!("{}\n  expected {}", lowering.outcomes, lowering.expected_outcomes),
                     Err(error) => error.lines().next().unwrap_or_default().to_string(),
                 };
-                outcomes.push(format!("{:?} of {:?} with {kind}: {outcome}", row.0, row.1));
+                outcomes.push(format!("{:?} of {:?} with {kind}: {outcome}\n", row.0, row.1));
             }
         }
-        assert_eq!(outcomes.join("\n"), "");
+        assert_eq!(
+            outcomes.concat(),
+            indoc! {"
+                Neg of Vector with sum: lowered
+                Neg of Vector with max: `neg` supports only unreduced inputs of kind `sum` but got kind `max`
+                Neg of Vector with min: `neg` supports only unreduced inputs of kind `sum` but got kind `min`
+                Add of Vectors with sum: lowered
+                Add of Vectors with max: `add` supports only unreduced inputs of kind `sum` but got kind `max`
+                Add of Vectors with min: `add` supports only unreduced inputs of kind `sum` but got kind `min`
+                Add of VectorAndScalar with sum: lowered
+                Add of VectorAndScalar with max: `add` supports only unreduced inputs of kind `sum` but got kind `max`
+                Add of VectorAndScalar with min: `add` supports only unreduced inputs of kind `sum` but got kind `min`
+                Add of VectorAndF64Vector with sum: lowered
+                Add of VectorAndF64Vector with max: `add` supports only unreduced inputs of kind `sum` but got kind `max`
+                Add of VectorAndF64Vector with min: `add` supports only unreduced inputs of kind `sum` but got kind `min`
+                Add of VectorAndReplicated with sum: `add` inputs must be unreduced over the same axes
+                Add of VectorAndReplicated with max: `add` inputs must be unreduced over the same axes
+                Add of VectorAndReplicated with min: `add` inputs must be unreduced over the same axes
+                Sub of Vectors with sum: lowered
+                Sub of Vectors with max: `sub` supports only unreduced inputs of kind `sum` but got kind `max`
+                Sub of Vectors with min: `sub` supports only unreduced inputs of kind `sum` but got kind `min`
+                Mul of VectorAndReduced with sum: lowered
+                Mul of VectorAndReduced with max: `mul` supports only unreduced inputs of kind `sum` but got kind `max`
+                Mul of VectorAndReduced with min: `mul` supports only unreduced inputs of kind `sum` but got kind `min`
+                Mul of Vectors with sum: `mul` cannot multiply inputs that are unreduced over the same mesh axis
+                Mul of Vectors with max: `mul` supports only unreduced inputs of kind `sum` but got kind `max`
+                Mul of Vectors with min: `mul` supports only unreduced inputs of kind `sum` but got kind `min`
+                Div of VectorAndReduced with sum: lowered
+                Div of VectorAndReduced with max: `div` supports only unreduced inputs of kind `sum` but got kind `max`
+                Div of VectorAndReduced with min: `div` supports only unreduced inputs of kind `sum` but got kind `min`
+                Max of Vectors with sum: `max` supports only unreduced inputs of kind `max` but got kind `sum`
+                Max of Vectors with max: lowered
+                Max of Vectors with min: `max` supports only unreduced inputs of kind `max` but got kind `min`
+                Max of VectorAndScalar with sum: `max` supports only unreduced inputs of kind `max` but got kind `sum`
+                Max of VectorAndScalar with max: lowered
+                Max of VectorAndScalar with min: `max` supports only unreduced inputs of kind `max` but got kind `min`
+                Max of VectorAndF64Vector with sum: `max` supports only unreduced inputs of kind `max` but got kind `sum`
+                Max of VectorAndF64Vector with max: lowered
+                Max of VectorAndF64Vector with min: `max` supports only unreduced inputs of kind `max` but got kind `min`
+                Min of Vectors with sum: `min` supports only unreduced inputs of kind `min` but got kind `sum`
+                Min of Vectors with max: `min` supports only unreduced inputs of kind `min` but got kind `max`
+                Min of Vectors with min: lowered
+                Min of VectorAndScalar with sum: `min` supports only unreduced inputs of kind `min` but got kind `sum`
+                Min of VectorAndScalar with max: `min` supports only unreduced inputs of kind `min` but got kind `max`
+                Min of VectorAndScalar with min: lowered
+                Min of VectorAndF64Vector with sum: `min` supports only unreduced inputs of kind `min` but got kind `sum`
+                Min of VectorAndF64Vector with max: `min` supports only unreduced inputs of kind `min` but got kind `max`
+                Min of VectorAndF64Vector with min: lowered
+                Clamp of ThreeVectors with sum: `clamp` does not support unreduced inputs
+                Clamp of ThreeVectors with max: `clamp` does not support unreduced inputs
+                Clamp of ThreeVectors with min: `clamp` does not support unreduced inputs
+                Abs of Vector with sum: `abs` does not support unreduced inputs
+                Abs of Vector with max: `abs` does not support unreduced inputs
+                Abs of Vector with min: `abs` does not support unreduced inputs
+                Exp of Vector with sum: `exp` does not support unreduced inputs
+                Exp of Vector with max: `exp` does not support unreduced inputs
+                Exp of Vector with min: `exp` does not support unreduced inputs
+                ConvertToF64 of Vector with sum: lowered
+                ConvertToF64 of Vector with max: lowered
+                ConvertToF64 of Vector with min: lowered
+                Reduce(Sum) of Vector with sum: lowered
+                Reduce(Sum) of Vector with max: `reduce` with kind `sum` supports only unreduced inputs of kind `sum` but got kind `max`
+                Reduce(Sum) of Vector with min: `reduce` with kind `sum` supports only unreduced inputs of kind `sum` but got kind `min`
+                Reduce(Mean) of Vector with sum: lowered
+                Reduce(Mean) of Vector with max: `reduce` with kind `mean` supports only unreduced inputs of kind `sum` but got kind `max`
+                Reduce(Mean) of Vector with min: `reduce` with kind `mean` supports only unreduced inputs of kind `sum` but got kind `min`
+                Reduce(Max) of Vector with sum: `reduce` with kind `max` supports only unreduced inputs of kind `max` but got kind `sum`
+                Reduce(Max) of Vector with max: lowered
+                Reduce(Max) of Vector with min: `reduce` with kind `max` supports only unreduced inputs of kind `max` but got kind `min`
+                Reduce(Min) of Vector with sum: `reduce` with kind `min` supports only unreduced inputs of kind `min` but got kind `sum`
+                Reduce(Min) of Vector with max: `reduce` with kind `min` supports only unreduced inputs of kind `min` but got kind `max`
+                Reduce(Min) of Vector with min: lowered
+                Reduce(Product) of Vector with sum: `reduce` with kind `product` cannot reduce inputs with unreduced axes
+                Reduce(Product) of Vector with max: `reduce` with kind `product` cannot reduce inputs with unreduced axes
+                Reduce(Product) of Vector with min: `reduce` with kind `product` cannot reduce inputs with unreduced axes
+                ArgMax of Vector with sum: `argmax` cannot reduce inputs with unreduced axes
+                ArgMax of Vector with max: `argmax` cannot reduce inputs with unreduced axes
+                ArgMax of Vector with min: `argmax` cannot reduce inputs with unreduced axes
+                Reshape of Vector with sum: lowered
+                Reshape of Vector with max: lowered
+                Reshape of Vector with min: lowered
+                Transpose of Vector with sum: lowered
+                Transpose of Vector with max: lowered
+                Transpose of Vector with min: lowered
+                Slice of Vector with sum: lowered
+                Slice of Vector with max: lowered
+                Slice of Vector with min: lowered
+                Reverse of Vector with sum: lowered
+                Reverse of Vector with max: lowered
+                Reverse of Vector with min: lowered
+                Concatenate of VectorAndReplicated with sum: lowered
+                Concatenate of VectorAndReplicated with max: lowered
+                Concatenate of VectorAndReplicated with min: lowered
+                Select of ConditionAndVectors with sum: lowered
+                Select of ConditionAndVectors with max: lowered
+                Select of ConditionAndVectors with min: lowered
+                Pad of VectorAndScalar with sum: lowered
+                Pad of VectorAndScalar with max: `pad` supports only unreduced inputs of kind `sum` but got kind `max`
+                Pad of VectorAndScalar with min: `pad` supports only unreduced inputs of kind `sum` but got kind `min`
+                CumulativeSum of Vector with sum: lowered
+                CumulativeSum of Vector with max: `cumulative` supports only unreduced inputs of kind `sum` but got kind `max`
+                CumulativeSum of Vector with min: `cumulative` supports only unreduced inputs of kind `sum` but got kind `min`
+                CumulativeMax of Vector with sum: `cumulative` with kind `max` cannot scan inputs with unreduced axes
+                CumulativeMax of Vector with max: `cumulative` with kind `max` cannot scan inputs with unreduced axes
+                CumulativeMax of Vector with min: `cumulative` with kind `max` cannot scan inputs with unreduced axes
+                Compare of Vectors with sum: `compare` does not support unreduced inputs
+                Compare of Vectors with max: `compare` does not support unreduced inputs
+                Compare of Vectors with min: `compare` does not support unreduced inputs
+                Not of BooleanVector with sum: lowered
+                Not of BooleanVector with max: lowered
+                Not of BooleanVector with min: lowered
+            "},
+        );
     }
 }

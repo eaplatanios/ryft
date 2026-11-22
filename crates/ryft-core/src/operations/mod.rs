@@ -2,8 +2,8 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
 use crate::arrays::{
-    ArrayType, Broadcastable, bf16, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz,
-    f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, u1, u2, u4,
+    bf16, f16, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz,
+    f8e8m0fnu, i1, i2, i4, u1, u2, u4, ArrayType, Broadcastable,
 };
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized, Parameterwise};
@@ -42,172 +42,169 @@ pub mod tagging;
 pub mod trigonometric;
 
 pub use arithmetic::{
-    ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, ArithmeticOperations,
-    DIV_OPERATION_NAME, Div, DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg,
-    NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME, RSQRT_OPERATION_NAME, Rem, RemOperation,
-    Rsqrt, RsqrtOperation, SATURATING_SUB_OPERATION_NAME, SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME,
-    SaturatingSub, SaturatingSubOperation, Sign, SignOperation, Sqrt, SqrtOperation, Sub, SubOperation,
+    Abs, AbsOperation, Add, AddOperation, ArithmeticOperations, Div, DivOperation, Mul, MulOperation, Neg,
+    NegOperation, Pow, PowOperation, Rem, RemOperation, Rsqrt, RsqrtOperation, SaturatingSub, SaturatingSubOperation,
+    Sign, SignOperation, Sqrt, SqrtOperation, Sub, SubOperation, ABS_OPERATION_NAME, ADD_OPERATION_NAME,
+    DIV_OPERATION_NAME, MUL_OPERATION_NAME, NEG_OPERATION_NAME, POW_OPERATION_NAME, REM_OPERATION_NAME,
+    RSQRT_OPERATION_NAME, SATURATING_SUB_OPERATION_NAME, SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME,
 };
 pub use assertions::{
-    ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
-    AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
+    ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
+    GuardOperation, ASSERT_OPERATION_NAME, GUARD_OPERATION_NAME,
 };
 pub use attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, AttentionOperations,
-    AttentionResiduals, AttentionRules, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    differentiable_dot_product_attention, dot_product_attention, AttentionConfiguration, AttentionImplementation,
+    AttentionInputs, AttentionKey, AttentionOperations, AttentionResiduals, AttentionRules,
+    DifferentiableDotProductAttention, DotProductAttention, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
     DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
-    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DifferentiableDotProductAttention, DotProductAttention,
-    differentiable_dot_product_attention, dot_product_attention,
+    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
 };
 pub use collectives::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,
-    CollectiveOperations, CollectiveOptions, HiddenAxes, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,
-    PARALLEL_ALL_TO_ALL_OPERATION_NAME, PARALLEL_BROADCAST_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME,
-    PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME,
-    PARALLEL_SUM_SCATTER_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation,
+    AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation, CollectiveOperations,
+    CollectiveOptions, HiddenAxes, ManualVariationAlignment, ParallelAllGather, ParallelAllGatherOperation,
     ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelArgExtrema,
     ParallelBroadcast, ParallelBroadcastOperation, ParallelBroadcastSource, ParallelCast, ParallelCastOperation,
     ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
     ParallelRaggedAllToAllOperation, ParallelReduce, ParallelReduceOperation, ParallelSumScatter,
     ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation, ShapeChangingCollectiveValue,
+    AXIS_INDEX_OPERATION_NAME, PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME,
+    PARALLEL_BROADCAST_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME, PARALLEL_PERMUTE_OPERATION_NAME,
+    PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_SUM_SCATTER_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME,
 };
-pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
+pub use comparisons::{Compare, CompareOperation, ComparisonDirection, ComparisonType, COMPARE_OPERATION_NAME};
 pub use complex::{
-    COMPLEX_OPERATION_NAME, CONJUGATE_OPERATION_NAME, Complex, ComplexOperation, ComplexOperations, Conjugate,
-    ConjugateOperation, IMAGINARY_OPERATION_NAME, Imaginary, ImaginaryOperation, REAL_OPERATION_NAME, Real,
-    RealOperation,
+    Complex, ComplexOperation, ComplexOperations, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real,
+    RealOperation, COMPLEX_OPERATION_NAME, CONJUGATE_OPERATION_NAME, IMAGINARY_OPERATION_NAME, REAL_OPERATION_NAME,
 };
 pub use composites::{
-    AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching,
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeAttribute, CompositeBatching,
-    CompositeBody, CompositeCallContext, CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeKey,
-    CompositeOperation, CompositeTransposeOperation, CompositeVjp, CustomRuleDefinition, CustomRuleReference,
-    CustomRuleRegistration, CustomRuleSource, CustomRuleTracer, CustomVjpOperation, DefaultBatching, DefaultJvp,
-    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, LiftedCustomRules, NamedComposite,
-    SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,
-    WeakCustomRuleReference, composite,
+    composite, AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching, Composite,
+    CompositeAttribute, CompositeBatching, CompositeBody, CompositeCallContext, CompositeConversion, CompositeJvp,
+    CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
+    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
+    CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal,
+    LiftedCustomRules, NamedComposite, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules,
+    VjpComposite, WeakCustomRuleReference, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME,
 };
 pub use constants::{
-    CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
-    DynamicIota, DynamicOne, DynamicZero, FILL_LIKE_OPERATION_NAME, Fill, FillLike, FillLikeOperation,
-    IOTA_LIKE_OPERATION_NAME, IOTA_OPERATION_NAME, Iota, IotaLike, IotaLikeOperation, IotaOperation,
-    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill, DynamicIota, DynamicOne,
+    DynamicZero, Fill, FillLike, FillLikeOperation, Iota, IotaLike, IotaLikeOperation, IotaOperation, One, OneLike,
+    OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, CONSTANT_OPERATION_NAME,
+    FILL_LIKE_OPERATION_NAME, IOTA_LIKE_OPERATION_NAME, IOTA_OPERATION_NAME, ONE_LIKE_OPERATION_NAME,
+    ONE_OPERATION_NAME, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME,
 };
-pub use control_flow::scan::scan;
 pub use control_flow::r#while::r#while;
+pub use control_flow::scan::scan;
 pub use control_flow::{
-    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ResidualStorageOperation,
-    SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation,
-    ScanOptions, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions,
-    WhilePredicate, WhileType,
+    Condition, ConditionOperation, ConditionType, ResidualStorageOperation, Scan, ScanInterpretationDomain,
+    ScanIterationCount, ScanOperation, ScanOptions, ScanType, Select, SelectOperation, While, WhileOperation,
+    WhileOptions, WhilePredicate, WhileType, CONDITION_OPERATION_NAME, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
+    WHILE_OPERATION_NAME,
 };
-pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
+pub use cumulative::{associative_scan, Cumulative, CumulativeKind, CumulativeOperation, CUMULATIVE_OPERATION_NAME};
 pub use custom_call::{
-    CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
-    CustomCallInputOutputAlias, CustomCallOperation, CustomCallUnrolling,
+    CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching, CustomCallInputOutputAlias,
+    CustomCallOperation, CustomCallUnrolling, CUSTOM_CALL_OPERATION_NAME,
 };
-pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
+pub use debugging::{Print, PrintOperation, PRINT_OPERATION_NAME};
 pub use differentiation::{
-    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, REMATERIALIZE_OPERATION_NAME,
-    RematerializationOptimizationBarrier, RematerializeOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient,
-    StopGradientOperation, StopGradients,
+    LinearCallOperation, RematerializationOptimizationBarrier, RematerializeOperation, StopGradient,
+    StopGradientOperation, StopGradients, LINEAR_CALL_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME,
+    STOP_GRADIENT_OPERATION_NAME,
 };
 pub use dimensions::{
-    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
+    ArithmeticDimensionOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation,
+    DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
     DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME,
     DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalar, DimensionToScalarOperation,
 };
 pub use dot::{
-    DOT_OPERATION_NAME, Dot, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation,
-    DotOperations, DotPrecision, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode,
-    RaggedDotOperation,
+    Dot, DotAlgorithm, DotAlgorithmPreset, DotDimensionNumbers, DotInputPrecision, DotOperation, DotOperations,
+    DotPrecision, RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, DOT_OPERATION_NAME,
+    RAGGED_DOT_OPERATION_NAME,
 };
 pub use einsum::{
-    EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION, Einsum, EinsumComposite, EinsumLabel, EinsumOptions,
-    EinsumPathStep, EinsumPathStrategy, EinsumPlan, EinsumSpecification, einsum, einsum_with_options,
+    einsum, einsum_with_options, Einsum, EinsumComposite, EinsumLabel, EinsumOptions, EinsumPathStep,
+    EinsumPathStrategy, EinsumPlan, EinsumSpecification, EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION,
 };
 pub use exponential::{
-    EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations,
-    LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation,
-    Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic, LogisticOperation,
+    Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations, Ln1p, Ln1pOperation, Log, LogAddExp,
+    LogAddExpOperation, LogOperation, Logistic, LogisticOperation, EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME,
+    LN_1P_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
 };
 pub use extrema::{
-    CLAMP_OPERATION_NAME, Clamp, ClampOperation, ExtremaOperations, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max,
-    MaxOperation, Min, MinOperation,
+    Clamp, ClampOperation, ExtremaOperations, Max, MaxOperation, Min, MinOperation, CLAMP_OPERATION_NAME,
+    MAX_OPERATION_NAME, MIN_OPERATION_NAME,
 };
 pub use logical::{
-    AND_OPERATION_NAME, And, AndOperation, LogicalOperations, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME,
-    Or, OrOperation, XOR_OPERATION_NAME, Xor, XorOperation,
+    And, AndOperation, LogicalOperations, Not, NotOperation, Or, OrOperation, Xor, XorOperation, AND_OPERATION_NAME,
+    NOT_OPERATION_NAME, OR_OPERATION_NAME, XOR_OPERATION_NAME,
 };
 pub use manipulation::{
-    BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastLike,
-    BroadcastLikeOperation, BroadcastOperation, CAST_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
-    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate, ConcatenateOperation,
-    ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
-    Diagonal, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicGather,
-    DynamicManipulationOperations, DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice,
-    DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
-    GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing,
-    ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
-    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
-    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    BasicIndex, Broadcast, BroadcastLike, BroadcastLikeOperation, BroadcastOperation, Cast, CastOperation, CastType,
+    Concatenate, ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, Diagonal, DynamicBroadcast,
+    DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations, DynamicPad,
+    DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation,
+    DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, Gather,
+    GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
+    IndexSlice, Indexed, Indexing, ManipulationOperations, Pad, PadOperation, Permutation, ReducePrecision,
+    ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation, Scatter, ScatterDimensionNumbers,
+    ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice, SliceOperation, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, CAST_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+    GATHER_OPERATION_NAME, PAD_OPERATION_NAME, REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME,
+    REVERSE_OPERATION_NAME, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, UPDATE_SLICE_OPERATION_NAME,
 };
 pub use quantization::{
-    BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaleRule, BlockScaledDot,
-    BlockScaledDotConfiguration, BlockScaledDotResidualPolicy, BlockScaledDotResiduals, BlockScaledGlobalScaling,
-    SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
+    block_scaled_dot, BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaleRule,
+    BlockScaledDot, BlockScaledDotConfiguration, BlockScaledDotResidualPolicy, BlockScaledDotResiduals,
+    BlockScaledGlobalScaling, ScaledDot, ScaledDotOperation, SCALED_DOT_OPERATION_NAME,
 };
 pub use random::{
-    CategoricalSamplingMode, DROPOUT_OPERATION_NAME, Dropout, DropoutOperation, DynamicRngBitGenerator,
-    RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation,
+    CategoricalSamplingMode, Dropout, DropoutOperation, DynamicRngBitGenerator, Random, RandomAlgorithm,
+    RngBitGenerator, RngBitGeneratorOperation, DROPOUT_OPERATION_NAME, RNG_BIT_GENERATOR_OPERATION_NAME,
 };
 pub use reductions::{
-    ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
-    REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind, ReductionOperations,
+    ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, Reduce, ReduceOperation, ReductionKind, ReductionOperations,
+    ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, REDUCE_OPERATION_NAME,
 };
 pub use references::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
-    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
-    REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceOperations, ReferenceRead, ReferenceReadOperation, ReferenceReadTransposition, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceOperations, ReferenceRead,
+    ReferenceReadOperation, ReferenceReadTransposition, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME,
+    REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
+    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME,
 };
 pub use rounding::{
-    CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,
-    RoundOperation, RoundingOperations,
+    Ceil, CeilOperation, Floor, FloorOperation, Round, RoundOperation, RoundingOperations, CEIL_OPERATION_NAME,
+    FLOOR_OPERATION_NAME, ROUND_OPERATION_NAME,
 };
 pub use sharding::{
-    AxisTypesError, CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch,
-    ConstrainShardingOperation, IntoPlacementRequest, LockstepDeviceGrid, LockstepDomain, LockstepOperation,
-    LockstepValue, PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, PlacementRequest,
-    PlacementRequestParameter, PlacementSources, RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation,
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
-    ShardMapValueKind, ShardingOperations, auto_axes, explicit_axes, shard_map, shard_map_along,
-    shard_map_with_inferred_input_shardings,
+    auto_axes, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, AxisTypesError,
+    ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, LockstepDeviceGrid, LockstepDomain,
+    LockstepOperation, LockstepValue, Place, PlaceDispatch, PlaceOperation, Placed, PlacementRequest,
+    PlacementRequestParameter, PlacementSources, Reshard, ReshardDispatch, ReshardOperation, ShardMap,
+    ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapValueKind, ShardingOperations,
+    CONSTRAIN_SHARDING_OPERATION_NAME, PLACE_OPERATION_NAME, RESHARD_OPERATION_NAME, SHARD_MAP_OPERATION_NAME,
 };
 pub use softmax::{
-    SOFTMAX_COMPOSITE_NAME, SOFTMAX_COMPOSITE_VERSION, Softmax, SoftmaxComposite, SoftmaxCrossEntropyWithTargetLogits,
-    softmax, softmax_cross_entropy_with_target_logits,
+    softmax, softmax_cross_entropy_with_target_logits, Softmax, SoftmaxComposite, SoftmaxCrossEntropyWithTargetLogits,
+    SOFTMAX_COMPOSITE_NAME, SOFTMAX_COMPOSITE_VERSION,
 };
-pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
-pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
-pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
+pub use sorting::{Sort, SortDirection, SortOperation, SortOrdering, TopK, SORT_OPERATION_NAME};
+pub use special::{Erf, ErfOperation, ERF_OPERATION_NAME};
+pub use tagging::{Tag, TagOperation, TAG_OPERATION_NAME};
 pub use trigonometric::{
-    ATAN2_OPERATION_NAME, Atan2, Atan2Operation, COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin,
-    SinOperation, TAN_OPERATION_NAME, TANH_OPERATION_NAME, Tan, TanOperation, Tanh, TanhOperation,
-    TrigonometricOperations,
+    Atan2, Atan2Operation, Cos, CosOperation, Sin, SinOperation, Tan, TanOperation, Tanh, TanhOperation,
+    TrigonometricOperations, ATAN2_OPERATION_NAME, COS_OPERATION_NAME, SIN_OPERATION_NAME, TANH_OPERATION_NAME,
+    TAN_OPERATION_NAME,
 };
 
 /// Universe membership of a capability implementor. Every capability (e.g., [`Add`]) is parameterized by the universe

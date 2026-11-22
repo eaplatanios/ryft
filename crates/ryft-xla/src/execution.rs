@@ -58,6 +58,12 @@ pub enum ExecutionError {
     #[error("public argument #{index} is committed to devices {actual:?}, but the executable requires {expected:?}")]
     CommittedInputDeviceMismatch { index: usize, actual: Vec<DeviceId>, expected: Vec<DeviceId> },
 
+    #[error("public argument #{index} belongs to a different PJRT client than the execution")]
+    ArgumentClientMismatch { index: usize },
+
+    #[error("captured array #{index} belongs to a different PJRT client than the execution")]
+    CaptureClientMismatch { index: usize },
+
     /// An input array has no buffered shard for a device required by the executable assignment.
     #[error("input array #{array_index} has no addressable shard for device {device_id}")]
     MissingArrayShardForDevice { array_index: usize, device_id: DeviceId },
@@ -585,6 +591,18 @@ impl Session {
             return Err(Error::from(ProgramError::InvalidInputCount {
                 expected: program.input_types().len(),
                 actual: inputs.len(),
+            }));
+        }
+        // The buffers of an array of another client must never reach PJRT, and nothing else tells them apart, because two
+        // clients can number their devices alike, so that the mesh, the sharding, and the layout of such an array can
+        // match the executable's. Check every input, captures included, before anything observes, erases, converts, or
+        // donates it. The session owns the program (refer to `Self::validate_program_owner`).
+        if let Some(index) = inputs.iter().position(|input| !std::ptr::eq(input.client(), self.client())) {
+            let capture_count = program.capture_count();
+            return Err(Error::Execution(if index < capture_count {
+                ExecutionError::CaptureClientMismatch { index }
+            } else {
+                ExecutionError::ArgumentClientMismatch { index: index - capture_count }
             }));
         }
         let plan = program.plan();
@@ -1806,7 +1824,9 @@ mod tests {
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_first_shard, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
-    use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
+    };
     use crate::{
         Array, ArrayPlacement, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options,
         PRINT_CUSTOM_CALL_TARGET, Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension,
@@ -2506,6 +2526,47 @@ mod tests {
         assert!(!arguments.inputs_by_device()[0][0].donatable);
         shared_taken.poison("test transaction consumed shared input");
         assert_eq!(read_first_shard::<f32>(client, &retained), vec![2.0]);
+    }
+
+    #[test]
+    fn test_execution_arguments_from_arrays_with_donation_takes_exclusive_ownership() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let device_ids = mesh.devices().iter().map(Device::id).collect::<Arc<[_]>>();
+        let weak_buffers = |array: &Array| {
+            array.shards().iter().map(|shard| Arc::downgrade(shard.buffer().unwrap())).collect::<Vec<_>>()
+        };
+
+        // A donated array hands its buffers over without sharing them, so a weak handle that a caller took before
+        // the donation can no longer reach a buffer that the execution may invalidate.
+        let input = f32_vector(&session, &mesh, &[1.0, 2.0]);
+        let weak = weak_buffers(&input);
+        let arguments =
+            ExecutionArguments::from_arrays_with_donation(vec![input], Arc::clone(&device_ids), &[true]).unwrap();
+        assert!(arguments.inputs_by_device().iter().all(|inputs| inputs[0].donatable));
+        assert!(weak.iter().all(|weak| weak.upgrade().is_none()));
+
+        // Donation is all or nothing per array, because PJRT requires the same donation flag for an input on every
+        // device. One shared shard buffer keeps every shard of the array in its allocation, and a weak handle of
+        // another shard still reaches its buffer.
+        let input = f32_vector(&session, &mesh, &[3.0, 4.0]);
+        let weak = weak_buffers(&input);
+        let held = Arc::clone(input.shards()[1].buffer().unwrap());
+        let arguments =
+            ExecutionArguments::from_arrays_with_donation(vec![input], Arc::clone(&device_ids), &[true]).unwrap();
+        assert!(arguments.inputs_by_device().iter().all(|inputs| !inputs[0].donatable));
+        assert!(Arc::ptr_eq(&weak[0].upgrade().unwrap(), &arguments.inputs_by_device()[0][0].buffer));
+        assert!(Arc::ptr_eq(&held, &arguments.inputs_by_device()[1][0].buffer));
+
+        // Arguments without donation keep the buffers in their allocations.
+        let input = f32_vector(&session, &mesh, &[5.0, 6.0]);
+        let weak = weak_buffers(&input);
+        let arguments = ExecutionArguments::from_arrays(vec![input], &device_ids).unwrap();
+        assert!(arguments.inputs_by_device().iter().all(|inputs| !inputs[0].donatable));
+        for (weak, inputs) in weak.iter().zip(arguments.inputs_by_device()) {
+            assert!(Arc::ptr_eq(&weak.upgrade().unwrap(), &inputs[0].buffer));
+        }
     }
 
     #[test]
@@ -3287,6 +3348,104 @@ mod tests {
     }
 
     #[test]
+    fn test_session_prepare_compiled_execution_rejects_inputs_of_another_client() {
+        let client = cpu_client(1);
+        let other_client = other_cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let other_session = Session::builder().client(other_client).build().unwrap();
+
+        // Both clients number their only device 0 in process 0, so an array of the other client has the mesh, the
+        // sharding, and the layout that an executable of this client expects, and nothing but its client tells it
+        // apart from an array of this client.
+        let foreign_mesh = domain_mesh(other_client, "x", 1);
+        assert_eq!(foreign_mesh, mesh);
+        let local = f32_scalar(&session, &mesh, 1.0);
+        let foreign = f32_scalar(&other_session, &foreign_mesh, 2.0);
+        let argument_error = ExecutionError::ArgumentClientMismatch { index: 0 };
+        let capture_error = ExecutionError::CaptureClientMismatch { index: 0 };
+
+        // A program with one capture and one public argument, which both enter it as hidden and public arguments.
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = ProgramBuilder::new();
+        let capture = builder.add_input(scalar_type.clone().into());
+        let argument = builder.add_input(scalar_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![capture, argument], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        for (inputs, expected) in [
+            (vec![local.clone(), foreign.clone()], &argument_error),
+            (vec![foreign.clone(), local.clone()], &capture_error),
+        ] {
+            assert!(matches!(
+                session.prepare_compiled_execution(&compiled, inputs.clone(), &[]),
+                Err(Error::Execution(error)) if error.to_string() == expected.to_string(),
+            ));
+            assert!(matches!(
+                session.execute_compiled_async(&compiled, inputs.clone()),
+                Err(Error::Execution(error)) if error.to_string() == expected.to_string(),
+            ));
+            let values = inputs.into_iter().map(Value::Array).collect::<Vec<_>>();
+            assert!(matches!(
+                session.execute_statefully(&compiled, values).r#await(),
+                Err(Error::Execution(error)) if error.to_string() == expected.to_string(),
+            ));
+        }
+
+        // Direct, asynchronous, and eager calls of a compiled function reject the argument the same way.
+        let double = crate::compile::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            scalar_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            double.executable().execute(&session, foreign.clone()).unwrap_err().to_string(),
+            argument_error.to_string(),
+        );
+        assert_eq!(
+            double.executable().execute_async(&session, foreign.clone()).err().unwrap().to_string(),
+            argument_error.to_string(),
+        );
+        assert_eq!(
+            double.call(foreign.clone()).unwrap_err(),
+            ProgramError::InvalidArgument { message: argument_error.to_string() },
+        );
+
+        // A stateful execution rejects a public argument of the other client before it binds its references, which
+        // keep their state.
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let update = builder.add_input(Type::Array(scalar_type));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let holder = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
+        let reference = Value::Reference(crate::Reference::new(holder.clone(), session.clone()));
+        assert!(matches!(
+            session.execute_statefully(&compiled, vec![reference, Value::Array(foreign.clone())]).r#await(),
+            Err(Error::Execution(error)) if error.to_string() == argument_error.to_string(),
+        ));
+        assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
+
+        // Execution arguments that PJRT consumes directly reject an array of another client than the first one.
+        let device_ids = [mesh.devices()[0].id()];
+        assert!(matches!(
+            ExecutionArguments::from_arrays(vec![local.clone(), foreign.clone()], &device_ids),
+            Err(Error::Execution(ExecutionError::ArgumentClientMismatch { index: 1 })),
+        ));
+        assert_eq!(read_first_shard::<f32>(other_client, &foreign), vec![2.0]);
+    }
+
+    #[test]
     fn test_session_prepare_compiled_execution_preserves_unreduced_shards_during_relayout() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
@@ -3476,6 +3635,100 @@ mod tests {
             input.block_until_ready(),
             Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed",
         ));
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_carries_failures_of_input_producers() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+
+        // As in `test_session_prepare_compiled_execution_relayouts_only_mismatching_shards_without_waiting`, the input
+        // holds shards in another layout than the executable's, which preparation converts, and the fence of a
+        // producer that fails after the execution was submitted, while every buffer of the input succeeds. Only the
+        // fence carries that failure, so the outputs of the execution must carry it as well.
+        let devices = client.addressable_devices().unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
+        let failing_input = || {
+            let buffers = devices
+                .iter()
+                .zip([(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()])
+                .map(|(device, bytes)| {
+                    client
+                        .buffer(bytes.as_slice(), BufferType::U8, [2, 4], None, device.clone(), Some(column_major.clone()))
+                        .unwrap()
+                })
+                .collect();
+            let (producer, producer_promise) = client.event(()).unwrap();
+            let input = Array::from_addressable_buffers(
+                &session,
+                input_type.clone(),
+                mesh.clone(),
+                Some(sharding.clone()),
+                buffers,
+            )
+            .unwrap()
+            .with_execution_fence(ExecutionFence::new(vec![producer]));
+            (input, producer_promise)
+        };
+        let is_producer_failure = |result: Result<(), Error>| {
+            matches!(result, Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed")
+        };
+
+        // The synchronous path returns outputs whose readiness and readback report the failure.
+        let (input, producer_promise) = failing_input();
+        let outputs = session.execute_program(&compiled, vec![input]).unwrap();
+        producer_promise.set(Some(ryft_pjrt::Error::aborted("producer failed"))).unwrap();
+        assert!(is_producer_failure(outputs[0].block_until_ready()));
+        assert!(is_producer_failure(outputs[0].copy_to_host().map(|_| ())));
+
+        // The asynchronous path returns a fence that reports it as well.
+        let (input, producer_promise) = failing_input();
+        let execution = session.execute_compiled_async(&compiled, vec![input]).unwrap();
+        producer_promise.set(Some(ryft_pjrt::Error::aborted("producer failed"))).unwrap();
+        assert!(is_producer_failure(execution.fence().block_until_ready().map_err(Error::from)));
+        assert!(is_producer_failure(execution.output()[0].block_until_ready()));
+
+        // The stateful path reports it through the completion of the invocation and the state of its references.
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let update = builder.add_input(Type::Array(scalar_type));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let holder = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
+        let reference = Value::Reference(crate::Reference::new(holder.clone(), session.clone()));
+        let (producer, producer_promise) = client.event(()).unwrap();
+        let update = f32_scalar(&session, &mesh, 2.0).with_execution_fence(ExecutionFence::new(vec![producer]));
+        let execution = session.execute_statefully(&compiled, vec![reference, Value::Array(update)]);
+        producer_promise.set(Some(ryft_pjrt::Error::aborted("producer failed"))).unwrap();
+        assert!(matches!(
+            execution.r#await(),
+            Err(Error::Execution(ExecutionError::AsynchronousFailure { reason })) if &*reason == "producer failed",
+        ));
+        assert!(is_producer_failure(holder.read().unwrap().block_until_ready()));
     }
 
     #[test]

@@ -946,11 +946,12 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
-        ArgMax, ArgMin, ArrayOperation, ArrayOperations, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh, Dimension,
-        DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding, ShardingDimension, Sub,
-        UnreducedKind, composite,
+        ArgMax, ArgMin, ArrayOperation, ArrayOperations, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh,
+        Dimension, DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis,
+        MeshAxisType, Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding,
+        ShardingDimension, Sub, UnreducedKind, composite,
     };
     use ryft_mlir::Location;
 
@@ -2741,6 +2742,145 @@ mod tests {
             assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{kind} over {data_type}");
             modules.push(lowering.module);
         }
-        assert_eq!(modules.join("\n"), "");
+        assert_eq!(
+            modules,
+            [
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {\
+                        sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>\
+                      }) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=max{"x"}>}) {
+                        %0 = stablehlo.bitcast_convert %arg0 : (tensor<4xf32>) -> tensor<4xi32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %c = stablehlo.constant dense<0> : tensor<i32>
+                        %2 = stablehlo.clamp %c, %1, %c : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %c_0 = stablehlo.constant dense<2147483647> : tensor<i32>
+                        %4 = stablehlo.clamp %c_0, %1, %c_0 : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %6 = stablehlo.compare LT, %1, %3, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+                        %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %8 = stablehlo.xor %1, %5 : tensor<4xi32>
+                        %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %10 = stablehlo.select %7, %9, %1 : tensor<4xi1>, tensor<4xi32>
+                        %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %12 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi1>
+                        %c_1 = stablehlo.constant dense<2143289344> : tensor<i32>
+                        %14 = stablehlo.clamp %c_1, %11, %c_1 : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %16 = stablehlo.select %13, %15, %11 : tensor<4xi1>, tensor<4xi32>
+                        %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=max{"x"}> : tensor<4xi32>
+                        %c_2 = stablehlo.constant dense<-2139095041> : tensor<i32>
+                        %18 = stablehlo.reduce(%17 init: %c_2) applies stablehlo.maximum across dimensions = [0] : (tensor<4xi32>, tensor<i32>) -> tensor<i32>
+                        %19 = sdy.sharding_constraint %18 <@mesh, [], unreduced=max{"x"}> : tensor<i32>
+                        %c_3 = stablehlo.constant dense<0> : tensor<i32>
+                        %20 = stablehlo.clamp %c_3, %19, %c_3 : tensor<i32>
+                        %21 = sdy.sharding_constraint %20 <@mesh, [], unreduced=max{"x"}> : tensor<i32>
+                        %c_4 = stablehlo.constant dense<2147483647> : tensor<i32>
+                        %22 = stablehlo.clamp %c_4, %19, %c_4 : tensor<i32>
+                        %23 = sdy.sharding_constraint %22 <@mesh, [], unreduced=max{"x"}> : tensor<i32>
+                        %24 = stablehlo.compare LT, %19, %21, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                        %25 = sdy.sharding_constraint %24 <@mesh, [], unreduced=max{"x"}> : tensor<i1>
+                        %26 = stablehlo.xor %19, %23 : tensor<i32>
+                        %27 = sdy.sharding_constraint %26 <@mesh, [], unreduced=max{"x"}> : tensor<i32>
+                        %28 = stablehlo.select %25, %27, %19 : tensor<i1>, tensor<i32>
+                        %29 = sdy.sharding_constraint %28 <@mesh, [], unreduced=max{"x"}> : tensor<i32>
+                        %30 = stablehlo.bitcast_convert %29 : (tensor<i32>) -> tensor<f32>
+                        %31 = sdy.sharding_constraint %30 <@mesh, [], unreduced=max{"x"}> : tensor<f32>
+                        return %31 : tensor<f32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {\
+                        sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>\
+                      }) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=min{"x"}>}) {
+                        %0 = stablehlo.bitcast_convert %arg0 : (tensor<4xf32>) -> tensor<4xi32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %c = stablehlo.constant dense<0> : tensor<i32>
+                        %2 = stablehlo.clamp %c, %1, %c : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %c_0 = stablehlo.constant dense<2147483647> : tensor<i32>
+                        %4 = stablehlo.clamp %c_0, %1, %c_0 : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %6 = stablehlo.compare LT, %1, %3, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+                        %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %8 = stablehlo.xor %1, %5 : tensor<4xi32>
+                        %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %10 = stablehlo.select %7, %9, %1 : tensor<4xi1>, tensor<4xi32>
+                        %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %12 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                        %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi1>
+                        %c_1 = stablehlo.constant dense<-2143289345> : tensor<i32>
+                        %14 = stablehlo.clamp %c_1, %11, %c_1 : (tensor<i32>, tensor<4xi32>, tensor<i32>) -> tensor<4xi32>
+                        %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %16 = stablehlo.select %13, %15, %11 : tensor<4xi1>, tensor<4xi32>
+                        %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=min{"x"}> : tensor<4xi32>
+                        %c_2 = stablehlo.constant dense<2139095040> : tensor<i32>
+                        %18 = stablehlo.reduce(%17 init: %c_2) applies stablehlo.minimum across dimensions = [0] : (tensor<4xi32>, tensor<i32>) -> tensor<i32>
+                        %19 = sdy.sharding_constraint %18 <@mesh, [], unreduced=min{"x"}> : tensor<i32>
+                        %c_3 = stablehlo.constant dense<0> : tensor<i32>
+                        %20 = stablehlo.clamp %c_3, %19, %c_3 : tensor<i32>
+                        %21 = sdy.sharding_constraint %20 <@mesh, [], unreduced=min{"x"}> : tensor<i32>
+                        %c_4 = stablehlo.constant dense<2147483647> : tensor<i32>
+                        %22 = stablehlo.clamp %c_4, %19, %c_4 : tensor<i32>
+                        %23 = sdy.sharding_constraint %22 <@mesh, [], unreduced=min{"x"}> : tensor<i32>
+                        %24 = stablehlo.compare LT, %19, %21, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                        %25 = sdy.sharding_constraint %24 <@mesh, [], unreduced=min{"x"}> : tensor<i1>
+                        %26 = stablehlo.xor %19, %23 : tensor<i32>
+                        %27 = sdy.sharding_constraint %26 <@mesh, [], unreduced=min{"x"}> : tensor<i32>
+                        %28 = stablehlo.select %25, %27, %19 : tensor<i1>, tensor<i32>
+                        %29 = sdy.sharding_constraint %28 <@mesh, [], unreduced=min{"x"}> : tensor<i32>
+                        %30 = stablehlo.bitcast_convert %29 : (tensor<i32>) -> tensor<f32>
+                        %31 = sdy.sharding_constraint %30 <@mesh, [], unreduced=min{"x"}> : tensor<f32>
+                        %32 = stablehlo.compare NE, %31, %31, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                        %33 = sdy.sharding_constraint %32 <@mesh, [], unreduced=min{"x"}> : tensor<i1>
+                        %34 = stablehlo.abs %31 : tensor<f32>
+                        %35 = sdy.sharding_constraint %34 <@mesh, [], unreduced=min{"x"}> : tensor<f32>
+                        %36 = stablehlo.select %33, %35, %31 : tensor<i1>, tensor<f32>
+                        %37 = sdy.sharding_constraint %36 <@mesh, [], unreduced=min{"x"}> : tensor<f32>
+                        return %37 : tensor<f32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32> {\
+                        sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>\
+                      }) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"x"}>}) {
+                        %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                        %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [], unreduced={"x"}> : tensor<f32>
+                        %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                        %2 = stablehlo.divide %1, %cst_0 : tensor<f32>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [], unreduced={"x"}> : tensor<f32>
+                        return %3 : tensor<f32>
+                      }
+                    }
+                "#},
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xbf16> {\
+                        sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>\
+                      }) -> (tensor<bf16> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"x"}>}) {
+                        %0 = stablehlo.convert %arg0 : (tensor<4xbf16>) -> tensor<4xf32>
+                        %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={"x"}> : tensor<4xf32>
+                        %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                        %2 = stablehlo.reduce(%1 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                        %3 = sdy.sharding_constraint %2 <@mesh, [], unreduced={"x"}> : tensor<f32>
+                        %4 = stablehlo.convert %3 : (tensor<f32>) -> tensor<bf16>
+                        %5 = sdy.sharding_constraint %4 <@mesh, [], unreduced={"x"}> : tensor<bf16>
+                        return %5 : tensor<bf16>
+                      }
+                    }
+                "#},
+            ],
+        );
     }
 }

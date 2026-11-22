@@ -243,7 +243,7 @@ impl Array {
     /// Both paths preserve the separate contributions along unreduced axes.
     ///
     /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
-    /// lets PJRT donate the source buffers to the destination, which avoids the extra allocation.
+    /// lets PJRT reuse the source buffers for the destination where it can, which may avoid an extra allocation.
     ///
     /// # Parameters
     ///
@@ -256,12 +256,16 @@ impl Array {
     /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the
     /// destination. This is the `ryft` analogue of JAX's `jax.device_put(arr, sharding, donate=True)`.
     ///
-    /// Donation lets PJRT reuse the source buffers for the output, which saves the memory of the source array for
-    /// large training tensors. Because `self` is consumed at the language boundary, the donated buffers are not
-    /// observable to the caller after this function returns. Rust ownership therefore enforces the same invariant that
-    /// the `donate=True` flag carries in JAX, without exposing a runtime hazard.
+    /// Donation is best effort, as in JAX. Only the compiled reshard on the mesh of this array donates its input, and
+    /// PJRT then may reuse the source buffers for the output, which can save the memory of the source array for large
+    /// training tensors. Nothing guarantees that saving. The other strategies (e.g., moves of whole shards, shard
+    /// regions, a reshard across meshes, or the host fallback) do not donate, a buffer that another handle shares is
+    /// never donated, and PJRT may still allocate new output buffers. Because `self` is consumed at the language
+    /// boundary, the donated buffers are not observable to the caller after this function returns. Rust ownership
+    /// therefore enforces the same invariant that the `donate=True` flag carries in JAX, without exposing a runtime
+    /// hazard.
     ///
-    /// The strategies follow [`Self::to_placement`], enabling donation for the compiled reshard on the source mesh.
+    /// The strategies follow [`Self::to_placement`].
     ///
     /// # Parameters
     ///
@@ -368,9 +372,7 @@ impl Array {
         };
         output.execution_fence = completion.join(self.execution_fence.clone());
         output.send_fence = self.send_fence.clone();
-        Ok(output
-            .with_committed(self.is_committed())
-            .with_locally_assigned(self.is_locally_assigned()))
+        Ok(output.with_committed(self.is_committed()).with_locally_assigned(self.is_locally_assigned()))
     }
 
     /// Places this array on the devices, with the sharding, and in the storage that `target` names. A memory that
@@ -751,7 +753,8 @@ impl Array {
     /// unreduced destination axis, whose devices away from coordinate zero hold additive identities), this process
     /// reads its value back and uploads the shards of its devices as [`Array::from_host_buffer`] does, in the
     /// background when the PJRT plugin supports it. The execution fence of the result joins the fence of this array
-    /// with the readiness of every buffer that this function creates and the fences of the slices, so the result waits
+    /// with the readiness of the buffer of this array that it reads, of every buffer that this function creates, and
+    /// the fences of the slices (or, for the upload, the readiness that its readback waits for), so the result waits
     /// for and reports the producer of this array even when no destination device belongs to this process.
     ///
     /// `layout` is the layout that the placement records for each destination shard (refer to
@@ -794,7 +797,11 @@ impl Array {
                 .into_iter()
                 .map(|device| Ok((device.id()?, device)))
                 .collect::<Result<HashMap<_, _>, PjrtError>>()?;
+            // The source buffer can be the only completion of the work that produced it (e.g., of a pending host
+            // upload, which has no execution fence), and no destination buffer reads it when no destination device
+            // belongs to this process, so the result waits for it directly.
             let mut completion = PlacementCompletion::default();
+            completion.track_buffer(source.buffer().unwrap())?;
             let mut work = session.reserve_work();
             let mut buffers = Vec::with_capacity(destinations.len());
             for destination in destinations {
@@ -1077,8 +1084,12 @@ impl Array {
     /// device of that shard, which a plan chose from metadata that every process shares, so the buffer must live on
     /// that device, whatever replicas this process holds. The shard sends its own buffer when it has one. Otherwise,
     /// the replica of its slice that [`Self::local_replica`] selects (e.g., of an array imported with a buffer for
-    /// only one of its local replicas) is copied to the memory of `device` that the type of this array declares, and
-    /// `completion` records the readiness of that copy. The callers prepare every buffer that they send before they
+    /// only one of its local replicas) is copied to the memory of `device` that the type of this array declares.
+    /// `completion` records the readiness of the returned buffer in both cases, so that the result of a placement that
+    /// only sends from this process (e.g., to a destination without devices of this process) still reports a failure
+    /// of the work that produced the sent buffer, which may have no other fence (e.g., a pending host upload, whose
+    /// readiness only its buffer carries) and whose failure a plugin need not report through the send. The callers
+    /// prepare every buffer that they send before they
     /// issue their first transfer, so a slice without any local buffer is reported before this process issues anything,
     /// while its receiver still waits for it, which is the accepted limitation that [`crate::arrays::resharding`]
     /// describes.
@@ -1098,6 +1109,7 @@ impl Array {
         let shard = &self.shards()[index];
         let (replica, buffer) = self.local_replica(index, shard.device(), process_index)?;
         if replica.index() == index {
+            completion.track_buffer(buffer)?;
             return Ok(Arc::clone(buffer));
         }
         let mut work = session.reserve_work();
@@ -1117,15 +1129,19 @@ impl Array {
     /// memory of its device, and `completion` records the readiness of that copy. The declared memory is information
     /// that every process shares, so every process stages the same shards.
     ///
-    /// A cross-host transfer also moves the raw bytes of the buffer, so a buffer in another layout is converted next.
-    /// The conversion runs on its device with [`Self::try_relayout_shard_on_device`] when this process can compile
-    /// operations for its own shards and the conversion compiles, and `completion` then records its fence. Otherwise,
-    /// the shard is copied through host memory into a buffer in `layout` in the default memory of its device with
-    /// [`Self::copy_shard_through_host`], and `completion` records the readiness of that buffer.
+    /// A cross-host transfer also moves the raw bytes of the buffer, and some plugins (e.g., CUDA) take the number of
+    /// bytes from the allocation of the sender, while the receiver allocates the exact shape of the shard. A buffer in
+    /// another layout or whose physical dimensions differ from the shape of the shard (e.g., the padded buffer of a
+    /// bounded-dynamic result, whose allocation covers the bound of a dimension) is therefore converted next into an
+    /// exactly sized buffer in `layout`. The conversion runs on its device with [`Self::try_relayout_shard_on_device`]
+    /// when this process can compile operations for its own shards and the conversion compiles, and `completion` then
+    /// records its fence. Otherwise, the shard is copied through host memory into a buffer in `layout` in the default
+    /// memory of its device with [`Self::copy_shard_through_host`], and `completion` records the readiness of that
+    /// buffer.
     ///
-    /// The physical layout of a buffer is known only to the process that holds it when this array declares no layout,
-    /// so this function never declines. The receivers of the shard chose the same strategy without knowing that layout,
-    /// and they wait for this send whatever it is.
+    /// The physical layout and dimensions of a buffer are known only to the process that holds it when this array
+    /// declares no layout, so this function never declines. The receivers of the shard chose the same strategy without
+    /// knowing them, and they wait for this send whatever they are.
     fn cross_host_send_buffer(
         &self,
         session: &Session,
@@ -1144,7 +1160,8 @@ impl Array {
             Arc::new(staged)
         };
         let current_layout = buffer.specification()?.layout;
-        if current_layout == *layout {
+        let exactly_sized = holds_exact_shape(&buffer, &shard.shape())?;
+        if exactly_sized && current_layout == *layout {
             return Ok(buffer);
         }
         if can_compile_local_operations(session) {
@@ -1426,8 +1443,11 @@ impl Array {
     }
 
     /// Produces the region with `slice`, in global array coordinates, from `source_buffer`, which holds the shard
-    /// `source` on its device, on that device, using the default PJRT layout for a remote transfer. `completion`
-    /// records the fences of the programs that produce it.
+    /// `source` on its device, on that device, using the default PJRT layout for a remote transfer. A region that a
+    /// remote transfer sends is also exactly sized, because a cross-host send moves the whole allocation of its buffer
+    /// (refer to [`Self::cross_host_send_buffer`]), so a whole source shard whose buffer is padded (e.g., a
+    /// bounded-dynamic result) is converted as a buffer in another layout is. `completion` records the fences of the
+    /// programs that produce it.
     fn prepare_shard_region(
         session: &Session,
         data_type: DataType,
@@ -1458,16 +1478,16 @@ impl Array {
             Arc::clone(output.shards()[0].buffer().unwrap())
         };
         // A receive declares the region's shape and uses the plugin's default device layout.
-        if let Some(layout) = remote_layout
-            && buffer.specification()?.layout != *layout
-        {
+        if let Some(layout) = remote_layout {
             let shape = slice.iter().map(Range::len).collect::<Vec<_>>();
-            let r#type = ArrayType::new(data_type, StaticShape::new(shape).into());
-            let input = Self::wrap_device_buffer(session, r#type, source.device(), Arc::clone(&buffer))?;
-            let r#type = input.r#type().into_owned().with_layout(Layout::from_pjrt(layout.clone())?);
-            let output = input.cast(r#type, &[])?;
-            completion.track_fence(output.execution_fence());
-            buffer = Arc::clone(output.shards()[0].buffer().unwrap());
+            if buffer.specification()?.layout != *layout || !holds_exact_shape(&buffer, &shape)? {
+                let r#type = ArrayType::new(data_type, StaticShape::new(shape).into());
+                let input = Self::wrap_device_buffer(session, r#type, source.device(), Arc::clone(&buffer))?;
+                let r#type = input.r#type().into_owned().with_layout(Layout::from_pjrt(layout.clone())?);
+                let output = input.cast(r#type, &[])?;
+                completion.track_fence(output.execution_fence());
+                buffer = Arc::clone(output.shards()[0].buffer().unwrap());
+            }
         }
         Ok(buffer)
     }
@@ -2664,6 +2684,13 @@ fn can_compile_local_operations(session: &Session) -> bool {
         || cache.artifact_exchange().is_none_or(|exchange| exchange.process_count() <= 1)
 }
 
+/// Returns whether the physical dimensions of `buffer` are `shape`, which is the shape of the shard or the region that
+/// it holds. A buffer that a bounded-dynamic execution produced is padded to the bound of each dynamic dimension, so
+/// its allocation is larger than that shape, although it holds only that shape and copies and readbacks preserve that.
+fn holds_exact_shape(buffer: &Buffer<'_>, shape: &[usize]) -> Result<bool, Error> {
+    Ok(buffer.dimensions()?.iter().map(|&size| size as usize).eq(shape.iter().copied()))
+}
+
 /// Returns whether replicas of each shard slice hold one value across the mesh.
 fn holds_one_value_per_slice(sharding: &Sharding) -> bool {
     sharding.unreduced_axes().is_empty() && sharding.varying_manual_axes().is_empty()
@@ -2704,8 +2731,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         CompilationArtifactExchange, CompilationArtifactExchangeError, CompilationArtifactExchangePolicy,
-        CompilationCache, DataType, Dimension, DimensionError, Error as CoreError, Layout, LogicalMesh, Memory,
-        MeshAxis, Shape, ShardingDimension, StridedLayout, TiledLayout,
+        CompilationCache, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Error as CoreError,
+        Layout, LogicalMesh, Memory, MeshAxis, Shape, ShardingDimension, StridedLayout, TiledLayout,
     };
     use ryft_pjrt::{BufferSpecification, BufferType, ExecutionFence, HostToDeviceTransferManager};
 
@@ -5128,6 +5155,29 @@ mod tests {
             placed.block_until_ready(),
             Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "producer failed",
         ));
+
+        // Along a replicated destination, the value of this process is shared or copied on devices, and no destination
+        // device belongs to this process. A source whose only completion is the readiness of its pending buffer (e.g.,
+        // a host upload) has no execution fence, so the result waits for and reports that buffer.
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let target = ArrayPlacement::mesh(mesh.clone(), replicated.clone()).unwrap();
+        let specification = BufferSpecification::new(BufferType::F32, [2u64]);
+        let memory = client.addressable_devices().unwrap()[0].default_memory().unwrap();
+        let manager = client.host_to_device_transfer_manager(vec![specification], memory).unwrap();
+        let source_mesh = domain_mesh(client, "x", 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let buffers = vec![manager.retrieve_buffer(0).unwrap()];
+        let source = Array::from_addressable_buffers(&session, r#type, source_mesh, None, buffers).unwrap();
+        let source = source.with_locally_assigned(true);
+        assert!(source.execution_fence().is_none());
+        let placed = source.to_placement(&session, target).unwrap();
+        assert_eq!(placed.sharding(), &replicated);
+        assert_eq!(placed.addressable_shards().count(), 0);
+        manager.set_error(0, PjrtError::aborted("upload failed")).unwrap();
+        assert!(matches!(
+            placed.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "upload failed",
+        ));
     }
 
     #[test]
@@ -5821,13 +5871,15 @@ mod tests {
             assert_eq!(sent.dimensions().unwrap(), [3]);
             assert_eq!(sent.copy_to_host(None).unwrap().r#await().unwrap(), values);
 
-            // The shard that holds a buffer sends it without a copy.
+            // The shard that holds a buffer sends it without a copy, and the result of the placement then waits for
+            // and reports its readiness, which may be the only completion of the work that produced it.
             let mut completion = PlacementCompletion::default();
             let sent = source
                 .cross_host_source_buffer(&session, 1, &client_devices[1], process_index, &mut completion)
                 .unwrap();
             assert!(Arc::ptr_eq(&sent, &held));
-            assert!(completion.join(None).is_none());
+            let fence = completion.join(None).unwrap();
+            fence.block_until_ready().unwrap();
         }
 
         // A shard whose slice has no buffer on this process cannot be sent.
@@ -5932,6 +5984,51 @@ mod tests {
             assert_eq!(sent.dimensions().unwrap(), [2, 3]);
             assert_eq!(sent.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&values));
         }
+
+        // A bounded-dynamic execution returns a buffer that is padded to the bound of its dynamic dimension, in the
+        // default layout. A plugin can take the size of a send from the allocation of the sender while the receiver
+        // allocates the shape of the shard, so the shard is sent as an exactly sized buffer, converted on its device or
+        // through host memory, and so is a whole shard that a region sends.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(1024)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let identity: CompiledFunction<ArrayType, ArrayType> =
+            crate::compile_with_options(|input| input, dynamic_type, &session, Options::new(mesh.clone())).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let input = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[11f32, 22.]));
+        let padded = identity.executable().execute(&session, input.unwrap()).unwrap();
+        let shard = padded.addressable_shards().next().unwrap();
+        let padded_buffer = shard.buffer().unwrap();
+        assert_ne!(padded_buffer.dimensions().unwrap(), [2]);
+        assert_eq!(padded_buffer.unpadded_dimensions().unwrap(), [2]);
+        let default_layout =
+            cross_host_default_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2])).unwrap().unwrap();
+        assert_eq!(padded_buffer.specification().unwrap().layout, default_layout);
+        for session in [&session, &shared_session] {
+            let mut completion = PlacementCompletion::default();
+            let buffer = Arc::clone(padded_buffer);
+            let sent = padded.cross_host_send_buffer(session, shard, buffer, &default_layout, &mut completion).unwrap();
+            completion.join(None).unwrap().block_until_ready().unwrap();
+            assert_eq!(sent.dimensions().unwrap(), [2]);
+            assert_eq!(sent.on_device_size_in_bytes().unwrap(), 8);
+            assert_eq!(sent.specification().unwrap().layout, default_layout);
+            assert_eq!(sent.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&[11f32, 22.]));
+        }
+        let mut completion = PlacementCompletion::default();
+        let buffer = Arc::clone(padded_buffer);
+        let region = Array::prepare_shard_region(
+            &session,
+            DataType::F32,
+            shard,
+            buffer,
+            shard.slice(),
+            Some(&default_layout),
+            &mut completion,
+        )
+        .unwrap();
+        completion.join(None).unwrap().block_until_ready().unwrap();
+        assert_eq!(region.dimensions().unwrap(), [2]);
+        assert_eq!(region.on_device_size_in_bytes().unwrap(), 8);
+        assert_eq!(region.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&[11f32, 22.]));
     }
 
     #[test]

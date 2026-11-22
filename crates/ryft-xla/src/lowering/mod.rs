@@ -2092,8 +2092,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
     });
     // The lowering only appends operations to the block, so the operations that follow the last one before the
     // lowering are those that the lowering emits into this block.
-    let previous_operation =
-        if false && has_pending_reduction { Some(block.operations()?.last().transpose()?) } else { None };
+    let previous_operation = if has_pending_reduction { Some(block.operations()?.last().transpose()?) } else { None };
     let mut outputs = operation.lower(lowerer, input_values, input_types, output_types)?;
     let collective_state = lowerer.collective_state();
     if let Some(previous_operation) = previous_operation {
@@ -2195,8 +2194,10 @@ impl PendingReduction {
 ///
 /// Each constrained value is a `sdy.sharding_constraint` placed right after the operation that produces it, with a
 /// sharding of its rank that is replicated in every dimension and declares its pending reduction, and it replaces
-/// every later use of that value. Operations nested in the regions of emitted operations are not visited, because
-/// their region arguments carry no sharding of their own (e.g., the scalar arguments of a `stablehlo.reduce` body).
+/// every later use of that value. A value that a `sdy.sharding_constraint` already uses (e.g., one that the lowering of
+/// an instruction of a nested region inlined into the same block constrained) is left as it is. Operations nested in
+/// the regions of emitted operations are not visited, because their region arguments carry no sharding of their own
+/// (e.g., the scalar arguments of a `stablehlo.reduce` body).
 fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     previous_operation: Option<OperationRef<'b, 'c, 't>>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -2232,12 +2233,26 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     }
     // The emitted operations are collected before any constraint is inserted, so that the constraints are not visited.
     let operations = operations.collect::<Result<Vec<_>, _>>()?;
+    // The values of a nested region that the lowering inlines into the same block are constrained by the lowering of
+    // the instructions of that region, which this walk visits again.
+    let is_constrained = |value: ValueRef<'b, 'c, 't>| -> Result<bool, Error> {
+        for operand in value.uses()? {
+            if operand?.operation()?.name().as_str() == Ok("sdy.sharding_constraint") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let pending_reduction_of =
+        |value: ValueRef<'b, 'c, 't>, pending_reductions: &[(ValueRef<'b, 'c, 't>, PendingReduction)]| {
+            pending_reductions
+                .iter()
+                .find(|(candidate, _)| *candidate == value)
+                .map(|(_, reduction)| reduction.clone())
+        };
     for operation in operations {
         let name = operation.name();
         let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        let pending_reduction_of = |value: ValueRef<'b, 'c, 't>, pending_reductions: &[(ValueRef<'b, 'c, 't>, PendingReduction)]| {
-            pending_reductions.iter().find(|(candidate, _)| *candidate == value).map(|(_, reduction)| reduction.clone())
-        };
         let result_reductions = if name == "sdy.sharding_constraint" {
             vec![PendingReduction::of_constraint(operation)?]
         } else if name.starts_with("sdy.") || matches!(name, "func.call" | "stablehlo.case" | "stablehlo.if") {
@@ -2260,7 +2275,7 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
                         return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                             operation: name.to_string(),
                             reason: format!(
-                                "operands with pending reductions of the different kinds `{}` and `{}`",
+                                "operands with pending reductions of different kinds `{}` and `{}`",
                                 merged.kind, reduction.kind,
                             ),
                         }));
@@ -2280,7 +2295,8 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
             };
             let result = operation.result(index)?.as_ref();
             let rank = result.r#type()?.cast::<TensorTypeRef>().map(|r#type| r#type.rank());
-            let (Some(rank), true) = (rank, constrains && !outputs.contains(&result)) else {
+            let (Some(rank), true) = (rank, constrains && !outputs.contains(&result) && !is_constrained(result)?)
+            else {
                 pending_reductions.push((result, reduction));
                 continue;
             };
@@ -3178,16 +3194,16 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayOperations, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation, ConstantOperation,
-        Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation, DimensionType,
-        DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses,
-        Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation, NegOperation, OneLike,
-        ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation, Program,
+        AddOperation, Array, ArrayOperations, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation,
+        ConstantOperation, Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext,
+        EffectClasses, Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation,
+        NegOperation, OneLike, ParallelReduce, ParameterizedFamily, Placeholder, PrintOperation, Program,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation, ReductionKind,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
-        ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions, ShardMap, ShardMapOperation,
-        ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, UnreducedKind, ValueProjection,
-        ZeroLike, i1, i2, i4, scan, shard_map, u1, u2, u4,
+        ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions, ShardMap,
+        ShardMapOperation, ShardMapOptions, Sin, StridedLayout, TiledLayout, Transpose, TypedProgram, UnreducedKind,
+        ValueProjection, ZeroLike, i1, i2, i4, scan, shard_map, u1, u2, u4,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -3787,7 +3803,8 @@ pub(crate) mod tests {
         let arrays = inputs
             .iter()
             .map(|input| {
-                let shards = devices.iter().zip(&input.contributions).map(|(device, bytes)| (device.id(), bytes.as_slice()));
+                let shards =
+                    devices.iter().zip(&input.contributions).map(|(device, bytes)| (device.id(), bytes.as_slice()));
                 crate::Array::from_host_shards(&session, input.r#type.clone(), mesh.clone(), None, shards)
                     .map_err(|error| error.to_string())
             })
@@ -4733,7 +4750,27 @@ pub(crate) mod tests {
         );
         let lowering = lower_unreduced_application(&Mean, &[input]).unwrap();
         assert_eq!(lowering.outcomes, lowering.expected_outcomes);
-        assert_eq!(lowering.module, "");
+        assert_eq!(
+            lowering.module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xbf16> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) -> (tensor<bf16> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"x"}>}) {
+                    %0 = stablehlo.convert %arg0 : (tensor<4xbf16>) -> tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={"x"}> : tensor<4xf32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %2 = stablehlo.reduce(%1 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [], unreduced={"x"}> : tensor<f32>
+                    %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                    %4 = stablehlo.divide %3, %cst_0 : tensor<f32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [], unreduced={"x"}> : tensor<f32>
+                    %6 = stablehlo.convert %5 : (tensor<f32>) -> tensor<bf16>
+                    %7 = sdy.sharding_constraint %6 <@mesh, [], unreduced={"x"}> : tensor<bf16>
+                    return %7 : tensor<bf16>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
