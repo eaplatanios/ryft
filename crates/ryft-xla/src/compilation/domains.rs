@@ -11,10 +11,10 @@ use std::time::Instant;
 
 use ryft_core::{
     ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh, Dimension,
-    DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, Memory, OperationPayloadProjection,
-    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult,
-    SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError,
-    Typed, TypedProgram,
+    DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, LogicalMesh, Memory,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
+    ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram,
+    Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -389,9 +389,7 @@ impl Session {
                         options.input_placements().and_then(|placements| placements.get(index).cloned().flatten())
                     })
                 };
-                Ok(placement.or_else(|| array_type.sharding().cloned()).unwrap_or_else(|| {
-                    Sharding::replicated(options.mesh().logical_mesh().clone(), array_type.shape().rank())
-                }))
+                Ok(placement.unwrap_or_else(|| declared_input_sharding(array_type, options.mesh().logical_mesh())))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         // The executable expects the buffers of every argument to be split evenly (refer to `validate_even_sharding`),
@@ -750,6 +748,19 @@ impl CompilationCacheDomain for Session {
     fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
         self.deserialize_compiled_program(bytes)
     }
+}
+
+/// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
+/// public argument of declared type `input_type` that has no input sharding override and no runtime placement (e.g.,
+/// of a `jit` dispatcher), which is the sharding of that type, and otherwise replicated over `mesh`. A call of a
+/// function compiled for its input types places its inputs by this same rule (refer to
+/// [`JitCallOperation::boundary_input_sharding`]), so that a direct execution, an eager call, and a nested call place
+/// an input alike.
+pub(crate) fn declared_input_sharding(input_type: &ArrayType, mesh: &LogicalMesh) -> Sharding {
+    input_type
+        .sharding()
+        .cloned()
+        .unwrap_or_else(|| Sharding::replicated(mesh.clone(), input_type.shape().rank()))
 }
 
 /// Returns `input_types` with the input sharding overrides of `options` (i.e., [`Options::input_shardings`])
@@ -1139,10 +1150,10 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
 /// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose source would be rejected as such a
 /// target, as the source is no destination of the forward program, and for the first `place` whose target or source
-/// sharding or `jit_call` whose effective boundary sharding (i.e., an override or a declared input sharding, refer to
-/// [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
-/// its unconstrained dimensions are read as replicated (refer to [`entry_boundary_sharding`]), when
-/// `use_shardy_partitioner` is not set and `mesh` has more than one device.
+/// sharding or `jit_call` whose effective boundary sharding (i.e., an override or where the executable of the callee
+/// places an input, refer to [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to
+/// [`Sharding::is_replicated`]), once its unconstrained dimensions are read as replicated (refer to
+/// [`entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
     for region in program.entry_region_ref().computation_regions() {
         for instruction in region.instructions() {
@@ -1160,7 +1171,8 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                     }));
                 }
                 if !use_shardy_partitioner && mesh.devices().len() > 1 {
-                    // The effective boundary of an input is its override or otherwise its declared sharding.
+                    // The effective boundary of an input is its override or otherwise where the executable of the
+                    // callee places it (refer to `JitCallOperation::boundary_input_sharding`).
                     let callee = region.with_id(instruction.regions()[0])?;
                     let mut shardings = Vec::new();
                     for (index, (input, declared)) in
@@ -1169,7 +1181,7 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                         if let Type::Array(actual) = region.atoms()[input.index()].r#type().as_ref()
                             && let Some(sharding) = call.boundary_input_sharding(index, actual, declared)
                         {
-                            shardings.push(sharding.clone());
+                            shardings.push(sharding.into_owned());
                         }
                     }
                     shardings.extend(

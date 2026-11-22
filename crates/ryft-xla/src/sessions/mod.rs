@@ -108,10 +108,10 @@ use ryft_core::{
     Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar, DimensionOperation, DimensionSize,
     DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
     ImportingContext, InterpretableOperation, LogicalMesh, MeshAxis, MeshContext, NamedAxes, NamedAxis,
-    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, ProgramError, Provenance,
-    ProvenanceScope, RegionDriver, RegionRef, RegionRole, Sharding, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, TracingContext, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection,
-    Zero, ZeroOperation, decode_logical_bytes,
+    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramError,
+    Provenance, ProvenanceScope, RegionDriver, RegionRef, RegionRole, Sharding, SpecializationCache,
+    SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Type as CoreType, TypeError, Typed,
+    TypedProgram, ValueProjection, Zero, ZeroOperation, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -125,8 +125,8 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
-    Array, ArrayPlacement, ArrayShard, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram,
-    FromPjrt, LiveArray, LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
+    Array, ArrayShard, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
+    LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
 pub mod effects;
@@ -380,6 +380,20 @@ impl Session {
     #[inline]
     pub fn device_mesh(&self) -> Result<&DeviceMesh, Error> {
         self.mesh.as_ref().ok_or_else(|| Error::from(SessionError::MissingMesh))
+    }
+
+    /// Creates a [`Placement`] for `sharding` on this session's [default mesh](Self::device_mesh). Use the placement
+    /// as a source or destination of [`Self::place`], [`Array::to_placement`], or [`Array::into_placement`]. These
+    /// entry points extend a sharding with replicated trailing dimensions when the value has higher rank.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::MissingMesh`] when the session has no default mesh, or
+    /// [`ShardingError::MeshMismatch`](ryft_core::ShardingError::MeshMismatch) when the sharding describes a different
+    /// logical topology.
+    #[inline]
+    pub fn placement(&self, sharding: Sharding) -> Result<Placement, Error> {
+        Ok(Placement::new(self.device_mesh()?.clone(), sharding)?)
     }
 
     /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
@@ -1122,11 +1136,10 @@ impl Context for Session {
 
         // Lowering passes the session constants of the lowered regions to the compiled program as hidden arguments, so
         // the arrays that this application captures take part in its placement like array inputs do. They are collected
-        // from the regions of this application before any deduplication, because the commitment of a handle is not part
-        // of the identity of its session constant, and a cached program may have been built from other handles of the
-        // same arrays. The arrays that the callee of a call closes over never decide where the call runs nor whether
-        // its results are committed, like its lifted captures (refer to `JitCallOperation::eager_inputs`), so they
-        // take no part, and execution places them on the mesh of the call.
+        // from the regions of this application and not from a cached program, because a cached program may have been
+        // built from other handles of the same arrays. The arrays that the callee of a call closes over never decide
+        // where the call runs nor whether its results are committed, like its lifted captures (refer to
+        // `JitCallOperation::eager_inputs`), so they take no part, and execution places them on the mesh of the call.
         let captures = if is_call {
             Vec::new()
         } else {
@@ -1286,15 +1299,12 @@ impl Context for Session {
                 //
                 // A device or in-place target resolves against the array here, through the one resolver that also
                 // resolves the destinations of `Session::place` for an `Array` leaf (refer to
-                // `ArrayPlacement::from_request` and `Array::run_placement_request`), so that the array takes exactly
-                // the type that the type rule of the request infers (e.g., an array on more devices is gathered onto a
-                // device target, replicated over the canonical mesh of one device). Like every placement with a target,
-                // its result is committed, as JAX commits the result of `device_put` onto a device or a memory space.
+                // `Array::run_placement_request`), so that the array takes exactly the type that the type rule of the
+                // request infers (e.g., an array on more devices is gathered onto a device target, replicated over the
+                // canonical mesh of one device). Like every placement with a target, its result is committed, as JAX
+                // commits the result of `device_put` onto a device or a memory space.
                 let output = match operation.target() {
-                    Some(target) => {
-                        let target = ArrayPlacement::from_request(target);
-                        array.run_placement_request(self, target, false)
-                    }
+                    Some(target) => array.run_placement_request(self, target.clone(), false),
                     None => array.with_session(self),
                 }
                 .and_then(|output| if operation.may_alias() { Ok(output) } else { output.into_unaliased(self) })
@@ -2093,8 +2103,8 @@ pub(crate) mod tests {
         values_to_bytes,
     };
     use crate::{
-        ArrayPlacement, CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
-        JitCallOperation, PlacementOptions, ProgramBuilder, Reference, jit,
+        CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt, JitCallOperation,
+        PlacementOptions, ProgramBuilder, Reference, jit,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -2662,7 +2672,7 @@ pub(crate) mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
-        let source_mesh = ArrayPlacement::device(mesh.devices()[0]).resolve(&session, 1).unwrap().mesh().clone();
+        let source_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
         let scoped = session.with_new_effect_scope().with_device_mesh(source_mesh);
 
         let input = Array::from_host_buffer(
@@ -2678,7 +2688,7 @@ pub(crate) mod tests {
         let output = Neg::neg(&input).unwrap();
         assert_eq!(session.state.work.snapshot(), 2);
 
-        let placed = output.into_placement(&scoped, ArrayPlacement::device(mesh.devices()[1])).unwrap();
+        let placed = output.into_placement(&scoped, mesh.devices()[1]).unwrap();
         assert_eq!(session.state.work.snapshot(), 3);
 
         let bytes = placed.copy_to_host_bytes().unwrap();

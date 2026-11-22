@@ -137,7 +137,7 @@ mod tests {
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayPlacement, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options,
         PlacementOptions, ProgramBuilder, Session, TracedProgram, Type, Value, compile, compile_with_options, trace,
     };
 
@@ -1175,7 +1175,7 @@ mod tests {
         // and type, and so they do for an array with a pending reduction along `x`, which has size one and which the
         // device completes.
         let direct = session
-            .place(input.clone(), PlacementOptions::to(ArrayPlacement::device(second_device).with_memory(memory)))
+            .place(input.clone(), PlacementOptions::to(PlacementRequest::Device { device: second_device, memory: Some(memory), layout: None }))
             .unwrap();
         assert_eq!(
             (output.mesh(), output.sharding(), output.r#type()),

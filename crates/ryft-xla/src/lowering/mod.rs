@@ -1578,13 +1578,13 @@ pub(crate) enum EntryResultPlacement {
 /// placement that the callee gives the corresponding callee result, and a callee result that returns a callee input is
 /// followed back to the corresponding input of the call. The boundary of the callee takes precedence, because the
 /// callee body cannot always show it, so a result of the call that a sharding override of a callee output covers is
-/// placed as that override, and one that returns a callee input with an effective boundary sharding (i.e., its override
-/// or otherwise the sharding of its declared type, refer to [`JitCallOperation::boundary_input_sharding`]) is placed as
-/// that sharding. Lowering constrains that result or operand of the call to that sharding as well, so that the call
-/// places it alike whether a program returns it or consumes it (refer to the lowering of [`JitCallOperation`]). Other
-/// operations that return a value equal to an input are not followed, because they change its placement (e.g.,
-/// `reshard` and `constrain_sharding`) or because the compiler is free to place their results differently (e.g., the
-/// `optimization_barrier` of rematerialization).
+/// placed as that override, and one that returns a callee input with an effective boundary sharding (i.e., its
+/// override or otherwise where the executable of the callee places it, refer to
+/// [`JitCallOperation::boundary_input_sharding`]) is placed as that sharding. Lowering constrains that result or
+/// operand of the call to that sharding as well, so that the call places it alike whether a program returns it or
+/// consumes it (refer to the lowering of [`JitCallOperation`]). Other operations that return a value equal to an input
+/// are not followed, because they change its placement (e.g., `reshard` and `constrain_sharding`) or because the
+/// compiler is free to place their results differently (e.g., the `optimization_barrier` of rematerialization).
 pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     output_count: usize,
@@ -2106,21 +2106,31 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
         Type::Array(input_type) => input_type.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis)),
         Type::Dimension(_) | Type::Reference(_) => false,
     });
-    // The lowering only appends operations to the block, so the operations that follow the last one before the
-    // lowering are those that the lowering emits into this block.
-    let previous_operation = if has_pending_reduction { Some(block.operations()?.last().transpose()?) } else { None };
+    // The lowering only appends operations to the block, so the operations that follow an anchor appended before the
+    // lowering are those that the lowering emits into this block, which are found without walking the operations of
+    // the block that precede them. The anchor is a `stablehlo.after_all` without operands, whose result nothing uses,
+    // and it is removed once they are constrained.
+    let anchor = if has_pending_reduction {
+        Some(block.append_operation(stable_hlo::after_all::<ValueRef<'b, 'c, 't>, _>(&[], location)?)?)
+    } else {
+        None
+    };
     let mut outputs = operation.lower(lowerer, input_values, input_types, output_types)?;
     let collective_state = lowerer.collective_state();
-    if let Some(previous_operation) = previous_operation {
+    if let Some(anchor) = anchor {
         constrain_unreduced_intermediates(
-            previous_operation,
+            anchor,
             input_values,
             input_types,
             &outputs,
+            output_types,
             collective_state,
             &mut block,
             location,
         )?;
+        // SAFETY: nothing uses the result of the anchor, so removing it from the block and dropping the detached
+        // operation that `remove_operation` returns destroys it without leaving a dangling use.
+        unsafe { block.remove_operation(anchor)? };
     }
     constrain_unreduced_outputs(&mut outputs, output_types, collective_state, &mut block, location)?;
     Ok(outputs)
@@ -2170,18 +2180,89 @@ impl PendingReduction {
         Ok((!axes.is_empty()).then_some(Self { axes, kind }))
     }
 
-    /// Returns the replicated sharding of rank `rank` over `mesh` that declares this pending reduction.
-    fn sharding(&self, mesh: &LogicalMesh, rank: usize) -> Result<Sharding, Error> {
-        Sharding::replicated(mesh.clone(), rank)
-            .with_unreduced_axes(self.axes.iter().cloned())
-            .and_then(|sharding| sharding.with_unreduced_kind(self.kind))
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }.into())
+    /// Returns the sharding of rank `rank` over `mesh` that declares this pending reduction for a value whose
+    /// dimensions are partitioned as `dimensions`, if known, and are otherwise replicated. Replication is also the
+    /// fallback when `dimensions` partitions a dimension along an axis of the pending reduction.
+    fn sharding(
+        &self,
+        mesh: &LogicalMesh,
+        rank: usize,
+        dimensions: Option<&[ShardingDimension]>,
+    ) -> Result<Sharding, Error> {
+        let declare = |sharding: Sharding| {
+            sharding
+                .with_unreduced_axes(self.axes.iter().cloned())
+                .and_then(|sharding| sharding.with_unreduced_kind(self.kind))
+        };
+        let partitioned = dimensions
+            .filter(|dimensions| dimensions.len() == rank)
+            .and_then(|dimensions| Sharding::new(mesh.clone(), dimensions.to_vec()).and_then(declare).ok());
+        match partitioned {
+            Some(sharding) => Ok(sharding),
+            None => declare(Sharding::replicated(mesh.clone(), rank))
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }.into()),
+        }
     }
 }
 
-/// Constrains the intermediate values that the lowering of one instruction emitted into `block` after
-/// `previous_operation` (or from the start of `block`, when it is [`None`]) and that carry a pending reduction, for
-/// [`lower_instruction_operation`]. The `outputs` of the instruction are left to [`constrain_unreduced_outputs`].
+/// Names of the elementwise StableHLO operations whose results are partitioned like their operands of the same shape,
+/// along which [`constrain_unreduced_intermediates`] carries the dimension shardings of the values that it constrains.
+const ELEMENTWISE_OPERATIONS: &[&str] = &[
+    "stablehlo.abs",
+    "stablehlo.add",
+    "stablehlo.and",
+    "stablehlo.bitcast_convert",
+    "stablehlo.clamp",
+    "stablehlo.compare",
+    "stablehlo.convert",
+    "stablehlo.divide",
+    "stablehlo.maximum",
+    "stablehlo.minimum",
+    "stablehlo.multiply",
+    "stablehlo.negate",
+    "stablehlo.not",
+    "stablehlo.or",
+    "stablehlo.select",
+    "stablehlo.subtract",
+    "stablehlo.xor",
+];
+
+/// Returns the shape of `value` when it is a ranked tensor, where [`None`] marks a dynamic dimension.
+fn tensor_shape(value: ValueRef<'_, '_, '_>) -> Result<Option<Vec<Option<usize>>>, Error> {
+    Ok(value
+        .r#type()?
+        .cast::<TensorTypeRef>()
+        .map(|r#type| r#type.dimensions().map(|size| size.value()).collect()))
+}
+
+/// Returns the dimension shardings of `sharding`, with its unconstrained dimensions closed as replicated, which is how
+/// a runtime array stores them and how a constraint that must state its pending reduction can declare them.
+fn closed_dimensions(sharding: &Sharding) -> Rc<[ShardingDimension]> {
+    sharding
+        .dimensions()
+        .iter()
+        .map(|dimension| match dimension {
+            ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+            dimension => dimension.clone(),
+        })
+        .collect()
+}
+
+/// Returns the operation that follows `operation` in its block, if any.
+fn next_operation<'b, 'c, 't>(operation: OperationRef<'b, 'c, 't>) -> Result<Option<OperationRef<'b, 'c, 't>>, Error> {
+    // SAFETY: `operation` is an operation of a block, for which the C API returns the operation after it, or a null
+    // handle when it is the last one.
+    let handle = unsafe { ryft_xla_sys::bindings::mlirOperationGetNextInBlock(operation.to_c_api()) };
+    if handle.ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the handle is not null and names an operation of the same block, which lives in the same context.
+    Ok(Some(unsafe { OperationRef::from_c_api(handle, operation.context())? }))
+}
+
+/// Constrains the intermediate values that the lowering of one instruction emitted into `block` after `anchor` and that
+/// carry a pending reduction, for [`lower_instruction_operation`]. The `outputs` of the instruction, of types
+/// `output_types`, are left to [`constrain_unreduced_outputs`].
 ///
 /// The pending reductions follow the dataflow of the emitted operations, in their order in `block`:
 ///
@@ -2208,17 +2289,30 @@ impl PendingReduction {
 ///     with [`LoweringError::UnsupportedOperation`]. Operands that are unreduced over different axes (e.g., the
 ///     factors of a `mul`) give a result that is unreduced over the union of those axes, like the core rules.
 ///
-/// Each constrained value is a `sdy.sharding_constraint` placed right after the operation that produces it, with a
-/// sharding of its rank that is replicated in every dimension and declares its pending reduction, and it replaces
-/// every later use of that value. A value that a `sdy.sharding_constraint` already uses (e.g., one that the lowering of
-/// an instruction of a nested region inlined into the same block constrained) is left as it is. Operations nested in
-/// the regions of emitted operations are not visited, because their region arguments carry no sharding of their own
-/// (e.g., the scalar arguments of a `stablehlo.reduce` body).
+/// Each constrained value is a `sdy.sharding_constraint` placed right after the operation that produces it, which
+/// declares its pending reduction, and it replaces every later use of that value. A value that a
+/// `sdy.sharding_constraint` already uses (e.g., one that the lowering of an instruction of a nested region inlined
+/// into the same block constrained) is left as it is. Operations nested in the regions of emitted operations are not
+/// visited, because their region arguments carry no sharding of their own (e.g., the scalar arguments of a
+/// `stablehlo.reduce` body).
+///
+/// The constraint partitions the dimensions of the value as an input of the instruction with a pending reduction or an
+/// output of the instruction partitions its own, where the value is known to be partitioned alike, so that it does not
+/// gather a value that the instruction leaves split along another axis. These dimension shardings follow the
+/// [`ELEMENTWISE_OPERATIONS`] whose operands and results have the same shape: forward from the inputs to the results,
+/// and backward from the outputs to the operands, which covers the intermediates of a reduction that an elementwise
+/// operation turns into an output (e.g., the sum of a mean before its division). Every other operation may permute or
+/// drop dimensions, so its results take only the dimension shardings that reach them backward from an output, and an
+/// intermediate that neither reaches is replicated in every dimension. Shardy rejects an unconstrained dimension in
+/// such a constraint, because its propagation then drops the unreduced axes at the consumer, so the dimensions are
+/// always closed.
+#[allow(clippy::too_many_arguments)]
 fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
-    previous_operation: Option<OperationRef<'b, 'c, 't>>,
+    anchor: OperationRef<'b, 'c, 't>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[Type],
     outputs: &[ValueRef<'b, 'c, 't>],
+    output_types: &[Type],
     collective_state: &CollectiveLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
@@ -2239,16 +2333,58 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     }) else {
         return Ok(());
     };
-    let mut operations = block.operations()?;
-    if let Some(previous_operation) = previous_operation {
-        for operation in operations.by_ref() {
-            if operation? == previous_operation {
-                break;
+    // The emitted operations are collected before any constraint is inserted, so that the constraints are not visited.
+    let mut operations = Vec::new();
+    let mut next = next_operation(anchor)?;
+    while let Some(operation) = next {
+        operations.push(operation);
+        next = next_operation(operation)?;
+    }
+    let operation_name = |operation: &OperationRef<'b, 'c, 't>| -> Result<String, Error> {
+        let name = operation.name();
+        let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        Ok(name.to_string())
+    };
+    let find = |value: ValueRef<'b, 'c, 't>, dimensions: &[(ValueRef<'b, 'c, 't>, Rc<[ShardingDimension]>)]| {
+        dimensions
+            .iter()
+            .find(|(candidate, _)| *candidate == value)
+            .map(|(_, dimensions)| Rc::clone(dimensions))
+    };
+
+    // The dimension shardings of the inputs with a pending reduction, which flow forward, and those of the outputs,
+    // which flow backward through the elementwise operations, before any constraint replaces a use.
+    let array_dimensions = |values: &[ValueRef<'b, 'c, 't>], types: &[Type], pending: bool| {
+        values
+            .iter()
+            .zip(types)
+            .filter_map(|(value, r#type)| match r#type {
+                Type::Array(r#type)
+                    if !pending || pending_reductions.iter().any(|(candidate, _)| candidate == value) =>
+                {
+                    r#type.sharding().map(|sharding| (*value, closed_dimensions(sharding)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut forward_dimensions = array_dimensions(input_values, input_types, true);
+    let mut backward_dimensions = array_dimensions(outputs, output_types, false);
+    for operation in operations.iter().rev() {
+        if operation.result_count() != 1 || !ELEMENTWISE_OPERATIONS.contains(&operation_name(operation)?.as_str()) {
+            continue;
+        }
+        let result = operation.result(0)?.as_ref();
+        let Some(dimensions) = find(result, &backward_dimensions) else { continue };
+        let shape = tensor_shape(result)?;
+        for operand in operation.operand_values() {
+            let operand = operand?;
+            if find(operand, &backward_dimensions).is_none() && tensor_shape(operand)? == shape {
+                backward_dimensions.push((operand, Rc::clone(&dimensions)));
             }
         }
     }
-    // The emitted operations are collected before any constraint is inserted, so that the constraints are not visited.
-    let operations = operations.collect::<Result<Vec<_>, _>>()?;
+
     // The values of a nested region that the lowering inlines into the same block are constrained by the lowering of
     // the instructions of that region, which this walk visits again.
     let is_constrained = |value: ValueRef<'b, 'c, 't>| -> Result<bool, Error> {
@@ -2267,8 +2403,8 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
                 .map(|(_, reduction)| reduction.clone())
         };
     for operation in operations {
-        let name = operation.name();
-        let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let name = operation_name(&operation)?;
+        let name = name.as_str();
         let result_reductions = if name == "sdy.sharding_constraint" {
             vec![PendingReduction::of_constraint(operation)?]
         } else if name.starts_with("sdy.") || matches!(name, "func.call" | "stablehlo.case" | "stablehlo.if") {
@@ -2303,6 +2439,9 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
             }
             vec![merged; operation.result_count()]
         };
+        // An elementwise result is partitioned like its operands of its shape, and result `i` of a loop like its
+        // operand `i`.
+        let elementwise = ELEMENTWISE_OPERATIONS.contains(&name);
         let constrains = name != "sdy.sharding_constraint";
         let mut anchor = operation;
         for (index, reduction) in result_reductions.into_iter().enumerate() {
@@ -2310,19 +2449,41 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
                 continue;
             };
             let result = operation.result(index)?.as_ref();
+            let mut dimensions = None;
+            if elementwise {
+                let shape = tensor_shape(result)?;
+                for operand in operation.operand_values() {
+                    let operand = operand?;
+                    if let Some(operand_dimensions) = find(operand, &forward_dimensions)
+                        && tensor_shape(operand)? == shape
+                    {
+                        dimensions = Some(operand_dimensions);
+                        break;
+                    }
+                }
+            } else if name == "stablehlo.while" {
+                dimensions = find(operation.operand_value(index)?, &forward_dimensions);
+            }
+            let dimensions = dimensions.or_else(|| find(result, &backward_dimensions));
             let rank = result.r#type()?.cast::<TensorTypeRef>().map(|r#type| r#type.rank());
             let (Some(rank), true) = (rank, constrains && !outputs.contains(&result) && !is_constrained(result)?)
             else {
+                if let Some(dimensions) = dimensions {
+                    forward_dimensions.push((result, dimensions));
+                }
                 pending_reductions.push((result, reduction));
                 continue;
             };
-            let sharding = reduction.sharding(mesh, rank)?;
+            let sharding = reduction.sharding(mesh, rank, dimensions.as_deref())?;
             let constrained = lower_sharding_constraint(&[result], &sharding, bound_manual_axes, block, location)?[0];
             let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
             // The constraint is appended to the block, and moved right after the operation that produces its operand
             // (or after the constraint of the previous result), so that it dominates every later use of that operand.
             anchor = unsafe { constraint.move_after(&anchor) };
             result.replace_uses_except(constrained, &[&anchor]);
+            if let Some(dimensions) = dimensions {
+                forward_dimensions.push((constrained, dimensions));
+            }
             pending_reductions.push((constrained, reduction));
         }
     }
@@ -3064,7 +3225,7 @@ fn region_result_placements<O: LowerableOperationFamily>(
                         match (actual.as_ref(), declared.get(*index)?) {
                             (Type::Array(actual), declared) => {
                                 match call.boundary_input_sharding(*index, actual, declared) {
-                                    Some(sharding) => return Some(EntryResultPlacement::Target(sharding.clone())),
+                                    Some(sharding) => return Some(EntryResultPlacement::Target(sharding.into_owned())),
                                     None => *index,
                                 }
                             }
@@ -3225,9 +3386,9 @@ pub(crate) mod tests {
         AddOperation, Array, ArrayOperations, AtomId, CaptureReference, CastOperation, Complex, ConditionOperation,
         ConstantOperation, Context, Cos, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EagerContext,
-        EffectClasses, Error as CoreError, Layout, LinearCallOperation, MeshAxis, MeshAxisType, MulOperation,
+        EffectClasses, Error as CoreError, Layout, LinearCallOperation, Max, MeshAxis, MeshAxisType, MulOperation,
         NegOperation, OneLike, ParallelReduce, ParameterizedFamily, Place, Placeholder, Placement, PrintOperation,
-        Program, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, ReduceOperation,
+        Program, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, Reduce, ReduceOperation,
         ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceType, ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions,
         ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout, Tag, TiledLayout,
@@ -4807,6 +4968,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_lower_instruction_constrains_unreduced_intermediates_with_dimension_shardings() {
+        // The intermediates of an instruction whose inputs carry a pending reduction and are split along another axis
+        // keep that split, which flows forward through the elementwise comparisons and selections of a maximum, and
+        // backward from the output through the division of a mean to the sum that it divides, so that none of them is
+        // gathered.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let split = Sharding::new(mesh, vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let lower = |kind: UnreducedKind| {
+            let sharding = split.clone().with_unreduced_kind(kind).unwrap();
+            let input_type = ArrayType::new_static(DataType::F32, [8, 4]).with_sharding(sharding).unwrap();
+            let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+                |(left, right): (ArrayTracer, ArrayTracer)| match kind {
+                    UnreducedKind::Max => left.max(&right).unwrap(),
+                    _ => left.reduce_mean(&[1]).unwrap() - right.reduce_mean(&[1]).unwrap(),
+                },
+                (input_type.clone(), input_type),
+            )
+            .unwrap();
+            traced.to_mlir_module("main").unwrap()
+        };
+        assert_eq!(
+            lower(UnreducedKind::Max),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {}], unreduced=max{"x"}>}, %arg1: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {}], unreduced=max{"x"}>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {}], unreduced=max{"x"}>}) {
+                    %0 = stablehlo.compare GT, %arg0, %arg1, FLOAT : (tensor<8x4xf32>, tensor<8x4xf32>) -> tensor<8x4xi1>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %2 = stablehlo.select %1, %arg0, %arg1 : tensor<8x4xi1>, tensor<8x4xf32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    %4 = stablehlo.negate %arg0 : tensor<8x4xf32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    %6 = stablehlo.compare EQ, %arg0, %arg1, FLOAT : (tensor<8x4xf32>, tensor<8x4xf32>) -> tensor<8x4xi1>
+                    %7 = sdy.sharding_constraint %6 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %8 = stablehlo.compare EQ, %arg0, %5, FLOAT : (tensor<8x4xf32>, tensor<8x4xf32>) -> tensor<8x4xi1>
+                    %9 = sdy.sharding_constraint %8 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %10 = stablehlo.and %7, %9 : tensor<8x4xi1>
+                    %11 = sdy.sharding_constraint %10 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %12 = stablehlo.add %arg0, %arg1 : tensor<8x4xf32>
+                    %13 = sdy.sharding_constraint %12 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    %14 = stablehlo.select %11, %13, %3 : tensor<8x4xi1>, tensor<8x4xf32>
+                    %15 = sdy.sharding_constraint %14 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    %16 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<8x4xf32>, tensor<8x4xf32>) -> tensor<8x4xi1>
+                    %17 = sdy.sharding_constraint %16 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %18 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<8x4xf32>, tensor<8x4xf32>) -> tensor<8x4xi1>
+                    %19 = sdy.sharding_constraint %18 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xi1>
+                    %20 = stablehlo.select %19, %arg1, %15 : tensor<8x4xi1>, tensor<8x4xf32>
+                    %21 = sdy.sharding_constraint %20 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    %22 = stablehlo.select %17, %arg0, %21 : tensor<8x4xi1>, tensor<8x4xf32>
+                    %23 = sdy.sharding_constraint %22 <@mesh, [{"y"}, {}], unreduced=max{"x"}> : tensor<8x4xf32>
+                    return %23 : tensor<8x4xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lower(UnreducedKind::Sum),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {}], unreduced={"x"}>}, %arg1: tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}, {}], unreduced={"x"}>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"y"}], unreduced={"x"}>}) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<8x4xf32>, tensor<f32>) -> tensor<8xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{"y"}], unreduced={"x"}> : tensor<8xf32>
+                    %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                    %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                    %3 = stablehlo.divide %1, %2 : tensor<8xf32>
+                    %4 = sdy.sharding_constraint %3 <@mesh, [{"y"}], unreduced={"x"}> : tensor<8xf32>
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %5 = stablehlo.reduce(%arg1 init: %cst_1) applies stablehlo.add across dimensions = [1] : (tensor<8x4xf32>, tensor<f32>) -> tensor<8xf32>
+                    %6 = sdy.sharding_constraint %5 <@mesh, [{"y"}], unreduced={"x"}> : tensor<8xf32>
+                    %cst_2 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                    %7 = stablehlo.broadcast_in_dim %cst_2, dims = [] : (tensor<f32>) -> tensor<8xf32>
+                    %8 = stablehlo.divide %6, %7 : tensor<8xf32>
+                    %9 = sdy.sharding_constraint %8 <@mesh, [{"y"}], unreduced={"x"}> : tensor<8xf32>
+                    %10 = stablehlo.subtract %4, %9 : tensor<8xf32>
+                    %11 = sdy.sharding_constraint %10 <@mesh, [{"y"}], unreduced={"x"}> : tensor<8xf32>
+                    return %11 : tensor<8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_lower_mlir_module_for_program_omits_shardy_for_targets_without_the_dialect() {
         // A device target that completes a pending reduction over a mesh axis of size one constrains its result, and
         // the signature shardings annotate the entry function. A target whose plugin lacks the Shardy dialect gets
@@ -5989,7 +6242,9 @@ pub(crate) mod tests {
     fn test_collect_nested_sharding_mesh_includes_call_boundaries() {
         // A call constrains its result to the override of the boundary of its callee, which no type records because the
         // override is over an auto mesh axis, so the module declares the mesh of the override even when it is lowered
-        // without signature shardings, both for a static program and for one with a bounded dynamic value.
+        // without signature shardings, both for a static program and for one with a bounded dynamic value. The call
+        // also constrains its operand replicated over that mesh, as an execution of its callee, whose input type has no
+        // sharding, places its argument (refer to `JitCallOperation::boundary_input_sharding`).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
@@ -6024,7 +6279,8 @@ pub(crate) mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
-                    return %0 : tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<4xf32>
+                    return %1 : tensor<4xf32>
                   }
                 }
             "#},
@@ -6038,9 +6294,10 @@ pub(crate) mod tests {
                   func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>) {
                     %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
                     %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
-                    %2 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
-                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
-                    return %1, %3 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>
+                    %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
+                    %3 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
+                    %4 = stablehlo.convert %3 : (tensor<i32>) -> tensor<i64>
+                    return %2, %4 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>
                   }
                 }
             "#},

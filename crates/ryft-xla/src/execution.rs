@@ -1883,7 +1883,7 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayPlacement, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options,
+        Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options,
         PRINT_CUSTOM_CALL_TARGET, Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension,
         RuntimeExtensions, RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully,
         compile_statefully_with_captures,
@@ -2934,7 +2934,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let uncommitted =
             Array::from_host_buffer(&session, scalar_type.clone(), None, None, 1f32.to_ne_bytes().as_slice()).unwrap();
-        let placement = ArrayPlacement::mesh(uncommitted.mesh().clone(), uncommitted.sharding().clone()).unwrap();
+        let placement = Placement::new(uncommitted.mesh().clone(), uncommitted.sharding().clone()).unwrap();
         let committed = uncommitted.to_placement(&session, placement).unwrap();
         assert!(!uncommitted.is_committed());
         assert!(committed.is_committed());

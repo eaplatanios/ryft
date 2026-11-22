@@ -557,7 +557,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType,
-        Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, ProjectedValue,
+        Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, Placement, ProjectedValue,
         ReductionKind, ReferenceType, ShardMapOptions, Sharding, ShardingDimension, UnreducedKind, ValueProjection,
         batch, shard_map,
     };
@@ -583,7 +583,7 @@ mod tests {
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
     #[cfg(feature = "cuda-13")]
-    use crate::{ArrayPlacement, ExecutionError, ToPjrt};
+    use crate::{ExecutionError, ToPjrt};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -843,7 +843,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     fn probe_cross_host_placements(
         client: &'static Client<'static>,
-        place: impl Fn(Array, &Session, ArrayPlacement) -> Result<Array, Error>,
+        place: impl Fn(Array, &Session, Placement) -> Result<Array, Error>,
     ) {
         let rank = client.process_index().unwrap();
         match client.cross_host_transfers_extension() {
@@ -881,27 +881,27 @@ mod tests {
             (
                 "sharded_to_reversed_sharded",
                 array(&forward_mesh, sharded(&forward_mesh), [9.0, 10.0, 11.0, 12.0]),
-                ArrayPlacement::mesh(reversed_mesh.clone(), sharded(&reversed_mesh)).unwrap(),
+                Placement::new(reversed_mesh.clone(), sharded(&reversed_mesh)).unwrap(),
             ),
             (
                 "replicated_to_replicated",
                 array(&process_0_mesh, replicated(&process_0_mesh), [1.0, 2.0, 3.0, 4.0]),
-                ArrayPlacement::mesh(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+                Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
             ),
             (
                 "replicated_to_sharded",
                 array(&process_0_mesh, replicated(&process_0_mesh), [5.0, 6.0, 7.0, 8.0]),
-                ArrayPlacement::mesh(forward_mesh.clone(), sharded(&forward_mesh)).unwrap(),
+                Placement::new(forward_mesh.clone(), sharded(&forward_mesh)).unwrap(),
             ),
             (
                 "sharded_to_reversed_replicated",
                 array(&forward_mesh, sharded(&forward_mesh), [13.0, 14.0, 15.0, 16.0]),
-                ArrayPlacement::mesh(reversed_mesh.clone(), replicated(&reversed_mesh)).unwrap(),
+                Placement::new(reversed_mesh.clone(), replicated(&reversed_mesh)).unwrap(),
             ),
             (
                 "replicated_to_replicated_again",
                 array(&process_0_mesh, replicated(&process_0_mesh), [17.0, 18.0, 19.0, 20.0]),
-                ArrayPlacement::mesh(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+                Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
             ),
         ];
         for (name, source, target) in placements {
@@ -924,7 +924,7 @@ mod tests {
     /// memory kind and the elements of every shard that this process addresses afterwards and the result of
     /// [`Array::block_until_ready`], or with the first line of the error of the placement.
     #[cfg(feature = "cuda-13")]
-    fn probe_placement(rank: usize, name: &str, session: &Session, source: &Array, target: ArrayPlacement) {
+    fn probe_placement(rank: usize, name: &str, session: &Session, source: &Array, target: Placement) {
         match source.to_placement(session, target) {
             Ok(placed) => {
                 let ready = match placed.block_until_ready() {
@@ -950,7 +950,7 @@ mod tests {
     /// that this rank addresses. A failed placement, readiness check, or readback panics with the rank and the step,
     /// which the report of [`run_cuda_rank_pair`] shows for both ranks.
     #[cfg(feature = "cuda-13")]
-    fn probe_placement_step(rank: usize, step: &str, session: &Session, source: &Array, target: ArrayPlacement) {
+    fn probe_placement_step(rank: usize, step: &str, session: &Session, source: &Array, target: Placement) {
         let placed = source
             .to_placement(session, target)
             .and_then(|placed| placed.block_until_ready().map(|()| placed))
@@ -2079,7 +2079,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             )
             .unwrap();
             let placed =
-                source.to_placement(&session, ArrayPlacement::mesh(destination_mesh.clone(), rows.clone()).unwrap());
+                source.to_placement(&session, Placement::new(destination_mesh.clone(), rows.clone()).unwrap());
             let placed = placed.unwrap();
             placed.block_until_ready().unwrap();
             assert_eq!(placed.mesh(), &destination_mesh);
@@ -2199,7 +2199,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             };
             let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated.clone()).unwrap();
             let source = Array::from_addressable_buffers(&session, r#type, source_mesh, None, buffers).unwrap();
-            let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated).unwrap();
+            let target = Placement::new(destination_mesh.clone(), replicated).unwrap();
             let placed = source.to_placement(&session, target).unwrap();
             placed.block_until_ready().unwrap();
             assert_eq!(placed.mesh(), &destination_mesh);
@@ -2257,7 +2257,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             // between the same devices read stale halves. Both memories exist on CUDA devices, so this does not exercise
             // such a failure, and a rank that failed so would not reach the transfers of a later placement of a tree.
             for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
-                let target = ArrayPlacement::mesh(reversed_mesh.clone(), sharded.clone()).unwrap().with_memory(memory);
+                let target = Placement::new(reversed_mesh.clone(), sharded.clone()).unwrap().with_memory(memory);
                 match source.to_placement(&session, target) {
                     Ok(placed) => {
                         let ready = match placed.block_until_ready() {
@@ -2339,7 +2339,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                     .unwrap();
                 let values = values_to_bytes(&[1f32, 2., 3., 4.]);
                 let source = Array::from_host_buffer(&session, r#type, source_mesh.clone(), None, values).unwrap();
-                let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap();
+                let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
                 probe_placement(rank, &format!("{memory:?}"), &session, &source, target);
             }
         });
@@ -2429,7 +2429,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 let sharding = Some(replicated.clone());
                 Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), sharding, Vec::new()).unwrap()
             };
-            let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap();
+            let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
             let placed = source
                 .to_placement(&session, target)
                 .and_then(|placed| placed.block_until_ready().map(|()| placed))
@@ -2509,7 +2509,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             // unmatched would make the next one between the same devices read stale values.
             for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
                 let target =
-                    ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap().with_memory(memory);
+                    Placement::new(destination_mesh.clone(), replicated.clone()).unwrap().with_memory(memory);
                 probe_placement(rank, &format!("{memory:?}"), &session, &source, target);
             }
         });
@@ -2573,7 +2573,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             assert!(!source.is_committed());
             assert_eq!(source.mesh().devices(), [devices[rank]]);
             for (name, sharding) in [("replicated", &replicated), ("sharded", &sharded)] {
-                let target = ArrayPlacement::mesh(mesh.clone(), sharding.clone()).unwrap();
+                let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
                 probe_placement(rank, name, &session, &source, target);
             }
             let source_mesh = DeviceMesh::new(
@@ -2584,7 +2584,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let r#type = ArrayType::new_static(DataType::F32, [4]);
             let values = values_to_bytes(&[5f32, 6., 7., 8.]);
             let committed = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
-            let target = ArrayPlacement::mesh(mesh, replicated).unwrap();
+            let target = Placement::new(mesh, replicated).unwrap();
             probe_placement(rank, "committed", &session, &committed, target);
         });
     }
@@ -2648,7 +2648,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             assert!(source.is_committed());
             assert_eq!(source.mesh().devices(), [devices[rank]]);
             for (name, sharding) in [("replicated", &replicated), ("sharded", &sharded)] {
-                let target = ArrayPlacement::mesh(mesh.clone(), sharding.clone()).unwrap();
+                let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
                 probe_placement(rank, name, &session, &source, target);
             }
         });
@@ -2814,8 +2814,9 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             for owner in [0, 1] {
                 let step = format!("onto rank {owner}");
                 let mesh = DeviceMesh::new(logical_mesh(1), vec![devices[owner]]).unwrap();
-                let target = ArrayPlacement::mesh(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2));
+                let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2));
                 let placed = target
+                    .map_err(Error::from)
                     .and_then(|target| source.to_placement(&session, target))
                     .and_then(|placed| placed.block_until_ready().map(|()| placed))
                     .unwrap_or_else(|error| panic!("rank {rank} failed to place the source {step}: {error}"));
@@ -2927,7 +2928,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             assert_eq!(source.mesh().devices(), [devices[rank]]);
             for owner in [0, 1] {
                 let mesh = DeviceMesh::new(logical_mesh(1), vec![devices[owner]]).unwrap();
-                let target = ArrayPlacement::mesh(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1));
+                let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1));
                 let target = target.unwrap();
                 probe_placement_step(rank, steps.next().unwrap(), &session, &source, target.clone());
                 let target = target.with_memory(Memory::Host { pinned: true });
@@ -2939,7 +2940,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
             let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
             for sharding in [replicated.clone(), split] {
-                let target = ArrayPlacement::mesh(mesh.clone(), sharding).unwrap();
+                let target = Placement::new(mesh.clone(), sharding).unwrap();
                 probe_placement_step(rank, steps.next().unwrap(), &session, &source, target);
             }
 
@@ -2949,7 +2950,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let r#type = ArrayType::new_static(DataType::F32, [4]);
             let values = values_to_bytes(&[5f32, 6., 7., 8.]);
             let committed = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
-            let target = ArrayPlacement::mesh(mesh, replicated).unwrap();
+            let target = Placement::new(mesh, replicated).unwrap();
             probe_placement_step(rank, steps.next().unwrap(), &session, &committed, target);
             assert!(steps.next().is_none());
         });
@@ -3035,7 +3036,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 let values = values_to_bytes(&[1f32, 2., 3., 4.]);
                 let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
                 for mesh in &meshes {
-                    let target = ArrayPlacement::mesh(mesh.clone(), rows(mesh)).unwrap();
+                    let target = Placement::new(mesh.clone(), rows(mesh)).unwrap();
                     probe_placement_step(rank, steps.next().unwrap(), &session, &source, target);
                 }
             }
@@ -3105,7 +3106,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
             let memories = [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }];
             for (step, memory) in steps.iter().zip(memories) {
-                let target = ArrayPlacement::mesh(destination_mesh.clone(), replicated.clone()).unwrap();
+                let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
                 probe_placement_step(rank, step, &session, &source, target.with_memory(memory));
             }
         });

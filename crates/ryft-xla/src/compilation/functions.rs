@@ -4920,6 +4920,29 @@ mod tests {
                 input: upload(&vector_type, Some(&mesh), None, &values),
                 caller_mesh: mesh.clone(),
             },
+            // A declared input type without a sharding over auto axes of a replicated argument is the row without
+            // overrides.
+            Row {
+                name: "declared unsharded input over auto axes of a split argument",
+                input_type: vector_type.clone(),
+                callee: compiled(&vector_type, Options::new(mesh.clone())),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "declared unsharded input over explicit axes of a split argument",
+                input_type: split_type.clone(),
+                callee: compiled(&vector_type, Options::new(explicit_mesh.clone())),
+                input: upload(&split_type, Some(&explicit_mesh), None, &values),
+                caller_mesh: explicit_mesh.clone(),
+            },
+            Row {
+                name: "declared unsharded input over explicit axes of a replicated argument",
+                input_type: explicit_replicated_type.clone(),
+                callee: compiled(&vector_type, Options::new(explicit_mesh.clone())),
+                input: upload(&explicit_replicated_type, Some(&explicit_mesh), None, &values),
+                caller_mesh: explicit_mesh.clone(),
+            },
             Row {
                 name: "dispatcher with an unconstrained input override",
                 input_type: vector_type.clone(),
@@ -5311,7 +5334,11 @@ mod tests {
         // bufferless result of a loop or a condition is placed as its type records, because the compiler reports no
         // placement for it and the placement of a call inside a nested region does not reach the result of the
         // operation that owns that region. A caller compiled ahead of time places its argument as its type records,
-        // which replicates the split input of the dispatcher before the call. The replay of a callee operation by
+        // which replicates the split input of the dispatcher before the call, and a caller that runs as replicas
+        // rejects an argument whose type records a split. A caller staged for an input type without a sharding does
+        // not record the mesh of that input, which its executable places replicated, so partial evaluation forwards
+        // it through a call whose callee declares an input without a sharding, and the interpretation of the known
+        // program returns a split argument where it is. The replay of a callee operation by
         // operation gives a `rematerialize` in the callee an eager input, whose type records its placement, while the
         // body of the `rematerialize` was traced for the input type of the callee, which records none.
         let other_devices = "fails with `\
@@ -5321,6 +5348,10 @@ mod tests {
                               require fully replicated boundary shardings of called functions because Shardy rejects \
                               dynamic tensors`";
         let replicated = "is placed as `{mesh<['x'=2:auto]>, [{}]}` instead of `{mesh<['x'=2:auto]>, [{'x'}]}`";
+        let split_known = "is placed as `{mesh<['x'=2:auto]>, [{'x'}]}` instead of `{mesh<['x'=2:auto]>, [{}]}`";
+        let split_arguments_of_replicas = "fails with `invalid compilation options: bounded-dynamic multi-device \
+                                           programs currently require fully replicated shardings because Shardy \
+                                           rejects dynamic tensors`";
         let rematerialized_replay = "fails with ``rematerialize` body input type signature mismatch: expected \
                                      [f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]] but got [f32[4]]`";
         let exceptions = [
@@ -5350,6 +5381,16 @@ mod tests {
             ("dispatcher over auto axes", "caller with a while loop", replicated),
             ("closed-over committed constant", "nested interpretation", rematerialized_replay),
             ("closed-over committed constant of a committed input", "nested interpretation", rematerialized_replay),
+            (
+                "declared unsharded input over explicit axes of a split argument",
+                "caller with a bounded dynamic argument",
+                split_arguments_of_replicas,
+            ),
+            (
+                "declared unsharded input over auto axes of a split argument",
+                "partial evaluation with a known input",
+                split_known,
+            ),
         ];
 
         // The derivatives of a call agree in values with those of the function that the callee was compiled from, and
@@ -5368,9 +5409,11 @@ mod tests {
         // The tangent of a call whose callee declares a split input that it returns is split like the result of the
         // call, and the cotangent of the replicated argument is resharded back to the placement of that argument, as
         // JAX returns the cotangent of a `jit` argument with the sharding of the argument. A callee that declares a
-        // replicated input over auto axes replicates the tangent and the cotangent of a split argument, as an input
-        // override does. A compiled gradient follows the eager cotangent, except where a caller compiled for other
-        // devices calls the callee and where the sum of a bufferless value does not lower.
+        // replicated input over auto axes, or an input without a sharding on a mesh of several devices, replicates the
+        // tangent and the cotangent of a split argument, as an input override does, except that the cotangent of an
+        // argument whose type records its split is resharded back to that split. A compiled gradient follows the eager
+        // cotangent, except where a caller compiled for other devices calls the callee and where the sum of a
+        // bufferless value does not lower.
         let differences = |fields: &[(&str, &str, &str)]| {
             let fields = fields
                 .iter()
@@ -5442,6 +5485,24 @@ mod tests {
                 "declared replicated input over auto axes of a split argument",
                 "eager VJP cotangent",
                 differences(&[("sharding", replicated, split)]),
+            ),
+            (
+                "declared unsharded input over auto axes of a split argument",
+                "eager JVP tangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
+            (
+                "declared unsharded input over auto axes of a split argument",
+                "eager VJP cotangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
+            (
+                "declared unsharded input over explicit axes of a split argument",
+                "eager JVP tangent",
+                differences(&[
+                    ("sharding", explicit_replicated_text, explicit_split_text),
+                    ("type", &explicit_typed(explicit_replicated_text), &explicit_typed(explicit_split_text)),
+                ]),
             ),
             ("input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
             ("other single device", "eager JVP tangent", moved(second)),
@@ -6201,6 +6262,91 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_function_gradient_leaves_split_residuals_of_calls_where_they_are() {
+        // The residual `cos(x)` of `sum(sin(place(x, split)))` stays split over the auto mesh axis in the gradient of
+        // the function and in the gradient of a caller of the function. The calls that differentiation derives from a
+        // call place the inputs of the original call at its boundary (here, the replicated placement of the input
+        // without a sharding) and leave every residual where it is, because their declared input types are only traced
+        // types, which do not record splits over auto mesh axes.
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let placement = Placement::new(mesh.clone(), split.clone()).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let function: CompiledFunction<ArrayType, ArrayType> = compile(
+            |x: CompileTracer| x.place(&placement, None).unwrap().sin().unwrap().reduce_sum(&[0], None).unwrap(),
+            vector_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let caller: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| function.call(x).unwrap(), vector_type.clone(), &session, mesh.clone()).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            vector_type,
+            mesh.clone(),
+            Some(split.clone()),
+            values_to_bytes(&[0.0f32, 1.0, 2.0, 3.0]),
+        )
+        .unwrap();
+        // The gradient of the caller constrains the input to the boundary of its call of the function as well, which
+        // is replicated too. Neither gradient constrains the residual `%5` (respectively `%6`).
+        let direct = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=2]>
+              func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                %0 = sdy.sharding_constraint %cst <@mesh, []> : tensor<f32>
+                %1 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                %2 = sdy.sharding_constraint %1 <@mesh, [{"x"}]> : tensor<4xf32>
+                %3 = stablehlo.sine %2 : tensor<4xf32>
+                %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %4 = stablehlo.reduce(%3 init: %cst_0) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                %5 = stablehlo.cosine %2 : tensor<4xf32>
+                %6 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                %7 = stablehlo.multiply %5, %6 : tensor<4xf32>
+                %8 = sdy.sharding_constraint %7 <@mesh, [{"x"}]> : tensor<4xf32>
+                %9 = stablehlo.broadcast_in_dim %8, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
+                return %9 : tensor<4xf32>
+              }
+            }
+        "#};
+        let nested = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=2]>
+              func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                %0 = sdy.sharding_constraint %cst <@mesh, []> : tensor<f32>
+                %1 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<4xf32>
+                %3 = sdy.sharding_constraint %2 <@mesh, [{"x"}]> : tensor<4xf32>
+                %4 = stablehlo.sine %3 : tensor<4xf32>
+                %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %5 = stablehlo.reduce(%4 init: %cst_0) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                %6 = stablehlo.cosine %3 : tensor<4xf32>
+                %7 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                %8 = stablehlo.multiply %6, %7 : tensor<4xf32>
+                %9 = sdy.sharding_constraint %8 <@mesh, [{"x"}]> : tensor<4xf32>
+                %10 = stablehlo.broadcast_in_dim %9, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
+                return %10 : tensor<4xf32>
+              }
+            }
+        "#};
+        for (function, expected) in [(&function, direct), (&caller, nested)] {
+            let gradient = function.gradient(&session).unwrap();
+            assert_eq!(gradient.function.lowered().lowered_program().stable_hlo(), expected);
+            let output = gradient.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!(output.sharding(), &split);
+            assert_eq!(
+                output.copy_to_host().unwrap().elements::<f32>().unwrap(),
+                [0.0f32, 1.0, 2.0, 3.0].map(f32::cos).to_vec(),
+            );
+        }
+    }
+
+    #[test]
     fn test_compiled_function_call_keeps_replicated_output_override_of_consumed_results_inside_compile() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
@@ -6213,7 +6359,8 @@ mod tests {
 
         // An identity with a replicated output override returns two replicas of a split input, and so does every call
         // of it inside another compiled function whose results that function consumes rather than returns. The call
-        // constrains its result to the override, which the body of the identity cannot show.
+        // constrains its result to the override, which the body of the identity cannot show, and its operand
+        // replicated, as an execution of the identity, whose input type has no sharding, places its argument.
         let vector_type = ArrayType::new_static(DataType::I32, [4]);
         let vector = Array::from_host_buffer(
             &engine,
@@ -6247,12 +6394,14 @@ mod tests {
                     return %0 : tensor<4xi32>
                   }
                   func.func @main(%arg0: tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
-                    %0 = call @jit_call_0(%arg0) : (tensor<4xi32>) -> tensor<4xi32>
-                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<4xi32>
-                    %2 = call @jit_call_0(%arg0) : (tensor<4xi32>) -> tensor<4xi32>
-                    %3 = sdy.sharding_constraint %2 <@mesh, [{}]> : tensor<4xi32>
-                    %4 = stablehlo.add %1, %3 : tensor<4xi32>
-                    return %4 : tensor<4xi32>
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
+                    %1 = call @jit_call_0(%0) : (tensor<4xi32>) -> tensor<4xi32>
+                    %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<4xi32>
+                    %3 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
+                    %4 = call @jit_call_0(%3) : (tensor<4xi32>) -> tensor<4xi32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{}]> : tensor<4xi32>
+                    %6 = stablehlo.add %2, %5 : tensor<4xi32>
+                    return %6 : tensor<4xi32>
                   }
                 }
             "#},
