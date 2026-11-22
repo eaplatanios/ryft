@@ -58,13 +58,10 @@ impl CompilationDomain for Session {
     // device mesh that the function names, refer to `JitCallOperation::with_boundary`), because the callee cannot show
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
     // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when it
-    // requests a placement (refer to `requests_placement`). Every entry point of the call therefore places, moves, and
-    // commits values as an execution of the function does, and the call requests the placement of its boundary as the
-    // shardings of a nested `jit` call do in JAX (refer to `has_placement_requests`). A call of a `jit` dispatcher without input sharding overrides also keeps its inputs
-    // placed as they are, because the dispatcher specializes its executables for the placements of their inputs over
-    // auto mesh axes (refer to `dispatch_signature`), unlike a function compiled for its input types alone. Core calls
-    // this once for each staged function, so the walk of the callee program costs nothing per call. Other operations
-    // are returned unchanged.
+    // requests a placement (refer to `requests_placement`). Otherwise public arguments or the enclosing caller
+    // select the devices, even for a function with committed captures. A dispatcher without input overrides also
+    // keeps each argument's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
+    // (refer to `dispatch_signature`). Core constructs the call operation once for each staged function.
     fn call_operation(operation: Operation, callee: &FlatProgram, options: &Options, dispatched: bool) -> Operation {
         match operation {
             Operation::JitCall(call) => {

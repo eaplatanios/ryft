@@ -1512,17 +1512,17 @@ where
 
 /// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
 /// through a `place` with a target, a `constrain_sharding`, or a `jit_call` whose callee names devices (i.e., carries a
-/// sharding override of its boundary, requests a placement itself, or captures a committed array, refer to
-/// [`JitCallOperation::with_boundary`]), whether or not that value reaches a result. These are the analogues of the
-/// `device_put` and `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX commit
-/// every output of a `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Such calls count
-/// because their callees cannot show their overrides (e.g., a replicated override over auto mesh axes stages nothing).
-/// The callees of calls are among the regions that lowering emits, so a request inside a callee counts too. A `place`
-/// without a target leaves its input where it is, so it requests nothing. A `place` with a device target (i.e., a
+/// sharding override of its boundary or requests a placement itself, refer to [`JitCallOperation::with_boundary`]),
+/// whether or not that value reaches a result. These are the analogues of the `device_put` and
+/// `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX commit every output of a
+/// `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Such calls count because their
+/// callees cannot show their overrides (e.g., a replicated override over auto mesh axes stages nothing). The callees of
+/// calls are among the regions that lowering emits, so a request inside a callee counts too. A `place` without a target
+/// leaves its input where it is, so it requests nothing. A `place` with a device target (i.e., a
 /// [`PlacementRequest::Device`]) is counted, as an explicit device commits an array eagerly, although JAX leaves a
-/// value that a bare device places inside `jit` uncommitted and on the devices that it already occupies. A `place`
-/// with an in-place target (i.e., a [`PlacementRequest::InPlace`]) is counted too, because JAX commits every output of
-/// a `jit` function that moves a value to a memory space (i.e., `jax.device_put(x, jax.memory.Space.Host)`), whose
+/// value that a bare device places inside `jit` uncommitted and on the devices that it already occupies. A `place` with
+/// an in-place target (i.e., a [`PlacementRequest::InPlace`]) is counted too, because JAX commits every output of a
+/// `jit` function that moves a value to a memory space (i.e., `jax.device_put(x, jax.memory.Space.Host)`), whose
 /// destinations `jaxpr_transfer_mem_kinds` in `jax._src.interpreters.pxla` collects and `lower_sharding_computation`
 /// counts among the reasons to commit. A `reshard` is not counted, because JAX does not count its own `reshard` among
 /// these requests either.

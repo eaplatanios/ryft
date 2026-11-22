@@ -16,7 +16,7 @@ use ryft_core::{
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, Operation as CoreOperation,
     OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
-    PlaceOperation, PlacementRequest,
+    PlaceOperation, Placement,
     PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, Program as CoreProgram, ProgramBatchingOutputAxesPolicy,
     ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
@@ -395,18 +395,11 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///
 /// # Calls of compiled functions
 ///
-/// A call of a compiled function behaves like a direct execution of that function, whatever the entry point that
-/// runs it (i.e., an eager call, a call inside another compiled function, the interpretation of a staged program, a
-/// partial evaluation that folds or splits it, a forward or reverse mode differentiation of it, or a caller whose
-/// bounded dynamic values make it run as replicas). It places its results with the same physical shardings, commits
-/// the same results, and accepts the same inputs, or every entry point rejects it with the same error, and it runs on
-/// the same devices whenever the function names devices. A function names devices when every execution of it runs on
-/// the devices of the mesh that it was compiled for whatever its inputs, which is when it has a sharding override of
-/// an input or output, when its program requests a placement (i.e., through a `place` with a target, a
-/// `constrain_sharding`, or a call of a function that names devices, refer to `has_placement_requests`), or when it
-/// captures a committed array. A function that names no devices has a program that is agnostic of devices, so a call
-/// runs it where its caller or its operands run, like a JAX `jit` function without shardings, while a direct execution
-/// runs it on the mesh that it was compiled for. That is the one exception to the agreement above.
+/// A call stages the callee's source in its caller. When an input or output has a sharding override, or the body
+/// requests placement through a targeted `place`, a `constrain_sharding`, or a nested call that names devices, the
+/// call uses the callee's mesh. Otherwise it runs on the devices of its caller or public arguments. Lifted captures
+/// follow those devices, even when the original array is committed. Executing the retained executable directly always
+/// uses the mesh it was compiled for.
 ///
 /// A call therefore carries the boundary of its callee as that function was compiled (refer to `with_boundary`), which
 /// is the sharding override of each of its inputs and outputs, if any, together with the device mesh that the function
@@ -428,9 +421,7 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     is for a call of a `jit` dispatcher, whose executables are specialized for the placements of their inputs.
 ///   - The type rule of the call accepts every input that the executable accepts (i.e., one whose type refines the
 ///     callee input type up to its sharding), so every context that binds a call accepts the same inputs.
-///   - The results are committed as an execution of the function commits them, which is every result of a function
-///     that names devices, and otherwise every result of a call that runs on more than one device or that has a
-///     committed input.
+///   - A call commits its results when it names devices, runs on multiple devices, or has a committed public input.
 ///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with the
 ///     device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
 ///     evaluation split, or a batched call), and partial evaluation treats a call as forwarding one of its inputs only
@@ -504,12 +495,9 @@ impl<T: CoreType> JitCallOperation<T> {
 
     /// Returns this call with the boundary of its callee, made of `mesh`, the device mesh that the callee was compiled
     /// for when it names devices, and of the sharding override of each callee input and output, by position, where
-    /// [`None`] marks a position without one. A callee names devices when an execution of it runs on the devices of its
-    /// mesh whatever its inputs, which is when it has a sharding override, when its program requests a placement (refer
-    /// to `has_placement_requests`), or when it captures a committed array, so `mesh` must be present whenever an
-    /// override is. Positions past the end of either list have none, and a list without any override is stored as
-    /// absent. A call without a mesh therefore equals, hashes, and renders like a call of a function that names no
-    /// devices.
+    /// [`None`] marks a position without one. A callee names devices when it has a sharding override or its program
+    /// requests a placement (refer to `has_placement_requests`), so `mesh` must be present whenever an override is.
+    /// A missing override is implicit past the end of either list. A list without overrides is stored as absent.
     pub(crate) fn with_boundary(
         mut self,
         mesh: Option<&DeviceMesh>,
@@ -739,6 +727,38 @@ impl<T: CoreType> JitCallOperation<T> {
 }
 
 impl JitCallOperation<Type> {
+    /// Prepares the inputs of an eager call, including calls replayed by a region interpreter. An explicit boundary
+    /// places all inputs on its mesh. Otherwise the public arguments select the devices and the lifted captures
+    /// follow them, as closed-over constants do in JAX.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from selecting the mesh or placing an argument or capture on it.
+    pub(crate) fn eager_inputs<'o>(&self, session: &Session, inputs: &'o [Value]) -> Result<Cow<'o, [Value]>, Error> {
+        if self.mesh.is_some() {
+            return inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| match input {
+                    Value::Array(array) => self.boundary_input(session, index, array.clone()).map(Value::Array),
+                    _ => Ok(input.clone()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Cow::Owned);
+        }
+        self.capture_inputs(session, inputs)
+    }
+
+    /// Returns whether the caller chose the result devices locally. An explicit call boundary names devices for
+    /// every process. An unpinned call inherits the device assignment of its public arguments or the session default.
+    pub(crate) fn results_are_locally_assigned(&self, session: &Session, inputs: &[Value]) -> bool {
+        let operands = inputs.iter().skip(self.capture_count).filter_map(|input| match input {
+            Value::Array(array) => Some(array),
+            Value::Dimension(_) | Value::Reference(_) => None,
+        });
+        self.mesh.is_none() && Array::operands_are_locally_assigned(session, operands, &[])
+    }
+
     /// Returns `array`, the input `index` of this call that `session` executes eagerly, moved and placed as an execution
     /// of the callee moves and places that argument. A call with a boundary moves the input onto the devices of its
     /// mesh, placed as the override of that input requests or otherwise as it is placed (i.e., replicated when its
@@ -748,7 +768,7 @@ impl JitCallOperation<Type> {
     /// # Errors
     ///
     /// Returns the error of moving the input (e.g., for an input of another client).
-    pub(crate) fn boundary_input(&self, session: &Session, index: usize, array: Array) -> Result<Array, Error> {
+    fn boundary_input(&self, session: &Session, index: usize, array: Array) -> Result<Array, Error> {
         let Some(mesh) = &self.mesh else {
             return Ok(array);
         };
@@ -765,55 +785,74 @@ impl JitCallOperation<Type> {
 
     /// Returns `inputs`, the inputs of this call that `session` executes eagerly, with the arrays of the lifted capture
     /// prefix moved to where the call runs when the callee names no devices. Such a call runs where its other array
-    /// inputs run (i.e., on the devices of the first committed one, or otherwise of the first one), and without them on
-    /// the default mesh of `session`, because a capture never decides where a call runs, as JAX ignores where the arrays
-    /// that a `jit` function closes over live. A capture moves onto those devices with its sharding, over its own
-    /// logical mesh when that has as many devices, and replicated otherwise, and keeps its commitment. Returns [`None`] when nothing moves
-    /// (e.g., for a call without captures or of a callee that names devices, whose inputs `Self::boundary_input` moves).
+    /// inputs run. A committed public input selects its devices. Uncommitted public inputs on the same devices keep
+    /// them. With no array input or with uncommitted inputs on different devices, the session default supplies them.
+    /// The capture keeps its logical mesh and sharding when the device count matches, and is replicated otherwise.
+    /// The temporary handle contributes no commitment to the call.
     ///
     /// # Errors
     ///
     /// Returns the error of moving a capture (e.g., for a capture of another client).
-    pub(crate) fn capture_inputs(&self, session: &Session, inputs: &[Value]) -> Result<Option<Vec<Value>>, Error> {
-        if self.mesh.is_some() || self.capture_count == 0 || inputs.len() < self.capture_count {
-            return Ok(None);
+    fn capture_inputs<'o>(&self, session: &Session, inputs: &'o [Value]) -> Result<Cow<'o, [Value]>, Error> {
+        if self.capture_count == 0 || inputs.len() < self.capture_count {
+            return Ok(Cow::Borrowed(inputs));
         }
         let operands = inputs[self.capture_count..].iter().filter_map(|input| match input {
             Value::Array(array) => Some(array),
             Value::Dimension(_) | Value::Reference(_) => None,
         });
-        let target = match operands.clone().find(|array| array.is_committed()).or_else(|| operands.clone().next()) {
-            Some(array) => array.mesh().clone(),
-            None => session.device_mesh_for(&[], None)?,
-        };
-        let mut moved = false;
-        let inputs = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| match input {
-                Value::Array(array) if index < self.capture_count => {
-                    // The type of a capture can name its logical mesh (e.g., a sharding over explicit mesh axes), and
-                    // so can the callee, whose program then runs only on a mesh of that topology, so a capture keeps
-                    // its logical mesh over the devices of the call whenever it has as many devices.
-                    let logical_mesh = array.sharding().mesh();
-                    let (mesh, sharding) = if logical_mesh.has_same_topology(target.logical_mesh()) {
-                        (target.clone(), array.sharding().clone())
-                    } else if logical_mesh.device_count() == target.device_count() {
-                        (DeviceMesh::new(logical_mesh.clone(), target.devices().to_vec())?, array.sharding().clone())
-                    } else {
-                        let rank = array.r#type().shape().rank();
-                        (target.clone(), Sharding::replicated(target.logical_mesh().clone(), rank))
-                    };
-                    if array.mesh() == &mesh && array.sharding() == &sharding {
-                        return Ok(input.clone());
-                    }
-                    moved = true;
-                    array.clone().reshard_on_devices(session, &mesh, &sharding, false).map(Value::Array)
+        let target = match operands.clone().find(|array| array.is_committed()) {
+            Some(committed) => committed.mesh().clone(),
+            None => match operands.clone().next() {
+                Some(first) if operands.clone().all(|other| other.mesh().devices() == first.mesh().devices()) => {
+                    first.mesh().clone()
                 }
-                input => Ok(input.clone()),
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        Ok(moved.then_some(inputs))
+                _ => session.device_mesh_for(&[], None)?,
+            },
+        };
+        let mut prepared = Cow::Borrowed(inputs);
+        for (index, input) in inputs[..self.capture_count].iter().enumerate() {
+            let Value::Array(array) = input else { continue };
+            // The callee can name the capture's logical mesh in its types while running on the caller's devices.
+            let logical_mesh = array.sharding().mesh();
+            let (mesh, sharding) = if logical_mesh.has_same_topology(target.logical_mesh()) {
+                (target.clone(), array.sharding().clone())
+            } else if logical_mesh.device_count() == target.device_count() {
+                (DeviceMesh::new(logical_mesh.clone(), target.devices().to_vec())?, array.sharding().clone())
+            } else {
+                (target.clone(), Sharding::replicated(target.logical_mesh().clone(), array.r#type().shape().rank()))
+            };
+            let capture = if array.mesh() == &mesh && array.sharding() == &sharding {
+                if !array.is_committed() {
+                    continue;
+                }
+                array.clone()
+            } else {
+                array.clone().reshard_on_devices(session, &mesh, &sharding, false)?
+            };
+            prepared.to_mut()[index] = Value::Array(capture.with_committed(false));
+        }
+        // Eager dispatch compiles the callee on its first array operand's logical mesh. Region replay executes
+        // individual operations, whose type rules see the runtime shardings. Give replicated arguments the same
+        // logical mesh on those devices, so replay can combine them with the capture just as compiled execution can.
+        let callee_mesh = prepared[..self.capture_count].iter().find_map(|input| match input {
+            Value::Array(array) => Some(array.mesh().clone()),
+            _ => None,
+        });
+        if let Some(mesh) = callee_mesh {
+            for (index, input) in inputs.iter().enumerate().skip(self.capture_count) {
+                if let Value::Array(array) = input
+                    && array.mesh().devices() == mesh.devices()
+                    && array.mesh().logical_mesh() != mesh.logical_mesh()
+                    && array.sharding().is_replicated()
+                {
+                    let sharding = Sharding::replicated(mesh.logical_mesh().clone(), array.sharding().rank());
+                    prepared.to_mut()[index] =
+                        Value::Array(array.clone().reshard_on_devices(session, &mesh, &sharding, false)?);
+                }
+            }
+        }
+        Ok(prepared)
     }
 
     /// Returns `array`, the result `index` of this call that `session` interprets eagerly, placed on the devices of
@@ -1854,13 +1893,8 @@ where
 // PJRT client. This mirrors JAX dispatching a `jit`-compiled function called from eager code straight to the compiled
 // executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
 // entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
-// through this same session. The boundary of the callee moves the inputs onto its devices and places them before the
-// callee runs, and it places the results after the callee returns, as an execution of the called function moves and
-// places its arguments and results (refer to `JitCallOperation::boundary_input`). The results are then committed as
-// such an execution commits them, which the callee decides as a whole. Every result of a callee that names devices
-// (i.e., through its boundary, the placement requests in its body, or the committed arrays that it captures) is
-// committed, which the mesh of the call records once for the callee, while the eager operations of the callee only
-// commit the results that depend on what they commit.
+// through this same session. Both entry points prepare the call arguments before running the callee. Region replay
+// also applies output overrides and the call's commitment to the results of the individually dispatched operations.
 impl InterpretableOperation<Session> for JitCallOperation<Type> {
     fn interpret<D: InterpretationDriver<Session>>(
         &self,
@@ -1871,17 +1905,10 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         let callee = driver.region(0)?;
         let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
         let invalid_argument = |error: Error| ProgramError::InvalidArgument { message: error.to_string() };
-        let inputs = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| match input {
-                Value::Array(array) => {
-                    Ok(Value::Array(self.boundary_input(context, index, array.clone()).map_err(invalid_argument)?))
-                }
-                input => Ok(input.clone()),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        let commits_outputs = self.mesh.is_some();
+        let locally_assigned = self.results_are_locally_assigned(context, inputs);
+        let inputs = self.eager_inputs(context, inputs).map_err(invalid_argument)?.into_owned();
+        let commits_outputs = self.mesh.is_some()
+            || inputs.iter().any(|input| matches!(input, Value::Array(array) if array.is_committed()));
         driver
             .interpret_region(context, 0, inputs)?
             .iter()
@@ -1890,7 +1917,7 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
                 Value::Array(array) => {
                     let array = self.boundary_output(context, index, array).map_err(invalid_argument)?;
                     let committed = commits_outputs || array.is_committed();
-                    Ok(Value::Array(array.with_committed(committed)))
+                    Ok(Value::Array(array.commit_if(committed).with_locally_assigned(locally_assigned)))
                 }
                 value => Ok(value),
             })
@@ -2573,10 +2600,8 @@ where
 /// callee names devices on `mesh` returns lives on those devices, so it is cast only to a type over a mesh of the same
 /// topology. A cotangent of an input over the canonical mesh of one device (i.e., [`LogicalMesh::single_device`]),
 /// which is where an uncommitted array lives, that a callee on a mesh of one device returns is instead placed onto the
-/// device of that mesh with a device target, which puts it on the canonical mesh there, and an unchecked cast states
-/// that type when the type rule of `place` does not (i.e., for a value whose type tracks no sharding), so that it
-/// combines with the other cotangents of that input, and lives where JAX returns such a cotangent (i.e., on the
-/// devices of the call). Every other value is returned unchanged, because values over
+/// canonical mesh over the device of that mesh, so that it combines with the other cotangents of that input, and lives
+/// where JAX returns such a cotangent (i.e., on the devices of the call). Every other value is returned unchanged, because values over
 /// different logical meshes do not combine, and a callee mesh of several devices has no such placement.
 fn refined_derived_value<C, V>(
     context: &C,
@@ -2600,14 +2625,10 @@ where
         && let [device] = mesh.devices()
         && refined.sharding().is_some_and(|sharding| sharding.mesh() == &LogicalMesh::single_device())
     {
-        let target = PlacementRequest::Device { device: *device, memory: Some(refined.memory()), layout: None };
-        let placed = context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0);
-        let placed_type = placed.r#type().into_owned();
-        if placed_type == Type::Array(refined.clone()) {
-            return Ok(placed);
-        }
-        let cast = CastOperation::unchecked(Type::Array(refined.clone()), vec![placed_type])?;
-        return Ok(context.bind(cast, Vec::new(), &[placed])?.remove(0));
+        let canonical_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![*device]).map_err(TypeError::from)?;
+        let sharding = Sharding::replicated(canonical_mesh.logical_mesh().clone(), refined.rank());
+        let target = Placement::new(canonical_mesh, sharding).map_err(TypeError::from)?.with_memory(refined.memory());
+        return Ok(context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0));
     }
     if moves_devices || refined.is_interchangeable_with(&declared) || !declared.is_refined_by(&refined) {
         return Ok(value);

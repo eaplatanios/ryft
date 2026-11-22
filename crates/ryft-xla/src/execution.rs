@@ -14,7 +14,7 @@
 //! failures of this lifecycle, including those of ordered effects.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ryft_core::macros::check_count;
@@ -23,7 +23,7 @@ use ryft_core::{
     ProgramError, ReadyOrPendingReferenceGuard, ReferenceCompletion as CoreReferenceCompletion,
     ReferenceCompletionBackend, ReferenceError, ReferenceId, ReferenceReplacementPreparation, ReferenceType, Shape,
     Sharding, ShardingDimension, ShardingError, StatefulCompilationDomain, StatefulExecution, Type as CoreType,
-    TypeRefinements, Typed, TypedProgram, ValueProjection, validate_reference_boundary,
+    TypeRefinements, Typed, TypedProgram, UnreducedKind, ValueProjection, validate_reference_boundary,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Error as PjrtError, Execution, ExecutionDeviceInputs, ExecutionFence,
@@ -1635,17 +1635,27 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
     Ok(devices)
 }
 
-/// Validates runtime refinement of a declared logical input type, excluding sharding because placement is resolved
-/// separately at the call boundary. This is the rule by which an executable accepts its arguments, and the type rule of
-/// a `jit_call` accepts the inputs of a call by the same rule (refer to `validate_call_input_types`).
+/// Validates runtime refinement of a declared logical input type, excluding the placement that a sharding describes,
+/// because an execution reshards its arguments as its executable expects. A reshard cannot change a pending reduction
+/// (i.e., the unreduced axes of a sharding and their kind), so the two types must agree on it. This is the rule by
+/// which an executable accepts its arguments. The type rule of a `jit_call` accepts the inputs of a call by a stricter
+/// rule, because a call does not reshard its inputs (refer to `validate_call_input_types`).
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {
         return Ok(());
     }
+    fn pending_reduction(r#type: &ArrayType) -> Option<(&BTreeSet<String>, UnreducedKind)> {
+        r#type
+            .sharding()
+            .filter(|sharding| !sharding.unreduced_axes().is_empty())
+            .map(|sharding| (sharding.unreduced_axes(), sharding.unreduced_kind()))
+    }
     let declared_without_sharding = declared.clone().with_sharding(None)?;
     let actual_without_sharding = actual.clone().with_sharding(None)?;
-    if declared_without_sharding.is_refined_by(&actual_without_sharding) {
+    if pending_reduction(declared) == pending_reduction(actual)
+        && declared_without_sharding.is_refined_by(&actual_without_sharding)
+    {
         Ok(())
     } else {
         Err(ProgramError::InvalidArgument {

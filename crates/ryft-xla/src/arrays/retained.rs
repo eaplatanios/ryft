@@ -75,6 +75,11 @@ pub struct RetainedArray {
     /// It is not part of the identity of this retained array. Refer to [`Array::is_committed`] for more information.
     committed: bool,
 
+    /// Whether the process chose the devices of the retained array on its own, which the arrays that [`Self::to_array`]
+    /// creates keep. Like [`Self::committed`], it is not part of the identity of this retained array. Refer to
+    /// [`Array::is_locally_assigned`] for more information.
+    locally_assigned: bool,
+
     /// PJRT [`Client`] that owns the buffers of the retained array.
     client: &'static Client<'static>,
 }
@@ -93,6 +98,7 @@ impl RetainedArray {
             execution_fence: array.execution_fence.clone(),
             send_fence: array.send_fence.clone(),
             committed: array.is_committed(),
+            locally_assigned: array.is_locally_assigned(),
             client: array.client(),
         }
     }
@@ -116,6 +122,13 @@ impl RetainedArray {
         self.committed
     }
 
+    /// Returns whether the process chose the devices of the retained array on its own (refer to
+    /// [`Array::is_locally_assigned`]).
+    #[inline]
+    pub(crate) fn is_locally_assigned(&self) -> bool {
+        self.locally_assigned
+    }
+
     /// Returns a new [`Array`] that refers to the device buffers of this retained array and belongs to `session`.
     ///
     /// # Errors
@@ -133,6 +146,7 @@ impl RetainedArray {
             send_fence: self.send_fence.clone(),
             session: session.clone(),
             committed: self.committed,
+            locally_assigned: self.locally_assigned,
         })
     }
 
@@ -282,6 +296,23 @@ mod tests {
     }
 
     #[test]
+    fn test_retained_array_is_locally_assigned() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = ArrayType::scalar(DataType::F32);
+        let array = Array::from_host_buffer(&session, r#type.clone(), None, None, 1f32.to_ne_bytes()).unwrap();
+        let retained = RetainedArray::new(&array);
+        assert!(retained.is_locally_assigned());
+
+        // The fact is not part of the identity of a retained array, like its commitment.
+        let cleared = RetainedArray::new(&array.with_locally_assigned(false));
+        assert!(!cleared.is_locally_assigned());
+        assert_eq!(cleared, retained);
+        let shared = Array::from_host_buffer(&session, r#type, domain_mesh(client, "x", 1), None, 1f32.to_ne_bytes());
+        assert!(!RetainedArray::new(&shared.unwrap()).is_locally_assigned());
+    }
+
+    #[test]
     fn test_retained_array_to_array() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -300,6 +331,11 @@ mod tests {
         assert!(!retained.to_array(&session.with_device_mesh(domain_mesh(client, "x", 1))).unwrap().is_committed());
         assert!(RetainedArray::new(&array.clone().with_committed(true)).to_array(&fork).unwrap().is_committed());
 
+        // The new array also keeps whether the process chose the devices of the retained array on its own.
+        assert!(retained.to_array(&fork).unwrap().is_locally_assigned());
+        let cleared = RetainedArray::new(&array.clone().with_locally_assigned(false));
+        assert!(!cleared.to_array(&fork).unwrap().is_locally_assigned());
+
         // Every session of the client that owns the buffers can create the array, and the buffers outlive the session
         // of the array that was retained.
         let other_session = Session::builder().client(client).build().unwrap();
@@ -313,8 +349,8 @@ mod tests {
         assert_eq!(
             retained.to_array(&foreign_session),
             Err(TypeError::invalid(
-                "session constant `session:f32[][sharding={mesh<['x'=1:auto]>, []}]` retains an array of a different \
-                 PJRT client than the client of this session",
+                "session constant `session:f32[][sharding={mesh<['device'=1:auto]>, []}]` retains an array of a \
+                 different PJRT client than the client of this session",
             )
             .into()),
         );
@@ -364,7 +400,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        assert_eq!(RetainedArray::new(&array).to_string(), "session:f32[][sharding={mesh<['x'=1:auto]>, []}]");
+        assert_eq!(RetainedArray::new(&array).to_string(), "session:f32[][sharding={mesh<['device'=1:auto]>, []}]");
     }
 
     #[test]

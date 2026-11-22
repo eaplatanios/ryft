@@ -54,15 +54,15 @@
 //!     of an array between devices of this process for an operation, and eager operations whose array inputs all have
 //!     the fact keep it.
 //!   - **Clearing:** A placement onto a device, a mesh, or a sharding clears it, even when that destination holds the
-//!     devices of its source, and so do constructions on a mesh that the caller provides and the outputs of compiled
-//!     functions, which run on the mesh that they were compiled for.
+//!     devices of its source. Construction on a caller-supplied mesh and direct execution on a compiled mesh also
+//!     clear it. A call without a placement request inherits local assignment from its public arguments.
 //!
 //! The fact is separate from [commitment](Array::is_committed), which records whether the devices were chosen on
 //! purpose and which a destination that names only a memory or a layout also sets, as in JAX, so commitment cannot
 //! tell whether the other processes know the devices. Every process of a distributed program applies the same
 //! functions to the same kinds of inputs, so every process computes the same fact for its own source. Every process
-//! therefore chooses the same strategy for a source with locally assigned devices, which is to place its own full value on
-//! its own devices of the destination with local copies, slices, or a host upload, so no process transfers anything
+//! therefore chooses the same strategy for a locally assigned source. Each process places its full value on its own
+//! devices of the destination with local copies, slices, or a host upload, so no process transfers anything
 //! or runs a collective, as JAX does for uncommitted arrays. A process whose devices hold the whole destination may do
 //! that local work with the strategies above, because they then move nothing between processes.
 //!
@@ -1683,8 +1683,7 @@ impl Array {
     ///   - **Environment:** The compilation configuration of the session and the capabilities of its PJRT plugin, which
     ///     every process loads alike (refer to [`PlacementEnvironment`]).
     ///
-    /// It never reads a buffer or a physical layout, and it reads `process_index` only for an array with process-local
-    /// devices, as described below.
+    /// It never reads a buffer or a physical layout. It reads `process_index` only for a locally assigned array.
     ///
     /// An array with locally assigned devices holds a full value that every process has, each on devices of its own
     /// choice, as JAX assumes for uncommitted arguments of a computation over several processes. Its devices are the

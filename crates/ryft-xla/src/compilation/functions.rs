@@ -32,11 +32,10 @@
 //! `call_in_context` variants take the array IR context explicitly, which also serves nullary functions. Every parent
 //! context is supported:
 //!
-//!   - An eager parent executes the call immediately through eager dispatch, which lowers it on its first use rather
-//!     than reusing the retained executable of a [`CompiledFunction`], but which runs it on the same devices, accepts
-//!     the same inputs, and places and commits its results as that executable does (refer to the contract of
-//!     [`JitCallOperation`](crate::JitCallOperation)). [`ExecutableFunction::execute`] and
-//!     [`CompiledFunctionDispatcher::execute`] run a retained executable directly on concrete arrays instead.
+//!   - An eager parent lowers the retained source on first use. When the callee requests placement, the call honors
+//!     its mesh and sharding overrides. Otherwise the public arguments select the devices, and captured arrays follow
+//!     them. [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
+//!     on the devices it was compiled for. See [`JitCallOperation`](crate::JitCallOperation).
 //!   - A staging parent (e.g., the trace of an enclosing [`compile`] or [`stage`]) records the call, and the enclosing
 //!     program lowers it as part of its own computation.
 //!   - Batching, differentiation, and partial evaluation parents rewrite the call through the ordinary rules of the
@@ -4290,6 +4289,60 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_function_call_places_captures_on_argument_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = |index: usize| {
+            let device = Device::from_pjrt(&devices[index]).unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, vec![device]).unwrap()
+        };
+        let first = mesh(0);
+        let second = mesh(1);
+        let ty = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |mesh: Option<&DeviceMesh>, values: [f32; 2]| {
+            Array::from_host_buffer(&session, ty.clone(), mesh.cloned(), None, values_to_bytes(&values)).unwrap()
+        };
+        let capture = upload(Some(&second), [2.0, 4.0]);
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x + captures[0].clone(),
+            vec![capture.clone()],
+            ty.clone(),
+            &session,
+            second.clone(),
+        )
+        .unwrap();
+
+        let callee = Arc::new(function.source_program().to_program_with_lifted_captures().unwrap());
+        let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+        let driver = EagerInterpretationDriver::new(&regions);
+        for placement in [None, Some(&first), Some(&second)] {
+            let input = upload(placement, [1.0, 3.0]);
+            let called = function.call(input.clone()).unwrap();
+            let mut interpreted = JitCallOperation::new(1)
+                .interpret(&session, &driver, &[Value::Array(capture.clone()), Value::Array(input.clone())])
+                .unwrap();
+            let interpreted = ValueProjection::<ArrayType>::into_projected(interpreted.remove(0)).unwrap();
+            assert_eq!(interpreted.mesh(), called.mesh());
+            assert_eq!(interpreted.sharding(), called.sharding());
+            for output in [&called, &interpreted] {
+                assert_eq!(output.mesh().devices(), input.mesh().devices());
+                assert_eq!(output.is_committed(), input.is_committed());
+                assert_eq!(output.is_locally_assigned(), input.is_locally_assigned());
+                assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
+            }
+            let executed = function.executable().execute(&session, input).unwrap();
+            assert_eq!(executed.mesh(), &second);
+            assert!(executed.is_committed());
+            assert!(!executed.is_locally_assigned());
+            assert_eq!(executed.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
+        }
+        assert_eq!(capture.mesh(), &second);
+        assert!(capture.is_committed());
+    }
+
+    #[test]
     fn test_compiled_function_call_agrees_with_execution_at_every_entry_point() {
         // What an entry point observes of the result of a callee.
         #[derive(Debug, PartialEq)]
@@ -4514,12 +4567,12 @@ mod tests {
                         vec![upload(&vector_type, Some(&second_mesh), None, &[0.0; 4])],
                         vector_type.clone(),
                         &session,
-                        second_mesh.clone(),
+                        first_mesh.clone(),
                     )
                     .unwrap(),
                 ),
-                input: upload(&vector_type, None, None, &values),
-                caller_mesh: second_mesh.clone(),
+                input: upload(&vector_type, Some(&first_mesh), None, &values),
+                caller_mesh: first_mesh.clone(),
             },
             Row {
                 name: "three levels of nesting",
@@ -4606,8 +4659,7 @@ mod tests {
             let executed = callee.execute(&session, row.input.clone()).unwrap();
             let expected = observe(&executed, false);
 
-            // The results of an eager call, like those of an execution, live on the devices of a compiled program,
-            // which every process knows, rather than on devices that this process chose on its own.
+            // Each row requests placement through either the callee or a public argument on a shared mesh.
             assert_eq!(
                 callee.call(row.input.clone()).map(|output| output.is_locally_assigned()),
                 Ok(executed.is_locally_assigned()),
@@ -4797,10 +4849,7 @@ mod tests {
         // bufferless result of a loop or a condition is placed as its type records, because the compiler reports no
         // placement for it and the placement of a call inside a nested region does not reach the result of the
         // operation that owns that region. A caller compiled ahead of time places its argument as its type records,
-        // which replicates the split input of the dispatcher before the call. Eager reverse mode differentiation cannot
-        // return the cotangent of an input that a call moves from the canonical mesh of one device onto a callee mesh
-        // of another name, because the type of that cotangent is over the callee mesh while the input that it belongs
-        // to is over the canonical mesh.
+        // which replicates the split input of the dispatcher before the call.
         let other_devices = "fails with `\
             `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
@@ -4808,20 +4857,14 @@ mod tests {
                               require fully replicated sharding overrides of called functions because Shardy rejects \
                               dynamic tensors`";
         let replicated = "is placed as `{mesh<['x'=2:auto]>, [{}]}` instead of `{mesh<['x'=2:auto]>, [{'x'}]}`";
-        let moved_cotangent = "fails with `cotangent contribution has type f32[4] but its accumulator expects \
-                               f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]`";
-        let moved_seed = "fails with `mesh `['device'=1:auto]` does not have the topology of the module mesh \
-                          `['x'=1:explicit]``";
         let exceptions = [
             ("split output override", "caller with a bounded dynamic argument", split_replicas),
             ("other single device", "nested call", other_devices),
             ("other single device", "nested call consumed by arithmetic", other_devices),
             ("other single device", "caller with a bounded dynamic argument", other_devices),
-            ("other single device", "eager VJP", moved_cotangent),
             ("other single device", "caller with a scan", other_devices),
             ("other single device", "caller with a condition", other_devices),
             ("other single device", "caller with a while loop", other_devices),
-            ("single device replicated output override", "eager VJP", moved_cotangent),
             (
                 "bufferless result",
                 "nested call consumed by arithmetic",
@@ -4831,10 +4874,6 @@ mod tests {
             ("bufferless result", "caller with a scan", replicated),
             ("bufferless result", "caller with a condition", replicated),
             ("bufferless result", "caller with a while loop", replicated),
-            ("placement in the body", "eager VJP", moved_cotangent),
-            ("device in the body", "eager VJP", moved_cotangent),
-            ("committed capture", "eager VJP", moved_seed),
-            ("three levels of nesting", "eager VJP", moved_cotangent),
             ("dispatcher over auto axes", "nested call", replicated),
             ("dispatcher over auto axes", "nested call consumed by arithmetic", replicated),
             ("dispatcher over auto axes", "caller with a bounded dynamic argument", replicated),
@@ -4871,8 +4910,11 @@ mod tests {
     #[test]
     fn test_compiled_function_call_rejects_inputs_that_its_input_types_forbid() {
         // A callee input type without a sharding describes a value that is invariant along manual mesh axes and fully
-        // reduced, so a call rejects an input that varies along a manual axis or that is unreduced or reduced, at every
-        // entry point, as JAX rejects a `shard_map` whose replicated output it cannot infer.
+        // reduced. A call inside a `shard_map` body accepts a value that varies along the manual axes of the map, and
+        // its outputs vary along them too, as a JAX `jit` function called on such a value does. A map that returns
+        // such an output replicated is therefore rejected, as JAX rejects out_specs whose replication it cannot infer,
+        // and one that returns it split assembles the shards. A call rejects an unreduced or a reduced input eagerly
+        // and inside a compiled caller alike, because it does not reshard its inputs.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
@@ -4897,7 +4939,7 @@ mod tests {
             stage_with_flat_captures(
                 |_, _, x: CompileTracer| {
                     Ok(shard_map(
-                        |local| { eprintln!("local {}", local.r#type()); let o = inner.call(local); if let Ok(o) = &o { eprintln!("out {}", o.r#type()); } o },
+                        |local| inner.call(local),
                         x,
                         manual.clone(),
                         manual_split.clone(),
@@ -4915,15 +4957,48 @@ mod tests {
             .map(|output| (output.r#type().to_string(), read_sharded_f32_array(&output)))
             .map_err(|error| error.to_string())
         };
-        eprintln!("replicated: {:?}", mapped(&manual_replicated));
-        eprintln!("split: {:?}", mapped(&manual_split));
+        assert_eq!(
+            mapped(&manual_replicated),
+            Err("`shard_map` body output #0 varies along active manual axis `x`, which its output sharding does not tile"
+                .to_string()),
+        );
+        assert_eq!(
+            mapped(&manual_split),
+            Ok(("f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]".to_string(), vec![2., 4., 6., 8.])),
+        );
 
-        // An unreduced or a reduced input of a callee over a plain input type is rejected eagerly and inside a compiled
-        // caller alike.
+        // The derivatives of such a call vary along the manual axes like its outputs.
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
+            |x| {
+                shard_map(
+                    |local| inner.call(local),
+                    x,
+                    manual.clone(),
+                    manual_split.clone(),
+                    manual_split.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            split_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (_, tangent) = outer.jvp(&session).unwrap().executable().execute(&session, (input.clone(), input.clone())).unwrap();
+        assert_eq!(read_sharded_f32_array(&tangent), vec![2., 4., 6., 8.]);
+        let (output, pullback) = session
+            .differentiate_at(Value::Array(input.clone()))
+            .vjp(|x| Ok(outer.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+            .unwrap();
+        let cotangent = ValueProjection::<ArrayType>::into_projected(pullback.apply_materialized(output).unwrap()).unwrap();
+        assert_eq!((cotangent.r#type().into_owned(), read_sharded_f32_array(&cotangent)), (split_type.clone(), vec![4., 8., 12., 16.]));
+
         let plain: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.clone() + x, vector_type.clone(), &session, mesh.clone()).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        for sharding in [replicated.clone().with_unreduced_axes(["x"]).unwrap(), replicated.with_reduced_axes(["x"]).unwrap()] {
+        for sharding in [replicated.clone().with_unreduced_axes(["x"]).unwrap(), replicated.with_reduced_axes(["x"]).unwrap()]
+        {
             let input_type = vector_type.clone().with_sharding(sharding).unwrap();
             let input = Array::from_host_buffer(
                 &session,
@@ -4933,7 +5008,8 @@ mod tests {
                 values_to_bytes(&[1f32, 2., 3., 4.]),
             )
             .unwrap();
-            eprintln!("eager: {:?}", plain.call(input.clone()).map(|output| output.r#type().to_string()).map_err(|error| error.to_string()));
+            let expected = Err(format!("`jit_call` input #0 expected f32[4] but got {input_type}"));
+            assert_eq!(plain.call(input.clone()).map(|output| output.r#type().to_string()).map_err(|e| e.to_string()), expected);
             let nested = stage_with_flat_captures(
                 |_, _, x: CompileTracer| Ok(plain.call(x)?),
                 Vec::new(),
@@ -4944,8 +5020,109 @@ mod tests {
             .and_then(|caller| caller.executable().execute(&session, input.clone()))
             .map(|output| output.r#type().to_string())
             .map_err(|error| error.to_string());
-            eprintln!("nested: {nested:?}");
+            assert_eq!(nested, expected);
         }
+
+        // An execution reshards its arguments, so it accepts a reduced argument, but no reshard can change a pending
+        // reduction, so it rejects an unreduced one with a type error, over an explicit or a manual mesh alike.
+        let manual_mesh = DeviceMesh::new(manual.clone(), mesh.devices().to_vec()).unwrap();
+        let unreduced = |mesh: &DeviceMesh| {
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+            let input_type = vector_type.clone().with_sharding(sharding).unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                input_type.clone(),
+                mesh.clone(),
+                None,
+                values_to_bytes(&[1f32, 2., 3., 4.]),
+            )
+            .unwrap();
+            let executed = plain.executable().execute(&session, input.clone()).map_err(|error| error.to_string());
+            let called = plain.call(input).map_err(|error| error.to_string());
+            (
+                executed.map(|output| output.r#type().to_string()),
+                called.map(|output| output.r#type().to_string()),
+                input_type,
+            )
+        };
+        for mesh in [&mesh, &manual_mesh] {
+            let (executed, called, input_type) = unreduced(mesh);
+            assert_eq!(executed, Err(format!("runtime input type `{input_type}` does not refine declared type `f32[4]`")));
+            assert_eq!(called, Err(format!("`jit_call` input #0 expected f32[4] but got {input_type}")));
+        }
+        let reduced_type = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced =
+            Array::from_host_buffer(&session, reduced_type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
+        assert_eq!(
+            read_sharded_f32_array(&plain.executable().execute(&session, reduced).unwrap()),
+            vec![2., 4., 6., 8., 2., 4., 6., 8.],
+        );
+    }
+
+    #[test]
+    fn test_compiled_function_call_vjp_returns_cotangents_of_moved_inputs() {
+        // A call that moves an uncommitted input onto the devices of its callee returns the cotangent of that input on
+        // the canonical mesh of the device of a callee mesh of one device, where JAX returns it, while a callee mesh of
+        // several devices has no such placement.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let second_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[1]],
+        )
+        .unwrap();
+        let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let input =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
+        let cotangent = |mesh: &DeviceMesh| {
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let function: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+                |x| x.clone() + x,
+                vector_type.clone(),
+                &session,
+                Options::new(mesh.clone()).with_output_shardings(vec![replicated]),
+            )
+            .unwrap();
+            session
+                .differentiate_at(Value::Array(input.clone()))
+                .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+                .and_then(|(output, pullback)| Ok(pullback.apply_materialized(output)?))
+                .map(|cotangent| {
+                    let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent).unwrap();
+                    (
+                        cotangent.mesh().devices().to_vec(),
+                        cotangent.r#type().to_string(),
+                        cotangent.copy_to_host().unwrap().elements::<f32>().unwrap(),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            cotangent(&second_mesh),
+            Ok((
+                vec![devices[1]],
+                "f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]".to_string(),
+                vec![4., 8., 12., 16.],
+            )),
+        );
+        assert_eq!(
+            cotangent(&wide_mesh),
+            Err("cotangent contribution has type f32[4] but its accumulator expects \
+                 f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]"
+                .to_string()),
+        );
     }
 
     #[test]
