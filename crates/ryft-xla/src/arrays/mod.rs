@@ -60,7 +60,7 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{AliasingParameter, HostOrArray, Placeable, PlacementOptions};
+pub use placement::{HostOrArray, Placeable, PlacementOptions};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};

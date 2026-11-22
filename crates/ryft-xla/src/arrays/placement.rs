@@ -70,36 +70,13 @@ use crate::{Error, FromPjrt, Session, Value};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// An aliasing leaf in the tree prefix of [`PlacementOptions`]. A `bool` leaf states whether the results of its branch
-/// of the input tree may share buffers with other arrays, and so does an `Option<bool>` leaf, which can also leave the
-/// option unspecified with [`None`] (refer to [`Session::place`]). So both `with_may_alias(false)` and
-/// `with_may_alias(Some(false))` request a forced copy.
-pub trait AliasingParameter: Parameter {
-    /// Returns the aliasing option of this branch, which is [`None`] when it is unspecified.
-    fn into_may_alias(self) -> Option<bool>;
-}
-
-impl AliasingParameter for bool {
-    #[inline]
-    fn into_may_alias(self) -> Option<bool> {
-        Some(self)
-    }
-}
-
-impl AliasingParameter for Option<bool> {
-    #[inline]
-    fn into_may_alias(self) -> Option<bool> {
-        self
-    }
-}
-
 /// Options of [`Session::place`].
 ///
 /// Each field follows JAX's tree prefix semantics, so when a field is present, its structure is broadcast over the
 /// input tree and applied leafwise. Destination and source prefixes accept [`PlacementRequestParameter`]s, including
-/// [`Placement`], [`PlacementRequest`], and their optional forms, and aliasing prefixes accept [`AliasingParameter`]s
-/// (i.e., `bool` and `Option<bool>`). Each prefix has one leaf type. To mix resolved placements and requests within the
-/// same prefix, convert the resolved leaves with [`PlacementRequest::from`].
+/// [`Placement`], [`PlacementRequest`], and their optional forms. Aliasing prefixes accept leaves that convert into
+/// `Option<bool>`, including `bool` and `Option<bool>`. Each prefix has one leaf type. To mix resolved placements
+/// and requests within the same prefix, convert the resolved leaves with [`PlacementRequest::from`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementOptions<
     Target = PlacementRequest,
@@ -175,8 +152,8 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
     /// Returns these options with the aliasing tree prefix replaced by `may_alias`, which can have another type than
     /// the current one. The type of each other option is kept, as in [`Self::with_target`], so that, for example,
     /// `PlacementOptions::defaults().with_may_alias(false)` requests a forced copy without a destination and without
-    /// naming the type of a destination. The prefix can hold `bool` or `Option<bool>` leaves (refer to
-    /// [`AliasingParameter`]).
+    /// naming the type of a destination. Both `false` and `Some(false)` request a forced copy, and [`None`] leaves
+    /// the option unspecified.
     #[inline]
     pub fn with_may_alias<NewMayAlias>(
         self,
@@ -735,13 +712,12 @@ impl Session {
     /// devices of a `device_put` source inside `jit` and accepts it.
     ///
     /// The donation option is only applied to concrete [`Array`] leaves, and it is ignored for host leaves and traced
-    /// leaves. The aliasing option is applied to concrete [`Array`] leaves when they are placed, and its leaves can be
-    /// `bool`s or `Option<bool>`s (refer to [`AliasingParameter`]), where `false` means `Some(false)` and `true` means
-    /// `Some(true)`. With `Some(false)`, the result holds no buffer of the leaf, even when the leaf was the only handle
-    /// of its buffers, and the buffers that the placement creates are not copied again. This also holds for a donated
-    /// leaf that already lives where it is placed, which gets storage of its own because the explicit request not to
-    /// alias wins, whereas JAX applies the donation and returns the storage of the input. A traced leaf whose
-    /// `may_alias` option is `Some(false)` stages its placement with a forced copy (refer to
+    /// leaves. Each aliasing option leaf converts into `Option<bool>`, so `false` means `Some(false)` and `true`
+    /// means `Some(true)`. When placing a concrete [`Array`] leaf with `Some(false)`, the result holds no buffer of
+    /// the leaf, even when the leaf was the only handle of its buffers. The buffers that the placement creates are
+    /// used directly. A donated leaf that already lives at its destination also gets storage of its own because
+    /// the explicit request to avoid aliasing takes precedence. JAX applies the donation and returns the input's
+    /// storage in this case. A traced leaf with `Some(false)` stages its placement with a forced copy (refer to
     /// [`PlaceOperation::with_may_alias`]), so that when a batched or
     /// differentiated function is evaluated on concrete arrays, its result shares no buffer with any other array, as
     /// in JAX. A compiled function has no observable buffer identity, so the option has no effect inside one. Host
@@ -795,7 +771,7 @@ impl Session {
         SourcePlacement: PlacementRequestParameter,
         Source: Parameterized<SourcePlacement>,
         Donate: Parameterized<bool>,
-        Aliasing: AliasingParameter,
+        Aliasing: Parameter + Into<Option<bool>>,
         MayAlias: Parameterized<Aliasing>,
     >(
         &self,
@@ -852,10 +828,10 @@ impl Session {
         };
         let may_alias_values = match may_alias {
             Some(may_alias) if is_root_parameter(&may_alias) => {
-                vec![may_alias.into_parameters().next().unwrap().into_may_alias(); parameter_count]
+                vec![may_alias.into_parameters().next().unwrap().into(); parameter_count]
             }
             Some(may_alias) => may_alias
-                .map_parameters(|may_alias| may_alias.into_may_alias())?
+                .map_parameters(Into::into)?
                 .broadcast_to_parameter_structure::<Input::To<Option<bool>>>(structure.clone())?
                 .into_parameters()
                 .collect::<Vec<_>>(),
