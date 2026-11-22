@@ -1998,10 +1998,7 @@ where
 
 /// Stages the output sharding overrides `shardings` (i.e., [`Options::output_shardings`]) on the outputs of a traced
 /// function (refer to `place`), so that the staged function, and every call of it, has the output types that its
-/// executions return. Outputs that are not arrays are left for lowering to reject. An override that leaves a dimension
-/// unconstrained is rejected, as JAX rejects such `out_shardings`, because the result of an execution has the placement
-/// of its override, and the sharding of an array states where its buffers are, which an unconstrained dimension does
-/// not (refer to `runtime_output_sharding`).
+/// executions return. Outputs that are not arrays are left for lowering to reject.
 fn place_outputs<V, P>(outputs: P, shardings: Option<&[Sharding]>) -> Result<P, Error>
 where
     V: CoreValue<Type = Type> + Reshard + ConstrainSharding,
@@ -2017,18 +2014,6 @@ where
             kind: "output",
             expected: outputs.len(),
             actual: shardings.len(),
-        }));
-    }
-    if let Some((index, sharding)) = shardings
-        .iter()
-        .enumerate()
-        .find(|(_, sharding)| sharding.dimensions().contains(&ShardingDimension::Unconstrained))
-    {
-        return Err(Error::Compilation(CompilationError::InvalidOptions {
-            reason: format!(
-                "output sharding override #{index} `{sharding}` leaves a dimension unconstrained, which the result of \
-                 an execution cannot have because its placement must state where its buffers are",
-            ),
         }));
     }
     let outputs = outputs
@@ -4517,6 +4502,7 @@ mod tests {
         let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
         let second_replicated = Sharding::replicated(second_mesh.logical_mesh().clone(), 1);
         let second_placement = Placement::new(second_mesh.clone(), second_replicated.clone()).unwrap();
+        let unconstrained_placement = Placement::new(mesh.clone(), unconstrained.clone()).unwrap();
         let second_device = devices[1];
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
         let short_vector_type = ArrayType::new_static(DataType::F32, [3]);
@@ -4562,6 +4548,7 @@ mod tests {
             .unwrap()
         };
         let values = [1.0f32, 2.0, 3.0, 4.0];
+        let identity = |(), x: CompileTracer| Ok::<_, Error>(x);
         let rows = vec![
             Row {
                 name: "no overrides",
@@ -4588,6 +4575,16 @@ mod tests {
                 caller_mesh: mesh.clone(),
             },
             Row {
+                name: "unconstrained output override",
+                input_type: vector_type.clone(),
+                callee: compiled(
+                    &vector_type,
+                    Options::new(mesh.clone()).with_output_shardings(vec![unconstrained.clone()]),
+                ),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
                 name: "input override",
                 input_type: vector_type.clone(),
                 callee: compiled(
@@ -4595,6 +4592,26 @@ mod tests {
                     Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
                 ),
                 input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "unconstrained input override",
+                input_type: vector_type.clone(),
+                callee: compiled(
+                    &vector_type,
+                    Options::new(mesh.clone()).with_input_shardings(vec![unconstrained.clone()]),
+                ),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "unconstrained input override of a replicated input",
+                input_type: vector_type.clone(),
+                callee: compiled(
+                    &vector_type,
+                    Options::new(mesh.clone()).with_input_shardings(vec![unconstrained.clone()]),
+                ),
+                input: upload(&vector_type, Some(&mesh), None, &values),
                 caller_mesh: mesh.clone(),
             },
             Row {
@@ -4666,6 +4683,21 @@ mod tests {
                 caller_mesh: second_mesh.clone(),
             },
             Row {
+                name: "unconstrained placement in the body",
+                input_type: vector_type.clone(),
+                callee: Callee::Compiled(
+                    compile(
+                        |x: CompileTracer| x.place(&unconstrained_placement, None).unwrap(),
+                        vector_type.clone(),
+                        &session,
+                        mesh.clone(),
+                    )
+                    .unwrap(),
+                ),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
                 name: "committed capture",
                 input_type: vector_type.clone(),
                 callee: Callee::Compiled(
@@ -4721,25 +4753,38 @@ mod tests {
                 caller_mesh: second_mesh.clone(),
             },
             Row {
+                name: "dispatcher with an unconstrained input override",
+                input_type: vector_type.clone(),
+                callee: Callee::Dispatcher(jit_with_options(
+                    identity,
+                    &session,
+                    Options::new(mesh.clone()).with_input_shardings(vec![unconstrained.clone()]),
+                )),
+                input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "dispatcher with an unconstrained input override of a replicated input",
+                input_type: vector_type.clone(),
+                callee: Callee::Dispatcher(jit_with_options(
+                    identity,
+                    &session,
+                    Options::new(mesh.clone()).with_input_shardings(vec![unconstrained.clone()]),
+                )),
+                input: upload(&vector_type, Some(&mesh), None, &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
                 name: "dispatcher over auto axes",
                 input_type: vector_type.clone(),
-                callee: Callee::Dispatcher(jit(|(), x: CompileTracer| Ok::<_, Error>(x), &session, mesh.clone())),
+                callee: Callee::Dispatcher(jit_with_options(identity, &session, Options::new(mesh.clone()))),
                 input: upload(&vector_type, Some(&mesh), Some(&split), &values),
                 caller_mesh: mesh.clone(),
             },
         ];
 
-        // The sharding and the type of a runtime array state where its buffers are, so neither leaves a dimension
-        // unconstrained, whichever entry point returns it.
-        let assert_definite = |array: &Array| {
-            let is_definite = |sharding: Option<&Sharding>| {
-                sharding.is_none_or(|sharding| !sharding.dimensions().contains(&ShardingDimension::Unconstrained))
-            };
-            assert!(is_definite(Some(array.sharding())) && is_definite(array.r#type().sharding()), "{array:?}");
-        };
         let observe = |array: &Array, negated: bool| {
             array.block_until_ready().unwrap();
-            assert_definite(array);
             Observation {
                 devices: array.shards().iter().map(ArrayShard::device).collect(),
                 shapes: array.shards().iter().map(|shard| shard.shape().to_string()).collect(),
@@ -4760,7 +4805,6 @@ mod tests {
         };
         let observe_derivative = |array: &Array| {
             array.block_until_ready().unwrap();
-            assert_definite(array);
             let memory_kind = |shard: &ArrayShard| match shard.buffer() {
                 Some(buffer) => buffer.memory().unwrap().kind().unwrap().into_owned(),
                 None => String::new(),
@@ -4821,7 +4865,7 @@ mod tests {
             "caller with a condition",
             "caller with a while loop",
         ];
-        let derivative_columns = ["eager JVP tangent", "eager VJP cotangent"];
+        let derivative_columns = ["eager JVP tangent", "eager VJP cotangent", "compiled gradient"];
 
         let mut outcomes = Vec::new();
         for row in &rows {
@@ -5019,7 +5063,8 @@ mod tests {
             // Eager derivatives of the call agree with those of the function that the callee was compiled from, which
             // is the identity for every row except those that place their input in their body, in values, devices,
             // sharding, type, memory, and commitment. The tangent is seeded with the input and the cotangent with the
-            // output. The capture of its row is zero and takes no part in where a call runs.
+            // output, and the compiled gradient is that of the sum of the output, compiled for the caller mesh. The
+            // capture of its row is zero and takes no part in where a call runs.
             macro_rules! apply {
                 ($compiled:expr, $x:expr) => {{
                     let x = ValueProjection::<ArrayType>::into_projected($x)?;
@@ -5027,6 +5072,7 @@ mod tests {
                         (true, _) => callee.call(x)?,
                         (false, "placement in the body") => x.place(&second_placement, None)?,
                         (false, "device in the body") => x.place(&second_device, None)?,
+                        (false, "unconstrained placement in the body") => x.place(&unconstrained_placement, None)?,
                         (false, _) => x,
                     };
                     Ok(y.into_value())
@@ -5041,10 +5087,25 @@ mod tests {
                     .differentiate_at(Value::Array(row.input.clone()))
                     .vjp(|x| apply!(compiled, x))
                     .and_then(|(output, pullback)| Ok(pullback.apply_materialized(output)?));
-                [tangent, cotangent].map(|derivative| {
+                let [tangent, cotangent] = [tangent, cotangent].map(|derivative| {
                     let array = derivative.and_then(|value| Ok(ValueProjection::<ArrayType>::into_projected(value)?));
                     array.map(|array| observe_derivative(&array)).map_err(|error| error.to_string())
-                })
+                });
+                let gradient = stage_with_flat_captures(
+                    |_, _, x: CompileTracer| {
+                        let output: Result<_, ProgramError> = (|| apply!(compiled, x.into_value()))();
+                        Ok(ValueProjection::<ArrayType>::into_projected(output?)?.reduce_sum(&[0], None)?)
+                    },
+                    Vec::new(),
+                    row.input_type.clone(),
+                    Options::new(row.caller_mesh.clone()),
+                )
+                .and_then(|total: StagedFunction<ArrayType, ArrayType>| session.compile_staged_function(total))
+                .and_then(|total| total.gradient(&session))
+                .and_then(|gradient| gradient.executable().execute(&session, row.input.clone()))
+                .map(|gradient| observe_derivative(&gradient))
+                .map_err(|error| error.to_string());
+                [tangent, cotangent, gradient]
             };
             for ((column, observation), reference) in
                 derivative_columns.iter().zip(differentiate(true)).zip(differentiate(false))
@@ -5121,7 +5182,14 @@ mod tests {
         // input on the canonical mesh of one device gets its cotangent back on that mesh, over the device of the call.
         // A placement in the body sends the cotangent to the devices of the call, which moved the input there, as JAX
         // returns the cotangent of a `jit` call to the devices of the call, whereas the function that the callee was
-        // compiled from, an uncompiled `place`, transposes it back to the device of the input.
+        // compiled from, an uncompiled `place`, transposes it back to the device of the input. Likewise, a placement
+        // onto an unconstrained target in the body returns the cotangent replicated, as the callee places it, whereas
+        // an uncompiled `place` transposes it back to the split placement of the input. The tangent of a call
+        // whose boundary leaves a dimension unconstrained keeps that dimension unconstrained in its sharding and type,
+        // as the result of the call does, and stores it replicated, while the cotangent of its input takes the type of
+        // that input, as a cotangent of a replicated input override does, because both store the dimension replicated.
+        // A compiled gradient follows the eager cotangent, except where a caller compiled for other devices calls the
+        // callee and where the sum of a bufferless value does not lower.
         let differences = |fields: &[(&str, &str, &str)]| {
             let fields = fields
                 .iter()
@@ -5142,11 +5210,36 @@ mod tests {
                 ("committed", "true", "false"),
             ])
         };
+        let unconstrained = "{mesh<['x'=2:auto]>, [{?}]}";
+        let unconstrained_tangent = |input: &str| {
+            differences(&[("sharding", unconstrained, input), ("type", &typed(unconstrained), &typed(replicated))])
+        };
         let derivative_exceptions = [
             ("replicated output override", "eager JVP tangent", differences(&[("sharding", replicated, split)])),
             ("replicated output override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
+            ("unconstrained output override", "eager JVP tangent", unconstrained_tangent(split)),
+            ("unconstrained output override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
+            ("unconstrained input override", "eager JVP tangent", unconstrained_tangent(split)),
+            ("unconstrained input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
+            (
+                "unconstrained input override of a replicated input",
+                "eager JVP tangent",
+                unconstrained_tangent(replicated),
+            ),
+            ("dispatcher with an unconstrained input override", "eager JVP tangent", unconstrained_tangent(split)),
+            (
+                "dispatcher with an unconstrained input override",
+                "eager VJP cotangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
+            (
+                "dispatcher with an unconstrained input override of a replicated input",
+                "eager JVP tangent",
+                unconstrained_tangent(replicated),
+            ),
             ("split output override", "eager JVP tangent", differences(&[("sharding", split, replicated)])),
             ("split output override", "eager VJP cotangent", differences(&[("sharding", split, replicated)])),
+            ("split output override", "compiled gradient", differences(&[("sharding", split, replicated)])),
             ("input override", "eager JVP tangent", differences(&[("sharding", replicated, split)])),
             ("input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
             ("other single device", "eager JVP tangent", moved(second)),
@@ -5155,6 +5248,7 @@ mod tests {
                 "eager VJP cotangent",
                 differences(&[("devices", "[1]", "[0]"), ("committed", "true", "false")]),
             ),
+            ("other single device", "compiled gradient", other_devices.to_string()),
             (
                 "single device replicated output override",
                 "eager JVP tangent",
@@ -5169,6 +5263,16 @@ mod tests {
                 "eager VJP cotangent",
                 differences(&[("committed", "true", "false")]),
             ),
+            (
+                "single device replicated output override",
+                "compiled gradient",
+                differences(&[("committed", "true", "false")]),
+            ),
+            (
+                "bufferless result",
+                "compiled gradient",
+                "fails with `cannot lower element type `zero` for sum reduction identity`".to_string(),
+            ),
             ("placement in the body", "eager VJP cotangent", differences(&[("devices", "[1]", "[0]")])),
             (
                 "device in the body",
@@ -5176,12 +5280,18 @@ mod tests {
                 differences(&[("sharding", second, canonical), ("type", &typed(second), &typed(canonical))]),
             ),
             ("device in the body", "eager VJP cotangent", differences(&[("devices", "[1]", "[0]")])),
+            (
+                "unconstrained placement in the body",
+                "eager VJP cotangent",
+                differences(&[("sharding", replicated, split)]),
+            ),
             ("three levels of nesting", "eager JVP tangent", moved(second)),
             (
                 "three levels of nesting",
                 "eager VJP cotangent",
                 differences(&[("devices", "[1]", "[0]"), ("committed", "true", "false")]),
             ),
+            ("three levels of nesting", "compiled gradient", differences(&[("committed", "true", "false")])),
         ];
         let expected_outcomes = rows
             .iter()
@@ -5213,19 +5323,6 @@ mod tests {
         assert_eq!(
             observe(&caller.execute((), input.clone()).unwrap(), false),
             observe(&dispatcher.execute((), input.clone()).unwrap(), false),
-        );
-
-        // An output override that leaves a dimension unconstrained is rejected, as JAX rejects such `out_shardings`.
-        let options = Options::new(mesh.clone()).with_output_shardings(vec![unconstrained.clone()]);
-        let rejected: Result<CompiledFunction<ArrayType, ArrayType>, _> =
-            compile_with_options(|x| x, vector_type.clone(), &session, options);
-        assert_eq!(
-            rejected.err().map(|error| error.to_string()),
-            Some(format!(
-                "invalid compilation options: output sharding override #0 `{unconstrained}` leaves a dimension \
-                 unconstrained, which the result of an execution cannot have because its placement must state where \
-                 its buffers are",
-            )),
         );
     }
 
@@ -5807,6 +5904,50 @@ mod tests {
             assert_eq!(output.sharding(), &replicated);
             assert_eq!(shapes(&output), vec!["[4]", "[4]"]);
             assert_eq!(values(&output), vec![values_to_bytes(&[1i32, 2, 3, 4]), values_to_bytes(&[1i32, 2, 3, 4])]);
+        }
+    }
+
+    #[test]
+    fn test_compiled_function_call_keeps_unconstrained_output_override_inside_compile() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let engine = Session::builder().client(client).build().unwrap();
+        let shapes = |array: &Array| array.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>();
+        let values =
+            |array: &Array| array.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+
+        // An identity with an output override that leaves a dimension unconstrained returns that dimension whole,
+        // whose runtime placement records it as unconstrained, directly and inside another compiled function.
+        let unconstrained = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained],
+        )
+        .unwrap();
+        let matrix_type = ArrayType::new_static(DataType::I32, [4, 4]);
+        let matrix_values = (0..16).collect::<Vec<i32>>();
+        let matrix =
+            Array::from_host_buffer(&engine, matrix_type.clone(), mesh.clone(), None, values_to_bytes(&matrix_values))
+                .unwrap();
+        let identity: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x| x,
+            matrix_type.clone(),
+            &engine,
+            Options::new(mesh.clone()).with_output_shardings(vec![unconstrained.clone()]),
+        )
+        .unwrap();
+        let wrapped: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| identity.call(x).unwrap(), matrix_type, &engine, mesh.clone()).unwrap();
+        for output in [
+            identity.executable().execute(&engine, matrix.clone()).unwrap(),
+            wrapped.executable().execute(&engine, matrix.clone()).unwrap(),
+        ] {
+            output.block_until_ready().unwrap();
+            assert_eq!(output.sharding(), &unconstrained);
+            assert_eq!(shapes(&output), vec!["[2, 4]", "[2, 4]"]);
+            assert_eq!(
+                values(&output),
+                vec![values_to_bytes(&matrix_values[..8]), values_to_bytes(&matrix_values[8..])],
+            );
         }
     }
 

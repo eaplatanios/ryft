@@ -95,7 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     once for each input type signature and call the contraction as one named composite.
   - **Quantization:** `BlockQuantize`, `BlockDequantize`, and `ScaledDot` for block-scaled (i.e., microscaling) formats
     such as NVFP4 and MXFP8, along with `block_scaled_dot`, which creates a differentiable block-scaled dot product for
-    training.
+    training. `BlockScaleRule` selects the block scale rule (i.e., the standard rules, power of two scales that are
+    rounded up, or the four-over-six rule of NVFP4), global scales can be grouped (e.g., one scale per row), and
+    `BlockScaledDotResidualPolicy::Quantized` makes the backward pass of `block_scaled_dot` keep only the quantized
+    forward inputs and quantize them again in the gradient format.
   - **Attention:** Scaled dot-product attention via `dot_product_attention` and `differentiable_dot_product_attention`,
     which is staged as calls of named composites that backends can replace with their own implementations.
   - **Random Number Generation:** `RngBitGenerator`, `DynamicRngBitGenerator`, `Random`, and `Dropout`.

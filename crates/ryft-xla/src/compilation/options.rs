@@ -226,11 +226,7 @@ impl Options {
     /// `reshard` over explicit mesh axes and a `constrain_sharding` over auto mesh axes, so that calls of the staged
     /// function return the output types that its executions return, and lowering places the executable outputs
     /// accordingly. Their number must equal the flat output arity, and a mismatch surfaces as
-    /// [`CompilationError::ShardingCountMismatch`](crate::CompilationError::ShardingCountMismatch). An override must
-    /// constrain every dimension, because the placement of the result of an execution states where its buffers are,
-    /// so one that leaves a dimension unconstrained surfaces as
-    /// [`CompilationError::InvalidOptions`](crate::CompilationError::InvalidOptions), as JAX rejects unconstrained
-    /// dimensions in `out_shardings`.
+    /// [`CompilationError::ShardingCountMismatch`](crate::CompilationError::ShardingCountMismatch).
     #[inline]
     pub fn with_output_shardings(mut self, output_shardings: Vec<Sharding>) -> Self {
         self.output_shardings = Some(output_shardings);

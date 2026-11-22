@@ -6,8 +6,9 @@ use ryft_mlir::{
     ValueRef,
 };
 
+use crate::lowering::{CollectiveLoweringState, constrain_unreduced_outputs};
 use crate::operations::{normalize_binary_elementwise_operands, normalize_elementwise_operand};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for MaxOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -29,15 +30,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
         let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
-        Ok(vec![lower_extremum_to_mlir(
-            true,
-            output_types[0].data_type(),
-            left,
-            right,
-            form,
-            &mut lowerer.block(),
-            lowerer.location(),
-        )?])
+        lower_elementwise_extremum(true, lowerer, left, right, &output_types[0], form)
     }
 }
 
@@ -61,15 +54,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
         let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
-        Ok(vec![lower_extremum_to_mlir(
-            false,
-            output_types[0].data_type(),
-            left,
-            right,
-            form,
-            &mut lowerer.block(),
-            lowerer.location(),
-        )?])
+        lower_elementwise_extremum(false, lowerer, left, right, &output_types[0], form)
     }
 }
 
@@ -195,6 +180,35 @@ impl FloatExtremumForm {
     }
 }
 
+/// Lowers the elementwise maximum (if `maximum` is set) or minimum of `left` and `right`, whose output has type
+/// `output_type`, with [`lower_extremum_to_mlir`]. An output that is unreduced (i.e., an extremum of values that are
+/// unreduced with the kind of the extremum) has intermediate values that are unreduced along the same mesh axes,
+/// because each device computes the extremum of its own contributions, which commutes with the reduction that completes
+/// them.
+/// Shardy rejects an operation whose result drops an unreduced axis of its inputs, so those intermediate values are
+/// constrained like the output (refer to [`constrain_unreduced_outputs`]). The constraints do not move any data, so the
+/// values, including the NaNs and the signs of zeros, are the same as for values without reduction state.
+fn lower_elementwise_extremum<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    maximum: bool,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    form: FloatExtremumForm,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let data_type = output_type.data_type();
+    let mut block = lowerer.block();
+    let location = lowerer.location();
+    if output_type.unreduced_axes().is_empty() {
+        return Ok(vec![lower_extremum_to_mlir(maximum, data_type, left, right, form, &mut block, location)?]);
+    }
+    let output_types = [Type::Array(output_type.clone())];
+    let unreduced = Some((output_types.as_slice(), lowerer.collective_state()));
+    Ok(vec![lower_constrained_extremum_to_mlir(
+        maximum, data_type, left, right, form, unreduced, &mut block, location,
+    )?])
+}
+
 /// Lowers one minimum or maximum that is compatible with JAX. Integer and Boolean values use the corresponding
 /// StableHLO operation. Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so
 /// that every XLA backend preserves the IEEE semantics of signed zeros and NaNs. Complex values use JAX's
@@ -208,6 +222,30 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    lower_constrained_extremum_to_mlir(maximum, element_type, left, right, form, None, block, location)
+}
+
+/// Lowers one minimum or maximum like [`lower_extremum_to_mlir`], constraining every intermediate value with
+/// [`constrain_unreduced_outputs`] as if it had the output types and the lowering state in `unreduced`, when present.
+/// The result itself is left for the lowering of the instruction to constrain.
+#[allow(clippy::too_many_arguments)]
+fn lower_constrained_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
+    maximum: bool,
+    element_type: DataType,
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    form: FloatExtremumForm,
+    unreduced: Option<(&[Type], &CollectiveLoweringState)>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let constrain = |value: ValueRef<'b, 'c, 't>, block: &mut BlockRef<'b, 'c, 't>| {
+        let mut values = [value];
+        if let Some((output_types, collective_state)) = unreduced {
+            constrain_unreduced_outputs(&mut values, output_types, collective_state, block, location)?;
+        }
+        Ok::<_, Error>(values[0])
+    };
     if !element_type.is_complex() && !element_type.is_floating_point() {
         let result = if maximum {
             block.append_operation(stable_hlo::maximum(left, right, location)?)?
@@ -231,7 +269,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 };
                 let ordered =
                     block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
-                let ordered = ordered.result(0).unwrap().as_ref();
+                let ordered = constrain(ordered.result(0).unwrap().as_ref(), block)?;
                 block.append_operation(stable_hlo::select(ordered, left, right, location)?)?
             }
             FloatExtremumForm::Native if maximum => {
@@ -239,7 +277,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             }
             FloatExtremumForm::Native => block.append_operation(stable_hlo::minimum(left, right, location)?)?,
         };
-        let mut result = result.result(0).unwrap().as_ref();
+        let mut result = constrain(result.result(0).unwrap().as_ref(), block)?;
 
         if form == FloatExtremumForm::Arithmetic {
             // The ordinary comparison treats the signed zeros as equal, so a tie between two zeros is resolved by
@@ -248,7 +286,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             // only when both are, which is their maximum, and the negated difference `-((-left) - right)` is positive
             // zero only when both are, which is their minimum.
             let negated_left = block.append_operation(stable_hlo::negate(left, location)?)?;
-            let negated_left = negated_left.result(0).unwrap().as_ref();
+            let negated_left = constrain(negated_left.result(0).unwrap().as_ref(), block)?;
             let equal = block.append_operation(stable_hlo::compare(
                 left,
                 right,
@@ -256,7 +294,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 stable_hlo::ComparisonType::Float,
                 location,
             )?)?;
-            let equal = equal.result(0).unwrap().as_ref();
+            let equal = constrain(equal.result(0).unwrap().as_ref(), block)?;
             let left_is_zero = block.append_operation(stable_hlo::compare(
                 left,
                 negated_left,
@@ -264,19 +302,19 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 stable_hlo::ComparisonType::Float,
                 location,
             )?)?;
-            let left_is_zero = left_is_zero.result(0).unwrap().as_ref();
+            let left_is_zero = constrain(left_is_zero.result(0).unwrap().as_ref(), block)?;
             let both_zero = block.append_operation(stable_hlo::and(equal, left_is_zero, location)?)?;
-            let both_zero = both_zero.result(0).unwrap().as_ref();
+            let both_zero = constrain(both_zero.result(0).unwrap().as_ref(), block)?;
             let zero = if maximum {
                 block.append_operation(stable_hlo::add(left, right, location)?)?
             } else {
                 let difference = block.append_operation(stable_hlo::subtract(negated_left, right, location)?)?;
-                let difference = difference.result(0).unwrap().as_ref();
+                let difference = constrain(difference.result(0).unwrap().as_ref(), block)?;
                 block.append_operation(stable_hlo::negate(difference, location)?)?
             };
-            let zero = zero.result(0).unwrap().as_ref();
+            let zero = constrain(zero.result(0).unwrap().as_ref(), block)?;
             let selected = block.append_operation(stable_hlo::select(both_zero, zero, result, location)?)?;
-            result = selected.result(0).unwrap().as_ref();
+            result = constrain(selected.result(0).unwrap().as_ref(), block)?;
         }
 
         // Some XLA backends implement native min/max using instructions that drop NaNs or do not distinguish signed
@@ -289,7 +327,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             stable_hlo::ComparisonType::Float,
             location,
         )?)?;
-        let left_is_nan = left_is_nan.result(0).unwrap().as_ref();
+        let left_is_nan = constrain(left_is_nan.result(0).unwrap().as_ref(), block)?;
         let right_is_nan = block.append_operation(stable_hlo::compare(
             right,
             right,
@@ -297,21 +335,21 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             stable_hlo::ComparisonType::Float,
             location,
         )?)?;
-        let right_is_nan = right_is_nan.result(0).unwrap().as_ref();
+        let right_is_nan = constrain(right_is_nan.result(0).unwrap().as_ref(), block)?;
         let right_or_result = block.append_operation(stable_hlo::select(right_is_nan, right, result, location)?)?;
-        let right_or_result = right_or_result.result(0).unwrap().as_ref();
+        let right_or_result = constrain(right_or_result.result(0).unwrap().as_ref(), block)?;
         let result = block.append_operation(stable_hlo::select(left_is_nan, left, right_or_result, location)?)?;
         return Ok(result.result(0).unwrap().as_ref());
     }
 
     let left_real = block.append_operation(stable_hlo::real(left, location)?)?;
-    let left_real = left_real.result(0).unwrap().as_ref();
+    let left_real = constrain(left_real.result(0).unwrap().as_ref(), block)?;
     let right_real = block.append_operation(stable_hlo::real(right, location)?)?;
-    let right_real = right_real.result(0).unwrap().as_ref();
+    let right_real = constrain(right_real.result(0).unwrap().as_ref(), block)?;
     let left_imaginary = block.append_operation(stable_hlo::imag(left, location)?)?;
-    let left_imaginary = left_imaginary.result(0).unwrap().as_ref();
+    let left_imaginary = constrain(left_imaginary.result(0).unwrap().as_ref(), block)?;
     let right_imaginary = block.append_operation(stable_hlo::imag(right, location)?)?;
-    let right_imaginary = right_imaginary.result(0).unwrap().as_ref();
+    let right_imaginary = constrain(right_imaginary.result(0).unwrap().as_ref(), block)?;
     let real_equal = block.append_operation(stable_hlo::compare(
         left_real,
         right_real,
@@ -319,7 +357,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let real_equal = real_equal.result(0).unwrap().as_ref();
+    let real_equal = constrain(real_equal.result(0).unwrap().as_ref(), block)?;
     let direction =
         if maximum { stable_hlo::ComparisonDirection::GreaterThan } else { stable_hlo::ComparisonDirection::LessThan };
     let real_ordered = block.append_operation(stable_hlo::compare(
@@ -329,7 +367,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let real_ordered = real_ordered.result(0).unwrap().as_ref();
+    let real_ordered = constrain(real_ordered.result(0).unwrap().as_ref(), block)?;
     let imaginary_ordered = block.append_operation(stable_hlo::compare(
         left_imaginary,
         right_imaginary,
@@ -337,24 +375,29 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let imaginary_ordered = imaginary_ordered.result(0).unwrap().as_ref();
+    let imaginary_ordered = constrain(imaginary_ordered.result(0).unwrap().as_ref(), block)?;
     let ordered = block.append_operation(stable_hlo::select(real_equal, imaginary_ordered, real_ordered, location)?)?;
-    let ordered = ordered.result(0).unwrap().as_ref();
+    let ordered = constrain(ordered.result(0).unwrap().as_ref(), block)?;
     let result = block.append_operation(stable_hlo::select(ordered, left, right, location)?)?;
     Ok(result.result(0).unwrap().as_ref())
 }
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, Shape};
+    use ryft_core::{
+        Clamp, Device, DeviceMesh, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, Placeholder, ScanOptions, Shape,
+        Sharding, Typed, UnreducedKind, ValueProjection, scan,
+    };
+    use ryft_pjrt::BufferType;
 
     use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Constant, Session};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
+    use crate::{Array, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, Session, compile};
 
     use super::*;
 
@@ -587,6 +630,198 @@ mod tests {
                 MixedValue::Dimension(3),
                 MixedValue::Dimension(3),
             ],
+        );
+    }
+
+    #[test]
+    fn test_max_and_min_operations_lower_unreduced_values() {
+        // Lowers the extremum of two vectors of type `type` for `mesh`.
+        fn module(session: &Session, mesh: &DeviceMesh, maximum: bool, r#type: &ArrayType) -> String {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let left = builder.add_input(r#type.clone().into());
+            let right = builder.add_input(r#type.clone().into());
+            let output = if maximum {
+                builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0]
+            } else {
+                builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0]
+            };
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            lowered.stable_hlo().to_string()
+        }
+
+        // Returns the extremum of `left` and `right` through the operation of the kind `kind`.
+        fn extremum<V: Max + Min>(kind: UnreducedKind, left: &V, right: &V) -> V {
+            if kind == UnreducedKind::Max { left.max(right).unwrap() } else { left.min(right).unwrap() }
+        }
+
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            pjrt_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let single_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![mesh.devices()[0]],
+        )
+        .unwrap();
+        let r#type = |kind: UnreducedKind| {
+            let sharding = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+            let sharding = sharding.with_unreduced_kind(kind).unwrap();
+            ArrayType::new_static(DataType::F32, [10]).with_sharding(sharding).unwrap()
+        };
+
+        // Each device holds the operands of `real_operands`, in both orders, so that executions check the signed zeros
+        // and the NaN payloads of the extremum of every device against those of the same operation on values without
+        // reduction state, at the top level of a compiled function, in the body of a `scan`, and in a called function.
+        let (left, right) = real_operands(&session, &single_device_mesh);
+        let (left, right) = (left.copy_to_host_bytes().unwrap(), right.copy_to_host_bytes().unwrap());
+        let contributions = [[left.clone(), right.clone()], [right, left]];
+        let mut outcomes = Vec::new();
+        let mut expected_outcomes = Vec::new();
+        for kind in [UnreducedKind::Max, UnreducedKind::Min] {
+            let r#type = r#type(kind);
+            let [left, right] = [0, 1].map(|operand| {
+                let buffers = pjrt_devices
+                    .iter()
+                    .zip(&contributions)
+                    .map(|(device, contributions)| {
+                        let bytes = contributions[operand].as_slice();
+                        client.buffer(bytes, BufferType::F32, &[10], None, device.clone(), None).unwrap()
+                    })
+                    .collect();
+                Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), None, buffers).unwrap()
+            });
+            let expected_shards = contributions
+                .iter()
+                .map(|[left, right]| {
+                    let upload =
+                        |bytes: &[u8]| replicated_array(&session, &single_device_mesh, DataType::F32, &[10], bytes);
+                    extremum(kind, &upload(left), &upload(right)).copy_to_host_bytes().unwrap()
+                })
+                .collect::<Vec<_>>();
+            let types = (r#type.clone(), r#type.clone());
+            let top_level: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
+                |(left, right): (CompileTracer, CompileTracer)| extremum(kind, &left, &right),
+                types.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let scanned: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
+                |(left, right): (CompileTracer, CompileTracer)| {
+                    let ((output, _), ()) = scan(
+                        |_, (left, right), ()| {
+                            let left = ValueProjection::<ArrayType>::into_projected(left)?;
+                            let right = ValueProjection::<ArrayType>::into_projected(right)?;
+                            Ok(((extremum(kind, &left, &right).into_value(), right.into_value()), ()))
+                        },
+                        (left.into_value(), right.into_value()),
+                        (),
+                        ScanOptions::new().with_iteration_count(1usize),
+                    )
+                    .unwrap();
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                },
+                types.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let called: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
+                compile(|inputs| top_level.call(inputs).unwrap(), types.clone(), &session, mesh.clone()).unwrap();
+            for (context, function) in
+                [("top level", &top_level), ("scan body", &scanned), ("called function", &called)]
+            {
+                let output = function.executable().execute(&session, (left.clone(), right.clone())).unwrap();
+                let shards =
+                    output.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+                outcomes.push(format!("{kind}, {context}: {} {shards:?}", output.r#type()));
+                expected_outcomes.push(format!("{kind}, {context}: {type} {expected_shards:?}"));
+            }
+        }
+        assert_eq!(outcomes.join("\n"), expected_outcomes.join("\n"));
+
+        // The intermediate values of an extremum of unreduced values are unreduced along the same axes, because each
+        // device computes the extremum of its own contributions, which commutes with the reduction that completes them.
+        // Without their constraints, Shardy rejects the comparisons, which drop the unreduced axes of their inputs.
+        assert_eq!(
+            module(&session, &mesh, true, &r#type(UnreducedKind::Max)),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>}, %arg1: tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>}) -> (tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=max{"x"}>}) {
+                    %0 = stablehlo.compare GT, %arg0, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %2 = stablehlo.select %1, %arg0, %arg1 : tensor<10xi1>, tensor<10xf32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    %4 = stablehlo.negate %arg0 : tensor<10xf32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    %6 = stablehlo.compare EQ, %arg0, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %8 = stablehlo.compare EQ, %arg0, %5, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %10 = stablehlo.and %7, %9 : tensor<10xi1>
+                    %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %12 = stablehlo.add %arg0, %arg1 : tensor<10xf32>
+                    %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    %14 = stablehlo.select %11, %13, %3 : tensor<10xi1>, tensor<10xf32>
+                    %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    %16 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %18 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %19 = sdy.sharding_constraint %18 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xi1>
+                    %20 = stablehlo.select %19, %arg1, %15 : tensor<10xi1>, tensor<10xf32>
+                    %21 = sdy.sharding_constraint %20 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    %22 = stablehlo.select %17, %arg0, %21 : tensor<10xi1>, tensor<10xf32>
+                    %23 = sdy.sharding_constraint %22 <@mesh, [{}], unreduced=max{"x"}> : tensor<10xf32>
+                    return %23 : tensor<10xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            module(&session, &mesh, false, &r#type(UnreducedKind::Min)),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>}, %arg1: tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>}) -> (tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced=min{"x"}>}) {
+                    %0 = stablehlo.compare LT, %arg0, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %2 = stablehlo.select %1, %arg0, %arg1 : tensor<10xi1>, tensor<10xf32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %4 = stablehlo.negate %arg0 : tensor<10xf32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %6 = stablehlo.compare EQ, %arg0, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %7 = sdy.sharding_constraint %6 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %8 = stablehlo.compare EQ, %arg0, %5, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %9 = sdy.sharding_constraint %8 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %10 = stablehlo.and %7, %9 : tensor<10xi1>
+                    %11 = sdy.sharding_constraint %10 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %12 = stablehlo.subtract %5, %arg1 : tensor<10xf32>
+                    %13 = sdy.sharding_constraint %12 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %14 = stablehlo.negate %13 : tensor<10xf32>
+                    %15 = sdy.sharding_constraint %14 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %16 = stablehlo.select %11, %15, %3 : tensor<10xi1>, tensor<10xf32>
+                    %17 = sdy.sharding_constraint %16 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %18 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %19 = sdy.sharding_constraint %18 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %20 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<10xf32>, tensor<10xf32>) -> tensor<10xi1>
+                    %21 = sdy.sharding_constraint %20 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xi1>
+                    %22 = stablehlo.select %21, %arg1, %17 : tensor<10xi1>, tensor<10xf32>
+                    %23 = sdy.sharding_constraint %22 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    %24 = stablehlo.select %19, %arg0, %23 : tensor<10xi1>, tensor<10xf32>
+                    %25 = sdy.sharding_constraint %24 <@mesh, [{}], unreduced=min{"x"}> : tensor<10xf32>
+                    return %25 : tensor<10xf32>
+                  }
+                }
+            "#},
         );
     }
 

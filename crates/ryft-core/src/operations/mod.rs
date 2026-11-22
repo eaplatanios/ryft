@@ -164,8 +164,9 @@ pub use manipulation::{
     UpdateSliceOperation,
 };
 pub use quantization::{
-    BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
-    BlockScaledGlobalScaling, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
+    BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaleRule, BlockScaledDot,
+    BlockScaledDotConfiguration, BlockScaledDotResidualPolicy, BlockScaledDotResiduals, BlockScaledGlobalScaling,
+    SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
 };
 pub use random::{
     CategoricalSamplingMode, DROPOUT_OPERATION_NAME, Dropout, DropoutOperation, DynamicRngBitGenerator,

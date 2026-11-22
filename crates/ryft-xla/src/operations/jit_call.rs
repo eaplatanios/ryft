@@ -2678,6 +2678,23 @@ where
 /// canonical mesh over the device of that mesh, so that it combines with the other cotangents of that input, and lives
 /// where JAX returns such a cotangent (i.e., on the devices of the call). Every other value is returned unchanged, because values over
 /// different logical meshes do not combine, and a callee mesh of several devices has no such placement.
+///
+/// A value whose type differs from `refined` in its sharding only in dimensions that one of them leaves unconstrained
+/// (i.e., `{?}`) and the other replicates (refer to [`replicates_unconstrained_dimensions`]) is cast to `refined` as
+/// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
+/// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. An eager array
+/// stores an unconstrained dimension replicated (refer to `entry_boundary_sharding` in `lowering/mod.rs`), so its
+/// buffers are those of `refined`. Inside a compiled program, the cast emits no sharding constraint (an unconstrained
+/// and a replicated dimension do not conflict over explicit mesh axes, and types record no placement over auto mesh
+/// axes), and the entry boundary of the program replicates an unconstrained dimension of any value that it exchanges.
+///
+/// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
+/// an input of type `refined` for a callee input of the type of the value (refer to [`is_untracked_refinement`]), as
+/// the cotangent of an input that a staged caller of untracked type passes to a callee with an input sharding override
+/// is. This mirrors the forward direction, where the call takes that input as it is (refer to `call_input_variation`)
+/// and its lowering constrains the operand to the override, so the derivative returns to the type of the caller input.
+/// The cast only stops tracking the placement of the value, which a type without a sharding states nothing about, and
+/// keeps its values and buffers.
 fn refined_derived_value<C, V>(
     context: &C,
     mesh: Option<&DeviceMesh>,
@@ -2705,11 +2722,65 @@ where
         let target = Placement::new(canonical_mesh, sharding).map_err(TypeError::from)?.with_memory(refined.memory());
         return Ok(context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0));
     }
-    if moves_devices || refined.is_interchangeable_with(&declared) || !declared.is_refined_by(&refined) {
+    if moves_devices
+        || refined.is_interchangeable_with(&declared)
+        || !(declared.is_refined_by(&refined)
+            || is_refined_up_to_unconstrained_dimensions(&declared, &refined)?
+            || is_untracked_refinement(&declared, &refined))
+    {
         return Ok(value);
     }
     let cast = CastOperation::unchecked(refined, vec![declared])?;
     Ok(context.bind(cast, Vec::new(), &[value])?.remove(0))
+}
+
+/// Returns whether `declared` is refined by `refined` once the sharding of `refined` is replaced by that of
+/// `declared`, where both are array types whose shardings differ only in dimensions that one of them leaves
+/// unconstrained and the other replicates (refer to [`replicates_unconstrained_dimensions`]).
+fn is_refined_up_to_unconstrained_dimensions(declared: &Type, refined: &Type) -> Result<bool, TypeError> {
+    let (Type::Array(declared), Type::Array(refined)) = (declared, refined) else {
+        return Ok(false);
+    };
+    let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding()) else {
+        return Ok(false);
+    };
+    if !replicates_unconstrained_dimensions(declared_sharding, refined_sharding) {
+        return Ok(false);
+    }
+    Ok(declared.is_refined_by(&refined.clone().with_sharding(declared_sharding.clone())?))
+}
+
+/// Returns whether `refined`, an array type that tracks no sharding, is a type that a call accepts for a callee input
+/// of type `declared` without varying along more manual mesh axes (refer to `call_input_variation`), where `declared`
+/// tracks a sharding. A call accepts it exactly when `declared` has the shape that `refined` refines and a sharding
+/// without unreduced or reduced axes and without manual variation, so that a value of type `declared` is a value of
+/// type `refined` whose placement is no longer tracked. A sharding that partitions a dimension along manual mesh axes
+/// is not accepted, because a cast cannot change placement over manual mesh axes, which inside a manual region also
+/// determines the shape of the local value.
+fn is_untracked_refinement(declared: &Type, refined: &Type) -> bool {
+    let (Type::Array(declared), Type::Array(refined)) = (declared, refined) else {
+        return false;
+    };
+    refined.sharding().is_none()
+        && declared.sharding().is_some_and(|sharding| {
+            sharding.dimensions().iter().all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
+        })
+        && call_input_variation(declared, refined).is_some()
+}
+
+/// Returns whether the distinct shardings `left` and `right` place an array alike, because they have the same logical
+/// mesh, rank, reduction state, and manual variation, and each of their dimensions is either equal in both or
+/// unconstrained (i.e., `{?}`) in one and replicated in the other. A runtime array stores an unconstrained dimension
+/// replicated, so arrays placed as either sharding have the same buffers.
+fn replicates_unconstrained_dimensions(left: &Sharding, right: &Sharding) -> bool {
+    left != right
+        && left.rank() == right.rank()
+        && left.dimensions().iter().zip(right.dimensions()).all(|dimensions| match dimensions {
+            (ShardingDimension::Unconstrained, ShardingDimension::Replicated)
+            | (ShardingDimension::Replicated, ShardingDimension::Unconstrained) => true,
+            (left, right) => left == right,
+        })
+        && left.with_dimensions(right.dimensions().to_vec()).is_ok_and(|left| &left == right)
 }
 
 /// Returns `cotangent`, the cotangent that the transposition of a call returns for an input whose cotangent type is
@@ -9131,5 +9202,85 @@ mod tests {
         let rebound = first.renamed(&renamed).unwrap();
         assert_eq!(rebound.definitions(), vec![local]);
         assert_ne!(rebound.outputs(), first.outputs());
+    }
+
+    #[test]
+    fn test_replicates_unconstrained_dimensions() {
+        // Shardings place an array alike when each dimension is equal or unconstrained in one and replicated in the
+        // other, over the same mesh and with the same reduction state and manual variation.
+        let axes = |axis_type: MeshAxisType| {
+            vec![MeshAxis::new("x", 2, axis_type).unwrap(), MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]
+        };
+        let mesh = LogicalMesh::new(axes(MeshAxisType::Explicit)).unwrap();
+        let sharding =
+            |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
+        let (replicated, unconstrained, split) =
+            (ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"]));
+        let open = sharding(&mesh, vec![unconstrained.clone(), split.clone()]);
+        let closed = sharding(&mesh, vec![replicated.clone(), split.clone()]);
+        assert!(replicates_unconstrained_dimensions(&open, &closed));
+        assert!(replicates_unconstrained_dimensions(&closed, &open));
+        assert!(replicates_unconstrained_dimensions(
+            &sharding(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+            &sharding(&mesh, vec![replicated.clone(), unconstrained.clone()]),
+        ));
+
+        // Equal shardings, an unconstrained dimension that the other sharding splits, another rank, another mesh,
+        // another reduction state, and another manual variation are not.
+        assert!(!replicates_unconstrained_dimensions(&open, &open));
+        assert!(!replicates_unconstrained_dimensions(
+            &sharding(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+            &sharding(&mesh, vec![split.clone(), replicated.clone()]),
+        ));
+        assert!(!replicates_unconstrained_dimensions(&sharding(&mesh, vec![unconstrained.clone()]), &closed));
+        let auto_mesh = LogicalMesh::new(axes(MeshAxisType::Auto)).unwrap();
+        assert!(!replicates_unconstrained_dimensions(
+            &open,
+            &sharding(&auto_mesh, vec![replicated.clone(), split.clone()])
+        ));
+        let open = sharding(&mesh, vec![unconstrained, replicated.clone()]);
+        let closed = sharding(&mesh, vec![replicated.clone(), replicated]);
+        assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_unreduced_axes(["y"]).unwrap()));
+        assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_reduced_axes(["y"]).unwrap()));
+        assert!(!replicates_unconstrained_dimensions(&open, &closed.with_varying_manual_axes(["y"]).unwrap()));
+    }
+
+    #[test]
+    fn test_is_untracked_refinement() {
+        // A type without a sharding is an untracked refinement of a type of the same shape whose sharding has no
+        // reduction state and no manual variation, whether that sharding replicates, splits over explicit axes, or
+        // leaves a dimension unconstrained.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let untracked = Type::Array(test_vector_type(4));
+        let typed = |dimension: ShardingDimension| {
+            let sharding = Sharding::new(mesh.clone(), vec![dimension]).unwrap();
+            test_vector_type(4).with_sharding(sharding).unwrap()
+        };
+        for dimension in
+            [ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"])]
+        {
+            assert!(is_untracked_refinement(&Type::Array(typed(dimension)), &untracked));
+        }
+
+        // A tracked or missing sharding of either side, another shape, reduction state, manual variation, and a split
+        // over manual axes are not.
+        let replicated = typed(ShardingDimension::Replicated);
+        let sharding = replicated.sharding().unwrap().clone();
+        assert!(!is_untracked_refinement(&Type::Array(replicated.clone()), &Type::Array(replicated.clone())));
+        assert!(!is_untracked_refinement(&untracked, &untracked));
+        assert!(!is_untracked_refinement(&Type::Array(replicated.clone()), &Type::Array(test_vector_type(3))));
+        for sharding in [
+            sharding.clone().with_unreduced_axes(["y"]).unwrap(),
+            sharding.clone().with_reduced_axes(["y"]).unwrap(),
+            sharding.with_varying_manual_axes(["y"]).unwrap(),
+        ] {
+            let declared = test_vector_type(4).with_sharding(sharding).unwrap();
+            assert!(!is_untracked_refinement(&Type::Array(declared), &untracked));
+        }
+        assert!(!is_untracked_refinement(&Type::Array(typed(ShardingDimension::sharded(["y"]))), &untracked));
     }
 }

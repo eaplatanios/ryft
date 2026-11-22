@@ -34,6 +34,22 @@ impl LowerableOperation for PlaceOperation {
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
 
+        // Transposition turns the source of a placement into the target of the transposed placement, which moves the
+        // cotangent there, so a source that names devices (i.e., a placement or a device) inside a manual region would
+        // move a value of that region in reverse mode, which the target rule below rejects. A program whose derivative
+        // could not be compiled is rejected when it is compiled itself, so such a source is rejected here, whatever the
+        // target is. An in-place source names only the storage of the value, so it is lowered there like anywhere else.
+        let is_inside_manual_region = !lowerer.collective_state().bound_manual_axes().is_empty();
+        if is_inside_manual_region && self.source().is_some_and(PlacementRequest::moves) {
+            let reason = "the source of a value inside a manual region cannot name devices, because transposition \
+                          would move the cotangent of that value to them";
+            return Err(LoweringError::UnsupportedOperation {
+                operation: PLACE_OPERATION_NAME.to_string(),
+                reason: reason.to_string(),
+            }
+            .into());
+        }
+
         // A placement without a target leaves its input where it is, so it lowers to nothing, also inside a manual
         // region. Its source only matters to transposition, and its copy policy is ignored like that of any other
         // placement, because a compiled program has no observable buffer identity.
@@ -48,7 +64,7 @@ impl LowerableOperation for PlaceOperation {
         // leave, even when the program mesh consists of that device alone. This rule exists only because those targets
         // move values, so an in-place target, which leaves the value on the devices of the region and changes only its
         // storage, is lowered there like anywhere else.
-        if target.moves() && !lowerer.collective_state().bound_manual_axes().is_empty() {
+        if target.moves() && is_inside_manual_region {
             return Err(LoweringError::UnsupportedOperation {
                 operation: PLACE_OPERATION_NAME.to_string(),
                 reason: "a value inside a manual region cannot be moved to another placement".to_string(),
@@ -106,8 +122,8 @@ mod tests {
     use ryft_core::{
         BatchAxis, DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
         MeshAxis, MeshAxisType, NegOperation, PartialValue, Place, PlaceDispatch, Placeholder, Placement, ProgramError,
-        Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StopGradient, TiledLayout, Typed,
-        Value as CoreValue, batch, differentiate_at, shard_map,
+        ProjectedValue, Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StopGradient,
+        TiledLayout, Typed, Value as CoreValue, ValueProjection, batch, differentiate_at, shard_map,
     };
     use ryft_pjrt::Client;
 
@@ -500,6 +516,121 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_place_operation_lower_rejects_sources_that_name_devices_inside_manual_regions() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let error = format!(
+            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices, \
+             because transposition would move the cotangent of that value to them",
+        );
+        let moved_error = format!(
+            "cannot lower `{PLACE_OPERATION_NAME}`: a value inside a manual region cannot be moved to another \
+             placement",
+        );
+
+        // Places the invariant value of a `shard_map` body over the first `count` devices with `target` and `source`,
+        // compiled forward, compiled in reverse mode, and eagerly, and returns whether each of them succeeded.
+        let place = |count: usize, target: Option<PlacementRequest>, source: Option<PlacementRequest>| {
+            let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Explicit).unwrap()]);
+            let program_mesh = DeviceMesh::new(explicit_mesh.unwrap(), devices[..count].to_vec()).unwrap();
+            let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Manual).unwrap()]).unwrap();
+            let specification = Sharding::replicated(manual_mesh.clone(), 1);
+            let r#type = ArrayType::new_static(DataType::F32, [4])
+                .with_sharding(Sharding::replicated(program_mesh.logical_mesh().clone(), 1))
+                .unwrap();
+            let forward: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
+                |x: CompileTracer| {
+                    let options = ShardMapOptions::new();
+                    let body = |local: ProjectedValue<ArrayType, _>| local.place(&target, &source);
+                    shard_map(body, x, manual_mesh.clone(), specification.clone(), specification.clone(), options)
+                        .unwrap()
+                },
+                r#type.clone(),
+                &session,
+                program_mesh.clone(),
+            );
+            let seed_type = match target.as_ref().and_then(PlacementRequest::memory) {
+                Some(memory) => r#type.clone().with_memory(memory),
+                None => r#type.clone(),
+            };
+            let reverse: Result<CompiledFunction<(ArrayType, ArrayType), ArrayType>, _> = compile(
+                |(x, seed): (CompileTracer, CompileTracer)| {
+                    let (_, pullback) = differentiate_at(x.into_value())
+                        .vjp(|x| {
+                            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                            let options = ShardMapOptions::new();
+                            let output = shard_map(
+                                |local: ProjectedValue<ArrayType, _>| local.place(&target, &source),
+                                x,
+                                manual_mesh.clone(),
+                                specification.clone(),
+                                specification.clone(),
+                                options,
+                            )
+                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                            Ok(output.into_value())
+                        })
+                        .unwrap();
+                    let cotangent = pullback.apply_materialized(seed.into_value()).unwrap();
+                    ValueProjection::<ArrayType>::into_projected(cotangent).unwrap()
+                },
+                (r#type.clone(), seed_type),
+                &session,
+                program_mesh.clone(),
+            );
+            let input = Array::from_host_buffer(
+                &session,
+                r#type.clone(),
+                program_mesh,
+                None,
+                values_to_bytes(&[1f32, 2., 3., 4.]),
+            )
+            .unwrap();
+            let body = |local: ProjectedValue<ArrayType, _>| local.place(&target, &source);
+            let eager =
+                shard_map(body, input, manual_mesh, specification.clone(), specification, ShardMapOptions::new());
+            [
+                forward.map(|_| ()).map_err(|error| error.to_string()),
+                reverse.map(|_| ()).map_err(|error| error.to_string()),
+                eager.map(|_| ()).map_err(|error| error.to_string()),
+            ]
+        };
+
+        // A source that names devices (i.e., the placement of the value over the devices of the region, or the sole
+        // device of a region of one device) would become the target of the transposed placement, which would move the
+        // cotangent of a value of the region, so it is rejected forward and eagerly, whatever the target is. The
+        // program of reverse mode keeps only the transposed placement, whose target is rejected.
+        let pinned = Some(PlacementRequest::from(Memory::Host { pinned: true }));
+        for count in [1, 2] {
+            let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Manual).unwrap()]).unwrap();
+            let manual_devices = DeviceMesh::new(manual_mesh.clone(), devices[..count].to_vec()).unwrap();
+            let resolved = Placement::new(manual_devices, Sharding::replicated(manual_mesh, 1)).unwrap();
+            let mut sources = vec![PlacementRequest::Resolved(resolved)];
+            if count == 1 {
+                sources.push(PlacementRequest::from(devices[0]));
+            }
+            for source in sources {
+                for target in [pinned.clone(), None] {
+                    assert_eq!(
+                        place(count, target.clone(), Some(source.clone())),
+                        [Err(error.clone()), Err(moved_error.clone()), Err(error.clone())],
+                    );
+                }
+            }
+
+            // An in-place source names only the storage of the value, and no source names nothing, so both compile
+            // forward and in reverse mode, and they execute eagerly.
+            for source in [Some(PlacementRequest::from(Memory::Device)), None] {
+                for target in [pinned.clone(), None] {
+                    assert_eq!(place(count, target, source.clone()), [Ok(()), Ok(()), Ok(())]);
+                }
+            }
+        }
     }
 
     #[test]

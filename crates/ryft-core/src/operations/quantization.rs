@@ -13,7 +13,9 @@
 //! [`block_scaled_dot`] creates the differentiable training entry point, the analogue of `jax.nn.scaled_dot_general`,
 //! which quantizes unquantized inputs in its primal and implements both the JAX gradient policies and the NVFP4
 //! training recipe of NVIDIA (i.e., current global scaling, stochastic gradient rounding, random Hadamard transforms
-//! of the weight gradient inputs, and 16×16 weight scale tiles).
+//! of the weight gradient inputs, and 16×16 weight scale tiles). It also covers recipes with one global scale per
+//! group of values (e.g., per row), with other [`BlockScaleRule`]s, and with backward passes that keep only the
+//! quantized forward inputs (refer to [`BlockScaledDotResidualPolicy`]).
 //!
 //! # Example
 //!
@@ -91,6 +93,11 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// precision are explicit inputs of [`BlockDequantize::block_dequantize`]. The representation imposes no rank or
 /// contraction layout, and consuming operations validate the element types, shapes, and scaling requirements.
 ///
+/// A global scale is either one scale for the whole value (i.e., a rank-0 array) or a _grouped_ global scale, which
+/// has the rank of the elements and, along every dimension, either the extent of the elements or the extent one. It
+/// broadcasts to the elements, so that every group of values that share all of its indices has its own scale (e.g.,
+/// one scale per row of a matrix with the shape `[rows, 1]`).
+///
 /// The parameter type can be an array value, a tracer, or a type descriptor, so this representation can be traced
 /// and transformed as a [`Parameterized`] structure, including its global scale when present.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
@@ -101,7 +108,8 @@ pub struct BlockQuantizedValue<P: Parameter> {
     /// Scale array with one value per block and the same rank as [`Self::elements`].
     pub scales: P,
 
-    /// Optional rank-0 real floating-point scale that multiplies the values after block dequantization.
+    /// Optional real floating-point scale that multiplies the values after block dequantization, for the whole value
+    /// or for groups of its values (refer to [`BlockQuantizedValue`]).
     pub global_scale: Option<P>,
 }
 
@@ -122,6 +130,49 @@ impl<P: Parameter> BlockQuantizedValue<P> {
 
 impl<P: Parameter + Capability> Capability for BlockQuantizedValue<P> {
     type Universe = P::Universe;
+}
+
+/// Rule that derives the scale of a block from its largest magnitude in [`BlockQuantize`]. The scale data type selects
+/// the recipe (refer to [`BlockQuantize`]), and this rule selects a variant of that recipe.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockScaleRule {
+    /// The rule of each recipe that [`BlockQuantize`] documents (i.e., `max_abs(block) / element_max` for `f8e4m3fn`
+    /// scales, and the power of two `2^(floor(log2(max_abs(block))) - emax)` of the OCP MX specification for
+    /// `f8e8m0fnu` scales, which clips the block values whose quotients exceed the largest finite element).
+    #[default]
+    Standard,
+
+    /// The smallest power of two for which the largest magnitude of the block does not exceed the largest finite
+    /// element (i.e., `max_abs(block) / element_max` rounded up to a power of two), so that no value of the block is
+    /// clipped. It equals the [standard](Self::Standard) scale when the block maximum is at most `element_max` times
+    /// that scale, and twice the standard scale otherwise. This is the rule of the `quantize` helper of JAX and of
+    /// the MXFP8 weights of models that are released in that format. It requires `f8e8m0fnu` scales.
+    RoundUp,
+
+    /// The four-over-six rule of NVFP4. Every block also tries the scale `max_abs(block) / 4`, which maps its largest
+    /// magnitude to the element `4` rather than to the largest finite element `6`, and thus spends the finer part of
+    /// the element grid on the whole block. The block keeps that scale only when it reconstructs the block with a
+    /// strictly smaller sum of absolute errors than the [standard](Self::Standard) scale does, both with rounding to
+    /// the nearest element. It requires `f8e4m3fn` scales and `f4e2m1fn` elements.
+    FourOverSix,
+}
+
+impl BlockScaleRule {
+    /// Validates that this rule applies to the recipe that `scale_type` selects for elements of `element_type`.
+    fn validate(self, name: &str, element_type: DataType, scale_type: DataType) -> Result<(), TypeError> {
+        match self {
+            Self::Standard => Ok(()),
+            Self::RoundUp if scale_type == DataType::F8E8M0FNU => Ok(()),
+            Self::RoundUp => Err(TypeError::invalid(format!(
+                "`{name}` round up scales require `f8e8m0fnu` scales but got `{scale_type}` scales",
+            ))),
+            Self::FourOverSix if scale_type == DataType::F8E4M3FN && element_type == DataType::F4E2M1FN => Ok(()),
+            Self::FourOverSix => Err(TypeError::invalid(format!(
+                "`{name}` four-over-six scales require `f8e4m3fn` scales and `f4e2m1fn` elements but got \
+                 `{scale_type}` scales and `{element_type}` elements",
+            ))),
+        }
+    }
 }
 
 /// Name used in diagnostics for [`BlockQuantize`].
@@ -165,7 +216,8 @@ const BLOCK_QUANTIZE_NAME: &str = "block_quantize";
 ///
 /// The power of two `2^floor(log2(max_abs(block)))` of the MX recipe keeps only the exponent bits of the block maximum,
 /// so it is exact for every block maximum, including those just below a power of two. The `quantize` helper of JAX
-/// instead rounds `max_abs(block) / element_max` up to a power of two.
+/// instead rounds `max_abs(block) / element_max` up to a power of two, which [`BlockScaleRule::RoundUp`] selects.
+/// [`BlockScaleRule::FourOverSix`] likewise selects a variant of the NVFP4 recipe.
 ///
 /// Both recipes round their scales and elements to the grids of the narrow types arithmetically (i.e., with exact
 /// power of two spacings derived from exponent bits) before converting them, so that every conversion is exact. This
@@ -201,7 +253,7 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Parame
         element_type: DataType,
         scale_type: DataType,
     ) -> Result<BlockQuantizedValue<Self>, ProgramError> {
-        self.block_quantize_with_options(block_size, element_type, scale_type, -1, None, None)
+        self.block_quantize_with_options(block_size, element_type, scale_type, BlockScaleRule::Standard, -1, None, None)
     }
 
     /// Quantizes `self` into a [`BlockQuantizedValue`] like [`Self::block_quantize`], with blocks of `block_size`
@@ -223,12 +275,14 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Parame
     /// `self` must be an `f32` or `f64` array of rank at least one, `block_size` must be at least two, `block_axes`
     /// must name at least one distinct axis, and the extent of every block axis must be a positive multiple of
     /// `block_size`, because [`ScaledDot`] requires non-empty scales whose blocks have at least two values along
-    /// each contracting dimension. A `global_scale` must be a rank-0 array of the data type of `self` and requires
-    /// `f8e4m3fn` scales, because power of two scales already span the range of their element types (JAX likewise
-    /// rejects global scales for MX formats). A `rounding_noise` array must have the data type and shape of `self`.
-    /// Returns a [`ProgramError`] if these requirements are not met, if `element_type` is not one of `f4e2m1fn`,
-    /// `f8e4m3fn`, and `f8e5m2`, if `scale_type` is not one of `f8e4m3fn` and `f8e8m0fnu`, or if a composed operation
-    /// fails. Homogeneous arrays require static shapes. Array IR values assert unknown block extents at runtime before
+    /// each contracting dimension. A `global_scale` must have the data type of `self` and either rank 0 or the shape
+    /// of a grouped global scale of `self` (refer to [`BlockQuantizedValue`]), which divides every group of values by
+    /// its own scale. It requires `f8e4m3fn` scales, because power of two scales already span the range of their
+    /// element types (JAX likewise rejects global scales for MX formats). A `rounding_noise` array must have the data
+    /// type and shape of `self`. Returns a [`ProgramError`] if these requirements are not met, if `element_type` is
+    /// not one of `f4e2m1fn`, `f8e4m3fn`, and `f8e5m2`, if `scale_type` is not one of `f8e4m3fn` and `f8e8m0fnu`, if
+    /// `scale_rule` does not apply to these types (refer to [`BlockScaleRule`]), or if a composed operation fails.
+    /// Homogeneous arrays require static shapes. Array IR values assert unknown block extents at runtime before
     /// reshaping, and preserve dynamic non-block extents, including empty ones. Known violations are rejected before
     /// composing operations.
     ///
@@ -237,14 +291,16 @@ pub trait BlockQuantize<T = <Self as Capability>::Universe>: Capability + Parame
     ///   - `block_size`: Number of consecutive values along each block axis that share one scale.
     ///   - `element_type`: Data type of the quantized elements.
     ///   - `scale_type`: Data type of the scales, which selects the quantization recipe.
+    ///   - `scale_rule`: Rule that derives the scale of each block within that recipe.
     ///   - `block_axes`: Axes along which blocks extend. Negative axes count backward from the input rank.
-    ///   - `global_scale`: Optional rank-0 scale that divides `self` before block scaling.
+    ///   - `global_scale`: Optional scale that divides `self`, or every group of its values, before block scaling.
     ///   - `rounding_noise`: Optional uniform samples in `[0, 1)` that select stochastic rounding.
     fn block_quantize_with_options<A: Into<Axes>>(
         &self,
         block_size: usize,
         element_type: DataType,
         scale_type: DataType,
+        scale_rule: BlockScaleRule,
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
@@ -259,13 +315,16 @@ where
         + And
         + Broadcast
         + Clamp
+        + Compare
         + ConvertElementType
         + Div
         + Floor
         + Mul
         + Reduce
         + Reshape
-        + Round,
+        + Round
+        + Select
+        + Sub,
     V::Domain: Fill<f64, V>,
 {
     fn block_quantize_with_options<A: Into<Axes>>(
@@ -273,6 +332,7 @@ where
         block_size: usize,
         element_type: DataType,
         scale_type: DataType,
+        scale_rule: BlockScaleRule,
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
@@ -288,6 +348,7 @@ where
             block_size,
             element_type,
             scale_type,
+            scale_rule,
             block_axes.into(),
             global_scale_type.as_ref(),
             noise_type.as_ref(),
@@ -327,12 +388,16 @@ where
         // A global scale divides the input before anything else, so the block scales describe the globally scaled
         // values. The scalar is broadcast with its own type, keeping its placement, and the division aligns it.
         let input = match global_scale {
-            Some(global_scale) => {
+            Some(global_scale) if global_scale.r#type().rank() == 0 => {
                 let mut expanded_type = global_scale.r#type().into_owned();
                 for (axis, &size) in dimensions.iter().enumerate() {
                     expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(size))?;
                 }
                 self.div(&global_scale.broadcast(expanded_type, &[])?)?
+            }
+            Some(global_scale) => {
+                // A grouped global scale already has the rank of the input and only expands its dimensions of extent 1.
+                self.div(&global_scale.broadcast_to(input_type.shape().clone())?)?
             }
             None => self.clone(),
         };
@@ -341,27 +406,39 @@ where
         // the grids of the narrow types, so that every conversion to a narrow type is exact. Compilers that fold a
         // conversion to a narrow type into a following conversion back (e.g., XLA's floating-point conversion
         // simplification on GPUs) therefore cannot change the result, because the rounding is explicit.
-        let block_max =
-            input.reshape(Shape::new(block_dimensions))?.abs()?.reduce(&reduction_axes, ReductionKind::Max)?;
+        let block_shape = Shape::new(block_dimensions);
+        let fill = |r#type: &ArrayType, value: f64| domain.fill(r#type, value);
+        let block_max = input.reshape(block_shape.clone())?.abs()?.reduce(&reduction_axes, ReductionKind::Max)?;
         let stored_scales =
-            quantize_block_scales(&block_max, element_format, scale_type, &scale_value_type, &|r#type, value| {
-                domain.fill(r#type, value)
-            })?;
-        let scales = stored_scales.convert_element_type(scale_type)?;
+            quantize_block_scales(&block_max, element_format, scale_type, scale_rule, &scale_value_type, &fill)?;
 
         // The elements are divided by the stored scales, which are exactly the values that `ScaledDotOperation`
         // dequantizes with. The scales derive from the input, so the expanded scales keep its memory space, placement,
         // and manual variation and only add replicated block dimensions, because broadcasting cannot change variation.
-        let mut expanded_type = stored_scales.r#type().into_owned();
-        for &axis in &reduction_axes {
-            expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(block_size))?;
-        }
-        let expanded_scales =
-            stored_scales.broadcast(expanded_type, scale_axes.as_slice())?.reshape(input_type.shape().clone())?;
-        let quotients = input.div(&expanded_scales)?;
-        let elements = quantize_block_elements(&quotients, element_format, rounding_noise, &|r#type, value| {
-            domain.fill(r#type, value)
-        })?;
+        let expand = |scales: &V| -> Result<V, ProgramError> {
+            let mut expanded_type = scales.r#type().into_owned();
+            for &axis in &reduction_axes {
+                expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(block_size))?;
+            }
+            scales.broadcast(expanded_type, scale_axes.as_slice())?.reshape(input_type.shape().clone())
+        };
+        let stored_scales = match scale_rule {
+            BlockScaleRule::FourOverSix => select_four_over_six_scales(
+                &input,
+                &block_max,
+                stored_scales,
+                element_format,
+                &scale_value_type,
+                &fill,
+                &fill,
+                &expand,
+                &|errors: &V| errors.reshape(block_shape.clone())?.reduce(&reduction_axes, ReductionKind::Sum),
+            )?,
+            BlockScaleRule::Standard | BlockScaleRule::RoundUp => stored_scales,
+        };
+        let scales = stored_scales.convert_element_type(scale_type)?;
+        let quotients = input.div(&expand(&stored_scales)?)?;
+        let elements = quantize_block_elements(&quotients, element_format, rounding_noise, &fill)?;
         Ok(BlockQuantizedValue {
             elements: elements.convert_element_type(element_type)?,
             scales,
@@ -386,12 +463,15 @@ where
         + And
         + BlockQuantize
         + Clamp
+        + Compare
         + ConvertElementType
         + Div
         + Floor
         + Mul
         + Reduce
-        + Round,
+        + Round
+        + Select
+        + Sub,
     <<V as ValueProjection<ArrayType>>::Projected as Value>::Domain:
         Fill<f64, <V as ValueProjection<ArrayType>>::Projected>,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Compare<V> + Div + Rem,
@@ -401,6 +481,7 @@ where
         block_size: usize,
         element_type: DataType,
         scale_type: DataType,
+        scale_rule: BlockScaleRule,
         block_axes: A,
         global_scale: Option<&Self>,
         rounding_noise: Option<&Self>,
@@ -419,6 +500,7 @@ where
                 block_size,
                 element_type,
                 scale_type,
+                scale_rule,
                 block_axes,
                 global_scale.as_ref(),
                 rounding_noise.as_ref(),
@@ -442,6 +524,7 @@ where
             block_size,
             element_type,
             scale_type,
+            scale_rule,
             block_axes.into(),
             global_scale_type.as_ref(),
             noise_type.as_ref(),
@@ -511,7 +594,12 @@ where
         let input = ValueProjection::<ArrayType>::into_projected(self.clone())?;
         let input = match global_scale {
             Some(global_scale) => {
-                let expanded = global_scale.dynamic_broadcast(&input_dimensions, &[])?;
+                // A grouped global scale maps every one of its dimensions to the same dimension of the input.
+                let output_axes = match global_scale_type.as_ref().map(ArrayType::rank) {
+                    Some(0) | None => Vec::new(),
+                    Some(rank) => (0..rank).collect(),
+                };
+                let expanded = global_scale.dynamic_broadcast(&input_dimensions, &output_axes)?;
                 input.div(&ValueProjection::<ArrayType>::into_projected(expanded)?)?
             }
             None => input,
@@ -533,46 +621,67 @@ where
         // The recipes fill only scalars, which need no dimension values and are staged as plain constants like in the
         // homogeneous composition, and arrays with the shape of the values that they combine with.
         let projected_context = block_max.domain();
+        let fill_scales = |r#type: &ArrayType, value: f64| {
+            if r#type.rank() == 0 {
+                return projected_context.fill(r#type, value);
+            }
+            debug_assert_eq!(r#type.shape(), scale_value_type.shape());
+            let scales = context.dynamic_fill(r#type, value, &scale_dynamic_dimensions)?;
+            Ok(ValueProjection::<ArrayType>::into_projected(scales)?)
+        };
         let stored_scales =
-            quantize_block_scales(&block_max, element_format, scale_type, &scale_value_type, &|r#type, value| {
-                if r#type.rank() == 0 {
-                    return projected_context.fill(r#type, value);
-                }
-                debug_assert_eq!(r#type.shape(), scale_value_type.shape());
-                let scales = context.dynamic_fill(r#type, value, &scale_dynamic_dimensions)?;
-                Ok(ValueProjection::<ArrayType>::into_projected(scales)?)
-            })?;
-        let scales = stored_scales.convert_element_type(scale_type)?;
-
-        // The elements are divided by the stored scales, which are exactly the values that dequantization multiplies
-        // them by. Each scale is repeated over its block size dimensions and the blocked shape is merged back into the
-        // input shape, keeping the placement and manual variation of the scales.
-        let expanded = <V as ValueProjection<ArrayType>>::from_projected(stored_scales)
-            .dynamic_broadcast(&block_dimensions, &scale_axes)?
-            .dynamic_reshape(&input_dimensions)?;
-        let expanded = ValueProjection::<ArrayType>::into_projected(expanded)?;
-        let input = ValueProjection::<ArrayType>::into_projected(input)?;
-        let quotients = input.div(&expanded)?;
+            quantize_block_scales(&block_max, element_format, scale_type, scale_rule, &scale_value_type, &fill_scales)?;
 
         // The shared recipe saturates and rounds the quotients, filling arrays with the input shape.
-        let rounding_noise = rounding_noise
-            .map(|value| ValueProjection::<ArrayType>::into_projected(value.clone()))
-            .transpose()?;
         let input_dynamic_dimensions = input_dimensions
             .iter()
             .zip(input_type.shape().dimensions())
             .filter(|(_, dimension)| dimension.value().is_none())
             .map(|(value, _)| value.clone())
             .collect::<Vec<_>>();
-        let elements =
-            quantize_block_elements(&quotients, element_format, rounding_noise.as_ref(), &|r#type, value| {
-                if r#type.rank() == 0 {
-                    return projected_context.fill(r#type, value);
-                }
-                debug_assert_eq!(r#type.shape(), input_type.shape());
-                let elements = context.dynamic_fill(r#type, value, &input_dynamic_dimensions)?;
-                Ok(ValueProjection::<ArrayType>::into_projected(elements)?)
-            })?;
+        let fill_elements = |r#type: &ArrayType, value: f64| {
+            if r#type.rank() == 0 {
+                return projected_context.fill(r#type, value);
+            }
+            debug_assert_eq!(r#type.shape(), input_type.shape());
+            let elements = context.dynamic_fill(r#type, value, &input_dynamic_dimensions)?;
+            Ok(ValueProjection::<ArrayType>::into_projected(elements)?)
+        };
+
+        // The elements are divided by the stored scales, which are exactly the values that dequantization multiplies
+        // them by. Each scale is repeated over its block size dimensions and the blocked shape is merged back into the
+        // input shape, keeping the placement and manual variation of the scales.
+        let expand = |scales: &<V as ValueProjection<ArrayType>>::Projected| {
+            let expanded = <V as ValueProjection<ArrayType>>::from_projected(scales.clone())
+                .dynamic_broadcast(&block_dimensions, &scale_axes)?
+                .dynamic_reshape(&input_dimensions)?;
+            Ok::<_, ProgramError>(ValueProjection::<ArrayType>::into_projected(expanded)?)
+        };
+        let input = ValueProjection::<ArrayType>::into_projected(input)?;
+        let stored_scales = match scale_rule {
+            BlockScaleRule::FourOverSix => select_four_over_six_scales(
+                &input,
+                &block_max,
+                stored_scales,
+                element_format,
+                &scale_value_type,
+                &fill_scales,
+                &fill_elements,
+                &expand,
+                &|errors: &<V as ValueProjection<ArrayType>>::Projected| {
+                    let blocked = <V as ValueProjection<ArrayType>>::from_projected(errors.clone())
+                        .dynamic_reshape(&block_dimensions)?;
+                    ValueProjection::<ArrayType>::into_projected(blocked)?.reduce(&reduction_axes, ReductionKind::Sum)
+                },
+            )?,
+            BlockScaleRule::Standard | BlockScaleRule::RoundUp => stored_scales,
+        };
+        let scales = stored_scales.convert_element_type(scale_type)?;
+        let quotients = input.div(&expand(&stored_scales)?)?;
+        let rounding_noise = rounding_noise
+            .map(|value| ValueProjection::<ArrayType>::into_projected(value.clone()))
+            .transpose()?;
+        let elements = quantize_block_elements(&quotients, element_format, rounding_noise.as_ref(), &fill_elements)?;
         Ok(BlockQuantizedValue {
             elements: <V as ValueProjection<ArrayType>>::from_projected(elements.convert_element_type(element_type)?),
             scales: <V as ValueProjection<ArrayType>>::from_projected(scales),
@@ -587,6 +696,7 @@ fn validate_block_quantize_inputs(
     block_size: usize,
     element_type: DataType,
     scale_type: DataType,
+    scale_rule: BlockScaleRule,
     block_axes: Axes,
     global_scale: Option<&ArrayType>,
     rounding_noise: Option<&ArrayType>,
@@ -598,6 +708,7 @@ fn validate_block_quantize_inputs(
         ))
         .into());
     }
+    scale_rule.validate(BLOCK_QUANTIZE_NAME, element_type, scale_type)?;
 
     let computation_type = input_type.data_type();
     if !matches!(computation_type, DataType::F32 | DataType::F64) {
@@ -643,10 +754,10 @@ fn validate_block_quantize_inputs(
             .into());
         }
 
-        if global_scale_type.rank() != 0 || global_scale_type.data_type() != computation_type {
+        if global_scale_type.data_type() != computation_type || !has_global_scale_shape(global_scale_type, input_type) {
             return Err(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `{computation_type}` array but got \
-                 `{global_scale_type}`",
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a `{computation_type}` array of rank 0 or with the \
+                 shape of the input `{input_type}` up to extents of one but got `{global_scale_type}`",
             ))
             .into());
         }
@@ -665,16 +776,31 @@ fn validate_block_quantize_inputs(
     Ok((element_format, block_axes))
 }
 
+/// Returns whether a global scale of type `global_scale` has a shape that applies to a value of type `value`, which
+/// is the case for a rank-0 scale and for a grouped scale (refer to [`BlockQuantizedValue`]). Data types are checked
+/// by the callers, whose requirements differ.
+fn has_global_scale_shape(global_scale: &ArrayType, value: &ArrayType) -> bool {
+    global_scale.rank() == 0
+        || global_scale.rank() == value.rank()
+            && global_scale
+                .shape()
+                .dimensions()
+                .iter()
+                .zip(value.shape().dimensions())
+                .all(|(scale_dimension, dimension)| scale_dimension.value() == Some(1) || scale_dimension == dimension)
+}
+
 /// Computes the stored block scales at the input precision, sharing the numerical recipe across shape universes.
 fn quantize_block_scales<V, F>(
     block_max: &V,
     element_format: BlockElementFormat,
     scale_type: DataType,
+    scale_rule: BlockScaleRule,
     scale_value_type: &ArrayType,
     fill: &F,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + And + Clamp + ConvertElementType + Div + Floor + Mul + Round,
+    V: Value<Type = ArrayType> + Add + And + Clamp + Compare + ConvertElementType + Div + Floor + Mul + Round + Select,
     F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
 {
     let computation_type = block_max.r#type().data_type();
@@ -696,15 +822,91 @@ where
         // OCP MX power of two scaling computes `2^(floor(log2(max_abs)) - emax)` exactly from the exponent bits of
         // the block maximum. The clamp maps blocks whose maxima are zero or subnormal to the smallest scale and
         // blocks whose maxima are not finite to the largest scale.
-        binade_scale(block_max, &|value| fill(scale_value_type, value))?
-            .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?
-            .clamp(
-                &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
-                &fill(&ArrayType::scalar(computation_type), largest_scale)?,
-            )?
+        let scales = binade_scale(block_max, &|value| fill(scale_value_type, value))?
+            .mul(&fill(scale_value_type, (-f64::from(element_format.max_exponent)).exp2())?)?;
+        let scales = match scale_rule {
+            // The standard scale maps the block maximum into the top binade of the element type, whose upper part
+            // exceeds the largest finite element. Doubling the scale of exactly those blocks is the smallest power of
+            // two that covers them. Both the product and the comparison are exact, because the scale is a power of two.
+            BlockScaleRule::RoundUp => block_max
+                .compare(
+                    &scales.mul(&fill(scale_value_type, element_format.max)?)?,
+                    ComparisonDirection::LessThanOrEqual,
+                )?
+                .select(&scales, &scales.mul(&fill(scale_value_type, 2.0)?)?)?,
+            BlockScaleRule::Standard | BlockScaleRule::FourOverSix => scales,
+        };
+        scales.clamp(
+            &fill(&ArrayType::scalar(computation_type), smallest_scale)?,
+            &fill(&ArrayType::scalar(computation_type), largest_scale)?,
+        )?
     };
 
     Ok(stored_scales)
+}
+
+/// Returns the block scales of [`BlockScaleRule::FourOverSix`], which are, for every block, the `f8e4m3fn` scale that
+/// maps the block maximum to the element `4` when it reconstructs the block with a strictly smaller sum of absolute
+/// errors than the provided standard scale, and the standard scale otherwise. Both candidates round their elements
+/// to the nearest value, so that the choice does not depend on rounding noise.
+///
+/// # Parameters
+///
+///   - `input`: Globally scaled input, whose element type is the computation type.
+///   - `block_max`: Largest magnitude of every block of `input`.
+///   - `six_scales`: Stored standard scales, which map every block maximum to the largest finite element.
+///   - `element_format`: Grid parameters of the element type.
+///   - `scale_value_type`: Type of the scales at the computation type.
+///   - `fill_scales`: Function that fills scalars and values of `scale_value_type`.
+///   - `fill_elements`: Function that fills scalars and values with the type of `input`.
+///   - `expand`: Function that repeats every scale over its block, returning a value with the shape of `input`.
+///   - `block_sum`: Function that sums a value with the shape of `input` over every block.
+#[allow(clippy::too_many_arguments)]
+fn select_four_over_six_scales<V, F, G, E, S>(
+    input: &V,
+    block_max: &V,
+    six_scales: V,
+    element_format: BlockElementFormat,
+    scale_value_type: &ArrayType,
+    fill_scales: &F,
+    fill_elements: &G,
+    expand: &E,
+    block_sum: &S,
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType>
+        + Abs
+        + Add
+        + And
+        + Clamp
+        + Compare
+        + ConvertElementType
+        + Div
+        + Floor
+        + Mul
+        + Round
+        + Select
+        + Sub,
+    F: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+    G: Fn(&ArrayType, f64) -> Result<V, ProgramError>,
+    E: Fn(&V) -> Result<V, ProgramError>,
+    S: Fn(&V) -> Result<V, ProgramError>,
+{
+    let computation_type = block_max.r#type().data_type();
+    let four_scales = block_max.div(&fill_scales(scale_value_type, 4.0)?)?.clamp(
+        &fill_scales(&ArrayType::scalar(computation_type), (-9.0f64).exp2())?,
+        &fill_scales(&ArrayType::scalar(computation_type), 448.0)?,
+    )?;
+    let four_scales =
+        round_to_floating_point_grid(&four_scales, -6, 3, None, &|value| fill_scales(scale_value_type, value))?;
+    let error = |scales: &V| {
+        let expanded_scales = expand(scales)?;
+        let elements = quantize_block_elements(&input.div(&expanded_scales)?, element_format, None, fill_elements)?;
+        block_sum(&input.sub(&elements.mul(&expanded_scales)?)?.abs()?)
+    };
+    error(&four_scales)?
+        .compare(&error(&six_scales)?, ComparisonDirection::LessThan)?
+        .select(&four_scales, &six_scales)
 }
 
 /// Saturates and rounds the scaled elements using the same arithmetic for static and runtime shapes.
@@ -795,9 +997,10 @@ pub trait BlockDequantize<T = <Self as Capability>::Universe>: Capability + Size
     /// divide the element extent with a quotient of at least two, as in [`BlockQuantize`]. Known violations are
     /// rejected before composing operations, and array IR values assert unknown ratios at runtime. Empty non-block
     /// dimensions are supported. Homogeneous values, including projected array views, require static shapes. Use the
-    /// parent array IR value for dynamic extents. A global scale must be a rank-0 real floating-point array. Returns a
-    /// [`ProgramError`] for invalid inputs, axes, output precision, or unsupported shapes, or if a component operation
-    /// fails.
+    /// parent array IR value for dynamic extents. A global scale must be a real floating-point array of rank 0 or with
+    /// the shape of a grouped global scale of the elements (refer to [`BlockQuantizedValue`]). Returns a
+    /// [`ProgramError`] for invalid inputs, axes, output precision, or unsupported shapes, or if a
+    /// component operation fails.
     ///
     /// # Parameters
     ///
@@ -864,13 +1067,17 @@ impl<V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape
             .convert_element_type(data_type)?;
         let output = elements.mul(&expanded_scales)?;
         match &self.global_scale {
-            Some(global_scale) => {
+            Some(global_scale) if global_scale.r#type().rank() == 0 => {
                 let global_scale = global_scale.convert_element_type(data_type)?;
                 let mut expanded_type = global_scale.r#type().into_owned();
                 for (axis, &extent) in element_shape.dimensions().iter().enumerate() {
                     expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
                 }
                 output.mul(&global_scale.broadcast(expanded_type, &[])?)
+            }
+            Some(global_scale) => {
+                // A grouped global scale has the rank of the elements and only expands its dimensions of extent 1.
+                output.mul(&global_scale.convert_element_type(data_type)?.broadcast_to(element_type.shape().clone())?)
             }
             None => Ok(output),
         }
@@ -968,8 +1175,16 @@ where
             Some(global_scale) => {
                 let global_scale = ValueProjection::<ArrayType>::into_projected(global_scale.clone())?
                     .convert_element_type(data_type)?;
+
+                // A grouped global scale maps every one of its dimensions to the same dimension of the elements.
+                let output_axes = match global_scale_type.as_ref().map(ArrayType::rank) {
+                    Some(0) | None => Vec::new(),
+                    Some(rank) => (0..rank).collect(),
+                };
+
                 let expanded = <V as ValueProjection<ArrayType>>::from_projected(global_scale)
-                    .dynamic_broadcast(&element_dimensions, &[])?;
+                    .dynamic_broadcast(&element_dimensions, &output_axes)?;
+
                 output.mul(&ValueProjection::<ArrayType>::into_projected(expanded)?)?
             }
             None => output,
@@ -1006,13 +1221,13 @@ fn validate_block_dequantize_inputs(
     }
 
     if let Some(global_scale) = global_scale
-        && (global_scale.rank() != 0
+        && (!has_global_scale_shape(global_scale, elements)
             || !global_scale.data_type().is_floating_point()
             || !global_scale.data_type().is_real())
     {
         return Err(TypeError::invalid(format!(
-            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array \
-             but got `{global_scale}`",
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a real floating-point array of rank 0 or with the shape \
+             of the elements `{elements}` up to extents of one but got `{global_scale}`",
         ))
         .into());
     }
@@ -1500,7 +1715,9 @@ const SCALED_MATMUL_NAME: &str = "scaled_matmul";
 ///
 /// Blanket implementations compose primitive contraction, broadcasting, multiplication, and conversion. Homogeneous
 /// values, including projected array views, require a static output shape when global scales are present. Parent
-/// array IR values additionally support dynamic output extents through dimension reads and dynamic broadcasting.
+/// array IR values additionally support dynamic output extents with rank-0 global scales through dimension reads
+/// and dynamic broadcasting. Grouped global scales (refer to [`BlockQuantizedValue`]) are placed along the output
+/// dimensions of their groups with static shape operations, so they require static shapes in both universes.
 /// Values covered by a blanket implementation cannot supply another implementation of this capability.
 ///
 /// The value parameter `V` identifies the array representation carried by [`BlockQuantizedValue`] and returned by
@@ -1512,13 +1729,17 @@ const SCALED_MATMUL_NAME: &str = "scaled_matmul";
 pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
     /// Contracts both representations' elements with their block scales, then multiplies the result by their global
     /// scales, treating an absent global scale as `1`. Elements and block scales follow [`ScaledDotOperation`]'s
-    /// requirements. Each present global scale must be a rank-0 real floating-point array. Known rank, shape, and
-    /// data type violations are rejected before staging any operations.
+    /// requirements. Each present global scale must be a real floating-point array of rank 0 or a grouped global
+    /// scale of its elements (refer to [`BlockQuantizedValue`]) with the extent one along every contracting dimension
+    /// of its side, because a scale that varied within a contraction could not multiply its result. Known rank,
+    /// shape, and data type violations are rejected before staging any operations.
     ///
-    /// If both global scales are present, their product is computed first using ordinary arithmetic type promotion.
-    /// That product, or the single present global scale, is broadcast at its own precision and multiplied with the
-    /// contraction result using arithmetic type promotion. The final result is converted to `accumulation_type`.
-    /// This preserves global-scale precision until after contraction rather than narrowing either input beforehand.
+    /// If both global scales are present and have rank 0, their product is computed first using ordinary arithmetic
+    /// type promotion. That product, or the single present global scale, is broadcast at its own precision and
+    /// multiplied with the contraction result using arithmetic type promotion. A grouped global scale is instead
+    /// broadcast along the output dimensions of its batching and free dimensions, and the result is multiplied by
+    /// each global scale in turn. The final result is converted to `accumulation_type`. This preserves global-scale
+    /// precision until after contraction rather than narrowing either input beforehand.
     ///
     /// # Parameters
     ///
@@ -1540,7 +1761,8 @@ pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
 
     /// Computes the rank-3 batched matrix product `[B, M, K] × [B, N, K] → [B, M, N]` with last-dimension
     /// contraction and leading batch dimensions. Both element and block-scale arrays must have rank 3. Global
-    /// scales remain rank-0. Precision and errors follow [`Self::scaled_dot`].
+    /// scales follow [`Self::scaled_dot`] (i.e., a grouped global scale has the shape `[B, M, 1]` or `[B, N, 1]`
+    /// up to extents of one), as do precision and errors.
     ///
     /// # Parameters
     ///
@@ -1555,7 +1777,13 @@ pub trait ScaledDot<T, V: Parameter>: Capability + Sized {
 
 impl<V> ScaledDot<ArrayType, V> for BlockQuantizedValue<V>
 where
-    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + ManualVariationAlignment<ArrayType>,
+    V: Value<Type = ArrayType>
+        + Broadcast
+        + ConvertElementType
+        + Mul
+        + ManualVariationAlignment<ArrayType>
+        + Reshape
+        + Transpose,
     V::Domain: Context<Operation: From<ScaledDotOperation>>,
 {
     fn scaled_dot(
@@ -1572,35 +1800,111 @@ where
             ))
             .into());
         }
-        let global_scale = match (&self.global_scale, &rhs.global_scale) {
-            (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
-            (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
-            (None, None) => None,
-        };
         let dimensions = match dimensions {
             Some(dimensions) => dimensions.clone(),
             None => ScaledDotOperation::default_dimensions(self.elements.r#type().rank())?,
         };
-        let operation = ScaledDotOperation::new(dimensions, output_type.data_type(), true, true);
+
+        // Rank-0 global scales multiply the whole result, so their product is formed first. A grouped global scale
+        // multiplies the result along the output dimensions of its own groups, so each scale is expanded on its own.
+        let grouped_global_scales = [self, rhs]
+            .iter()
+            .any(|side| side.global_scale.as_ref().is_some_and(|global_scale| global_scale.r#type().rank() != 0));
+        let global_scale = match (&self.global_scale, &rhs.global_scale) {
+            _ if grouped_global_scales => None,
+            (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
+            (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
+            (None, None) => None,
+        };
+
+        let operation = ScaledDotOperation::new(dimensions.clone(), output_type.data_type(), true, true);
         let inputs = V::align_manual_variation(&[
             self.elements.clone(),
             rhs.elements.clone(),
             self.scales.clone(),
             rhs.scales.clone(),
         ])?;
+
         let mut outputs = self.elements.domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
-        let output = outputs.remove(0);
-        let output = match global_scale {
-            Some(global_scale) => {
-                let mut expanded_type = global_scale.r#type().into_owned();
-                for (axis, &extent) in output_type.static_shape().unwrap().dimensions().iter().enumerate() {
-                    expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
-                }
-                output.mul(&global_scale.broadcast(expanded_type, &[])?)?
+        let mut output = outputs.remove(0);
+
+        if let Some(global_scale) = global_scale {
+            let mut expanded_type = global_scale.r#type().into_owned();
+            for (axis, &extent) in output_type.static_shape().unwrap().dimensions().iter().enumerate() {
+                expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
             }
-            None => output,
-        };
+            output = output.mul(&global_scale.broadcast(expanded_type, &[])?)?;
+        }
+
+        if grouped_global_scales {
+            let output_shape = output_type.static_shape().unwrap();
+            let batch_count = dimensions.lhs_batching_dimensions().len();
+            let lhs_rank = self.elements.r#type().rank();
+            let lhs_free_count = lhs_rank - batch_count - dimensions.lhs_contracting_dimensions().len();
+            let sides = [
+                (self, dimensions.lhs_batching_dimensions(), dimensions.lhs_contracting_dimensions(), batch_count),
+                (
+                    rhs,
+                    dimensions.rhs_batching_dimensions(),
+                    dimensions.rhs_contracting_dimensions(),
+                    batch_count + lhs_free_count,
+                ),
+            ];
+
+            for (side, batching_dimensions, contracting_dimensions, free_offset) in sides {
+                let Some(global_scale) = &side.global_scale else { continue };
+                let (global_scale, output_axes) = if global_scale.r#type().rank() == 0 {
+                    (global_scale.clone(), Vec::new())
+                } else {
+                    // The output lists batch axes first, then the left input's free axes and the right input's.
+                    // Move the singleton contracting axes to the end so the reshape can drop them.
+                    let shape = side.elements.r#type().static_shape().unwrap();
+                    let extents = shape.dimensions();
+                    let free_dimensions = (0..extents.len())
+                        .filter(|axis| !batching_dimensions.contains(axis) && !contracting_dimensions.contains(axis))
+                        .collect::<Vec<_>>();
+                    let grouped_shape = extents
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, &extent)| {
+                            Dimension::Static(if contracting_dimensions.contains(&axis) { 1 } else { extent })
+                        })
+                        .collect::<Vec<_>>();
+                    let global_scale = global_scale.broadcast_to(Shape::new(grouped_shape))?;
+                    let permutation = batching_dimensions
+                        .iter()
+                        .chain(&free_dimensions)
+                        .chain(contracting_dimensions)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let global_scale = if permutation.iter().enumerate().all(|(index, &axis)| index == axis) {
+                        global_scale
+                    } else {
+                        global_scale.transpose(permutation)?
+                    };
+                    let kept_shape = batching_dimensions
+                        .iter()
+                        .chain(&free_dimensions)
+                        .map(|&axis| Dimension::Static(extents[axis]))
+                        .collect::<Vec<_>>();
+                    let output_axes = (0..batching_dimensions.len())
+                        .chain(free_offset..free_offset + free_dimensions.len())
+                        .collect::<Vec<_>>();
+                    (global_scale.reshape(Shape::new(kept_shape))?, output_axes)
+                };
+
+                let mut expanded_type = global_scale.r#type().into_owned();
+                for (axis, &extent) in output_shape.dimensions().iter().enumerate() {
+                    if !output_axes.contains(&axis) {
+                        expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(extent))?;
+                    }
+                }
+
+                output = output.mul(&global_scale.broadcast(expanded_type, &output_axes)?)?;
+            }
+        }
+
         output.convert_element_type(output_type.data_type())
     }
 
@@ -1628,6 +1932,31 @@ where
         accumulation_type: Option<DataType>,
     ) -> Result<V, ProgramError> {
         let output_type = validate_scaled_dot_inputs(self, rhs, dimensions, accumulation_type)?;
+
+        // Grouped global scales are placed along the output dimensions with static shape operations, so the whole
+        // contraction is delegated to the homogeneous composition, which requires static shapes for them.
+        let array_type = |value: &V| Ok::<_, TypeError>(<&ArrayType>::try_from(value.r#type().as_ref())?.clone());
+        let mut grouped_global_scales = false;
+        for global_scale in [&self.global_scale, &rhs.global_scale].into_iter().flatten() {
+            grouped_global_scales |= array_type(global_scale)?.rank() != 0;
+        }
+
+        if grouped_global_scales {
+            let project = |side: &BlockQuantizedValue<V>| {
+                Ok::<_, ProgramError>(BlockQuantizedValue {
+                    elements: ValueProjection::<ArrayType>::into_projected(side.elements.clone())?,
+                    scales: ValueProjection::<ArrayType>::into_projected(side.scales.clone())?,
+                    global_scale: side
+                        .global_scale
+                        .as_ref()
+                        .map(|global_scale| ValueProjection::<ArrayType>::into_projected(global_scale.clone()))
+                        .transpose()?,
+                })
+            };
+            let output = project(self)?.scaled_dot(&project(rhs)?, dimensions, Some(output_type.data_type()))?;
+            return Ok(ValueProjection::<ArrayType>::from_projected(output));
+        }
+
         let global_scale = match (&self.global_scale, &rhs.global_scale) {
             (Some(lhs), Some(rhs)) => Some(lhs.mul(rhs)?),
             (Some(scale), None) | (None, Some(scale)) => Some(scale.clone()),
@@ -1744,24 +2073,30 @@ fn validate_scaled_dot_inputs<P>(
 where
     P: Parameter + Typed<Type: ArrayMemberType>,
 {
-    for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
-        if let Some(global_scale) = global_scale {
-            let r#type = global_scale.r#type();
-            let r#type = r#type.as_array_type()?;
-            if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
-                return Err(TypeError::invalid(format!(
-                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale must be a rank-0 real floating-point array \
-                     but got `{type}`",
-                ))
-                .into());
-            }
-        }
-    }
-
     let input_types = [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales]
         .into_iter()
         .map(|value| Ok(value.r#type().as_array_type()?.clone()))
         .collect::<Result<Vec<_>, TypeError>>()?;
+
+    let mut grouped_global_scales = false;
+    let sides = [("left", &lhs.global_scale, &input_types[0]), ("right", &rhs.global_scale, &input_types[1])];
+    for (name, global_scale, elements) in sides {
+        if let Some(global_scale) = global_scale {
+            let r#type = global_scale.r#type();
+            let r#type = r#type.as_array_type()?;
+            if !has_global_scale_shape(r#type, elements)
+                || !r#type.data_type().is_floating_point()
+                || !r#type.data_type().is_real()
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale must be a real floating-point array of rank 0 \
+                     or with the shape of the elements `{elements}` up to extents of one but got `{type}`",
+                ))
+                .into());
+            }
+            grouped_global_scales |= r#type.rank() != 0;
+        }
+    }
 
     // Model the raw capability's variation alignment on descriptors only. The actual value transitions are
     // still staged by that capability, preserving their transpose and cross-device cotangent sums.
@@ -1792,8 +2127,41 @@ where
         None => ScaledDotOperation::default_dimensions(input_types[0].rank())?,
     };
 
-    let operation = ScaledDotOperation::new(dimensions, accumulation_type.unwrap_or(DataType::F32), true, true);
-    Ok(operation.infer_output_types(&input_types, &[])?.remove(0))
+    let operation = ScaledDotOperation::new(dimensions.clone(), accumulation_type.unwrap_or(DataType::F32), true, true);
+    let output_type = operation.infer_output_types(&input_types, &[])?.remove(0);
+
+    // Type inference has validated the dimension numbers, so they index the global scales of the same rank. A scale
+    // that varied along a contracting dimension would have to scale the terms of the contraction individually.
+    if grouped_global_scales {
+        let sides = [
+            ("left", &lhs.global_scale, dimensions.lhs_contracting_dimensions()),
+            ("right", &rhs.global_scale, dimensions.rhs_contracting_dimensions()),
+        ];
+        for (name, global_scale, contracting_dimensions) in sides {
+            let Some(global_scale) = global_scale else { continue };
+            let r#type = global_scale.r#type();
+            let r#type = r#type.as_array_type()?;
+            if r#type.rank() != 0
+                && let Some(&axis) =
+                    contracting_dimensions.iter().find(|&&axis| r#type.dimension(axis).value() != Some(1))
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` {name} global scale `{type}` must have extent one along \
+                     contracting dimension {axis}",
+                ))
+                .into());
+            }
+        }
+
+        if input_types[..2].iter().chain([&output_type]).any(|r#type| r#type.static_shape().is_none()) {
+            return Err(TypeError::invalid(format!(
+                "`{SCALED_DOT_OPERATION_NAME}` grouped global scales require static shapes",
+            ))
+            .into());
+        }
+    }
+
+    Ok(output_type)
 }
 
 /// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
@@ -1817,8 +2185,9 @@ const BLOCK_SCALED_DOT_NAME: &str = "block_scaled_dot";
 
 /// Element and scale formats of one input of a block-scaled matrix product, which [`BlockScaledDotConfiguration`]
 /// assigns to the left-hand side input, the right-hand side input, and/or the gradients. The scale data type selects
-/// the [`BlockQuantize`] recipe. Formats with [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale
-/// in addition to their block scales. [`BlockScaledDot::call`] accepts or computes this global scale.
+/// the [`BlockQuantize`] recipe and the [`BlockScaleRule`] selects a variant of it. Formats with
+/// [`F8E4M3FN`](DataType::F8E4M3FN) scales (e.g., NVFP4) use a global scale in addition to their
+/// block scales. [`BlockScaledDot::call`] accepts or computes this global scale.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockScaleFormat {
     /// Number of consecutive values along the contracting dimension that share one scale.
@@ -1829,14 +2198,18 @@ pub struct BlockScaleFormat {
 
     /// Data type of the block scales.
     scale_type: DataType,
+
+    /// Rule that derives the scale of each block.
+    scale_rule: BlockScaleRule,
 }
 
 impl BlockScaleFormat {
-    /// Creates a new [`BlockScaleFormat`]. [`block_scaled_dot`] validates the format against the requirements of
+    /// Creates a new [`BlockScaleFormat`] with the [standard](BlockScaleRule::Standard) scale rule.
+    /// [`block_scaled_dot`] validates the format against the requirements of
     /// [`BlockQuantize::block_quantize_with_options`].
     #[inline]
     pub const fn new(block_size: usize, element_type: DataType, scale_type: DataType) -> Self {
-        Self { block_size, element_type, scale_type }
+        Self { block_size, element_type, scale_type, scale_rule: BlockScaleRule::Standard }
     }
 
     /// Returns the NVFP4 format of NVIDIA, which has blocks of 16 [`F4E2M1FN`](DataType::F4E2M1FN) elements with
@@ -1860,6 +2233,14 @@ impl BlockScaleFormat {
         Self::new(32, DataType::F4E2M1FN, DataType::F8E8M0FNU)
     }
 
+    /// Returns this format with the provided [`BlockScaleRule`] for the scale of each block, which must apply to the
+    /// element and scale data types of this format.
+    #[inline]
+    pub const fn with_scale_rule(mut self, scale_rule: BlockScaleRule) -> Self {
+        self.scale_rule = scale_rule;
+        self
+    }
+
     /// Returns the number of consecutive values along the contracting dimension that share one scale.
     #[inline]
     pub const fn block_size(&self) -> usize {
@@ -1876,6 +2257,12 @@ impl BlockScaleFormat {
     #[inline]
     pub const fn scale_type(&self) -> DataType {
         self.scale_type
+    }
+
+    /// Returns the [`BlockScaleRule`] that derives the scale of each block.
+    #[inline]
+    pub const fn scale_rule(&self) -> BlockScaleRule {
+        self.scale_rule
     }
 
     /// Returns whether this format uses a global scale in addition to its block scales (i.e., whether it has
@@ -1913,6 +2300,26 @@ pub enum BlockScaledGlobalScaling {
     Current,
 }
 
+/// Selects which representation of the forward inputs a [`BlockScaledDot`] saves for its backward pass.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockScaledDotResidualPolicy {
+    /// The original inputs are kept at their own precision. Each backward contraction quantizes the input that it
+    /// contracts again, in the format of that input, along the dimension that it contracts, and rounds it to the
+    /// nearest value.
+    #[default]
+    Inputs,
+
+    /// The quantized forward inputs (i.e., their elements, block scales, and global scales) are kept instead of the
+    /// original inputs, which the backward pass never reads, so that the values that a program holds between its
+    /// forward and backward passes have the size of the narrow formats. Each backward contraction dequantizes the
+    /// quantized input that it contracts and quantizes it again in the gradient format along the dimension that it
+    /// contracts, with stochastic rounding when stochastic gradient rounding is enabled, and with the current global
+    /// scale of its dequantized values (refer to [`BlockScaledGlobalScaling::Current`]) when the gradient format uses
+    /// global scales. The gradients are thus those of the quantized forward computation. This requires quantized
+    /// backward contractions.
+    Quantized,
+}
+
 /// Value-independent semantics of a [`BlockScaledDot`], which [`block_scaled_dot`] creates. Unless overridden, the
 /// gradient format follows the left-hand side input format, and backward contractions are quantized when that format
 /// does not use global scales. [`Self::nvfp4_training`] selects the NVFP4 training recipe of NVIDIA.
@@ -1940,6 +2347,9 @@ pub struct BlockScaledDotConfiguration {
     /// Whether the backward contractions are quantized. With [`None`], they are quantized when the resolved gradient
     /// format does not use global scales, and unquantized otherwise.
     quantized_backward: Option<bool>,
+
+    /// Policy for saving the forward inputs for the backward pass.
+    residual_policy: BlockScaledDotResidualPolicy,
 
     /// Whether quantized gradients round stochastically.
     stochastic_gradient_rounding: bool,
@@ -1971,6 +2381,7 @@ impl BlockScaledDotConfiguration {
             gradient_format: None,
             global_scaling: BlockScaledGlobalScaling::Provided,
             quantized_backward: None,
+            residual_policy: BlockScaledDotResidualPolicy::Inputs,
             stochastic_gradient_rounding: false,
             hadamard_transform: false,
             tiled_rhs_scales: false,
@@ -2049,8 +2460,17 @@ impl BlockScaledDotConfiguration {
         self
     }
 
+    /// Selects which representation of the forward inputs to save for the backward pass.
+    /// [`BlockScaledDotResidualPolicy::Quantized`] requires quantized backward contractions.
+    #[inline]
+    pub fn with_residual_policy(mut self, residual_policy: BlockScaledDotResidualPolicy) -> Self {
+        self.residual_policy = residual_policy;
+        self
+    }
+
     /// Returns this configuration with stochastic (i.e., `true`) or nearest (i.e., `false`) rounding of the output
-    /// cotangents in quantized backward contractions. Stochastic rounding requires
+    /// cotangents in quantized backward contractions, and of the inputs that those contractions quantize again from
+    /// [quantized residuals](BlockScaledDotResidualPolicy::Quantized). Stochastic rounding requires
     /// the `random_state` input of [`BlockScaledDot::call`].
     #[inline]
     pub fn with_stochastic_gradient_rounding(mut self, stochastic_gradient_rounding: bool) -> Self {
@@ -2119,6 +2539,12 @@ impl BlockScaledDotConfiguration {
         self.quantized_backward.unwrap_or(!self.gradient_format().has_global_scale())
     }
 
+    /// Returns the policy for saving the forward inputs for the backward pass.
+    #[inline]
+    pub fn residual_policy(&self) -> BlockScaledDotResidualPolicy {
+        self.residual_policy
+    }
+
     /// Returns whether quantized gradients round stochastically.
     #[inline]
     pub fn stochastic_gradient_rounding(&self) -> bool {
@@ -2173,6 +2599,8 @@ impl BlockScaledDotConfiguration {
                 ))
                 .into());
             }
+
+            format.scale_rule.validate(BLOCK_SCALED_DOT_NAME, format.element_type, format.scale_type)?;
         }
 
         if !matches!(self.accumulation_type, DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64) {
@@ -2193,6 +2621,13 @@ impl BlockScaledDotConfiguration {
             .into());
         }
 
+        if !self.quantized_backward() && self.residual_policy == BlockScaledDotResidualPolicy::Quantized {
+            return Err(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` quantized residuals require quantized backward contractions",
+            ))
+            .into());
+        }
+
         if self.hadamard_transform
             && self.global_scaling == BlockScaledGlobalScaling::Provided
             && (self.lhs_format.has_global_scale() || self.gradient_format().has_global_scale())
@@ -2206,6 +2641,30 @@ impl BlockScaledDotConfiguration {
 
         Ok(())
     }
+}
+
+/// Values that the reverse mode rule of a [`BlockScaledDot`] saves for its backward pass. The
+/// [`BlockScaledDotResidualPolicy`] selects whether these include the original inputs or their quantized forward
+/// representations. Both policies also save the optional inputs of the call and the original input types, so the
+/// backward pass can type its cotangents. Note that this type is public mainly because the bounds of
+/// [`BlockScaledDot::call`] name it.
+#[derive(Clone, Debug, PartialEq, Parameterized)]
+pub struct BlockScaledDotResiduals<P: Parameter> {
+    /// Type of the left-hand side input.
+    lhs_type: ArrayType,
+
+    /// Type of the right-hand side input.
+    rhs_type: ArrayType,
+
+    /// Left-hand side and right-hand side inputs under [`BlockScaledDotResidualPolicy::Inputs`], and nothing otherwise.
+    inputs: Vec<P>,
+
+    /// Quantized left-hand side and right-hand side inputs in the normalized layout under
+    /// [`BlockScaledDotResidualPolicy::Quantized`], and nothing otherwise.
+    quantized_inputs: Vec<BlockQuantizedValue<P>>,
+
+    /// Optional left, right, and gradient global scales and random state of the call, each as zero or one value.
+    optional_inputs: [Vec<P>; 4],
 }
 
 /// Differentiable block-scaled generalized dot product, built by [`block_scaled_dot`]. It quantizes its
@@ -2234,7 +2693,7 @@ where
             D::Operation,
             (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
             DomainTracer<D>,
-            (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
+            BlockScaledDotResiduals<DomainTracer<D>>,
         >,
     >,
 }
@@ -2260,12 +2719,17 @@ where
     /// otherwise. The product of the contracting extents must be a positive multiple of the block sizes of both input
     /// formats, and tiled right scales additionally require that of the free extents of the right-hand side input.
     /// Quantized backward contractions block the products of the free extents of both inputs, so differentiation
-    /// requires each of them to be a multiple of the gradient format's block size and of the block size of its own
-    /// input's format (and of `16` for Hadamard transforms of the left free extents). Global scales must be rank-0
-    /// real floating-point arrays that are only present for formats with global scales under
-    /// [`BlockScaledGlobalScaling::Provided`], and a gradient global scale additionally requires quantized backward
-    /// contractions. A random generator state must be present exactly when stochastic gradient rounding is enabled
-    /// and must have a generator state type. Refer to [`RandomAlgorithm::from_state_type`] for more information.
+    /// requires each of them to be a multiple of the gradient format's block size and, unless the residuals are
+    /// [quantized](BlockScaledDotResidualPolicy::Quantized), of its input format's block size (and of `16` for
+    /// Hadamard transforms of the left free extents). Global scales must be real floating-point arrays that are only
+    /// present for formats with global scales under [`BlockScaledGlobalScaling::Provided`]. The left and right global
+    /// scales have rank 0 or are grouped global scales of their inputs (refer to [`BlockQuantizedValue`]) with the
+    /// extent one along the contracting dimensions, which give every group of values its own scale (e.g., one scale
+    /// per row of the left input). Differentiating a call with grouped global scales and quantized backward
+    /// contractions requires quantized residuals. A gradient global scale must have rank 0 and additionally requires
+    /// quantized backward contractions. A random generator state must be present exactly when stochastic gradient
+    /// rounding is enabled and must have a generator state type. Refer to [`RandomAlgorithm::from_state_type`] for
+    /// more information.
     ///
     /// Note that this function is differentiable only with respect to `lhs` and `rhs`. The global scales and random
     /// state receive structural zero cotangents.
@@ -2304,7 +2768,7 @@ where
                     D::Operation,
                     (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
                     DomainTracer<D>,
-                    (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
+                    BlockScaledDotResiduals<DomainTracer<D>>,
                 >,
                 DomainTracer<D>,
                 (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
@@ -2314,12 +2778,23 @@ where
         // The global scales and the random state are validated before alignment, so that calls rejected here stage
         // nothing. The rules validate the shapes when the composite traces its primal, after alignment.
         let configuration = &self.configuration;
+        let dimensions = &configuration.dimensions;
         let global_scales = [
-            ("left", lhs_global_scale.as_ref(), configuration.lhs_format),
-            ("right", rhs_global_scale.as_ref(), configuration.rhs_format),
-            ("gradient", gradient_global_scale.as_ref(), configuration.gradient_format()),
+            (
+                "left",
+                lhs_global_scale.as_ref(),
+                configuration.lhs_format,
+                Some((lhs.r#type(), dimensions.lhs_contracting_dimensions())),
+            ),
+            (
+                "right",
+                rhs_global_scale.as_ref(),
+                configuration.rhs_format,
+                Some((rhs.r#type(), dimensions.rhs_contracting_dimensions())),
+            ),
+            ("gradient", gradient_global_scale.as_ref(), configuration.gradient_format(), None),
         ];
-        for (name, global_scale, format) in global_scales {
+        for (name, global_scale, format, input) in global_scales {
             let Some(global_scale) = global_scale else { continue };
             if configuration.global_scaling != BlockScaledGlobalScaling::Provided || !format.has_global_scale() {
                 return Err(TypeError::invalid(format!(
@@ -2330,10 +2805,33 @@ where
             }
 
             let r#type = global_scale.r#type();
-            if r#type.rank() != 0 || !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
+            if !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
-                    "`{BLOCK_SCALED_DOT_NAME}` {name} global scale must be a rank-0 real floating-point array \
-                     but got `{type}`",
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} global scale must be a real floating-point array but got \
+                     `{type}`",
+                ))
+                .into());
+            }
+
+            if r#type.rank() == 0 {
+                continue;
+            }
+
+            // A grouped global scale has one scale per group of values of its input that share their indices along
+            // some of its batching and free dimensions. The cotangent has no input whose groups it could follow.
+            let Some((input_type, contracting_dimensions)) = input else {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_SCALED_DOT_NAME}` gradient global scale must be a rank-0 array but got `{type}`",
+                ))
+                .into());
+            };
+            if !has_global_scale_shape(&r#type, &input_type)
+                || contracting_dimensions.iter().any(|&axis| r#type.dimension(axis).value() != Some(1))
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_SCALED_DOT_NAME}` {name} global scale must have rank 0 or the shape of its input \
+                     `{input_type}` up to extents of one, with extent one along its contracting dimensions, but got \
+                     `{type}`",
                 ))
                 .into());
             }
@@ -2379,7 +2877,9 @@ where
 /// [`jax.nn.scaled_dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_dot_general.html). Its
 /// primal quantizes both inputs along their contracting dimensions with the formats of `configuration` and contracts
 /// the resulting representations with [`ScaledDot`], including their global scales. Its reverse mode differentiation
-/// rule saves the inputs at high precision and computes the input gradients with one of two policies:
+/// rule saves the inputs at high precision, or their quantized representations under
+/// [`BlockScaledDotResidualPolicy::Quantized`], and computes the input gradients
+/// with one of two policies:
 ///
 ///   - **Unquantized Backward Contractions:** Contract the output cotangent with the other input at `f32` (or `f64`),
 ///     so that quantization acts as a straight-through estimator. When the gradient format uses global scales,
@@ -2388,7 +2888,8 @@ where
 ///   - **Quantized Backward Contractions:** Quantize the output cotangent with the gradient format and the other input
 ///     with its own format along the contracting dimension of each gradient contraction, and contract them with
 ///     [`ScaledDot`]. The configuration can add stochastic gradient rounding, Hadamard transforms of the weight
-///     gradient inputs, and tiled right scales.
+///     gradient inputs, and tiled right scales. With quantized residuals, the other input is the dequantized forward
+///     representation of that input instead, quantized again with the gradient format.
 ///
 /// Both policies first normalize every input to the rank-3 layout `[batch, free, contracting]` by transposing and
 /// merging its dimensions, so several contracting dimensions form one blocked dimension. That dimension follows the
@@ -2462,70 +2963,98 @@ where
     let primal_configuration = configuration.clone();
     let forward_configuration = configuration.clone();
     let backward_configuration = configuration.clone();
-    Ok(BlockScaledDot {
-        configuration,
-        function: composite(
-            move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
-                DomainTracer<D>,
-                DomainTracer<D>,
-                [Vec<DomainTracer<D>>; 4],
-            )|
-                  -> Result<_, ProgramError> {
-                // The primal quantizes the left-hand side and right-hand side inputs and contracts them using their
-                // optional global scales. The gradient global scale and random state affect only the backward rule.
-                BlockScaledDotRules::new(&primal_configuration, &lhs, &rhs)?.forward(
-                    &lhs,
-                    &rhs,
-                    lhs_global_scale.first(),
-                    rhs_global_scale.first(),
-                )
-            },
+
+    // TODO(eaplatanios): Can we inline the following closures?
+    let primal = move |(lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]): (
+        DomainTracer<D>,
+        DomainTracer<D>,
+        [Vec<DomainTracer<D>>; 4],
+    )|
+          -> Result<_, ProgramError> {
+        // The primal quantizes the left-hand side and right-hand side inputs and contracts them using their optional
+        // global scales. The gradient global scale and random state affect only the backward rule.
+        BlockScaledDotRules::new(&primal_configuration, &lhs.r#type(), &rhs.r#type())?.forward(
+            &lhs,
+            &rhs,
+            lhs_global_scale.first(),
+            rhs_global_scale.first(),
         )
-        .with_symbolic_zero_vjp(
-            move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4])| -> Result<_, ProgramError> {
-                // Save the original inputs as residuals alongside the primal output. The backward rule needs these
-                // unquantized values for its contractions and clipping masks, together with the optional scales and
-                // random state.
-                let (lhs, rhs, [lhs_global_scale, rhs_global_scale, _, _]) = &inputs;
-                let output = BlockScaledDotRules::new(&forward_configuration, lhs, rhs)?.forward(
+    };
+
+    let forward = move |(lhs, rhs, optional_inputs): (
+        DomainTracer<D>,
+        DomainTracer<D>,
+        [Vec<DomainTracer<D>>; 4],
+    )|
+          -> Result<_, ProgramError> {
+        // Keep either the original inputs or their quantized representations as residuals alongside the primal
+        // output, together with the optional scales and random state. The backward rule needs the original inputs for
+        // unquantized contractions and clipping masks, and can contract the quantized representations otherwise.
+        let lhs_type = lhs.r#type().into_owned();
+        let rhs_type = rhs.r#type().into_owned();
+        let rules = BlockScaledDotRules::new(&forward_configuration, &lhs_type, &rhs_type)?;
+        let [lhs_global_scale, rhs_global_scale, _, _] = &optional_inputs;
+        let (lhs_quantized, rhs_quantized) =
+            rules.quantize_inputs(&lhs, &rhs, lhs_global_scale.first(), rhs_global_scale.first())?;
+        let output = rules.contract_inputs(&lhs_quantized, &rhs_quantized)?;
+        let (inputs, quantized_inputs) = match forward_configuration.residual_policy {
+            BlockScaledDotResidualPolicy::Inputs => (vec![lhs, rhs], Vec::new()),
+            BlockScaledDotResidualPolicy::Quantized => (Vec::new(), vec![lhs_quantized, rhs_quantized]),
+        };
+        Ok((
+            output,
+            BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs },
+        ))
+    };
+
+    let backward = move |residuals: BlockScaledDotResiduals<DomainTracer<D>>,
+                         seed: MaybeZero<DomainTracer<D>>|
+          -> Result<_, ProgramError> {
+        // Start with structural zeros in the parameter structure of the inputs. Global scales and the random state
+        // retain these zeros because only the left-hand side and right-hand side inputs are differentiable.
+        let BlockScaledDotResiduals { lhs_type, rhs_type, inputs, quantized_inputs, optional_inputs } = residuals;
+        let mut cotangents = (
+            MaybeZero::Zero(lhs_type.cotangent()?),
+            MaybeZero::Zero(rhs_type.cotangent()?),
+            optional_inputs
+                .clone()
+                .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?,
+        );
+
+        // A structural zero seed needs no backward contraction. For a value seed, apply the configured backward
+        // policy and replace only the left-hand side and right-hand side input cotangents.
+        if let MaybeZero::Value(seed) = seed {
+            let [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state] = &optional_inputs;
+            let backward_inputs = match (inputs.as_slice(), quantized_inputs.as_slice()) {
+                ([lhs, rhs], []) => BlockScaledDotBackwardInputs::Inputs {
                     lhs,
                     rhs,
-                    lhs_global_scale.first(),
-                    rhs_global_scale.first(),
-                )?;
-                Ok((output, inputs))
-            },
-            move |inputs: (DomainTracer<D>, DomainTracer<D>, [Vec<DomainTracer<D>>; 4]),
-                  seed: MaybeZero<DomainTracer<D>>|
-                  -> Result<_, ProgramError> {
-                // Start with structural zeros in the same parameter structure as the inputs. Global scales and the
-                // random state retain these zeros because only the left-hand side and right-hand side inputs are
-                // differentiable.
-                let mut cotangents = inputs
-                    .clone()
-                    .try_map_parameters(|value| Ok::<_, ProgramError>(MaybeZero::Zero(value.r#type().cotangent()?)))?;
-
-                // A structural zero seed needs no backward contraction. For a value seed, apply the configured
-                // backward policy and replace only the left-hand side and right-hand side input cotangents.
-                if let MaybeZero::Value(seed) = seed {
-                    let (lhs, rhs, [lhs_global_scale, rhs_global_scale, gradient_global_scale, random_state]) = &inputs;
-                    let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(&backward_configuration, lhs, rhs)?
-                        .backward(
-                        lhs,
-                        rhs,
-                        lhs_global_scale.first(),
-                        rhs_global_scale.first(),
-                        gradient_global_scale.first(),
-                        random_state.first(),
-                        &seed,
-                    )?;
-                    cotangents.0 = MaybeZero::Value(lhs_cotangent);
-                    cotangents.1 = MaybeZero::Value(rhs_cotangent);
+                    lhs_global_scale: lhs_global_scale.first(),
+                    rhs_global_scale: rhs_global_scale.first(),
+                },
+                ([], [lhs, rhs]) => BlockScaledDotBackwardInputs::Quantized { lhs, rhs },
+                _ => {
+                    return Err(TypeError::invalid(format!(
+                        "`{BLOCK_SCALED_DOT_NAME}` residuals must hold both inputs or both quantized inputs",
+                    ))
+                    .into());
                 }
-                Ok(cotangents)
-            },
-        )
-        .with_name(BLOCK_SCALED_DOT_NAME),
+            };
+            let (lhs_cotangent, rhs_cotangent) = BlockScaledDotRules::new(
+                &backward_configuration,
+                &lhs_type,
+                &rhs_type,
+            )?
+            .backward(backward_inputs, gradient_global_scale.first(), random_state.first(), &seed)?;
+            cotangents.0 = MaybeZero::Value(lhs_cotangent);
+            cotangents.1 = MaybeZero::Value(rhs_cotangent);
+        }
+        Ok(cotangents)
+    };
+
+    Ok(BlockScaledDot {
+        configuration,
+        function: composite(primal).with_symbolic_zero_vjp(forward, backward).with_name(BLOCK_SCALED_DOT_NAME),
     })
 }
 
@@ -2573,6 +3102,33 @@ enum GlobalScale<V> {
     Current,
 }
 
+/// Inputs of the backward rule of a [`BlockScaledDot`], as selected by its [`BlockScaledDotResidualPolicy`].
+enum BlockScaledDotBackwardInputs<'o, V: Parameter> {
+    /// Original inputs with their optional provided global scales.
+    Inputs {
+        /// Left-hand side input.
+        lhs: &'o V,
+
+        /// Right-hand side input.
+        rhs: &'o V,
+
+        /// Optional provided global scale of the left-hand side input.
+        lhs_global_scale: Option<&'o V>,
+
+        /// Optional provided global scale of the right-hand side input.
+        rhs_global_scale: Option<&'o V>,
+    },
+
+    /// Quantized forward inputs in the normalized layout, with blocks along their contracting dimension.
+    Quantized {
+        /// Quantized left-hand side input.
+        lhs: &'o BlockQuantizedValue<V>,
+
+        /// Quantized right-hand side input.
+        rhs: &'o BlockQuantizedValue<V>,
+    },
+}
+
 /// Shapes and permutations that normalize the inputs of a [`BlockScaledDot`] to the rank-3 layout
 /// `[batch, free, contracting]`, together with the rules that operate on that layout.
 struct BlockScaledDotRules<'o> {
@@ -2602,21 +3158,26 @@ struct BlockScaledDotRules<'o> {
 
     /// Static shape of the output, which lists the batch, left free, and right free dimensions.
     output_shape: Vec<usize>,
+
+    // TODO(eaplatanios): The following two fields should be moved to right after the `computation_type` field.
+    /// Data type of the cotangent of the left-hand side input.
+    lhs_cotangent_type: DataType,
+
+    /// Data type of the cotangent of the right-hand side input.
+    rhs_cotangent_type: DataType,
 }
 
 impl<'o> BlockScaledDotRules<'o> {
-    /// Creates a new [`BlockScaledDotRules`] instance by validating the shapes of `lhs` and `rhs` against
-    /// `configuration` and computing their normalization.
-    fn new<V: Value<Type = ArrayType>>(
+    /// Creates a new [`BlockScaledDotRules`] instance by validating the types `lhs_type` and `rhs_type` of the inputs
+    /// against `configuration` and computing their normalization.
+    fn new(
         configuration: &'o BlockScaledDotConfiguration,
-        lhs: &V,
-        rhs: &V,
+        lhs_type: &ArrayType,
+        rhs_type: &ArrayType,
     ) -> Result<Self, ProgramError> {
         // The quantization recipes require real floating-point inputs. Reject other element types before selecting
         // the computation type or inferring the contraction shape.
-        let lhs_type = lhs.r#type();
-        let rhs_type = rhs.r#type();
-        for (name, r#type) in [("left", &lhs_type), ("right", &rhs_type)] {
+        for (name, r#type) in [("left", lhs_type), ("right", rhs_type)] {
             if !r#type.data_type().is_floating_point() || !r#type.data_type().is_real() {
                 return Err(TypeError::invalid(format!(
                     "`{}` {} input must have a real floating-point element type but got `{}`",
@@ -2650,8 +3211,8 @@ impl<'o> BlockScaledDotRules<'o> {
         let dimensions = &configuration.dimensions;
         let output_type = infer_dot_output_type(
             BLOCK_SCALED_DOT_NAME,
-            &lhs_type.as_ref().clone().with_data_type(computation_type),
-            &rhs_type.as_ref().clone().with_data_type(computation_type),
+            &lhs_type.clone().with_data_type(computation_type),
+            &rhs_type.clone().with_data_type(computation_type),
             dimensions,
             DotPrecision::default(),
             None,
@@ -2713,6 +3274,8 @@ impl<'o> BlockScaledDotRules<'o> {
             lhs_canonical_shape: [batch, lhs_free, contracting],
             rhs_canonical_shape: [batch, rhs_free, contracting],
             output_shape,
+            lhs_cotangent_type: lhs_type.cotangent()?.data_type(),
+            rhs_cotangent_type: rhs_type.cotangent()?.data_type(),
         };
 
         // Check the extents blocked by the forward rule here. Backward contractions can block different dimensions,
@@ -2734,12 +3297,17 @@ impl<'o> BlockScaledDotRules<'o> {
         ];
 
         if backward && configuration.quantized_backward() {
-            requirements.extend([
-                ("right free", n, configuration.gradient_format().block_size),
-                ("right free", n, configuration.rhs_format.block_size),
-                ("left free", m, configuration.gradient_format().block_size),
-                ("left free", m, configuration.lhs_format.block_size),
-            ]);
+            // Quantized residuals are quantized again in the gradient format rather than in their own formats.
+            let quantizes_inputs = configuration.residual_policy == BlockScaledDotResidualPolicy::Inputs;
+            requirements.push(("right free", n, configuration.gradient_format().block_size));
+            if quantizes_inputs {
+                requirements.push(("right free", n, configuration.rhs_format.block_size));
+            }
+
+            requirements.push(("left free", m, configuration.gradient_format().block_size));
+            if quantizes_inputs {
+                requirements.push(("left free", m, configuration.lhs_format.block_size));
+            }
 
             if configuration.hadamard_transform {
                 requirements.push(("left free", m, 16));
@@ -2826,16 +3394,59 @@ impl<'o> BlockScaledDotRules<'o> {
             + Transpose,
         V::Domain: Context<Operation: From<ScaledDotOperation>> + Fill<f64, V>,
     {
+        let (lhs, rhs) = self.quantize_inputs(lhs, rhs, lhs_global_scale, rhs_global_scale)?;
+        self.contract_inputs(&lhs, &rhs)
+    }
+
+    /// Quantizes both inputs along their contracting dimensions in the normalized layout, as the primal contraction
+    /// consumes them.
+    fn quantize_inputs<V>(
+        &self,
+        lhs: &V,
+        rhs: &V,
+        lhs_global_scale: Option<&V>,
+        rhs_global_scale: Option<&V>,
+    ) -> Result<(BlockQuantizedValue<V>, BlockQuantizedValue<V>), ProgramError>
+    where
+        V: Value<Type = ArrayType>
+            + Abs
+            + Broadcast
+            + BlockQuantize
+            + Clamp
+            + ConvertElementType
+            + Div
+            + Mul
+            + Reduce
+            + Reshape
+            + Transpose,
+        V::Domain: Fill<f64, V>,
+    {
         let configuration = self.configuration;
+        let (lhs_global_scale, rhs_global_scale) = self.normalize_global_scales(lhs_global_scale, rhs_global_scale)?;
         let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
         let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
-        let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale)?;
-        let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale)?;
+        let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale.as_ref())?;
+        let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale.as_ref())?;
         let lhs = self.quantize(&lhs, configuration.lhs_format, 2, false, lhs_global_scale, None)?;
         let rhs =
             self.quantize(&rhs, configuration.rhs_format, 2, configuration.tiled_rhs_scales, rhs_global_scale, None)?;
+        Ok((lhs, rhs))
+    }
+
+    /// Contracts the quantized inputs that [`Self::quantize_inputs`] returns and restores the output layout.
+    fn contract_inputs<V>(&self, lhs: &BlockQuantizedValue<V>, rhs: &BlockQuantizedValue<V>) -> Result<V, ProgramError>
+    where
+        V: Value<Type = ArrayType>
+            + Broadcast
+            + ConvertElementType
+            + Mul
+            + ManualVariationAlignment<ArrayType>
+            + Reshape
+            + Transpose,
+        V::Domain: Context<Operation: From<ScaledDotOperation>>,
+    {
         let dimensions = DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0]);
-        let output = self.contract(&lhs, &rhs, &dimensions, configuration.accumulation_type)?;
+        let output = self.contract(lhs, rhs, &dimensions, self.configuration.accumulation_type)?;
         let output_shape = Shape::new(self.output_shape.iter().map(|&size| Dimension::Static(size)).collect());
         output.reshape(output_shape)
     }
@@ -2843,10 +3454,7 @@ impl<'o> BlockScaledDotRules<'o> {
     /// Computes the cotangents of the left-hand side and right-hand side inputs for the output cotangent `seed`.
     fn backward<V>(
         &self,
-        lhs: &V,
-        rhs: &V,
-        lhs_global_scale: Option<&V>,
-        rhs_global_scale: Option<&V>,
+        inputs: BlockScaledDotBackwardInputs<'_, V>,
         gradient_global_scale: Option<&V>,
         random_state: Option<&V>,
         seed: &V,
@@ -2874,82 +3482,162 @@ impl<'o> BlockScaledDotRules<'o> {
             + Transpose,
         V::Domain: Context<Operation: From<ScaledDotOperation>> + Fill<f64, V> + Iota<V>,
     {
+        /// Input of a quantized backward contraction with how it is quantized along the contracted dimension.
+        struct QuantizedBackwardInput<V> {
+            /// Input at the computation type in the normalized layout.
+            value: V,
+
+            /// Format in which the input is quantized.
+            format: BlockScaleFormat,
+
+            /// Whether the scales of the input are square tiles.
+            tiled: bool,
+
+            /// Source of the global scale of the input.
+            global_scale: GlobalScale<V>,
+
+            /// Optional rounding noise of the input.
+            noise: Option<V>,
+        }
+
         self.validate_extents(true)?;
-        let lhs_type = lhs.r#type().cotangent()?.data_type();
-        let rhs_type = rhs.r#type().cotangent()?.data_type();
         let configuration = self.configuration;
         let [batch, m, k] = self.lhs_canonical_shape;
         let [_, n, _] = self.rhs_canonical_shape;
-        let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
-        let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
         let seed = seed.convert_element_type(self.computation_type)?.reshape(Shape::new(vec![
             Dimension::Static(batch),
             Dimension::Static(m),
             Dimension::Static(n),
         ]))?;
-        let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale)?;
-        let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale)?;
         let (lhs_cotangent, rhs_cotangent) = if configuration.quantized_backward() {
-            let gradient_global_scale = self.global_scale(configuration.gradient_format(), gradient_global_scale)?;
-            let (noise, weight_gradient_noise) = match random_state {
+            let gradient_format = configuration.gradient_format();
+            let gradient_global_scale = self.global_scale(gradient_format, gradient_global_scale)?;
+            let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.computation_type, shape);
+            let (state, noise, weight_gradient_noise) = match random_state {
                 Some(state) => {
-                    let noise_type = |shape: [usize; 3]| ArrayType::new_static(self.computation_type, shape);
                     let (state, noise) = state.random_uniform(&noise_type([batch, m, n]))?;
-                    let (_, weight_gradient_noise) = state.random_uniform(&noise_type([batch, m, n]))?;
-                    (Some(noise), Some(weight_gradient_noise))
+                    let (state, weight_gradient_noise) = state.random_uniform(&noise_type([batch, m, n]))?;
+                    (Some(state), Some(noise), Some(weight_gradient_noise))
                 }
-                None => (None, None),
+                None => (None, None, None),
+            };
+
+            // Each backward contraction contracts the seed with one input, which is quantized along the contracted
+            // dimension. The original inputs are quantized again in their own formats with their own global scales.
+            // Quantized residuals are dequantized and quantized again in the gradient format, with their own rounding
+            // noise. When that format uses global scales, each of them uses the current global scale of its dequantized
+            // values under either source of global scales, because the provided scales describe the forward formats of
+            // the inputs and the cotangent, and a grouped one varies along the contracted dimension.
+            let (lhs, rhs) = match inputs {
+                BlockScaledDotBackwardInputs::Inputs { lhs, rhs, lhs_global_scale, rhs_global_scale } => {
+                    // These contractions contract the dimensions along which a grouped global scale varies, where
+                    // it could not multiply their results. Like the backward extents, only differentiation requires
+                    // this, so that such scales remain available to calls that are never differentiated.
+                    if [lhs_global_scale, rhs_global_scale]
+                        .into_iter()
+                        .flatten()
+                        .any(|global_scale| global_scale.r#type().rank() != 0)
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{BLOCK_SCALED_DOT_NAME}` grouped global scales with quantized backward contractions \
+                             require quantized residuals",
+                        ))
+                        .into());
+                    }
+                    let (lhs_global_scale, rhs_global_scale) =
+                        self.normalize_global_scales(lhs_global_scale, rhs_global_scale)?;
+                    let lhs = QuantizedBackwardInput {
+                        value: self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?,
+                        format: configuration.lhs_format,
+                        tiled: false,
+                        global_scale: self.global_scale(configuration.lhs_format, lhs_global_scale.as_ref())?,
+                        noise: None,
+                    };
+                    let rhs = QuantizedBackwardInput {
+                        value: self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?,
+                        format: configuration.rhs_format,
+                        tiled: configuration.tiled_rhs_scales,
+                        global_scale: self.global_scale(configuration.rhs_format, rhs_global_scale.as_ref())?,
+                        noise: None,
+                    };
+                    (lhs, rhs)
+                }
+                BlockScaledDotBackwardInputs::Quantized { lhs, rhs } => {
+                    let global_scale =
+                        if gradient_format.has_global_scale() { GlobalScale::Current } else { GlobalScale::None };
+                    let (rhs_noise, lhs_noise) = match state {
+                        Some(state) => {
+                            let (state, rhs_noise) = state.random_uniform(&noise_type([batch, n, k]))?;
+                            let (_, lhs_noise) = state.random_uniform(&noise_type([batch, m, k]))?;
+                            (Some(rhs_noise), Some(lhs_noise))
+                        }
+                        None => (None, None),
+                    };
+                    let lhs = QuantizedBackwardInput {
+                        value: lhs.block_dequantize([2], self.computation_type)?,
+                        format: gradient_format,
+                        tiled: false,
+                        global_scale: global_scale.clone(),
+                        noise: lhs_noise,
+                    };
+                    let rhs = QuantizedBackwardInput {
+                        value: rhs.block_dequantize([2], self.computation_type)?,
+                        format: gradient_format,
+                        tiled: false,
+                        global_scale,
+                        noise: rhs_noise,
+                    };
+                    (lhs, rhs)
+                }
             };
 
             // The input gradient contracts the seed `[B, M, N]` with the right input `[B, N, K]` along `N`.
-            let seed_along_n = self.quantize(
-                &seed,
-                configuration.gradient_format(),
-                2,
-                false,
-                gradient_global_scale.clone(),
-                noise.as_ref(),
-            )?;
-            let rhs_along_n = self.quantize(
-                &rhs,
-                configuration.rhs_format,
-                1,
-                configuration.tiled_rhs_scales,
-                rhs_global_scale.clone(),
-                None,
-            )?;
+            let seed_along_n =
+                self.quantize(&seed, gradient_format, 2, false, gradient_global_scale.clone(), noise.as_ref())?;
+            let rhs_along_n =
+                self.quantize(&rhs.value, rhs.format, 1, rhs.tiled, rhs.global_scale, rhs.noise.as_ref())?;
             let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
             let lhs_cotangent = self.contract(&seed_along_n, &rhs_along_n, &dimensions, self.computation_type)?;
 
             // The weight gradient contracts the seed `[B, M, N]` with the left input `[B, M, K]` along `M`,
             // after the optional Hadamard transform of both along `M`.
-            let (seed, lhs) = if configuration.hadamard_transform {
-                (self.hadamard_transform(&seed, m)?, self.hadamard_transform(&lhs, m)?)
+            let (seed, lhs_value) = if configuration.hadamard_transform {
+                (self.hadamard_transform(&seed, m)?, self.hadamard_transform(&lhs.value, m)?)
             } else {
-                (seed, lhs.clone())
+                (seed, lhs.value)
             };
-            let seed_along_m = self.quantize(
-                &seed,
-                configuration.gradient_format(),
-                1,
-                false,
-                gradient_global_scale,
-                weight_gradient_noise.as_ref(),
-            )?;
-            let lhs_along_m = self.quantize(&lhs, configuration.lhs_format, 1, false, lhs_global_scale, None)?;
+            let seed_along_m =
+                self.quantize(&seed, gradient_format, 1, false, gradient_global_scale, weight_gradient_noise.as_ref())?;
+            let lhs_along_m =
+                self.quantize(&lhs_value, lhs.format, 1, lhs.tiled, lhs.global_scale, lhs.noise.as_ref())?;
             let dimensions = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
             let rhs_cotangent = self.contract(&seed_along_m, &lhs_along_m, &dimensions, self.computation_type)?;
             (lhs_cotangent, rhs_cotangent)
         } else {
+            // Unquantized contractions read the original inputs, which the configuration guarantees to be kept.
+            let BlockScaledDotBackwardInputs::Inputs { lhs, rhs, lhs_global_scale, rhs_global_scale } = inputs else {
+                return Err(TypeError::invalid(format!(
+                    "`{BLOCK_SCALED_DOT_NAME}` quantized residuals require quantized backward contractions",
+                ))
+                .into());
+            };
+            let (lhs_global_scale, rhs_global_scale) =
+                self.normalize_global_scales(lhs_global_scale, rhs_global_scale)?;
+            let lhs = self.normalize(lhs, &self.lhs_permutation, self.lhs_canonical_shape)?;
+            let rhs = self.normalize(rhs, &self.rhs_permutation, self.rhs_canonical_shape)?;
+            let lhs_global_scale = self.global_scale(configuration.lhs_format, lhs_global_scale.as_ref())?;
+            let rhs_global_scale = self.global_scale(configuration.rhs_format, rhs_global_scale.as_ref())?;
             let lhs_cotangent = seed.dot(&rhs, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))?;
             let rhs_cotangent = seed.dot(&lhs, &DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]))?;
 
             // Straight-through estimation zeroes the gradients of values that the forward quantization clipped.
             let mask = |cotangent: V, value: &V, format: BlockScaleFormat, global_scale: GlobalScale<V>| {
                 let threshold = match global_scale {
-                    GlobalScale::Provided(global_scale) if configuration.gradient_format().has_global_scale() => {
-                        self.broadcast_scalar(&global_scale, [batch, value.r#type().dimension(1).value().unwrap(), k])?
-                    }
+                    GlobalScale::Provided(global_scale) if configuration.gradient_format().has_global_scale() => self
+                        .broadcast_global_scale(
+                        &global_scale,
+                        [batch, value.r#type().dimension(1).value().unwrap(), k],
+                    )?,
                     GlobalScale::None
                         if configuration.gradient_format().has_global_scale() && format.has_global_scale() =>
                     {
@@ -2966,8 +3654,63 @@ impl<'o> BlockScaledDotRules<'o> {
             (lhs_cotangent, rhs_cotangent)
         };
         Ok((
-            self.denormalize(&lhs_cotangent, &self.lhs_permutation, &self.lhs_shape, lhs_type)?,
-            self.denormalize(&rhs_cotangent, &self.rhs_permutation, &self.rhs_shape, rhs_type)?,
+            self.denormalize(&lhs_cotangent, &self.lhs_permutation, &self.lhs_shape, self.lhs_cotangent_type)?,
+            self.denormalize(&rhs_cotangent, &self.rhs_permutation, &self.rhs_shape, self.rhs_cotangent_type)?,
+        ))
+    }
+
+    /// Returns the provided global scales of both inputs in the form that the normalized layout of their inputs takes.
+    /// A rank-0 scale is returned unchanged. A grouped scale is expanded over the batching and free dimensions of its
+    /// input, transposed like that input, and merged to the shape `[batch, free, 1]`.
+    fn normalize_global_scales<V: Value<Type = ArrayType> + Broadcast + Reshape + Transpose>(
+        &self,
+        lhs_global_scale: Option<&V>,
+        rhs_global_scale: Option<&V>,
+    ) -> Result<(Option<V>, Option<V>), ProgramError> {
+        let normalize = |global_scale: Option<&V>,
+                         shape: &[usize],
+                         permutation: &[usize],
+                         contracting_dimensions: &[usize],
+                         canonical_shape: [usize; 3]|
+         -> Result<Option<V>, ProgramError> {
+            let Some(global_scale) = global_scale else { return Ok(None) };
+            if global_scale.r#type().rank() == 0 {
+                return Ok(Some(global_scale.clone()));
+            }
+            let grouped_shape = shape
+                .iter()
+                .enumerate()
+                .map(|(axis, &extent)| {
+                    Dimension::Static(if contracting_dimensions.contains(&axis) { 1 } else { extent })
+                })
+                .collect::<Vec<_>>();
+            let global_scale = global_scale.broadcast_to(Shape::new(grouped_shape))?;
+            let global_scale = if permutation.iter().enumerate().all(|(index, &axis)| index == axis) {
+                global_scale
+            } else {
+                global_scale.transpose(permutation.to_vec())?
+            };
+            let [batch, free, _] = canonical_shape;
+            let normalized_shape = vec![Dimension::Static(batch), Dimension::Static(free), Dimension::Static(1)];
+            Ok(Some(global_scale.reshape(Shape::new(normalized_shape))?))
+        };
+
+        let dimensions = &self.configuration.dimensions;
+        Ok((
+            normalize(
+                lhs_global_scale,
+                &self.lhs_shape,
+                &self.lhs_permutation,
+                dimensions.lhs_contracting_dimensions(),
+                self.lhs_canonical_shape,
+            )?,
+            normalize(
+                rhs_global_scale,
+                &self.rhs_shape,
+                &self.rhs_permutation,
+                dimensions.rhs_contracting_dimensions(),
+                self.rhs_canonical_shape,
+            )?,
         ))
     }
 
@@ -3024,6 +3767,7 @@ impl<'o> BlockScaledDotRules<'o> {
             format.block_size,
             format.element_type,
             format.scale_type,
+            format.scale_rule,
             block_axes,
             global_scale.as_ref(),
             rounding_noise,
@@ -3059,7 +3803,13 @@ impl<'o> BlockScaledDotRules<'o> {
         data_type: DataType,
     ) -> Result<V, ProgramError>
     where
-        V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + ManualVariationAlignment<ArrayType>,
+        V: Value<Type = ArrayType>
+            + Broadcast
+            + ConvertElementType
+            + Mul
+            + ManualVariationAlignment<ArrayType>
+            + Reshape
+            + Transpose,
         V::Domain: Context<Operation: From<ScaledDotOperation>>,
     {
         let accumulation_type = if self.configuration.lhs_format.has_global_scale()
@@ -3169,17 +3919,21 @@ impl<'o> BlockScaledDotRules<'o> {
             .fill(&ArrayType::new(self.computation_type, value.r#type().shape().clone()), constant)
     }
 
-    /// Broadcasts the rank-0 `scalar` to a rank-3 array of `shape`, keeping its placement.
-    fn broadcast_scalar<V: Value<Type = ArrayType> + Broadcast>(
+    /// Broadcasts `global_scale`, which has rank 0 or the normalized form of a grouped global scale, to a rank-3
+    /// array of `shape`, keeping its placement.
+    fn broadcast_global_scale<V: Value<Type = ArrayType> + Broadcast>(
         &self,
-        scalar: &V,
+        global_scale: &V,
         shape: [usize; 3],
     ) -> Result<V, ProgramError> {
-        let mut expanded_type = scalar.r#type().into_owned();
+        if global_scale.r#type().rank() != 0 {
+            return global_scale.broadcast_to(Shape::new(shape.iter().map(|&size| Dimension::Static(size)).collect()));
+        }
+        let mut expanded_type = global_scale.r#type().into_owned();
         for (axis, size) in shape.into_iter().enumerate() {
             expanded_type = expanded_type.with_inserted_dimension(axis, Dimension::Static(size))?;
         }
-        scalar.broadcast(expanded_type, &[])
+        global_scale.broadcast(expanded_type, &[])
     }
 }
 
@@ -4379,8 +5133,17 @@ mod tests {
             vec![1.0f32, 2.0, 0.5, 0.25, 3.0, 6.0, 1.0, 1.5, 3.0, 0.5, 12.0, 2.0, 1.0, 1.0, 3.0, 6.0],
         )
         .unwrap();
-        let BlockQuantizedValue { elements, scales, .. } =
-            input.block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, 0, None, None).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(
+                2,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         let BlockQuantizedValue { elements: transposed_elements, scales: transposed_scales, .. } = input
             .transpose(vec![1, 0])
             .unwrap()
@@ -4393,7 +5156,15 @@ mod tests {
         // Two block axes form tiles that share one scale. Every tile below is a scaled copy of `f4e2m1fn` grid points,
         // so quantization is exact and dequantization over both block axes reproduces the input.
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(2, DataType::F4E2M1FN, DataType::F8E4M3FN, [0, 1], None, None)
+            .block_quantize_with_options(
+                2,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                [0, 1],
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2, 2]));
         assert_eq!(scales.to_f64s(), vec![1.0, 0.25, 0.5, 2.0]);
@@ -4414,7 +5185,15 @@ mod tests {
         let input = Array::vector(vec![12.0f32, 6.0, 2.0, 24.0, 2.0, 4.0, 1.0, 6.0]).unwrap();
         let global_scale = Array::scalar(4.0f32).unwrap();
         let quantized = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                Some(&global_scale),
+                None,
+            )
             .unwrap();
         assert_eq!(quantized.scales.to_f64s(), vec![1.0, 0.25]);
         assert_eq!(quantized.elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0]);
@@ -4425,7 +5204,15 @@ mod tests {
         // brings it back into range.
         let input = Array::vector(vec![6000.0f32, 3000.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                Some(&global_scale),
+                None,
+            )
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![256.0, 0.04296875]);
         assert_eq!(elements.to_f64s(), vec![6.0, 3.0, 0.0, 0.0, 6.0, 6.0, 6.0, 6.0]);
@@ -4438,7 +5225,15 @@ mod tests {
         let input = ArrayIrValue::Array(Array::vector(vec![6.0f32, 3.0, 1.0, 12.0]).unwrap());
         let global_scale = ArrayIrValue::Array(Array::scalar(2.0f32).unwrap());
         let quantized = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, Some(&global_scale), None)
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                Some(&global_scale),
+                None,
+            )
             .unwrap();
         assert_eq!(quantized.global_scale, Some(global_scale.clone()));
         assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
@@ -4452,6 +5247,7 @@ mod tests {
                     4,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
+                    BlockScaleRule::Standard,
                     1,
                     Some(&global_scale),
                     None,
@@ -4487,6 +5283,149 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantize_with_options_grouped_global_scale() {
+        // A grouped global scale divides every row by its own scale, so rows that are scaled copies of each other
+        // quantize to the same elements and block scales, and dequantization restores each row with its scale.
+        let input = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 12.0, 6.0, 2.0, 24.0]).unwrap();
+        let global_scale = Array::matrix(2, 1, vec![1.0f32, 4.0]).unwrap();
+        let quantized = input
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                Some(&global_scale),
+                None,
+            )
+            .unwrap();
+        assert_eq!(quantized.scales.to_f64s(), vec![1.0, 1.0]);
+        assert_eq!(quantized.elements.to_f64s(), vec![3.0, 1.5, 0.5, 6.0, 3.0, 1.5, 0.5, 6.0]);
+        assert_eq!(quantized.global_scale, Some(global_scale.clone()));
+        assert_eq!(quantized.block_dequantize([1], DataType::F32), Ok(input.clone()));
+
+        // Concrete array IR values quantize like arrays.
+        assert_eq!(
+            ArrayIrValue::Array(input.clone()).block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                Some(&ArrayIrValue::Array(global_scale.clone())),
+                None,
+            ),
+            Ok(quantized.clone().map_parameters(ArrayIrValue::Array).unwrap()),
+        );
+
+        // With a dynamic number of rows, the scale of every row is broadcast along the columns at the runtime extents.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, global_scale): (Tracer<_>, Tracer<_>)| {
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    BlockScaleRule::Standard,
+                    -1,
+                    Some(&global_scale),
+                    None,
+                )?;
+                Ok(vec![elements, scales])
+            },
+            (
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(4)]),
+                )),
+                ArrayIrType::Array(ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1)]),
+                )),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows, 4], %1:f32[rows, 1] .
+                let %2:dimension<4> = constant [value=4]
+                    %3:dimension<rows ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %4:dimension<4> = constant [value=4]
+                    %5:dimension<1> = constant [value=1]
+                    %6:f32[rows, 4] = broadcast [output_axes=[0, 1]] %1 %3 %4
+                    %7:f32[rows, 4] = div %0 %6
+                    %8:f32[rows, 1, 4] = reshape [requires_runtime_assertion=false] %7 %3 %5 %2
+                    %9:f32[rows, 1, 4] = abs %8
+                    %10:f32[rows, 1] = reduce [kind=max, axes=[2]] %9
+                    %11:f32[] = constant [value=6.0]
+                    %12:dimension<1> = constant [value=1]
+                    %13:f32[rows, 1] = broadcast [output_axes=[]] %11 %3 %12
+                    %14:f32[rows, 1] = div %10 %13
+                    %15:f32[] = constant [value=0.001953125]
+                    %16:f32[] = constant [value=448.0]
+                    %17:f32[rows, 1] = clamp %15 %14 %16
+                    %18:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %17
+                    %19:f32[] = constant [value=inf]
+                    %20:dimension<1> = constant [value=1]
+                    %21:f32[rows, 1] = broadcast [output_axes=[]] %19 %3 %20
+                    %22:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %21
+                    %23:u32[rows, 1] = and %18 %22
+                    %24:f32[rows, 1] = convert_element_type [data_type=f32, bitcast=true] %23
+                    %25:f32[] = constant [value=0.015625]
+                    %26:dimension<1> = constant [value=1]
+                    %27:f32[rows, 1] = broadcast [output_axes=[]] %25 %3 %26
+                    %28:f32[] = constant [value=inf]
+                    %29:dimension<1> = constant [value=1]
+                    %30:f32[rows, 1] = broadcast [output_axes=[]] %28 %3 %29
+                    %31:f32[rows, 1] = clamp %27 %24 %30
+                    %32:f32[] = constant [value=0.125]
+                    %33:dimension<1> = constant [value=1]
+                    %34:f32[rows, 1] = broadcast [output_axes=[]] %32 %3 %33
+                    %35:f32[rows, 1] = mul %31 %34
+                    %36:f32[rows, 1] = div %17 %35
+                    %37:f32[rows, 1] = round %36
+                    %38:f32[rows, 1] = mul %37 %35
+                    %39:f8e4m3fn[rows, 1] = convert_element_type [data_type=f8e4m3fn] %38
+                    %40:f32[rows, 1, 4] = broadcast [output_axes=[0, 1]] %38 %3 %5 %2
+                    %41:f32[rows, 4] = reshape [requires_runtime_assertion=false] %40 %3 %4
+                    %42:f32[rows, 4] = div %7 %41
+                    %43:f32[] = constant [value=-6.0]
+                    %44:f32[] = constant [value=6.0]
+                    %45:f32[rows, 4] = clamp %43 %42 %44
+                    %46:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %45
+                    %47:f32[] = constant [value=inf]
+                    %48:dimension<4> = constant [value=4]
+                    %49:f32[rows, 4] = broadcast [output_axes=[]] %47 %3 %48
+                    %50:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %49
+                    %51:u32[rows, 4] = and %46 %50
+                    %52:f32[rows, 4] = convert_element_type [data_type=f32, bitcast=true] %51
+                    %53:f32[] = constant [value=1.0]
+                    %54:dimension<4> = constant [value=4]
+                    %55:f32[rows, 4] = broadcast [output_axes=[]] %53 %3 %54
+                    %56:f32[] = constant [value=inf]
+                    %57:dimension<4> = constant [value=4]
+                    %58:f32[rows, 4] = broadcast [output_axes=[]] %56 %3 %57
+                    %59:f32[rows, 4] = clamp %55 %52 %58
+                    %60:f32[] = constant [value=0.5]
+                    %61:dimension<4> = constant [value=4]
+                    %62:f32[rows, 4] = broadcast [output_axes=[]] %60 %3 %61
+                    %63:f32[rows, 4] = mul %59 %62
+                    %64:f32[rows, 4] = div %45 %63
+                    %65:f32[rows, 4] = round %64
+                    %66:f32[rows, 4] = mul %65 %63
+                    %67:f4e2m1fn[rows, 4] = convert_element_type [data_type=f4e2m1fn] %66
+                in (%67, %39)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((ArrayIrValue::Array(input), ArrayIrValue::Array(global_scale))),
+            Ok(vec![ArrayIrValue::Array(quantized.elements), ArrayIrValue::Array(quantized.scales)]),
+        );
+    }
+
+    #[test]
     fn test_block_quantize_with_options_stochastic_rounding() {
         // The block scale is `1`, so the quotients equal the inputs. `6` is on the grid, `1.3` lies between `1.0` and
         // `1.5` (spacing `0.5`), and `0.2` lies below the smallest normal value `1.0`, where the spacing stays `0.5`.
@@ -4494,7 +5433,15 @@ mod tests {
         let input = Array::vector(vec![6.0f32, 1.3, -1.3, 0.2]).unwrap();
         let noise = Array::vector(vec![0.0f32, 0.3, 0.3, 0.7]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                None,
+                Some(&noise),
+            )
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
         assert_eq!(elements.to_f64s(), vec![6.0, 1.0, -1.5, 0.5]);
@@ -4505,13 +5452,29 @@ mod tests {
         let noise = Array::vector(vec![1.0f32 - f32::EPSILON / 2.0, 0.0, 0.0, 0.0]).unwrap();
         let input = Array::vector(vec![448.0f32, 0.0, 0.0, 0.0]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F8E4M3FN, DataType::F8E8M0FNU, -1, None, Some(&noise))
+            .block_quantize_with_options(
+                4,
+                DataType::F8E4M3FN,
+                DataType::F8E8M0FNU,
+                BlockScaleRule::Standard,
+                -1,
+                None,
+                Some(&noise),
+            )
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
         assert_eq!(elements.to_f64s(), vec![448.0, 0.0, 0.0, 0.0]);
         let input = Array::vector(vec![57344.0f32, 0.0, 0.0, 0.0]).unwrap();
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F8E5M2, DataType::F8E8M0FNU, -1, None, Some(&noise))
+            .block_quantize_with_options(
+                4,
+                DataType::F8E5M2,
+                DataType::F8E8M0FNU,
+                BlockScaleRule::Standard,
+                -1,
+                None,
+                Some(&noise),
+            )
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0]);
         assert_eq!(elements.to_f64s(), vec![57344.0, 0.0, 0.0, 0.0]);
@@ -4529,7 +5492,15 @@ mod tests {
         )
         .unwrap();
         let BlockQuantizedValue { elements, scales, .. } = input
-            .block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, Some(&noise))
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                -1,
+                None,
+                Some(&noise),
+            )
             .unwrap();
         assert_eq!(scales.to_f64s(), vec![1.0; 20]);
         assert_eq!(
@@ -4548,6 +5519,7 @@ mod tests {
                 4,
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
                 -1,
                 None,
                 Some(&noise.convert_element_type(DataType::F32).unwrap()),
@@ -4566,44 +5538,369 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantize_with_options_scale_rules() {
+        // The standard power of two scale of the first block is `1`, which clips its maximum `480` to the largest
+        // finite element `448`, while the round up scale `2` covers it, so only that rule reproduces the block. The
+        // maximum of the second block does not exceed `448` times its standard scale, so both rules agree on it, and
+        // a block of zeros keeps the smallest scale under both rules.
+        let input =
+            Array::vector(vec![480.0f32, 2.0, 104.0, -448.0, 448.0, 3.0, 1.5, 0.75, 0.0, 0.0, 0.0, 0.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(
+                4,
+                DataType::F8E4M3FN,
+                DataType::F8E8M0FNU,
+                BlockScaleRule::Standard,
+                -1,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0, 1.0, (-126.0f64).exp2()]);
+        assert_eq!(elements.to_f64s(), vec![448.0, 2.0, 104.0, -448.0, 448.0, 3.0, 1.5, 0.75, 0.0, 0.0, 0.0, 0.0],);
+        let quantized = input
+            .block_quantize_with_options(
+                4,
+                DataType::F8E4M3FN,
+                DataType::F8E8M0FNU,
+                BlockScaleRule::RoundUp,
+                -1,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(quantized.scales.r#type().into_owned(), ArrayType::new_static(DataType::F8E8M0FNU, [3]));
+        assert_eq!(quantized.scales.to_f64s(), vec![2.0, 1.0, (-126.0f64).exp2()]);
+        assert_eq!(
+            quantized.elements.to_f64s(),
+            vec![240.0, 1.0, 52.0, -224.0, 448.0, 3.0, 1.5, 0.75, 0.0, 0.0, 0.0, 0.0],
+        );
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input));
+
+        // The standard NVFP4 scale of the first block maps its maximum `4` to the element `6`, which leaves every
+        // other value off the element grid, while the scale `1` of the four-over-six rule reproduces the block. The
+        // second block is exact only with its standard scale, and the third block is exact with both scales, so both
+        // keep the standard scale, which the rule replaces only for a strictly smaller error.
+        let input = Array::vector(vec![4.0f32, 3.0, 2.0, 1.0, 6.0, 3.0, 1.5, 0.5, 6.0, 3.0, 0.0, 0.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } =
+            input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN).unwrap();
+        assert_eq!(scales.to_f64s(), vec![0.6875, 1.0, 1.0]);
+        assert_eq!(elements.to_f64s(), vec![6.0, 4.0, 3.0, 1.5, 6.0, 3.0, 1.5, 0.5, 6.0, 3.0, 0.0, 0.0]);
+        let quantized = input
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::FourOverSix,
+                -1,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(quantized.scales.to_f64s(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(quantized.elements.to_f64s(), vec![4.0, 3.0, 2.0, 1.0, 6.0, 3.0, 1.5, 0.5, 6.0, 3.0, 0.0, 0.0]);
+        assert_eq!(quantized.block_dequantize([-1], DataType::F32), Ok(input.clone()));
+
+        // The rule chooses its scales with rounding to the nearest element, so rounding noise only changes the
+        // elements of the chosen scales. Zero noise rounds every quotient down, which leaves exact blocks unchanged.
+        let noise = Array::vector(vec![0.0f32; 12]).unwrap();
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::FourOverSix,
+                -1,
+                None,
+                Some(&noise),
+            ),
+            Ok(quantized),
+        );
+    }
+
+    #[test]
+    fn test_block_quantize_with_options_scale_rules_dynamic_extents() {
+        // The four-over-six rule compares the reconstruction errors of both scales of every block at the runtime
+        // extents, and the program agrees with the eager composition.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(9)).unwrap());
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: Tracer<_>| {
+                let BlockQuantizedValue { elements, scales, .. } = input.block_quantize_with_options(
+                    4,
+                    DataType::F4E2M1FN,
+                    DataType::F8E4M3FN,
+                    BlockScaleRule::FourOverSix,
+                    -1,
+                    None,
+                    None,
+                )?;
+                Ok(vec![elements, scales])
+            },
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(4)]),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows, 4] .
+                let %1:dimension<4> = constant [value=4]
+                    %2:dimension<rows ∈ [0, 9)> = dimension_size [axis=0] %0
+                    %3:dimension<4> = constant [value=4]
+                    %4:dimension<1> = constant [value=1]
+                    %5:f32[rows, 1, 4] = reshape [requires_runtime_assertion=false] %0 %2 %4 %1
+                    %6:f32[rows, 1, 4] = abs %5
+                    %7:f32[rows, 1] = reduce [kind=max, axes=[2]] %6
+                    %8:f32[] = constant [value=6.0]
+                    %9:dimension<1> = constant [value=1]
+                    %10:f32[rows, 1] = broadcast [output_axes=[]] %8 %2 %9
+                    %11:f32[rows, 1] = div %7 %10
+                    %12:f32[] = constant [value=0.001953125]
+                    %13:f32[] = constant [value=448.0]
+                    %14:f32[rows, 1] = clamp %12 %11 %13
+                    %15:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %14
+                    %16:f32[] = constant [value=inf]
+                    %17:dimension<1> = constant [value=1]
+                    %18:f32[rows, 1] = broadcast [output_axes=[]] %16 %2 %17
+                    %19:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %18
+                    %20:u32[rows, 1] = and %15 %19
+                    %21:f32[rows, 1] = convert_element_type [data_type=f32, bitcast=true] %20
+                    %22:f32[] = constant [value=0.015625]
+                    %23:dimension<1> = constant [value=1]
+                    %24:f32[rows, 1] = broadcast [output_axes=[]] %22 %2 %23
+                    %25:f32[] = constant [value=inf]
+                    %26:dimension<1> = constant [value=1]
+                    %27:f32[rows, 1] = broadcast [output_axes=[]] %25 %2 %26
+                    %28:f32[rows, 1] = clamp %24 %21 %27
+                    %29:f32[] = constant [value=0.125]
+                    %30:dimension<1> = constant [value=1]
+                    %31:f32[rows, 1] = broadcast [output_axes=[]] %29 %2 %30
+                    %32:f32[rows, 1] = mul %28 %31
+                    %33:f32[rows, 1] = div %14 %32
+                    %34:f32[rows, 1] = round %33
+                    %35:f32[rows, 1] = mul %34 %32
+                    %36:f32[] = constant [value=4.0]
+                    %37:dimension<1> = constant [value=1]
+                    %38:f32[rows, 1] = broadcast [output_axes=[]] %36 %2 %37
+                    %39:f32[rows, 1] = div %7 %38
+                    %40:f32[] = constant [value=0.001953125]
+                    %41:f32[] = constant [value=448.0]
+                    %42:f32[rows, 1] = clamp %40 %39 %41
+                    %43:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %42
+                    %44:f32[] = constant [value=inf]
+                    %45:dimension<1> = constant [value=1]
+                    %46:f32[rows, 1] = broadcast [output_axes=[]] %44 %2 %45
+                    %47:u32[rows, 1] = convert_element_type [data_type=u32, bitcast=true] %46
+                    %48:u32[rows, 1] = and %43 %47
+                    %49:f32[rows, 1] = convert_element_type [data_type=f32, bitcast=true] %48
+                    %50:f32[] = constant [value=0.015625]
+                    %51:dimension<1> = constant [value=1]
+                    %52:f32[rows, 1] = broadcast [output_axes=[]] %50 %2 %51
+                    %53:f32[] = constant [value=inf]
+                    %54:dimension<1> = constant [value=1]
+                    %55:f32[rows, 1] = broadcast [output_axes=[]] %53 %2 %54
+                    %56:f32[rows, 1] = clamp %52 %49 %55
+                    %57:f32[] = constant [value=0.125]
+                    %58:dimension<1> = constant [value=1]
+                    %59:f32[rows, 1] = broadcast [output_axes=[]] %57 %2 %58
+                    %60:f32[rows, 1] = mul %56 %59
+                    %61:f32[rows, 1] = div %42 %60
+                    %62:f32[rows, 1] = round %61
+                    %63:f32[rows, 1] = mul %62 %60
+                    %64:f32[rows, 1, 4] = broadcast [output_axes=[0, 1]] %63 %2 %4 %1
+                    %65:f32[rows, 4] = reshape [requires_runtime_assertion=false] %64 %2 %3
+                    %66:f32[rows, 4] = div %0 %65
+                    %67:f32[] = constant [value=-6.0]
+                    %68:f32[] = constant [value=6.0]
+                    %69:f32[rows, 4] = clamp %67 %66 %68
+                    %70:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %69
+                    %71:f32[] = constant [value=inf]
+                    %72:dimension<4> = constant [value=4]
+                    %73:f32[rows, 4] = broadcast [output_axes=[]] %71 %2 %72
+                    %74:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %73
+                    %75:u32[rows, 4] = and %70 %74
+                    %76:f32[rows, 4] = convert_element_type [data_type=f32, bitcast=true] %75
+                    %77:f32[] = constant [value=1.0]
+                    %78:dimension<4> = constant [value=4]
+                    %79:f32[rows, 4] = broadcast [output_axes=[]] %77 %2 %78
+                    %80:f32[] = constant [value=inf]
+                    %81:dimension<4> = constant [value=4]
+                    %82:f32[rows, 4] = broadcast [output_axes=[]] %80 %2 %81
+                    %83:f32[rows, 4] = clamp %79 %76 %82
+                    %84:f32[] = constant [value=0.5]
+                    %85:dimension<4> = constant [value=4]
+                    %86:f32[rows, 4] = broadcast [output_axes=[]] %84 %2 %85
+                    %87:f32[rows, 4] = mul %83 %86
+                    %88:f32[rows, 4] = div %69 %87
+                    %89:f32[rows, 4] = round %88
+                    %90:f32[rows, 4] = mul %89 %87
+                    %91:f32[rows, 4] = mul %90 %65
+                    %92:f32[rows, 4] = sub %0 %91
+                    %93:f32[rows, 4] = abs %92
+                    %94:f32[rows, 1, 4] = reshape [requires_runtime_assertion=false] %93 %2 %4 %1
+                    %95:f32[rows, 1] = reduce [kind=sum, axes=[2]] %94
+                    %96:f32[rows, 1, 4] = broadcast [output_axes=[0, 1]] %35 %2 %4 %1
+                    %97:f32[rows, 4] = reshape [requires_runtime_assertion=false] %96 %2 %3
+                    %98:f32[rows, 4] = div %0 %97
+                    %99:f32[] = constant [value=-6.0]
+                    %100:f32[] = constant [value=6.0]
+                    %101:f32[rows, 4] = clamp %99 %98 %100
+                    %102:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %101
+                    %103:f32[] = constant [value=inf]
+                    %104:dimension<4> = constant [value=4]
+                    %105:f32[rows, 4] = broadcast [output_axes=[]] %103 %2 %104
+                    %106:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %105
+                    %107:u32[rows, 4] = and %102 %106
+                    %108:f32[rows, 4] = convert_element_type [data_type=f32, bitcast=true] %107
+                    %109:f32[] = constant [value=1.0]
+                    %110:dimension<4> = constant [value=4]
+                    %111:f32[rows, 4] = broadcast [output_axes=[]] %109 %2 %110
+                    %112:f32[] = constant [value=inf]
+                    %113:dimension<4> = constant [value=4]
+                    %114:f32[rows, 4] = broadcast [output_axes=[]] %112 %2 %113
+                    %115:f32[rows, 4] = clamp %111 %108 %114
+                    %116:f32[] = constant [value=0.5]
+                    %117:dimension<4> = constant [value=4]
+                    %118:f32[rows, 4] = broadcast [output_axes=[]] %116 %2 %117
+                    %119:f32[rows, 4] = mul %115 %118
+                    %120:f32[rows, 4] = div %101 %119
+                    %121:f32[rows, 4] = round %120
+                    %122:f32[rows, 4] = mul %121 %119
+                    %123:f32[rows, 4] = mul %122 %97
+                    %124:f32[rows, 4] = sub %0 %123
+                    %125:f32[rows, 4] = abs %124
+                    %126:f32[rows, 1, 4] = reshape [requires_runtime_assertion=false] %125 %2 %4 %1
+                    %127:f32[rows, 1] = reduce [kind=sum, axes=[2]] %126
+                    %128:bool[rows, 1] = compare [direction=LessThan] %95 %127
+                    %129:f32[rows, 1] = select %128 %63 %35
+                    %130:f8e4m3fn[rows, 1] = convert_element_type [data_type=f8e4m3fn] %129
+                    %131:f32[rows, 1, 4] = broadcast [output_axes=[0, 1]] %129 %2 %4 %1
+                    %132:f32[rows, 4] = reshape [requires_runtime_assertion=false] %131 %2 %3
+                    %133:f32[rows, 4] = div %0 %132
+                    %134:f32[] = constant [value=-6.0]
+                    %135:f32[] = constant [value=6.0]
+                    %136:f32[rows, 4] = clamp %134 %133 %135
+                    %137:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %136
+                    %138:f32[] = constant [value=inf]
+                    %139:dimension<4> = constant [value=4]
+                    %140:f32[rows, 4] = broadcast [output_axes=[]] %138 %2 %139
+                    %141:u32[rows, 4] = convert_element_type [data_type=u32, bitcast=true] %140
+                    %142:u32[rows, 4] = and %137 %141
+                    %143:f32[rows, 4] = convert_element_type [data_type=f32, bitcast=true] %142
+                    %144:f32[] = constant [value=1.0]
+                    %145:dimension<4> = constant [value=4]
+                    %146:f32[rows, 4] = broadcast [output_axes=[]] %144 %2 %145
+                    %147:f32[] = constant [value=inf]
+                    %148:dimension<4> = constant [value=4]
+                    %149:f32[rows, 4] = broadcast [output_axes=[]] %147 %2 %148
+                    %150:f32[rows, 4] = clamp %146 %143 %149
+                    %151:f32[] = constant [value=0.5]
+                    %152:dimension<4> = constant [value=4]
+                    %153:f32[rows, 4] = broadcast [output_axes=[]] %151 %2 %152
+                    %154:f32[rows, 4] = mul %150 %153
+                    %155:f32[rows, 4] = div %136 %154
+                    %156:f32[rows, 4] = round %155
+                    %157:f32[rows, 4] = mul %156 %154
+                    %158:f4e2m1fn[rows, 4] = convert_element_type [data_type=f4e2m1fn] %157
+                in (%158, %130)
+            "}
+            .trim_end(),
+        );
+        let input = Array::matrix(3, 4, vec![4.0f32, 3.0, 2.0, 1.0, 6.0, 3.0, 1.5, 0.5, 6.0, 3.0, 0.0, 0.0]).unwrap();
+        let BlockQuantizedValue { elements, scales, .. } = input
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::FourOverSix,
+                -1,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(scales.to_f64s(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(elements.to_f64s(), vec![4.0, 3.0, 2.0, 1.0, 6.0, 3.0, 1.5, 0.5, 6.0, 3.0, 0.0, 0.0]);
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(input)),
+            Ok(vec![ArrayIrValue::Array(elements), ArrayIrValue::Array(scales)]),
+        );
+    }
+
+    #[test]
     fn test_block_quantize_with_options_validation() {
         // Block axes must be distinct, in bounds, and non-empty, and each block extent must be a positive multiple of
         // the block size.
         let input = Array::matrix(2, 8, vec![1.0f32; 16]).unwrap();
         assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, Axes::default(), None, None),
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                Axes::default(),
+                None,
+                None
+            ),
             Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_QUANTIZE_NAME}` requires at least one block axis",
             )))),
         );
         assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [0], None, None),
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                [0],
+                None,
+                None
+            ),
             Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_QUANTIZE_NAME}` block dimension 0 size 2 is not a positive multiple of block size 4",
             )))),
         );
         assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [2], None, None),
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                [2],
+                None,
+                None
+            ),
             Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
         );
-        assert_eq!(
-            input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, [1, -1], None, None),
-            Err(ProgramError::Axis(AxisError::DuplicateAxis { axis: 1 })),
-        );
-
-        // Global scales must be `f32` scalars and require `f8e4m3fn` block scales, and rounding noise must match the
-        // input type.
         assert_eq!(
             input.block_quantize_with_options(
                 4,
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                [1, -1],
+                None,
+                None
+            ),
+            Err(ProgramError::Axis(AxisError::DuplicateAxis { axis: 1 })),
+        );
+
+        // Global scales must be `f32` arrays that are scalars or grouped scales of the input and require `f8e4m3fn`
+        // block scales, and rounding noise must match the input type.
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
                 [1],
                 Some(&Array::vector(vec![1.0f32]).unwrap()),
                 None,
             ),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[1]`",
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a `f32` array of rank 0 or with the shape of the input \
+                 `f32[2, 8]` up to extents of one but got `f32[1]`",
             )))),
         );
         assert_eq!(
@@ -4611,12 +5908,14 @@ mod tests {
                 4,
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
                 [1],
                 Some(&Array::scalar(1.0f64).unwrap()),
                 None,
             ),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f64[]`",
+                "`{BLOCK_QUANTIZE_NAME}` global scale must be a `f32` array of rank 0 or with the shape of the input \
+                 `f32[2, 8]` up to extents of one but got `f64[]`",
             )))),
         );
         assert_eq!(
@@ -4624,6 +5923,7 @@ mod tests {
                 4,
                 DataType::F8E4M3FN,
                 DataType::F8E8M0FNU,
+                BlockScaleRule::Standard,
                 -1,
                 Some(&Array::scalar(1.0f32).unwrap()),
                 None,
@@ -4637,6 +5937,7 @@ mod tests {
                 4,
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
                 [1],
                 None,
                 Some(&Array::vector(vec![0.5f32; 16]).unwrap()),
@@ -4644,6 +5945,52 @@ mod tests {
             Err(ProgramError::from(TypeError::invalid(format!(
                 "`{BLOCK_QUANTIZE_NAME}` rounding noise must have the data type and shape of the input `f32[2, 8]` \
                  but got `f32[16]`",
+            )))),
+        );
+
+        // Every scale rule other than the standard one applies to a single recipe.
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::RoundUp,
+                -1,
+                None,
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` round up scales require `f8e8m0fnu` scales but got `f8e4m3fn` scales",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E8M0FNU,
+                BlockScaleRule::FourOverSix,
+                -1,
+                None,
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` four-over-six scales require `f8e4m3fn` scales and `f4e2m1fn` elements but \
+                 got `f8e8m0fnu` scales and `f4e2m1fn` elements",
+            )))),
+        );
+        assert_eq!(
+            input.block_quantize_with_options(
+                4,
+                DataType::F8E4M3FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::FourOverSix,
+                -1,
+                None,
+                None,
+            ),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_QUANTIZE_NAME}` four-over-six scales require `f8e4m3fn` scales and `f4e2m1fn` elements but \
+                 got `f8e4m3fn` scales and `f8e4m3fn` elements",
             )))),
         );
     }
@@ -4657,6 +6004,7 @@ mod tests {
                     2,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
+                    BlockScaleRule::Standard,
                     [0],
                     Some(&global_scale),
                     Some(&noise),
@@ -4751,6 +6099,7 @@ mod tests {
                     4,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
+                    BlockScaleRule::Standard,
                     [-1, 0],
                     Some(&global_scale),
                     Some(&noise),
@@ -4859,6 +6208,7 @@ mod tests {
                 4,
                 DataType::F4E2M1FN,
                 DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
                 [-1, 0],
                 Some(&global_scale),
                 Some(&noise),
@@ -4876,28 +6226,37 @@ mod tests {
 
     #[test]
     fn test_block_quantize_with_options_dynamic_extents_validation() {
-        // With dynamic extents, everything that the types determine (e.g., static block extents and global scale
-        // types) is still rejected before staging, and rejected requests stage nothing.
+        // With dynamic extents, everything that the types determine (e.g., static block extents and the scale types
+        // that global scales require) is still rejected before staging, and rejected requests stage nothing.
         let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(9)).unwrap());
         let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input: Tracer<_>| {
                 assert_eq!(
-                    input.block_quantize_with_options(4, DataType::F4E2M1FN, DataType::F8E4M3FN, -1, None, None),
+                    input.block_quantize_with_options(
+                        4,
+                        DataType::F4E2M1FN,
+                        DataType::F8E4M3FN,
+                        BlockScaleRule::Standard,
+                        -1,
+                        None,
+                        None
+                    ),
                     Err(ProgramError::from(TypeError::invalid(format!(
                         "`{BLOCK_QUANTIZE_NAME}` block dimension 1 size 6 is not a positive multiple of block size 4",
                     )))),
                 );
                 assert_eq!(
                     input.block_quantize_with_options(
-                        4,
-                        DataType::F4E2M1FN,
+                        2,
                         DataType::F8E4M3FN,
-                        [0],
+                        DataType::F8E8M0FNU,
+                        BlockScaleRule::Standard,
+                        -1,
                         Some(&input),
                         None,
                     ),
                     Err(ProgramError::from(TypeError::invalid(format!(
-                        "`{BLOCK_QUANTIZE_NAME}` global scale must be a rank-0 `f32` array but got `f32[n, 6]`",
+                        "`{BLOCK_QUANTIZE_NAME}` global scales require `f8e4m3fn` scales but got `f8e8m0fnu` scales",
                     )))),
                 );
                 Ok(input)
@@ -4937,6 +6296,7 @@ mod tests {
                         4,
                         DataType::F4E2M1FN,
                         DataType::F8E4M3FN,
+                        BlockScaleRule::Standard,
                         [-1],
                         Some(&global_scale),
                         None,
@@ -5168,6 +6528,31 @@ mod tests {
     }
 
     #[test]
+    fn test_block_dequantize_grouped_global_scale() {
+        // A grouped global scale multiplies every row by its own scale, for arrays and array IR values alike.
+        let quantized = BlockQuantizedValue::new(
+            Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 3.0, 1.5, 0.5, 6.0]).unwrap(),
+            Array::matrix(2, 1, vec![1.0f32, 2.0]).unwrap(),
+        )
+        .with_global_scale(Array::matrix(2, 1, vec![1.0f32, 4.0]).unwrap());
+        let expected = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 24.0, 12.0, 4.0, 48.0]).unwrap();
+        assert_eq!(quantized.block_dequantize([1], DataType::F32), Ok(expected.clone()));
+        let quantized = quantized.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(quantized.block_dequantize([1], DataType::F32), Ok(ArrayIrValue::Array(expected)));
+
+        // A scale with the shape of the elements scales every value on its own.
+        let quantized = BlockQuantizedValue::new(
+            Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
+            Array::vector(vec![2.0f32, 3.0]).unwrap(),
+        )
+        .with_global_scale(Array::vector(vec![1.0f32, 2.0, 0.5, 4.0]).unwrap());
+        assert_eq!(
+            quantized.block_dequantize([0], DataType::F32),
+            Ok(Array::vector(vec![2.0f32, 8.0, 4.5, 48.0]).unwrap()),
+        );
+    }
+
+    #[test]
     fn test_block_dequantize_axes_and_empty_arrays() {
         // Axis order does not alter block layout, and negative axes select from the end of the array.
         let elements = Array::matrix(4, 4, (1..=16).map(|value| value as f32).collect()).unwrap();
@@ -5335,21 +6720,24 @@ mod tests {
 
     #[test]
     fn test_block_dequantize_validation_global_scale() {
-        // Global scales must be rank-0 real floating-point arrays, for arrays and array IR values alike.
+        // Global scales must be real floating-point arrays that are scalars or grouped scales of the elements, for
+        // arrays and array IR values alike.
         let quantized = BlockQuantizedValue::new(
             Array::vector(vec![1.0f32, 2.0, 3.0, 4.0]).unwrap(),
             Array::vector(vec![2.0f32, 3.0]).unwrap(),
         );
-        let invalid = quantized.clone().with_global_scale(Array::vector(vec![5.0f32]).unwrap());
+        let invalid = quantized.clone().with_global_scale(Array::vector(vec![5.0f32, 6.0]).unwrap());
         let expected = ProgramError::from(TypeError::invalid(format!(
-            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `f32[1]`",
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a real floating-point array of rank 0 or with the shape \
+             of the elements `f32[4]` up to extents of one but got `f32[2]`",
         )));
         assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected.clone()));
         let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
         assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected));
         let invalid = quantized.with_global_scale(Array::scalar(5i32).unwrap());
         let expected = ProgramError::from(TypeError::invalid(format!(
-            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a rank-0 real floating-point array but got `i32[]`",
+            "`{BLOCK_DEQUANTIZE_NAME}` global scale must be a real floating-point array of rank 0 or with the shape \
+             of the elements `f32[4]` up to extents of one but got `i32[]`",
         )));
         assert_eq!(invalid.block_dequantize([0], DataType::F32), Err(expected.clone()));
         let invalid = invalid.map_parameters(ArrayIrValue::Array).unwrap();
@@ -6500,6 +7888,59 @@ mod tests {
     }
 
     #[test]
+    fn test_block_quantized_value_scaled_dot_grouped_global_scales() {
+        // Grouped global scales multiply the output along the dimensions of their groups, which here are the batch and
+        // the rows of the left side and the batch of the right side. The result equals the dot product of the
+        // dequantized representations, for arrays and array IR values alike.
+        let values = |shape: [usize; 3], cycle: &[f32]| {
+            let count = shape.iter().product::<usize>();
+            Array::from_elements::<f32>(
+                ArrayType::new_static(DataType::F32, shape),
+                &(0..count).map(|index| cycle[index % cycle.len()]).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let lhs =
+            values([2, 2, 4], &[6.0, 1.0, 0.5, 2.0, 3.0]).block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let lhs = lhs.unwrap().with_global_scale(values([2, 2, 1], &[1.0, 2.0, 4.0, 0.5]));
+        let rhs =
+            values([2, 1, 4], &[1.0, 6.0, 2.0, 0.5, 3.0]).block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let rhs = rhs.unwrap().with_global_scale(values([2, 1, 1], &[8.0, 0.25]));
+        let dimensions = DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0]);
+        let expected = lhs
+            .block_dequantize([2], DataType::F32)
+            .unwrap()
+            .dot(&rhs.block_dequantize([2], DataType::F32).unwrap(), &dimensions)
+            .unwrap();
+        assert_eq!(expected.to_f64s(), vec![112.0, 660.0, 47.0, 4.1875]);
+        assert_eq!(lhs.scaled_matmul(&rhs, None), Ok(expected.clone()));
+        assert_eq!(
+            lhs.clone()
+                .map_parameters(ArrayIrValue::Array)
+                .unwrap()
+                .scaled_matmul(&rhs.clone().map_parameters(ArrayIrValue::Array).unwrap(), None),
+            Ok(ArrayIrValue::Array(expected.clone())),
+        );
+
+        // The groups follow their dimensions when the batching dimension of the left side is not its leading one and
+        // the contracting dimension of the right side is not its last one. The output lists the batch and then the
+        // free dimensions of both sides, so it is unchanged. A rank-0 scale on one side still scales the whole output.
+        let transpose = |quantized: &BlockQuantizedValue<Array>, permutation: [usize; 3]| {
+            quantized.clone().try_map_parameters(|value| value.transpose(permutation.to_vec())).unwrap()
+        };
+        let transposed_lhs = transpose(&lhs, [1, 0, 2]);
+        let transposed_rhs = transpose(&rhs, [0, 2, 1]);
+        let dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![1], vec![0]);
+        assert_eq!(transposed_lhs.scaled_dot(&transposed_rhs, Some(&dimensions), None), Ok(expected.clone()));
+        let scaled_rhs = BlockQuantizedValue::new(transposed_rhs.elements.clone(), transposed_rhs.scales.clone())
+            .with_global_scale(Array::scalar(2.0f32).unwrap());
+        assert_eq!(
+            transposed_lhs.scaled_dot(&scaled_rhs, Some(&dimensions), None).unwrap().to_f64s(),
+            vec![28.0, 165.0, 376.0, 33.5],
+        );
+    }
+
+    #[test]
     fn test_block_quantized_value_scaled_dot_validation() {
         let lhs = BlockQuantizedValue::new(
             Array::matrix(1, 4, vec![1.0f32; 4]).unwrap(),
@@ -6509,25 +7950,37 @@ mod tests {
             Array::matrix(4, 1, vec![1.0f32; 4]).unwrap(),
             Array::matrix(2, 1, vec![1.0f32; 2]).unwrap(),
         );
-        // Global scales on either side must be rank-0 real floating-point arrays, for arrays and array IR values alike.
+        // Global scales on either side must be real floating-point arrays that are scalars or grouped scales of
+        // their elements, for arrays and array IR values alike.
         let invalid_lhs = lhs.clone().with_global_scale(Array::vector(vec![1.0f32]).unwrap());
         let expected = ProgramError::from(TypeError::invalid(format!(
-            "`{SCALED_DOT_OPERATION_NAME}` left global scale must be a rank-0 real floating-point array but got \
-             `f32[1]`",
+            "`{SCALED_DOT_OPERATION_NAME}` left global scale must be a real floating-point array of rank 0 or with \
+             the shape of the elements `f32[1, 4]` up to extents of one but got `f32[1]`",
         )));
         assert_eq!(invalid_lhs.scaled_dot(&rhs, None, None), Err(expected.clone()));
         let array_ir_rhs = rhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
         let invalid_lhs = invalid_lhs.map_parameters(ArrayIrValue::Array).unwrap();
         assert_eq!(invalid_lhs.scaled_dot(&array_ir_rhs, None, None), Err(expected));
+        let unscaled_rhs = rhs.clone();
         let invalid_rhs = rhs.with_global_scale(Array::scalar(1i32).unwrap());
         let expected = ProgramError::from(TypeError::invalid(format!(
-            "`{SCALED_DOT_OPERATION_NAME}` right global scale must be a rank-0 real floating-point array but got \
-             `i32[]`",
+            "`{SCALED_DOT_OPERATION_NAME}` right global scale must be a real floating-point array of rank 0 or with \
+             the shape of the elements `f32[4, 1]` up to extents of one but got `i32[]`",
         )));
         assert_eq!(lhs.scaled_dot(&invalid_rhs, None, None), Err(expected.clone()));
-        let array_ir_lhs = lhs.map_parameters(ArrayIrValue::Array).unwrap();
+        let array_ir_lhs = lhs.clone().map_parameters(ArrayIrValue::Array).unwrap();
         let invalid_rhs = invalid_rhs.map_parameters(ArrayIrValue::Array).unwrap();
         assert_eq!(array_ir_lhs.scaled_dot(&invalid_rhs, None, None), Err(expected));
+
+        // A grouped global scale cannot vary along a contracting dimension of its side.
+        let invalid_lhs = lhs.with_global_scale(Array::matrix(1, 4, vec![1.0f32; 4]).unwrap());
+        let expected = ProgramError::from(TypeError::invalid(format!(
+            "`{SCALED_DOT_OPERATION_NAME}` left global scale `f32[1, 4]` must have extent one along contracting \
+             dimension 1",
+        )));
+        assert_eq!(invalid_lhs.scaled_dot(&unscaled_rhs, None, None), Err(expected.clone()));
+        let invalid_lhs = invalid_lhs.map_parameters(ArrayIrValue::Array).unwrap();
+        assert_eq!(invalid_lhs.scaled_dot(&array_ir_rhs, None, None), Err(expected));
 
         // Even with two global scales, invalid block shapes are rejected before their scalar product is staged.
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
@@ -6964,6 +8417,13 @@ mod tests {
         assert!(!mxfp4.has_global_scale());
         assert_eq!(mxfp4.largest_unclipped_value(), Ok(6.0 * 127.0f64.exp2()));
 
+        // Formats use the standard scale rule unless another one is selected, which changes nothing else.
+        assert_eq!(nvfp4.scale_rule(), BlockScaleRule::Standard);
+        let four_over_six = nvfp4.with_scale_rule(BlockScaleRule::FourOverSix);
+        assert_eq!(four_over_six.scale_rule(), BlockScaleRule::FourOverSix);
+        assert_eq!(four_over_six.with_scale_rule(BlockScaleRule::Standard), nvfp4);
+        assert_ne!(four_over_six, nvfp4);
+
         // Construction does not validate formats, but element types without a grid have no largest value.
         assert_eq!(
             BlockScaleFormat::new(4, DataType::F16, DataType::F8E4M3FN).largest_unclipped_value(),
@@ -7280,6 +8740,46 @@ mod tests {
             ))),
         ));
 
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(
+                configuration.clone().with_lhs_format(nvfp4.with_scale_rule(BlockScaleRule::RoundUp)),
+            ),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` round up scales require `f8e8m0fnu` scales but got `f8e4m3fn` scales",
+            ))),
+        ));
+        let quantized_residuals = configuration.clone().with_residual_policy(BlockScaledDotResidualPolicy::Quantized);
+        assert!(matches!(
+            block_scaled_dot::<EagerArrayContext>(quantized_residuals),
+            Err(error) if error == ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` quantized residuals require quantized backward contractions",
+            ))),
+        ));
+
+        // Grouped global scales follow the groups of an input, which the cotangent does not have. The quantized
+        // backward contractions of the original inputs would contract the dimensions along which they vary, which
+        // only differentiation rejects.
+        let quantized =
+            block_scaled_dot::<EagerArrayContext>(configuration.clone().with_quantized_backward(true)).unwrap();
+        let (lhs, rhs) = (cyclic_matrix(4, 8, &[1.0]), cyclic_matrix(8, 4, &[1.0]));
+        assert_eq!(
+            quantized.call(lhs.clone(), rhs.clone(), None, None, Some(cyclic_matrix(4, 1, &[1.0])), None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scale must be a rank-0 array but got `f32[4, 1]`",
+            )))),
+        );
+        let (_, pullback) = differentiate_at((lhs, rhs))
+            .with_captures(cyclic_matrix(4, 1, &[1.0]))
+            .vjp(|(lhs, rhs), lhs_global_scale| quantized.call(lhs, rhs, Some(lhs_global_scale), None, None, None))
+            .unwrap();
+        assert_eq!(
+            pullback.apply_materialized(cyclic_matrix(4, 4, &[1.0])),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` grouped global scales with quantized backward contractions require \
+                 quantized residuals",
+            )))),
+        );
+
         // Calls validate the contracting extent, global scales, random states, and input types.
         let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
         let lhs = cyclic_matrix(2, 8, &[1.0]);
@@ -7293,8 +8793,21 @@ mod tests {
         assert_eq!(
             function.call(lhs.clone(), rhs.clone(), Some(Array::vector(vec![1.0f32]).unwrap()), None, None, None),
             Err(ProgramError::from(TypeError::invalid(format!(
-                "`{BLOCK_SCALED_DOT_NAME}` left global scale must be a rank-0 real floating-point array but \
-                 got `f32[1]`",
+                "`{BLOCK_SCALED_DOT_NAME}` left global scale must have rank 0 or the shape of its input `f32[2, 8]` \
+                 up to extents of one, with extent one along its contracting dimensions, but got `f32[1]`",
+            )))),
+        );
+        assert_eq!(
+            function.call(lhs.clone(), rhs.clone(), None, Some(cyclic_matrix(8, 1, &[1.0])), None, None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` right global scale must have rank 0 or the shape of its input `f32[8, 3]` \
+                 up to extents of one, with extent one along its contracting dimensions, but got `f32[8, 1]`",
+            )))),
+        );
+        assert_eq!(
+            function.call(lhs.clone(), rhs.clone(), None, None, Some(Array::scalar(1i32).unwrap()), None),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{BLOCK_SCALED_DOT_NAME}` gradient global scale must be a real floating-point array but got `i32[]`",
             )))),
         );
         assert_eq!(
@@ -7591,6 +9104,177 @@ mod tests {
     }
 
     #[test]
+    fn test_block_scaled_dot_grouped_global_scales() {
+        // The second row of the left input and the second column of the right input exceed the largest value `6 · 448`
+        // that NVFP4 represents with a unit global scale, so they clip without global scales. A scale per row of the
+        // left input and per column of the right input brings every group into range, and all of the values are
+        // then exactly representable, so the output and the gradients equal those of the plain dot product.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4);
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = Array::matrix(2, 4, vec![3.0f32, 1.5, 0.5, 6.0, 10752.0, 5376.0, 2688.0, 896.0]).unwrap();
+        let rhs = Array::matrix(4, 2, vec![1.0f32, 21504.0, 6.0, 10752.0, 2.0, 5376.0, 0.5, 1792.0]).unwrap();
+        let lhs_global_scale = Array::matrix(2, 1, vec![1.0f32, 4.0]).unwrap();
+        let rhs_global_scale = Array::matrix(1, 2, vec![1.0f32, 8.0]).unwrap();
+        let seed = Array::matrix(2, 2, vec![1.0f32, -2.0, 0.5, 3.0]).unwrap();
+        let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .with_captures((lhs_global_scale, rhs_global_scale))
+            .vjp(|(lhs, rhs), (lhs_global_scale, rhs_global_scale)| {
+                function.call(lhs, rhs, Some(lhs_global_scale), Some(rhs_global_scale), None, None)
+            })
+            .unwrap();
+        let (expected_output, expected_pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .vjp(|(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()))
+            .unwrap();
+        assert_eq!(output, expected_output);
+        assert_eq!(pullback.apply_materialized(seed.clone()), expected_pullback.apply_materialized(seed));
+        assert_ne!(function.call(lhs, rhs, None, None, None, None), Ok(expected_output));
+    }
+
+    #[test]
+    fn test_block_scaled_dot_differentiation_quantized_residuals() {
+        // With quantized residuals, both gradient contractions read the quantized forward inputs rather than the
+        // original ones, and quantize them again in the gradient format along the dimension that they contract.
+        let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
+        let mxfp8 =
+            BlockScaleFormat::new(4, DataType::F8E4M3FN, DataType::F8E8M0FNU).with_scale_rule(BlockScaleRule::RoundUp);
+        let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+            .with_gradient_format(mxfp8)
+            .with_residual_policy(BlockScaledDotResidualPolicy::Quantized);
+        assert!(configuration.quantized_backward());
+        assert_eq!(configuration.residual_policy(), BlockScaledDotResidualPolicy::Quantized);
+        let values = |rows: usize, columns: usize, phase: f64| {
+            Array::from_elements::<f64>(
+                ArrayType::new_static(DataType::F64, [rows, columns]),
+                &(0..rows * columns).map(|index| (index as f64 * 0.37 + phase).sin()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .convert_element_type(DataType::F32)
+            .unwrap()
+        };
+        let (lhs, rhs, seed) = (values(4, 8, 0.1), values(8, 4, 0.7), values(4, 4, 1.3));
+
+        // The reference is built from the public quantization capabilities. The forward contraction and the residuals
+        // use the inputs quantized to NVFP4 along the contracting dimension.
+        let requantize = |value: &Array, axis: isize, noise: Option<&Array>| {
+            value
+                .block_quantize_with_options(
+                    4,
+                    DataType::F8E4M3FN,
+                    DataType::F8E8M0FNU,
+                    BlockScaleRule::RoundUp,
+                    axis,
+                    None,
+                    noise,
+                )
+                .unwrap()
+                .block_dequantize([axis], DataType::F32)
+                .unwrap()
+        };
+        let quantized_lhs = lhs
+            .block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN)
+            .unwrap()
+            .block_dequantize([1], DataType::F32)
+            .unwrap();
+        let quantized_rhs = rhs
+            .block_quantize_with_options(
+                4,
+                DataType::F4E2M1FN,
+                DataType::F8E4M3FN,
+                BlockScaleRule::Standard,
+                0,
+                None,
+                None,
+            )
+            .unwrap()
+            .block_dequantize([0], DataType::F32)
+            .unwrap()
+            .transpose(vec![1, 0])
+            .unwrap();
+        let reference = |noise: [Option<&Array>; 4]| {
+            // The input gradient contracts the seed `[M, N]` with the quantized right input `[N, K]` along `N`, and
+            // the weight gradient contracts the seed with the quantized left input `[M, K]` along `M`.
+            let lhs_cotangent = requantize(&seed, 1, noise[0])
+                .dot(&requantize(&quantized_rhs, 0, noise[2]), &DotDimensionNumbers::matmul())
+                .unwrap();
+            let rhs_cotangent = requantize(&seed, 0, noise[1])
+                .dot(
+                    &requantize(&quantized_lhs, 0, noise[3]),
+                    &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()),
+                )
+                .unwrap()
+                .transpose(vec![1, 0])
+                .unwrap();
+            (lhs_cotangent, rhs_cotangent)
+        };
+        let function = block_scaled_dot::<EagerArrayContext>(configuration.clone()).unwrap();
+        let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_eq!(
+            output,
+            quantized_lhs
+                .dot(&quantized_rhs.transpose(vec![1, 0]).unwrap(), &DotDimensionNumbers::matmul())
+                .unwrap()
+        );
+        let cotangents = pullback.apply_materialized(seed.clone()).unwrap();
+        assert_eq!(cotangents, reference([None; 4]));
+
+        // The gradients of the original inputs, quantized again in their own formats, differ from them.
+        let inputs = block_scaled_dot::<EagerArrayContext>(
+            configuration.clone().with_residual_policy(BlockScaledDotResidualPolicy::Inputs),
+        );
+        let (_, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .vjp(|(lhs, rhs)| inputs.as_ref().unwrap().call(lhs, rhs, None, None, None, None))
+            .unwrap();
+        assert_ne!(pullback.apply_materialized(seed.clone()).unwrap(), cotangents);
+
+        // Stochastic gradient rounding also rounds the quantized residuals stochastically. The seed draws its noise
+        // for both contractions first, followed by the right and the left input, each in its normalized layout.
+        let function =
+            block_scaled_dot::<EagerArrayContext>(configuration.with_stochastic_gradient_rounding(true)).unwrap();
+        let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[1u64, 0]).unwrap();
+        let (_, pullback) = differentiate_at((lhs, rhs))
+            .with_captures(state.clone())
+            .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
+            .unwrap();
+        let draw = |state: &Array, shape: [usize; 3]| {
+            let (state, noise) = state.random_uniform(&ArrayType::new_static(DataType::F32, shape)).unwrap();
+            (state, noise.reshape(Shape::new(vec![Dimension::Static(shape[1]), Dimension::Static(shape[2])])).unwrap())
+        };
+        let (state, input_gradient_noise) = draw(&state, [1, 4, 4]);
+        let (state, weight_gradient_noise) = draw(&state, [1, 4, 4]);
+        let (state, rhs_noise) = draw(&state, [1, 4, 8]);
+        let (_, lhs_noise) = draw(&state, [1, 4, 8]);
+        let stochastic_cotangents = pullback.apply_materialized(seed.clone()).unwrap();
+        assert_eq!(
+            stochastic_cotangents,
+            reference([Some(&input_gradient_noise), Some(&weight_gradient_noise), Some(&rhs_noise), Some(&lhs_noise)]),
+        );
+        assert_ne!(stochastic_cotangents, cotangents);
+
+        // A gradient format with global scales quantizes the residuals again with their current global scales. The
+        // left input below is only representable with its provided global scale, and every tensor is exactly
+        // representable along both of its dimensions, so the gradients equal those of the plain dot product.
+        let configuration = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), nvfp4)
+            .with_quantized_backward(true)
+            .with_residual_policy(BlockScaledDotResidualPolicy::Quantized);
+        let function = block_scaled_dot::<EagerArrayContext>(configuration).unwrap();
+        let lhs = cyclic_matrix(4, 4, &[10752.0, 5376.0, 2688.0, 5376.0]);
+        let rhs = Array::matrix(4, 4, [6.0f32, 3.0, 1.5, 6.0].iter().flat_map(|&value| [value; 4]).collect()).unwrap();
+        let seed = cyclic_matrix(4, 4, &[6.0, 3.0, 1.5, 3.0]);
+        let (output, pullback) = differentiate_at((lhs.clone(), rhs.clone()))
+            .with_captures(Array::scalar(4.0f32).unwrap())
+            .vjp(|(lhs, rhs), lhs_global_scale| function.call(lhs, rhs, Some(lhs_global_scale), None, None, None))
+            .unwrap();
+        let (expected_output, expected_pullback) = differentiate_at((lhs, rhs))
+            .vjp(|(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()))
+            .unwrap();
+        assert_eq!(output, expected_output);
+        assert_eq!(pullback.apply_materialized(seed.clone()), expected_pullback.apply_materialized(seed));
+    }
+
+    #[test]
     fn test_block_scaled_dot_batching() {
         // Batching a mapped left input against a replicated right input calls the function once per batch item.
         let nvfp4 = BlockScaleFormat::new(4, DataType::F4E2M1FN, DataType::F8E4M3FN);
@@ -7835,6 +9519,7 @@ mod tests {
                     16,
                     DataType::F4E2M1FN,
                     DataType::F8E4M3FN,
+                    BlockScaleRule::Standard,
                     axes.clone(),
                     Some(&global_scale),
                     noise,
@@ -7860,7 +9545,7 @@ mod tests {
         let expected_lhs = quantize(&rank_three(&seed), vec![2], Some(&input_gradient_noise))
             .dot(&weight, &DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]))
             .unwrap();
-        let rules = BlockScaledDotRules::new(function.configuration(), &lhs, &rhs).unwrap();
+        let rules = BlockScaledDotRules::new(function.configuration(), &lhs.r#type(), &rhs.r#type()).unwrap();
         let expected_rhs =
             quantize(&rules.hadamard_transform(&rank_three(&seed), 32).unwrap(), vec![1], Some(&weight_gradient_noise))
                 .dot(
@@ -7983,7 +9668,7 @@ mod tests {
             .with_quantized_backward(true)
             .with_tiled_rhs_scales(true);
         let (lhs, rhs) = (cyclic_matrix(4, 8, &[1.0]), cyclic_matrix(8, 4, &[1.0]));
-        let rules = BlockScaledDotRules::new(&configuration, &lhs, &rhs).unwrap();
+        let rules = BlockScaledDotRules::new(&configuration, &lhs.r#type(), &rhs.r#type()).unwrap();
         let weight = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [1, 8, 8]),
             &(0..64).map(|index| (index as f64 * 0.91).cos() * (1.0 + (index / 16) as f64)).collect::<Vec<_>>(),
@@ -8007,7 +9692,7 @@ mod tests {
         // The matrix is orthogonal.
         let configuration = BlockScaledDotConfiguration::nvfp4_training(DotDimensionNumbers::matmul());
         let (lhs, rhs) = (cyclic_matrix(16, 16, &[1.0]), cyclic_matrix(16, 16, &[1.0]));
-        let rules = BlockScaledDotRules::new(&configuration, &lhs, &rhs).unwrap();
+        let rules = BlockScaledDotRules::new(&configuration, &lhs.r#type(), &rhs.r#type()).unwrap();
         let basis = Array::from_elements::<f32>(
             ArrayType::new_static(DataType::F32, [1, 16, 16]),
             &(0..256).map(|index| if index % 17 == 0 { 1.0 } else { 0.0 }).collect::<Vec<_>>(),

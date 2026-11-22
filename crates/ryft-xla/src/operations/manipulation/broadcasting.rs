@@ -1048,17 +1048,11 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>();
             let expected = outputs.as_ref().map(|outputs| stack(&outputs[..2])).map_err(Clone::clone);
 
-            // The function of one batch item rejects a mix of reduction states, and XLA rejects the comparison that
-            // the lowering of an extremum of unreduced values uses, unbatched as well as batched.
+            // The function of one batch item rejects a mix of reduction states.
             let expected_rejection = match (x_state, u_state) {
                 ("replicated", "unreduced sum") | ("unreduced sum", "replicated") => {
                     Some(format!("`{ADD_OPERATION_NAME}` inputs must be unreduced over the same axes"))
                 }
-                (_, "unreduced max" | "unreduced min") => Some(
-                    "<unknown>:0: error: loc(\"compare.8\"): 'stablehlo.compare' op dropped unreduced axis 'x' without \
-                     a blessed operation (e.g., sdy.reshard). This is an invalid transition from unreduced to reduced."
-                        .to_string(),
-                ),
                 _ => None,
             };
             if expected.as_ref().err() != expected_rejection.as_ref() {
@@ -1151,8 +1145,12 @@ mod tests {
                 disagreements.push(format!("{cell}, jvp: {jvp:?} != {expected_jvp:?}"));
             }
 
-            // Reverse mode needs a seed of the cotangent type of an output.
+            // Reverse mode needs a seed of the cotangent type of an output, and a value that is unreduced with the
+            // maximum or the minimum kind defines no cotangent.
             let Ok(outputs) = &outputs else { continue };
+            if matches!(x_state, "unreduced max" | "unreduced min") {
+                continue;
+            }
             let seed_type = match outputs[0].r#type.cotangent() {
                 Ok(seed_type) => seed_type,
                 Err(error) => {

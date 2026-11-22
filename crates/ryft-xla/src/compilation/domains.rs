@@ -983,10 +983,7 @@ fn apply_signature_shardings(
 /// `output_type`. This is `annotation` with the dimensions that `output_type` records as unconstrained left
 /// unconstrained, because types compare unconstrained dimensions exactly and an array must have the placement that its
 /// type records. The two describe the same buffers, because `annotation` replicates those dimensions (refer to
-/// `entry_result_shardings`) and the runtime placement of an array reads an unconstrained dimension as replicated. An
-/// output sharding override never leaves a dimension unconstrained, because staging rejects such an override (refer to
-/// `place_outputs`), so only the type of an output that the program itself leaves unconstrained (e.g., through the
-/// target of a `place`) records one.
+/// `entry_result_shardings`) and the runtime placement of an array reads an unconstrained dimension as replicated.
 fn runtime_output_sharding(annotation: &Sharding, output_type: &ArrayType) -> Result<Sharding, Error> {
     let Some(type_sharding) = output_type.sharding() else {
         return Ok(annotation.clone());
@@ -1126,7 +1123,8 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
 /// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose source would be rejected as such a
 /// target, as the source is no destination of the forward program, and for the first `place` whose target or source
-/// sharding or `jit_call` whose boundary override is not fully replicated (refer to [`Sharding::is_replicated`]) when
+/// sharding or `jit_call` whose boundary override is not fully replicated (refer to [`Sharding::is_replicated`]), once
+/// its unconstrained dimensions are read as replicated (refer to [`entry_boundary_sharding`]), when
 /// `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_partitioner: bool) -> Result<(), Error> {
     for region in program.entry_region_ref().computation_regions() {
@@ -1215,7 +1213,10 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                                 })
                             });
                         }
-                        if !use_shardy_partitioner && mesh.devices().len() > 1 && !placement.sharding().is_replicated()
+                        // An unconstrained dimension is stored replicated, as at the boundary of a call.
+                        if !use_shardy_partitioner
+                            && mesh.devices().len() > 1
+                            && !entry_boundary_sharding(placement.sharding())?.is_replicated()
                         {
                             return Err(unsupported(if is_source {
                                 "bounded-dynamic multi-device programs currently require fully replicated placement \

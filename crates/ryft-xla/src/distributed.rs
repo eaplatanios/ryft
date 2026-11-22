@@ -2557,10 +2557,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
             let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
 
-            // The implicit reshard of a compiled input copies the column-major replica of rank 0 to its own device and
-            // sends it to rank 1, which receives it in the default row-major layout. Both ranks record the layout that
-            // the moves of both ranks imply (i.e., none), rather than rank 0 keeping the declared layout of its copy,
-            // so both prepare the result for the compiled function below in the same way.
+            // Resharding the source onto both devices (i.e., `reshard_on_devices`) copies the column-major replica of
+            // rank 0 to its own device and sends it to rank 1, which receives it in the default row-major layout. Both
+            // ranks record the layout that the moves of both ranks imply (i.e., none), rather than rank 0 keeping the
+            // declared layout of its copy, so both prepare the result for the compiled function below in the same way.
             let moved = source.clone().reshard_on_devices(&session, &mesh, &replicated, false).unwrap();
             moved.block_until_ready().unwrap();
             let shards = moved
@@ -2770,7 +2770,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let r#type = ArrayType::new_static(DataType::F32, [4]);
             let values = values_to_bytes(&[1f32, 2., 3., 4.]);
             let source = Array::from_host_buffer(&session, r#type, None, None, values).unwrap();
-            assert!(source.is_locally_assigned(), "rank {rank} uploaded a value whose devices were not locally assigned");
+            assert!(
+                source.is_locally_assigned(),
+                "rank {rank} uploaded a value whose devices were not locally assigned"
+            );
             assert_eq!(source.mesh().devices(), [devices[rank]]);
             for owner in [0, 1] {
                 let mesh = DeviceMesh::new(logical_mesh(1), vec![devices[owner]]).unwrap();
