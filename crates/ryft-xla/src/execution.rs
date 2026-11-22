@@ -176,8 +176,18 @@ impl ExecutionPlan {
         let physical_input_logical_indices = signature.project_inputs(&(0..input_types.len()).collect::<Vec<_>>());
         let mut physical_input_types = signature.physical_input_types(input_types);
         let compiled_executable = executable.executable()?;
-        let input_layouts =
-            if physical_input_types.is_empty() { Vec::new() } else { compiled_executable.input_layouts()? };
+        // A plugin without the layouts extension (e.g., the MPS plugin) does not report the layouts of its executables.
+        // The validation below then rejects an input type that declares a layout, which it cannot confirm, and an
+        // execution passes the inputs without a declared layout as they are.
+        let input_layouts = if physical_input_types.is_empty() {
+            Some(Vec::new())
+        } else {
+            match compiled_executable.input_layouts() {
+                Ok(layouts) => Some(layouts),
+                Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
         let physical_output_types = signature.physical_output_types(output_types);
         let output_layouts = if physical_output_types.iter().any(|array_type| array_type.layout().is_some()) {
             compiled_executable.output_layouts()?
@@ -188,7 +198,7 @@ impl ExecutionPlan {
         // declared layouts, including when rebuilding a plan for a persistent executable. Unspecified layouts impose
         // no constraint, and tokens are excluded from these physical array type lists.
         for (kind, types, layouts) in [
-            ("input", physical_input_types.as_slice(), input_layouts.as_slice()),
+            ("input", physical_input_types.as_slice(), input_layouts.as_deref().unwrap_or_default()),
             ("output", physical_output_types.as_slice(), output_layouts.as_slice()),
         ] {
             for (index, array_type) in types.iter().enumerate() {
@@ -264,14 +274,16 @@ impl ExecutionPlan {
         }
         // These types describe the physical executable signature, including layouts chosen for unconstrained
         // logical inputs. Keep the logical declarations unchanged so they still admit other representations.
-        for (index, array_type) in physical_input_types.iter_mut().enumerate() {
-            let layout = input_layouts.get(index).ok_or_else(|| {
-                Error::Compilation(CompilationError::IncompatibleExecutable {
-                    reason: format!("executable input {index} has no physical layout"),
-                })
-            })?;
-            let layout = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)?;
-            *array_type = array_type.clone().with_layout(layout);
+        if let Some(input_layouts) = &input_layouts {
+            for (index, array_type) in physical_input_types.iter_mut().enumerate() {
+                let layout = input_layouts.get(index).ok_or_else(|| {
+                    Error::Compilation(CompilationError::IncompatibleExecutable {
+                        reason: format!("executable input {index} has no physical layout"),
+                    })
+                })?;
+                let layout = Layout::from_pjrt(ryft_pjrt::Layout::from_proto(layout.serialize()?.proto()?)?)?;
+                *array_type = array_type.clone().with_layout(layout);
+            }
         }
         let logical_donation_flags =
             std::iter::repeat_n(false, capture_count).chain(donation_flags.iter().copied()).collect::<Vec<_>>();
@@ -655,7 +667,10 @@ impl Session {
             if input.data_type().is_zero() {
                 continue;
             }
-            let expected = physical_type.layout().unwrap();
+            // The executable of a plugin without the layouts extension reports no layout to match.
+            let Some(expected) = physical_type.layout() else {
+                continue;
+            };
             if let Some(actual) = input.layout() {
                 if actual != expected {
                     let source = input.clone().with_session(self)?;
@@ -1621,7 +1636,8 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
 }
 
 /// Validates runtime refinement of a declared logical input type, excluding sharding because placement is resolved
-/// separately at the call boundary.
+/// separately at the call boundary. This is the rule by which an executable accepts its arguments, and the type rule of
+/// a `jit_call` accepts the inputs of a call by the same rule (refer to `validate_call_input_types`).
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {
@@ -2661,6 +2677,60 @@ mod tests {
         session.clear_cache();
         assert!(!execute(&observed));
         assert!(execute(&requested));
+    }
+
+    #[test]
+    fn test_session_execute_compiled_async_commits_outputs_of_nested_boundary_shardings() {
+        // The function runs on a single device, where only explicit placement requests commit its outputs.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let vector_type = ArrayType::new_static(DataType::I32, [2]);
+        let uncommitted =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1i32, 2])).unwrap();
+        assert!(!uncommitted.is_committed());
+        let execute = |options: Options| {
+            let double = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |input| input.clone() + input,
+                vector_type.clone(),
+                &session,
+                options,
+            )
+            .unwrap();
+            let wrapper = crate::compile::<_, ArrayType, (ArrayType, ArrayType)>(
+                |input| (double.call(input.clone()).unwrap(), input),
+                vector_type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let (doubled, forwarded) = wrapper.executable().execute(&session, uncommitted.clone()).unwrap();
+            [(doubled, vec![2i32, 4]), (forwarded, vec![1i32, 2])]
+                .into_iter()
+                .map(|(output, values)| {
+                    output.block_until_ready().unwrap();
+                    assert_eq!(output.mesh(), &mesh);
+                    assert_eq!(output.sharding(), &replicated);
+                    assert_eq!(
+                        output.shards().iter().map(|shard| shard.shape().to_string()).collect::<Vec<_>>(),
+                        ["[2]"]
+                    );
+                    assert_eq!(output.copy_to_host().unwrap().elements::<i32>().unwrap(), values);
+                    output.is_committed()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A call of a compiled function with a sharding override requests the placement of the boundary of that
+        // function, like the shardings of a nested `jit` call in JAX, although a replicated override over an auto mesh
+        // axis stages nothing. Every output of the calling function is therefore committed, including one that the
+        // call does not produce.
+        assert_eq!(execute(Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()])), [true, true]);
+        assert_eq!(execute(Options::new(mesh.clone()).with_output_shardings(vec![replicated.clone()])), [true, true]);
+
+        // A call without overrides requests nothing, so the outputs keep the rule for the commitment of the inputs.
+        assert_eq!(execute(Options::new(mesh.clone())), [false, false]);
     }
 
     #[test]

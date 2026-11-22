@@ -35,7 +35,7 @@ use ryft_core::{
     DimensionType, DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses,
     ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation,
     LogicalMesh, Memory, MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlaceTarget, ProgramError,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
     Provenance, RegionId, RegionRef, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
     ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation,
     TagOperation, Type as CoreType, TypeError, Typed, TypedProgram, Value, ZeroLikeOperation, ZeroOperation,
@@ -44,7 +44,7 @@ use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
     Module, Operation as MlirOperation, OperationPrintingFlags, Region, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue, ValueRef,
+    Value as MlirValue, ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::devices::MemoryExtension;
@@ -62,11 +62,11 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::validate_boundary_memory;
-use crate::sharding::ShardyTensorSharding;
+use crate::sharding::{ShardyTensorSharding, supports_shardy};
 use crate::{
-    ArrayConstant, CompilationError, Constant, Error, FlatProgram, JitCallOperation, Operation, Program,
-    RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
-    normalize_runtime_requirements,
+    ArrayConstant, CompilationError, Constant, Error, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation,
+    Operation, Program, RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir,
+    Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -131,6 +131,23 @@ pub enum LoweringError {
         .mesh.logical_mesh(),
     )]
     DeviceOutsideProgramMesh { device: Device, mesh: DeviceMesh },
+
+    #[error(
+        "`{}` cannot call a function compiled for the devices {:?} of mesh `{}` inside a program compiled for the \
+         devices {:?} of mesh `{}`",
+        JIT_CALL_OPERATION_NAME,
+        .callee.devices().iter().map(|device| device.id()).collect::<Vec<_>>(),
+        .callee.logical_mesh(),
+        .mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>(),
+        .mesh.logical_mesh(),
+    )]
+    CallOutsideProgramMesh { callee: DeviceMesh, mesh: DeviceMesh },
+
+    #[error(
+        "the sharding of {kind} {index} splits dimension {dimension} of extent {extent} into {shard_count} shards, but \
+         XLA requires the number of shards to divide the extent"
+    )]
+    UnevenSharding { kind: &'static str, index: usize, dimension: usize, extent: usize, shard_count: usize },
 
     /// A valid operation requests behavior this backend cannot lower.
     #[error("cannot lower `{operation}`: {reason}")]
@@ -1490,13 +1507,21 @@ where
 }
 
 /// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
-/// through a `place` with a target or a `constrain_sharding`, whether or not that value reaches a result. These are the
-/// analogues of the `device_put` and `with_sharding_constraint` calls that make JAX commit every output of a `jit`
-/// function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). A `place` without a target leaves its input
-/// where it is, so it requests nothing. A `place` with a device target (i.e., a [`PlaceTarget::Device`]) is counted,
-/// as an explicit device commits an array eagerly, although JAX leaves a value that a bare device places inside `jit`
-/// uncommitted and on the devices that it already occupies. A `reshard` is not counted, because JAX does not count its
-/// own `reshard` among these requests either.
+/// through a `place` with a target, a `constrain_sharding`, or a `jit_call` whose callee names devices (i.e., carries a
+/// sharding override of its boundary, requests a placement itself, or captures a committed array, refer to
+/// [`JitCallOperation::with_boundary`]), whether or not that value reaches a result. These are the analogues of the
+/// `device_put` and `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX commit
+/// every output of a `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Such calls count
+/// because their callees cannot show their overrides (e.g., a replicated override over auto mesh axes stages nothing).
+/// The callees of calls are among the regions that lowering emits, so a request inside a callee counts too. A `place`
+/// without a target leaves its input where it is, so it requests nothing. A `place` with a device target (i.e., a
+/// [`PlacementRequest::Device`]) is counted, as an explicit device commits an array eagerly, although JAX leaves a
+/// value that a bare device places inside `jit` uncommitted and on the devices that it already occupies. A `place`
+/// with an in-place target (i.e., a [`PlacementRequest::InPlace`]) is counted too, because JAX commits every output of
+/// a `jit` function that moves a value to a memory space (i.e., `jax.device_put(x, jax.memory.Space.Host)`), whose
+/// destinations `jaxpr_transfer_mem_kinds` in `jax._src.interpreters.pxla` collects and `lower_sharding_computation`
+/// counts among the reasons to commit. A `reshard` is not counted, because JAX does not count its own `reshard` among
+/// these requests either.
 pub(crate) fn has_placement_requests<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
@@ -1511,6 +1536,7 @@ where
                 .projected_payload::<PlaceOperation>()
                 .is_some_and(|operation| operation.target().is_some())
                 || operation.projected_payload::<ConstrainShardingOperation>().is_some()
+                || operation.projected_payload::<JitCallOperation<Type>>().is_some_and(|call| call.mesh().is_some())
         })
     })
 }
@@ -1539,15 +1565,18 @@ pub(crate) enum EntryResultPlacement {
 /// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
 /// target, which leaves its input where it is, a `place` with a device target, which keeps the sharding of its input
 /// on the only device of the program mesh, and `stop_gradient` and `tag`, which only mark values for program
-/// transforms and lower to nothing. A `jit_call` always runs its callee, whose results are the results of the call, so
-/// a result of a call has the placement that the callee gives the corresponding callee result, and a callee result
-/// that returns a callee input is followed back to the corresponding input of the call. A sharding override of the
-/// boundary of the callee that the call carries (i.e., of a compiled function that it calls) takes precedence, because
-/// the callee body cannot always show it, so a result of the call that such an output override covers, or that
-/// returns a callee input that such an input override covers, is placed as that override. Other operations that
-/// return a value equal to an input are not followed, because they change its placement (e.g., `reshard` and
-/// `constrain_sharding`) or because the compiler is free to place their results differently (e.g., the
-/// `optimization_barrier` of rematerialization).
+/// transforms and lower to nothing. A device target that completes a pending reduction over mesh axes of size one
+/// gives its result another sharding than its input, so such a result is placed as its type states instead. A
+/// `jit_call` always runs its callee, whose results are the results of the call, so a result of a call has the
+/// placement that the callee gives the corresponding callee result, and a callee result that returns a callee input is
+/// followed back to the corresponding input of the call. A sharding override of the boundary of the callee that the
+/// call carries (i.e., of a compiled function that it calls) takes precedence, because the callee body cannot always
+/// show it, so a result of the call that such an output override covers, or that returns a callee input that such an
+/// input override covers, is placed as that override. Lowering constrains that result or operand of the call to the
+/// override as well, so that the call places it alike whether a program returns it or consumes it (refer to the
+/// lowering of [`JitCallOperation`]). Other operations that return a value equal to an input are not followed, because
+/// they change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
+/// results differently (e.g., the `optimization_barrier` of rematerialization).
 pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     output_count: usize,
@@ -1820,7 +1849,10 @@ impl MlirLowerableValue for Array {
 
 /// Collects the module mesh from the meshes referenced by emitted sharding constraints and nested-computation
 /// boundaries, starting from `existing`, and rejects every mesh whose topology differs from it with
-/// [`LoweringError::MismatchedMeshTopology`].
+/// [`LoweringError::MismatchedMeshTopology`]. The constraints include those of the boundary overrides of `jit_call`s,
+/// whose shardings no type records. A constraint that this function does not recognize but that lowering emits over
+/// the sharding of a type still finds its mesh, because the module declares the mesh of those types whenever the
+/// lowered module refers to a mesh that this function did not find (refer to `declare_constrained_mesh`).
 pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     existing: Option<LogicalMesh>,
@@ -1849,12 +1881,20 @@ where
                         .map(|operation| operation.sharding().mesh())
                 })
                 .or_else(|| {
-                    // A device target names no mesh and lowers to no sharding constraint.
+                    // A device target names no mesh. It lowers to a sharding constraint only when it completes a
+                    // reduction, over the mesh of its result type, which `declare_constrained_mesh` declares.
                     operation
                         .projected_payload::<PlaceOperation>()
                         .and_then(PlaceOperation::target)
-                        .and_then(PlaceTarget::placement)
+                        .and_then(PlacementRequest::placement)
                         .map(|target| target.sharding().mesh())
+                })
+                .or_else(|| {
+                    // A call constrains its operands and results that the boundary of its callee overrides.
+                    operation
+                        .projected_payload::<JitCallOperation<Type>>()
+                        .and_then(|call| call.boundary_shardings().next())
+                        .map(Sharding::mesh)
                 });
             let incoming = if let Some(mesh) = declared_mesh {
                 Some(mesh.clone())
@@ -1932,6 +1972,20 @@ where
 /// unused one never changes the semantics of the module.
 pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
     remove_unused_constants_in_block(module.body()?)
+}
+
+/// Removes every Shardy operation from `module`, including those in nested regions, for a target whose plugin lacks
+/// the Shardy dialect (refer to [`supports_shardy`]). Each `sdy.sharding_constraint` is replaced by its operand and
+/// the `sdy.mesh` declaration is erased. Such a target runs every program on a single device (compilation rejects any
+/// other mesh for it), where every sharding holds the whole array and thus every constraint is the identity, so the
+/// module computes the same values without them.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOperation`] for any other Shardy operation (e.g., the `sdy.manual_computation`
+/// of a `shard_map`), which has no equivalent without the dialect.
+pub(crate) fn remove_shardy_operations(module: &Module<'_, '_>) -> Result<(), Error> {
+    remove_shardy_operations_in_block(module.body()?)
 }
 
 /// Lowers one traced instruction to the corresponding StableHLO operations through its [`LowerableOperation`]
@@ -2341,6 +2395,9 @@ where
             }
         }
     }
+    // A target whose plugin lacks the Shardy dialect gets no sharding attributes, and `remove_shardy_operations` drops
+    // the sharding operations of its module below.
+    let supports_shardy = supports_shardy(target_platform);
     // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary, whose
     // types already omit static zeros and include hidden extent scalars, while tokens have no array type. Placement
     // belongs to physical array slots, including captures, but never to the appended effect token. Default device
@@ -2350,7 +2407,8 @@ where
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(sharding) = argument_sharding_attributes.get(index).and_then(Option::as_ref) {
+            if supports_shardy && let Some(sharding) = argument_sharding_attributes.get(index).and_then(Option::as_ref)
+            {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_argument_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
@@ -2381,7 +2439,7 @@ where
         .enumerate()
         .map(|(index, tensor_type)| {
             let mut attributes = HashMap::new();
-            if let Some(sharding) = result_sharding_attributes.get(index).and_then(Option::as_ref) {
+            if supports_shardy && let Some(sharding) = result_sharding_attributes.get(index).and_then(Option::as_ref) {
                 attributes.insert("sdy.sharding".into(), sharding.as_ref());
             }
             if let Some(r#type) = physical_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device) {
@@ -2541,6 +2599,10 @@ where
             location,
         )?
     })?;
+    let mesh = declare_constrained_mesh(&module, program, mesh, location.as_ref())?;
+    if !supports_shardy {
+        remove_shardy_operations(&module)?;
+    }
 
     remove_unused_constants(&module)?;
     if !module.verify()? {
@@ -2603,10 +2665,25 @@ fn region_result_placements<O: LowerableOperationFamily>(
             let operation = instruction.operation();
             let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
                 match operation.target() {
-                    Some(PlaceTarget::Placement(target)) => {
+                    Some(PlacementRequest::Resolved(target)) => {
                         return Some(EntryResultPlacement::Target(target.sharding().clone()));
                     }
-                    Some(PlaceTarget::Device { .. }) | None => 0,
+                    Some(PlacementRequest::Device { .. }) => {
+                        // A device target completes a pending reduction over mesh axes of size one, so its result can
+                        // have another sharding than its input, which is then the placement of the result.
+                        let sharding = |atom: AtomId| match region.atoms()[atom.index()].r#type().as_ref() {
+                            Type::Array(array_type) => array_type.sharding().cloned(),
+                            _ => None,
+                        };
+                        let output_sharding = sharding(instruction.outputs()[output_index]);
+                        if output_sharding != sharding(*instruction.inputs().first()?) {
+                            return output_sharding.map(EntryResultPlacement::Target);
+                        }
+                        0
+                    }
+                    // An in-place target leaves its input on the devices where it lives with its sharding, so the
+                    // result is placed as its input is.
+                    Some(PlacementRequest::InPlace { .. }) | None => 0,
                 }
             } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
                 || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
@@ -2648,6 +2725,62 @@ fn region_result_placements<O: LowerableOperationFamily>(
     region.output_ids().iter().map(|&output_id| result_placement(output_id)).collect()
 }
 
+/// Returns the module mesh of `module`, which is the lowering of `program`, after declaring it when `mesh`, the mesh
+/// that the signature and `collect_nested_sharding_mesh` found before the program was lowered, is [`None`] but the
+/// lowered operations refer to a mesh anyway. This makes the declaration follow what lowering emitted rather than a
+/// list of the operations that emit sharding constraints, which a new constraint (e.g., one that a lowering rule emits
+/// for the sharding of a result type) would otherwise have to join. Every Shardy operation other than the declaration
+/// itself refers to the module mesh, and the declared mesh is the one shared by the shardings of the array types of
+/// the regions that lowering emits, which every constraint over the sharding of a type refers to. A constraint over a
+/// sharding that no type carries must be found by `collect_nested_sharding_mesh` instead, and verification of the
+/// module reports it otherwise.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::MismatchedMeshTopology`] when the shardings of those types disagree on the topology.
+fn declare_constrained_mesh<'c, 't, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    module: &Module<'c, 't>,
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    mesh: Option<LogicalMesh>,
+    location: LocationRef<'c, 't>,
+) -> Result<Option<LogicalMesh>, Error>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    if mesh.is_some() {
+        return Ok(mesh);
+    }
+    let mut refers_to_mesh = false;
+    module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
+        Ok(name) if name.starts_with("sdy.") && name != "sdy.mesh" => {
+            refers_to_mesh = true;
+            WalkResult::Interrupt
+        }
+        _ => WalkResult::Advance,
+    });
+    if !refers_to_mesh {
+        return Ok(None);
+    }
+    let mut mesh = None;
+    for region in program.entry_region_ref().computation_regions() {
+        for atom in region.atoms() {
+            if let Type::Array(array_type) = atom.r#type().as_ref()
+                && let Some(sharding) = array_type.sharding()
+            {
+                mesh = Some(match mesh.take() {
+                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
+                    None => sharding.mesh().clone(),
+                });
+            }
+        }
+    }
+    if let Some(mesh) = &mesh {
+        module.body()?.insert_operation(mesh.to_mlir(location)?, 0)?;
+    }
+    Ok(mesh)
+}
+
 /// Validates that `incoming` has the topology of the module mesh `existing`, which it returns. The module mesh keeps
 /// the axis types of the first mesh that declared it, because the emitted `sdy.mesh` records only axis names and sizes.
 ///
@@ -2663,6 +2796,44 @@ fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh) -> Result
         }));
     }
     Ok(existing)
+}
+
+/// Removes every Shardy operation from `block` and from the regions nested in its operations, as
+/// [`remove_shardy_operations`] describes.
+fn remove_shardy_operations_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 't>) -> Result<(), Error> {
+    let mut shardy_operations = Vec::new();
+    for operation in block.operations()? {
+        let operation = operation?;
+        // An operation is classified before its regions are visited, so that an unsupported operation is reported
+        // rather than the Shardy terminator of its body.
+        let name = operation.name();
+        match name.as_str() {
+            Ok("sdy.sharding_constraint") => {
+                operation.result(0)?.replace_uses(operation.operand_value(0)?);
+                shardy_operations.push(operation);
+            }
+            Ok("sdy.mesh") => shardy_operations.push(operation),
+            Ok(name) if name.starts_with("sdy.") => {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: name.to_string(),
+                    reason: "the target platform does not support the Shardy dialect".to_string(),
+                }));
+            }
+            _ => {}
+        }
+        for region in operation.regions() {
+            for nested_block in region?.blocks()? {
+                remove_shardy_operations_in_block(nested_block?)?;
+            }
+        }
+    }
+    for operation in shardy_operations {
+        // SAFETY: the uses of a removed constraint were replaced by its operand and a mesh declaration has no results,
+        // so no remaining operation references a result of the removed operation, and dropping the detached operation
+        // that `remove_operation` returns destroys it.
+        unsafe { block.remove_operation(operation)? };
+    }
+    Ok(())
 }
 
 /// Removes every unused `stablehlo.constant` operation from `block` and from the regions nested in its operations.
@@ -2708,7 +2879,9 @@ pub(crate) mod tests {
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
-    use ryft_mlir::{Attribute, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize};
+    use ryft_mlir::{
+        Attribute, DialectHandle, ElementsAttribute, Operation as MlirOperation, Region, Size as MlirSize,
+    };
     use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -3993,6 +4166,159 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_declares_the_mesh_of_completed_device_reductions() {
+        // A device target that completes a pending reduction over a mesh axis of size one constrains its result over
+        // the mesh of its type, which neither the signature nor a payload names, so the module declares the mesh
+        // because the lowered constraint refers to it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let input_type = test_vector_type(4).with_sharding(unreduced).unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(PlaceOperation::new(Device::new(0, 0), None), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = program
+            .output_types()
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            to_mlir_module_for_program(&program, &[], &vec![input_type], &output_types, "main", None, None).unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_omits_shardy_for_targets_without_the_dialect() {
+        // A device target that completes a pending reduction over a mesh axis of size one constrains its result, and
+        // the signature shardings annotate the entry function. A target whose plugin lacks the Shardy dialect gets
+        // neither, nor the mesh that both refer to.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let input_type = test_vector_type(4).with_sharding(unreduced.clone()).unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(PlaceOperation::new(Device::new(0, 0), None), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = program
+            .output_types()
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned().unwrap())
+            .collect::<Vec<_>>();
+        let lower = |target_platform| {
+            lower_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone()],
+                &output_types,
+                "main",
+                Some(std::slice::from_ref(&unreduced)),
+                Some(std::slice::from_ref(&replicated)),
+                target_platform,
+            )
+            .unwrap()
+        };
+        let lowered = lower(Some("cpu"));
+        assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x"}>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        let lowered = lower(Some("mps"));
+        assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    return %arg0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_remove_shardy_operations() {
+        // Constraints are replaced by their operands in nested regions as well, and the mesh declaration is erased.
+        let context = MlirContext::new();
+        context.load_dialect(DialectHandle::func().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
+        context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
+        let module = context
+            .parse_module(indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    %1 = "stablehlo.case"(%arg1) ({
+                      %2 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+                      %3 = stablehlo.negate %2 : tensor<4xf32>
+                      stablehlo.return %3 : tensor<4xf32>
+                    }, {
+                      stablehlo.return %0 : tensor<4xf32>
+                    }) : (tensor<i32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#})
+            .unwrap();
+        remove_shardy_operations(&module).unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> tensor<4xf32> {
+                    %0 = "stablehlo.case"(%arg1) ({
+                      %1 = stablehlo.negate %arg0 : tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      stablehlo.return %arg0 : tensor<4xf32>
+                    }) : (tensor<i32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+
+        // A manual computation has no equivalent without the dialect.
+        let body = unproject_plain_program(neg_branch(test_vector_type(4)));
+        let module = context.parse_module(lower_replicated_shard_map_body(body, 1).unwrap()).unwrap();
+        assert!(matches!(
+            remove_shardy_operations(&module),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "sdy.manual_computation"
+                    && reason == "the target platform does not support the Shardy dialect",
+        ));
+    }
+
+    #[test]
     fn test_lower_mlir_module_for_program_rejects_unresolved_reference_state() {
         assert_eq!(token_threaded_effects(EffectClasses::single(EffectClass::OrderedState)).next(), None);
 
@@ -4874,6 +5200,68 @@ pub(crate) mod tests {
                   }
                 }
             "},
+        );
+    }
+
+    #[test]
+    fn test_collect_nested_sharding_mesh_includes_call_boundaries() {
+        // A call constrains its result to the override of the boundary of its callee, which no type records because the
+        // override is over an auto mesh axis, so the module declares the mesh of the override even when it is lowered
+        // without signature shardings, both for a static program and for one with a bounded dynamic value.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let lower = |array_type: ArrayType| {
+            let callee = {
+                let mut builder = ArrayIrProgramBuilder::new();
+                let input = builder.add_input(array_type.clone().into());
+                Arc::new(
+                    builder
+                        .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                        .unwrap(),
+                )
+            };
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let callee_region = builder.intern_callee(&callee, None).unwrap();
+            let call =
+                JitCallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated.clone())]);
+            let output =
+                builder.add_instruction(Operation::JitCall(call), vec![callee_region], vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            assert_eq!(collect_nested_sharding_mesh(&program, None).unwrap(), Some(mesh.clone()));
+            let types = vec![array_type];
+            to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap()
+        };
+        assert_eq!(
+            lower(test_vector_type(4)),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
+        assert_eq!(
+            lower(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length)]))),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
+                    %2 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    return %1, %3 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>
+                  }
+                }
+            "#},
         );
     }
 

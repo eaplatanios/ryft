@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, PLACE_OPERATION_NAME, PlaceOperation, PlaceTarget};
+use ryft_core::{ArrayType, PLACE_OPERATION_NAME, PlaceOperation, PlacementRequest};
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
@@ -45,8 +45,10 @@ impl LowerableOperation for PlaceOperation {
         // tracked over manual mesh axes, but a value that is created inside the region (e.g., a constant) has no
         // tracked sharding, and constraining it over the whole mesh there would contradict the region. A device target
         // is rejected there as well, because it moves the value onto one device, which a value of the region cannot
-        // leave, even when the program mesh consists of that device alone.
-        if !lowerer.collective_state().bound_manual_axes().is_empty() {
+        // leave, even when the program mesh consists of that device alone. This rule exists only because those targets
+        // move values, so an in-place target, which leaves the value on the devices of the region and changes only its
+        // storage, is lowered there like anywhere else.
+        if target.moves() && !lowerer.collective_state().bound_manual_axes().is_empty() {
             return Err(LoweringError::UnsupportedOperation {
                 operation: PLACE_OPERATION_NAME.to_string(),
                 reason: "a value inside a manual region cannot be moved to another placement".to_string(),
@@ -54,12 +56,24 @@ impl LowerableOperation for PlaceOperation {
             .into());
         }
         // A device target is the only device of the program mesh (refer to `validate_placements`), and its output keeps
-        // the sharding of its input, so it lowers to no sharding constraint and changes the storage only.
+        // the sharding of its input, so it lowers to no sharding constraint and changes the storage only, unless its
+        // input carries reduction state over mesh axes of size one, which the device target completes (refer to
+        // `PlacementRequest`). The output sharding is then constrained without that state, so that the compiler
+        // completes the pending reduction, which involves a single device and moves no data. An in-place target keeps
+        // the sharding of its input exactly, so it lowers to its layout and memory only, as JAX lowers a `device_put`
+        // onto a memory space to a memory annotation alone.
         let (input_type, output_type) = (&input_types[0], &output_types[0]);
         let mut value = input_values[0];
-        if let PlaceTarget::Placement(target) = target {
+        let sharding = match target {
+            PlacementRequest::Resolved(target) => Some(target.sharding()),
+            PlacementRequest::Device { .. } => {
+                output_type.sharding().filter(|&sharding| input_type.sharding() != Some(sharding))
+            }
+            PlacementRequest::InPlace { .. } => None,
+        };
+        if let Some(sharding) = sharding {
             let location = lowerer.location();
-            let sharding = target.sharding().to_mlir(location)?;
+            let sharding = sharding.to_mlir(location)?;
             value = lowerer
                 .block()
                 .append_operation(shardy::sharding_constraint(value, sharding, location)?)?
@@ -91,17 +105,17 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         BatchAxis, DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, NegOperation, PartialValue, Place, PlaceDispatch, Placeholder, Placement, Reduce,
-        ReductionKind, Shape, Sharding, ShardingDimension, StopGradient, TiledLayout, Typed, Value as CoreValue, batch,
-        differentiate_at,
+        MeshAxis, MeshAxisType, NegOperation, PartialValue, Place, PlaceDispatch, Placeholder, Placement, ProgramError,
+        Reduce, ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StopGradient, TiledLayout, Typed,
+        Value as CoreValue, batch, differentiate_at, shard_map,
     };
     use ryft_pjrt::Client;
 
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, ProgramBuilder, Session,
-        TracedProgram, Type, Value, compile, compile_with_options, trace,
+        Array, ArrayPlacement, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options,
+        PlacementOptions, ProgramBuilder, Session, TracedProgram, Type, Value, compile, compile_with_options, trace,
     };
 
     use super::*;
@@ -124,6 +138,15 @@ mod tests {
             .iter()
             .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
             .collect()
+    }
+
+    /// Places `value` on `target` through the `PlaceDispatch` primitive of its value type, without a source and with
+    /// the default copy policy, which is how a device target reaches values that `Session::place` resolves otherwise.
+    fn place_on<V: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, V>>>(
+        value: &V,
+        target: &PlacementRequest,
+    ) -> Result<V, ProgramError> {
+        V::Dispatch::place(value, Some(target), None, true)
     }
 
     #[test]
@@ -228,7 +251,7 @@ mod tests {
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh, sharding).unwrap();
         let place = |may_alias: bool| -> TracedProgram<ArrayType, ArrayType> {
-            let target = PlaceTarget::Placement(target.clone());
+            let target = PlacementRequest::Resolved(target.clone());
             trace(
                 move |input: ArrayTracer| {
                     <ArrayTracer as CoreValue>::Dispatch::place(&input, Some(&target), None, may_alias).unwrap()
@@ -282,7 +305,13 @@ mod tests {
         let place = |source: Option<Placement>, may_alias: bool| -> TracedProgram<ArrayType, ArrayType> {
             trace(
                 move |input: ArrayTracer| {
-                    <ArrayTracer as CoreValue>::Dispatch::place(&input, None, source.clone(), may_alias).unwrap()
+                    <ArrayTracer as CoreValue>::Dispatch::place(
+                        &input,
+                        None,
+                        source.clone().map(PlacementRequest::from),
+                        may_alias,
+                    )
+                    .unwrap()
                 },
                 input_type.clone(),
             )
@@ -316,6 +345,193 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_place_operation_lower_device_target() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![Device::new(0, 0)],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let place = |target: PlacementRequest| -> TracedProgram<ArrayType, ArrayType> {
+            trace(move |input: ArrayTracer| place_on(&input, &target).unwrap(), input_type.clone()).unwrap()
+        };
+
+        // A device target keeps the sharding of its input, so it lowers to no sharding constraint, and it lowers to
+        // nothing at all when it keeps the storage of its input.
+        let device = Device::new(0, 0);
+        assert_eq!(
+            place(PlacementRequest::Device { device, memory: Some(Memory::Device), layout: None })
+                .to_mlir_module("main")
+                .unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) -> (tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) {
+                    return %arg0 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        // A device target that changes the layout and the memory of its input constrains the layout and then
+        // annotates the memory.
+        let target = PlacementRequest::Device {
+            device,
+            memory: Some(Memory::Host { pinned: true }),
+            layout: Some(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
+        };
+        assert_eq!(
+            place(target).to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) -> (tensor<4x2xf32> {mhlo.layout_mode = "{0,1}", mhlo.memory_kind = "pinned_host", sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) {
+                    %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x2xf32>) -> tensor<4x2xf32>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<4x2xf32>) -> tensor<4x2xf32>
+                    return %1 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        // A device target completes a pending reduction along an axis of size one, so its output is constrained to the
+        // sharding of its type, without that reduction, and the annotation of the result is that sharding too.
+        let unreduced_type = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(move |input: ArrayTracer| place_on(&input, &PlacementRequest::from(device)).unwrap(), unreduced_type)
+                .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], unreduced={"x"}>}) -> (tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={"x"}>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}, {}], replicated={"x"}> : tensor<4x2xf32>
+                    return %0 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_place_operation_lower_in_place_target() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(
+                    mesh.logical_mesh().clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // An in-place target keeps the sharding of its input, so it lowers to no sharding constraint, only to a layout
+        // constraint and a memory annotation.
+        let target = PlacementRequest::InPlace {
+            memory: Some(Memory::Host { pinned: true }),
+            layout: Some(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
+        };
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(move |input: ArrayTracer| place_on(&input, &target).unwrap(), input_type).unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<4x2xf32> {mhlo.layout_mode = "{0,1}", mhlo.memory_kind = "pinned_host", sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+                    %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<4x2xf32>) -> tensor<4x2xf32>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<4x2xf32>) -> tensor<4x2xf32>
+                    return %1 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_place_operation_lower_in_place_target_inside_manual_regions() {
+        // A value inside a manual region cannot be moved to another placement, but an in-place target leaves it on the
+        // devices of the region and changes only its storage, so it lowers there like anywhere else. The result of the
+        // region keeps the memory that its body selects, so the function returns it in that memory.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = PlacementRequest::from(Memory::Host { pinned: true });
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
+                shard_map(
+                    |local: ArrayTracer| place_on(&local, &target),
+                    x,
+                    mesh.clone(),
+                    sharding.clone(),
+                    sharding.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            ArrayType::new_static(DataType::F32, [4]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32> {mhlo.memory_kind = "pinned_host", sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %2 = stablehlo.custom_call @annotate_device_placement(%arg1) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_place_operation_lower_executes_in_place_targets() {
+        // A compiled function moves its result to the memory of an in-place target on the devices and with the
+        // distribution of its input.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let compiled: CompiledFunction<ArrayType, ArrayType> =
+            compile(move |input| input.place(&pinned, None).unwrap(), input_type.clone(), &session, mesh.clone())
+                .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type.with_memory(pinned));
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.sharding(), &sharding);
+        for shard in output.shards() {
+            assert_eq!(shard.buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        }
+        assert_eq!(shard_values(&output), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(output.is_committed());
     }
 
     #[test]
@@ -765,6 +981,120 @@ mod tests {
     }
 
     #[test]
+    fn test_place_operation_eager_device_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let (first_mesh, second_mesh) = single_device_meshes(client);
+        let (first_device, second_device) = (first_mesh.devices()[0], second_mesh.devices()[0]);
+        let input = f32_vector(&session, &first_mesh, &[1., 2.]);
+        let traced = |target: PlacementRequest, input: &Array| -> TracedProgram<ArrayType, ArrayType> {
+            trace(move |input: ArrayTracer| place_on(&input, &target).unwrap(), input.r#type().into_owned()).unwrap()
+        };
+        let interpret = |traced: TracedProgram<ArrayType, ArrayType>, input: &Array| {
+            let Value::Array(output) =
+                traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
+            else {
+                panic!("placing an array must produce an array");
+            };
+            output
+        };
+
+        // A staged device target resolves against the array that it executes on, as a bare device destination of
+        // `Session::place` does. The device of the array keeps the array on its own mesh.
+        let target = PlacementRequest::Device { device: first_device, memory: Some(Memory::Device), layout: None };
+        let traced_program = traced(target, &input);
+        assert_eq!(
+            traced_program.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [target=device(0, memory=Device)] %0
+                in (%1)"
+            },
+        );
+        let output = interpret(traced_program, &input);
+        assert_eq!(output.mesh(), &first_mesh);
+        assert_eq!(output.sharding(), input.sharding());
+        assert_eq!(output.r#type().memory(), Memory::Device);
+        assert!(output.is_committed());
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
+
+        // Another device moves the array onto that device with its logical mesh and sharding, which is what the type
+        // of the staged result records, and in the memory that the target names.
+        let memory = Memory::Host { pinned: true };
+        let target = PlacementRequest::Device { device: second_device, memory: Some(memory), layout: None };
+        let output = interpret(traced(target, &input), &input);
+        assert_eq!(output.mesh(), &second_mesh);
+        assert_eq!(output.sharding(), input.sharding());
+        assert_eq!(output.r#type().memory(), memory);
+        assert_eq!(output.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        assert!(output.is_committed());
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
+
+        // That is how a direct placement of the array on the device places it, so both report the same mesh, sharding,
+        // and type, and so they do for an array with a pending reduction along `x`, which has size one and which the
+        // device completes.
+        let direct = session
+            .place(input.clone(), PlacementOptions::to(ArrayPlacement::device(second_device).with_memory(memory)))
+            .unwrap();
+        assert_eq!(
+            (output.mesh(), output.sharding(), output.r#type()),
+            (direct.mesh(), direct.sharding(), direct.r#type())
+        );
+        let unreduced = Array::from_host_buffer(
+            &session,
+            input
+                .r#type()
+                .into_owned()
+                .with_sharding(input.sharding().clone().with_unreduced_axes(["x"]).unwrap())
+                .unwrap(),
+            first_mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        let output = interpret(traced(PlacementRequest::from(second_device), &unreduced), &unreduced);
+        let direct = session.place(unreduced, PlacementOptions::to(second_device)).unwrap();
+        assert_eq!(
+            (output.mesh(), output.sharding(), output.r#type()),
+            (direct.mesh(), direct.sharding(), direct.r#type())
+        );
+        assert_eq!((output.mesh(), output.sharding()), (&second_mesh, input.sharding()));
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
+
+        // An array on more devices cannot keep its sharding on one device, so it is gathered onto the target device,
+        // replicated over the canonical mesh of one device. That is the type that the staged result records, so the
+        // replay of the staged program on such an array gathers it as a direct placement of the array does.
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharded = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap(),
+            mesh,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let traced_program = traced(PlacementRequest::from(second_device), &sharded);
+        assert_eq!(
+            traced_program.program().to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
+                let %1:f32[4][sharding={mesh<['device'=1:auto]>, [{}]}] = place [target=device(1)] %0
+                in (%1)"
+            },
+        );
+        let output = interpret(traced_program, &sharded);
+        let direct = session.place(sharded, PlacementOptions::to(second_device)).unwrap();
+        let gathered = Sharding::replicated(LogicalMesh::single_device(), 1);
+        assert_eq!((output.mesh().devices(), output.sharding()), ([second_device].as_slice(), &gathered));
+        assert_eq!(
+            (output.mesh(), output.sharding(), output.r#type(), output.is_committed()),
+            (direct.mesh(), direct.sharding(), direct.r#type(), direct.is_committed()),
+        );
+        assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
+    }
+
+    #[test]
     fn test_place_operation_eager_jvp() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -824,6 +1154,34 @@ mod tests {
     }
 
     #[test]
+    fn test_place_operation_eager_vjp_device_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let (source_mesh, target_mesh) = single_device_meshes(client);
+        let device = target_mesh.devices()[0];
+        let primal = f32_vector(&session, &source_mesh, &[1., 2., 3.]);
+
+        // The primal moves onto the device, and the source of the placement is where the primal concretely lives, so
+        // the pullback moves the cotangent back to the source mesh.
+        let target = PlacementRequest::from(device);
+        let (value, pullback) = differentiate_at(primal.clone()).vjp(|x| place_on(&x, &target)).unwrap();
+        assert_eq!(value.mesh().devices(), [device]);
+        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
+        let cotangent = Array::from_host_buffer(
+            &session,
+            value.r#type().into_owned(),
+            value.mesh().clone(),
+            None,
+            values_to_bytes(&[4f32, 5., 6.]),
+        )
+        .unwrap();
+        let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
+        assert_eq!(input_cotangent.mesh(), &source_mesh);
+        assert_eq!(input_cotangent.r#type(), primal.r#type());
+        assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
+    }
+
+    #[test]
     fn test_place_operation_eager_gradient() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -841,6 +1199,43 @@ mod tests {
         assert_eq!(gradient.mesh(), &source_mesh);
         assert_eq!(gradient.r#type(), primal.r#type());
         assert_eq!(shard_values(&gradient), vec![vec![1., 1., 1.]]);
+    }
+
+    #[test]
+    fn test_place_operation_eager_in_place_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let pinned = Memory::Host { pinned: true };
+        let primal = f32_vector(&session, &mesh, &[1., 2., 3.]);
+        let tangent = f32_vector(&session, &mesh, &[1., 0., -1.]);
+        let memory_kinds = |array: &Array| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // The primal and the tangent both move to the memory on the devices where they live.
+        let (value, tangent): (Array, Array) =
+            differentiate_at(primal.clone()).jvp(tangent, |x| x.place(&pinned, None)).unwrap();
+        for (output, values) in [(&value, vec![1., 2., 3.]), (&tangent, vec![1., 0., -1.])] {
+            assert_eq!(output.mesh(), &mesh);
+            assert_eq!(output.sharding(), primal.sharding());
+            assert_eq!(output.r#type().as_ref(), &primal.r#type().into_owned().with_memory(pinned));
+            assert_eq!(memory_kinds(output), vec!["pinned_host"; 2]);
+            assert_eq!(shard_values(output), vec![values.clone(), values]);
+        }
+
+        // The pullback returns the cotangent to the memory of the input, on the same devices.
+        let (value, pullback) = differentiate_at(primal.clone()).vjp(|x| x.place(&pinned, None)).unwrap();
+        assert_eq!(value.r#type().memory(), pinned);
+        let input_cotangent = pullback.apply_materialized(value).unwrap();
+        assert_eq!(input_cotangent.mesh(), &mesh);
+        assert_eq!(input_cotangent.r#type(), primal.r#type());
+        assert_eq!(memory_kinds(&input_cotangent), memory_kinds(&primal));
+        assert_eq!(shard_values(&input_cotangent), vec![vec![1., 2., 3.]; 2]);
     }
 
     #[test]
@@ -863,6 +1258,31 @@ mod tests {
         let output: Array =
             batch(|x| x.place(&target, None), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(output.mesh(), &target_mesh);
+        assert_eq!(output.r#type().shape(), ArrayType::new_static(DataType::F32, [2, 3]).shape());
+        assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4., 5., 6.]]);
+    }
+
+    #[test]
+    fn test_place_operation_eager_batch_device_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let (source_mesh, target_mesh) = single_device_meshes(client);
+        let device = target_mesh.devices()[0];
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            source_mesh,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+
+        // Batching passes the device target through unchanged, so the packed result moves onto the device.
+        let target = PlacementRequest::from(device);
+        let output: Array =
+            batch(|x| place_on(&x, &target), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        assert_eq!(output.mesh().devices(), [device]);
+        assert!(output.is_committed());
         assert_eq!(output.r#type().shape(), ArrayType::new_static(DataType::F32, [2, 3]).shape());
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4., 5., 6.]]);
     }

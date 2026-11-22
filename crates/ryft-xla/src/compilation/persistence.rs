@@ -1451,11 +1451,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, AnalyzableCompilationDomain, ArrayReference, ArrayType, AssertOperation, CompilationCacheDomain,
-        CompilationDomain, CompilationTracer, CompiledFunction, DataType, Dimension, DimensionBounds,
-        DimensionVariable, DiskCache, Error as CoreError, ExternalReferenceBinding, Memory, Placeholder,
-        PrintOperation, ProgramError, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceType, Shape, Sharding, ShardingDimension, Sin, StagedFunction, StatefulCompilationDomain, Typed,
-        ValueProjection,
+        CompilationDomain, CompilationTracer, CompiledFunction, DataType, Device, DeviceMesh, Dimension,
+        DimensionBounds, DimensionVariable, DiskCache, Error as CoreError, ExternalReferenceBinding, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Place, Placeholder, Placement, PrintOperation, ProgramError,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource, ReferenceType, Shape, Sharding,
+        ShardingDimension, Sin, StagedFunction, StatefulCompilationDomain, Typed, ValueProjection,
     };
     use ryft_pjrt::protos::CompilationOptions;
 
@@ -1760,6 +1760,48 @@ mod tests {
         assert_eq!(restored.committed_outputs(), &[false]);
         let output = session.execute(&restored, vec![Value::Array(input)]).unwrap().pop().unwrap();
         assert!(!program_array(&output).is_committed());
+    }
+
+    #[test]
+    fn test_compiled_program_serialize_round_trips_calls_of_functions_that_name_devices() {
+        // A caller of a function that places its value on the second device runs that call there and commits its
+        // result, as a direct execution of the function does, also after the program of the caller is serialized and
+        // deserialized on its own.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let second_mesh = DeviceMesh::new(logical_mesh.clone(), vec![second_device]).unwrap();
+        let placement = Placement::new(second_mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [3]);
+        let callee = crate::compile::<_, ArrayType, ArrayType>(
+            move |x| x.place(&placement, None).unwrap(),
+            vector_type.clone(),
+            &session,
+            second_mesh.clone(),
+        )
+        .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |x| callee.call(x).unwrap(),
+            vector_type.clone(),
+            Options::new(second_mesh),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+        let bytes = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        let restored = session.deserialize_program(&bytes).unwrap().unwrap();
+        assert_eq!(restored.committed_outputs(), &[true]);
+        let input =
+            Array::from_host_buffer(&session, vector_type, None, None, values_to_bytes(&[1f32, 2., 3.])).unwrap();
+        let output = session.execute(&restored, vec![Value::Array(input.clone())]).unwrap().pop().unwrap();
+        let output = program_array(&output);
+        let executed = callee.executable().execute(&session, input).unwrap();
+        assert_eq!(output.mesh().devices(), &[second_device]);
+        assert_eq!(output.mesh().devices(), executed.mesh().devices());
+        assert!(output.is_committed());
+        assert!(executed.is_committed());
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3.]);
     }
 
     #[test]

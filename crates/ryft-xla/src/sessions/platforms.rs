@@ -39,7 +39,9 @@ pub enum Platform {
     /// Apple GPUs through the Metal plugin, which requires the `metal` feature.
     Metal,
 
-    /// Apple GPUs through the MPS plugin, which requires the `mps` feature.
+    /// Apple GPUs through the MPS plugin, which requires the `mps` feature. The plugin has a single device and does
+    /// not support the Shardy dialect, so programs are compiled for it without sharding information and `shard_map`
+    /// regions are rejected.
     Mps,
 }
 

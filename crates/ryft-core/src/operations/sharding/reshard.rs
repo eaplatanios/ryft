@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, MeshAxisType, Sharding,
-    ShardingDimension,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, Layout, MeshAxisType,
+    Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
@@ -15,6 +15,7 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
+use crate::operations::sharding::place::validate_shard_layout;
 use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -222,7 +223,14 @@ impl Operation for ReshardOperation {
             })
             .map_err(|error| TypeError::invalid(error.to_string()))?;
 
-        Ok(vec![input.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
+        // A layout describes each shard, so the output keeps the layout of the input only while it still describes the
+        // shards of the output, and declares no layout otherwise, as for `place` (refer to `PlacementRequest`).
+        let output = input.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let describes_shards = output
+            .layout()
+            .is_none_or(|layout| validate_shard_layout(&output, layout, output.sharding(), false).is_ok());
+
+        Ok(vec![if describes_shards { output } else { output.with_layout(None::<Layout>) }])
     }
 
     #[inline]
@@ -508,7 +516,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape, ShardingError, UnreducedKind, f8e8m0fnu,
+        Shape, ShardingError, StridedLayout, TiledLayout, UnreducedKind, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -628,6 +636,40 @@ mod tests {
                     "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives for \
                      transitions over them",
                 ),
+            }],
+        );
+
+        // A layout describes each shard, so the output keeps the layout of the input only while it still describes the
+        // shards of the output. The byte strides `[8, 4]` of a dense `f32[4, 2]` column shard describe the shards of an
+        // `f32[4, 4]` value that stays split into columns, but they overlap the rows of the one `f32[4, 4]` shard of a
+        // replicated output, which therefore declares no layout, whereas a tiled layout describes every shard.
+        let strided = Layout::Strided(StridedLayout::new(vec![8, 4]));
+        let tiled = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let columns = Sharding::new(
+            explicit_mesh.clone(),
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(explicit_mesh, 2);
+        let matrix_type = ArrayType::new_static(DataType::F32, [4, 4]);
+        let split_input_type = matrix_type.clone().with_sharding(columns.clone()).unwrap();
+        let replicated_output_type = matrix_type.with_sharding(replicated.clone()).unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(replicated),
+            cases = [{
+                input_types = [split_input_type.clone().with_layout(strided.clone())],
+                output_types = [replicated_output_type.clone()],
+            }, {
+                input_types = [split_input_type.clone().with_layout(tiled.clone())],
+                output_types = [replicated_output_type.with_layout(tiled)],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(columns),
+            cases = [{
+                input_types = [split_input_type.clone().with_layout(strided.clone())],
+                output_types = [split_input_type.with_layout(strided)],
             }],
         );
 

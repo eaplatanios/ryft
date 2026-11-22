@@ -101,7 +101,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .remove(0)
         .copy_to_host(None)?
         .r#await()?
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(chunk);

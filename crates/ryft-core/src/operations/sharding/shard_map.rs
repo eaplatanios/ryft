@@ -938,6 +938,7 @@ impl ShardMapBoundary {
             input_type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         Ok(ArrayType::new(input_type.data_type(), input_type.shape().clone())
             .with_layout(input_type.layout().cloned())
+            .with_memory(input_type.memory())
             .with_sharding(carried_state.apply(sharding.clone().with_varying_manual_axes(varying_axes)?)?)?)
     }
 
@@ -9686,7 +9687,7 @@ mod tests {
     #[test]
     fn test_shard_map_boundary_global_output_type() {
         // Variation along the active manual axes is consumed by the output sharding, while variation along outer
-        // manual axes survives on the global output.
+        // manual axes survives on the global output, as do the layout and the memory kind of the local output.
         let mesh = manual_mesh_2x2();
         let boundary = ShardMapBoundary::new(
             mesh.clone(),
@@ -9705,6 +9706,7 @@ mod tests {
             boundary.global_output_type(0, &local_output_type),
             Ok(f32_type(&[8], None)
                 .with_layout(layout)
+                .with_memory(Memory::Host { pinned: true })
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
                         .unwrap()
@@ -20551,13 +20553,13 @@ mod tests {
             batched.to_string(),
             formatdoc! {"
                 lambda %0:dimension<2>, %1:f32[2][sharding={output_sharding}] .
-                let %2:f32[2][sharding={output_sharding}] = shard_map [
+                let %2:f32[2][sharding={output_sharding}]@Host[Pinned] = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{input_sharding}],
                     output_shardings=[{output_sharding}],
                     manual_axes=['x'],
                     global_input_types=[f32[2][sharding={input_sharding}]],
-                    global_output_types=[f32[2][sharding={output_sharding}]],
+                    global_output_types=[f32[2][sharding={output_sharding}]@Host[Pinned]],
                 ] %1 [
                     body={{
                         lambda %0:f32[2][sharding={input_sharding}] .

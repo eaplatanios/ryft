@@ -117,7 +117,7 @@ impl ExecutableSignature {
             types
                 .iter()
                 .map(|r#type| {
-                    if r#type.data_type().is_zero() && r#type.static_shape().is_some() {
+                    if !ExecutableSignature::materializes(r#type) {
                         None
                     } else {
                         let index = physical_index;
@@ -159,6 +159,14 @@ impl ExecutableSignature {
             unordered_io: false,
             requires_assertion_handler: false,
         }
+    }
+
+    /// Returns whether an executable boundary materializes an argument or result of type `array_type` as a physical
+    /// argument or result, which every type does except a statically shaped [`DataType::Zero`] type, whose values
+    /// carry no runtime payload.
+    #[inline]
+    pub(crate) fn materializes(array_type: &ArrayType) -> bool {
+        !array_type.data_type().is_zero() || array_type.static_shape().is_none()
     }
 
     /// Attaches the effect metadata known at compilation time, also used when restoring persistent executable metadata.

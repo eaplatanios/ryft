@@ -11,9 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added `Parameterized::try_map_parameters`, `Parameterized::try_map_named_parameters`,
-  `Parameterized::broadcast_to_parameter_structure`, and `Parameterized::node_paths` (i.e., the paths of all nodes of
-  a tree, which `Parameterized::from_broadcasted_named_parameters` now also takes for the prefix tree, so that it
-  matches the nodes of both trees by path, including the containers without leaves).
+  `Parameterized::broadcast_to_parameter_structure`, and the required `Parameterized::paths`, which returns the
+  paths of all nodes of a tree (i.e., its containers, including those without leaves, as well as its leaves, whose
+  paths `Parameterized::parameter_paths` returns). `Parameterized::broadcast_to_parameter_structure` uses these paths
+  to match the nodes of a tree prefix and of the target structure by path, including the containers without leaves.
+  It, `Parameterized::from_broadcasted_named_parameters`, and `Parameterized::from_named_parameters` reject distinct
+  nodes with the same path (e.g., the entries of two map keys with the same `Debug` text) with the new
+  `ParameterError::DuplicateParameterPaths`.
 - Added a backend-neutral, typed program representation (i.e., an intermediate representation or IR) in
   `ryft_core::programs`:
   - `Program`s are immutable graphs of `Instruction`s over typed `Atom`s, organized into sealed `Region`s that model
@@ -52,7 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Staging via `stage` and `Compile::stage`, followed by lowering, compilation, and execution through the
     `StagedFunction`, `LoweredFunction`, `CompiledFunction`, and `ExecutableFunction` lifecycle handles. Runtime
     captures are lifted into leading program inputs, and staged functions can be embedded as nested calls in enclosing
-    traces through `StagedCallOperation`s.
+    traces through `StagedCallOperation`s, on which `CompilationDomain::call_operation` lets a backend record the facts
+    about the boundary of the called function that only its options hold.
   - Retained JIT dispatch via `jit` and `Compile::jit`, which return `CompiledFunctionDispatcher`s that keep the
     compiled executables of their specializations in a bounded LRU cache.
   - A shared `CompilationCache` that deduplicates backend compilation, with caching in memory, optional persistent
@@ -106,11 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     Program Multiple Data (SPMD) computations and `auto_axes` and `explicit_axes` for switching the types of mesh
     axes within a function. `Place` moves a value to a `Placement`, possibly on the devices of another mesh, and values
     report where they concretely live via `Placed`, so that reverse mode differentiation moves cotangents back to where
-    their primals came from. `Place::place(targets, sources)` accepts `None` to infer every source, `Some(&sources)`
-    for a fully explicit source tree, or a borrowed tree of optional placements to infer individual leaves. A
-    `PlaceOperation` can also target a single device (i.e., a `PlaceTarget::Device`), which keeps the tracked sharding
-    of its input and which backends resolve against the value or the device mesh of a compiled program, so that a
-    value whose devices are not known while it is traced can still be placed on a device.
+    their primals came from.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
     are created via `composite` and support custom JVP, VJP, and batching rules. Composites can also be named (i.e.,

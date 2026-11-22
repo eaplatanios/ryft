@@ -19,6 +19,7 @@ use crate::lowering::types::lower_tensor_type;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::Program;
 use crate::operations::control_flow::lowered_effect_classes;
+use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{
     Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
 };
@@ -262,10 +263,15 @@ where
     for (index, &effect) in threaded_effects.iter().enumerate() {
         effect_tokens.set(effect, manual_computation.result(global_output_types.len() + index).unwrap().as_ref());
     }
+
+    // A body output in another memory than device memory (e.g., one that the body places in pinned host memory) gives
+    // the global output that memory, which the result of the manual computation does not record, so it is annotated
+    // after the manual computation as a transfer to that memory would be.
     manual_computation
         .results()
         .take(global_output_types.len())
-        .map(|result| result.map(|result| result.as_ref()).map_err(Error::from))
+        .zip(global_output_types)
+        .map(|(result, output_type)| annotate_output_memory(result?.as_ref(), output_type, block, context, location))
         .collect()
 }
 
@@ -387,17 +393,17 @@ pub(crate) mod tests {
         ConvertElementTypeOperation, Cos, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionValue, DomainTracer,
         DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClass, Error as CoreError, Exp, Fill,
-        Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NamedAxis, Operation as CoreOperation,
-        OperationPayloadProjection, ParallelAllGather, ParallelAllToAllOperation, ParallelArgExtrema,
-        ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermuteOperation, ParallelReduce,
-        ParallelReduceOperation, ParallelVary, ParallelVaryOperation, Placeholder, Program as CoreProgram,
-        ProgramBatchingOutputAxesPolicy, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProjectedValue,
-        Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReferenceWrite, Reshape,
-        ReshapeOperation, Shape, ShardMap, ShardMapOptions, ShardingError, Sin, Sort, SortDirection, StagingContext,
-        TracingScope, Type as CoreType, Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection,
-        WhileOperation, batch, composite, differentiable_dot_product_attention, differentiate_at, explicit_axes,
-        shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        Gather, GatherMode, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedAxis,
+        Operation as CoreOperation, OperationPayloadProjection, ParallelAllGather, ParallelAllToAllOperation,
+        ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermuteOperation,
+        ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation, Place, Placeholder,
+        Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramBuilder as CoreProgramBuilder,
+        ProjectedContext, ProjectedValue, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, ReferenceWrite, Reshape, ReshapeOperation, Shape, ShardMap, ShardMapOptions, ShardingError, Sin,
+        Sort, SortDirection, StagingContext, TracingScope, Type as CoreType, Typed, TypedProgram, UnreducedKind,
+        Value as CoreValue, ValueProjection, WhileOperation, batch, composite, differentiable_dot_product_attention,
+        differentiate_at, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput,
@@ -419,8 +425,9 @@ pub(crate) mod tests {
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, ExecutionArguments, FromPjrt, Options, Platform, Reference, Session,
-        TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
+        Array, ArrayConstant, ArrayShard, ArrayTracer, ExecutionArguments, FromPjrt, Options, Platform, Reference,
+        Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace,
+        trace_with_context,
     };
 
     use super::*;
@@ -5726,5 +5733,46 @@ pub(crate) mod tests {
         let (unplaced, replicated) = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(unplaced.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
         assert_eq!(replicated.copy_to_host().unwrap().elements::<u64>().unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_shard_map_compilation_returns_outputs_in_the_memory_of_their_body_on_cpu() {
+        // A body that places its output in pinned host memory gives the global output that memory, both in the output
+        // type of the compiled function and in the memory of the buffers that an execution returns, as the output of
+        // `jax.device_put(x, jax.memory.Space.Host)` inside the body of a JAX `shard_map` lives in pinned host memory.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let manual = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual_split = Sharding::new(manual.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(split).unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let function = crate::compile::<_, ArrayType, ArrayType>(
+            move |x| {
+                shard_map(
+                    |local: ProjectedValue<ArrayType, _>| local.place(&pinned, None),
+                    x,
+                    manual.clone(),
+                    manual_split.clone(),
+                    manual_split.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            vector_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(function.output_types(), &[vector_type.clone().with_memory(pinned)]);
+        let input =
+            Array::from_host_buffer(&session, vector_type, mesh, None, values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0]))
+                .unwrap();
+        let output = function.executable().execute(&session, input).unwrap();
+        assert_eq!(output.r#type().memory(), pinned);
+        let memory_kind = |shard: &ArrayShard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned();
+        assert_eq!(output.shards().iter().map(memory_kind).collect::<Vec<_>>(), vec!["pinned_host"; 2]);
+        assert_eq!(read_device_f32s(&output), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
     }
 }

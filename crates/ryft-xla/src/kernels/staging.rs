@@ -307,6 +307,13 @@ impl CoreOperation for KernelExtension {
         }
     }
 
+    fn requires_fresh_storage(&self) -> bool {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.requires_fresh_storage(),
+        }
+    }
+
     fn effects(&self) -> Cow<'_, Effects> {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -460,6 +467,10 @@ impl CoreOperation for KernelOperation {
 
     fn defers_reference_discharge(&self) -> bool {
         self.0.defers_reference_discharge()
+    }
+
+    fn requires_fresh_storage(&self) -> bool {
+        self.0.requires_fresh_storage()
     }
 
     fn effects(&self) -> Cow<'_, Effects> {

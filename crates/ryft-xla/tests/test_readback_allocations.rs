@@ -94,11 +94,13 @@ fn test_array_copy_to_host_bytes_payload_allocations() {
     let replicated = vec![ShardingDimension::replicated(), ShardingDimension::replicated()];
 
     // A tile can copy directly into the output when it covers whole rows or a partial slice followed by whole trailing
-    // dimensions. The column layout allocates one tile buffer per shard and a separate output buffer for the merge.
+    // dimensions, so those layouts allocate only the output buffer. Readback reads one replica of each distinct tile,
+    // and the column layout has two distinct tiles, each replicated along `y`, so it allocates one buffer for each of
+    // those two tiles and a separate output buffer for the merge.
     for (shape, dimensions, expected_allocations) in [
         (SHAPE.as_slice(), rows, (0, 1)),
         (subrow_shape.as_slice(), subrows, (0, 1)),
-        (SHAPE.as_slice(), columns, (devices.len(), 1)),
+        (SHAPE.as_slice(), columns, (2, 1)),
         (SHAPE.as_slice(), replicated, (0, 1)),
     ] {
         let sharding = Sharding::new(logical_mesh.clone(), dimensions).unwrap();

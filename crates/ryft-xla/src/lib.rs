@@ -35,9 +35,9 @@ pub mod types;
 pub mod values;
 
 pub use arrays::{
-    Array, ArrayError, ArrayPlacement, ArrayPlacementTarget, ArrayShard, ArrayShardStorage, ArrayStatistics,
-    HostOrArray, LiveArray, Placeable, PlaceableParameter, PlacementOptions, RetainedArray, ShardDescriptor,
-    ShardIndex, ShardLayout, block_until_ready, ready,
+    AliasingParameter, Array, ArrayError, ArrayPlacement, ArrayPlacementTarget, ArrayShard, ArrayShardStorage,
+    ArrayStatistics, HostOrArray, LiveArray, Placeable, PlaceableParameter, PlacementOptions, RetainedArray,
+    ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready,
 };
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
@@ -116,7 +116,7 @@ pub(crate) mod tests {
     use crate::compilation::options::resolve_shardy_debug_options;
     use crate::{Array, FromPjrt, Session};
 
-    #[cfg(feature = "cuda-13")]
+    #[cfg(any(feature = "cuda-13", feature = "mps"))]
     use crate::Platform;
 
     /// Returns a CPU client with `device_count` addressable devices, for tests that need a fixed device count or that
@@ -187,6 +187,12 @@ pub(crate) mod tests {
                 ..Default::default()
             })))
             .unwrap()
+    }
+
+    /// Returns the process-wide MPS client for tests that explicitly exercise the MPS plugin.
+    #[cfg(feature = "mps")]
+    pub(crate) fn mps_client() -> &'static Client<'static> {
+        Platform::Mps.client(None).unwrap()
     }
 
     /// Returns the execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`, which is a [`cpu_client`] with one
