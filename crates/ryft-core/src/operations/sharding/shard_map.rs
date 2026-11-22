@@ -1020,10 +1020,11 @@ impl ShardMapBoundary {
 
     /// Returns the global type of output `output_index` whose body produces `local_output_type`, which is the local
     /// shape scaled by the manual partition counts of the output sharding, under that sharding with the variation along
-    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. Its data type and layout are preserved,
-    /// and its boundary type uses device memory. The layout must therefore still address the global shape, so a layout
-    /// that does not (e.g., byte strides under which the tiles of the global array would overlap) is rejected with
-    /// the [`TypeError`] of [`ArrayType::validate_layout`].
+    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. Its data type, layout, and memory kind are
+    /// preserved, so that a body that places its output in another memory (e.g., pinned host memory) returns the global
+    /// output in that memory, as JAX's `shard_map` keeps the memory kind of the output of its body. The layout must
+    /// therefore still address the global shape, so a layout that does not (e.g., byte strides under which the tiles
+    /// of the global array would overlap) is rejected with the [`TypeError`] of [`ArrayType::validate_layout`].
     ///
     /// With manual variation checking enabled, the body output must vary along every active manual axis that the output
     /// sharding tiles and, when [`Self::checks_output_replication`] is enabled, along no other active manual axis. Its
@@ -1119,6 +1120,7 @@ impl ShardMapBoundary {
             Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
         )
         .with_layout(local_output_type.layout().cloned())
+        .with_memory(local_output_type.memory())
         .with_sharding(
             carried_state
                 .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?

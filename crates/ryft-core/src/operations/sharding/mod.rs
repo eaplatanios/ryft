@@ -121,7 +121,8 @@ pub use constrain_sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
 };
 pub use place::{
-    IntoPlaceTarget, PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, PlaceTarget, Placed, PlacementSources,
+    IntoPlacementRequest, PLACE_OPERATION_NAME, Place, PlaceDispatch, PlaceOperation, Placed, PlacementRequest,
+    PlacementRequestParameter, PlacementSources,
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{

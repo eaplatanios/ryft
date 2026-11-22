@@ -1,5 +1,9 @@
 use std::fmt::Display;
 
+use ryft_macros::Parameter;
+
+use crate::parameters::Parameter;
+
 /// Represents the memory space in which the values described by an [`ArrayType`](crate::arrays::ArrayType) reside.
 /// [`Memory`] represents the abstract *placement* information carried by staged types: it names the memory *tier* that
 /// holds the underlying data within its owning device's memory hierarchy. Host memories are not a placement target
@@ -27,7 +31,7 @@ use std::fmt::Display;
 /// meant for diagnostics and rendered types/programs; backends that need their own placement vocabulary (e.g., the
 /// XLA device placement annotation values or PJRT memory-kind names) own explicit conversions in their lowering
 /// code instead of relying on this rendering.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub enum Memory {
     /// Default device-resident memory (e.g., HBM on a GPU or a TPU).
     #[default]

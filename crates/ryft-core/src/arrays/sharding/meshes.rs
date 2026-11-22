@@ -171,6 +171,18 @@ impl LogicalMesh {
         }
     }
 
+    /// Returns the canonical [`LogicalMesh`] of a single device, which has one [`MeshAxisType::Auto`] axis
+    /// named `device` of size 1. A value that is gathered from several devices onto one device (e.g., by a
+    /// [`PlaceOperation`](crate::PlaceOperation) with a [`PlacementRequest::Device`](crate::PlacementRequest::Device)
+    /// target) lives on this mesh, replicated, so that the type that a staged placement infers for it and the
+    /// placement that a backend gives it when the placement executes agree.
+    #[inline]
+    pub fn single_device() -> Self {
+        // The only axis has a valid name and size, and a mesh with one axis has neither duplicate axis names
+        // nor a device count that overflows.
+        Self::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap()
+    }
+
     /// Returns this [`LogicalMesh`] with the axes named `axis_names` retyped as `r#type`, keeping the names, sizes, and
     /// order of all axes and the types of the other axes, so that the result has the same topology as this mesh (refer
     /// to [`Self::has_same_topology`]). This is the analogue of JAX's `AbstractMesh.update_axis_types`, which
@@ -565,6 +577,15 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&mesh_0.0, &mesh_1.0));
         assert!(!Arc::ptr_eq(&mesh_0.0, &mesh_2.0));
+    }
+
+    #[test]
+    fn test_logical_mesh_single_device() {
+        let mesh = LogicalMesh::single_device();
+        assert_eq!(mesh, LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap());
+        assert_eq!(mesh.device_count(), 1);
+        assert_eq!(mesh.to_string(), "['device'=1:auto]");
+        assert!(Arc::ptr_eq(&mesh.0, &LogicalMesh::single_device().0));
     }
 
     #[test]

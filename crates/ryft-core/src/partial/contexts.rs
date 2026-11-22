@@ -678,18 +678,21 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Under a context that does not allow copies to fold, work that must produce storage of its own on every
         // execution remains residual, so that it runs every time that the residual program runs. Folding a
         // region-carrying application whole would bypass the rules of the operations in its regions, so those are
-        // inspected too. Dormant rule regions do not run when this operation runs.
+        // inspected too. Dormant rule regions do not run when this operation runs. A context that allows copies to
+        // fold evaluates its known work once (e.g., the primal of linearization), so it makes each such copy once,
+        // and neither the operation nor its regions are inspected.
         let must_defer_copies = || {
-            !self.state.allow_copy_folding && operation.requires_fresh_storage()
-                || regions.regions().enumerate().any(|(index, region)| {
-                    operation.region_role(index) == Some(RegionRole::Computation)
-                        && region.computation_regions().any(|region| {
-                            region
-                                .instructions()
-                                .iter()
-                                .any(|instruction| instruction.operation().requires_fresh_storage())
-                        })
-                })
+            !self.state.allow_copy_folding
+                && (operation.requires_fresh_storage()
+                    || regions.regions().enumerate().any(|(index, region)| {
+                        operation.region_role(index) == Some(RegionRole::Computation)
+                            && region.computation_regions().any(|region| {
+                                region
+                                    .instructions()
+                                    .iter()
+                                    .any(|instruction| instruction.operation().requires_fresh_storage())
+                            })
+                    }))
         };
 
         // Deferred work always remains residual because folding it would discharge its transformation obligation.
@@ -2880,6 +2883,20 @@ mod tests {
                 in (%1)"
             },
         );
+
+        // Under the default setting, the same application folds whole, because a single evaluation of its known inputs
+        // makes the copy of its region once.
+        let known = PartialEvaluationValue::known(input.clone());
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let outputs = context
+            .fold_or_residualize(
+                LinearCallOperation::new(0),
+                vec![region(false), region(true)],
+                std::slice::from_ref(&known),
+            )
+            .unwrap();
+        assert_eq!(outputs[0].as_known(), Some(&input));
+        assert!(context.state.builder.borrow().instructions().is_empty());
     }
 
     #[test]
