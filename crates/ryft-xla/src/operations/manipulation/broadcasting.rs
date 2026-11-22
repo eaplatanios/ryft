@@ -349,15 +349,19 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::fmt::Display;
+    use std::ops::Range;
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, Broadcast, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds,
-        DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation,
-        Error as CoreError, Layout, LogicalMesh, MeshAxis, Placeholder, ProgramBuilder as CoreProgramBuilder,
-        ProgramError, Shape, ShardMapOptions, StridedLayout, Tile, TileDimension, TiledLayout, TypedProgram,
+        ADD_OPERATION_NAME, Add, Array as CoreArray, BatchAxis, Broadcast, ConvertElementType, DataType, Device,
+        DeviceMesh, DifferentiableType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
+        DimensionVariable, DynamicBroadcastOperation, Error as CoreError, Layout, LogicalMesh, Max, MeshAxis, Min,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions, StridedLayout, Tile,
+        TileDimension, TiledLayout, Typed, TypedProgram, UnreducedKind, batch, differentiate_at,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -369,8 +373,8 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, ExecutionArguments, FromPjrt, Session, Type, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, ExecutionArguments, FromPjrt,
+        Session, TracedProgram, Type, Value, compile, to_mlir_module_for_program, trace_with_context,
     };
 
     use super::*;
@@ -912,6 +916,320 @@ mod tests {
             let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(bytes.as_slice()), expected);
         }
+    }
+
+    #[test]
+    fn test_broadcast_operation_lower_batches_values_with_pending_reductions() {
+        // Every observable fact of an array, so that a batched result can be compared with the stacked results of the
+        // unbatched function applied to every batch item.
+        #[derive(Clone, Debug, PartialEq)]
+        struct Observed {
+            r#type: ArrayType,
+            shards: Vec<Vec<f32>>,
+            values: Vec<f32>,
+        }
+
+        // Applies the function under test to `x` and `u` in the reduction state `state`, through an operation that
+        // commutes with the reduction that completes the values of that state.
+        fn combine<V: Add + Max + Min>(state: &str, x: &V, u: &V) -> Result<V, ProgramError> {
+            match state {
+                "unreduced max" => Max::max(x, u),
+                "unreduced min" => Min::min(x, u),
+                _ => Add::add(x, u),
+            }
+        }
+
+        // Returns the first line of the message of `error`. The rest of an MLIR verification diagnostic prints the
+        // rejected operation, whose shapes differ between a batched function and the function of one batch item.
+        fn diagnostic(error: impl Display) -> String {
+            error.to_string().lines().next().unwrap_or_default().to_string()
+        }
+
+        // Batches `combine` over the leading axis of `x`, with `u` the same for every batch item.
+        macro_rules! batched_combine {
+            ($state:expr, $x:expr, $u:expr) => {
+                batch(
+                    |(x, u)| combine($state, &x, &u),
+                    ($x, $u),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .map_err(ProgramError::from)
+            };
+        }
+
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            pjrt_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let r#type = |state: &str, shape: &[usize]| {
+            let sharding = Sharding::replicated(logical_mesh.clone(), shape.len());
+            let sharding = match state {
+                "replicated" => sharding,
+                "reduced" => sharding.with_reduced_axes(["x"]).unwrap(),
+                "unreduced sum" => sharding.with_unreduced_axes(["x"]).unwrap(),
+                "unreduced max" => {
+                    sharding.with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(UnreducedKind::Max).unwrap()
+                }
+                "unreduced min" => {
+                    sharding.with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(UnreducedKind::Min).unwrap()
+                }
+                _ => unreachable!("unknown reduction state `{state}`"),
+            };
+            ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding).unwrap()
+        };
+        // Uploads an array of type `type` whose devices hold the slice `range` of their own contribution when it is
+        // unreduced, and of the first contribution otherwise.
+        let upload = |r#type: ArrayType, contributions: &[Vec<f32>; 2], range: Range<usize>| {
+            let is_unreduced = !r#type.unreduced_axes().is_empty();
+            let shape = r#type.static_shape().unwrap();
+            let dimensions = shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
+            let buffers = pjrt_devices
+                .iter()
+                .enumerate()
+                .map(|(index, device)| {
+                    let values = &contributions[if is_unreduced { index } else { 0 }][range.clone()];
+                    let bytes = values_to_bytes(values);
+                    client.buffer(bytes.as_slice(), BufferType::F32, &dimensions, None, device.clone(), None).unwrap()
+                })
+                .collect();
+            Array::from_addressable_buffers(&session, r#type, mesh.clone(), None, buffers).unwrap()
+        };
+        let observe = |array: &Array| Observed {
+            r#type: array.r#type().into_owned(),
+            shards: array
+                .shards()
+                .iter()
+                .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
+                .collect(),
+            values: array.copy_to_host().unwrap().elements::<f32>().unwrap(),
+        };
+        // Stacks observed batch items along a new leading batch dimension.
+        let stack = |items: &[Observed]| Observed {
+            r#type: items[0].r#type.batched(0, Dimension::Static(items.len()), ShardingDimension::Replicated).unwrap(),
+            shards: (0..items[0].shards.len())
+                .map(|device| items.iter().flat_map(|item| item.shards[device].clone()).collect())
+                .collect(),
+            values: items.iter().flat_map(|item| item.values.clone()).collect(),
+        };
+        let x_contributions = [
+            (1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+            (1..=16)
+                .map(|value| if value % 2 == 0 { -10. * value as f32 } else { 10. * value as f32 })
+                .collect(),
+        ];
+        let u_contributions = [vec![0.5, -1., 2., 8.], vec![4., 3., -2., -8.]];
+        let seed_contributions =
+            [vec![9., 10., 11., 12., 13., 14., 15., 16.], vec![-1., 2., -3., 4., -5., 6., -7., 8.]];
+
+        let mut disagreements = Vec::new();
+        let states = ["replicated", "reduced", "unreduced sum", "unreduced max", "unreduced min"];
+        let pairs = states
+            .iter()
+            .map(|state| (*state, *state))
+            .chain([("replicated", "unreduced sum"), ("unreduced sum", "replicated")]);
+        for (x_state, u_state) in pairs {
+            let cell = format!("mapped {x_state}, unmapped {u_state}");
+            let state = if x_state == "replicated" { u_state } else { x_state };
+            let x = upload(r#type(x_state, &[2, 4]), &x_contributions, 0..8);
+            let u = upload(r#type(u_state, &[4]), &u_contributions, 0..4);
+            let items = (0..4)
+                .map(|item| upload(r#type(x_state, &[4]), &x_contributions, 4 * item..4 * item + 4))
+                .collect::<Vec<_>>();
+            let outputs = items
+                .iter()
+                .map(|x| combine(state, x, &u).map(|output| observe(&output)).map_err(diagnostic))
+                .collect::<Result<Vec<_>, _>>();
+            let expected = outputs.as_ref().map(|outputs| stack(&outputs[..2])).map_err(Clone::clone);
+
+            // The function of one batch item rejects a mix of reduction states, and XLA rejects the comparison that
+            // the lowering of an extremum of unreduced values uses, unbatched as well as batched.
+            let expected_rejection = match (x_state, u_state) {
+                ("replicated", "unreduced sum") | ("unreduced sum", "replicated") => {
+                    Some(format!("`{ADD_OPERATION_NAME}` inputs must be unreduced over the same axes"))
+                }
+                (_, "unreduced max" | "unreduced min") => Some(
+                    "<unknown>:0: error: loc(\"compare.8\"): 'stablehlo.compare' op dropped unreduced axis 'x' without \
+                     a blessed operation (e.g., sdy.reshard). This is an invalid transition from unreduced to reduced."
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            if expected.as_ref().err() != expected_rejection.as_ref() {
+                disagreements.push(format!("{cell}, expected: {expected:?} does not report {expected_rejection:?}"));
+            }
+
+            // Eager batching, and batching nested in batching.
+            let eager: Result<Array, _> = batched_combine!(state, x.clone(), u.clone());
+            let eager = eager.map(|output| observe(&output)).map_err(diagnostic);
+            if eager != expected {
+                disagreements.push(format!("{cell}, eager: {eager:?} != {expected:?}"));
+            }
+            let nested_x = upload(r#type(x_state, &[2, 2, 4]), &x_contributions, 0..16);
+            let nested: Result<Array, _> = batch(
+                |(x, u)| batched_combine!(state, x, u),
+                (nested_x, u.clone()),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
+                None,
+            );
+            let nested = nested.map(|output| observe(&output)).map_err(diagnostic);
+            let expected_nested = outputs
+                .as_ref()
+                .map(|outputs| stack(&[stack(&outputs[..2]), stack(&outputs[2..])]))
+                .map_err(Clone::clone);
+            if nested != expected_nested {
+                disagreements.push(format!("{cell}, nested: {nested:?} != {expected_nested:?}"));
+            }
+
+            // The replay of the staged batched function.
+            let input_types = (x.r#type().into_owned(), u.r#type().into_owned());
+            let traced: Result<TracedProgram<(ArrayType, ArrayType), ArrayType>, _> =
+                trace_with_context(|_, (x, u): (ArrayTracer, ArrayTracer)| batched_combine!(state, x, u), input_types);
+            let staged = traced.map_err(diagnostic).and_then(|traced| {
+                let inputs = (Value::Array(x.clone()), Value::Array(u.clone()));
+                match traced.program().interpret_in_context(&session, inputs) {
+                    Ok(Value::Array(output)) => Ok(observe(&output)),
+                    Ok(_) => Err("a batched function of arrays must produce an array".to_string()),
+                    Err(error) => Err(diagnostic(error)),
+                }
+            });
+            if staged != expected {
+                disagreements.push(format!("{cell}, staged: {staged:?} != {expected:?}"));
+            }
+
+            // A compiled batched function.
+            let error = RefCell::new(None::<String>);
+            let compiled: Result<CompiledFunction<(ArrayType, ArrayType), ArrayType>, _> = compile(
+                |(x, u): (CompileTracer, CompileTracer)| {
+                    batched_combine!(state, x.clone(), u).unwrap_or_else(|message| {
+                        error.replace(Some(diagnostic(message)));
+                        x
+                    })
+                },
+                (x.r#type().into_owned(), u.r#type().into_owned()),
+                &session,
+                mesh.clone(),
+            );
+            let compiled = match error.take() {
+                Some(message) => Err(message),
+                None => compiled.map_err(diagnostic),
+            };
+            let compiled = compiled.and_then(|compiled| {
+                let output = compiled.executable().execute(&session, (x.clone(), u.clone()));
+                output.map(|output| observe(&output)).map_err(diagnostic)
+            });
+            if compiled != expected {
+                disagreements.push(format!("{cell}, compiled: {compiled:?} != {expected:?}"));
+            }
+
+            // Forward mode differentiation of the batched function, with the inputs as their own tangents.
+            let jvp = differentiate_at((x.clone(), u.clone()))
+                .jvp((x.clone(), u.clone()), |(x, u)| batched_combine!(state, x, u))
+                .map(|(primal, tangent): (Array, Array)| (observe(&primal), observe(&tangent)))
+                .map_err(diagnostic);
+            let expected_jvp = items[..2]
+                .iter()
+                .map(|x| {
+                    differentiate_at((x.clone(), u.clone()))
+                        .jvp((x.clone(), u.clone()), |(x, u)| combine(state, &x, &u))
+                        .map(|(primal, tangent): (Array, Array)| (observe(&primal), observe(&tangent)))
+                        .map_err(diagnostic)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| {
+                    let (primals, tangents) = items.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+                    (stack(&primals), stack(&tangents))
+                });
+            if jvp != expected_jvp {
+                disagreements.push(format!("{cell}, jvp: {jvp:?} != {expected_jvp:?}"));
+            }
+
+            // Reverse mode needs a seed of the cotangent type of an output.
+            let Ok(outputs) = &outputs else { continue };
+            let seed_type = match outputs[0].r#type.cotangent() {
+                Ok(seed_type) => seed_type,
+                Err(error) => {
+                    disagreements.push(format!("{cell}, seed: {error}"));
+                    continue;
+                }
+            };
+            let vjp = |x: Array, seed: Array| {
+                let (output, pullback) =
+                    differentiate_at((x, u.clone())).vjp(|(x, u)| combine(state, &x, &u)).map_err(diagnostic)?;
+                let (x_cotangent, u_cotangent): (Array, Array) =
+                    pullback.apply_materialized(seed).map_err(diagnostic)?;
+                Ok::<_, String>((observe(&output), observe(&x_cotangent), observe(&u_cotangent)))
+            };
+
+            // Batched reverse mode differentiation, with a seed that is the same for every batch item.
+            let seed = upload(seed_type.clone(), &seed_contributions, 0..4);
+            let batched_vjp: Result<(Array, Array, Array), _> = batch(
+                |(x, u, seed)| {
+                    let (output, pullback) = differentiate_at((x, u)).vjp(|(x, u)| combine(state, &x, &u))?;
+                    let (x_cotangent, u_cotangent) = pullback.apply_materialized(seed)?;
+                    Ok((output, x_cotangent, u_cotangent))
+                },
+                (x.clone(), u.clone(), seed.clone()),
+                (BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()),
+                (BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            );
+            let batched_vjp = batched_vjp
+                .map(|(output, x_cotangent, u_cotangent)| {
+                    (observe(&output), observe(&x_cotangent), observe(&u_cotangent))
+                })
+                .map_err(diagnostic);
+            let expected_batched_vjp =
+                items[..2].iter().map(|x| vjp(x.clone(), seed.clone())).collect::<Result<Vec<_>, _>>().map(|items| {
+                    let outputs = items.iter().map(|item| item.0.clone()).collect::<Vec<_>>();
+                    let x_cotangents = items.iter().map(|item| item.1.clone()).collect::<Vec<_>>();
+                    let u_cotangents = items.iter().map(|item| item.2.clone()).collect::<Vec<_>>();
+                    (stack(&outputs), stack(&x_cotangents), stack(&u_cotangents))
+                });
+            if batched_vjp != expected_batched_vjp {
+                disagreements.push(format!("{cell}, batched vjp: {batched_vjp:?} != {expected_batched_vjp:?}"));
+            }
+
+            // Reverse mode differentiation of the batched function, with a seed that differs per batch item. The
+            // cotangent of the unmapped input is the sum of the cotangents of every batch item.
+            let packed_seed_type = seed_type.batched(0, Dimension::Static(2), ShardingDimension::Replicated).unwrap();
+            let packed_seed = upload(packed_seed_type, &seed_contributions, 0..8);
+            let vjp_of_batched = differentiate_at((x.clone(), u.clone()))
+                .vjp(|(x, u)| batched_combine!(state, x, u))
+                .map_err(diagnostic)
+                .and_then(|(output, pullback)| {
+                    let (x_cotangent, u_cotangent): (Array, Array) =
+                        pullback.apply_materialized(packed_seed.clone()).map_err(diagnostic)?;
+                    let u_cotangent = observe(&u_cotangent);
+                    Ok((observe(&output), observe(&x_cotangent), (u_cotangent.r#type, u_cotangent.values)))
+                });
+            let expected_vjp_of_batched = (0..2)
+                .map(|item| {
+                    vjp(items[item].clone(), upload(seed_type.clone(), &seed_contributions, 4 * item..4 * item + 4))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| {
+                    let outputs = items.iter().map(|item| item.0.clone()).collect::<Vec<_>>();
+                    let x_cotangents = items.iter().map(|item| item.1.clone()).collect::<Vec<_>>();
+                    let u_cotangent =
+                        items.iter().map(|item| item.2.values.as_slice()).fold(vec![0.; 4], |sum, values| {
+                            sum.iter().zip(values).map(|(sum, value)| sum + value).collect()
+                        });
+                    (stack(&outputs), stack(&x_cotangents), (items[0].2.r#type.clone(), u_cotangent))
+                });
+            if vjp_of_batched != expected_vjp_of_batched {
+                disagreements
+                    .push(format!("{cell}, vjp of batched: {vjp_of_batched:?} != {expected_vjp_of_batched:?}"));
+            }
+        }
+        assert_eq!(disagreements, Vec::<String>::new());
     }
 
     #[test]

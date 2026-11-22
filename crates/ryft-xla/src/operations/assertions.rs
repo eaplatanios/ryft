@@ -2304,6 +2304,7 @@ mod tests {
             Some("cpu"),
             true,
             &[],
+            &[],
             RaggedDotLoweringStrategy::default(),
             &[],
         )

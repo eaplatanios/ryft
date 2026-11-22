@@ -14,18 +14,18 @@ use ryft_core::{
     CaptureConstant, CastOperation, CompositeKey, Concretizable, ConstrainShardingOperation, Context,
     CotangentAccumulator, CotangentDestinations, DeviceMesh, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, Operation as CoreOperation,
-    OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance, Parameterized, PartialEvaluationContext,
-    PlaceOperation, Placement,
-    PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PartitionedProgram, Program as CoreProgram, ProgramBatchingOutputAxesPolicy,
-    ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
-    RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
-    ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension,
-    StagedCallOperation, TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
-    Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection, Zero,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero,
+    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance,
+    ParallelReduceOperation, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram, PlaceOperation, Placement,
+    Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramError, ReductionKind, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
+    RematerializationOptimizationBarrier, ReshardOperation, ResidualDemandSplit, ResidualInputSource,
+    ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension, StagedCallOperation, TangentActivity,
+    Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
+    UnreducedKind, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -33,6 +33,7 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
+use crate::execution::validate_committed_input_devices;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::lower_array_ir_type;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, collect_session_constants, entry_boundary_sharding};
@@ -414,13 +415,17 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     (refer to `collect_nested_sharding_mesh`). Compiling a caller for other devices than those of a call that names
 ///     devices, or for the replicas of a bounded dynamic program while an override splits a value, fails with an exact
 ///     error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible device assignment.
-///   - Eager dispatch and eager interpretation move the inputs onto the devices of a call that names devices, whether
-///     or not they are committed elsewhere, as an execution moves its arguments, and place the inputs and the results
-///     that have overrides as these request. Eager dispatch places every other input as the executable of the callee
+///   - Eager dispatch and eager interpretation require committed public arguments to be on the physical devices of
+///     a call that names devices. They move captures and uncommitted arguments to those devices and apply the input
+///     and output sharding overrides. Eager dispatch places every other input as the executable of the callee
 ///     does, which is as the callee input type records for a function compiled for its input types, and as the input
 ///     is for a call of a `jit` dispatcher, whose executables are specialized for the placements of their inputs.
-///   - The type rule of the call accepts every input that the executable accepts (i.e., one whose type refines the
-///     callee input type up to its sharding), so every context that binds a call accepts the same inputs.
+///   - The type rule of the call accepts every input whose type refines the callee input type up to the placement that
+///     its sharding describes, so every context that binds a call accepts the same inputs (refer to
+///     `validate_call_input_types`). It rejects an input whose unreduced or reduced axes differ from those of the
+///     callee input type, which an execution would reshard where it can, because a call does not reshard its inputs.
+///     An input of a `shard_map` body may vary along manual mesh axes that the callee input type does not declare,
+///     and every output of the call then varies along them too.
 ///   - A call commits its results when it names devices, runs on multiple devices, or has a committed public input.
 ///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with the
 ///     device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
@@ -728,25 +733,70 @@ impl<T: CoreType> JitCallOperation<T> {
 
 impl JitCallOperation<Type> {
     /// Prepares the inputs of an eager call, including calls replayed by a region interpreter. An explicit boundary
-    /// places all inputs on its mesh. Otherwise the public arguments select the devices and the lifted captures
-    /// follow them, as closed-over constants do in JAX.
+    /// checks the devices of committed public arguments before placing inputs. Otherwise the public arguments
+    /// select the devices and the lifted captures follow them, as closed-over constants do in JAX.
     ///
     /// # Errors
     ///
     /// Returns the error from selecting the mesh or placing an argument or capture on it.
-    pub(crate) fn eager_inputs<'o>(&self, session: &Session, inputs: &'o [Value]) -> Result<Cow<'o, [Value]>, Error> {
-        if self.mesh.is_some() {
-            return inputs
+    pub(crate) fn eager_inputs<'o>(
+        &self,
+        session: &Session,
+        inputs: &'o [Value],
+        declared: &[Type],
+    ) -> Result<Cow<'o, [Value]>, Error> {
+        if let Some(mesh) = &self.mesh {
+            for (index, input) in inputs.iter().skip(self.capture_count).enumerate() {
+                if let Value::Array(array) = input {
+                    validate_committed_input_devices(array, index, mesh)?;
+                }
+            }
+            // Check the values' types before an override changes their sharding, including any reduction state.
+            let types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            validate_call_input_types(JIT_CALL_OPERATION_NAME, declared, &types)?;
+            let placed = inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| match input {
-                    Value::Array(array) => self.boundary_input(session, index, array.clone()).map(Value::Array),
+                    Value::Array(array) => {
+                        self.boundary_input(session, mesh, index, array.clone(), &declared[index]).map(Value::Array)
+                    }
                     _ => Ok(input.clone()),
                 })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Cow::Owned);
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Cow::Owned(placed));
         }
-        self.capture_inputs(session, inputs)
+
+        let mut prepared = self.capture_inputs(session, inputs)?;
+        for (index, declared) in declared.iter().enumerate().skip(self.capture_count) {
+            let Some(Value::Array(array)) = prepared.get(index) else { continue };
+            if let Some(sharding) = self.declared_input_sharding(index, &array.r#type(), declared) {
+                let mesh = DeviceMesh::new(sharding.mesh().clone(), array.mesh().devices().to_vec())?;
+                let placed = array.clone().reshard_on_devices(session, &mesh, sharding, false)?;
+                prepared.to_mut()[index] = Value::Array(placed);
+            }
+        }
+        Ok(prepared)
+    }
+
+    /// Returns the sharding declared for a public input when the actual type refines it except for placement and
+    /// both carry the same manual variation. Explicit overrides take precedence, and dispatchers specialize on the
+    /// supplied input placements.
+    fn declared_input_sharding<'d>(
+        &self,
+        index: usize,
+        actual: &ArrayType,
+        declared: &'d Type,
+    ) -> Option<&'d Sharding> {
+        if index < self.capture_count || self.keeps_input_placements || self.input_sharding(index).is_some() {
+            return None;
+        }
+        let Type::Array(declared) = declared else { return None };
+        let sharding = declared.sharding()?;
+        if actual.sharding() == Some(sharding) {
+            return None;
+        }
+        call_input_variation(declared, actual).is_some_and(|axes| axes.is_empty()).then_some(sharding)
     }
 
     /// Returns whether the caller chose the result devices locally. An explicit call boundary names devices for
@@ -759,20 +809,26 @@ impl JitCallOperation<Type> {
         self.mesh.is_none() && Array::operands_are_locally_assigned(session, operands, &[])
     }
 
-    /// Returns `array`, the input `index` of this call that `session` executes eagerly, moved and placed as an execution
-    /// of the callee moves and places that argument. A call with a boundary moves the input onto the devices of its
-    /// mesh, placed as the override of that input requests or otherwise as it is placed (i.e., replicated when its
-    /// sharding is over another topology), whether or not it is committed, and keeps its commitment. A call without a
-    /// boundary leaves every input where it is.
+    /// Places an input on the boundary's devices after all committed public arguments have passed the device check.
+    /// An explicit override selects the sharding first, followed by a sharding required by the declared input type.
+    /// Otherwise the array keeps its sharding when the mesh topologies agree and is replicated when they differ.
+    /// The input keeps its commitment.
     ///
     /// # Errors
     ///
     /// Returns the error of moving the input (e.g., for an input of another client).
-    fn boundary_input(&self, session: &Session, index: usize, array: Array) -> Result<Array, Error> {
-        let Some(mesh) = &self.mesh else {
-            return Ok(array);
-        };
-        let sharding = match self.input_sharding(index) {
+    fn boundary_input(
+        &self,
+        session: &Session,
+        mesh: &DeviceMesh,
+        index: usize,
+        array: Array,
+        declared: &Type,
+    ) -> Result<Array, Error> {
+        let sharding = match self
+            .input_sharding(index)
+            .or_else(|| self.declared_input_sharding(index, &array.r#type(), declared))
+        {
             Some(sharding) => sharding.clone(),
             None if array.sharding().mesh().has_same_topology(mesh.logical_mesh()) => array.sharding().clone(),
             None => Sharding::replicated(mesh.logical_mesh().clone(), array.r#type().shape().rank()),
@@ -936,9 +992,10 @@ impl<T: ArrayMemberType + From<ArrayType>> CoreOperation for JitCallOperation<T>
         // callee input type does not have establishes no such fact, except that the outputs vary along the manual
         // mesh axes along which the inputs vary beyond the callee input types.
         let output_types = match T::Refinements::new(callee_interface.input_types(), input_types) {
-            Ok(refinements) => {
-                output_types.iter().map(|r#type| refinements.refine_declared(r#type, &[])).collect::<Result<_, _>>()?
-            }
+            Ok(refinements) => output_types
+                .iter()
+                .map(|r#type| refinements.refine_declared(r#type, &[]))
+                .collect::<Result<_, _>>()?,
             Err(_) => output_types,
         };
         match variation {
@@ -1843,6 +1900,7 @@ pub fn transpose_primal_jit_call<
             match cotangent {
                 Some(MaybeZero::Value(cotangent)) if !input.r#type().is_reference() => {
                     let refined = input.r#type().cotangent().map_err(ProgramError::from)?;
+                    let cotangent = summed_input_cotangent(context, &refined, cotangent)?;
                     return Ok(MaybeZero::Value(refined_derived_value(context, operation.mesh(), refined, cotangent)?));
                 }
                 Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
@@ -1906,7 +1964,10 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
         let invalid_argument = |error: Error| ProgramError::InvalidArgument { message: error.to_string() };
         let locally_assigned = self.results_are_locally_assigned(context, inputs);
-        let inputs = self.eager_inputs(context, inputs).map_err(invalid_argument)?.into_owned();
+        let inputs = self
+            .eager_inputs(context, inputs, callee.interface().input_types())
+            .map_err(invalid_argument)?
+            .into_owned();
         let commits_outputs = self.mesh.is_some()
             || inputs.iter().any(|input| matches!(input, Value::Array(array) if array.is_committed()));
         driver
@@ -1931,8 +1992,8 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
 // results of the call, rather than as annotations of the callee, because the callee may be inlined or shared with
 // calls that carry other overrides. Each constraint is the sharding with which the function annotates its own
 // boundary (refer to `entry_boundary_sharding`), and it is closed over auto mesh axes, so that a replicated override
-// stops the compiler from splitting the value, like the replicated result of an execution. A call without overrides
-// lowers to the call alone.
+// stops the compiler from splitting the value, like the replicated result of an execution. An input sharding from
+// the callee's declared type constrains only the placement tracked by that type.
 impl LowerableOperation for JitCallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -1946,9 +2007,20 @@ impl LowerableOperation for JitCallOperation<Type> {
             .iter()
             .zip(input_types)
             .enumerate()
-            .map(|(index, (value, r#type))| match self.input_sharding(index) {
-                Some(sharding) => lower_boundary_constraint(lowerer, *value, r#type, sharding),
-                None => Ok(*value),
+            .map(|(index, (&value, ty))| {
+                if let Some(sharding) = self.input_sharding(index) {
+                    return lower_boundary_constraint(lowerer, value, ty, sharding);
+                }
+                if let Type::Array(actual) = ty
+                    && let declared = &lowerer.regions()[0].entry_region_ref().interface().input_types()[index]
+                    && let Some(sharding) = self.declared_input_sharding(index, actual, declared)
+                {
+                    let types = std::slice::from_ref(actual);
+                    return Ok(ReshardOperation::new(sharding.clone())
+                        .lower(lowerer, &[value], types, types)?
+                        .remove(0));
+                }
+                Ok(value)
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
@@ -1960,7 +2032,10 @@ impl LowerableOperation for JitCallOperation<Type> {
             // An operand whose type refines the callee input type (e.g., with a static extent for a bounded dynamic
             // one) enters the callee at the type of the callee input, and a result leaves it at the refined type of
             // the call (refer to `validate_call_input_types`). Neither conversion checks anything, because the call
-            // has accepted its operands and the callee computes its results from them.
+            // has accepted its operands and the callee computes its results from them. Only shapes are converted. A
+            // difference in sharding alone (i.e., in placement, or in manual variation that a call in a `shard_map`
+            // body passes on to its results) lowers to nothing, because the call accepts only operands whose values
+            // the callee input types describe.
             let callee_input_types = callee.input_types();
             let input_values = input_values
                 .iter()
@@ -2637,6 +2712,40 @@ where
     Ok(context.bind(cast, Vec::new(), &[value])?.remove(0))
 }
 
+/// Returns `cotangent`, the cotangent that the transposition of a call returns for an input whose cotangent type is
+/// `refined`, summed over the manual mesh axes along which it varies beyond `refined`. A call whose inputs vary along
+/// manual mesh axes beyond the callee input types runs its callee as if every input varied along all of them (refer
+/// to `CallVariation`), as a JAX `jit` function is retraced with `pvary` inserted on the inputs that vary along fewer
+/// axes. Each shard along such an axis then holds one contribution to the cotangent of such an input, and their sum
+/// is its cotangent, which a mesh-form `parallel_reduce` computes as the transposition of `parallel_vary` does. Every
+/// other cotangent, including every cotangent of a call without that variation, is returned unchanged.
+fn summed_input_cotangent<C, V>(context: &C, refined: &Type, cotangent: C::Value) -> Result<C::Value, ProgramError>
+where
+    C: Context<Type = Type, Operation = Operation<V>>,
+    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+{
+    let (mesh, axes) = match (refined, cotangent.r#type().as_ref()) {
+        (Type::Array(refined), Type::Array(actual)) if let Some(sharding) = actual.sharding() => {
+            let declared = refined.sharding().map(Sharding::varying_manual_axes);
+            let axes = sharding
+                .varying_manual_axes()
+                .iter()
+                .filter(|axis| !declared.is_some_and(|declared| declared.contains(*axis)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if axes.is_empty() {
+                return Ok(cotangent);
+            }
+            (sharding.mesh().clone(), axes)
+        }
+        _ => return Ok(cotangent),
+    };
+    axes.into_iter().try_fold(cotangent, |cotangent, axis| {
+        let reduction = ParallelReduceOperation::new(ReductionKind::Sum, axis).with_mesh(mesh.clone());
+        Ok(context.bind(reduction, Vec::new(), &[cotangent])?.remove(0))
+    })
+}
+
 /// Returns `sharding`, the boundary sharding of a value that batching maps along `axis`, with a replicated batch
 /// dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding or when
 /// the batch dimension cannot be inserted.
@@ -2655,7 +2764,9 @@ fn batched_boundary_sharding(sharding: Option<&Sharding>, axis: &BatchAxis) -> O
 
 /// Manual mesh axes along which inputs of a call vary beyond what the callee input types declare (e.g., a value of a
 /// `shard_map` body that varies along the manual axes of the map, passed to a function compiled for a plain type),
-/// along which every output of the call then varies too (refer to `validate_call_input_types`).
+/// along which every output of the call then varies too (refer to `validate_call_input_types`). The callee runs as if
+/// every input varied along all of them, so the transposition of the call sums the cotangent of an input that varies
+/// along fewer of them over the others (refer to `summed_input_cotangent`).
 struct CallVariation {
     /// Logical mesh of the manual axes, which is the mesh of the sharding of the varying inputs.
     mesh: LogicalMesh,
@@ -2699,14 +2810,14 @@ impl CallVariation {
 }
 
 /// Returns the manual mesh axes along which an input of type `actual` varies beyond `declared`, the type of the callee
-/// input that receives it, when a call accepts that input, or [`None`] when it rejects it. A call accepts an input
-/// that an execution of its callee would accept (refer to `validate_input_type`), except that it never changes what a
-/// sharding states about the values (i.e., its unreduced and reduced axes, with the kind of reduction, and its manual
-/// variation), because a call, unlike an execution, does not reshard its inputs. A declared type without a sharding
-/// describes a value that is fully reduced and invariant along manual mesh axes. The placement of the input may
-/// differ from the declared one, because it does not change the values. A call that is staged inside a `shard_map` body
-/// may pass a value that varies along manual mesh axes where the callee declares none, as a JAX `jit` function called
-/// on such a value is retraced at its varying type, and the outputs of that call then vary along those axes too.
+/// input that receives it, when a call accepts that input, or [`None`] when it rejects it. The type of the input must
+/// refine the declared type up to the placement that their shardings describe, which a call may change because it
+/// does not change the values. What a sharding states about the values must agree, because a call, unlike an
+/// execution (refer to `validate_input_type`), does not reshard its inputs. These are the unreduced and reduced axes,
+/// with the kind of reduction, where a declared type without a sharding describes a fully reduced value. The input may
+/// vary along more manual mesh axes than the declared type, which a value of a `shard_map` body does where the callee
+/// declares none, as a JAX `jit` function called on such a value is retraced at its varying type, and the outputs of
+/// the call then vary along those axes too (refer to `CallVariation`).
 fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTreeSet<String>> {
     fn components(
         sharding: Option<&Sharding>,
@@ -2742,8 +2853,7 @@ fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTre
 /// manual mesh axes along which the inputs vary beyond the callee input types, if any, along which the outputs of the
 /// call vary too. This is the only owner of that rule, so that every context that binds a call (e.g., eager dispatch,
 /// staging, and the transforms of a call) accepts the same inputs and infers the same outputs. An execution of the
-/// callee accepts more (refer to `validate_input_type`), because it reshards its arguments, but a call accepts every
-/// input whose values an execution would not change.
+/// callee accepts a reduced argument as well (refer to `validate_input_type`), because it reshards its arguments.
 fn validate_call_input_types<T: ArrayMemberType>(
     operation_name: &'static str,
     expected_types: &[T],

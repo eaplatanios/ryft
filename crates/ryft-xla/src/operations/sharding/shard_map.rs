@@ -426,8 +426,8 @@ pub(crate) mod tests {
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayShard, ArrayTracer, ExecutionArguments, FromPjrt, Options, PlacementOptions,
-        Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace,
-        trace_with_context,
+        Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program,
+        trace, trace_with_context,
     };
 
     use super::*;
@@ -5761,8 +5761,7 @@ pub(crate) mod tests {
         };
         let upload = |shape: &[usize], sharding: &Sharding, memory: Memory, values: &[f32]| {
             let r#type = ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding.clone()).unwrap();
-            let array =
-                Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(values)).unwrap();
+            let array = Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(values)).unwrap();
             match memory {
                 Memory::Device => array,
                 memory => session.place(array, PlacementOptions::to(memory)).unwrap(),
@@ -5771,7 +5770,12 @@ pub(crate) mod tests {
         let rows = [
             ("identity body on a pinned host input", Body::Identity, pinned, pinned),
             ("body that places a device input in pinned host memory", Body::Place(pinned), Memory::Device, pinned),
-            ("body that places a pinned host input in device memory", Body::Place(Memory::Device), pinned, Memory::Device),
+            (
+                "body that places a pinned host input in device memory",
+                Body::Place(Memory::Device),
+                pinned,
+                Memory::Device,
+            ),
         ];
         let mut outcomes = Vec::new();
         let mut expected_outcomes = Vec::new();
@@ -5802,8 +5806,12 @@ pub(crate) mod tests {
             assert_eq!(function.output_types(), &[output_type(output_memory)], "{name}");
             let output = function.executable().execute(&session, input.clone()).unwrap();
             assert_eq!(read_device_f32s(&output), vec![vec![1.0, 2.0], vec![3.0, 4.0]], "{name}");
-            let (primal, tangent) =
-                function.jvp(&session).unwrap().executable().execute(&session, (input.clone(), input.clone())).unwrap();
+            let (primal, tangent) = function
+                .jvp(&session)
+                .unwrap()
+                .executable()
+                .execute(&session, (input.clone(), input.clone()))
+                .unwrap();
             let (vjp_output, pullback) = session
                 .differentiate_at(Value::Array(input.clone()))
                 .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
@@ -5814,7 +5822,8 @@ pub(crate) mod tests {
                 vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
             )
             .unwrap();
-            let batched_input = upload(&[2, 4], &batch_sharding, input_memory, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+            let batched_input =
+                upload(&[2, 4], &batch_sharding, input_memory, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
             let batched = function
                 .batch(&session, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::default().with_extent(2))
                 .unwrap()

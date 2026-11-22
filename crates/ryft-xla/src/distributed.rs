@@ -570,7 +570,7 @@ mod tests {
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayError, Error, FromPjrt, Options, Reference, Session, Type, Value, compile_statefully};
     #[cfg(feature = "cuda-13")]
-    use crate::{ArrayPlacement, ToPjrt};
+    use crate::{ArrayPlacement, ExecutionError, ToPjrt};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, DistributedCompilationArtifactExchange,
@@ -2575,16 +2575,24 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                 .collect::<Vec<_>>();
             println!("probe: rank {rank} moved: {:?} {shards:?}", moved.layout());
 
-            // A compiled function on both devices takes the source, which it moves to its devices first, and the moved
-            // array, whose buffers differ in layout between the ranks.
+            // A compiled function on both devices takes the moved array, whose buffers differ in layout between the
+            // ranks, and both ranks prepare it in the same way. It rejects the source on both ranks before either moves
+            // anything, because the source is committed to the device of rank 0 alone and a fixed device assignment
+            // constrains committed public arguments.
             let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated).unwrap();
             let compiled =
                 crate::compile::<_, ArrayType, ArrayType>(|x| x.clone() + x, input_type, &session, mesh).unwrap();
-            for (name, input) in [("source", source), ("moved", moved)] {
-                let output = compiled.executable().execute(&session, input).unwrap();
-                output.block_until_ready().unwrap();
-                println!("probe: rank {rank} doubled {name}: {:?}", read_addressable_f32s(&output));
-            }
+            let rejected = compiled.executable().execute(&session, source).err().map(|error| error.to_string());
+            let expected = Error::Execution(ExecutionError::CommittedInputDeviceMismatch {
+                index: 0,
+                actual: vec![devices[0].id()],
+                expected: devices.iter().map(Device::id).collect(),
+            });
+            assert_eq!(rejected, Some(expected.to_string()));
+            println!("probe: rank {rank} source: {}", rejected.unwrap());
+            let output = compiled.executable().execute(&session, moved).unwrap();
+            output.block_until_ready().unwrap();
+            println!("probe: rank {rank} doubled moved: {:?}", read_addressable_f32s(&output));
         });
     }
 
@@ -2606,10 +2614,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             probes,
             indoc! {"
                 rank 0 moved: None [(true, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
-                rank 0 doubled source: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
+                rank 0 source: public argument #0 is committed to devices [0], but the executable requires [0, 1]
                 rank 0 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
                 rank 1 moved: None [(false, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
-                rank 1 doubled source: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
+                rank 1 source: public argument #0 is committed to devices [0], but the executable requires [0, 1]
                 rank 1 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]"},
         );
     }

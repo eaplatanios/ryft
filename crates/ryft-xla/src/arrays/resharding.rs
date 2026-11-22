@@ -133,8 +133,10 @@
 //!     and waits.
 //!   - **A Program That Reads The Source:** A compiled program whose input is the source (i.e., a compiled reshard on
 //!     the mesh of the source, or the gather of a reshard across meshes) reads every shard of this process, so a
-//!     missing buffer of any of them stops this process before that program, while its peers wait in its collectives
-//!     and in the transfers that follow it.
+//!     failure to start that program on this process stops it before that program, while its peers wait in its
+//!     collectives and in the transfers that follow it. Such failures are a missing buffer of any of these shards, a
+//!     failed conversion of a buffer whose physical layout only this process knows, and a failed launch (e.g., a
+//!     failed allocation).
 //!   - **A Failed Preparation Of A Sent Buffer:** A copy, a staging in device memory, or a conversion to the layout of
 //!     the receiver that fails to start stops this process before its transfers.
 
@@ -1592,6 +1594,9 @@ impl Array {
     /// then wait for whatever it has not issued yet. This function therefore checks that this array has a buffer on
     /// every device of this process only where this array itself is the input of a compiled program (i.e., of a
     /// compiled reshard on its own mesh or of the gather of a reshard across meshes), which reads every such buffer.
+    /// Such a program stops this process before its collectives and before every transfer after it whenever it fails
+    /// to start here, which besides a missing buffer covers a failed conversion of a buffer whose physical layout
+    /// only this process knows and a failed launch (e.g., a failed allocation).
     /// Any other strategy reads only the shards that its moves name, serves a missing one from another replica of this
     /// process (refer to [`Self::local_replica`]), and fails only for a slice without any local buffer, and it looks up
     /// everything that its transfers do not need only once they are issued.
@@ -1962,8 +1967,13 @@ impl Array {
     /// cross-host sends that this process issued, so that [`Self::ready`] and [`Self::block_until_ready`] surface their
     /// errors without this function waiting for them.
     ///
-    /// A failed replica of this array therefore always fails the readiness functions and the readbacks of the result,
-    /// which is never ready and never reads back a value. Which error they report is not fixed, though. A failed
+    /// A failed replica of this array that this process copies locally therefore always fails the readiness functions
+    /// and the readbacks of the result, which is never ready and never reads back a value. A failed replica that this
+    /// process sends to another process (e.g., the source buffer itself when there is no gather, refer to
+    /// [`Self::cross_host_source_buffer`]) instead strands its receiver, whose readiness and readbacks block, because a
+    /// plugin may never launch a send of a failed buffer. This is the accepted limit of a process that fails before
+    /// it posts its part of a transfer (refer to the documentation of this module). Which error a locally copied
+    /// failed replica reports is not fixed, though. A failed
     /// replica that a device of the destination mesh copies (e.g., the replica on its own device) fails that copy, and
     /// the final reshard that reads the copy fails as well, and the fence of the result reports whichever of these
     /// failures it observes first (refer to [`ExecutionFence::join`]). Both name the cause of the failed replica, the
@@ -2868,11 +2878,11 @@ mod tests {
     // Plans the placement of the source of `views` (i.e., the source as each process sees it, in process order) on
     // `mesh` according to `sharding` on every process, and returns the strategy that all of them choose (or the
     // strategies of all of them in process order, separated by ` | `, when they differ) when their plans agree, or how
-    // they disagree otherwise. The plans agree when every process fails alike before it posts anything or none fails,
-    // every send has exactly one matching receive on its peer, every receive has a matching send, and every process
-    // that owns a device of a program that one process runs runs the same program. The processes may choose different
-    // strategies only when that holds (e.g., a process whose own value lies on its devices and whose devices hold the
-    // whole destination).
+    // they disagree otherwise, preceded by those strategies when every process plans without failing. The plans agree
+    // when every process fails alike before it posts anything or none fails, every send has exactly one matching
+    // receive on its peer, every receive has a matching send, and every process that owns a device of a program that
+    // one process runs runs the same program. The processes may choose different strategies only when that holds
+    // (e.g., a process whose own value lies on its devices and whose devices hold the whole destination).
     //
     // Agreeing plans are not enough when a process holds some buffers of the source, because what only it knows (i.e.,
     // which of its shards have buffers) could still stop it before it posts the transfers that its peers expect. The
@@ -2900,12 +2910,18 @@ mod tests {
                 return Err(format!("processes disagree on failing: {outcomes:?}"));
             }
         };
+        let strategies = works.iter().map(|work| work.strategy).collect::<Vec<_>>();
+        let planned = if strategies.iter().all(|strategy| *strategy == strategies[0]) {
+            strategies[0].to_string()
+        } else {
+            strategies.join(" | ")
+        };
         for (process_index, work) in works.iter().enumerate() {
             for send in &work.sends {
                 let peer = send.destination.process_index();
                 if works[peer].receives.iter().filter(|receive| *receive == send).count() != 1 {
                     return Err(format!(
-                        "process {process_index} sends {send:?} without one receive on process {peer}"
+                        "{planned}: process {process_index} sends {send:?} without one receive on process {peer}"
                     ));
                 }
             }
@@ -2913,14 +2929,16 @@ mod tests {
                 let peer = receive.source.process_index();
                 if !works[peer].sends.contains(receive) {
                     return Err(format!(
-                        "process {process_index} receives {receive:?} that process {peer} never sends"
+                        "{planned}: process {process_index} receives {receive:?} that process {peer} never sends"
                     ));
                 }
             }
             for program in &work.programs {
                 for peer in program.mesh.devices().iter().map(Device::process_index) {
                     if !works[peer].programs.contains(program) {
-                        return Err(format!("process {process_index} runs {program:?} without process {peer}"));
+                        return Err(format!(
+                            "{planned}: process {process_index} runs {program:?} without process {peer}"
+                        ));
                     }
                 }
             }
@@ -2946,15 +2964,11 @@ mod tests {
             match placed {
                 Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                     if message == "the cross-host transfers extension is not provided by the PJRT plugin" => {}
-                Ok(_) => return Err("process 0 completes without posting its transfers".to_string()),
-                Err(error) => return Err(format!("process 0 fails before it posts its transfers: {error}")),
+                Ok(_) => return Err(format!("{planned}: process 0 completes without posting its transfers")),
+                Err(error) => return Err(format!("{planned}: process 0 fails before it posts its transfers: {error}")),
             }
         }
-        let strategies = works.iter().map(|work| work.strategy).collect::<Vec<_>>();
-        if strategies.iter().all(|strategy| *strategy == strategies[0]) {
-            return Ok(strategies[0].to_string());
-        }
-        Ok(strategies.join(" | "))
+        Ok(planned)
     }
 
     #[test]
@@ -3794,6 +3808,26 @@ mod tests {
         assert!(replica_failures.contains(&ready), "unexpected readiness of the result: {ready:?}");
         let readback = failure(placed.copy_to_host_bytes().map(|_| ()));
         assert!(replica_failures.contains(&readback), "unexpected readback of the result: {readback:?}");
+
+        // The session also reports the failed replica, once for each failed submission in registration order. The
+        // copies that read the failed replica report its cause as the copy reports it, and the executions that read
+        // those copies report it as the failed execution reports it.
+        let Err(Error::Execution(ExecutionError::SynchronizationFailures { failures })) = session.synchronize() else {
+            panic!("expected the session to report the failed replica");
+        };
+        let failures = failures
+            .into_iter()
+            .map(|(identity, error)| (identity, failure(Err(error)).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures,
+            [
+                (0, replica_failures[0].clone().unwrap()),
+                (1, replica_failures[0].clone().unwrap()),
+                (2, replica_failures[1].clone().unwrap()),
+                (3, replica_failures[1].clone().unwrap()),
+            ],
+        );
     }
 
     #[test]
@@ -6128,7 +6162,8 @@ mod tests {
             vec![own, peer]
         };
         // A process that imported only some of its shards holds a buffer on the second local device alone, in the
-        // layout of the type, with the elements of its shard there, which `values` lists in row-major order.
+        // layout and the memory of the type, with the elements of its shard there, which `values` lists in row-major
+        // order.
         let partially_addressable = |r#type: &ArrayType,
                                      devices: &[Device],
                                      sharding: &dyn Fn(&DeviceMesh) -> Sharding,
@@ -6137,16 +6172,12 @@ mod tests {
             let mesh = mesh(devices);
             let device = client.addressable_devices().unwrap()[1].clone();
             let layout = r#type.layout().map(|layout| layout.to_pjrt().unwrap());
-            let buffer =
-                client.buffer(values_to_bytes(values).as_slice(), BufferType::F32, dimensions, None, device, layout);
+            let bytes = values_to_bytes(values);
+            let buffer = client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, device.clone(), layout);
+            let buffer = buffer.unwrap().copy_to_memory(device.memory(r#type.memory()).unwrap()).unwrap();
             let sharding = Some(sharding(&mesh));
-            let own = Array::from_addressable_buffers(
-                &session,
-                r#type.clone(),
-                mesh.clone(),
-                sharding.clone(),
-                vec![buffer.unwrap()],
-            );
+            let own =
+                Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), sharding.clone(), vec![buffer]);
             let peer = Array::from_addressable_buffers(&session, r#type.clone(), mesh, sharding, Vec::new());
             vec![own.unwrap(), peer.unwrap()]
         };
@@ -6192,6 +6223,16 @@ mod tests {
                 ),
             ),
             (
+                "partially addressable import in pinned host memory",
+                partially_addressable(
+                    &r#type.clone().with_memory(Memory::Host { pinned: true }),
+                    &[local[0], local[1]],
+                    &replicated,
+                    [2, 2],
+                    &[1., 2., 3., 4.],
+                ),
+            ),
+            (
                 "partially addressable sharded import",
                 partially_addressable(&r#type, &[local[0], local[1]], &sharded, [1, 2], &[3., 4.]),
             ),
@@ -6227,7 +6268,8 @@ mod tests {
         // choose the same strategy, except that a process whose own value lies on its devices and whose devices hold
         // the whole destination places it with the strategy of a shared source, which moves nothing between processes.
         // A partial import reaches its first transfer in production whenever another local replica serves a missing
-        // one or a missing tile is only copied locally. The partially addressable sharded import has no local buffer
+        // one or a missing tile is only copied locally, which in pinned host memory includes the staging of each sent
+        // replica in device memory. A disagreement names the strategy of each process. The partially addressable sharded import has no local buffer
         // at all for its first tile, so process 0 stops before its transfers wherever that tile must leave the
         // process or feed a gather, while process 1 waits for its receive, which is the accepted limit of the PJRT
         // cross-host transfers that `.tasks/plan_placement_decisions.md` records.
@@ -6279,11 +6321,16 @@ mod tests {
                 partially addressable import with a declared layout -> unreduced over both processes: compiled reshard across meshes
                 partially addressable import with a declared layout -> replicated on process 0: exact shards
                 partially addressable import with a declared layout -> sharded on process 1: compiled reshard across meshes
-                partially addressable sharded import -> replicated over both processes: DISAGREE: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
+                partially addressable import in pinned host memory -> replicated over both processes: exact shards
+                partially addressable import in pinned host memory -> sharded over both processes: compiled reshard across meshes
+                partially addressable import in pinned host memory -> unreduced over both processes: compiled reshard across meshes
+                partially addressable import in pinned host memory -> replicated on process 0: exact shards
+                partially addressable import in pinned host memory -> sharded on process 1: compiled reshard across meshes
+                partially addressable sharded import -> replicated over both processes: DISAGREE: shard regions: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 partially addressable sharded import -> sharded over both processes: exact shards
-                partially addressable sharded import -> unreduced over both processes: DISAGREE: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
+                partially addressable sharded import -> unreduced over both processes: DISAGREE: compiled reshard across meshes: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 partially addressable sharded import -> replicated on process 0: compiled reshard
-                partially addressable sharded import -> sharded on process 1: DISAGREE: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
+                partially addressable sharded import -> sharded on process 1: DISAGREE: exact shards: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 process-local committed -> replicated over both processes: process-local value
                 process-local committed -> sharded over both processes: process-local value
                 process-local committed -> unreduced over both processes: process-local value

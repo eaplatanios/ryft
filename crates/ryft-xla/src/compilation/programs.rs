@@ -732,8 +732,8 @@ impl CompiledProgram {
     /// target or a `constrain_sharding` in any region that it emits), as JAX commits the results of `jit` functions
     /// with explicit shardings. It is also the case for every output, including the hidden final reference states, of
     /// a lowering for a mesh of more than one device, as JAX commits every result of a computation on more than one
-    /// device, and of a lowering that captures a committed array through any of its handles, like the outputs of an
-    /// operation that has a committed input.
+    /// device. The arrays that a lowering captures never commit its outputs, as JAX ignores the commitment of the
+    /// arrays that a `jit` function closes over.
     #[inline]
     pub(crate) fn committed_outputs(&self) -> &[bool] {
         &self.committed_outputs

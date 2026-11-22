@@ -43,8 +43,8 @@ use ryft_core::{
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
-    Module, Operation as MlirOperation, OperationPrintingFlags, Region, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue, ValueRef, WalkOrder, WalkResult,
+    Module, Operation as MlirOperation, OperationPrintingFlags, OperationResultRef, Region, Type as MlirType,
+    TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::devices::MemoryExtension;
@@ -62,11 +62,12 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::validate_boundary_memory;
+use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::sharding::ShardyTensorSharding;
 use crate::{
-    ArrayConstant, CompilationError, Constant, Error, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation,
-    Operation, Program, RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir,
-    Type, normalize_runtime_requirements,
+    ArrayConstant, CompilationError, Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME,
+    JitCallOperation, Operation, Program, RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement,
+    SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -1352,6 +1353,7 @@ where
         target_platform,
         true,
         &[],
+        &[],
         RaggedDotLoweringStrategy::default(),
         &[],
         false,
@@ -1399,6 +1401,7 @@ where
         None,
         true,
         &[],
+        &[],
         RaggedDotLoweringStrategy::default(),
         open_results,
         false,
@@ -1417,6 +1420,15 @@ where
 /// mutation of the state buffer of the caller. Read-only state may be finite and bounded dynamic because it has no
 /// hidden alias. The validation here owns the physical alias contract, and the XLA session additionally enforces the
 /// supported memory, sharding, and dynamic shape classes before calling it.
+///
+/// `donated_inputs` flags the public inputs whose buffers the caller gives up to every execution (i.e., one flag per
+/// public input, or none at all). Each donated input is paired with an output that it can share its buffers with and
+/// the pair is recorded as the same kind of alias, as JAX does for the donated arguments of a `jit` function. An
+/// output can share the buffers of an input when both are static device arrays of the identical type and sharding,
+/// and when the output is not open on a mesh of more than one device, because the compiler could then place it
+/// differently than the input. Without such an alias the outputs of every execution are written to new buffers,
+/// which is correct but forces backends that cache launch state per buffer address (e.g., the command buffers of
+/// the XLA GPU backend) to rebuild that state for every execution of a program that updates its inputs in a loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     Input,
@@ -1436,6 +1448,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     target_platform: Option<&str>,
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
+    donated_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
 ) -> Result<LoweredModule, Error>
@@ -1458,6 +1471,7 @@ where
         target_platform,
         supports_shardy,
         reference_states,
+        donated_inputs,
         ragged_dot_lowering_strategy,
         open_results,
         true,
@@ -1488,26 +1502,6 @@ where
         }
     }
     session_constants
-}
-
-/// Returns whether any of the [`RetainedArray`]s that `program` references in the regions that lowering emits is
-/// [committed](RetainedArray::is_committed), like the outputs of an operation that captures it. Commitment is not part
-/// of the identity of a retained array, so [`collect_session_constants`] keeps only the first of several handles of the
-/// same buffers, and this function decides over every handle instead, so that the answer does not depend on the order
-/// in which a program references them.
-pub(crate) fn has_committed_session_constants<ProgramInput, ProgramOutput, O: CoreOperation<Type = Type>>(
-    program: &Program<ProgramInput, ProgramOutput, O>,
-) -> bool
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    program.entry_region_ref().computation_regions().any(|region| {
-        region
-            .atoms()
-            .iter()
-            .any(|atom| matches!(atom.as_constant(), Some(Constant::Session(constant)) if constant.is_committed()))
-    })
 }
 
 /// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
@@ -2046,7 +2040,7 @@ where
         .with_captured_values(captured_values)
         .with_effect_tokens(*effect_tokens)
         .with_collective_state(collective_state.clone());
-    let outputs =
+    let mut outputs =
         instruction
             .operation()
             .lower(&mut lowerer, input_values, input_types.as_slice(), output_types.as_slice())?;
@@ -2054,7 +2048,42 @@ where
         collective_state.has_assertions.set(true);
     }
     *effect_tokens = lowerer.effect_tokens;
+    constrain_unreduced_outputs(&mut outputs, &output_types, collective_state, block, location)?;
     Ok(outputs)
+}
+
+/// Constrains every lowered instruction output in `outputs` whose type in `output_types` is unreduced over a mesh axis
+/// that no enclosing manual region binds to its tracked sharding. Shardy rejects an operation whose result drops an
+/// unreduced axis of its inputs, and its propagation does not carry unreduced axes through most operations (e.g.,
+/// `stablehlo.add` or `stablehlo.broadcast_in_dim`), so these outputs must declare them, like JAX constrains the result
+/// of every operation on a mesh with explicit axes. An output that a Shardy operation produces (e.g., the
+/// `sdy.sharding_constraint` of a placement transition or the `sdy.manual_computation` of a `shard_map`) already
+/// declares its sharding and is left as it is. Every path that lowers an instruction calls this function once on its
+/// outputs.
+pub(crate) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
+    outputs: &mut [ValueRef<'b, 'c, 't>],
+    output_types: &[Type],
+    collective_state: &CollectiveLoweringState,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let bound_manual_axes = collective_state.bound_manual_axes();
+    let is_declared = |output: &ValueRef<'b, 'c, 't>| {
+        output
+            .cast::<OperationResultRef>()
+            .and_then(|result| result.operation().ok())
+            .is_some_and(|operation| operation.name().as_str().is_ok_and(|name| name.starts_with("sdy.")))
+    };
+    for (output, output_type) in outputs.iter_mut().zip(output_types) {
+        if let Type::Array(output_type) = output_type
+            && let Some(sharding) = output_type.sharding()
+            && sharding.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis))
+            && !is_declared(output)
+        {
+            *output = lower_sharding_constraint(&[*output], sharding, bound_manual_axes, block, location)?[0];
+        }
+    }
+    Ok(())
 }
 
 /// Normalizes an MLIR symbol name provided by the user by trimming surrounding whitespace and one leading `@`.
@@ -2132,6 +2161,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     target_platform: Option<&str>,
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
+    donated_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
     export_effects: bool,
@@ -2277,6 +2307,46 @@ where
             }
             // Distinct logical inputs, which `state_inputs` enforces above, map to distinct physical inputs, so this
             // insertion can never displace an earlier alias.
+            aliases.insert(physical_input_index, physical_output_index);
+        }
+    }
+    if !donated_inputs.is_empty() && donated_inputs.len() != global_input_types.len() {
+        return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
+            expected_count: global_input_types.len(),
+            actual_count: donated_inputs.len(),
+        }));
+    }
+    // Each donated input is paired with the first output that can share its buffers and that no earlier input was
+    // paired with, as JAX pairs the donated arguments of a `jit` function with its results. The pairs are the same
+    // hints as the reference state aliases above, so an input that finds no output simply stays unpaired.
+    for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
+        let logical_input_index = capture_types.len() + input_index;
+        let input_type = &logical_argument_types[logical_input_index];
+        let Some(physical_input_index) = signature.input_mapping()[logical_input_index] else { continue };
+        if state_inputs.contains(&logical_input_index)
+            || input_type.static_shape().is_none()
+            || input_type.memory() != Memory::Device
+        {
+            continue;
+        }
+        let input_sharding = &argument_shardings[logical_input_index];
+        // The compiler places an open output itself, and only on a single device is that placement certain to be the
+        // placement of the input.
+        let has_single_device = input_sharding
+            .as_ref()
+            .is_none_or(|sharding| sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1);
+        let physical_output_index =
+            global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
+                let physical_output_index = signature.output_mapping()[logical_output_index]?;
+                let is_open = open_results.get(logical_output_index).copied().unwrap_or(false);
+                (output_type == input_type
+                    && &result_shardings[logical_output_index] == input_sharding
+                    && (has_single_device || !is_open)
+                    && !aliased_outputs.contains(&physical_output_index))
+                .then_some(physical_output_index)
+            });
+        if let Some(physical_output_index) = physical_output_index {
+            aliased_outputs.insert(physical_output_index);
             aliases.insert(physical_input_index, physical_output_index);
         }
     }
@@ -4202,6 +4272,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_constrains_unreduced_outputs() {
+        // Shardy rejects an operation whose result does not declare the unreduced axes of its inputs, so every output
+        // that is unreduced over an axis that no manual region binds is constrained, also where its placement does not
+        // change (e.g., a sum, and a broadcast that gives it a batch dimension).
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = test_vector_type(4)
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F32, [2, 4])
+            .with_sharding(Sharding::replicated(mesh, 2).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let left = builder.add_input(input_type.clone().into());
+        let right = builder.add_input(input_type.clone().into());
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![1]), Vec::new(), vec![sum], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), input_type],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<2x4xf32> {
+                    %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}], unreduced={"x"}> : tensor<4xf32>
+                    %2 = stablehlo.broadcast_in_dim %1, dims = [1] : (tensor<4xf32>) -> tensor<2x4xf32>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{}, {}], unreduced={"x"}> : tensor<2x4xf32>
+                    return %3 : tensor<2x4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_lower_mlir_module_for_program_omits_shardy_for_targets_without_the_dialect() {
         // A device target that completes a pending reduction over a mesh axis of size one constrains its result, and
         // the signature shardings annotate the entry function. A target whose plugin lacks the Shardy dialect gets
@@ -4234,6 +4352,7 @@ pub(crate) mod tests {
                 Some(std::slice::from_ref(&replicated)),
                 Some("cpu"),
                 supports_shardy,
+                &[],
                 &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
@@ -4435,6 +4554,7 @@ pub(crate) mod tests {
             None,
             true,
             &states,
+            &[],
             RaggedDotLoweringStrategy::default(),
             &[],
         )
@@ -4476,6 +4596,7 @@ pub(crate) mod tests {
                 None,
                 true,
                 std::slice::from_ref(&invalid_state),
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             ),
@@ -4500,6 +4621,7 @@ pub(crate) mod tests {
                     None,
                     true,
                     &states,
+                    &[],
                     RaggedDotLoweringStrategy::default(),
                     &[],
                 ),
@@ -4521,6 +4643,7 @@ pub(crate) mod tests {
                 None,
                 true,
                 &states,
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             ),
@@ -4552,12 +4675,83 @@ pub(crate) mod tests {
                 None,
                 true,
                 std::slice::from_ref(&reference_state),
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             ),
             Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
                                compatibility is unsupported",
+        ));
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_with_reference_state_aliases_donated_inputs() {
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let pair_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = crate::operations::ProgramBuilder::new();
+        let first = builder.add_input(Type::Array(vector_type.clone()));
+        let second = builder.add_input(Type::Array(vector_type.clone()));
+        let third = builder.add_input(Type::Array(pair_type.clone()));
+        let program: FlatProgram =
+            builder.build(vec![second, first, third], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap();
+        let input_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
+        let output_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
+        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_results: &[bool]| {
+            lower_mlir_module_for_program_with_reference_state(
+                &program,
+                &[],
+                &input_types,
+                &output_types,
+                "main",
+                shardings,
+                shardings,
+                None,
+                true,
+                &[],
+                donated_inputs,
+                RaggedDotLoweringStrategy::default(),
+                open_results,
+            )
+        };
+        let signature = |lowered: LoweredModule| {
+            let line = lowered.stable_hlo.lines().find(|line| line.contains("func.func @main")).unwrap();
+            line.trim().to_string()
+        };
+
+        // Each donated input is paired with the first unpaired output of its type, and other inputs with none.
+        assert_eq!(
+            signature(lower(None, &[true, true, false], &[]).unwrap()),
+            concat!(
+                "func.func @main(%arg0: tensor<4xf32> {tf.aliasing_output = 0 : i64}, ",
+                "%arg1: tensor<4xf32> {tf.aliasing_output = 1 : i64}, %arg2: tensor<2xf32>) -> ",
+                "(tensor<4xf32>, tensor<4xf32>, tensor<2xf32>) {",
+            ),
+        );
+        assert_eq!(
+            signature(lower(None, &[false, true, true], &[]).unwrap()),
+            concat!(
+                "func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32> {tf.aliasing_output = 0 : i64}, ",
+                "%arg2: tensor<2xf32> {tf.aliasing_output = 2 : i64}) -> ",
+                "(tensor<4xf32>, tensor<4xf32>, tensor<2xf32>) {",
+            ),
+        );
+        assert!(!signature(lower(None, &[], &[]).unwrap()).contains("tf.aliasing_output"));
+
+        // An open output is only paired on a single device, where the compiler cannot place it differently.
+        let shardings = |device_count: usize| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Auto).unwrap()]).unwrap();
+            vec![Sharding::replicated(mesh, 1); 3]
+        };
+        let open_results = [true, false, false];
+        let single_device = signature(lower(Some(&shardings(1)), &[true, false, false], &open_results).unwrap());
+        assert!(single_device.contains("tf.aliasing_output = 0 : i64"));
+        let two_devices = signature(lower(Some(&shardings(2)), &[true, false, false], &open_results).unwrap());
+        assert!(two_devices.contains("tf.aliasing_output = 1 : i64"));
+
+        assert!(matches!(
+            lower(None, &[true], &[]),
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 3, actual_count: 1 })),
         ));
     }
 

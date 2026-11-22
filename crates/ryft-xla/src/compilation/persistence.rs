@@ -39,8 +39,10 @@ use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 /// Fixed header identifying the executable envelope.
 const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL01";
 
-/// Metadata schema emitted by executable serialization. Version 2 added the commitment of every logical output.
-const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 2;
+/// Metadata schema emitted by executable serialization. Version 2 added the commitment of every logical output, and
+/// version 3 stopped committing the outputs of a lowering that captures a committed array, so that executables of
+/// older versions, which can record that commitment, are not restored.
+const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 3;
 
 /// Required features for reference states, dynamic extents, effects, and runtime contracts.
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;

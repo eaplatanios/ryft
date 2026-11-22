@@ -54,6 +54,10 @@ pub enum ExecutionError {
     #[error("got {actual_count} donation flag(s), but expected {expected_count}")]
     DonationFlagCountMismatch { expected_count: usize, actual_count: usize },
 
+    /// A public argument is committed to a physical device assignment incompatible with the executable.
+    #[error("public argument #{index} is committed to devices {actual:?}, but the executable requires {expected:?}")]
+    CommittedInputDeviceMismatch { index: usize, actual: Vec<DeviceId>, expected: Vec<DeviceId> },
+
     /// An input array has no buffered shard for a device required by the executable assignment.
     #[error("input array #{array_index} has no addressable shard for device {device_id}")]
     MissingArrayShardForDevice { array_index: usize, device_id: DeviceId },
@@ -479,7 +483,7 @@ impl Session {
         // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
         // carry final reference states are returned verbatim.
         let mut resources = Some(self.prepare_execution_resources(program)?);
-        let committed = inputs.iter().any(Array::is_committed);
+        let committed = inputs.iter().skip(program.capture_count()).any(Array::is_committed);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
         let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
         let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, &mut resources, |_| {})?;
@@ -617,6 +621,12 @@ impl Session {
             .map_err(ProgramError::from)?;
             (input_refinements, Some(actual_input_types))
         };
+
+        // Validate the logical public arguments before padding, erasing, donating, or moving any buffers.
+        // Captures, including hidden session constants, are placed on the executable's mesh.
+        for (index, input) in inputs.iter().skip(program.capture_count()).enumerate() {
+            validate_committed_input_devices(input, index, program.mesh())?;
+        }
 
         // Erased inputs of the zero data type have no buffers through which PJRT could order consumer work after their
         // producers. Observe completion before dropping those inputs, including before any consumer effects run.
@@ -875,8 +885,8 @@ impl Session {
             let donation_overrides =
                 reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
 
-            // The outputs are committed when an input of the attempt that is submitted, including a reference snapshot,
-            // is committed. Each attempt sets this before it can be submitted.
+            // The outputs are committed when a public input of the attempt that is submitted, including a reference
+            // snapshot, is committed. Captures never commit them. Each attempt sets this before it can be submitted.
             let mut committed;
             let (
                 execution,
@@ -916,7 +926,7 @@ impl Session {
                     .map(ValueProjection::<ArrayType>::into_projected)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(ProgramError::from)?;
-                committed = arrays.iter().any(Array::is_committed);
+                committed = arrays.iter().skip(program.capture_count()).any(Array::is_committed);
                 let prepared_execution =
                     self.prepare_compiled_execution(program, arrays, donation_overrides.as_slice())?;
 
@@ -1477,13 +1487,12 @@ impl Session {
     }
 
     /// Reconstructs selected logical outputs from one submitted execution's physical buffers. The outputs are
-    /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any array
-    /// input of the execution, including the arrays that the program captures, is committed. The outputs that
-    /// [`CompiledProgram::committed_outputs`] flags (e.g., the public outputs of a program that requests a placement
-    /// explicitly, or all of them when the program runs on more than one device or captures a committed array through
-    /// any of its handles) are committed in either case, which both the plain and the stateful execution paths rely
-    /// on. Eager operations and compiled reshards replace the commitment of the arrays that this function returns with
-    /// their own.
+    /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any public
+    /// array input of the execution is committed. The arrays that the program captures never commit them. The outputs
+    /// that [`CompiledProgram::committed_outputs`] flags (e.g., the public outputs of a program that requests a
+    /// placement explicitly, or all of them when the program runs on more than one device) are committed in either
+    /// case, which both the plain and the stateful execution paths rely on. Eager operations and compiled reshards
+    /// replace the commitment of the arrays that this function returns with their own.
     fn reconstruct_compiled_outputs(
         &self,
         program: &CompiledProgram,
@@ -1633,6 +1642,23 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
         }
     }
     Ok(devices)
+}
+
+/// Checks the commitment of a public argument against the physical devices of a fixed call boundary.
+/// The order identifies the device assigned to each partition. Logical mesh names and shardings can differ.
+pub(crate) fn validate_committed_input_devices(
+    input: &Array,
+    index: usize,
+    mesh: &DeviceMesh,
+) -> Result<(), ExecutionError> {
+    if input.is_committed() && input.mesh().devices() != mesh.devices() {
+        return Err(ExecutionError::CommittedInputDeviceMismatch {
+            index,
+            actual: input.mesh().devices().iter().map(Device::id).collect(),
+            expected: mesh.devices().iter().map(Device::id).collect(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates runtime refinement of a declared logical input type, excluding the placement that a sharding describes,
@@ -2786,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_execute_compiled_async_commits_outputs_of_committed_captures() {
+    fn test_session_execute_compiled_async_ignores_the_commitment_of_captures() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -2820,16 +2846,14 @@ mod tests {
             program_array(&output).is_committed()
         };
 
-        // A committed capture commits the outputs whichever of two aliases of the same buffers the function captures
-        // first, although the executable receives the buffers only once, and the second function reuses the executable
-        // of the first one from the cache.
-        assert!(execute(&uncommitted, &committed));
-        assert!(execute(&committed, &uncommitted));
+        // A capture never commits the outputs, whichever of two aliases of the same buffers the function captures
+        // first, as JAX returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` and a committed `c`, and
+        // also after the second function reuses the executable of the first one from the cache.
+        assert!(!execute(&uncommitted, &committed));
+        assert!(!execute(&committed, &uncommitted));
         session.clear_cache();
-        assert!(execute(&committed, &uncommitted));
-        assert!(execute(&uncommitted, &committed));
-
-        // Without a committed capture or input, the outputs are uncommitted.
+        assert!(!execute(&committed, &uncommitted));
+        assert!(!execute(&uncommitted, &committed));
         assert!(!execute(&uncommitted, &uncommitted));
     }
 

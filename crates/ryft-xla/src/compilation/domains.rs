@@ -30,8 +30,7 @@ use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::{
     collect_session_constants, contains_unresolved_references, contains_unresolved_state, entry_boundary_sharding,
-    entry_open_results, entry_result_placements, entry_result_shardings, has_committed_session_constants,
-    has_placement_requests,
+    entry_open_results, entry_result_placements, entry_result_shardings, has_placement_requests,
 };
 use crate::{
     Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
@@ -508,19 +507,15 @@ impl Session {
         // function that is compiled for more than one device is committed as well, including its hidden reference
         // states, as JAX commits every result of a computation on more than one device (refer to
         // `lower_sharding_computation` in `jax._src.interpreters.pxla`), whereas a function that is compiled for a
-        // single device leaves its outputs to the other rules. Every output of a function that captures a committed
-        // array is committed too, like the outputs of a function with a committed input. The executable receives the
-        // arrays of session constants once per buffer, through whichever handle the program references first, so this
-        // is decided over every handle instead (refer to `has_committed_session_constants`). Other outputs are
-        // committed when an input of an execution is. Eager operations and compiled reshards set the commitment of
-        // their results themselves, so these flags do not reach them.
+        // single device leaves its outputs to the other rules. Other outputs are committed when a public argument of
+        // an execution is. The arrays that a function captures never commit its outputs, committed or not, as JAX
+        // returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
+        // operations and compiled reshards set the commitment of their results themselves, so these flags do not
+        // reach them.
         let requests_placement = requests_placement(program, options);
         let runs_on_multiple_devices = options.mesh().devices().len() > 1;
-        let has_committed_captures = has_committed_session_constants(program);
         let committed_outputs = (0..output_types.len())
-            .map(|index| {
-                has_committed_captures || runs_on_multiple_devices || index < output_count && requests_placement
-            })
+            .map(|index| runs_on_multiple_devices || index < output_count && requests_placement)
             .collect::<Vec<_>>();
         // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
@@ -610,6 +605,7 @@ impl Session {
             target_platform,
             supports_shardy,
             reference_states,
+            &donation_flags,
             options.ragged_dot_lowering_strategy(),
             &open_outputs,
         )?;
@@ -987,7 +983,10 @@ fn apply_signature_shardings(
 /// `output_type`. This is `annotation` with the dimensions that `output_type` records as unconstrained left
 /// unconstrained, because types compare unconstrained dimensions exactly and an array must have the placement that its
 /// type records. The two describe the same buffers, because `annotation` replicates those dimensions (refer to
-/// `entry_result_shardings`) and the runtime placement of an array reads an unconstrained dimension as replicated.
+/// `entry_result_shardings`) and the runtime placement of an array reads an unconstrained dimension as replicated. An
+/// output sharding override never leaves a dimension unconstrained, because staging rejects such an override (refer to
+/// `place_outputs`), so only the type of an output that the program itself leaves unconstrained (e.g., through the
+/// target of a `place`) records one.
 fn runtime_output_sharding(annotation: &Sharding, output_type: &ArrayType) -> Result<Sharding, Error> {
     let Some(type_sharding) = output_type.sharding() else {
         return Ok(annotation.clone());
@@ -1101,23 +1100,27 @@ fn contains_shard_map(program: &FlatProgram) -> bool {
 /// devices error when an input is committed to other devices. The devices of a Ryft program are fixed by its mesh
 /// before lowering, so a target on other devices is rejected instead. A device target (i.e., a
 /// [`PlacementRequest::Device`]) keeps the sharding of its input, so it is accepted exactly when `mesh` consists of
-/// that device alone, in which case it lowers to its layout and memory only. Unlike JAX, which leaves a value that a
-/// bare device places inside `jit` uncommitted and on the devices that it occupies, a function with such a target
-/// commits its outputs, as an explicit device commits an array eagerly. An in-place target (i.e., a
+/// that device alone, in which case it lowers to its layout and memory only. A device source is accepted exactly when
+/// the same device target would be, with or without a target, because transposition turns it into the destination of
+/// the cotangent, so that a program whose derivative could not be compiled is rejected when the program itself is
+/// compiled, whereas JAX elides the devices of a `device_put` source inside `jit` and accepts it. Unlike JAX, which
+/// leaves a value that a bare device places inside `jit` uncommitted and on the devices that it occupies, a function
+/// with such a target commits its outputs, as an explicit device commits an array eagerly. An in-place target (i.e., a
 /// [`PlacementRequest::InPlace`]) leaves its input on the devices where it lives, which are those of `mesh`, so it has
 /// nothing to validate and lowers to its layout and memory only. Without the Shardy partitioner (i.e., for
 /// bounded dynamic programs), the compiler runs one fully replicated replica of the program on each device and ignores
 /// sharding constraints, so it would silently ignore a `place` whose target is not replicated. A `place` without a
-/// target leaves its input where it is and lowers to nothing, so it is not checked. Regions that lowering never reaches
-/// (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not checked, because they are
-/// not part of the compiled program. Entry points that lower a program without compiling it for a device mesh (e.g.,
-/// [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices and do not run it.
+/// target leaves its input where it is and lowers to nothing, so only a device source of it is checked. Regions that
+/// lowering never reaches (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not
+/// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
+/// for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices
+/// and do not run it.
 ///
 /// # Errors
 ///
 /// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
 /// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`]
-/// for the first `place` whose device target is not the only device of `mesh`,
+/// for the first `place` whose device target or device source is not the only device of `mesh`,
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
 /// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose
 /// boundary override is not fully replicated (refer to [`Sharding::is_replicated`]) when `use_shardy_partitioner` is
@@ -1153,41 +1156,80 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                 }
                 continue;
             }
-            // A `place` without a target leaves its input where it is and lowers to nothing, so it has nothing to
-            // validate, whatever its source says, and neither has one with an in-place target, which leaves its input
-            // on the devices of the program mesh.
-            let target = instruction.operation().projected_payload::<PlaceOperation>().and_then(PlaceOperation::target);
-            let target = match target {
-                Some(PlacementRequest::Resolved(target)) => target,
-                Some(PlacementRequest::Device { device, .. }) => {
-                    // A device target keeps the sharding of its input, which is over the program mesh, so it is valid
-                    // exactly when that mesh consists of the device alone.
-                    if mesh.devices() != [*device] {
-                        return Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
-                            device: *device,
-                            mesh: mesh.clone(),
-                        }));
-                    }
-                    continue;
-                }
-                Some(PlacementRequest::InPlace { .. }) | None => continue,
+            let Some(place) = instruction.operation().projected_payload::<PlaceOperation>() else {
+                continue;
             };
-            let target_mesh = target.mesh();
-            if target_mesh.devices() != mesh.devices()
-                || !target_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
-            {
-                return Err(Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
-                    target: target_mesh.clone(),
-                    mesh: mesh.clone(),
-                }));
-            }
-            if !use_shardy_partitioner && mesh.devices().len() > 1 && !target.sharding().is_replicated() {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: PLACE_OPERATION_NAME.to_string(),
-                    reason: "bounded-dynamic multi-device programs currently require fully replicated placement \
-                             targets because Shardy rejects dynamic tensors"
-                        .to_string(),
-                }));
+            // A source is validated exactly like the same target, because transposition turns it into the target of the
+            // cotangent (refer to `PlacementRequest`), so that a program is rejected when it is compiled rather than
+            // when it is differentiated. A rejected source is reported as such, since nothing is moved to it forward.
+            let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+            for (request, is_source) in [(place.target(), false), (place.source(), true)] {
+                let unsupported = |reason: String| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: PLACE_OPERATION_NAME.to_string(),
+                        reason,
+                    })
+                };
+                match request {
+                    // A device keeps the sharding of the value, which is over the program mesh, so it is valid exactly
+                    // when that mesh consists of the device alone.
+                    Some(PlacementRequest::Device { device, .. }) if mesh.devices() != [*device] => {
+                        return Err(if is_source {
+                            unsupported(format!(
+                                "its source names the device {}, which is not the only device of the mesh `{}` over \
+                                 the devices {:?} that the program is compiled for, and transposition would return \
+                                 the cotangent to it",
+                                device.id(),
+                                mesh.logical_mesh(),
+                                device_ids(mesh),
+                            ))
+                        } else {
+                            Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
+                                device: *device,
+                                mesh: mesh.clone(),
+                            })
+                        });
+                    }
+                    Some(PlacementRequest::Resolved(placement)) => {
+                        let placement_mesh = placement.mesh();
+                        if placement_mesh.devices() != mesh.devices()
+                            || !placement_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
+                        {
+                            return Err(if is_source {
+                                unsupported(format!(
+                                    "its source names the devices {:?} of mesh `{}`, which are not the devices {:?} \
+                                     of the mesh `{}` that the program is compiled for, and transposition would \
+                                     return the cotangent to them",
+                                    device_ids(placement_mesh),
+                                    placement_mesh.logical_mesh(),
+                                    device_ids(mesh),
+                                    mesh.logical_mesh(),
+                                ))
+                            } else {
+                                Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
+                                    target: placement_mesh.clone(),
+                                    mesh: mesh.clone(),
+                                })
+                            });
+                        }
+                        if !use_shardy_partitioner && mesh.devices().len() > 1 && !placement.sharding().is_replicated()
+                        {
+                            return Err(unsupported(if is_source {
+                                "bounded-dynamic multi-device programs currently require fully replicated placement \
+                                 sources because transposition turns them into the targets of cotangents and Shardy \
+                                 rejects dynamic tensors"
+                                    .to_string()
+                            } else {
+                                "bounded-dynamic multi-device programs currently require fully replicated placement \
+                                 targets because Shardy rejects dynamic tensors"
+                                    .to_string()
+                            }));
+                        }
+                    }
+                    // An in-place request leaves the value on the devices where it lives, which are those of the
+                    // program mesh, and an absent one states nothing, so neither has anything to validate.
+                    Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => {}
+                }
             }
         }
     }
