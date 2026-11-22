@@ -1443,21 +1443,18 @@ impl Context for Session {
 
                         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
                         // types never record. The arguments of a call are instead placed as an execution of its callee
-                        // places them, which is as the override of the boundary of the callee requests, if any, and
-                        // otherwise as the callee input type records, except that a call of a `jit` dispatcher keeps
-                        // such an input placed as it is, like the executables of the dispatcher (refer to
-                        // `JitCallOperation::with_kept_input_placements`). Either way the call returns
-                        // what that execution returns.
-                        let input_placements = match &operation {
-                            Operation::JitCall(call) => Some(
+                        // places them, which `JitCallOperation::eager_input_placement` decides for every array input
+                        // (e.g., a call that a program transform created leaves the residuals that the transform added
+                        // where they are, rather than gathering them to the placement of their traced types). Either
+                        // way the call returns what that execution returns.
+                        let input_placements = match (&operation, &callee_input_types) {
+                            (Operation::JitCall(call), Some(declared)) => Some(
                                 inputs
                                     .iter()
+                                    .zip(declared)
                                     .enumerate()
-                                    .filter_map(|(index, input)| match input {
-                                        Value::Array(array) => Some(match call.input_sharding(index) {
-                                            Some(sharding) => Some(sharding.clone()),
-                                            None => call.keeps_input_placements().then(|| array.sharding().clone()),
-                                        }),
+                                    .filter_map(|(index, (input, declared))| match input {
+                                        Value::Array(array) => Some(call.eager_input_placement(index, array, declared)),
                                         Value::Dimension(_) | Value::Reference(_) => None,
                                     })
                                     .collect::<Arc<[_]>>(),
@@ -2069,16 +2066,16 @@ pub(crate) mod tests {
         Atan2Operation, AttachedRegions, BatchAxis, CaptureReference, Cast, CastOperation, CompareOperation,
         ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, Condition,
         ConditionOperation, ConstantOperation, ConstrainSharding, DataType, DenseDifferentiableType, Device,
-        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError,
-        DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionValue,
-        DimensionVariable, DivOperation, DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation,
-        Error as CoreError, Exp, Fill, Layout, Memory, MeshAxisType, Mul, MulOperation, Neg, NegOperation,
-        OneOperation, ParallelReduceOperation, Place, PlaceDispatch, PlaceOperation, Placeholder, Placement,
-        PlacementRequest, ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation,
+        Differentiate, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation,
+        DimensionError, DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation,
+        DimensionValue, DimensionVariable, DivOperation, DomainTracer, DynamicBroadcastOperation,
+        DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout, Memory, MeshAxisType, Mul, MulOperation, Neg,
+        NegOperation, OneOperation, ParallelReduceOperation, Place, PlaceDispatch, PlaceOperation, Placeholder,
+        Placement, PlacementRequest, ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceType, ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary,
-        ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape,
-        SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, ZeroOperation,
-        batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
+        ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin,
+        StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation,
+        ZeroOperation, batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
         shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::protos::Precision;
@@ -2103,8 +2100,8 @@ pub(crate) mod tests {
         values_to_bytes,
     };
     use crate::{
-        CompileTracer, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt, JitCallOperation,
-        PlacementOptions, ProgramBuilder, Reference, jit,
+        CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
+        JitCallOperation, PlacementOptions, ProgramBuilder, Reference, compile, jit,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -5191,6 +5188,54 @@ pub(crate) mod tests {
         let cotangent = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]);
         let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
         assert_eq!(read_first_shard::<f32>(client, &input_cotangent), vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_session_bind_leaves_call_inputs_that_a_transform_added_where_they_are() {
+        // The pullback of a call of `sum(sin(place(x, split)))` calls the transposed callee with the cosine residual,
+        // which the forward call returns split along the auto mesh axis. The executable of that eager call must take
+        // the residual where it is instead of gathering it to the replicated placement of its traced type.
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh.clone(), split.clone()).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let x = Array::from_host_buffer(
+            &session,
+            r#type.clone(),
+            mesh.clone(),
+            Some(split.clone()),
+            values_to_bytes(&[0f32, 1.0, 2.0, 3.0]).as_slice(),
+        )
+        .unwrap();
+        let inner: CompiledFunction<ArrayType, ArrayType> = compile(
+            |x: CompileTracer| x.place(&target, None).unwrap().sin().unwrap().reduce_sum(&[0], None).unwrap(),
+            r#type,
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (output, pullback) = session
+            .differentiate_at(Value::Array(x))
+            .vjp(|x| Ok(inner.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+            .unwrap();
+        let Value::Array(cotangent) = pullback.apply_materialized(output).unwrap() else {
+            panic!("expected an array cotangent");
+        };
+        assert_eq!(cotangent.sharding(), &split);
+
+        // The only eager program with two arguments is the transposed call, which takes the seed replicated and the
+        // residual split.
+        let cache = &session.state.eager_dispatch_cache;
+        let argument_shardings = cache
+            .keys()
+            .iter()
+            .filter_map(|key| cache.get(key))
+            .map(|entry| entry.program.expected_argument_shardings().to_vec())
+            .filter(|shardings| shardings.len() == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(argument_shardings, vec![vec![Sharding::replicated(mesh.logical_mesh().clone(), 0), split]]);
     }
 
     #[test]
