@@ -904,14 +904,15 @@ impl ShardMapBoundary {
     }
 
     /// Returns the global boundary type of input `input_index` for the caller's global input type `input_type`, which
-    /// is the data type, shape, and layout of `input_type` placed by the input sharding, together with the manual
-    /// variation that `input_type` carries (e.g., the variation of a value of an enclosing manual region along its own
-    /// manual axes) and its reduction state along the axes that the input sharding does not govern (e.g., the unreduced
-    /// axes of a pending sum along an enclosing manual axis). The memory kind of `input_type` is not part of the
-    /// boundary type, so passing an input in another memory amounts to an implicit transfer into device memory, which
-    /// transposition undoes. This normalizes the types of the values that a caller passes to a shard map, as well as
-    /// the declared global input types that [`ShardMapOperation::from_program`] receives, into the global input types
-    /// of the resulting [`ShardMapOperation`].
+    /// is the data type, shape, layout, and memory kind of `input_type` placed by the input sharding, together with the
+    /// manual variation that `input_type` carries (e.g., the variation of a value of an enclosing manual region along
+    /// its own manual axes) and its reduction state along the axes that the input sharding does not govern (e.g., the
+    /// unreduced axes of a pending sum along an enclosing manual axis). The body therefore receives an input in the
+    /// memory of the caller's value (e.g., pinned host memory), as the body of a JAX `shard_map` does, and the mirror
+    /// rule of the outputs gives a global output the memory of the body output (refer to `global_output_type`). This
+    /// normalizes the types of the values that a caller passes to a shard map, as well as the declared global input
+    /// types that [`ShardMapOperation::from_program`] receives, into the global input types of the resulting
+    /// [`ShardMapOperation`].
     ///
     /// # Parameters
     ///
@@ -9190,8 +9191,8 @@ mod tests {
 
     #[test]
     fn test_shard_map_boundary_global_input_type() {
-        // The boundary type keeps the data type, shape, layout, and manual variation of the caller's type, takes the
-        // placement of the input sharding, and drops the memory kind.
+        // The boundary type keeps the data type, shape, layout, memory kind, and manual variation of the caller's type,
+        // and takes the placement of the input sharding.
         let mesh = manual_mesh_2x2();
         let boundary = ShardMapBoundary::new(
             mesh.clone(),
@@ -9210,6 +9211,7 @@ mod tests {
             boundary.global_input_type(0, &input_type),
             Ok(f32_type(&[8], None)
                 .with_layout(layout)
+                .with_memory(Memory::Host { pinned: true })
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
                         .unwrap()
@@ -27903,23 +27905,25 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_transposition_transfers_cotangents_to_the_caller_memory() {
-        // The forward boundary moves a caller's input from pinned host memory into device memory, so transposition
-        // transfers the assembled cotangent back after reconciling its placement in device memory, whether the caller's
-        // input carries the input sharding itself or no sharding at all.
+    fn test_shard_map_transposition_keeps_cotangents_in_the_caller_memory() {
+        // The body receives a caller's input in pinned host memory as it is, so the transposed map returns the cotangent
+        // in that memory, and transposition only reconciles its placement there, whether the caller's input carries the
+        // input sharding itself or no sharding at all.
         let host = Memory::Host { pinned: true };
         let global = f32_type(&[4], None).with_sharding(sharded_along_x()).unwrap();
+        let host_global = global.clone().with_memory(host);
         let local = f32_type(&[2], None)
             .with_sharding(Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
+            .unwrap()
+            .with_memory(host);
         let transposed_shard_map = formatdoc! {"
-            let %1:{global} = shard_map [
+            let %1:{host_global} = shard_map [
                 mesh=['x'=2:manual],
                 input_shardings=[{sharded}],
                 output_shardings=[{sharded}],
                 manual_axes=['x'],
-                global_input_types=[{global}],
-                global_output_types=[{global}],
+                global_input_types=[{host_global}],
+                global_output_types=[{host_global}],
             ] %0 [
                 body={{
                     lambda %0:{local} .
@@ -27928,7 +27932,6 @@ mod tests {
             ]",
             sharded = sharded_along_x(),
         };
-        let host_global = global.clone().with_memory(host);
         let program = identity_shard_map_program(
             manual_mesh(),
             sharded_along_x(),
@@ -27939,10 +27942,9 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap().to_string(),
             formatdoc! {"
-                lambda %0:{global} .
+                lambda %0:{host_global} .
                 {transposed_shard_map}
-                    %2:{host_global} = transfer_to_memory [destination=Host[Pinned]] %1
-                in (%2)"},
+                in (%1)"},
         );
         let host_unplaced = f32_type(&[4], None).with_memory(host);
         let program = identity_shard_map_program(
@@ -27955,34 +27957,33 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap().to_string(),
             formatdoc! {"
-                lambda %0:{global} .
+                lambda %0:{host_global} .
                 {transposed_shard_map}
-                    %2:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %1
-                    %3:{host_unplaced} = transfer_to_memory [destination=Host[Pinned]] %2
-                in (%3)"},
+                    %2:{host_unplaced} = broadcast [output_type={host_unplaced}, output_axes=[0]] %1
+                in (%2)"},
         );
 
-        // The accumulator of a replicated reference destination in host memory is transferred before it is added into
-        // that destination.
+        // The accumulator of a replicated reference destination in host memory stays in that memory.
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let caller_type = f32_type(&[2], None).with_memory(host);
         let program =
             identity_shard_map_program(manual_mesh(), replicated.clone(), sharded_along_x(), caller_type, Vec::new());
-        let replicated_type = f32_type(&[2], None).with_sharding(replicated.clone()).unwrap();
+        let replicated_type = f32_type(&[2], None).with_sharding(replicated.clone()).unwrap().with_memory(host);
         let host_replicated = f32_type(&[2], None).with_memory(host);
         let local_replicated = f32_type(&[2], None)
             .with_sharding(Sharding::replicated(manual_mesh(), 1).with_varying_manual_axes(["x"]).unwrap())
-            .unwrap();
+            .unwrap()
+            .with_memory(host);
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap().to_string(),
             formatdoc! {"
-                lambda %0:{global}, %1:ref<{host_replicated}> .
+                lambda %0:{host_global}, %1:ref<{host_replicated}> .
                 let %2:{replicated_type} = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{sharded}],
                     output_shardings=[{replicated}],
                     manual_axes=['x'],
-                    global_input_types=[{global}],
+                    global_input_types=[{host_global}],
                     global_output_types=[{replicated_type}],
                 ] %0 [
                     body={{
@@ -27995,9 +27996,8 @@ mod tests {
                         in (%4)
                     }},
                 ]
-                    %3:f32[2] = broadcast [output_type=f32[2], output_axes=[0]] %2
-                    %4:{host_replicated} = transfer_to_memory [destination=Host[Pinned]] %3
-                    () = reference_add_update %1 %4
+                    %3:{host_replicated} = broadcast [output_type={host_replicated}, output_axes=[0]] %2
+                    () = reference_add_update %1 %3
                 in ()",
                 sharded = sharded_along_x(),
             },

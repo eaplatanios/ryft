@@ -763,6 +763,59 @@ impl JitCallOperation<Type> {
         array.reshard_on_devices(session, mesh, &sharding, false)
     }
 
+    /// Returns `inputs`, the inputs of this call that `session` executes eagerly, with the arrays of the lifted capture
+    /// prefix moved to where the call runs when the callee names no devices. Such a call runs where its other array
+    /// inputs run (i.e., on the devices of the first committed one, or otherwise of the first one), and without them on
+    /// the default mesh of `session`, because a capture never decides where a call runs, as JAX ignores where the arrays
+    /// that a `jit` function closes over live. A capture moves onto those devices with its sharding, over its own
+    /// logical mesh when that has as many devices, and replicated otherwise, and keeps its commitment. Returns [`None`] when nothing moves
+    /// (e.g., for a call without captures or of a callee that names devices, whose inputs `Self::boundary_input` moves).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of moving a capture (e.g., for a capture of another client).
+    pub(crate) fn capture_inputs(&self, session: &Session, inputs: &[Value]) -> Result<Option<Vec<Value>>, Error> {
+        if self.mesh.is_some() || self.capture_count == 0 || inputs.len() < self.capture_count {
+            return Ok(None);
+        }
+        let operands = inputs[self.capture_count..].iter().filter_map(|input| match input {
+            Value::Array(array) => Some(array),
+            Value::Dimension(_) | Value::Reference(_) => None,
+        });
+        let target = match operands.clone().find(|array| array.is_committed()).or_else(|| operands.clone().next()) {
+            Some(array) => array.mesh().clone(),
+            None => session.device_mesh_for(&[], None)?,
+        };
+        let mut moved = false;
+        let inputs = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| match input {
+                Value::Array(array) if index < self.capture_count => {
+                    // The type of a capture can name its logical mesh (e.g., a sharding over explicit mesh axes), and
+                    // so can the callee, whose program then runs only on a mesh of that topology, so a capture keeps
+                    // its logical mesh over the devices of the call whenever it has as many devices.
+                    let logical_mesh = array.sharding().mesh();
+                    let (mesh, sharding) = if logical_mesh.has_same_topology(target.logical_mesh()) {
+                        (target.clone(), array.sharding().clone())
+                    } else if logical_mesh.device_count() == target.device_count() {
+                        (DeviceMesh::new(logical_mesh.clone(), target.devices().to_vec())?, array.sharding().clone())
+                    } else {
+                        let rank = array.r#type().shape().rank();
+                        (target.clone(), Sharding::replicated(target.logical_mesh().clone(), rank))
+                    };
+                    if array.mesh() == &mesh && array.sharding() == &sharding {
+                        return Ok(input.clone());
+                    }
+                    moved = true;
+                    array.clone().reshard_on_devices(session, &mesh, &sharding, false).map(Value::Array)
+                }
+                input => Ok(input.clone()),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(moved.then_some(inputs))
+    }
+
     /// Returns `array`, the result `index` of this call that `session` interprets eagerly, placed on the devices of
     /// the mesh of the call as the override of that result requests, like an execution of the callee places it, or
     /// `array` unchanged when the result has no override.
@@ -2520,9 +2573,10 @@ where
 /// callee names devices on `mesh` returns lives on those devices, so it is cast only to a type over a mesh of the same
 /// topology. A cotangent of an input over the canonical mesh of one device (i.e., [`LogicalMesh::single_device`]),
 /// which is where an uncommitted array lives, that a callee on a mesh of one device returns is instead placed onto the
-/// device of that mesh with a device target, which gathers it onto the canonical mesh there (refer to the type rule
-/// of `place`), so that it combines with the other cotangents of that input, and lives where JAX returns such a
-/// cotangent (i.e., on the devices of the call). Every other value is returned unchanged, because values over
+/// device of that mesh with a device target, which puts it on the canonical mesh there, and an unchecked cast states
+/// that type when the type rule of `place` does not (i.e., for a value whose type tracks no sharding), so that it
+/// combines with the other cotangents of that input, and lives where JAX returns such a cotangent (i.e., on the
+/// devices of the call). Every other value is returned unchanged, because values over
 /// different logical meshes do not combine, and a callee mesh of several devices has no such placement.
 fn refined_derived_value<C, V>(
     context: &C,
@@ -2547,7 +2601,13 @@ where
         && refined.sharding().is_some_and(|sharding| sharding.mesh() == &LogicalMesh::single_device())
     {
         let target = PlacementRequest::Device { device: *device, memory: Some(refined.memory()), layout: None };
-        return Ok(context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0));
+        let placed = context.bind(PlaceOperation::new(target, None), Vec::new(), &[value])?.remove(0);
+        let placed_type = placed.r#type().into_owned();
+        if placed_type == Type::Array(refined.clone()) {
+            return Ok(placed);
+        }
+        let cast = CastOperation::unchecked(Type::Array(refined.clone()), vec![placed_type])?;
+        return Ok(context.bind(cast, Vec::new(), &[placed])?.remove(0));
     }
     if moves_devices || refined.is_interchangeable_with(&declared) || !declared.is_refined_by(&refined) {
         return Ok(value);

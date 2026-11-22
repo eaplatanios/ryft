@@ -793,6 +793,7 @@ mod tests {
                 None,
                 None,
                 Some("cpu"),
+                true,
                 &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],

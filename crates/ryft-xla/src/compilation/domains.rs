@@ -23,7 +23,7 @@ use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
 use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
-use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options};
+use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
 use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
 use crate::execution::ExecutionPlan;
 use crate::lowering::admission::validate_data_dependent_compilation;
@@ -33,7 +33,6 @@ use crate::lowering::{
     entry_open_results, entry_result_placements, entry_result_shardings, has_committed_session_constants,
     has_placement_requests,
 };
-use crate::sharding::supports_shardy;
 use crate::{
     Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
     OpShardingExtension, Operation, Session, Type, Value,
@@ -58,11 +57,10 @@ impl CompilationDomain for Session {
     // A `jit_call` of a compiled function carries the boundary of that function (i.e., its sharding overrides and the
     // device mesh that the function names, refer to `JitCallOperation::with_boundary`), because the callee cannot show
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
-    // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when an
-    // execution of it commits every result to them whatever its inputs (refer to `names_devices`). Every entry point of
-    // the call therefore places, moves, and commits values as an execution of the function does, and the call requests
-    // the placement of its boundary as the shardings of a nested `jit` call do in JAX (refer to
-    // `has_placement_requests`). A call of a `jit` dispatcher without input sharding overrides also keeps its inputs
+    // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when it
+    // requests a placement (refer to `requests_placement`). Every entry point of the call therefore places, moves, and
+    // commits values as an execution of the function does, and the call requests the placement of its boundary as the
+    // shardings of a nested `jit` call do in JAX (refer to `has_placement_requests`). A call of a `jit` dispatcher without input sharding overrides also keeps its inputs
     // placed as they are, because the dispatcher specializes its executables for the placements of their inputs over
     // auto mesh axes (refer to `dispatch_signature`), unlike a function compiled for its input types alone. Core calls
     // this once for each staged function, so the walk of the callee program costs nothing per call. Other operations
@@ -75,7 +73,7 @@ impl CompilationDomain for Session {
                     .chain(options.input_shardings().into_iter().flatten().cloned().map(Some))
                     .collect();
                 let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
-                let mesh = names_devices(callee, options).then(|| options.mesh());
+                let mesh = requests_placement(callee, options).then(|| options.mesh());
                 let call = call.with_boundary(mesh, input_shardings, output_shardings);
                 let call = if dispatched && options.input_shardings().is_none() {
                     call.with_kept_input_placements()
@@ -530,18 +528,18 @@ impl Session {
         // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
         // still has to take the replica path. This is why every lowered region is inspected instead of just the
-        // boundary types, which it already subsumes. A target whose plugin lacks the Shardy dialect takes that path for
+        // boundary types, which it already subsumes. A target whose plugin cannot compile with Shardy takes that path for
         // every program, and only on a single device, where lowering can drop every sharding constraint.
         //
         // The target platform also gates platform-specific lowerings such as fused attention. A client whose platform
         // cannot be queried cannot compile the program either, so a failed query fails the lowering.
         let target = self.target()?;
         let target_platform = Some(target.platform_name());
-        let supports_shardy = supports_shardy(target_platform);
+        let supports_shardy = supports_shardy(self.client())?;
         if !supports_shardy && options.mesh().devices().len() != 1 {
             return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: format!(
-                    "platform `{}` does not support the Shardy dialect, so it only runs programs on a single device",
+                    "Ryft requires a single-device mesh because the plugin for platform `{}` cannot compile with Shardy",
                     target.platform_name(),
                 ),
             }));
@@ -561,7 +559,7 @@ impl Session {
                 } else {
                     format!(
                         "platform `{}` cannot run `shard_map` regions because `sdy.manual_computation` requires the \
-                         Shardy dialect",
+                         Shardy partitioner",
                         target.platform_name(),
                     )
                 },
@@ -613,6 +611,7 @@ impl Session {
             lowered_argument_shardings,
             lowered_result_shardings,
             target_platform,
+            supports_shardy,
             reference_states,
             options.ragged_dot_lowering_strategy(),
             &open_outputs,
@@ -858,18 +857,13 @@ pub(crate) fn jit_compilation_options(
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a
 /// value explicitly, through an input or output sharding override or anywhere in its program (refer to
-/// [`has_placement_requests`]), which commits every public output of its executions.
+/// [`has_placement_requests`]), which commits every public output of its executions. Such a function names the devices
+/// of the mesh of `options`, which every execution and every call of it runs on whatever its inputs. Any other function
+/// has a program that is agnostic of devices, and the inputs of a call decide where the call runs. The arrays that the
+/// function captures are not among them, whether they are committed or not, as JAX ignores where the arrays that a
+/// `jit` function closes over live (refer to `JitCallOperation`).
 fn requests_placement(program: &FlatProgram, options: &Options) -> bool {
     options.input_shardings().is_some() || options.output_shardings().is_some() || has_placement_requests(program)
-}
-
-/// Returns whether a function whose program is `program` and whose options are `options` names the devices of the mesh
-/// of `options`, which every execution of it runs on and commits all of its public outputs to whatever its inputs. This
-/// is the case when it requests a placement (refer to [`requests_placement`]) or captures a committed array (refer to
-/// [`has_committed_session_constants`]). Otherwise its program is agnostic of devices, and the devices of its inputs
-/// decide where it runs and what it commits.
-fn names_devices(program: &FlatProgram, options: &Options) -> bool {
-    requests_placement(program, options) || has_committed_session_constants(program)
 }
 
 /// Validates that the staged `output_types` carry the output sharding overrides of `options` (i.e.,

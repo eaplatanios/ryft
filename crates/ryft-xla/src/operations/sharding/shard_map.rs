@@ -425,8 +425,8 @@ pub(crate) mod tests {
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayShard, ArrayTracer, ExecutionArguments, FromPjrt, Options, Platform, Reference,
-        Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace,
+        Array, ArrayConstant, ArrayShard, ArrayTracer, ExecutionArguments, FromPjrt, Options, PlacementOptions,
+        Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program, trace,
         trace_with_context,
     };
 
@@ -5736,43 +5736,105 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_compilation_returns_outputs_in_the_memory_of_their_body_on_cpu() {
-        // A body that places its output in pinned host memory gives the global output that memory, both in the output
-        // type of the compiled function and in the memory of the buffers that an execution returns, as the output of
-        // `jax.device_put(x, jax.memory.Space.Host)` inside the body of a JAX `shard_map` lives in pinned host memory.
+    fn test_shard_map_compilation_agrees_with_its_types_on_memory_on_cpu() {
+        // The body of a map receives an input in the memory of the caller's value and gives the global output the
+        // memory of its own output, as the body of a JAX `shard_map` keeps `f32<host>` and returns `pinned_host`. The
+        // buffers that an execution returns live in the memory that the output types record, also for the derivatives
+        // and the batched form of the map, whether the body keeps the memory of its input or changes it.
+        #[derive(Clone, Copy)]
+        enum Body {
+            Identity,
+            Place(Memory),
+        }
+
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let manual = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_split = Sharding::new(manual.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let vector_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(split).unwrap();
         let pinned = Memory::Host { pinned: true };
-        let function = crate::compile::<_, ArrayType, ArrayType>(
-            move |x| {
-                shard_map(
-                    |local: ProjectedValue<ArrayType, _>| local.place(&pinned, None),
-                    x,
-                    manual.clone(),
-                    manual_split.clone(),
-                    manual_split.clone(),
-                    ShardMapOptions::new(),
-                )
-                .unwrap()
-            },
-            vector_type.clone(),
-            &session,
-            mesh.clone(),
-        )
-        .unwrap();
-        assert_eq!(function.output_types(), &[vector_type.clone().with_memory(pinned)]);
-        let input =
-            Array::from_host_buffer(&session, vector_type, mesh, None, values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0]))
-                .unwrap();
-        let output = function.executable().execute(&session, input).unwrap();
-        assert_eq!(output.r#type().memory(), pinned);
         let memory_kind = |shard: &ArrayShard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned();
-        assert_eq!(output.shards().iter().map(memory_kind).collect::<Vec<_>>(), vec!["pinned_host"; 2]);
-        assert_eq!(read_device_f32s(&output), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let observe = |array: &Array| {
+            array.block_until_ready().unwrap();
+            (array.r#type().memory(), array.shards().iter().map(memory_kind).collect::<Vec<_>>())
+        };
+        let upload = |shape: &[usize], sharding: &Sharding, memory: Memory, values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec()).with_sharding(sharding.clone()).unwrap();
+            let array =
+                Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(values)).unwrap();
+            match memory {
+                Memory::Device => array,
+                memory => session.place(array, PlacementOptions::to(memory)).unwrap(),
+            }
+        };
+        let rows = [
+            ("identity body on a pinned host input", Body::Identity, pinned, pinned),
+            ("body that places a device input in pinned host memory", Body::Place(pinned), Memory::Device, pinned),
+            ("body that places a pinned host input in device memory", Body::Place(Memory::Device), pinned, Memory::Device),
+        ];
+        let mut outcomes = Vec::new();
+        let mut expected_outcomes = Vec::new();
+        for (name, body, input_memory, output_memory) in rows {
+            let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(split.clone()).unwrap();
+            let input = upload(&[4], &split, input_memory, &[1.0, 2.0, 3.0, 4.0]);
+            let function = crate::compile::<_, ArrayType, ArrayType>(
+                |x| {
+                    shard_map(
+                        |local: ProjectedValue<ArrayType, _>| match body {
+                            Body::Identity => Ok(local),
+                            Body::Place(memory) => local.place(&memory, None),
+                        },
+                        x,
+                        manual.clone(),
+                        manual_split.clone(),
+                        manual_split.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap()
+                },
+                input_type.clone().with_memory(input_memory),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let output_type = |memory: Memory| input_type.clone().with_memory(memory);
+            assert_eq!(function.output_types(), &[output_type(output_memory)], "{name}");
+            let output = function.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!(read_device_f32s(&output), vec![vec![1.0, 2.0], vec![3.0, 4.0]], "{name}");
+            let (primal, tangent) =
+                function.jvp(&session).unwrap().executable().execute(&session, (input.clone(), input.clone())).unwrap();
+            let (vjp_output, pullback) = session
+                .differentiate_at(Value::Array(input.clone()))
+                .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+                .unwrap();
+            let cotangent = pullback.apply_materialized(vjp_output.clone()).unwrap();
+            let batch_sharding = Sharding::new(
+                mesh.logical_mesh().clone(),
+                vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+            )
+            .unwrap();
+            let batched_input = upload(&[2, 4], &batch_sharding, input_memory, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+            let batched = function
+                .batch(&session, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::default().with_extent(2))
+                .unwrap()
+                .executable()
+                .execute(&session, batched_input)
+                .unwrap();
+            let array = |value: Value| ValueProjection::<ArrayType>::into_projected(value).unwrap();
+            for (column, array, memory) in [
+                ("execution", output, output_memory),
+                ("JVP primal", primal, output_memory),
+                ("JVP tangent", tangent, output_memory),
+                ("VJP primal", array(vjp_output), output_memory),
+                ("VJP cotangent", array(cotangent), input_memory),
+                ("batching", batched, output_memory),
+            ] {
+                outcomes.push(format!("{name}, {column}: {:?}", observe(&array)));
+                let kind = if memory == Memory::Device { "device" } else { "pinned_host" };
+                expected_outcomes.push(format!("{name}, {column}: {:?}", (memory, vec![kind.to_string(); 2])));
+            }
+        }
+        assert_eq!(outcomes.join("\n"), expected_outcomes.join("\n"));
     }
 }

@@ -14,8 +14,11 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use ryft_core::{DeviceMesh, Parameterized, Sharding};
-use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionValue};
-use ryft_pjrt::{Client, Program};
+use ryft_pjrt::protos::{
+    CompilationOptions, ComputationDeviceAssignment, DebugOptions, DeviceAssignment, ExecutableCompilationOptions,
+    OptionValue,
+};
+use ryft_pjrt::{Client, Error as PjrtError, Program};
 
 use crate::compilation::keys::canonical_compilation_options_bytes;
 use crate::{Error, KernelCompilerBinding, RaggedDotLoweringStrategy};
@@ -410,13 +413,125 @@ impl Hash for Options {
     }
 }
 
-/// Cached XLA defaults of one process-lifetime PJRT client.
-struct ClientDebugOptions {
-    /// Client that resolves the defaults.
+/// Compilation probes shared by sessions using the same process-lifetime PJRT client.
+struct ClientCompilationProbes {
+    /// Client whose compiler is being queried.
     client: &'static Client<'static>,
+
+    /// Whether the compiler accepts Shardy. A failed query leaves the slot empty for a later attempt.
+    shardy: Mutex<Option<bool>>,
 
     /// Result of the portable compilation probe, including when the plugin cannot provide defaults.
     defaults: OnceLock<Option<DebugOptions>>,
+}
+
+impl ClientCompilationProbes {
+    fn for_client(client: &'static Client<'static>) -> Arc<Self> {
+        static CLIENTS: Mutex<Vec<Arc<ClientCompilationProbes>>> = Mutex::new(Vec::new());
+        let mut clients = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = clients.iter().find(|entry| std::ptr::eq(entry.client, client)) {
+            return Arc::clone(entry);
+        }
+        let entry = Arc::new(Self { client, shardy: Mutex::new(None), defaults: OnceLock::new() });
+        clients.push(Arc::clone(&entry));
+        entry
+    }
+}
+
+/// Returns whether this client's compiler accepts a static Shardy module with the Shardy partitioner enabled.
+/// The first query compiles a one-device identity without executing it. Sessions sharing a client reuse its answer.
+pub(super) fn supports_shardy(client: &'static Client<'static>) -> Result<bool, PjrtError> {
+    let entry = ClientCompilationProbes::for_client(client);
+    let mut cached = entry.shardy.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(supported) = *cached {
+        return Ok(supported);
+    }
+
+    // Each rank can compile against one of its own devices without coordinating with the other ranks.
+    // A client with no addressable device can still probe if it supports portable compilation.
+    let devices = client.addressable_devices()?;
+    let device = devices.first().map(|device| device.id()).transpose()?;
+    let assignment = device.map(|id| DeviceAssignment {
+        replica_count: 1,
+        computation_count: 1,
+        computation_devices: vec![ComputationDeviceAssignment { replica_device_ids: vec![id as i64] }],
+    });
+    let supported = probe_shardy(|module, shardy| {
+        let options = CompilationOptions {
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                device_assignment: assignment.clone(),
+                use_spmd_partitioning: shardy,
+                use_shardy_partitioner: shardy,
+                ..Default::default()
+            }),
+            compile_portable_executable: assignment.is_none(),
+            ..Default::default()
+        };
+        client.compile(&Program::Mlir { bytecode: module.as_bytes().to_vec() }, &options).map(drop)
+    })?;
+    *cached = Some(supported);
+    Ok(supported)
+}
+
+/// Tests the same identity with and, on a program rejection, without Shardy. Some plugins report an unknown dialect
+/// only on stderr and return a generic parse error to PJRT. Compiling the control distinguishes that rejection from
+/// a plugin that cannot compile even a plain module with the same device assignment.
+fn probe_shardy(mut compile: impl FnMut(&str, bool) -> Result<(), PjrtError>) -> Result<bool, PjrtError> {
+    let result = compile(
+        r#"module {
+              sdy.mesh @mesh = <["x"=1]>
+              func.func @main(%arg0: tensor<1xf32>) -> tensor<1xf32> {
+                  %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<1xf32>
+                  return %0 : tensor<1xf32>
+              }
+          }"#,
+        true,
+    );
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if is_shardy_program_rejection(&error) => {
+            compile(
+                "module { func.func @main(%arg0: tensor<1xf32>) -> tensor<1xf32> { return %arg0 : tensor<1xf32> } }",
+                false,
+            )?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// PJRT has no dedicated status for an unsupported input dialect. Some compilers use a general error code even
+/// for a parser diagnostic. Keep infrastructure failures visible and leave the cache empty when they occur.
+fn is_shardy_program_rejection(error: &PjrtError) -> bool {
+    match error {
+        PjrtError::InvalidArgument { .. } | PjrtError::Unimplemented { .. } => true,
+        PjrtError::Internal { message, .. }
+        | PjrtError::Unknown { message, .. }
+        | PjrtError::NotFound { message, .. }
+        | PjrtError::FailedPrecondition { message, .. } => {
+            let message = message.to_ascii_lowercase();
+            let mentions = |terms: &[&str]| terms.iter().any(|term| message.contains(term));
+            (mentions(&["shardy", "sdy", "spmd"])
+                && mentions(&[
+                    "unsupported",
+                    "not support",
+                    "unregistered",
+                    "not registered",
+                    "unknown",
+                    "not found",
+                    "not implemented",
+                    "unimplemented",
+                    "disabled",
+                    "unavailable",
+                ]))
+                || (mentions(&["failed to parse", "failed to deserialize"])
+                    && mentions(&["stablehlo", "mlir", "module", "program"]))
+        }
+        _ => false,
+    }
 }
 
 /// Supplies the client's default debug options to MLIR export for multi-partition CPU or CUDA programs that use
@@ -446,19 +561,7 @@ pub(crate) fn resolve_shardy_debug_options(client: &'static Client<'static>, opt
 
     // TODO(eaplatanios): Remove this workaround when CPU and CUDA PJRT resolve defaults and apply option overrides
     //  before MLIR export. Reference: https://github.com/openxla/xla/issues/52711
-    static CLIENT_DEFAULTS: Mutex<Vec<Arc<ClientDebugOptions>>> = Mutex::new(Vec::new());
-    let entry = {
-        let mut clients = CLIENT_DEFAULTS.lock().unwrap_or_else(PoisonError::into_inner);
-        match clients.iter().find(|entry| std::ptr::eq(entry.client, client)) {
-            Some(entry) => Arc::clone(entry),
-            None => {
-                let entry = Arc::new(ClientDebugOptions { client, defaults: OnceLock::new() });
-                clients.push(Arc::clone(&entry));
-                entry
-            }
-        }
-    };
-    // A client's probe can compile without holding the cache lock or blocking probes for other clients.
+    let entry = ClientCompilationProbes::for_client(client);
     if let Some(defaults) = entry.defaults.get_or_init(|| probe_debug_options(client))
         && requested_v3.or(defaults.xla_enable_hlo_sharding_v3) == Some(true)
     {
@@ -521,6 +624,45 @@ mod tests {
     use crate::tests::{device_mesh_2x2, hash_of};
 
     use super::*;
+
+    #[test]
+    fn test_supports_shardy() {
+        let first = crate::tests::cpu_client(1);
+        let second = crate::tests::cpu_client(2);
+        let first_entry = ClientCompilationProbes::for_client(first);
+        assert!(Arc::ptr_eq(&first_entry, &ClientCompilationProbes::for_client(first)));
+        assert!(!Arc::ptr_eq(&first_entry, &ClientCompilationProbes::for_client(second)));
+        assert_eq!(supports_shardy(first), Ok(true));
+        assert_eq!(*first_entry.shardy.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn test_probe_shardy() {
+        let parse_error = PjrtError::internal("Failed to parse StableHLO program.");
+        let client_error = PjrtError::unavailable("compiler service unavailable");
+        let internal_error = PjrtError::internal("Shardy worker lost its connection");
+        for (first, control, expected) in [
+            (Ok(()), None, Ok(true)),
+            (Err(parse_error.clone()), Some(Ok(())), Ok(false)),
+            (Err(PjrtError::failed_precondition("Unregistered dialect: sdy")), Some(Ok(())), Ok(false)),
+            (Err(PjrtError::unimplemented("Shardy partitioner is unavailable")), Some(Ok(())), Ok(false)),
+            (Err(parse_error), Some(Err(client_error.clone())), Err(client_error.clone())),
+            (Err(client_error.clone()), None, Err(client_error)),
+            (Err(internal_error.clone()), None, Err(internal_error)),
+        ] {
+            let mut results = [(true, first)].into_iter().chain(control.map(|result| (false, result)));
+            assert_eq!(
+                probe_shardy(|module, shardy| {
+                    let (expected_shardy, result) = results.next().unwrap();
+                    assert_eq!(shardy, expected_shardy);
+                    assert_eq!(module.contains("sdy.sharding_constraint"), shardy);
+                    result
+                }),
+                expected
+            );
+            assert!(results.next().is_none());
+        }
+    }
 
     #[test]
     fn test_feedback_directed_profile_new() {

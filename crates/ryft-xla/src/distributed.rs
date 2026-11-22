@@ -2762,7 +2762,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let r#type = ArrayType::new_static(DataType::F32, [4]);
             let values = values_to_bytes(&[1f32, 2., 3., 4.]);
             let source = Array::from_host_buffer(&session, r#type, None, None, values).unwrap();
-            assert!(source.has_process_local_devices(), "rank {rank} uploaded a value without process-local devices");
+            assert!(source.is_locally_assigned(), "rank {rank} uploaded a value whose devices were not locally assigned");
             assert_eq!(source.mesh().devices(), [devices[rank]]);
             for owner in [0, 1] {
                 let mesh = DeviceMesh::new(logical_mesh(1), vec![devices[owner]]).unwrap();

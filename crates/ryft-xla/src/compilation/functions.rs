@@ -4609,8 +4609,8 @@ mod tests {
             // The results of an eager call, like those of an execution, live on the devices of a compiled program,
             // which every process knows, rather than on devices that this process chose on its own.
             assert_eq!(
-                callee.call(row.input.clone()).map(|output| output.has_process_local_devices()),
-                Ok(executed.has_process_local_devices()),
+                callee.call(row.input.clone()).map(|output| output.is_locally_assigned()),
+                Ok(executed.is_locally_assigned()),
             );
             // The staged caller takes the captures of the callee as leading inputs, which its call receives first.
             let staged: StagedFunction<ArrayType, ArrayType> =

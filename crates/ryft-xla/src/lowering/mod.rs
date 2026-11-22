@@ -62,7 +62,7 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::validate_boundary_memory;
-use crate::sharding::{ShardyTensorSharding, supports_shardy};
+use crate::sharding::ShardyTensorSharding;
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation,
     Operation, Program, RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir,
@@ -1350,6 +1350,7 @@ where
         &value_shardings(argument_shardings, argument_count),
         &value_shardings(result_shardings, global_output_types.parameter_count()),
         target_platform,
+        true,
         &[],
         RaggedDotLoweringStrategy::default(),
         &[],
@@ -1396,6 +1397,7 @@ where
         argument_shardings,
         result_shardings,
         None,
+        true,
         &[],
         RaggedDotLoweringStrategy::default(),
         open_results,
@@ -1432,6 +1434,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     argument_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
+    supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
@@ -1453,6 +1456,7 @@ where
         &value_shardings(argument_shardings, argument_count),
         &value_shardings(result_shardings, global_output_types.parameter_count()),
         target_platform,
+        supports_shardy,
         reference_states,
         ragged_dot_lowering_strategy,
         open_results,
@@ -1974,11 +1978,10 @@ pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Err
     remove_unused_constants_in_block(module.body()?)
 }
 
-/// Removes every Shardy operation from `module`, including those in nested regions, for a target whose plugin lacks
-/// the Shardy dialect (refer to [`supports_shardy`]). Each `sdy.sharding_constraint` is replaced by its operand and
-/// the `sdy.mesh` declaration is erased. Such a target runs every program on a single device (compilation rejects any
-/// other mesh for it), where every sharding holds the whole array and thus every constraint is the identity, so the
-/// module computes the same values without them.
+/// Removes every Shardy operation from `module`, including those in nested regions, for a plugin that cannot compile
+/// with Shardy. Each `sdy.sharding_constraint` is replaced by its operand and the `sdy.mesh` declaration is erased.
+/// Ryft runs programs on such targets on a single device. Every sharding then holds the whole array, so removing
+/// these constraints preserves the result.
 ///
 /// # Errors
 ///
@@ -2127,6 +2130,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     argument_shardings: &[Option<Sharding>],
     result_shardings: &[Option<Sharding>],
     target_platform: Option<&str>,
+    supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
@@ -2395,9 +2399,6 @@ where
             }
         }
     }
-    // A target whose plugin lacks the Shardy dialect gets no sharding attributes, and `remove_shardy_operations` drops
-    // the sharding operations of its module below.
-    let supports_shardy = supports_shardy(target_platform);
     // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary, whose
     // types already omit static zeros and include hidden extent scalars, while tokens have no array type. Placement
     // belongs to physical array slots, including captures, but never to the appended effect token. Default device
@@ -2816,7 +2817,7 @@ fn remove_shardy_operations_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c,
             Ok(name) if name.starts_with("sdy.") => {
                 return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: name.to_string(),
-                    reason: "the target platform does not support the Shardy dialect".to_string(),
+                    reason: "the target plugin cannot compile with Shardy".to_string(),
                 }));
             }
             _ => {}
@@ -4222,8 +4223,8 @@ pub(crate) mod tests {
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned().unwrap())
             .collect::<Vec<_>>();
-        let lower = |target_platform| {
-            lower_mlir_module_for_program(
+        let lower = |supports_shardy| {
+            lower_mlir_module_for_program_with_reference_state(
                 &program,
                 &[],
                 &vec![input_type.clone()],
@@ -4231,11 +4232,15 @@ pub(crate) mod tests {
                 "main",
                 Some(std::slice::from_ref(&unreduced)),
                 Some(std::slice::from_ref(&replicated)),
-                target_platform,
+                Some("cpu"),
+                supports_shardy,
+                &[],
+                RaggedDotLoweringStrategy::default(),
+                &[],
             )
             .unwrap()
         };
-        let lowered = lower(Some("cpu"));
+        let lowered = lower(true);
         assert_eq!(lowered.mesh(), Some(&mesh));
         assert_eq!(
             lowered.into_stable_hlo(),
@@ -4249,7 +4254,7 @@ pub(crate) mod tests {
                 }
             "#},
         );
-        let lowered = lower(Some("mps"));
+        let lowered = lower(false);
         assert_eq!(lowered.mesh(), Some(&mesh));
         assert_eq!(
             lowered.into_stable_hlo(),
@@ -4314,7 +4319,7 @@ pub(crate) mod tests {
             remove_shardy_operations(&module),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
                 if operation == "sdy.manual_computation"
-                    && reason == "the target platform does not support the Shardy dialect",
+                    && reason == "the target plugin cannot compile with Shardy",
         ));
     }
 
@@ -4428,6 +4433,7 @@ pub(crate) mod tests {
             Some(argument_shardings.as_slice()),
             Some(result_shardings.as_slice()),
             None,
+            true,
             &states,
             RaggedDotLoweringStrategy::default(),
             &[],
@@ -4468,6 +4474,7 @@ pub(crate) mod tests {
                 Some(argument_shardings.as_slice()),
                 Some(result_shardings.as_slice()),
                 None,
+                true,
                 std::slice::from_ref(&invalid_state),
                 RaggedDotLoweringStrategy::default(),
                 &[],
@@ -4491,6 +4498,7 @@ pub(crate) mod tests {
                     argument_shardings,
                     result_shardings,
                     None,
+                    true,
                     &states,
                     RaggedDotLoweringStrategy::default(),
                     &[],
@@ -4511,6 +4519,7 @@ pub(crate) mod tests {
                 Some(argument_shardings.as_slice()),
                 Some(mismatched_result_shardings.as_slice()),
                 None,
+                true,
                 &states,
                 RaggedDotLoweringStrategy::default(),
                 &[],
@@ -4541,6 +4550,7 @@ pub(crate) mod tests {
                 Some(std::slice::from_ref(&sharding)),
                 Some(std::slice::from_ref(&sharding)),
                 None,
+                true,
                 std::slice::from_ref(&reference_state),
                 RaggedDotLoweringStrategy::default(),
                 &[],
