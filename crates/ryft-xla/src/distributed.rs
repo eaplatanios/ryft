@@ -2212,9 +2212,11 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let source = Array::from_host_buffer(&session, r#type, forward_mesh, None, values).unwrap();
 
             // Each rank sends its half to the other one and receives the other half into default device memory, which it
-            // then copies to the requested memory. Both ranks look up that memory before they issue any transfer, so a
-            // memory that a device lacks fails on both ranks alike, and every later swap still pairs its transfers. A
-            // swap that left a transfer unmatched would make the next swap between the same devices read stale halves.
+            // then copies to the requested memory. Each rank looks up that memory on its own device only after it issued
+            // both of its transfers, so a memory that its device lacks fails that rank after the swap is paired, and
+            // every later swap still pairs its transfers. A swap that left a transfer unmatched would make the next swap
+            // between the same devices read stale halves. Both memories exist on CUDA devices, so this does not exercise
+            // such a failure, and a rank that failed so would not reach the transfers of a later placement of a tree.
             for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
                 let target = ArrayPlacement::mesh(reversed_mesh.clone(), sharded.clone()).unwrap().with_memory(memory);
                 match source.to_placement(&session, target) {

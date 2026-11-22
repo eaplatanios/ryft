@@ -18,8 +18,10 @@ pub enum CompilationArtifactExchangeError {
 /// Exchanges serialized compiled programs between processes participating in a distributed job. Core treats keys and
 /// artifacts as opaque bytes. Backends must encode the complete compilation identity in keys, using identical bytes
 /// for matching compilations across processes. They must serialize every piece of invocation metadata and reject
-/// artifacts that are incompatible with the local runtime. Process zero is the leader that compiles and publishes,
-/// and every other process is a follower that receives.
+/// artifacts that are incompatible with the local runtime. For each compilation, one process is the
+/// [`artifact_exchange_leader`](crate::CompilationCacheDomain::artifact_exchange_leader) that compiles and publishes,
+/// and every other process that compiles the same program is a follower that receives. Processes that do not take part
+/// in a compilation never call this exchange for it.
 pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the zero-based index of this process.
     fn process_index(&self) -> usize;
@@ -27,15 +29,22 @@ pub trait CompilationArtifactExchange: Send + Sync {
     /// Returns the number of processes participating in the exchange.
     fn process_count(&self) -> usize;
 
-    /// Validates this process's compatibility with the leader for `key` before the leader compiles the program or a
-    /// follower waits for its artifact. Followers may wait up to `timeout` for the leader's compatibility announcement.
-    /// A process calls this function only for compilations that miss its in-memory cache. Processes may therefore call
-    /// it for different keys and in different orders, skip a key that another process compiles, or call it again for a
-    /// key whose program they evicted. Implementations must address each round by `key` rather than by call order, and
-    /// the leader must not wait for followers. Implementations should compare `key`, the process count, and any launch
-    /// or backend compatibility identity that the transport owns. The default validates only the local process
-    /// coordinates so that simple transports remain usable.
-    fn validate_compatibility(&self, key: &[u8], timeout: Duration) -> Result<(), CompilationArtifactExchangeError> {
+    /// Validates this process's compatibility with `leader`, the index of the leader process for `key`, before the
+    /// leader compiles the program or a follower waits for its artifact. Every process that calls this function for
+    /// `key` passes the same `leader`, and this process is that leader exactly when `leader` is its own index.
+    /// Followers may wait up to `timeout` for the leader's compatibility announcement. A process calls this function
+    /// only for compilations that miss its in-memory cache. Processes may therefore call it for different keys and in
+    /// different orders, skip a key that another process compiles, or call it again for a key whose program they
+    /// evicted. Implementations must address each round by `key` rather than by call order, and the leader must not
+    /// wait for followers. Implementations should compare `key`, the process count, and any launch or backend
+    /// compatibility identity that the transport owns. The default validates only the local process coordinates
+    /// and the leader index so that simple transports remain usable.
+    fn validate_compatibility(
+        &self,
+        key: &[u8],
+        leader: usize,
+        timeout: Duration,
+    ) -> Result<(), CompilationArtifactExchangeError> {
         let _ = key;
         let _ = timeout;
         if self.process_count() == 0 {
@@ -43,11 +52,19 @@ pub trait CompilationArtifactExchange: Send + Sync {
                 message: "exchange process count must be greater than zero".to_string(),
             });
         }
+
         if self.process_index() >= self.process_count() {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process index is outside the configured process count".to_string(),
             });
         }
+
+        if leader >= self.process_count() {
+            return Err(CompilationArtifactExchangeError::Incompatible {
+                message: "exchange leader index is outside the configured process count".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -174,27 +191,32 @@ mod tests {
 
     #[test]
     fn test_compilation_artifact_exchange_validate_compatibility() {
-        // The default checks only the process coordinates, so it accepts any key and timeout.
-        assert_eq!(
-            TestExchange { process_index: 0, process_count: 1 }.validate_compatibility(b"", Duration::ZERO),
-            Ok(())
-        );
-        assert_eq!(
-            TestExchange { process_index: 1, process_count: 2 }.validate_compatibility(b"key", Duration::from_secs(1)),
-            Ok(()),
-        );
+        // The default checks only the process coordinates and the leader index, so it accepts any key and timeout and
+        // any leader among the processes, including this process and another one.
+        let timeout = Duration::from_secs(1);
+        let exchange = |process_index, process_count| TestExchange { process_index, process_count };
+        assert_eq!(exchange(0, 1).validate_compatibility(b"", 0, Duration::ZERO), Ok(()));
+        assert_eq!(exchange(1, 2).validate_compatibility(b"key", 0, timeout), Ok(()));
+        assert_eq!(exchange(1, 3).validate_compatibility(b"key", 1, timeout), Ok(()));
+        assert_eq!(exchange(2, 3).validate_compatibility(b"key", 1, timeout), Ok(()));
 
         // An empty exchange reports its process count before the index that it cannot contain.
         assert_eq!(
-            TestExchange { process_index: 0, process_count: 0 }.validate_compatibility(b"key", Duration::from_secs(1)),
+            exchange(0, 0).validate_compatibility(b"key", 0, timeout),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process count must be greater than zero".to_string(),
             }),
         );
         assert_eq!(
-            TestExchange { process_index: 2, process_count: 2 }.validate_compatibility(b"key", Duration::from_secs(1)),
+            exchange(2, 2).validate_compatibility(b"key", 0, timeout),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: "exchange process index is outside the configured process count".to_string(),
+            }),
+        );
+        assert_eq!(
+            exchange(1, 2).validate_compatibility(b"key", 2, timeout),
+            Err(CompilationArtifactExchangeError::Incompatible {
+                message: "exchange leader index is outside the configured process count".to_string(),
             }),
         );
     }

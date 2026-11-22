@@ -1,3 +1,10 @@
+//! Resolved placements of arrays on concrete devices. A [`Placement`] names the devices that hold the shards of an
+//! array (i.e., a [`DeviceMesh`] and a [`Sharding`] over it) together with the optional [`Memory`] space and storage
+//! [`Layout`] of those shards. It is the resolved form of the target and the source of a
+//! [`PlaceOperation`](crate::PlaceOperation), whose other forms (i.e., a single device or a change of storage in place)
+//! are the variants of [`PlacementRequest`](crate::PlacementRequest), and it is what backend arrays report as the
+//! placement that they concretely live on (refer to [`Placed`](crate::Placed)).
+
 use std::fmt::Display;
 
 use ryft_macros::Parameter;
@@ -18,11 +25,14 @@ use crate::parameters::Parameter;
 /// types cannot record (refer to [`Sharding::without_auto_axes`]).
 ///
 /// A [`Placement`] plays two roles. As the target of a [`PlaceOperation`](crate::PlaceOperation), it says where a
-/// value must be moved, and an omitted memory or layout keeps the storage that the value already has. As the source
-/// of such an operation, it is informative and says where the value is expected to live when the operation is
-/// created. Transposition uses it to move the cotangent back to those devices, and type inference checks it against
-/// what the type of the value tracks, while backends that execute the operation on a concrete value move the value
-/// from wherever it actually lives without comparing that placement with the source.
+/// value must be moved. An omitted memory keeps the memory of the value, and an omitted layout keeps the layout of the
+/// value only while that layout still addresses each shard of the target (e.g., the byte strides of a column shard of
+/// a matrix do not address the one whole shard of a replicated target), and the placed value declares no layout
+/// otherwise, so that backends store it in their default layout. As the source of such an operation, it is informative
+/// and says where the value is expected to live when the operation is created. Transposition uses it to move the
+/// cotangent back to those devices, and type inference checks it against what the type of the value tracks, while
+/// backends that execute the operation on a concrete value move the value from wherever it actually lives without
+/// comparing that placement with the source.
 ///
 /// A [`Placement`] can also describe a batch item inside a batched function, which observes the placement of the packed
 /// value with its batch dimension removed. Such a batch item does not live on the whole mesh when its batch is split

@@ -360,16 +360,25 @@ pub struct ExecutionArguments {
 impl ExecutionArguments {
     /// Creates execution arguments that pass `arrays` to [`ryft_pjrt::LoadedExecutable::execute`] without donating any
     /// of them. The inputs of each device are in `addressable_device_ids` order, and
-    /// [`Self::as_execution_device_inputs`] converts the result to the form that PJRT consumes.
+    /// [`Self::as_execution_device_inputs`] converts the result to the form that PJRT consumes. Every array must
+    /// belong to the PJRT client of the first one, which must also own the executable that the arguments are passed
+    /// to, because PJRT cannot use the buffers of another client.
     pub fn from_arrays(arrays: Vec<Array>, addressable_device_ids: &[DeviceId]) -> Result<Self, Error> {
         let donation_flags = vec![false; arrays.len()];
         Self::from_arrays_with_donation(arrays, addressable_device_ids.into(), donation_flags.as_slice())
     }
 
-    /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
-    /// uniquely owned. A requested donation is silently downgraded to a non-donating input when any shard buffer is
-    /// shared (e.g., by another clone of the array). Callers that need to
-    /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
+    /// Creates execution arguments from `arrays` like [`Self::from_arrays`], honoring `donation_flags` only for arrays
+    /// that this function can take exclusive ownership of. A requested donation is silently downgraded to a
+    /// non-donating input when the array has another clone or any of its shard buffers is shared (e.g., through a
+    /// clone of the [`Arc`] that [`ArrayShard::buffer`] returns). Otherwise every shard buffer of the array leaves the
+    /// allocation that the array shared with any [`Weak`](std::sync::Weak) handle of it, so that no handle other than
+    /// the result can reach a buffer that a donating execution invalidates (refer to
+    /// [`Array::into_exclusive_shard_buffers`]). Donation is all or nothing per array, because PJRT requires the same
+    /// donation flag for an input on every device. A clone of a donatable buffer that a caller takes from
+    /// [`Self::inputs_by_device`] observes an invalid buffer once an execution has consumed it. Callers that need to
+    /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result. Donation only permits
+    /// PJRT to reuse the buffers of an input for the outputs of an execution, which it may not do.
     pub fn from_arrays_with_donation(
         arrays: Vec<Array>,
         addressable_device_ids: Arc<[DeviceId]>,
@@ -389,32 +398,52 @@ impl ExecutionArguments {
 
         // Every array must have exactly one buffer on each addressable device and none elsewhere. Its shards are
         // looked up by device in constant time, and counting its buffers detects buffers on other devices.
+        let client = arrays.first().map(Array::client);
         let mut inputs_by_device = (0..addressable_device_ids.len())
             .map(|_| Vec::with_capacity(arrays.len()))
             .collect::<Vec<Vec<ExecutionInput<'static>>>>();
-        for (array_index, (array, requested)) in arrays.iter().zip(donation_flags).enumerate() {
-            let donatable = *requested && array.has_unique_shard_buffers();
-            for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
-                let buffer = array
-                    .device_shard(device_id)
-                    .and_then(ArrayShard::buffer)
-                    .ok_or(Error::Execution(ExecutionError::MissingArrayShardForDevice { array_index, device_id }))?;
-                device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable });
+        for (array_index, (array, &requested)) in arrays.into_iter().zip(donation_flags).enumerate() {
+            if client.is_some_and(|client| !std::ptr::eq(array.client(), client)) {
+                return Err(Error::Execution(ExecutionError::ArgumentClientMismatch { index: array_index }));
             }
-            if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len() {
-                let device_id = array
+            if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len()
+                && let Some(device_id) = array
                     .shards()
                     .iter()
                     .filter(|shard| shard.buffer().is_some())
                     .map(|shard| shard.device().id())
                     .find(|device_id| !addressable_device_ids.contains(device_id))
-                    .unwrap();
+            {
                 return Err(Error::Execution(ExecutionError::UnexpectedArrayShardDevice { array_index, device_id }));
             }
+            let missing_shard = |device_id| ExecutionError::MissingArrayShardForDevice { array_index, device_id };
+            if requested && array.has_unique_shard_buffers() {
+                // The array is consumed here, so the shard of each device is found before its buffers are taken.
+                let shard_indices = addressable_device_ids
+                    .iter()
+                    .map(|&device_id| {
+                        array
+                            .device_shard(device_id)
+                            .filter(|shard| shard.buffer().is_some())
+                            .map(ArrayShard::index)
+                            .ok_or(Error::Execution(missing_shard(device_id)))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (mut buffers, donatable) = array.into_exclusive_shard_buffers();
+                for (device_inputs, shard_index) in inputs_by_device.iter_mut().zip(shard_indices) {
+                    let buffer = buffers[shard_index].take().unwrap();
+                    device_inputs.push(ExecutionInput { buffer, donatable });
+                }
+            } else {
+                for (device_inputs, &device_id) in inputs_by_device.iter_mut().zip(addressable_device_ids.iter()) {
+                    let buffer = array
+                        .device_shard(device_id)
+                        .and_then(ArrayShard::buffer)
+                        .ok_or(Error::Execution(missing_shard(device_id)))?;
+                    device_inputs.push(ExecutionInput { buffer: Arc::clone(buffer), donatable: false });
+                }
+            }
         }
-
-        // Dropping the consumed arrays leaves the execution inputs as the only owners of donated buffers.
-        drop(arrays);
         Ok(Self { addressable_device_ids, inputs_by_device })
     }
 
@@ -470,7 +499,8 @@ impl Session {
     }
 
     /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with the fence of
-    /// the whole execution. Programs with external reference state must flow through the stateful call surface
+    /// the whole execution, which also reports a failure of the producer of an input (refer to
+    /// `Self::execute_pjrt_buffers`). Programs with external reference state must flow through the stateful call surface
     /// instead, which owns the reference transaction and the hidden outputs that carry final reference states.
     ///
     /// The backend may execute inline or return pending arrays and a completion fence. This function adds no wait
@@ -491,8 +521,9 @@ impl Session {
         let mut resources = Some(self.prepare_execution_resources(program)?);
         let committed = inputs.iter().skip(program.capture_count()).any(Array::is_committed);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
-        let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
-        let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, &mut resources, |_| {})?;
+        let (arguments, input_fences, input_refinements, physical_output_count) = prepared.into_arguments()?;
+        let execution =
+            self.execute_pjrt_buffers(program, arguments, input_fences, physical_output_count, &mut resources, |_| {})?;
         let (physical_outputs, fence) = execution.into_parts();
         let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
         let outputs = self.reconstruct_compiled_outputs(
@@ -992,7 +1023,7 @@ impl Session {
                 // inputs here releases only retry ownership, allowing ordinary inputs to remain donatable.
                 drop(inputs.take());
                 // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
-                let (execution_inputs, input_refinements, physical_output_count) =
+                let (execution_inputs, input_fences, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments()?;
                 let read_only_guard_storage = RefCell::new(read_only_guards);
                 let prepared_replacement_storage = RefCell::new(prepared_replacements);
@@ -1020,6 +1051,7 @@ impl Session {
                 let execution = self.execute_pjrt_buffers(
                     program,
                     execution_inputs,
+                    input_fences,
                     physical_output_count,
                     &mut resources,
                     after_submission,
@@ -1187,6 +1219,10 @@ impl Session {
     ///   - `program`: Compiled program to execute.
     ///   - `arguments`: Physical array inputs grouped by device, to which this function appends the hidden effect
     ///     tokens of ordered programs.
+    ///   - `input_fences`: Execution fences of the inputs that are pending or failed. The fence that this function
+    ///     returns and passes to `after_submission` joins them with the completion of the execution, so that the
+    ///     outputs and the reference states that it produces report a failure of the producer of an input. The session
+    ///     work and the effect scope track the completion of the execution alone.
     ///   - `array_output_count`: Number of physical array outputs that every device returns.
     ///   - `resources`: Prepared invocation resources. This function takes them at the PJRT handoff so the caller
     ///     can release any reference guards before dropping the resources after an earlier failure.
@@ -1197,6 +1233,7 @@ impl Session {
         &self,
         program: &CompiledProgram,
         mut arguments: ExecutionArguments,
+        input_fences: Vec<ExecutionFence>,
         array_output_count: usize,
         resources: &mut Option<ExecutionResources>,
         after_submission: impl FnOnce(&ExecutionFence),
@@ -1273,8 +1310,10 @@ impl Session {
         // The fence releases the context before it reports readiness, and the session releases these leases only after
         // that, so pointees of the context's user data outlive native context destruction.
         self.runtimes().retain(&fence, retained_resources);
+        let joined_fence = (!input_fences.is_empty())
+            .then(|| ExecutionFence::join(std::iter::once(fence.clone()).chain(input_fences)));
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
-        after_submission(&fence);
+        after_submission(joined_fence.as_ref().unwrap_or(&fence));
         let output_count = program.signature().physical_output_count();
         debug_assert_eq!(array_output_count, program.signature().array_output_count());
         let invalid_outputs = device_outputs
@@ -1320,7 +1359,7 @@ impl Session {
                 per_output_buffers[output_index].push(buffer);
             }
         }
-        Ok(Execution::new(per_output_buffers, fence))
+        Ok(Execution::new(per_output_buffers, joined_fence.unwrap_or(fence)))
     }
 
     /// Places `inputs` on `mesh` according to `expected_shardings` at the call boundary. Inputs that already match skip
@@ -1761,14 +1800,31 @@ struct PreparedExecution {
 }
 
 impl PreparedExecution {
-    /// Consumes the materialized arrays into PJRT arguments grouped by device.
-    fn into_arguments(self) -> Result<(ExecutionArguments, <ArrayType as CoreType>::Refinements, usize), Error> {
+    /// Consumes the materialized arrays into PJRT arguments grouped by device, and returns them together with the
+    /// execution fences of those arrays (i.e., of the public arguments and the captures) that are pending or failed,
+    /// the input refinements, and the physical result count.
+    ///
+    /// An execution fence of an input can carry the failure of work that no buffer of the input depends on (e.g., of a
+    /// storage conversion or of an effect of its producer), which PJRT therefore cannot order the execution after, so
+    /// the fence of the outputs of the execution joins these fences (refer to `Session::execute_pjrt_buffers`). Fences
+    /// that completed successfully carry nothing, and an input without a fence (e.g., a host upload) costs only that
+    /// check.
+    fn into_arguments(
+        self,
+    ) -> Result<(ExecutionArguments, Vec<ExecutionFence>, <ArrayType as CoreType>::Refinements, usize), Error> {
+        let input_fences = self
+            .inputs
+            .iter()
+            .filter_map(Array::execution_fence)
+            .filter(|fence| !matches!(fence.is_ready(), Ok(true)))
+            .cloned()
+            .collect();
         let arguments = ExecutionArguments::from_arrays_with_donation(
             self.inputs,
             self.addressable_device_ids,
             self.donation_flags.as_slice(),
         )?;
-        Ok((arguments, self.input_refinements, self.physical_output_count))
+        Ok((arguments, input_fences, self.input_refinements, self.physical_output_count))
     }
 }
 
@@ -3423,9 +3479,8 @@ mod tests {
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
-        let program: FlatProgram = builder
-            .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder; 2], Vec::new())
-            .unwrap();
+        let program: FlatProgram =
+            builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         let holder = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
@@ -3669,7 +3724,14 @@ mod tests {
                 .zip([(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()])
                 .map(|(device, bytes)| {
                     client
-                        .buffer(bytes.as_slice(), BufferType::U8, [2, 4], None, device.clone(), Some(column_major.clone()))
+                        .buffer(
+                            bytes.as_slice(),
+                            BufferType::U8,
+                            [2, 4],
+                            None,
+                            device.clone(),
+                            Some(column_major.clone()),
+                        )
                         .unwrap()
                 })
                 .collect();
@@ -3685,9 +3747,7 @@ mod tests {
             .with_execution_fence(ExecutionFence::new(vec![producer]));
             (input, producer_promise)
         };
-        let is_producer_failure = |result: Result<(), Error>| {
-            matches!(result, Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed")
-        };
+        let is_producer_failure = |result: Result<(), Error>| matches!(result, Err(Error::Pjrt(ryft_pjrt::Error::Aborted { message, .. })) if message == "producer failed");
 
         // The synchronous path returns outputs whose readiness and readback report the failure.
         let (input, producer_promise) = failing_input();

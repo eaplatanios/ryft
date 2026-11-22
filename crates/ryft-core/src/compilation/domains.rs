@@ -253,6 +253,20 @@ pub trait CompilationCacheDomain: CompilationDomain {
         None
     }
 
+    /// Returns the index of the exchange leader of `program` (i.e., of the process that compiles it and publishes its
+    /// artifact through a [`CompilationArtifactExchange`](crate::CompilationArtifactExchange)), while every other
+    /// process that compiles `program` is a follower that receives that artifact. The leader must be one of the
+    /// processes that compile `program`, or its followers wait for an artifact that nobody publishes, and every process
+    /// must return the same index for `program` from information that all of them share. Domains whose programs can
+    /// run on a subset of the processes (e.g., on a mesh of their devices) therefore return the lowest index among
+    /// those processes. The default is process zero, which suits domains whose every compilation takes place on every
+    /// process.
+    #[inline]
+    fn artifact_exchange_leader(&self, program: &Self::LoweredProgram) -> usize {
+        let _ = program;
+        0
+    }
+
     /// Serializes a compiled program for persistent caching and artifact exchange. Returns `Ok(Some(bytes))` on success
     /// or `Ok(None)` when serialization is unavailable for this backend instance or compiled program (e.g., when the
     /// active runtime plugin does not implement executable serialization). This runtime capability check allows a

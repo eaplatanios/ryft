@@ -1429,7 +1429,7 @@ pub trait Parameterized<P: Parameter>: Sized {
 }
 
 /// Returns the sorted [`Display`] texts of the [`ParameterPath`]s that occur more than once in `paths`, each once.
-fn find_duplicate_paths<'p>(paths: impl IntoIterator<Item = &'p ParameterPath>) -> Vec<String> {
+pub(crate) fn find_duplicate_paths<'p, P: IntoIterator<Item = &'p ParameterPath>>(paths: P) -> Vec<String> {
     let mut seen_paths = HashSet::new();
     let mut duplicate_paths = paths
         .into_iter()

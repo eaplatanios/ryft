@@ -478,14 +478,19 @@ struct ActiveExchange<'o> {
     /// Persistent key bytes identifying the artifact to exchange.
     key: &'o [u8],
 
+    /// Index of the leader process of this compilation (refer to
+    /// [`CompilationCacheDomain::artifact_exchange_leader`]).
+    leader: usize,
+
     /// Follower deadline of the configured exchange policy.
     timeout: Duration,
 }
 
 impl ActiveExchange<'_> {
-    /// Returns whether this process is the exchange leader, which compiles and publishes artifacts.
+    /// Returns whether this process is the exchange leader of this compilation, which compiles and publishes its
+    /// artifact.
     fn is_leader(self) -> bool {
-        self.exchange.process_index() == 0
+        self.exchange.process_index() == self.leader
     }
 }
 
@@ -675,8 +680,9 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
     /// Attaches a distributed exchange of compiled artifacts that is used according to `policy`. The exchange is used
     /// only when the domain supplies a key through [`CompilationCacheDomain::persistent_cache_key`] and can serialize
     /// and deserialize compiled programs. Participating processes must produce identical key bytes for the same
-    /// compilation. Process zero compiles and publishes, while follower processes receive and restore. An exchange
-    /// with a single process is ignored.
+    /// compilation. The leader of each compilation (refer to [`CompilationCacheDomain::artifact_exchange_leader`])
+    /// compiles and publishes, while the other processes that compile the same program receive and restore it. An
+    /// exchange with a single process is ignored.
     #[inline]
     pub fn with_artifact_exchange(
         mut self,
@@ -918,7 +924,8 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
                     None
                 }
                 (Some((exchange, timeout)), Some(key)) => {
-                    let exchange = ActiveExchange { exchange, key, timeout };
+                    let leader = domain.artifact_exchange_leader(program);
+                    let exchange = ActiveExchange { exchange, key, leader, timeout };
                     self.validate_exchange_compatibility(exchange)?.then_some(exchange)
                 }
             };
@@ -979,7 +986,8 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
     /// this compilation.
     fn validate_exchange_compatibility(&self, exchange: ActiveExchange<'_>) -> Result<bool, C::Error> {
         let compatibility_start = Instant::now();
-        let Err(error) = exchange.exchange.validate_compatibility(exchange.key, exchange.timeout) else {
+        let Err(error) = exchange.exchange.validate_compatibility(exchange.key, exchange.leader, exchange.timeout)
+        else {
             self.record_duration(
                 CompilationStep::ExchangeCompatibilityValidation { outcome: CompilationStepOutcome::Succeeded },
                 compatibility_start.elapsed(),
@@ -2027,6 +2035,10 @@ mod tests {
         /// Accepts synthetic fixture artifacts independently of the lowered output count.
         accept_all_programs: bool,
 
+        /// Index of the exchange leader of every program (refer to
+        /// [`CompilationCacheDomain::artifact_exchange_leader`]).
+        exchange_leader: usize,
+
         /// One-shot backend compiler shared by clones of this fixture domain.
         compiler: Option<Arc<Mutex<Option<TestCompiler>>>>,
     }
@@ -2105,6 +2117,10 @@ mod tests {
                     message: format!("cached program {} cannot serve {} outputs", compiled.0, program.0.len()),
                 })
             }
+        }
+
+        fn artifact_exchange_leader(&self, _program: &TestLoweredProgram) -> usize {
+            self.exchange_leader
         }
 
         fn persistent_cache_key(&self, key: &u8) -> Option<Vec<u8>> {
@@ -2188,6 +2204,7 @@ mod tests {
         fn validate_compatibility(
             &self,
             _key: &[u8],
+            _leader: usize,
             _timeout: Duration,
         ) -> Result<(), CompilationArtifactExchangeError> {
             match self.state.compatibility_error.lock().unwrap().as_ref() {
@@ -2715,6 +2732,44 @@ mod tests {
     }
 
     #[test]
+    fn test_compilation_cache_with_artifact_exchange_leader_of_participating_processes() {
+        // Processes 1 and 2 of three compile a program that runs only on their devices (e.g., a reshard on a mesh of
+        // their devices), and process 0 never compiles it. The domain names process 1 as the leader of that program,
+        // so process 1 compiles and publishes it, and process 2 receives it, without waiting for process 0.
+        let state = Arc::new(TestExchangeState::default());
+        let policy = CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) };
+        let domain = TestDomain { exchange_leader: 1, ..TestDomain::persistent() };
+        let exchange = |process_index| TestExchange { process_index, process_count: 3, state: Arc::clone(&state) };
+        let follower_context =
+            CompilationCache::<TestDomain>::new().with_artifact_exchange(Arc::new(exchange(2)), policy);
+        let follower_domain = domain.clone();
+        let follower = thread::spawn(move || {
+            let program = compile_with(
+                &follower_context,
+                &follower_domain,
+                7,
+                move || -> Result<TestCompiledProgram, ProgramError> {
+                    panic!("process 2 must restore the artifact of process 1")
+                },
+            )
+            .unwrap();
+            (program.0, follower_context.statistics())
+        });
+
+        let leader_context =
+            CompilationCache::<TestDomain>::new().with_artifact_exchange(Arc::new(exchange(1)), policy);
+        let leader = compile_with(&leader_context, &domain, 7, move || Ok(TestCompiledProgram(29))).unwrap();
+        let (follower_value, follower_statistics) = follower.join().unwrap();
+        assert_eq!(leader.0, 29);
+        assert_eq!(follower_value, 29);
+        assert_eq!(leader_context.statistics().compilations, 1);
+        assert_eq!(leader_context.statistics().exchange_publishes, 1);
+        assert_eq!(leader_context.statistics().exchange_waits, 0);
+        assert_eq!(follower_statistics.compilations, 0);
+        assert_eq!(follower_statistics.exchange_hits, 1);
+    }
+
+    #[test]
     fn test_compilation_cache_with_artifact_exchange_borrowed_exchanges() {
         /// Exchange that borrows another exchange, which caches accept for as long as the borrowed exchange lives.
         struct BorrowedExchange<'o>(&'o TestExchange);
@@ -2731,9 +2786,10 @@ mod tests {
             fn validate_compatibility(
                 &self,
                 key: &[u8],
+                leader: usize,
                 timeout: Duration,
             ) -> Result<(), CompilationArtifactExchangeError> {
-                self.0.validate_compatibility(key, timeout)
+                self.0.validate_compatibility(key, leader, timeout)
             }
 
             fn publish(&self, key: &[u8], artifact: &[u8]) -> Result<(), CompilationArtifactExchangeError> {

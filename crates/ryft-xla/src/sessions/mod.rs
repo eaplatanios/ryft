@@ -1110,6 +1110,7 @@ impl Context for Session {
         let is_call = call.is_some();
         let call_locally_assigned = call.map(|call| call.results_are_locally_assigned(self, inputs));
         let call_mesh = call.and_then(|call| call.mesh()).cloned();
+        let has_regions = regions.region_count() > 0;
 
         let mut array_inputs = inputs
             .iter()
@@ -1577,11 +1578,15 @@ impl Context for Session {
         // committed, as JAX commits the result of an eager operation on a committed array, or when the program runs on
         // more than one device (refer to `Array::commit_if`). The captures of this application decide that rather than
         // the session constants of the cached program, which may come from other handles of the same arrays, so the
-        // commitment of the outputs depends neither on the order of the captures nor on the cache. The results of a
-        // call are committed as an execution of its callee commits them instead, which is when a public argument is
-        // committed or when the compiled program commits them (refer to `CompiledProgram::committed_outputs`), so that
-        // neither the mesh of this session nor a capture commits them. An unpinned call inherits local assignment from
-        // its public arguments.
+        // commitment of the outputs depends neither on the order of the captures nor on the cache. The results of an
+        // operation with regions are also committed when the compiled program commits them (i.e., when a region
+        // requests a placement, refer to `CompiledProgram::committed_outputs`), as an execution of a compiled function
+        // commits them and as JAX commits the result of a `lax.cond` whose branches place their values. The results of
+        // a call are committed as an execution of its callee commits them instead, which is when a public argument is
+        // committed or when the compiled program commits them, so that neither the mesh of this session nor a capture
+        // commits them. The commitment of the results of an operation without regions follows its inputs alone, even
+        // when the operation is itself a placement request (e.g., a sharding constraint). An unpinned call inherits
+        // local assignment from its public arguments.
         let mut arguments =
             compiled.constants.iter().map(|constant| constant.to_array(self)).collect::<Result<Vec<_>, _>>()?;
         let committed = if is_call {
@@ -1606,7 +1611,10 @@ impl Context for Session {
                             "eager program returned fewer arrays than its outputs".to_string(),
                         )
                     })?;
-                    let committed = committed || (is_call && array.is_committed());
+
+                    // The execution commits an output when a public argument is committed, which `committed` already
+                    // covers for an operation other than a call, or when the compiled program commits it.
+                    let committed = committed || (has_regions && array.is_committed());
                     Ok(Value::Array(array.commit_if(committed).with_locally_assigned(locally_assigned)))
                 }
                 EagerDispatchOutput::Dimension(value) => {
@@ -2047,18 +2055,19 @@ pub(crate) mod tests {
     use ryft_core::{
         AbsOperation, Add, AddOperation, AndOperation, Array as CoreArray, ArrayOperation, ArrayReference,
         Atan2Operation, AttachedRegions, BatchAxis, CaptureReference, Cast, CastOperation, CompareOperation,
-        ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, ConditionOperation,
-        ConstantOperation, DataType, DenseDifferentiableType, Device, Dimension as CoreDimension,
-        DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError, DimensionFromScalarOperation,
-        DimensionSizeOperation, DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation,
-        DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout,
-        Memory, MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Place,
-        PlaceDispatch, PlaceOperation, Placeholder, Placement, PlacementRequest, ProjectedContext, ProjectedValue,
-        Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation,
-        SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding,
-        ShardingDimension, ShardingError, StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer, Typed,
-        Value as CoreValue, WhileOperation, ZeroOperation, batch, differentiate_at, i4, rematerialize, shard_map,
-        shard_map_along, shard_map_with_inferred_input_shardings,
+        ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, Condition,
+        ConditionOperation, ConstantOperation, ConstrainSharding, DataType, DenseDifferentiableType, Device,
+        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError,
+        DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionValue,
+        DimensionVariable, DivOperation, DomainTracer, DynamicBroadcastOperation, DynamicReshapeOperation,
+        Error as CoreError, Exp, Fill, Layout, Memory, MeshAxisType, Mul, MulOperation, Neg, NegOperation,
+        OneOperation, ParallelReduceOperation, Place, PlaceDispatch, PlaceOperation, Placeholder, Placement,
+        PlacementRequest, ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceType, ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary,
+        ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape,
+        SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, ZeroOperation,
+        batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -2926,6 +2935,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_bind_commits_results_of_regions_that_request_a_placement() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let upload = |r#type: ArrayType, bytes: Vec<u8>| {
+            Value::Array(Array::from_host_buffer(&session, r#type, None, None, bytes).unwrap())
+        };
+        let input = upload(ArrayType::scalar(DataType::F32), 7f32.to_ne_bytes().to_vec());
+        let predicate = upload(ArrayType::scalar(DataType::Boolean), vec![1]);
+        assert!(!program_array(&input).is_committed());
+        assert!(!program_array(&predicate).is_committed());
+        let target =
+            Placement::new(program_array(&input).mesh().clone(), program_array(&input).sharding().clone()).unwrap();
+        let output = |value: Value| {
+            let array = program_array(&value);
+            assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![7.0]);
+            array.is_committed()
+        };
+
+        // A region operation on uncommitted inputs whose regions request a placement commits its results, as the
+        // execution of a compiled function that requests one does, and as JAX commits the result of a `lax.cond`
+        // whose branches place their values on a device.
+        let placed = predicate
+            .condition(|value| value.place(&target, None), |value| value.place(&target, None), input.clone())
+            .unwrap();
+        assert!(output(placed));
+        let (placed, ()) = scan(
+            |_, carry, ()| Ok((carry.place(&target, None)?, ())),
+            input.clone(),
+            (),
+            ScanOptions::new().with_iteration_count(2usize),
+        )
+        .unwrap();
+        assert!(output(placed));
+
+        // A region operation whose regions request no placement, and an operation without regions, leave the
+        // commitment of their results to their inputs.
+        let unplaced = predicate.condition(|value| Ok(value), |value| Ok(value), input.clone()).unwrap();
+        assert!(!output(unplaced));
+        let constrained = input.constrain_sharding(target.sharding()).unwrap();
+        assert!(!output(constrained));
+    }
+
+    #[test]
     fn test_session_bind_rejects_managed_callbacks() {
         let session = Session::builder().client(execution_client()).build().unwrap();
         let _guard = EffectCallbackGuard::enter();
@@ -3211,7 +3263,7 @@ pub(crate) mod tests {
         assert_eq!(moved.sharding(), &replicated);
         assert_eq!(
             vec![moved.r#type().into_owned()],
-            output_type(PlaceOperation::new(target.clone(), Some(source.clone()))).unwrap(),
+            output_type(PlaceOperation::new(target.clone(), source.clone())).unwrap(),
         );
         assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
 
@@ -3256,7 +3308,7 @@ pub(crate) mod tests {
         assert_eq!(gathered.layout(), Some(&layout));
         assert_eq!(
             vec![gathered.r#type().into_owned()],
-            PlaceOperation::new(target, Some(Placement::new(mesh, sharding).unwrap().with_layout(layout)))
+            PlaceOperation::new(target, Placement::new(mesh, sharding).unwrap().with_layout(layout))
                 .infer_output_types(&[sharded.r#type().into_owned()], &[])
                 .unwrap(),
         );
