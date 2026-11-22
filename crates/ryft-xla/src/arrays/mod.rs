@@ -634,13 +634,12 @@ impl Array {
         self.committed
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns whether this process chose the devices of this [`Array`] independently of the other processes.
-    /// Each process may hold the same value on devices of its own choice. A destination that names only a memory or
-    /// a layout sets [commitment](Self::is_committed) while preserving the original device assignment.
+    /// Returns whether this process chose the devices of this [`Array`] independently of the other processes. Each
+    /// process may hold the same value on devices of its own choice. A destination that names only a memory or a layout
+    /// sets [commitment](Self::is_committed) while preserving the original device assignment.
     ///
     /// An array is locally assigned when no destination that names devices was ever given for it or for the
-    /// arrays that it derives from. That is the case for the following arrays, and for no others.
+    /// arrays that it derives from. That is the case for the following arrays, and for no others:
     ///
     ///   - **Default Uploads:** It is a host value that was uploaded without a mesh by a [`Session`] without a
     ///     [default mesh](Session::device_mesh) (e.g., through [`Self::from_host_buffer`]), or a host value that
@@ -660,7 +659,7 @@ impl Array {
     ///
     /// Every process of a distributed program that applies the same functions to the same kinds of inputs therefore
     /// computes the same fact for its own array, which is what lets every process choose the same strategy when it
-    /// places such an array on devices of several processes (refer to [`crate::arrays::resharding`]).
+    /// places such an array on devices of several processes (refer to [`resharding`]).
     ///
     /// An array without the fact is treated as one whose devices every process knows, which holds only when every
     /// process of a distributed run names the same devices wherever a program names devices (e.g., the default mesh of
@@ -683,9 +682,9 @@ impl Array {
     /// devices of its first committed capture, whose fact its results take, or otherwise on the
     /// [default mesh](Session::device_mesh) of `session`, which is information that every process shares, or, without
     /// one, on the first device of the client, which this process chose on its own, as for a default upload.
-    pub(crate) fn operands_are_locally_assigned<'a>(
+    pub(crate) fn operands_are_locally_assigned<'a, I: IntoIterator<Item = &'a Array>>(
         session: &Session,
-        inputs: impl IntoIterator<Item = &'a Array>,
+        inputs: I,
         captures: &[RetainedArray],
     ) -> bool {
         let mut inputs = inputs.into_iter().peekable();
