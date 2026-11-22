@@ -545,6 +545,22 @@ impl Array {
         Ok(self)
     }
 
+    /// Returns this array as a new logical array (refer to the identity rules of [`RetainedArray`]), with its type,
+    /// placement, buffers, completion fences, commitment, and locally assigned devices. Any new storage is registered
+    /// as one logical array with the array's [session](Self::session). An operation whose result is a new array calls
+    /// this function wherever it would otherwise return the storage of its input on this process (e.g., a forced copy
+    /// on a process that holds no buffer to copy), and no other function creates such storage. Storage that no other
+    /// handle refers to (i.e., that has no clone and no [`RetainedArray`]) is kept, because nothing can tell it apart
+    /// from new storage, so whether this function allocates depends on the handles of this process, while its result
+    /// is a new array on every process.
+    pub(crate) fn with_new_identity(mut self) -> Self {
+        if Arc::strong_count(&self.parts) != 1 || Arc::weak_count(&self.parts) != 0 {
+            let metadata = Arc::clone(&self.parts.metadata);
+            self.parts = Arc::new(ArrayParts::new(self.session(), metadata, self.parts.shards.clone()));
+        }
+        self
+    }
+
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
     #[inline]
     pub fn data_type(&self) -> DataType {

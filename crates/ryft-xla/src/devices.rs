@@ -16,6 +16,17 @@ impl FromPjrt<PjrtDevice<'_>> for Device {
 }
 
 impl FromPjrt<&PjrtDevice<'_>> for Device {
+    // Converts a PJRT device into the coordinates of a `ryft-core` `Device` (i.e., its device identifier and its
+    // process index), without the PJRT client that owns it. Device coordinates make placements and programs portable
+    // across clients, so a converted device names those coordinates rather than that PJRT device: every client with a
+    // device at the same coordinates resolves it to its own device, and a `Session` resolves every `Device` that it is
+    // given against its own client. Converting the device of another client (e.g., device 0 of a second CPU client) and
+    // placing a value through a session therefore places it on the device of the session's client with those
+    // coordinates, not on the device of the other client. A session rejects a device of its own process that its client
+    // does not address (`ArrayError::NonAddressableDevice`), and the devices of other processes are resolved by the
+    // processes that own them. Arrays cannot move between PJRT clients through this frontend, where JAX's `device_put`
+    // can transfer an array to a device of another platform.
+
     type Output = Result<Self, ryft_pjrt::Error>;
 
     #[inline]

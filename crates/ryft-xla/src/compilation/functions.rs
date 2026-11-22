@@ -4570,49 +4570,51 @@ mod tests {
         assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
 
         // A capture whose type leaves a dimension unconstrained is stored replicated, so it follows the function like
-        // a replicated capture, explicitly captured and imported into a nested body alike. So does an array that is
-        // split along an auto axis and imported into a nested body.
+        // a replicated capture.
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
+        let capture = Array::from_host_buffer(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            Some(unconstrained),
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+            |captures, _: CompileTracer| captures[0].clone(),
+            vec![capture],
+            vector_type.clone(),
+            &session,
+            single_device_mesh.clone(),
+        )
+        .unwrap();
+        let output = function.executable().execute(&session, input.clone()).unwrap();
+        assert_eq!(output.mesh(), &single_device_mesh);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        // An array that a nested body imports keeps the type that it was imported with, which names the mesh of the
+        // array, so an array split along an auto axis of another topology fails the topology check of lowering even
+        // though the executable could receive it replicated (a recorded limit).
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        for sharding in [unconstrained.clone(), split] {
-            let capture = Array::from_host_buffer(
-                &session,
-                vector_type.clone(),
-                mesh.clone(),
-                Some(sharding.clone()),
-                values_to_bytes(&values),
-            )
-            .unwrap();
-            if sharding == unconstrained {
-                let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
-                    |captures, _: CompileTracer| captures[0].clone(),
-                    vec![capture.clone()],
-                    vector_type.clone(),
-                    &session,
-                    single_device_mesh.clone(),
-                )
+        let capture =
+            Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(split), values_to_bytes(&values))
                 .unwrap();
-                let output = function.executable().execute(&session, input.clone()).unwrap();
-                assert_eq!(output.mesh(), &single_device_mesh);
-                assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
-            }
-            let body = rematerialize(|x: Tracer<TracingContext<Constant, Operation>>| {
-                ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))
-            });
-            let function: CompiledFunction<ArrayType, ArrayType> = compile(
-                |x: CompileTracer| {
-                    ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
-                },
-                vector_type.clone(),
-                &session,
-                single_device_mesh.clone(),
-            )
-            .unwrap();
-            let output = function.executable().execute(&session, input.clone()).unwrap();
-            assert_eq!(output.mesh(), &single_device_mesh);
-            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
-        }
+        let body = rematerialize(|x: Tracer<TracingContext<Constant, Operation>>| {
+            ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))
+        });
+        let function = compile::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| {
+                ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
+            },
+            vector_type.clone(),
+            &session,
+            single_device_mesh.clone(),
+        );
+        assert_eq!(
+            function.map(|_| ()).unwrap_err().to_string(),
+            "mesh `['x'=2:auto]` does not have the topology of the module mesh `['device'=1:auto]`",
+        );
     }
 
     #[test]
@@ -7333,21 +7335,21 @@ mod tests {
             options,
         )
         .unwrap();
-        fn overrides<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
-            function: &CompiledFunction<In, Out>,
-        ) -> (Option<Vec<Sharding>>, Option<Vec<Sharding>>) {
-            let options = function.function.staged().options();
+        let overrides = |options: &Options| {
             (options.input_shardings().map(<[_]>::to_vec), options.output_shardings().map(<[_]>::to_vec))
-        }
+        };
 
         // The executables of the gradient and of the JVP receive the inputs that they share with the function where an
         // execution of the function receives them, rather than gathering a split argument at their entry, as JAX keeps
         // the shardings of a `jit` function for its JVP (with the tangents placed as their primals) and its gradient.
         // The JVP also returns the outputs that it shares with the function, and their tangents, as the function does.
         let gradient = function.gradient(&session).unwrap();
-        assert_eq!(overrides(&gradient), (Some(vec![split.clone()]), None));
+        assert_eq!(overrides(gradient.function.staged().options()), (Some(vec![split.clone()]), None));
         let jvp = function.jvp(&session).unwrap();
-        assert_eq!(overrides(&jvp), (Some(vec![split.clone(), split.clone()]), Some(vec![replicated.clone(); 2])));
+        assert_eq!(
+            overrides(jvp.function.staged().options()),
+            (Some(vec![split.clone(), split.clone()]), Some(vec![replicated.clone(); 2]))
+        );
 
         // A batched function applies the overrides to each batch item, and the batch dimension takes the placement of
         // the batch axis.
@@ -7360,7 +7362,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            overrides(&batched),
+            overrides(batched.function.staged().options()),
             (Some(vec![batched_split]), Some(vec![Sharding::replicated(mesh.logical_mesh().clone(), 1)])),
         );
         let values = [0f32, 1.0, 2.0, 3.0];

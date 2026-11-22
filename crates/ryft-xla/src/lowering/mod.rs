@@ -1545,15 +1545,90 @@ pub(crate) fn has_placement_requests_in_region<V: Value<Type = Type> + Typed, O:
     includes_memory_requests: bool,
 ) -> bool {
     region.computation_regions().any(|region| {
-        region.instructions().iter().any(|instruction| {
-            let operation = instruction.operation();
-            operation.projected_payload::<PlaceOperation>().is_some_and(|operation| match operation.target() {
-                Some(PlacementRequest::InPlace { .. }) => includes_memory_requests,
-                target => target.is_some(),
-            }) || operation.projected_payload::<ConstrainShardingOperation>().is_some()
-                || operation.projected_payload::<JitCallOperation<Type>>().is_some_and(|call| call.mesh().is_some())
+        region.instructions().iter().any(|instruction| match placement_request(instruction.operation()) {
+            Some(InstructionPlacementRequest::Memory) => includes_memory_requests,
+            request => request.is_some(),
         })
     })
+}
+
+/// Placement request that one instruction makes explicitly (refer to [`has_placement_requests`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum InstructionPlacementRequest<'o> {
+    /// A `place` with a device target, which names that device.
+    Device(Device),
+
+    /// A `place` whose target is a resolved placement, or a `jit_call` whose callee names devices (refer to
+    /// [`JitCallOperation::with_boundary`]), which name the devices of this mesh.
+    Mesh(&'o DeviceMesh),
+
+    /// A `place` with an in-place target, which only moves a value to another memory and names no devices.
+    Memory,
+
+    /// A `constrain_sharding`, which names a sharding over a logical mesh but no devices.
+    Sharding,
+}
+
+/// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
+/// placement requests of a program, which both [`has_placement_requests`] (and through it whether a compiled function
+/// names the devices of its mesh, refer to `requests_placement` in `crate::compilation::domains`) and
+/// [`requested_placement_mesh`] project.
+pub(crate) fn placement_request<O: LowerableOperationFamily>(operation: &O) -> Option<InstructionPlacementRequest<'_>> {
+    if let Some(place) = operation.projected_payload::<PlaceOperation>() {
+        return match place.target()? {
+            PlacementRequest::InPlace { .. } => Some(InstructionPlacementRequest::Memory),
+            PlacementRequest::Device { device, .. } => Some(InstructionPlacementRequest::Device(*device)),
+            PlacementRequest::Resolved(placement) => Some(InstructionPlacementRequest::Mesh(placement.mesh())),
+        };
+    }
+    if operation.projected_payload::<ConstrainShardingOperation>().is_some() {
+        return Some(InstructionPlacementRequest::Sharding);
+    }
+    let mesh = operation.projected_payload::<JitCallOperation<Type>>()?.mesh()?;
+    Some(InstructionPlacementRequest::Mesh(mesh))
+}
+
+/// Returns the devices that the placement requests of the instructions of `regions` name (refer to
+/// [`placement_request`]), as the mesh of the first request that names devices (the canonical mesh of one device for a
+/// device target), or [`None`] when no request names devices. The caller includes the computation descendants of the
+/// regions that it wants searched (e.g., through [`RegionRef::computation_regions`]).
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOperation`] when two requests name different devices, which no single mesh
+/// runs, and the error of forming the mesh of a device target.
+#[cfg_attr(not(test), expect(dead_code, reason = "eager dispatch of operations with regions is about to call it"))]
+pub(crate) fn requested_placement_mesh<'r, V: Value<Type = Type> + Typed + 'r, O: LowerableOperationFamily + 'r>(
+    regions: impl IntoIterator<Item = RegionRef<'r, V, O>>,
+) -> Result<Option<Cow<'r, DeviceMesh>>, Error> {
+    let mut requested: Option<Cow<'r, DeviceMesh>> = None;
+    for region in regions {
+        for instruction in region.instructions() {
+            let mesh = match placement_request(instruction.operation()) {
+                Some(InstructionPlacementRequest::Device(device)) => {
+                    Cow::Owned(DeviceMesh::new(LogicalMesh::single_device(), vec![device])?)
+                }
+                Some(InstructionPlacementRequest::Mesh(mesh)) => Cow::Borrowed(mesh),
+                _ => continue,
+            };
+            match &requested {
+                None => requested = Some(mesh),
+                Some(first) if first.devices() == mesh.devices() => {}
+                Some(first) => {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: instruction.operation().name().to_string(),
+                        reason: format!(
+                            "it requests a placement onto the devices {:?}, while another placement request of the \
+                             same program names the devices {:?}, and the two do not form one mesh",
+                            mesh.devices().iter().map(Device::id).collect::<Vec<_>>(),
+                            first.devices().iter().map(Device::id).collect::<Vec<_>>(),
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(requested)
 }
 
 /// Placement that the entry region of a program gives one of its results, as [`entry_result_placements`] returns it.
@@ -5984,6 +6059,7 @@ pub(crate) mod tests {
             let scalar = session.place(4f32, PlacementOptions::defaults()).unwrap();
             let first = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
             let second = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
+            let copy = session.place(first.clone(), PlacementOptions::defaults().with_may_alias(false)).unwrap();
             if client.process_index().unwrap() == 0 {
                 let buffer = scalar.shards()[0].buffer().unwrap();
                 assert!(Arc::ptr_eq(first.shards()[0].buffer().unwrap(), buffer));
@@ -5994,14 +6070,14 @@ pub(crate) mod tests {
             }
             let mut builder = ArrayIrProgramBuilder::new();
             let first_clone = first.clone();
-            let outputs = [&scalar, &first, &second, &first_clone]
+            let outputs = [&scalar, &first, &second, &first_clone, &copy]
                 .map(|array| builder.add_constant(Constant::Session(RetainedArray::new(array))))
                 .to_vec();
-            let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 4]).unwrap();
+            let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 5]).unwrap();
             let constants = collect_session_constants(&program);
-            assert_eq!(constants, [&scalar, &first, &second].map(RetainedArray::new));
+            assert_eq!(constants, [&scalar, &first, &second, &copy].map(RetainedArray::new));
             let captures = constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
-            let output_types = vec![scalar.r#type().into_owned(); 4];
+            let output_types = vec![scalar.r#type().into_owned(); 5];
             to_mlir_module_for_program(&program, &captures, &(), &output_types, "main", None, None).unwrap()
         });
 
@@ -6010,12 +6086,59 @@ pub(crate) mod tests {
             modules[0],
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<f32>) -> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>) {
-                    return %arg0, %arg1, %arg2, %arg1 : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<f32>, %arg3: tensor<f32>) -> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>) {
+                    return %arg0, %arg1, %arg2, %arg1, %arg3 : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
                   }
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_requested_placement_mesh() {
+        let vector_type = test_vector_type(4);
+        let first = Device::new(0, 0);
+        let second = Device::new(1, 0);
+        let device_mesh = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let program = |targets: Vec<PlacementRequest>| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let mut value = builder.add_input(vector_type.clone().into());
+            for target in targets {
+                value = builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![value], None).unwrap()
+                    [0];
+            }
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let requested = |program: &FlatProgram| {
+            requested_placement_mesh(program.entry_region_ref().computation_regions())
+                .map(|mesh| mesh.map(Cow::into_owned))
+                .map_err(|error| error.to_string())
+        };
+        let memory = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
+
+        // A request that only moves a value to another memory names no devices, and requests that name the same
+        // devices form one mesh, which a device target names as the canonical mesh of that device.
+        assert_eq!(requested(&program(vec![memory.clone()])), Ok(None));
+        assert!(has_placement_requests(&program(vec![memory.clone()]), true));
+        assert!(!has_placement_requests(&program(vec![memory.clone()]), false));
+        assert_eq!(
+            requested(&program(vec![memory, PlacementRequest::from(first), PlacementRequest::from(first)])),
+            Ok(Some(device_mesh(first))),
+        );
+
+        // Requests that name different devices do not form one mesh.
+        assert_eq!(
+            requested(&program(vec![PlacementRequest::from(first), PlacementRequest::from(second)])),
+            Err("cannot lower `place`: it requests a placement onto the devices [1], while another placement \
+                 request of the same program names the devices [0], and the two do not form one mesh"
+                .to_string()),
+        );
+
+        // A call whose callee names devices names the devices of its mesh.
+        let call = JitCallOperation::<Type>::new(0).with_boundary(Some(&device_mesh(second)), Vec::new(), Vec::new());
+        let call = Operation::JitCall(call);
+        assert_eq!(placement_request(&call), Some(InstructionPlacementRequest::Mesh(&device_mesh(second))));
+        assert_eq!(placement_request(&Operation::JitCall(JitCallOperation::new(0))), None);
     }
 
     #[test]

@@ -34,7 +34,7 @@ use ryft_mlir::{
 };
 
 use crate::compilation::domains::{commits_public_outputs, declared_input_sharding};
-use crate::execution::validate_committed_input_devices;
+use crate::execution::{validate_committed_input_devices, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::lower_array_ir_type;
 use crate::lowering::{
@@ -902,6 +902,11 @@ impl JitCallOperation<Type> {
                 .enumerate()
                 .map(|(index, input)| match input {
                     Value::Array(array) => {
+                        // A reshard to the boundary never completes a pending reduction, so an input that the boundary
+                        // expects reduced is rejected as an execution rejects it, before anything is moved.
+                        if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), &declared[index]) {
+                            validate_input_reduction(array, &sharding, index, self.capture_count)?;
+                        }
                         self.boundary_input(session, mesh, index, array.clone(), &declared[index]).map(Value::Array)
                     }
                     _ => Ok(input.clone()),
@@ -940,6 +945,7 @@ impl JitCallOperation<Type> {
             if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared)
                 && array.sharding() != sharding.as_ref()
             {
+                validate_input_reduction(array, &sharding, index, self.capture_count)?;
                 let mesh = DeviceMesh::new(sharding.mesh().clone(), array.mesh().devices().to_vec())?;
                 let placed = array.clone().reshard_on_devices(session, &mesh, &sharding, false)?;
                 prepared.to_mut()[index] = Value::Array(placed);
@@ -3673,7 +3679,7 @@ mod tests {
         TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection, ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
-    use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
@@ -4200,6 +4206,18 @@ mod tests {
             module,
             indoc! {r#"
                 module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func private @jit_call_0(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    return %arg0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<4xf32>
+                    %2 = call @jit_call_0(%1) : (tensor<4xf32>) -> tensor<4xf32>
+                    %3 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                    %4 = call @jit_call_0(%3) : (tensor<4xf32>) -> tensor<4xf32>
+                    return %2, %4 : tensor<4xf32>, tensor<4xf32>
+                  }
                 }
             "#},
         );
@@ -9584,6 +9602,59 @@ mod tests {
 
         // A lifted capture of a call of a compiled function is placed by the executable's own rule.
         assert_eq!(placement(&JitCallOperation::new(1), 0), None);
+    }
+
+    #[test]
+    fn test_jit_call_operation_eager_inputs_reject_reduction_state_over_auto_axes() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input = |sharding: &Sharding| {
+            let buffers = client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .zip([1.0f32, 2.0])
+                .map(|(device, value)| {
+                    client.buffer(value.to_ne_bytes().as_slice(), BufferType::F32, [], None, device, None).unwrap()
+                })
+                .collect();
+            Array::from_addressable_buffers(
+                &session,
+                scalar_type.clone(),
+                mesh.clone(),
+                Some(sharding.clone()),
+                buffers,
+            )
+            .unwrap()
+        };
+        let plain: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x: CompileTracer| x, scalar_type.clone(), &session, mesh.clone()).unwrap();
+        let overridden: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x: CompileTracer| x,
+            scalar_type.clone(),
+            &session,
+            Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
+        )
+        .unwrap();
+
+        // An eager call places its input at the boundary of its callee, which expects it reduced, and a reshard never
+        // completes a pending sum over an auto axis, so the call rejects the input as an execution of the callee does,
+        // whether or not the callee names devices. A reduced input passes.
+        for function in [&plain, &overridden] {
+            assert_eq!(
+                function
+                    .call(input(&replicated.clone().with_unreduced_axes(["x"]).unwrap()))
+                    .unwrap_err()
+                    .to_string(),
+                "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
+                 because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, \
+                 or place it over explicit mesh axes, before passing it to a compiled function",
+            );
+            assert!(function.call(input(&replicated)).is_ok());
+        }
     }
 
     #[test]
