@@ -441,18 +441,45 @@ impl Session {
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
     }
 
-    /// Returns whether a value that is computed from the array inputs `inputs` and placed where
-    /// [`Self::device_mesh_for`] places it is committed to its devices (refer to [`Array::is_committed`]).
-    /// [`Array::commit_if`] extends this rule for eager results and host uploads without a mesh, which it also commits
-    /// when they live on more than one device. The value is committed when its mesh was chosen on purpose, which is the
-    /// case when an input is committed or, without array inputs, when this handle has a configured mesh. It is
-    /// uncommitted when its mesh is only a fallback, which is the case when all inputs are uncommitted or, without
-    /// array inputs, when this handle has no mesh and the value is placed on devices that the client enumerates first.
-    /// Values with array inputs are placed on the mesh of their inputs rather than on the mesh of this handle, so that
-    /// mesh does not commit them.
-    #[inline]
-    pub(crate) fn commits_placement(&self, inputs: &[Array]) -> bool {
-        if inputs.is_empty() { self.mesh.is_some() } else { inputs.iter().any(Array::is_committed) }
+    /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays
+    /// `captures`, and placed where [`Self::device_mesh_for`] places it, is committed to its devices (refer to
+    /// [`Array::is_committed`]). [`Array::commit_if`] extends this rule for eager results and host uploads without a
+    /// mesh, which it also commits when they live on more than one device. The value is committed when its mesh was
+    /// chosen on purpose, which is the case when an input or a capture is committed or, without array inputs, when
+    /// this handle has a configured mesh. It is uncommitted when its mesh is only a fallback, which is the case when
+    /// all inputs and captures are uncommitted or, without array inputs and committed captures, when this handle has
+    /// no mesh and the value is placed on devices that the client enumerates first. Values with array inputs are
+    /// placed on the mesh of their inputs rather than on the mesh of this handle, so that mesh does not commit them.
+    pub(crate) fn commits_placement<'a, I: IntoIterator<Item = &'a Array>>(
+        &self,
+        inputs: I,
+        captures: &[RetainedArray],
+    ) -> bool {
+        let mut inputs = inputs.into_iter().peekable();
+        let committed = if inputs.peek().is_some() { inputs.any(Array::is_committed) } else { self.mesh.is_some() };
+        committed || captures.iter().any(RetainedArray::is_committed)
+    }
+
+    /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays `captures`
+    /// lives on devices that this process chose on its own (i.e., [`Array::is_locally_assigned`] returns `true`).
+    /// An eager operation runs on the devices of its array inputs, so its results are locally assigned exactly when all
+    /// of those inputs are. Without array inputs, it runs on the devices of its first committed capture, whose fact its
+    /// results take, or otherwise on the [default mesh](Self::device_mesh) of this handle, which is information that
+    /// every process shares, or, without one, on the first device of the client, which this process chose on its own,
+    /// as for a default upload.
+    pub(crate) fn assigns_placement_locally<'a, I: IntoIterator<Item = &'a Array>>(
+        &self,
+        inputs: I,
+        captures: &[RetainedArray],
+    ) -> bool {
+        let mut inputs = inputs.into_iter().peekable();
+        if inputs.peek().is_some() {
+            return inputs.all(Array::is_locally_assigned);
+        }
+        match captures.iter().find(|capture| capture.is_committed()) {
+            Some(capture) => capture.is_locally_assigned(),
+            None => self.mesh.is_none(),
+        }
     }
 
     /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
@@ -1557,10 +1584,13 @@ impl Context for Session {
         // its public arguments.
         let mut arguments =
             compiled.constants.iter().map(|constant| constant.to_array(self)).collect::<Result<Vec<_>, _>>()?;
-        let committed = (!is_call && self.commits_placement(array_inputs.as_slice()))
-            || captures.iter().any(RetainedArray::is_committed);
-        let locally_assigned = call_locally_assigned
-            .unwrap_or_else(|| Array::operands_are_locally_assigned(self, &array_inputs, &captures));
+        let committed = if is_call {
+            captures.iter().any(RetainedArray::is_committed)
+        } else {
+            self.commits_placement(&array_inputs, &captures)
+        };
+        let locally_assigned =
+            call_locally_assigned.unwrap_or_else(|| self.assigns_placement_locally(&array_inputs, &captures));
         arguments.extend(array_inputs);
         let mut arrays = self
             .execute_program(&compiled.program, arguments)
@@ -2782,6 +2812,32 @@ pub(crate) mod tests {
         let outputs = domain.bind(AddOperation::new(), Vec::new(), &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_first_shard::<f32>(client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_session_assigns_placement_locally() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 1));
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+        let local = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
+        let shared = Array::from_host_buffer(&session, r#type, domain_mesh(client, "x", 1), None, bytes).unwrap();
+
+        // An operation runs on the devices of its array inputs, so its results are locally assigned exactly
+        // when all of them are, whatever the mesh of the session.
+        assert!(meshed_session.assigns_placement_locally(&[local.clone()], &[]));
+        assert!(session.assigns_placement_locally(&[local.clone(), local.clone()], &[RetainedArray::new(&shared)]));
+        assert!(!session.assigns_placement_locally(&[local.clone(), shared.clone()], &[]));
+
+        // Without array inputs, the first committed capture decides where it runs, and otherwise the session does,
+        // which chooses the first device of its client on its own only when it has no mesh.
+        assert!(session.assigns_placement_locally(&[], &[]));
+        assert!(!meshed_session.assigns_placement_locally(&[], &[]));
+        assert!(!meshed_session.assigns_placement_locally(&[], &[RetainedArray::new(&local)]));
+        let committed_local = RetainedArray::new(&local.with_committed(true));
+        assert!(meshed_session.assigns_placement_locally(&[], &[committed_local.clone()]));
+        assert!(!session.assigns_placement_locally(&[], &[RetainedArray::new(&shared), committed_local]));
     }
 
     #[test]

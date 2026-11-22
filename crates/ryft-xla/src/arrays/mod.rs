@@ -650,7 +650,7 @@ impl Array {
     ///     layout, or a copy of such an array on its own devices.
     ///   - **Eager Results:** It is the result of an eager operation whose array inputs are all locally assigned,
     ///     or of one without array inputs that runs where such an upload would (refer to
-    ///     [`Self::operands_are_locally_assigned`]).
+    ///     [`Session::assigns_placement_locally`]).
     ///
     /// A placement onto a device, a mesh, or a sharding, a construction on a mesh that the caller provides (e.g.,
     /// through [`Self::from_addressable_buffers`]), and direct execution of a compiled function all produce arrays
@@ -672,29 +672,6 @@ impl Array {
     #[inline]
     pub(crate) fn is_locally_assigned(&self) -> bool {
         self.locally_assigned
-    }
-
-    // TODO(eaplatanios): Should this be moved?
-    /// Returns whether the results of an eager operation that `session` applies to the array inputs `inputs` and the
-    /// captured arrays `captures` live on devices that this process chose on its own (refer to
-    /// [`Self::is_locally_assigned`]). The operation runs on the devices of its array inputs, so its results
-    /// are locally assigned exactly when all of those inputs are. Without array inputs, it runs on the
-    /// devices of its first committed capture, whose fact its results take, or otherwise on the
-    /// [default mesh](Session::device_mesh) of `session`, which is information that every process shares, or, without
-    /// one, on the first device of the client, which this process chose on its own, as for a default upload.
-    pub(crate) fn operands_are_locally_assigned<'a, I: IntoIterator<Item = &'a Array>>(
-        session: &Session,
-        inputs: I,
-        captures: &[RetainedArray],
-    ) -> bool {
-        let mut inputs = inputs.into_iter().peekable();
-        if inputs.peek().is_some() {
-            return inputs.all(Self::is_locally_assigned);
-        }
-        match captures.iter().find(|capture| capture.is_committed()) {
-            Some(capture) => capture.is_locally_assigned(),
-            None => !session.commits_placement(&[]),
-        }
     }
 
     /// Returns the [`ArrayShard`]s that make up this [`Array`].
@@ -2207,36 +2184,6 @@ mod tests {
         assert!(uploaded.clone().with_session(&meshed_session).unwrap().is_locally_assigned());
         assert!(RetainedArray::new(&uploaded).to_array(&meshed_session).unwrap().is_locally_assigned());
         assert!(!RetainedArray::new(&on_mesh).to_array(&session).unwrap().is_locally_assigned());
-    }
-
-    #[test]
-    fn test_array_operands_are_locally_assigned() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 1));
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let bytes = values_to_bytes(&[1f32, 2.]);
-        let local = Array::from_host_buffer(&session, r#type.clone(), None, None, bytes.as_slice()).unwrap();
-        let shared = Array::from_host_buffer(&session, r#type, domain_mesh(client, "x", 1), None, bytes).unwrap();
-
-        // An operation runs on the devices of its array inputs, so its results are locally assigned exactly when all of
-        // them are, whatever the mesh of the session.
-        assert!(Array::operands_are_locally_assigned(&meshed_session, &[local.clone()], &[]));
-        assert!(Array::operands_are_locally_assigned(
-            &session,
-            &[local.clone(), local.clone()],
-            &[RetainedArray::new(&shared)]
-        ));
-        assert!(!Array::operands_are_locally_assigned(&session, &[local.clone(), shared.clone()], &[]));
-
-        // Without array inputs, the first committed capture decides where it runs, and otherwise the session does,
-        // which chooses the first device of its client on its own only when it has no mesh.
-        assert!(Array::operands_are_locally_assigned(&session, &[], &[]));
-        assert!(!Array::operands_are_locally_assigned(&meshed_session, &[], &[]));
-        assert!(!Array::operands_are_locally_assigned(&meshed_session, &[], &[RetainedArray::new(&local)]));
-        let committed_local = RetainedArray::new(&local.with_committed(true));
-        assert!(Array::operands_are_locally_assigned(&meshed_session, &[], &[committed_local.clone()]));
-        assert!(!Array::operands_are_locally_assigned(&session, &[], &[RetainedArray::new(&shared), committed_local]));
     }
 
     #[test]

@@ -806,7 +806,7 @@ impl JitCallOperation<Type> {
             Value::Array(array) => Some(array),
             Value::Dimension(_) | Value::Reference(_) => None,
         });
-        self.mesh.is_none() && Array::operands_are_locally_assigned(session, operands, &[])
+        self.mesh.is_none() && session.assigns_placement_locally(operands, &[])
     }
 
     /// Places an input on the boundary's devices after all committed public arguments have passed the device check.
