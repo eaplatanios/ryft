@@ -1,13 +1,13 @@
 //! Placement of arrays on devices, which is the `ryft` analogue of JAX's
 //! [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html).
 //!
-//! A placement goes through three representations. An [`ArrayPlacement`] is a request, which names a bare device, a
-//! bare memory, a device mesh with a sharding, or a sharding over the [default mesh](Session::device_mesh) of a
+//! A placement goes through three representations. An [`ArrayPlacement`] is a request, which names a bare device,
+//! a bare memory, a device mesh with a sharding, or a sharding over the [default mesh](Session::device_mesh) of a
 //! session, and which may leave the memory and layout unspecified. A core [`PlacementRequest`] is the form in which a
 //! placement is recorded, which is a resolved [`Placement`] (i.e., the concrete devices, a sharding with the rank of
 //! the value, and the selected memory and layout, which inside a batched function also records how the enclosing
-//! batches are distributed), a bare device, or a change of storage in place. The backend then executes the placement on
-//! concrete arrays. A runtime [`Array`] moves its buffers with the strategies of `arrays::resharding`, and a traced
+//! batches are distributed), a bare device, or a change of storage in place. The backend then executes the placement
+//! on concrete arrays. A runtime [`Array`] moves its buffers with the strategies of `arrays::resharding`, and a traced
 //! value records a [`PlaceOperation`], which executes like that wherever its program runs on concrete arrays, and which
 //! a compiled function lowers to sharding, layout, and memory constraints over the devices of the mesh that it is
 //! compiled for.
@@ -28,31 +28,31 @@
 //! in its target or in its source, must belong to the program, because transposition turns a source into the target
 //! of the cotangent (refer to [`Session::place`]).
 //!
-//! There are three entry points.
+//! There are three entry points:
 //!
-//!   - [`Session::place`] accepts a tree of [`Placeable`] leaves, which are host values that it uploads, runtime
-//!     [`Array`]s, and traced values of compiled, differentiated, or batched functions, and it takes requests or
-//!     resolved placements through [`PlacementOptions`].
+//!   - [`Session::place`] accepts a [`Placeable`] [`Parameterized`], whose parameters are host values that it uploads,
+//!     runtime [`Array`]s, and traced values of compiled, differentiated, or batched functions, and it takes requests
+//!     or resolved placements through [`PlacementOptions`].
 //!   - [`Array::to_placement`] and [`Array::into_placement`] move one runtime [`Array`], the latter donating its
 //!     buffers.
 //!   - The core [`Place`] capability places any value that implements it, including traced values in every context,
-//!     with targets and sources of every form of [`PlacementRequest`] (e.g., resolved [`Placement`]s, [`Device`]s, and
-//!     [`Memory`] spaces), which it records without resolving them against a session.
+//!     with targets and sources of every form of [`PlacementRequest`] (e.g., resolved [`Placement`]s, [`Device`]s,
+//!     and [`Memory`] spaces), which it records without resolving them against a session.
 //!
 //! The destination, source, donation, and aliasing options of [`Session::place`] are each a tree prefix of the input,
-//! which is broadcast over the subtree under each of its leaves, so one destination can place a whole tree. A `None`
+//! which is broadcast over the subtree under each of its leaves, so one destination can place a whole tree. A [`None`]
 //! destination or source leaf omits that option for its subtree, and a prefix leaf over a subtree without leaves
 //! places nothing. A request whose sharding is shorter than the rank of a leaf replicates the omitted trailing
 //! dimensions, so one request can place leaves of different ranks.
 //!
-//! Placing runtime arrays issues the transfers and usually returns without waiting for them, so the readiness
-//! functions and the readbacks of each resulting [`Array`] (e.g., [`Array::block_until_ready`]) are what report their
-//! completion and any failure. A placement can still block the calling thread in the cases that `arrays::resharding`
-//! documents (e.g., on the first cross-host rendezvous between two devices of the CUDA plugin, and on host readbacks
-//! when the PJRT plugin lacks host to device transfer managers). Every [`Array`] that is placed on a destination, a
-//! bare memory included, is [committed](Array::is_committed) to its devices, a host value uploaded without one is
-//! uncommitted, and an [`Array`] without a destination keeps its commitment. A traced value stays traced, and these
-//! promises apply to the arrays that its placement produces when its program executes.
+//! Placing runtime arrays issues the transfers and usually returns without waiting for them, so the readiness functions
+//! and the readbacks of each resulting [`Array`] (e.g., [`Array::block_until_ready`]) are what report their completion
+//! and any failure. A placement can still block the calling thread in the cases that `arrays::resharding` documents
+//! (e.g., on the first cross-host rendezvous between two devices of the CUDA plugin, and on host readbacks when the
+//! PJRT plugin lacks host to device transfer managers). Every [`Array`] that is placed on a destination, a bare memory
+//! included, is [committed](Array::is_committed) to its devices, a host value uploaded without one is uncommitted, and
+//! an [`Array`] without a destination keeps its commitment. A traced value stays traced, and these promises apply to
+//! the arrays that its placement produces when its program executes.
 
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
@@ -77,7 +77,7 @@ use crate::{Error, FromPjrt, Session, Value};
 #[cfg(doc)]
 use ryft_core::Place;
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Placement of an [`Array`] on devices. It specifies a destination for [`Session::place`],
 /// [`Array::to_placement`], and [`Array::into_placement`], or an expected source in [`PlacementOptions`]. Its
@@ -5786,9 +5786,7 @@ mod tests {
                     // there is one. A result that is rejected as expected agrees.
                     let check_rejection =
                         |path: &str, expected: &Option<String>, result: &Result<(), String>| match expected {
-                            Some(expected)
-                                if !result.as_ref().is_err_and(|message| message.contains(expected.as_str())) =>
-                            {
+                            Some(expected) if result.as_ref().err() != Some(expected) => {
                                 Some(format!("{cell}, {path}: {result:?} does not report `{expected}`"))
                             }
                             _ => None,
@@ -5962,12 +5960,16 @@ mod tests {
         // device target of a pending sum over a larger axis are rejected, as for the same state over an explicit axis.
         // The type rule with the runtime sharding of the array agrees with the eager placement on every cell. A staged
         // value has only its type, so the replay of a staged program rejects the targets that restate a state over an
-        // auto axis when it is traced, and it agrees with the eager placement on every other target.
+        // auto axis when it is traced, and it agrees with the eager placement on every other target. Each input also
+        // has a packed counterpart of type `f32[2]` with the same state, whose batch items are such scalars, so that an
+        // eager `batch` of the placement of each item validates the item against its runtime sharding too, and accepts
+        // the identity target while it rejects a target that drops the state with the same error.
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto = DeviceMesh::new(auto_mesh.clone(), devices[..2].to_vec()).unwrap();
         let other_auto = DeviceMesh::new(auto_mesh.clone(), devices[2..].to_vec()).unwrap();
         let auto_replicated = Sharding::replicated(auto_mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F32);
+        let pair = ArrayType::new_static(DataType::F32, [2]);
         let changed = format!(
             "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding collective) \
              instead",
@@ -5988,6 +5990,17 @@ mod tests {
                     ],
                 )
                 .unwrap(),
+                Array::from_host_shards(
+                    &session,
+                    pair.clone(),
+                    auto.clone(),
+                    Some(Sharding::replicated(auto_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap()),
+                    [
+                        (devices[0].id(), values_to_bytes(&[1f32, 2.]).as_slice()),
+                        (devices[1].id(), values_to_bytes(&[10f32, 20.]).as_slice()),
+                    ],
+                )
+                .unwrap(),
             ),
             (
                 "reduced over an auto axis",
@@ -5999,9 +6012,17 @@ mod tests {
                     values_to_bytes(&[3f32]),
                 )
                 .unwrap(),
+                Array::from_host_buffer(
+                    &session,
+                    pair.clone(),
+                    auto.clone(),
+                    Some(Sharding::replicated(auto_mesh.clone(), 1).with_reduced_axes(["x"]).unwrap()),
+                    values_to_bytes(&[3f32, 30.]),
+                )
+                .unwrap(),
             ),
         ];
-        for (input_name, input) in auto_inputs {
+        for (input_name, input, packed) in auto_inputs {
             assert_eq!(
                 (observe(&input).values, input.r#type().into_owned()),
                 (vec![3.], scalar.clone().with_sharding(auto_replicated.clone()).unwrap())
@@ -6094,6 +6115,27 @@ mod tests {
                     if &result != expected {
                         disagreements.push(format!("{cell}, {path}: {result:?} != {expected:?}"));
                     }
+                }
+
+                // The identity target keeps the packed value exactly (i.e., its runtime sharding and the contribution
+                // of each device), and a target that drops the state is rejected with the error of the other paths.
+                let expected_batched = match target_name {
+                    "identity" => Ok((packed.sharding().clone(), shard_values(&packed))),
+                    "replicated" => Err(changed.clone()),
+                    _ => continue,
+                };
+                let batched: Result<Array, _> = batch(
+                    |x| record(&error, session.place(x, options())),
+                    packed.clone(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                );
+                let batched = batched
+                    .map(|output| (output.sharding().clone(), shard_values(&output)))
+                    .map_err(|other| error.take().unwrap_or(other.to_string()));
+                if batched != expected_batched {
+                    disagreements.push(format!("{cell}, batched: {batched:?} != {expected_batched:?}"));
                 }
             }
         }
