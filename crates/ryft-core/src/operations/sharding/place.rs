@@ -826,6 +826,27 @@ impl PlaceOperation {
         Ok(output)
     }
 
+    /// Validates this operation for a concrete value of type `input` whose sharding over every mesh axis is
+    /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule
+    /// of this operation (i.e., [`Self::infer_output_type`] followed by the check that the target splits each static
+    /// extent evenly), made with the concrete sharding of the value, so it is what a backend calls when it executes
+    /// this operation on a concrete value (e.g., when an eager context binds it), where the reduction state and the
+    /// shards of the value are known more precisely than its type records them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`TypeError`] of [`Self::infer_output_type`], and one for a target that splits a static extent
+    /// of the value unevenly.
+    pub fn infer_placed_output_type(
+        &self,
+        input: &ArrayType,
+        concrete_sharding: Option<&Sharding>,
+    ) -> Result<ArrayType, TypeError> {
+        let output = Self::infer_output_type(input, concrete_sharding, self.target(), self.source())?;
+        Self::validate_even_splits(input, self.target())?;
+        Ok(output)
+    }
+
     /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, leaves the reduction state of the value unchanged. This is the part of the type rule of
     /// [`PlaceOperation`] that owns reduction state (refer to [`Self::infer_output_type`], through which backends
@@ -994,10 +1015,7 @@ impl Operation for PlaceOperation {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        let input = &input_types[0];
-        let output = Self::infer_output_type(input, None, self.target(), self.source())?;
-        Self::validate_even_splits(input, self.target())?;
-        Ok(vec![output])
+        Ok(vec![self.infer_placed_output_type(&input_types[0], None)?])
     }
 
     #[inline]

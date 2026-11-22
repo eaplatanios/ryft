@@ -373,12 +373,11 @@ impl ExecutionArguments {
     /// non-donating input when the array has another clone or any of its shard buffers is shared (e.g., through a
     /// clone of the [`Arc`] that [`ArrayShard::buffer`] returns). Otherwise every shard buffer of the array leaves the
     /// allocation that the array shared with any [`Weak`](std::sync::Weak) handle of it, so that no handle other than
-    /// the result can reach a buffer that a donating execution invalidates (refer to
-    /// [`Array::into_exclusive_shard_buffers`]). Donation is all or nothing per array, because PJRT requires the same
-    /// donation flag for an input on every device. A clone of a donatable buffer that a caller takes from
-    /// [`Self::inputs_by_device`] observes an invalid buffer once an execution has consumed it. Callers that need to
-    /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result. Donation only permits
-    /// PJRT to reuse the buffers of an input for the outputs of an execution, which it may not do.
+    /// the result can reach a buffer that a donating execution invalidates. Donation is all or nothing per array,
+    /// because PJRT requires the same donation flag for an input on every device. A clone of a donatable buffer that a
+    /// caller takes from [`Self::inputs_by_device`] observes an invalid buffer once an execution has consumed it.
+    /// Callers that need to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
+    /// Donation only permits PJRT to reuse the buffers of an input for the outputs, which it may not do.
     pub fn from_arrays_with_donation(
         arrays: Vec<Array>,
         addressable_device_ids: Arc<[DeviceId]>,
