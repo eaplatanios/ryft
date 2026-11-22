@@ -1014,12 +1014,12 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 
 /// [`Operation`] that returns its first input at a different type representation (e.g., `f32[n]` as `f32[2]`). The
 /// input and output describe the same value, with equal extents on corresponding axes. Arrays require equal element
-/// types, rank and memory space. Layout may change, as long as the requested layout addresses the output shape (refer
-/// to [`ArrayType::validate_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes under the rules
-/// of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation. Placement over
-/// [`MeshAxisType::Manual`] axes is preserved, since it only changes through manual collectives, and so are manual
-/// variation and reduction state. Array types never record placement over [`MeshAxisType::Auto`] axes (refer to
-/// [`ArrayType::with_sharding`]), which belongs to backend compilers and is constrained through
+/// types, rank and memory space. Layout may change, as long as the requested layout addresses each shard of the output
+/// (refer to [`ArrayType::validate_shard_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes
+/// under the rules of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation.
+/// Placement over [`MeshAxisType::Manual`] axes is preserved, since it only changes through manual collectives, and so
+/// are manual variation and reduction state. Array types never record placement over [`MeshAxisType::Auto`] axes (refer
+/// to [`ArrayType::with_sharding`]), which belongs to backend compilers and is constrained through
 /// [`ConstrainShardingOperation`](crate::ConstrainShardingOperation) instead. The axes that shard a dimension are
 /// ordered from major to minor, so the axes up to and including a manual axis determine which block of the dimension
 /// each of its shards holds. Each dimension therefore keeps its axes up to and including its last manual axis, and only
@@ -2005,11 +2005,13 @@ impl CastType for ArrayIrType {
                     }
                 }
 
-                // A requested layout must address the output shape, so that a malformed request fails here rather than
-                // only when interpretation materializes the output or a backend lowers it.
-                output.validate_layout().map_err(|error| {
-                    TypeError::invalid(format!("`{CAST_OPERATION_NAME}` output layout is invalid: {error}"))
-                })?;
+                // A requested layout must address each shard of the output, so that a malformed request fails here
+                // rather than only when interpretation materializes the output or a backend lowers it.
+                if let Some(layout) = output.layout() {
+                    output.validate_shard_layout(layout, output.sharding(), false).map_err(|error| {
+                        TypeError::invalid(format!("`{CAST_OPERATION_NAME}` output layout is invalid: {error}"))
+                    })?;
+                }
             }
             (Self::Dimension(input), Self::Dimension(output)) => {
                 if matches!((input.extent(), output.extent()), (Some(input), Some(output)) if input != output) {

@@ -510,14 +510,14 @@ impl ArrayType {
         Ok(())
     }
 
-    /// Validates this array type's explicit [`Layout`], if any, against its [`Shape`] using the storage addressing
-    /// rules of [`ArrayAddressing`] (e.g., a strided or tiled layout must have the array's rank, and strides may not
-    /// alias elements). Dynamic extents are checked at their known lower bounds, because a symbolic type does not
-    /// know its runtime extents. Larger runtime extents can still expose additional stride aliasing or a storage size
-    /// overflow, which interpretation validates against the resolved extents. Operations whose output types request
-    /// a layout (e.g., [`BroadcastOperation`](crate::BroadcastOperation) and [`CastOperation`](crate::CastOperation))
-    /// call this function during type inference, so that a malformed request fails there rather than when the output
-    /// is materialized or lowered.
+    /// Validates this array type's explicit [`Layout`], if any, against its whole [`Shape`] using the storage
+    /// addressing rules of [`ArrayAddressing`] (e.g., a strided or tiled layout must have the array's rank, and strides
+    /// may not alias elements). Dynamic extents are checked at their known lower bounds, because a symbolic type does
+    /// not know its runtime extents. Larger runtime extents can still expose additional stride aliasing or a storage
+    /// size overflow, which interpretation validates against the resolved extents. This is the check for storage that
+    /// holds the whole value in one buffer (e.g., a reference [`Array`](crate::Array), or one shard whose shape is this
+    /// shape). A layout of a value that a sharding distributes describes each of its shards instead, so type rules
+    /// validate a requested layout with [`Self::validate_shard_layout`].
     ///
     /// # Errors
     ///
@@ -540,6 +540,83 @@ impl ArrayType {
             })?;
         }
         Ok(())
+    }
+
+    /// Validates `layout` as the storage layout of each shard of a value of this type that `sharding` distributes, as
+    /// far as the type and `sharding` determine those shards. A layout describes each shard (i.e., the buffer that one
+    /// device holds), never the whole value, so this is the layout check of every type rule that requests or keeps a
+    /// layout for a value with a sharding (e.g., [`BroadcastOperation`](crate::BroadcastOperation),
+    /// [`CastOperation`](crate::CastOperation), and [`PlaceOperation`](crate::PlaceOperation), which passes the
+    /// sharding of its target or the concrete sharding of its input), so that a type that one of them accepts is
+    /// accepted by the others. A value without `sharding` has one shard, which is the whole value.
+    ///
+    /// A tiled layout is a permutation of the dimensions with tiles, which is valid for every shape of its rank, so it
+    /// is validated against the shape of the value. A strided layout holds byte strides that must keep the elements of
+    /// a shard apart, and strides that overlap the elements of a shard also overlap those of every larger shard, so it
+    /// is validated against the largest shard (i.e., the first shard along each dimension, which holds the ceiling of
+    /// its extent divided by the number of shards along it, also when that number does not divide it). An unconstrained
+    /// dimension (i.e., `{?}`) is stored replicated (refer to [`ShardingDimension::Unconstrained`]), so its shards have
+    /// its whole extent, as for a replicated dimension. A dynamic extent is replaced by its lower bound, so a layout is
+    /// rejected when it overlaps the elements of a shard for every extent that the bounds permit (e.g., a zero stride
+    /// of an `f32[n]` with `2 <= n <= 8`), and accepted when it only overlaps those of larger extents (e.g., a zero
+    /// stride of an `f32[n]` with `1 <= n <= 8`), which the backend that places a concrete value validates against the
+    /// shards that it creates. The shards are only determined when `sharding` describes every mesh axis, which
+    /// `is_complete` states (e.g., the runtime sharding of a concrete value), or when its mesh has no
+    /// [`MeshAxisType::Auto`] axis larger than one, along which a value may be split without its type
+    /// recording it. Otherwise, only the rank of a strided layout is validated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`TypeError`] of [`Self::validate_layout`] for the largest shard, or one for a strided layout whose
+    /// rank is not the rank of this type when the shards are not determined.
+    pub fn validate_shard_layout(
+        &self,
+        layout: &Layout,
+        sharding: Option<&Sharding>,
+        is_complete: bool,
+    ) -> Result<(), TypeError> {
+        let shard_shape = match (layout, sharding) {
+            (Layout::Tiled(_), _) | (_, None) => Some(self.shape().clone()),
+            (Layout::Strided(_), Some(sharding)) => {
+                let is_determined = is_complete
+                    || sharding
+                        .mesh()
+                        .axes()
+                        .iter()
+                        .all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1);
+                let dimensions = self
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .zip(sharding.dimensions())
+                    .map(|(dimension, sharding_dimension)| {
+                        let extent = dimension.bounds().lower();
+                        Dimension::Static(match sharding_dimension {
+                            ShardingDimension::Replicated | ShardingDimension::Unconstrained => extent,
+                            ShardingDimension::Sharded(axis_names) => {
+                                // The product is over distinct axes of one mesh, so it never exceeds the device count
+                                // of that mesh, which fits `usize`, and it is at least one.
+                                let count = axis_names
+                                    .iter()
+                                    .filter_map(|name| sharding.mesh().axis_size(name))
+                                    .product::<usize>();
+                                extent.div_ceil(count.max(1))
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (is_determined && dimensions.len() == self.rank()).then(|| Shape::new(dimensions))
+            }
+        };
+        match (layout, shard_shape) {
+            (_, Some(shape)) => self.clone().with_shape(shape).with_layout(layout.clone()).validate_layout(),
+            (Layout::Strided(strided), None) if strided.rank() != self.rank() => Err(TypeError::invalid(format!(
+                "strided layout rank {} does not match array rank {}",
+                strided.rank(),
+                self.rank(),
+            ))),
+            (_, None) => Ok(()),
+        }
     }
 
     /// Returns this array type's sharding for a same-rank resize, preserving dimension placement and reduction state.
@@ -1964,6 +2041,70 @@ mod tests {
                 "strided layout stride 2 on axis 0 is smaller than the 4-byte span occupied by more minor axes and \
                  may alias array elements",
             )),
+        );
+    }
+
+    #[test]
+    fn test_array_type_validate_shard_layout() {
+        let strided = |strides: Vec<isize>| Layout::Strided(StridedLayout::new(strides));
+        let overlap = |stride: isize, axis: usize, span: usize| {
+            Err(TypeError::invalid(format!(
+                "strided layout stride {stride} on axis {axis} is smaller than the {span}-byte span occupied by more \
+                 minor axes and may alias array elements",
+            )))
+        };
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let auto = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let split = |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions);
+
+        // A layout describes each shard, so the byte strides `[8, 4]` of a dense `f32[4, 2]` column shard address the
+        // column shards of an `f32[4, 4]` value, while they overlap the rows of the whole value and of a replicated
+        // value, and strides that overlap a column shard are rejected. A tiled layout is valid for any shape of its
+        // rank.
+        let matrix = ArrayType::new_static(F32, [4, 4]);
+        let columns = split(&explicit, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(explicit.clone(), 2);
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![8, 4]), Some(&columns), false), Ok(()));
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![8, 4]), None, false), overlap(8, 0, 16));
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![8, 4]), Some(&replicated), false), overlap(8, 0, 16));
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![4, 8]), Some(&columns), false), overlap(8, 1, 16));
+        let tiled = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        assert_eq!(matrix.validate_shard_layout(&tiled, Some(&columns), false), Ok(()));
+
+        // An uneven split is validated against its largest shard, which is the first one (e.g., two of the three
+        // elements of an `f32[3]` over two devices).
+        let vector = ArrayType::new_static(F32, [3]);
+        let elements = split(&explicit, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(vector.validate_shard_layout(&strided(vec![0]), Some(&elements), false), overlap(0, 0, 4));
+        assert_eq!(
+            ArrayType::new_static(F32, [2]).validate_shard_layout(&strided(vec![0]), Some(&elements), false),
+            Ok(()),
+        );
+
+        // A dynamic extent is replaced by its lower bound (divided by the number of shards and rounded up for a split
+        // dimension), so a layout that overlaps a shard for every extent that the bounds permit is rejected, and one
+        // that overlaps only the shards of larger extents is accepted.
+        let dynamic = |lower: usize| {
+            let extent = DimensionVariable::new("n", DimensionBounds::new(lower, Some(9)).unwrap());
+            ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+        };
+        let replicated = Sharding::replicated(explicit.clone(), 1);
+        for sharding in [None, Some(&replicated)] {
+            assert_eq!(dynamic(2).validate_shard_layout(&strided(vec![0]), sharding, false), overlap(0, 0, 4));
+            assert_eq!(dynamic(1).validate_shard_layout(&strided(vec![0]), sharding, false), Ok(()));
+        }
+        assert_eq!(dynamic(3).validate_shard_layout(&strided(vec![0]), Some(&elements), false), overlap(0, 0, 4));
+        assert_eq!(dynamic(2).validate_shard_layout(&strided(vec![0]), Some(&elements), false), Ok(()));
+
+        // Along an auto axis larger than one, a value may be split without its type recording it, so its shards are
+        // only determined by a sharding that describes every mesh axis, and otherwise only the rank of a strided
+        // layout is validated.
+        let auto_replicated = Sharding::replicated(auto, 2);
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![8, 4]), Some(&auto_replicated), false), Ok(()));
+        assert_eq!(matrix.validate_shard_layout(&strided(vec![8, 4]), Some(&auto_replicated), true), overlap(8, 0, 16));
+        assert_eq!(
+            matrix.validate_shard_layout(&strided(vec![4]), Some(&auto_replicated), false),
+            Err(TypeError::invalid("strided layout rank 1 does not match array rank 2")),
         );
     }
 

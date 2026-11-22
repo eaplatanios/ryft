@@ -115,6 +115,36 @@ pub trait Block<'b, 'c: 'b, 't: 'c>: Sized {
         Ok(BlockOperationRefIterator { current_operation, error: None })
     }
 
+    /// Returns a [`BlockOperationRefIterator`] over references of the [`Operation`]s that follow `operation` in this
+    /// [`Block`], in their order in it. The iterator reads each next [`Operation`] from the previous one when it
+    /// reaches it, so [`Operation`]s that are inserted later after the ones that it has already returned are
+    /// visited too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `operation` is not an [`Operation`] of this [`Block`].
+    fn operations_after<O: Operation<'b, 'c, 't>>(
+        &self,
+        operation: &O,
+    ) -> Result<BlockOperationRefIterator<'b, 'c, 't>, Error> {
+        let in_block = operation.parent_block()?.is_some_and(|block| unsafe {
+            // The following context borrow ensures that access to the underlying MLIR data structures is done safely
+            // from Rust, as for the comparison of two blocks.
+            let _guard = self.context().borrow();
+            mlirBlockEqual(self.to_c_api(), block.to_c_api())
+        });
+        if !in_block {
+            return Err(Error::invalid_argument("the operation is not an operation of this block"));
+        }
+        let handle = unsafe { mlirOperationGetNextInBlock(operation.to_c_api()) };
+        let current_operation = if handle.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { OperationRef::from_c_api(handle, self.context())? })
+        };
+        Ok(BlockOperationRefIterator { current_operation, error: None })
+    }
+
     /// Returns a reference to the terminator [`Operation`] of this [`Block`], if one exists.
     ///
     /// In the context of MLIR, an "SSA region terminator" refers to an operation within a [`Region`](crate::Region)
@@ -758,6 +788,29 @@ mod tests {
         let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
         let op_1 = block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
         assert_eq!(block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap(), vec![op_0, op_1]);
+    }
+
+    #[test]
+    fn test_block_operations_after() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let mut block = context.block_with_no_arguments();
+        let op_0 = block.append_operation(OperationBuilder::new("foo", location).build().unwrap()).unwrap();
+        let op_1 = block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
+        let op_2 = block.append_operation(OperationBuilder::new("baz", location).build().unwrap()).unwrap();
+        let after = |operation| block.operations_after(&operation).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(after(op_0), vec![op_1, op_2]);
+        assert_eq!(after(op_1), vec![op_2]);
+        assert_eq!(after(op_2), vec![]);
+
+        // An operation of another block is rejected.
+        let mut other = context.block_with_no_arguments();
+        let foreign = other.append_operation(OperationBuilder::new("qux", location).build().unwrap()).unwrap();
+        assert!(matches!(
+            block.operations_after(&foreign),
+            Err(Error::InvalidArgument { message, .. }) if message == "the operation is not an operation of this block",
+        ));
     }
 
     #[test]

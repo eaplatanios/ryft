@@ -64,6 +64,20 @@ pub enum ExecutionError {
     #[error("captured array #{index} belongs to a different PJRT client than the execution")]
     CaptureClientMismatch { index: usize },
 
+    #[error(
+        "public argument #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
+         because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, or place \
+         it over explicit mesh axes, before passing it to a compiled function"
+    )]
+    UnreducedAutoAxisArgument { index: usize, axes: Vec<String> },
+
+    #[error(
+        "captured array #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
+         because a staged type does not record a pending reduction over auto mesh axes; reduce the array, or place it \
+         over explicit mesh axes, before a compiled function captures it"
+    )]
+    UnreducedAutoAxisCapture { index: usize, axes: Vec<String> },
+
     /// An input array has no buffered shard for a device required by the executable assignment.
     #[error("input array #{array_index} has no addressable shard for device {device_id}")]
     MissingArrayShardForDevice { array_index: usize, device_id: DeviceId },
@@ -674,6 +688,15 @@ impl Session {
         // Captures, including hidden session constants, are placed on the executable's mesh.
         for (index, input) in inputs.iter().skip(program.capture_count()).enumerate() {
             validate_committed_input_devices(input, index, program.mesh())?;
+        }
+
+        // The runtime sharding of an input records a pending reduction over auto mesh axes, which its type omits, so
+        // validation against the declared type cannot see it. Every execution path prepares its arguments here.
+        for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
+            if let Some(physical_index) = physical_index {
+                let expected = &program.expected_argument_shardings()[*physical_index];
+                validate_input_reduction(input, expected, index, program.capture_count())?;
+            }
         }
 
         // Erased inputs of the zero data type have no buffers through which PJRT could order consumer work after their
@@ -1715,6 +1738,37 @@ pub(crate) fn validate_committed_input_devices(
         });
     }
     Ok(())
+}
+
+/// Validates that `input`, the input at `index` of an execution whose first `capture_count` inputs are captures, can
+/// enter the executable at the `expected` sharding of its argument. A reshard moves shards but never completes a
+/// pending reduction, so the unreduced axes of the runtime sharding of `input` and their kind must be those of
+/// `expected`. Types record a pending reduction over explicit and manual mesh axes, and argument validation compares
+/// it (refer to [`validate_input_type`]). They omit one over auto mesh axes (refer to [`ArrayType::with_sharding`]),
+/// so an executable that was compiled for the type of such an input expects it reduced, and nothing could carry the
+/// reduction across its boundary. Such an input is rejected with [`ExecutionError::UnreducedAutoAxisArgument`] or
+/// [`ExecutionError::UnreducedAutoAxisCapture`] instead. An input without a pending reduction, which is the common
+/// case, costs one branch.
+pub(crate) fn validate_input_reduction(
+    input: &Array,
+    expected: &Sharding,
+    index: usize,
+    capture_count: usize,
+) -> Result<(), ExecutionError> {
+    let sharding = input.sharding();
+    if sharding.unreduced_axes().is_empty() {
+        return Ok(());
+    }
+    let same_axes = sharding.unreduced_axes() == expected.unreduced_axes();
+    if same_axes && sharding.unreduced_kind() == expected.unreduced_kind() {
+        return Ok(());
+    }
+    let axes = sharding.unreduced_axes().iter().cloned().collect();
+    Err(if index < capture_count {
+        ExecutionError::UnreducedAutoAxisCapture { index, axes }
+    } else {
+        ExecutionError::UnreducedAutoAxisArgument { index: index - capture_count, axes }
+    })
 }
 
 /// Validates runtime refinement of a declared logical input type, excluding the placement that a sharding describes,
@@ -3614,6 +3668,85 @@ mod tests {
             input.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
             vec![(0..8).collect::<Vec<u8>>(), (8..16).collect::<Vec<u8>>()],
         );
+    }
+
+    #[test]
+    fn test_session_prepare_compiled_execution_rejects_reduction_state_over_auto_axes() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input = |sharding: &Sharding| {
+            let buffers = client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .zip([1.0f32, 2.0])
+                .map(|(device, value)| {
+                    client.buffer(value.to_ne_bytes().as_slice(), BufferType::F32, [], None, device, None).unwrap()
+                })
+                .collect();
+            Array::from_addressable_buffers(
+                &session,
+                scalar_type.clone(),
+                mesh.clone(),
+                Some(sharding.clone()),
+                buffers,
+            )
+            .unwrap()
+        };
+        let function = crate::compile::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| x.place(&None::<Placement>, None).unwrap(),
+            scalar_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::new();
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let update = builder.add_input(Type::Array(scalar_type.clone()));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatProgram = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
+        let stateful = session.compile_program(&lowered).unwrap();
+
+        // A pending sum over the auto axis cannot cross the boundary of an executable compiled for the type of the
+        // argument, whichever path executes it, so it is rejected before any reshard is attempted.
+        let unreduced = input(&replicated.clone().with_unreduced_axes(["x"]).unwrap());
+        let is_rejected = |result: Result<(), Error>| {
+            matches!(
+                result,
+                Err(Error::Execution(ExecutionError::UnreducedAutoAxisArgument { index: 0, axes }))
+                    if axes == vec!["x".to_string()],
+            )
+        };
+        assert!(is_rejected(function.executable().execute(&session, unreduced.clone()).map(|_| ())));
+        assert!(is_rejected(function.executable().execute_async(&session, unreduced.clone()).map(|_| ())));
+        let holder = ArrayReference::new(f32_scalar(&session, &mesh, 1.0));
+        let reference = Value::Reference(crate::Reference::new(holder.clone(), session.clone()));
+        let stateful_inputs = vec![reference.clone(), Value::Array(unreduced)];
+        assert!(is_rejected(session.execute_statefully(&stateful, stateful_inputs).r#await().map(|_| ())));
+        assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
+        assert_eq!(
+            ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["x".to_string()] }.to_string(),
+            "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
+             because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, or \
+             place it over explicit mesh axes, before passing it to a compiled function",
+        );
+
+        // A value that is reduced along the auto axis is replicated along it, which is what the executable expects.
+        let reduced = input(&replicated.with_reduced_axes(["x"]).unwrap());
+        let output = function.executable().execute(&session, reduced.clone()).unwrap();
+        assert_eq!(output.copy_to_host_bytes().unwrap(), 1f32.to_ne_bytes().to_vec());
+        let outputs = session.execute_statefully(&stateful, vec![reference, Value::Array(reduced)]).r#await().unwrap();
+        assert_eq!(read_first_shard::<f32>(client, program_array(&outputs[0])), vec![2.0]);
     }
 
     #[test]

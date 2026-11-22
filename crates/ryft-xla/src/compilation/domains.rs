@@ -130,17 +130,28 @@ impl Session {
         validate_reference_outputs(program.as_ref(), capture_count, output_types)?;
         validate_output_shardings(output_types, options)?;
 
-        // Captured arrays are placed as they are at runtime, including over the auto mesh axes that their types do not
-        // record, so that executions need not reshard them.
+        // The captures that survive pruning are placed as `capture_sharding` resolves them, which is as they are at
+        // runtime, including over the auto mesh axes that their types do not record, so that executions need not
+        // reshard them. A capture whose placement the function cannot keep fails here, and only if the function uses
+        // it.
         let capture_placements = staged
             .source_program()
             .captures()
             .iter()
-            .map(|capture| match capture {
-                Value::Array(array) if array.sharding().references_auto_axis() => Some(array.sharding().clone()),
-                _ => None,
+            .enumerate()
+            .map(|(index, capture)| match capture {
+                Value::Array(array) => {
+                    let sharding = capture_sharding(
+                        &format!("capture #{index}"),
+                        &array.r#type(),
+                        array.sharding(),
+                        options.mesh(),
+                    )?;
+                    Ok((&sharding != array.sharding() || sharding.references_auto_axis()).then_some(sharding))
+                }
+                _ => Ok(None),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, Error>>()?;
         let placed_options;
         let options = if capture_placements.iter().any(Option::is_some) {
             placed_options = options.clone().with_capture_placements(capture_placements.into());
@@ -380,9 +391,11 @@ impl Session {
                 let placement = if index < source_capture_count {
                     options.capture_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 } else if index < lowered_capture_count {
-                    let constant = &session_constants[index - source_capture_count];
+                    let constant_index = index - source_capture_count;
+                    let constant = &session_constants[constant_index];
                     constant.validate_client(self.client())?;
-                    Some(constant.sharding().clone())
+                    let description = format!("retained array #{constant_index}");
+                    Some(capture_sharding(&description, &constant.r#type(), constant.sharding(), options.mesh())?)
                 } else {
                     let index = index - lowered_capture_count;
                     options.input_shardings().and_then(|shardings| shardings.get(index).cloned()).or_else(|| {
@@ -511,10 +524,10 @@ impl Session {
         // returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
         // operations and compiled reshards set the commitment of their results themselves, so these flags do not
         // reach them.
-        let requests_placement = requests_placement(program, options, true);
+        let commits_public_outputs = commits_public_outputs(options.mesh(), requests_placement(program, options, true));
         let runs_on_multiple_devices = options.mesh().devices().len() > 1;
         let committed_outputs = (0..output_types.len())
-            .map(|index| runs_on_multiple_devices || index < output_count && requests_placement)
+            .map(|index| runs_on_multiple_devices || index < output_count && commits_public_outputs)
             .collect::<Vec<_>>();
         // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
@@ -750,6 +763,50 @@ impl CompilationCacheDomain for Session {
     }
 }
 
+/// Returns the sharding with which the executable of a function compiled for `mesh` receives an array that the function
+/// captures, an explicit capture or an array that its program imports (i.e., a session constant) alike, whose type is
+/// `array_type` and whose runtime array is placed as `sharding`. A capture never decides where the function runs, and
+/// the executable receives it on `mesh` as it receives a public argument. A capture over a logical mesh of the topology
+/// of `mesh` is received as it is placed, including over the auto mesh axes that its type does not record, so that an
+/// execution only moves it onto the devices of `mesh` and never copies a capture that is already placed there. A
+/// capture over a logical mesh of another topology is received replicated over `mesh` when its runtime array stores
+/// what its type records as replicated, which includes a capture that is split along auto mesh axes only, which types
+/// never record, and the dimensions that its type leaves unconstrained, which a runtime array stores replicated (refer
+/// to `entry_boundary_sharding`). This is how JAX runs a `jit` function on the devices of its arguments whatever the
+/// devices of the arrays that it closes over. `description` names the capture in the error (e.g., "capture #0").
+///
+/// Only the captures that survive the pruning of the staged program are resolved, so that a capture that the
+/// function does not use places nothing and fails nothing. An imported array keeps the type that it was imported with,
+/// so one whose type names a mesh of another topology still fails the topology check of lowering through the types of
+/// the values computed from it.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::InvalidArgument`] for a capture over a logical mesh of another topology whose type records a
+/// placement other than replication (i.e., a split, a pending reduction, or manual variation over that mesh), which
+/// the function computes with and which no placement over `mesh` can keep.
+pub(crate) fn capture_sharding(
+    description: &str,
+    array_type: &ArrayType,
+    sharding: &Sharding,
+    mesh: &DeviceMesh,
+) -> Result<Sharding, Error> {
+    if sharding.mesh().has_same_topology(mesh.logical_mesh()) {
+        return Ok(sharding.clone());
+    }
+    let stored = array_type.sharding().map(entry_boundary_sharding).transpose()?;
+    if !stored.as_ref().is_none_or(Sharding::is_replicated) {
+        return Err(Error::from(ProgramError::InvalidArgument {
+            message: format!(
+                "{description} has the type `{array_type}` over a mesh of another topology than the mesh `{}` that \
+                 the function is compiled for, whose placement it cannot keep",
+                mesh.logical_mesh(),
+            ),
+        }));
+    }
+    Ok(Sharding::replicated(mesh.logical_mesh().clone(), array_type.rank()))
+}
+
 /// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
 /// public argument of declared type `input_type` that has no input sharding override and no runtime placement (e.g.,
 /// of a `jit` dispatcher), which is the sharding of that type, and otherwise replicated over `mesh`. A call of a
@@ -867,6 +924,17 @@ pub(crate) fn jit_compilation_options(
         options.profile_version = profile.version();
     }
     options
+}
+
+/// Returns whether every execution of a program on `mesh` commits its public outputs whatever the commitment of its
+/// arguments, where `requests_placement` says whether the program requests a placement explicitly anywhere, including
+/// one that only moves a value to another memory (refer to `requests_placement`). This is the case when it does, as JAX
+/// commits every result of a `jit` function with any explicit sharding, and when the program runs on more than one
+/// device, as JAX commits every result of a computation on more than one device. Compiled programs record it (refer to
+/// [`CompiledProgram::committed_outputs`]), and region replay of a call commits the results of its callee by it, so
+/// that the two agree.
+pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, requests_placement: bool) -> bool {
+    requests_placement || mesh.devices().len() > 1
 }
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a

@@ -45,6 +45,7 @@
 //! so a source inferred from a batch item is lifted back to where the packed value lives, an explicit target places
 //! every batch item where it says, and a placement without a target leaves the packed value where it is.
 
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -53,7 +54,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
-    ArrayType, Device, DeviceMesh, Dimension, Layout, LogicalMesh, Memory, MeshAxisType, Placement, Shape, Sharding,
+    ArrayType, Device, DeviceMesh, Dimension, Layout, LogicalMesh, Memory, MeshAxisType, Placement, Sharding,
     ShardingDimension, decode_logical_bytes,
 };
 use crate::axes::Axis;
@@ -465,8 +466,8 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// as the source), and its transpose leaves the cotangent where it is as well. A source that describes such a value is
 /// still rejected for an input outside any manual region. A global array outside any manual region can still be tiled
 /// over a manual axis of its mesh, and it is moved like any other array. Backends separately reject placements onto a
-/// target that moves values inside active manual regions when they lower a program. A target layout must address the
-/// shape of the input (refer to [`ArrayType::validate_layout`]).
+/// target that moves values inside active manual regions when they lower a program. A target layout must address each
+/// shard of the output (refer to [`ArrayType::validate_shard_layout`]).
 ///
 /// The optional source is informative about devices. It is a [`PlacementRequest`] too, which is a [`Placement`], a
 /// single [`Device`] whose mesh is not known (e.g., a device that a caller names for a value whose devices are not
@@ -583,17 +584,24 @@ impl PlaceOperation {
     }
 
     /// Returns whether the transposition of this placement, for an input of type `input`, leaves the cotangent on the
-    /// devices where it lives and changes at most its memory (refer to [`PlacementRequest`]). That is the case when
+    /// devices where it lives and changes at most its memory (i.e., the transposed placement has no target or an
+    /// in-place target, refer to [`PlacementRequest`]), when the transposition succeeds. That is the case when the
+    /// source of this placement is an in-place request, which names no devices to return the cotangent to, and when
     /// this placement moves nothing (i.e., it has no target or an in-place target) and either its source is not known
     /// or its input lives inside a manual region, whose cotangent lives in the same region. Otherwise, the transposed
-    /// placement moves the cotangent to the source or keeps it on the mesh of the forward target. This is the one owner
-    /// of that rule, which transposition and backends that reject moves of values inside manual regions share (e.g.,
-    /// the lowering of a source that names devices inside a manual region, which only matters when transposition
-    /// moves the cotangent to it).
+    /// placement moves the cotangent to the devices of the source, or, without a source, onto the placement or the
+    /// device of the forward target. Transposition decides the form of the transposed placement with this function,
+    /// so the two agree for every placement, and backends that reject moves of values inside manual regions share
+    /// it (e.g., the lowering of a source that names devices inside a manual region, which only matters when
+    /// transposition moves the cotangent to it).
     #[inline]
     pub fn transposes_in_place(&self, input: &ArrayType) -> bool {
-        !self.target.as_ref().is_some_and(PlacementRequest::moves)
-            && (self.source.is_none() || input.sharding().is_some_and(is_manual_region_sharding))
+        let target_moves = self.target.as_ref().is_some_and(PlacementRequest::moves);
+        match &self.source {
+            Some(PlacementRequest::InPlace { .. }) => true,
+            Some(_) => !target_moves && input.sharding().is_some_and(is_manual_region_sharding),
+            None => !target_moves,
+        }
     }
 
     /// Validates a placement of a value of type `input` onto `target`, which states that the value lives
@@ -758,7 +766,7 @@ impl PlaceOperation {
                     None => (known_sharding, is_known_complete),
                 };
 
-                validate_shard_layout(input, layout, sharding, is_complete).map_err(|error| {
+                input.validate_shard_layout(layout, sharding, is_complete).map_err(|error| {
                     TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` source layout is invalid: {error}"))
                 })?;
             }
@@ -816,7 +824,7 @@ impl PlaceOperation {
 
         match (destination.layout(), output.layout()) {
             (Some(layout), _) => {
-                validate_shard_layout(&output, layout, sharding, is_complete).map_err(|error| {
+                output.validate_shard_layout(layout, sharding, is_complete).map_err(|error| {
                     TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
                 })?;
                 output = output.with_layout(layout.clone());
@@ -826,7 +834,7 @@ impl PlaceOperation {
                     PlacementRequest::InPlace { .. } => (input.sharding(), false),
                     _ => (sharding, is_complete),
                 };
-                if validate_shard_layout(&output, layout, sharding, is_complete).is_err() {
+                if output.validate_shard_layout(layout, sharding, is_complete).is_err() {
                     output = output.with_layout(None::<Layout>);
                 }
             }
@@ -1327,14 +1335,25 @@ impl_differentiable_operation! {
             let input_type = inputs[0].r#type();
             let input_cotangent_type = input_type.cotangent()?;
 
+            // The type of the input omits its reduction state over auto mesh axes, which a placement source records
+            // when it is the runtime sharding of a concrete input (refer to `PlacementRequest::resolve_source`), and
+            // the type rule checked that such a source restates the state that the type records. The reduction state
+            // whose cotangent dual the input cotangent must carry is therefore that of a placement source, and that
+            // of the type of the input otherwise, so that no decision below drops a state that only the source shows.
+            let input_sharding = match operation.source() {
+                Some(PlacementRequest::Resolved(placement)) => Some(placement.sharding()),
+                _ => input_type.sharding(),
+            };
+
             // A device target leaves a value without reduction state, so the output cotangent has none either, and the
             // broadcast below gives the input cotangent the cotangent dual of the reduction state of the input back.
             // That is exact over mesh axes of size one, where the one device that holds the cotangent is the only
-            // contribution of an unreduced cotangent. The cotangent of an input that is reduced over a larger axis
-            // is unreduced over it, and its contributions on the devices along that axis must sum to the output
+            // contribution of an unreduced cotangent, and over the axes along which the input is unreduced, whose
+            // reduced cotangent is complete on every device. The cotangent of an input that is reduced over a larger
+            // axis is unreduced over it, and its contributions on the devices along that axis must sum to the output
             // cotangent, which a placement that leaves the complete cotangent on each of them cannot produce.
             let has_device_target = matches!(operation.target(), Some(PlacementRequest::Device { .. }));
-            if has_device_target && let Some(sharding) = input_type.sharding() {
+            if has_device_target && let Some(sharding) = input_sharding {
                 let larger_axes = sharding
                     .reduced_axes()
                     .iter()
@@ -1348,6 +1367,39 @@ impl_differentiable_operation! {
                              reduced over mesh axes larger than one (i.e., {}), because its cotangent is unreduced \
                              over them",
                             larger_axes.join(", "),
+                        ),
+                    }
+                    .into());
+                }
+            }
+
+            // Every other transposed placement that moves the cotangent restates the cotangent dual of the reduction
+            // state of the input (i.e., of a placement source, or of a placement target, which restates it too), and
+            // a cotangent type cannot record reduction state over auto mesh axes, so the type rule of the transposed
+            // placement would reject that state, and dropping it would return the whole output cotangent on each
+            // device where the cotangent of a reduced input holds contributions that sum to it.
+            if !has_device_target && !operation.transposes_in_place(&input_type) {
+                let auto_axes = [operation.source(), operation.target()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(PlacementRequest::placement)
+                    .map(Placement::sharding)
+                    .flat_map(|sharding| {
+                        sharding
+                            .unreduced_axes()
+                            .iter()
+                            .chain(sharding.reduced_axes())
+                            .filter(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto))
+                            .map(|axis| format!("`{axis}`"))
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !auto_axes.is_empty() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "cannot transpose `{}` for a value with reduction state over auto mesh \
+                             axes (i.e., {}), because the type of its cotangent cannot record that state",
+                            PLACE_OPERATION_NAME,
+                            auto_axes.into_iter().collect::<Vec<_>>().join(", "),
                         ),
                     }
                     .into());
@@ -1371,18 +1423,6 @@ impl_differentiable_operation! {
                     }
                     PlacementRequest::InPlace { .. } => None,
                 })
-            };
-
-            // Returns the transposed placement that leaves the cotangent on the devices where it lives and only returns
-            // it to the memory of the input when the forward target changed the storage of the input in place. This is
-            // the transposed placement of a value inside a manual region, which cannot have been moved and whose
-            // cotangent lives in the same region, and of a placement whose source is not known. The forward source
-            // stays the source, so that a second transposition records it again.
-            let storage_only = |source: Option<&PlacementRequest>, target: Option<&PlacementRequest>| {
-                let memory = Some(input_type.memory());
-                let target = target.map(|_| PlacementRequest::InPlace { memory, layout: None });
-                let source = source.map(transposed_end).transpose()?.flatten();
-                Ok::<_, TypeError>(PlaceOperation::new(target, source))
             };
 
             // A device target gathers an input that its type tracks over a mesh of more than one device onto that one
@@ -1413,23 +1453,46 @@ impl_differentiable_operation! {
                 ),
             };
 
-            let transposed = match (operation.source(), operation.target()) {
-                (Some(source), target) if operation.transposes_in_place(&input_type) => {
-                    storage_only(Some(source), target)?
+            // Returns the transposed placement that leaves the cotangent on the devices where it lives, which is
+            // the one that `PlaceOperation::transposes_in_place` describes. It returns the cotangent in place to the
+            // memory of the input when the forward placement has a target or an in-place source, and changes nothing
+            // otherwise. A forward source that names devices stays the source (i.e., that of a value inside a manual
+            // region, which cannot have been moved and whose cotangent lives in the same region), so that a second
+            // transposition records it again, and otherwise the forward target becomes the source, as the two ends of
+            // a placement swap. An in-place source after a target that moved the value names no devices to return it
+            // to, so a cotangent that a device target gathered or that lives on a mesh of another topology is rejected.
+            let in_place = || -> Result<PlaceOperation, ProgramError> {
+                let has_in_place_source = operation.source().is_some_and(|source| !source.moves());
+                if has_in_place_source && is_gathered {
+                    return Err(gathered_error());
                 }
+                if has_in_place_source && crosses_meshes {
+                    return Err(cross_mesh_error());
+                }
+                let memory = Some(input_type.memory());
+                let target = (operation.target().is_some() || has_in_place_source)
+                    .then_some(PlacementRequest::InPlace { memory, layout: None });
+                let source = match operation.source() {
+                    Some(source) if source.moves() => Some(source),
+                    _ => operation.target(),
+                };
+                Ok(PlaceOperation::new(target, source.map(transposed_end).transpose()?.flatten()))
+            };
+
+            let transposed = match (operation.source(), operation.target()) {
+                _ if operation.transposes_in_place(&input_type) => in_place()?,
                 (Some(source), target) => {
                     // With a known source, the cotangent moves back to the source in the memory of the input for every
                     // form of the forward target, as JAX's `device_put` transpose swaps its devices and sources. This
                     // includes an in-place target, whose output cotangent can live on other devices than the input did
                     // (e.g., a gradient seed). A placement source gets the cotangent dual of its sharding, a device
                     // source becomes the placement of the input cotangent over the logical mesh of the input on that
-                    // device (or stays a device for an input without a tracked sharding), and an in-place source names
-                    // no devices, so the cotangent returns in place to the memory that it names, which is the memory of
-                    // the input. The forward target becomes the transposed source, so that a second transposition moves
-                    // the value to the forward target again, except for an in-place target, which says nothing about
-                    // where the output cotangent lives. After a device target, the output cotangent has no reduction
-                    // state, so a placement source loses its reduction state too, because a placement cannot change it,
-                    // and the broadcast below restores it.
+                    // device (or stays a device for an input without a tracked sharding), and an in-place source, which
+                    // names no devices, transposes in place (refer to `in_place`). The forward target becomes the
+                    // transposed source, so that a second transposition moves the value to the forward target again,
+                    // except for an in-place target, which says nothing about where the output cotangent lives. After
+                    // a device target, the output cotangent has no reduction state, so a placement source loses its
+                    // reduction state too, because a placement cannot change it, and the broadcast below restores it.
                     let memory = Some(input_type.memory());
                     let transposed_target = match source {
                         PlacementRequest::Resolved(placement) => {
@@ -1462,19 +1525,20 @@ impl_differentiable_operation! {
                                 PlacementRequest::Device { device: *device, memory, layout: None }
                             }
                         }
-                        PlacementRequest::InPlace { .. } if is_gathered => return Err(gathered_error().into()),
-                        PlacementRequest::InPlace { .. } if crosses_meshes => return Err(cross_mesh_error().into()),
-                        PlacementRequest::InPlace { .. } => PlacementRequest::InPlace { memory, layout: None },
+                        PlacementRequest::InPlace { .. } => {
+                            unreachable!("an in-place source transposes in place, which the first arm handles")
+                        }
                     };
                     let transposed_source = target.map(transposed_end).transpose()?.flatten();
                     PlaceOperation::new(transposed_target, transposed_source)
                 }
-                (None, target @ (None | Some(PlacementRequest::InPlace { .. }))) => {
+                (None, None | Some(PlacementRequest::InPlace { .. })) => {
                     // Without a source, the devices of the input are not known, so an in-place target returns the
                     // cotangent in place to the memory of the input, and a placement without a target and a source is
                     // an identity up to its copy policy, and so is its transpose, which still forces a copy, as JAX's
-                    // `device_put` transpose does.
-                    storage_only(None, target)?
+                    // `device_put` transpose does. Both transpose in place, so the first arm handles them, and this
+                    // arm only names them.
+                    in_place()?
                 }
                 (None, Some(PlacementRequest::Resolved(target))) => {
                     // Without a source, the value is not known to have changed meshes, so the cotangent stays on the
@@ -1667,10 +1731,11 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
 /// somewhere (i.e., interpretation, batching, and differentiation, refer to [`PlacementRequest::resolve_source`]).
 /// Array IR values project the array member, place it, and lift the result back into their original universe.
 ///
-/// Unlike [`Place`], this primitive also takes an optional source, and both the target and the source are
-/// [`PlacementRequest`]s, whose forms it handles as their contract states, together with the copy policy of the
-/// placement (refer to [`PlaceOperation::with_may_alias`]). Without a target, the value stays where it is (i.e., its
-/// devices, sharding, memory, and layout are unchanged), which places a value with its source recorded or, with
+/// Unlike [`Place`], which takes trees of targets and sources and places each leaf with a copy policy that
+/// lets the output share storage with its input, this primitive places one value, takes its target and source as
+/// [`PlacementRequest`]s, whose forms it handles as their contract states, and also takes the copy policy of the
+/// placement (refer to [`PlaceOperation::with_may_alias`]). Without a target, the value stays where it is (i.e.,
+/// its devices, sharding, memory, and layout are unchanged), which places a value with its source recorded or, with
 /// `may_alias` set to `false`, gives it storage of its own. With `may_alias` set to `false`, implementations for
 /// concrete values must return a value whose storage no other value shares, and implementations for staged values must
 /// stage the placement with that policy, so that the copy happens when the staged placement executes on concrete
@@ -1957,61 +2022,6 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(S::from_parameters(self.parameter_structure(), outputs)?)
-    }
-}
-
-/// Validates `layout` as the storage layout of each shard of a value of type `r#type` that `sharding` distributes, as
-/// far as the type determines its shards. A layout describes each shard (i.e., the buffer that one device holds), so
-/// its rank must always be the rank of the value. A tiled layout is a permutation of the dimensions with tiles, which
-/// is valid for every shape of its rank, so it is validated against the shape of the value. A strided layout holds
-/// byte strides that must keep the elements of a shard apart, so they are validated against the extents of a shard
-/// when `sharding` determines them (i.e., when every extent is static and split evenly, and `sharding` either describes
-/// every mesh axis, which `is_complete` states, or its mesh has no auto axis larger than one, along which a value may
-/// be split without its type recording it). Otherwise, only the rank of a strided layout is validated here, and the
-/// backend that places the value validates its strides against the shards that it creates. An unconstrained dimension
-/// (i.e., `{?}`) is stored replicated (refer to [`ShardingDimension::Unconstrained`]), so its shards have its whole
-/// extent, as for a replicated dimension. A value without a tracked sharding is validated against its whole shape.
-pub(super) fn validate_shard_layout(
-    r#type: &ArrayType,
-    layout: &Layout,
-    sharding: Option<&Sharding>,
-    is_complete: bool,
-) -> Result<(), TypeError> {
-    let shard_shape = match (layout, sharding) {
-        (Layout::Tiled(_), _) | (_, None) => Some(r#type.shape().clone()),
-        (Layout::Strided(_), Some(sharding)) => {
-            let is_determined = is_complete
-                || sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1);
-            r#type
-                .shape()
-                .dimensions()
-                .iter()
-                .zip(sharding.dimensions())
-                .map(|(dimension, sharding_dimension)| match (dimension, sharding_dimension) {
-                    (Dimension::Static(extent), ShardingDimension::Replicated | ShardingDimension::Unconstrained) => {
-                        Some(Dimension::Static(*extent))
-                    }
-                    (Dimension::Static(extent), ShardingDimension::Sharded(axis_names)) => {
-                        let count =
-                            axis_names.iter().filter_map(|name| sharding.mesh().axis_size(name)).product::<usize>();
-                        (extent % count == 0).then(|| Dimension::Static(extent / count))
-                    }
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-                .filter(|dimensions| is_determined && dimensions.len() == r#type.rank())
-                .map(Shape::new)
-        }
-    };
-
-    match (layout, shard_shape) {
-        (_, Some(shape)) => r#type.clone().with_shape(shape).with_layout(layout.clone()).validate_layout(),
-        (Layout::Strided(strided), None) if strided.rank() != r#type.rank() => Err(TypeError::invalid(format!(
-            "strided layout rank {} does not match array rank {}",
-            strided.rank(),
-            r#type.rank(),
-        ))),
-        (_, None) => Ok(()),
     }
 }
 
@@ -2545,6 +2555,75 @@ mod tests {
         let operation = PlaceOperation::new(None, PINNED_HOST);
         assert_eq!(operation.source(), Some(&PlacementRequest::from(PINNED_HOST)));
         assert_eq!(operation.to_string(), "place [source=in_place(memory=Host[Pinned])]");
+    }
+
+    #[test]
+    fn test_place_operation_transposes_in_place() {
+        // For every form of the source and of the target, the predicate says exactly whether the transposed placement
+        // that reverse mode executes leaves the cotangent where it lives (i.e., has no target or an in-place target).
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh.clone(), 1);
+        let mesh = |device: usize| DeviceMesh::new(logical_mesh.clone(), vec![Device::new(device, 0)]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
+        let sources = [
+            None,
+            Some(PlacementRequest::from(Memory::Device)),
+            Some(PlacementRequest::from(Placement::new(mesh(0), sharding.clone()).unwrap())),
+            Some(PlacementRequest::from(Device::new(0, 0))),
+        ];
+        let targets = [
+            None,
+            Some(PlacementRequest::from(PINNED_HOST)),
+            Some(PlacementRequest::from(Placement::new(mesh(1), sharding.clone()).unwrap())),
+            Some(PlacementRequest::from(Device::new(1, 0))),
+        ];
+        for source in &sources {
+            for target in &targets {
+                let context = RecordingContext::default();
+                let input = PlacedArray {
+                    array: Array::from_elements(input_type.clone(), &[1.0f32, 2.0]).unwrap(),
+                    placement: None,
+                    context: context.clone(),
+                };
+                let (output, pullback) = differentiate_at(input)
+                    .vjp(|x| {
+                        <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(
+                            &x,
+                            target.as_ref(),
+                            source.clone(),
+                            true,
+                        )
+                    })
+                    .unwrap();
+                let seed = PlacedArray {
+                    array: Array::from_elements(output.r#type().cotangent().unwrap(), &[5.0f32, 6.0]).unwrap(),
+                    placement: output.placement.clone(),
+                    context: context.clone(),
+                };
+                pullback.apply_materialized(seed).unwrap();
+                let transposed = context.0.borrow().iter().rev().find_map(|operation| match operation {
+                    ArrayOperation::Place(place) if !place.may_alias() => Some(place.clone()),
+                    _ => None,
+                });
+                let transposed = transposed.unwrap();
+                assert_eq!(
+                    PlaceOperation::new(target.clone(), source.clone()).transposes_in_place(&input_type),
+                    !transposed.target().is_some_and(PlacementRequest::moves),
+                    "source {source:?}, target {target:?}, transposed placement {transposed}",
+                );
+            }
+        }
+
+        // The counterexample of an earlier version, whose transposed placement only returns the cotangent to the
+        // memory of the input, and a value inside a manual region, whose cotangent stays in that region.
+        let scalar = ArrayType::scalar(DataType::F32);
+        assert!(PlaceOperation::new(None, Memory::Device).transposes_in_place(&scalar));
+        let manual_sharding = manual_region_placement(1).sharding().clone();
+        let manual_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(manual_sharding).unwrap();
+        let manual_source = PlacementRequest::from(manual_region_placement(1));
+        assert!(PlaceOperation::new(None, manual_source.clone()).transposes_in_place(&manual_type));
+        assert!(PlaceOperation::new(PINNED_HOST, manual_source.clone()).transposes_in_place(&manual_type));
+        assert!(!PlaceOperation::new(None, manual_source).transposes_in_place(&input_type));
     }
 
     #[test]
@@ -3731,6 +3810,30 @@ mod tests {
                 Ok(strided_auto_type.clone().with_memory(PINNED_HOST)),
             );
         }
+
+        // A dynamic extent is checked at its lower bound, so a zero stride of a replicated `f32[n]` with `2 <= n <= 8`,
+        // under which the elements of every extent that the bounds permit overlap, is rejected, while the same stride
+        // of an `f32[n]` with `1 <= n <= 8`, which addresses the extent one, is left to the backend that places a
+        // concrete value.
+        let replicated = placement(&mesh, vec![ShardingDimension::Replicated]);
+        let zero_stride = Layout::Strided(StridedLayout::new(vec![0]));
+        let dynamic_type = |lower: usize| {
+            let extent = DimensionVariable::new("n", DimensionBounds::new(lower, Some(9)).unwrap());
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+        };
+        let operation = PlaceOperation::new(replicated.clone().with_layout(zero_stride.clone()), None);
+        assert_eq!(
+            operation.infer_output_types(&[dynamic_type(2)], &[]),
+            Err(TypeError::invalid(format!(
+                "`{PLACE_OPERATION_NAME}` target layout is invalid: strided layout stride 0 on axis 0 is smaller than \
+                 the 4-byte span occupied by more minor axes and may alias array elements",
+            ))),
+        );
+        let input_type = dynamic_type(1);
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&input_type), &[]),
+            Ok(vec![input_type.with_sharding(replicated.sharding().clone()).unwrap().with_layout(zero_stride)]),
+        );
     }
 
     #[test]
@@ -7187,6 +7290,98 @@ mod tests {
                 in (%1)"
             },
         );
+    }
+
+    #[test]
+    fn test_place_operation_transposition_reduction_state_of_concrete_inputs() {
+        // A concrete input that is reduced or unreduced over the mesh axis `x` of size two, explicit or auto, lives on
+        // the devices 0 and 1, and the forward placement records that placement as its source, which carries the
+        // reduction state over the auto axis that the type of the input omits. For every form of the target, the
+        // pullback either returns the cotangent with the cotangent dual of that state (i.e., contributions that sum to
+        // the seed for a reduced input, and the complete seed on each device for an unreduced one) or is rejected with
+        // an exact error. It never returns a cotangent without the dual state of an auto axis, which for a reduced
+        // input would hold the whole seed on each device rather than contributions that sum to it. A target that
+        // restates a state over an auto axis is already rejected when reverse mode stages the placement of the tangent, whose
+        // type cannot record that state (refer to the accepted limit on staged placements in the decisions register).
+        let device_error = format!(
+            "cannot transpose `{PLACE_OPERATION_NAME}` onto a single device for a value that is reduced over mesh axes \
+             larger than one (i.e., `x`), because its cotangent is unreduced over them",
+        );
+        let auto_error = format!(
+            "cannot transpose `{PLACE_OPERATION_NAME}` for a value with reduction state over auto mesh axes (i.e., \
+             `x`), because the type of its cotangent cannot record that state",
+        );
+        let changed_error = format!(
+            "`{PLACE_OPERATION_NAME}` cannot change reduction state; use a reduction (or the corresponding collective) \
+             instead",
+        );
+        let forward_error = format!(
+            "`{PLACE_OPERATION_NAME}` cannot move a value with reduction state over mesh axes larger than one (i.e., \
+             `x`) onto a single device; use a reduction (or the corresponding collective) first",
+        );
+        let unsupported = |message: &String| {
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message: message.clone() }))
+        };
+        let invalid =
+            |message: &String| Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid(message))));
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+            let other_mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
+            let replicated = Sharding::replicated(logical_mesh, 1);
+            for (state, sharding) in [
+                ("reduced", replicated.clone().with_reduced_axes(["x"]).unwrap()),
+                ("unreduced", replicated.clone().with_unreduced_axes(["x"]).unwrap()),
+            ] {
+                let input_type =
+                    ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.without_auto_axes()).unwrap();
+                let context = RecordingContext::default();
+                let input = PlacedArray {
+                    array: Array::from_elements(input_type.clone(), &[1.0f32, 2.0]).unwrap(),
+                    placement: Some(Placement::new(mesh.clone(), sharding.clone()).unwrap()),
+                    context: context.clone(),
+                };
+                let gradient = (
+                    Array::from_elements(input_type.cotangent().unwrap(), &[5.0f32, 6.0]).unwrap(),
+                    Some(sharding.cotangent().unwrap()),
+                );
+                let is_auto = axis_type == MeshAxisType::Auto;
+                let is_reduced = state == "reduced";
+                let targets = [
+                    (
+                        "resolved",
+                        Some(PlacementRequest::from(Placement::new(other_mesh.clone(), sharding.clone()).unwrap())),
+                        if is_auto { invalid(&changed_error) } else { Ok(gradient.clone()) },
+                    ),
+                    (
+                        "device",
+                        Some(PlacementRequest::from(Device::new(2, 0))),
+                        if is_reduced { unsupported(&device_error) } else { invalid(&forward_error) },
+                    ),
+                    (
+                        "in-place",
+                        Some(PlacementRequest::from(PINNED_HOST)),
+                        if is_auto { unsupported(&auto_error) } else { Ok(gradient.clone()) },
+                    ),
+                    ("none", None, if is_auto { unsupported(&auto_error) } else { Ok(gradient.clone()) }),
+                ];
+                for (target_name, target, expected) in targets {
+                    let place = differentiate_at(input.clone()).vjp(|x| {
+                        <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, target.as_ref(), None, true)
+                    });
+                    let result = place.and_then(|(output, pullback)| {
+                        let seed = PlacedArray {
+                            array: Array::from_elements(output.r#type().cotangent()?, &[5.0f32, 6.0])?,
+                            placement: output.placement.clone(),
+                            context: context.clone(),
+                        };
+                        let gradient = pullback.apply_materialized(seed)?;
+                        Ok((gradient.array, gradient.placement.map(|placement| placement.sharding().clone())))
+                    });
+                    assert_eq!(result, expected, "{axis_type} axis, {state} input, target {target_name}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -197,7 +197,7 @@ use ryft_core::{
 use ryft_pjrt::Execution;
 
 use crate::compilation::CompilationError;
-use crate::compilation::domains::with_input_shardings;
+use crate::compilation::domains::{capture_sharding, with_input_shardings};
 use crate::compilation::options::Options;
 use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
 use crate::compilation::programs::CompiledProgram;
@@ -1231,17 +1231,43 @@ where
 
     /// Returns the [`Options`] with which functions derived from this one (e.g., its gradient) are compiled. They keep
     /// the options that select how programs lower (i.e., the mesh, the kernel compiler, and the ragged dot lowering
-    /// strategy) and drop the ones that describe this function's own signature or executable (i.e., its input and
-    /// output shardings, donation flags, input bound bucketing, and feedback-directed profile), which do not apply to a
-    /// derived function.
-    fn derived_options(&self) -> Options {
+    /// strategy) and drop the ones that describe this function's own executable (i.e., its donation flags, input bound
+    /// bucketing, and feedback-directed profile), which do not apply to a derived function. `input_shardings` and
+    /// `output_shardings` are the sharding overrides of the inputs and outputs of the derived function, which carries
+    /// the overrides of this function for the inputs and outputs that it shares with it (refer to
+    /// `repeated_boundary_shardings`), so that its executable receives each such input where an execution of this
+    /// function does, rather than gathering it at its entry to split it again at the call of this function.
+    fn derived_options(
+        &self,
+        input_shardings: Option<Vec<Sharding>>,
+        output_shardings: Option<Vec<Sharding>>,
+    ) -> Options {
         let options = self.function.staged().options();
         let derived =
             Options::new(self.mesh().clone()).with_ragged_dot_lowering_strategy(options.ragged_dot_lowering_strategy());
-        match options.kernel_compiler() {
+        let derived = match options.kernel_compiler() {
             Some(compiler) => derived.with_kernel_compiler(compiler.clone()),
             None => derived,
+        };
+        let derived = match input_shardings {
+            Some(shardings) => derived.with_input_shardings(shardings),
+            None => derived,
+        };
+        match output_shardings {
+            Some(shardings) => derived.with_output_shardings(shardings),
+            None => derived,
         }
+    }
+
+    /// Returns the sharding overrides of the inputs and of the outputs of this function, each repeated `count` times,
+    /// for a derived function whose inputs and outputs are `count` copies of those of this function with the same
+    /// shapes (e.g., `count = 1` for the inputs of its gradient, and `count = 2` for the primals and tangents of its
+    /// JVP, as JAX gives the tangents of a `jit` call the shardings of their primals).
+    fn repeated_boundary_shardings(&self, count: usize) -> (Option<Vec<Sharding>>, Option<Vec<Sharding>>) {
+        let options = self.function.staged().options();
+        let repeated =
+            |shardings: &[Sharding]| shardings.iter().cycle().take(shardings.len() * count).cloned().collect();
+        (options.input_shardings().map(repeated), options.output_shardings().map(repeated))
     }
 
     /// Returns the input types of this function in its input structure, from which functions derived from this one
@@ -1359,7 +1385,7 @@ where
             Vec::new(),
             input_signature,
             session,
-            self.derived_options(),
+            self.derived_options(self.repeated_boundary_shardings(1).0, None),
         )?;
         *self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned") =
             Some((SessionWitness::new(session), compiled.function.clone()));
@@ -1476,7 +1502,10 @@ where
             Vec::new(),
             (input_signature, tangent_signature),
             session,
-            self.derived_options(),
+            {
+                let (input_shardings, output_shardings) = self.repeated_boundary_shardings(2);
+                self.derived_options(input_shardings, output_shardings)
+            },
         )?;
         *self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned") =
             Some((SessionWitness::new(session), compiled.function.clone()));
@@ -1576,6 +1605,32 @@ where
         let batched_input_types =
             In::from_parameters(input_structure.clone(), batched_input_types).map_err(ProgramError::from)?;
 
+        // The sharding overrides of this function apply to each batch item, as an explicit placement does under
+        // batching, and the batch dimension of a mapped input or output takes the placement of the batch axis.
+        let options = staged.options();
+        let batched = |shardings: Option<&[Sharding]>, axes: &[BatchAxis]| {
+            shardings
+                .map(|shardings| {
+                    shardings
+                        .iter()
+                        .zip(axes)
+                        .map(|(sharding, axis)| match axis.axis() {
+                            None => Ok(sharding.clone()),
+                            Some(axis) => {
+                                let position =
+                                    axis.normalize(sharding.dimensions().len() + 1).map_err(ProgramError::from)?;
+                                let mut dimensions = sharding.dimensions().to_vec();
+                                dimensions.insert(position, batch_sharding.clone());
+                                Ok(sharding.with_dimensions(dimensions)?)
+                            }
+                        })
+                        .collect::<Result<Vec<_>, Error>>()
+                })
+                .transpose()
+        };
+        let input_shardings = batched(options.input_shardings(), &input_batch_axes)?;
+        let output_shardings = batched(options.output_shardings(), &output_batch_axes)?;
+
         compile_with_flat_captures::<_, In, Out>(
             move |_, _, inputs| {
                 let inputs = inputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -1622,7 +1677,7 @@ where
             Vec::new(),
             batched_input_types,
             session,
-            self.derived_options(),
+            self.derived_options(input_shardings, output_shardings),
         )
     }
 }
@@ -2093,35 +2148,25 @@ where
     session.compile_staged_function(staged)
 }
 
-/// Returns `capture`, the array at `index` among the captures of a function that is staged for `mesh`, placed where the
-/// function runs. A capture never decides where a function runs, and the executable of the function receives it on
-/// `mesh` as it receives a public argument. A capture over a logical mesh of the topology of `mesh` is returned as it
-/// is, because an execution moves it onto the devices of `mesh` with its placement. A capture over a logical mesh of
-/// another topology is replicated over `mesh` here, once, when its type records it as replicated (e.g., a capture that
-/// is split along auto mesh axes only, which types never record), because the function is traced with the type of the
-/// capture, which would otherwise name a mesh that the function does not run on. This is how JAX runs a `jit` function
-/// on the devices of its arguments whatever the devices of the arrays that it closes over.
+/// Returns `capture`, a capture of a function that is staged for `mesh`, with the type with which the function is
+/// traced. A capture over a logical mesh of another topology that the executable receives replicated over `mesh`
+/// (refer to [`capture_sharding`]) is replicated over `mesh` here, once, because the function is traced with the type
+/// of the capture, which would otherwise name a mesh that the function does not run on. Every other capture is
+/// returned as it is. A capture over a logical mesh of the topology of `mesh` is moved onto the devices of `mesh` by an
+/// execution, with its placement. A capture whose placement the function cannot keep is rejected only if it survives
+/// the pruning of the staged program (refer to `Session::lower_staged_program`), so that a function that ignores it
+/// compiles.
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::InvalidArgument`] for a capture over a logical mesh of another topology whose type records a
-/// placement other than replication (i.e., a split, a pending reduction, or manual variation over that mesh), which
-/// the function computes with and which no placement over `mesh` can keep, and the error of moving a capture.
-fn placed_capture(index: usize, capture: Array, mesh: &DeviceMesh) -> Result<Array, Error> {
+/// Returns the error of moving a capture.
+fn placed_capture(capture: Array, mesh: &DeviceMesh) -> Result<Array, Error> {
     if capture.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
         return Ok(capture);
     }
-    if !capture.r#type().sharding().is_none_or(Sharding::is_replicated) {
-        return Err(Error::from(ProgramError::InvalidArgument {
-            message: format!(
-                "capture #{index} has the type `{}` over a mesh of another topology than the mesh `{}` that the \
-                 function is compiled for, whose placement it cannot keep",
-                capture.r#type(),
-                mesh.logical_mesh(),
-            ),
-        }));
-    }
-    let sharding = Sharding::replicated(mesh.logical_mesh().clone(), capture.r#type().rank());
+    let Ok(sharding) = capture_sharding("a capture", &capture.r#type(), capture.sharding(), mesh) else {
+        return Ok(capture);
+    };
     let session = capture.session().clone();
     capture.reshard_on_devices(&session, mesh, &sharding, false)
 }
@@ -2163,8 +2208,7 @@ where
 {
     let captures = captures
         .into_iter()
-        .enumerate()
-        .map(|(index, capture)| placed_capture(index, capture, options.mesh()).map(Value::Array))
+        .map(|capture| placed_capture(capture, options.mesh()).map(Value::Array))
         .collect::<Result<Vec<_>, Error>>()?;
     let input_structure = input_types.parameter_structure();
     let input_types =
@@ -4492,7 +4536,7 @@ mod tests {
         // follows the function onto its single device, as JAX returns such a capture of a `jit` function on the
         // device of the function.
         let function: CompiledFunction<ArrayType, ArrayType> = compile_capturing(MeshAxisType::Auto).unwrap();
-        let output = function.executable().execute(&session, input).unwrap();
+        let output = function.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(output.mesh(), &single_device_mesh);
         assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
 
@@ -4506,6 +4550,69 @@ mod tests {
              topology than the mesh `['device'=1:auto]` that the function is compiled for, whose placement it cannot \
              keep",
         );
+
+        // A function that ignores such a capture compiles, because only the captures that survive the pruning of the
+        // staged program are resolved against the mesh of the function.
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let capture =
+            Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(split), values_to_bytes(&values))
+                .unwrap();
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+            |_, x: CompileTracer| x,
+            vec![capture],
+            vector_type.clone(),
+            &session,
+            single_device_mesh.clone(),
+        )
+        .unwrap();
+        let output = function.executable().execute(&session, input.clone()).unwrap();
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        // A capture whose type leaves a dimension unconstrained is stored replicated, so it follows the function like
+        // a replicated capture, explicitly captured and imported into a nested body alike. So does an array that is
+        // split along an auto axis and imported into a nested body.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        for sharding in [unconstrained.clone(), split] {
+            let capture = Array::from_host_buffer(
+                &session,
+                vector_type.clone(),
+                mesh.clone(),
+                Some(sharding.clone()),
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            if sharding == unconstrained {
+                let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+                    |captures, _: CompileTracer| captures[0].clone(),
+                    vec![capture.clone()],
+                    vector_type.clone(),
+                    &session,
+                    single_device_mesh.clone(),
+                )
+                .unwrap();
+                let output = function.executable().execute(&session, input.clone()).unwrap();
+                assert_eq!(output.mesh(), &single_device_mesh);
+                assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+            }
+            let body = rematerialize(|x: Tracer<TracingContext<Constant, Operation>>| {
+                ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))
+            });
+            let function: CompiledFunction<ArrayType, ArrayType> = compile(
+                |x: CompileTracer| {
+                    ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
+                },
+                vector_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap();
+            let output = function.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!(output.mesh(), &single_device_mesh);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+        }
     }
 
     #[test]
@@ -5335,12 +5442,9 @@ mod tests {
         // placement for it and the placement of a call inside a nested region does not reach the result of the
         // operation that owns that region. A caller compiled ahead of time places its argument as its type records,
         // which replicates the split input of the dispatcher before the call, and a caller that runs as replicas
-        // rejects an argument whose type records a split. A caller staged for an input type without a sharding does
-        // not record the mesh of that input, which its executable places replicated, so partial evaluation forwards
-        // it through a call whose callee declares an input without a sharding, and the interpretation of the known
-        // program returns a split argument where it is. The replay of a callee operation by
-        // operation gives a `rematerialize` in the callee an eager input, whose type records its placement, while the
-        // body of the `rematerialize` was traced for the input type of the callee, which records none.
+        // rejects an argument whose type records a split. The replay of a callee operation by operation gives a
+        // `rematerialize` in the callee an eager input, whose type records its placement, while the body of the
+        // `rematerialize` was traced for the input type of the callee, which records none.
         let other_devices = "fails with `\
             `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
@@ -5348,7 +5452,6 @@ mod tests {
                               require fully replicated boundary shardings of called functions because Shardy rejects \
                               dynamic tensors`";
         let replicated = "is placed as `{mesh<['x'=2:auto]>, [{}]}` instead of `{mesh<['x'=2:auto]>, [{'x'}]}`";
-        let split_known = "is placed as `{mesh<['x'=2:auto]>, [{'x'}]}` instead of `{mesh<['x'=2:auto]>, [{}]}`";
         let split_arguments_of_replicas = "fails with `invalid compilation options: bounded-dynamic multi-device \
                                            programs currently require fully replicated shardings because Shardy \
                                            rejects dynamic tensors`";
@@ -5385,11 +5488,6 @@ mod tests {
                 "declared unsharded input over explicit axes of a split argument",
                 "caller with a bounded dynamic argument",
                 split_arguments_of_replicas,
-            ),
-            (
-                "declared unsharded input over auto axes of a split argument",
-                "partial evaluation with a known input",
-                split_known,
             ),
         ];
 
@@ -7215,6 +7313,62 @@ mod tests {
         let (x_second, s_second) = reverse_over_reverse.executable().execute(&engine, (x, s)).unwrap();
         assert_eq!(read_first_shard::<f32>(client, &x_second), vec![0.0; 3]);
         assert_eq!(read_first_shard::<f32>(client, &s_second), vec![2.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_derived_functions_keep_sharding_overrides() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let options = Options::new(mesh.clone())
+            .with_input_shardings(vec![split.clone()])
+            .with_output_shardings(vec![replicated.clone()]);
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x: CompileTracer| x.sin().unwrap().reduce_sum(&[0], None).unwrap(),
+            vector_type.clone(),
+            &session,
+            options,
+        )
+        .unwrap();
+        fn overrides<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+            function: &CompiledFunction<In, Out>,
+        ) -> (Option<Vec<Sharding>>, Option<Vec<Sharding>>) {
+            let options = function.function.staged().options();
+            (options.input_shardings().map(<[_]>::to_vec), options.output_shardings().map(<[_]>::to_vec))
+        }
+
+        // The executables of the gradient and of the JVP receive the inputs that they share with the function where an
+        // execution of the function receives them, rather than gathering a split argument at their entry, as JAX keeps
+        // the shardings of a `jit` function for its JVP (with the tangents placed as their primals) and its gradient.
+        // The JVP also returns the outputs that it shares with the function, and their tangents, as the function does.
+        let gradient = function.gradient(&session).unwrap();
+        assert_eq!(overrides(&gradient), (Some(vec![split.clone()]), None));
+        let jvp = function.jvp(&session).unwrap();
+        assert_eq!(overrides(&jvp), (Some(vec![split.clone(), split.clone()]), Some(vec![replicated.clone(); 2])));
+
+        // A batched function applies the overrides to each batch item, and the batch dimension takes the placement of
+        // the batch axis.
+        let batched = function
+            .batch(&session, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::default().with_extent(2))
+            .unwrap();
+        let batched_split = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        assert_eq!(
+            overrides(&batched),
+            (Some(vec![batched_split]), Some(vec![Sharding::replicated(mesh.logical_mesh().clone(), 1)])),
+        );
+        let values = [0f32, 1.0, 2.0, 3.0];
+        let input = Array::from_host_buffer(&session, vector_type, mesh, Some(split.clone()), values_to_bytes(&values))
+            .unwrap();
+        let output = gradient.executable().execute(&session, input).unwrap();
+        assert_eq!(output.sharding(), &split);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values.map(f32::cos));
     }
 
     #[test]

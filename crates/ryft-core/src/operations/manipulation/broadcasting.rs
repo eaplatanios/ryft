@@ -600,7 +600,12 @@ impl Broadcast for ArrayType {
             }
         }
 
-        output_type.validate_layout()?;
+        // A layout describes each shard of the output, so it is validated against the shards that its sharding
+        // determines, as every type rule that requests or keeps a layout validates it.
+        if let Some(layout) = output_type.layout() {
+            output_type.validate_shard_layout(layout, output_type.sharding(), false)?;
+        }
+
         Ok(output_type)
     }
 }
@@ -2033,7 +2038,11 @@ fn infer_broadcast_like_output_type(
             )));
         }
     }
-    output_type.validate_layout()?;
+
+    if let Some(layout) = output_type.layout() {
+        output_type.validate_shard_layout(layout, output_type.sharding(), false)?;
+    }
+
     Ok(output_type)
 }
 
@@ -2102,7 +2111,10 @@ fn infer_explicit_broadcast_output_type(
         output_type = output_type.with_layout(layout.clone());
     }
 
-    output_type.validate_layout()?;
+    if let Some(layout) = output_type.layout() {
+        output_type.validate_shard_layout(layout, output_type.sharding(), false)?;
+    }
+
     Ok(output_type)
 }
 
@@ -2451,6 +2463,57 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_broadcast_type_inference_shard_layouts() {
+        // A layout describes each shard, so the byte strides `[8, 4]` of a dense `f32[4, 2]` column shard are valid
+        // for an `f32[4, 4]` value that is split into two column shards (e.g., the output of a `place` onto those
+        // shards), although they would overlap the rows of the whole value. Every form of broadcasting accepts that
+        // type, and rejects strides that overlap the elements of a shard.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let columns =
+            Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]).unwrap();
+        let unplaced_type = ArrayType::new_static(DataType::F32, [4, 4]).with_sharding(columns.clone()).unwrap();
+        let shard_strides = Layout::Strided(StridedLayout::new(vec![8, 4]));
+        let overlapping = Layout::Strided(StridedLayout::new(vec![4, 8]));
+        let placed_type = unplaced_type.clone().with_layout(shard_strides.clone());
+        let overlap_error = "strided layout stride 8 on axis 1 is smaller than the 16-byte span occupied by more minor \
+                             axes and may alias array elements";
+        check_operation_type_inference!(
+            operation = BroadcastOperation::new(placed_type.clone(), vec![0, 1]),
+            cases = [{
+                input_types = [placed_type.clone()],
+                output_types = [placed_type.clone()],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = BroadcastOperation::new(unplaced_type.clone().with_layout(overlapping.clone()), vec![0, 1]),
+            cases = [{
+                input_types = [placed_type.clone()],
+                error = overlap_error,
+            }],
+        );
+        check_operation_type_inference!(
+            operation = BroadcastLikeOperation::new(vec![0, 1]),
+            cases = [{
+                input_types = [unplaced_type.clone(), placed_type.clone()],
+                output_types = [placed_type.clone()],
+            }],
+        );
+        let dimension_type = |extent: usize| ArrayIrType::Dimension(DimensionType::from(Dimension::Static(extent)));
+        for (layout, expected) in [(shard_strides, Ok(placed_type.clone())), (overlapping, Err(overlap_error))] {
+            assert_eq!(
+                DynamicBroadcastOperation::new(vec![0, 1])
+                    .with_output_sharding(columns.clone())
+                    .with_output_layout(layout)
+                    .infer_output_types(
+                        &[ArrayIrType::Array(unplaced_type.clone()), dimension_type(4), dimension_type(4)],
+                        &[],
+                    ),
+                expected.map(|r#type| vec![ArrayIrType::Array(r#type)]).map_err(TypeError::invalid),
+            );
+        }
     }
 
     #[test]

@@ -654,12 +654,16 @@ impl Array {
             // identity is `false`.
             contributions.sort_by(|(_, left, _), (_, right, _)| left.cmp(right));
             let unreduced_kind = self.sharding().unreduced_kind();
+
+            // The tiles are indexed by their slices, so that each contribution finds its tile without a scan.
             let mut tiles = Vec::<(Vec<Range<usize>>, CoreArray)>::new();
+            let mut tile_indices = HashMap::<Vec<Range<usize>>, usize>::new();
             for (slices, _, bytes) in contributions {
                 let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
                 let contribution = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
-                match tiles.iter_mut().find(|(tile_slices, _)| *tile_slices == slices) {
-                    Some((_, tile)) => {
+                match tile_indices.get(&slices) {
+                    Some(&index) => {
+                        let tile = &mut tiles[index].1;
                         *tile = match unreduced_kind {
                             UnreducedKind::Sum if element_type == DataType::Boolean => Or::or(&*tile, &contribution)?,
                             UnreducedKind::Sum => Add::add(&*tile, &contribution)?,
@@ -667,7 +671,10 @@ impl Array {
                             UnreducedKind::Min => Min::min(&*tile, &contribution)?,
                         }
                     }
-                    None => tiles.push((slices, contribution)),
+                    None => {
+                        tile_indices.insert(slices.clone(), tiles.len());
+                        tiles.push((slices, contribution));
+                    }
                 }
             }
 
@@ -3350,6 +3357,24 @@ mod tests {
 
         // Only the first replica of each summand is read, so the other replicas are not compared with it.
         assert_eq!(readback([first, [1., 3.], second, [0., 0.]]).unwrap(), values_to_bytes(&[11f32, 22.]));
+
+        // Split along `y`, each tile combines the summands of the devices that hold its slice, and only those.
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["y"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(split).unwrap();
+        let buffers = [1f32, 2., 10., 20.]
+            .iter()
+            .zip(&devices)
+            .map(|(value, device)| {
+                client
+                    .buffer(value.to_ne_bytes().as_slice(), BufferType::F32, [1], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let array = Array::from_addressable_buffers(&session, r#type, mesh, None, buffers).unwrap();
+        assert_eq!(array.copy_to_host_bytes().unwrap(), values_to_bytes(&[11f32, 22.]));
     }
 
     #[test]

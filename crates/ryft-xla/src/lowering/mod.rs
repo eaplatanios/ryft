@@ -1535,7 +1535,16 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    program.entry_region_ref().computation_regions().any(|region| {
+    has_placement_requests_in_region(program.entry_region_ref(), includes_memory_requests)
+}
+
+/// Returns whether `region` requests the placement of a value explicitly in any of the regions that lowering emits for
+/// it (refer to [`has_placement_requests`]).
+pub(crate) fn has_placement_requests_in_region<V: Value<Type = Type> + Typed, O: LowerableOperationFamily>(
+    region: RegionRef<'_, V, O>,
+    includes_memory_requests: bool,
+) -> bool {
+    region.computation_regions().any(|region| {
         region.instructions().iter().any(|instruction| {
             let operation = instruction.operation();
             operation.projected_payload::<PlaceOperation>().is_some_and(|operation| match operation.target() {
@@ -2248,18 +2257,6 @@ fn closed_dimensions(sharding: &Sharding) -> Rc<[ShardingDimension]> {
         .collect()
 }
 
-/// Returns the operation that follows `operation` in its block, if any.
-fn next_operation<'b, 'c, 't>(operation: OperationRef<'b, 'c, 't>) -> Result<Option<OperationRef<'b, 'c, 't>>, Error> {
-    // SAFETY: `operation` is an operation of a block, for which the C API returns the operation after it, or a null
-    // handle when it is the last one.
-    let handle = unsafe { ryft_xla_sys::bindings::mlirOperationGetNextInBlock(operation.to_c_api()) };
-    if handle.ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: the handle is not null and names an operation of the same block, which lives in the same context.
-    Ok(Some(unsafe { OperationRef::from_c_api(handle, operation.context())? }))
-}
-
 /// Constrains the intermediate values that the lowering of one instruction emitted into `block` after `anchor` and that
 /// carry a pending reduction, for [`lower_instruction_operation`]. The `outputs` of the instruction, of types
 /// `output_types`, are left to [`constrain_unreduced_outputs`].
@@ -2334,12 +2331,7 @@ fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
         return Ok(());
     };
     // The emitted operations are collected before any constraint is inserted, so that the constraints are not visited.
-    let mut operations = Vec::new();
-    let mut next = next_operation(anchor)?;
-    while let Some(operation) = next {
-        operations.push(operation);
-        next = next_operation(operation)?;
-    }
+    let operations = block.operations_after(&anchor)?.collect::<Result<Vec<_>, _>>()?;
     let operation_name = |operation: &OperationRef<'b, 'c, 't>| -> Result<String, Error> {
         let name = operation.name();
         let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;

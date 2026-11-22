@@ -15,7 +15,6 @@ use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
-use crate::operations::sharding::place::validate_shard_layout;
 use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -228,7 +227,7 @@ impl Operation for ReshardOperation {
         let output = input.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
         let describes_shards = output
             .layout()
-            .is_none_or(|layout| validate_shard_layout(&output, layout, output.sharding(), false).is_ok());
+            .is_none_or(|layout| output.validate_shard_layout(layout, output.sharding(), false).is_ok());
 
         Ok(vec![if describes_shards { output } else { output.with_layout(None::<Layout>) }])
     }
