@@ -43,6 +43,14 @@ pub struct StagedProgram<C: CompilationDomain> {
 
     /// Memoized source program with runtime captures lifted into leading flat inputs.
     lifted_program: OnceLock<Arc<FlatProgram<C>>>,
+
+    /// Memoized operation that calls this program, before the result identities of any one call are instantiated.
+    /// Refer to [`CompilationDomain::call_operation`] for more information.
+    call_operation: OnceLock<C::Operation>,
+
+    /// Whether this program is a staged specialization of a [`CompiledFunctionDispatcher`].
+    /// Refer to [`CompilationDomain::call_operation`] for more information.
+    dispatched: bool,
 }
 
 impl<C: CompilationDomain> StagedProgram<C> {
@@ -175,7 +183,15 @@ impl<C: CompilationDomain> StagedProgram<C> {
         // Validate every capture reference against its runtime slot and type, then prune unused captures and renumber
         // the surviving references together with their table entries to keep the closed program consistent.
         let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
-        Ok(Self { source_program, input_types, output_types, options, lifted_program: OnceLock::new() })
+        Ok(Self {
+            source_program,
+            input_types,
+            output_types,
+            options,
+            lifted_program: OnceLock::new(),
+            call_operation: OnceLock::new(),
+            dispatched: false,
+        })
     }
 
     /// Returns the flat source program and its runtime captures.
@@ -436,39 +452,16 @@ where
         Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
         Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
     {
-        self.call_in_context_with(context, inputs, |operation| operation)
-    }
-
-    /// Calls this function in the provided `context` like [`Self::call_in_context`], binding the staged-call operation
-    /// that `transform_fn` returns for the one that this function constructs. A compilation domain uses it to record
-    /// facts about the called function that its operation keeps but that the callee program does not show (e.g., the
-    /// sharding overrides of the boundary of a compiled function). `transform_fn` must return a call of the same callee
-    /// with the same capture prefix, because the call is bound with this function's callee and inputs.
-    pub fn call_in_context_with<V, CallerContext, Path, F>(
-        &self,
-        context: &CallerContext,
-        inputs: Input::To<V>,
-        transform_fn: F,
-    ) -> Result<Output::To<V>, ProgramError>
-    where
-        C::Operation: StagedCallOperation<C::Constant>,
-        V: Value<Type = C::Type>,
-        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
-            + ImportingContext<C, Path>,
-        Input: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
-        Input::To<V>: Parameterized<V>,
-        Output: Parameterized<C::Type, Family: ParameterizedFamily<V>>,
-        Output::To<V>: Parameterized<V, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
-        F: FnOnce(C::Operation) -> C::Operation,
-    {
-        let outputs = self.call_flat_in_context_with(context, inputs.into_parameters().collect(), transform_fn)?;
+        let outputs = self.call_flat_in_context(context, inputs.into_parameters().collect())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
     /// Calls this function in the provided `context` with flat `inputs` and returns its flat outputs, binding one
     /// staged-call operation exactly as [`Self::call_in_context`] does. Use it when the caller holds the flat leaves
     /// of the input structure rather than the structured inputs. Explicit context selection supports empty `inputs`,
-    /// including nullary and capture-only calls.
+    /// including nullary and capture-only calls. Every call of a staged function is bound here, and the operation that
+    /// it binds is the one that [`CompilationDomain::call_operation`] returns for this function, so that the call
+    /// records the facts about the boundary of this function that only its options or its whole program hold.
     pub fn call_flat_in_context<V, CallerContext, Path>(
         &self,
         context: &CallerContext,
@@ -479,24 +472,6 @@ where
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
-    {
-        self.call_flat_in_context_with(context, inputs, |operation| operation)
-    }
-
-    /// Binds one staged-call operation of this function in `context` over flat `inputs`, after `transform_fn`
-    /// (refer to [`Self::call_in_context_with`]), and returns its flat outputs.
-    fn call_flat_in_context_with<V, CallerContext, Path, F>(
-        &self,
-        context: &CallerContext,
-        inputs: Vec<V>,
-        transform_fn: F,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        C::Operation: StagedCallOperation<C::Constant>,
-        V: Value<Type = C::Type>,
-        CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
-            + ImportingContext<C, Path>,
-        F: FnOnce(C::Operation) -> C::Operation,
     {
         let mut flat_inputs = self
             .state
@@ -510,11 +485,25 @@ where
         let capture_count = flat_inputs.len();
         flat_inputs.extend(inputs);
         let callee = self.callee_program()?;
-        let operation = transform_fn(C::Operation::staged_call_with_types(
-            capture_count,
-            &callee.input_types(),
-            &callee.output_types(),
-        )?);
+
+        // The backend derives the call of this function once (refer to `CompilationDomain::call_operation`), and each
+        // call instantiates the result identities of its own call site, which a callee without identities lacks.
+        let operation = self
+            .state
+            .program
+            .call_operation
+            .get_or_init(|| {
+                let operation = C::Operation::staged_call(capture_count);
+                C::call_operation(operation, &callee, self.options(), self.state.program.dispatched)
+            })
+            .clone();
+
+        let operation = if callee.entry_region_ref().type_identity_signature().identities().is_empty() {
+            operation
+        } else {
+            operation.with_call_types(&callee.input_types(), &callee.output_types())?
+        };
+
         context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
@@ -542,6 +531,13 @@ where
             }
         }
         Ok(callee)
+    }
+
+    /// Returns this function marked as a staged specialization of a [`CompiledFunctionDispatcher`], which its calls
+    /// pass to [`CompilationDomain::call_operation`]. The function must not have been cloned yet.
+    fn into_dispatched(mut self) -> Self {
+        Arc::get_mut(&mut self.state).unwrap().program.dispatched = true;
+        self
     }
 }
 
@@ -1517,12 +1513,14 @@ where
     /// the [`DispatchInputs::Types`] signature of [`CompilationDomain::dispatch_signature`], which need no domain
     /// instance, so a dispatcher that infers its domain need not have selected one. Host side effects of the closure
     /// therefore run once per staged specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
-    /// remove staged specializations together with executable ones.
+    /// remove staged specializations together with executable ones. A staged specialization owns the specialized
+    /// options that [`CompilationDomain::dispatch_signature`] returns, or the options of this dispatcher when it
+    /// returns none, and its calls pass those to [`CompilationDomain::call_operation`].
     ///
     /// # Errors
     ///
-    /// Returns an error when the inputs do not satisfy the declared staged input types, when the domain rejects the
-    /// staged input types, when tracing the closure fails, when the same thread recursively requests a staged
+    /// Returns an error when the inputs do not satisfy the declared staged input types, when the domain rejects
+    /// the staged input types, when tracing the closure fails, when the same thread recursively requests a staged
     /// specialization that it is still producing, or when binding the call fails in `context`.
     pub fn call_in_context<V, CallerContext, Path>(
         &self,
@@ -1748,7 +1746,7 @@ where
                     scope,
                 );
                 accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
-                producer.insert(staged?)
+                producer.insert(staged?.into_dispatched())
             }
             Err(_) => {
                 statistics.staged_cache_misses.fetch_add(1, Ordering::Relaxed);
@@ -2136,7 +2134,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
-    use crate::programs::{EmptyRegionDriver, Operation, RegionInterface, RegionSlot, TypeError};
+    use crate::programs::{EmptyRegionDriver, Operation, OperationFormatter, RegionInterface, RegionSlot, TypeError};
 
     use super::*;
 
@@ -2229,6 +2227,13 @@ mod tests {
     struct TestCallOperation {
         /// Number of leading inputs that hold the lifted captures of the callee.
         capture_count: usize,
+
+        /// Marker of the options of the callee that [`TestMarkedCallDomain`] records, rendered as a `marker` field.
+        marker: Option<usize>,
+
+        /// Whether [`TestMarkedCallDomain`] recorded the callee as a staged specialization of a dispatcher, rendered as
+        /// a `dispatched` field when it did.
+        dispatched: bool,
     }
 
     impl Operation for TestCallOperation {
@@ -2236,6 +2241,20 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "call"
+        }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            let operation_formatter = OperationFormatter::new(formatter, indentation, self.name())?;
+            match self.marker {
+                Some(marker) => operation_formatter.bracketed(|contents| {
+                    contents.field("marker", marker)?;
+                    if self.dispatched {
+                        contents.field("dispatched", true)?;
+                    }
+                    Ok(())
+                }),
+                None => Ok(()),
+            }
         }
 
         fn region_slots(&self) -> &'static [RegionSlot] {
@@ -2261,7 +2280,7 @@ mod tests {
 
     impl StagedCallOperation<CaptureReference<ArrayType>> for TestCallFamily {
         fn staged_call(capture_count: usize) -> Self {
-            Self::Call(TestCallOperation { capture_count })
+            Self::Call(TestCallOperation { capture_count, marker: None, dispatched: false })
         }
     }
 
@@ -2291,6 +2310,63 @@ mod tests {
             let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types, None))
+        }
+
+        fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "the test call domain does not lower programs".into() })
+        }
+
+        fn compile(&self, _program: &FlatProgram<Self>) -> Result<(Arc<FlatProgram<Self>>, Vec<Array>), ProgramError> {
+            unreachable!("the test call domain never lowers programs")
+        }
+
+        fn execute(&self, _program: &FlatProgram<Self>, _inputs: Vec<Array>) -> Result<Vec<Array>, ProgramError> {
+            unreachable!("the test call domain never lowers programs")
+        }
+    }
+
+    /// Compilation domain like [`TestCallDomain`], whose calls record the marker of the [`CarriedOptions`] of their
+    /// callee through [`CompilationDomain::call_operation`]. The tests that use it only stage programs, so it rejects
+    /// lowering.
+    #[derive(Clone)]
+    struct TestMarkedCallDomain;
+
+    impl Domain for TestMarkedCallDomain {
+        type Type = ArrayType;
+        type Value = Array;
+        type Constant = CaptureReference<ArrayType>;
+        type Operation = TestCallFamily;
+    }
+
+    impl CompilationDomain for TestMarkedCallDomain {
+        type DispatchKey = Arc<[ArrayType]>;
+        type LoweredProgram = FlatProgram<Self>;
+        type CompiledProgram = FlatProgram<Self>;
+        type Options = CarriedOptions;
+        type Error = ProgramError;
+
+        fn dispatch_signature(
+            inputs: DispatchInputs<'_, '_, Self::Value>,
+            _options: &CarriedOptions,
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
+            let input_types = inputs.into_types();
+            let input_types: Arc<[ArrayType]> = input_types.into();
+            Ok((input_types.clone(), input_types, None))
+        }
+
+        fn call_operation(
+            operation: TestCallFamily,
+            callee: &FlatProgram<Self>,
+            options: &CarriedOptions,
+            dispatched: bool,
+        ) -> TestCallFamily {
+            let _ = callee;
+            match operation {
+                TestCallFamily::Call(call) => {
+                    TestCallFamily::Call(TestCallOperation { marker: Some(options.marker), dispatched, ..call })
+                }
+                operation => operation,
+            }
         }
 
         fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {
@@ -2546,38 +2622,32 @@ mod tests {
     }
 
     #[test]
-    fn test_staged_function_call_in_context_with() {
-        // The call binds the operation that `decorate` returns for the call that the function constructs, which is
-        // decorated exactly once.
-        let callee: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
-            |_, mut captures: Vec<CompilationTracer<TestCallDomain>>, _input| Ok(captures.remove(0)),
+    fn test_staged_function_call_in_context_records_options() {
+        // The call binds the operation that `CompilationDomain::call_operation` returns for the options of the callee,
+        // which are the options of the callee rather than those of the caller.
+        let callee: StagedFunction<TestMarkedCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestMarkedCallDomain>>, _input| Ok(captures.remove(0)),
             vec![Array::scalar(7.0).unwrap()],
             ArrayType::scalar(DataType::F64),
-            (),
+            CarriedOptions { marker: 3 },
         )
         .unwrap();
-        let decorations = Cell::new(0usize);
-        let caller: StagedFunction<TestCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
-            |_, _, input: CompilationTracer<TestCallDomain>| {
+        let caller: StagedFunction<TestMarkedCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, _, input: CompilationTracer<TestMarkedCallDomain>| {
                 let context = input.context().clone();
-                callee.call_in_context_with(&context, input, |operation| {
-                    assert!(matches!(operation, TestCallFamily::Call(TestCallOperation { capture_count: 1 })));
-                    decorations.set(decorations.get() + 1);
-                    TestCallFamily::Call(TestCallOperation { capture_count: 1 })
-                })
+                callee.call_in_context(&context, input)
             },
             Vec::new(),
             ArrayType::scalar(DataType::F64),
-            (),
+            CarriedOptions { marker: 5 },
         )
         .unwrap();
-        assert_eq!(decorations.get(), 1);
         assert_eq!(
             caller.source_program().program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call %1 %0 [
+                    %2:f64[] = call [marker=3] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             in (%0)
@@ -2615,6 +2685,43 @@ mod tests {
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
                     %2:f64[] = call %1 %0 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_staged_function_call_flat_in_context_records_options() {
+        // The flat call binds the operation that `CompilationDomain::call_operation` returns for the options of the
+        // callee, and that operation receives the captures of the callee ahead of the flat inputs.
+        let callee: StagedFunction<TestMarkedCallDomain, ArrayType, ArrayType> = StagedFunction::stage(
+            |_, mut captures: Vec<CompilationTracer<TestMarkedCallDomain>>, _input| Ok(captures.remove(0)),
+            vec![Array::scalar(7.0).unwrap()],
+            ArrayType::scalar(DataType::F64),
+            CarriedOptions { marker: 3 },
+        )
+        .unwrap();
+        let caller = StagedProgram::<TestMarkedCallDomain>::stage(
+            |_, _, inputs| {
+                let context = inputs[0].context().clone();
+                callee.call_flat_in_context(&context, inputs)
+            },
+            Vec::new(),
+            vec![ArrayType::scalar(DataType::F64)],
+            CarriedOptions { marker: 5 },
+        )
+        .unwrap();
+        assert_eq!(caller.source_program().captures(), &[Array::scalar(7.0).unwrap()]);
+        assert_eq!(
+            caller.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const capture#0:f64[]
+                    %2:f64[] = call [marker=3] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             in (%0)
@@ -3708,6 +3815,44 @@ mod tests {
 
         // Invalidation removes the staged specializations of every scope and counts them.
         assert_eq!(function.invalidate_specializations(&()), 2);
+    }
+
+    #[test]
+    fn test_compiled_function_dispatcher_call_in_context_records_options() {
+        // The call binds the operation that `CompilationDomain::call_operation` returns for the options of the staged
+        // specialization, which are the options of the dispatcher, including when the specialization is reused, and
+        // tells the domain that the callee is a staged specialization of a dispatcher.
+        let function: CompiledFunctionDispatcher<TestMarkedCallDomain, (), ArrayType, ArrayType, _> =
+            TestMarkedCallDomain.jit_with_options(
+                |(), input: CompilationTracer<TestMarkedCallDomain>| Ok(input.unary(NegOperation::new())),
+                CarriedOptions { marker: 4 },
+            );
+        let stage_caller = || {
+            StagedFunction::<TestMarkedCallDomain, ArrayType, ArrayType>::stage(
+                |_, _, input: CompilationTracer<TestMarkedCallDomain>| {
+                    let context = input.context().clone();
+                    function.call_in_context(&context, (), input)
+                },
+                Vec::new(),
+                ArrayType::scalar(DataType::F64),
+                CarriedOptions { marker: 5 },
+            )
+            .unwrap()
+        };
+        let expected = indoc! {"
+            lambda %0:f64[] .
+            let %1:f64[] = call [marker=4, dispatched=true] %0 [
+                callee={
+                    lambda %0:f64[] .
+                    let %1:f64[] = neg %0
+                    in (%1)
+                },
+            ]
+            in (%1)"};
+        assert_eq!(stage_caller().source_program().program().to_string(), expected);
+        assert_eq!(stage_caller().source_program().program().to_string(), expected);
+        let statistics = function.statistics();
+        assert_eq!((statistics.staged_cache_hits, statistics.staged_cache_misses, statistics.traces), (1, 1, 1));
     }
 
     #[test]

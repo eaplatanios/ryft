@@ -12,23 +12,35 @@ pub trait StagedCallOperation<Constant: Value>: Operation<Type = Constant::Type>
     /// of that callee boundary.
     fn staged_call(capture_count: usize) -> Self;
 
-    /// Constructs one call with its exact callee signature. Families that export callee-local nominal identities
-    /// override this hook to allocate instruction-owned result identities while forwarding input identities.
-    /// Allocation happens when the call is built, and output inference must remain deterministic. The default returns
-    /// [`Self::staged_call`], leaving result inference to the family. A family whose inference reports the callee's
-    /// result types then makes each call instruction define the callee-local identities itself. Program construction
-    /// rejects a second call to the same callee in one region, because it would define those identities again although
-    /// sharing a callee root does not make the runtime results of separate calls the same quantity. Override this
-    /// function to instantiate fresh result identities for every call instead.
+    /// Constructs one call with its exact callee signature, which is [`Self::staged_call`] instantiated for that
+    /// signature by [`Self::with_call_types`].
     #[inline]
     fn staged_call_with_types(
         capture_count: usize,
         input_types: &[Constant::Type],
         output_types: &[Constant::Type],
     ) -> Result<Self, TypeError> {
-        let _ = input_types;
-        let _ = output_types;
-        Ok(Self::staged_call(capture_count))
+        Self::staged_call(capture_count).with_call_types(input_types, output_types)
+    }
+
+    /// Returns this call instantiated for one call site of a callee with the exact signature `input_types`
+    /// and `output_types`. Families that export callee-local nominal identities override this hook to allocate
+    /// instruction-owned result identities while forwarding input identities, replacing those of any earlier
+    /// instantiation, so that a call that is built once for a callee can be instantiated again for each of its call
+    /// sites. Allocation happens when the call is instantiated, and output inference must remain deterministic. The
+    /// default returns this call unchanged, leaving result inference to the family. A family whose inference reports
+    /// the callee's result types then makes each call instruction define the callee-local identities itself. Program
+    /// construction rejects a second call to the same callee in one region, because it would define those identities
+    /// again although sharing a callee root does not make the runtime results of separate calls the same quantity.
+    /// Override this function to instantiate fresh result identities for every call instead.
+    #[inline]
+    fn with_call_types(
+        self,
+        input_types: &[Constant::Type],
+        output_types: &[Constant::Type],
+    ) -> Result<Self, TypeError> {
+        let _ = (input_types, output_types);
+        Ok(self)
     }
 }
 

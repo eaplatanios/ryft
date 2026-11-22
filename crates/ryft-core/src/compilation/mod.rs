@@ -106,6 +106,9 @@
 //! and a transform context imports them through its parent and wraps them like constants. To embed a staged function
 //! in a larger trace, an operation family implements [`StagedCallOperation`], and that operation then owns how the
 //! nested call behaves under lowering, batching, differentiation, partial evaluation, and interpretation.
+//! Core constructs that operation from the signature of the callee alone and passes it through
+//! [`CompilationDomain::call_operation`] with the options of the staged function, which lets a backend
+//! record facts about the boundary of the callee that its options hold but that its program does not show.
 //!
 //! # Specialization and Caching
 //!

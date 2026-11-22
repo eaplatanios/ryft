@@ -175,7 +175,10 @@ impl LogicalMesh {
     /// named `device` of size 1. A value that is gathered from several devices onto one device (e.g., by a
     /// [`PlaceOperation`](crate::PlaceOperation) with a [`PlacementRequest::Device`](crate::PlacementRequest::Device)
     /// target) lives on this mesh, replicated, so that the type that a staged placement infers for it and the
-    /// placement that a backend gives it when the placement executes agree.
+    /// placement that a backend gives it when the placement executes agree. Backends also give this mesh to a value
+    /// that they place without a configured mesh (e.g., a host value that is uploaded without one), so that such a
+    /// value combines with a gathered value on the same device. Types name their logical mesh, so a value on another
+    /// mesh of one device (e.g., one with an explicit axis named `x`) does not combine with values on this one.
     #[inline]
     pub fn single_device() -> Self {
         // The only axis has a valid name and size, and a mesh with one axis has neither duplicate axis names
