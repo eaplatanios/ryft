@@ -347,6 +347,21 @@ impl Device {
     }
 }
 
+impl Display for Device {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Renders a `Device` as its `DeviceId`, followed by `@` and its `ProcessIndex` when that index is not 0 (e.g.,
+        // `5` for device 5 of process 0 and `5@1` for device 5 of process 1). This is the one rendering of a device,
+        // which every rendering of a device or a list of devices uses (e.g., that of a `Placement` and that of a device
+        // request of `PlaceOperation`), so that two devices that differ only in their process never render alike, as
+        // the contract of `Operation::render` requires. The renderings of single-process programs, whose devices all
+        // belong to process 0, show device IDs alone.
+        match self.process_index {
+            0 => write!(formatter, "{}", self.id),
+            process_index => write!(formatter, "{}@{}", self.id, process_index),
+        }
+    }
+}
+
 /// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`Device`]s into a [`LogicalMesh`].
 /// Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g., for a two-dimensional mesh
 /// with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has linear index `i * 2 + j`.
@@ -615,6 +630,19 @@ mod tests {
             mesh.with_axis_types(["x", "w"], MeshAxisType::Auto),
             Err(ShardingError::UnknownMeshAxisName { name }) if name == "w",
         ));
+    }
+
+    #[test]
+    fn test_device() {
+        let device = Device::new(5, 1);
+        assert_eq!(device.id(), 5);
+        assert_eq!(device.process_index(), 1);
+
+        // A device of process 0 renders as its ID alone, and a device of another process also renders its process, so
+        // that two devices that differ only in their process render differently.
+        assert_eq!(Device::new(5, 0).to_string(), "5");
+        assert_eq!(device.to_string(), "5@1");
+        assert_ne!(Device::new(5, 0), device);
     }
 
     #[test]

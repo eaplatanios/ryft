@@ -227,6 +227,27 @@ impl<T: Type> CaptureConstant for CaptureReference<T> {
     }
 }
 
+/// Policy for the type with which a function that is being traced receives an array that enters its trace from outside
+/// (i.e., an array that it captures explicitly or that its trace, or a trace nested in it, imports). It is part of the
+/// [`TracingScope`](crate::TracingScope) of a trace, which every trace nested in it inherits (refer to
+/// [`NamedAxes::capture_placement`](crate::NamedAxes::capture_placement)), and [`CapturingContext::capture`]
+/// consults it before it registers a runtime value in the capture table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CapturePlacement {
+    /// The array keeps its own type, including its sharding. This is the policy of plain traces and eager regions.
+    #[default]
+    Preserve,
+
+    /// The array follows the call of the function that captures it. A backend may receive an array whose type records
+    /// nothing beyond replication with its type stripped of its sharding, so that the function runs where its call
+    /// runs whatever the devices of the array, while an array whose type records a split, a pending reduction, or
+    /// manual variation keeps its type. Functions staged for compilation by a backend that places their captures
+    /// (refer to [`CompilationDomain::capture_placement`](crate::CompilationDomain::capture_placement)) are traced
+    /// with this policy, and the mesh on which the function receives such arrays comes from its compilation options
+    /// when it is lowered.
+    FollowCall,
+}
+
 /// [`Context`] that can register runtime values as captures (e.g., for a [`Program`] that is being built). The returned
 /// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
 /// [`CaptureReference`] into a side table owned by the surrounding compiled function. Stackable transform contexts
@@ -240,8 +261,14 @@ pub trait CapturingContext: Context {
     /// staged payload that [`capture`](Self::capture) returns).
     type Capture: Value<Type = Self::Type>;
 
-    /// Appends `value` to the current captures table of this [`CapturingContext`] and returns the constant payload
-    /// that refers to it.
+    /// Returns the constant payload through which the program that this [`CapturingContext`] builds holds `value`.
+    /// That is usually a reference to a new entry for `value` that this function appends to the current captures
+    /// table. A trace that stages a function under
+    /// [`CapturePlacement::FollowCall`](crate::CapturePlacement::FollowCall) first asks the domain that it compiles for
+    /// whether the function holds `value` as a constant of its own instead (refer to
+    /// [`CompilationDomain::capture_constant`](crate::CompilationDomain::capture_constant)), and when the domain gives
+    /// one (e.g., the XLA backend gives a session constant for an array whose type records nothing beyond
+    /// replication), this function returns that constant and appends nothing to the captures table.
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError>;
 }
 
@@ -273,6 +300,11 @@ where
 
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+        // A trace that stages a function under `CapturePlacement::FollowCall` holds the constant that its domain gives
+        // a runtime value that enters it, if any, whether the function captures it explicitly or its trace imports it.
+        if let Some(constant) = self.capture_constant(&value)? {
+            return Ok(constant);
+        }
         let mut captures = self.captures().borrow_mut();
         let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
         captures.push(value);

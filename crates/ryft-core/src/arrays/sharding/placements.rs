@@ -203,13 +203,14 @@ impl Placement {
 
 impl Display for Placement {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The device mesh is rendered as its logical mesh followed by its device IDs, which are globally unique,
-        // so that the rendering identifies the devices along with how the sharding partitions the array over them.
+        // The device mesh is rendered as its logical mesh followed by its devices (refer to the rendering of `Device`,
+        // which also renders the process of a device of a process other than process 0), so that the rendering
+        // identifies the devices along with how the sharding partitions the array over them.
         write!(
             formatter,
             "{{mesh<{}>, devices=[{}], sharding={}",
             self.mesh.logical_mesh(),
-            self.mesh.devices().iter().map(|device| device.id().to_string()).collect::<Vec<_>>().join(", "),
+            self.mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
             self.sharding,
         )?;
         if let Some(memory) = self.memory {
@@ -257,6 +258,16 @@ mod tests {
         assert_eq!(
             placement.to_string(),
             "{mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{'x'}]}}",
+        );
+
+        // Placements whose devices differ only in their processes differ and render differently, because a device of
+        // a process other than process 0 also renders its process.
+        let remote_mesh = DeviceMesh::new(mesh.logical_mesh().clone(), vec![Device::new(0, 0), Device::new(1, 1)]);
+        let remote_placement = Placement::new(remote_mesh.unwrap(), sharding.clone()).unwrap();
+        assert_ne!(remote_placement, placement);
+        assert_eq!(
+            remote_placement.to_string(),
+            "{mesh<['x'=2:explicit]>, devices=[0, 1@1], sharding={mesh<['x'=2:auto]>, [{'x'}]}}",
         );
 
         // A sharding over a mesh with a different topology is rejected.
@@ -321,7 +332,7 @@ mod tests {
         assert_eq!(placement.memory(), Some(Memory::Device));
         assert_eq!(
             placement.to_string(),
-            format!("{{mesh<[]>, devices=[3], sharding={{mesh<[]>, [{{}}, {{}}]}}, memory=Device, layout={layout}}}"),
+            format!("{{mesh<[]>, devices=[3@1], sharding={{mesh<[]>, [{{}}, {{}}]}}, memory=Device, layout={layout}}}"),
         );
     }
 
@@ -348,7 +359,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         assert_eq!(placement.layout(), None);
         assert_eq!(placement.memory(), Some(Memory::Host { pinned: true }));
-        assert_eq!(placement.to_string(), "{mesh<[]>, devices=[3], sharding={mesh<[]>, []}, memory=Host[Pinned]}");
+        assert_eq!(placement.to_string(), "{mesh<[]>, devices=[3@1], sharding={mesh<[]>, []}, memory=Host[Pinned]}");
     }
 
     #[test]
