@@ -468,12 +468,29 @@ pub struct ThroughCapture;
 pub trait ImportingContext<Source: Domain, Path>: Context {
     /// Brings `value`, a value of the `Source` domain, into this [`Context`].
     fn import(&self, value: Source::Value) -> Result<Self::Value, ProgramError>;
+
+    /// Borrows `value` as a value of the `Source` domain when it already has that representation. A [`SameContext`]
+    /// import can lend the value directly. A transform context lends the source value of the parent value that it wraps
+    /// (i.e., the known value of a partial evaluation, the primal of a dual, or the packed value of a batch, whose type
+    /// has the mapped axis in addition to the item type of `value`), so a call under a transform sees the runtime facts
+    /// (e.g., placement commitment) of its input as the same call outside the transform does. The default supplies no
+    /// source value.
+    #[inline]
+    fn as_source_value<'v>(&self, value: &'v Self::Value) -> Option<&'v Source::Value> {
+        let _ = value;
+        None
+    }
 }
 
 impl<C: Context> ImportingContext<C, SameContext> for C {
     #[inline]
     fn import(&self, value: C::Value) -> Result<C::Value, ProgramError> {
         Ok(value)
+    }
+
+    #[inline]
+    fn as_source_value<'v>(&self, value: &'v C::Value) -> Option<&'v C::Value> {
+        Some(value)
     }
 }
 
@@ -524,6 +541,11 @@ where
         // An imported value is available to the known side, so it enters as a known value of the parent's import.
         Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known(self.parent().import(value)?)))
     }
+
+    #[inline]
+    fn as_source_value<'v>(&self, value: &'v Self::Value) -> Option<&'v S::Value> {
+        self.parent().as_source_value(value.value().ok()?.as_known()?)
+    }
 }
 
 impl<S: Domain, Path, C: ImportingContext<S, Path>, P: BatchingPolicy<C>> ImportingContext<S, ThroughParent<Path>>
@@ -535,6 +557,11 @@ where
     fn import(&self, value: S::Value) -> Result<Self::Value, ProgramError> {
         // An imported value does not vary across the batch, so it enters as a replicated batch of the parent's import.
         Ok(BatchingTracer::new(self.clone(), P::replicated(self.parent().import(value)?)))
+    }
+
+    #[inline]
+    fn as_source_value<'v>(&self, value: &'v Self::Value) -> Option<&'v S::Value> {
+        self.parent().as_source_value(P::value(value.batch()))
     }
 }
 
@@ -550,6 +577,11 @@ where
         // zero tangent.
         let primal = self.primal().import(value)?;
         Ok(DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal)?, self.clone()))
+    }
+
+    #[inline]
+    fn as_source_value<'v>(&self, value: &'v Self::Value) -> Option<&'v S::Value> {
+        self.primal().as_source_value(value.primal())
     }
 }
 

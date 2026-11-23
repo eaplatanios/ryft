@@ -205,7 +205,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + Select<T>
     + ManipulationOperations<T>
     + Placed
-    + Place<T>
+    + Place<Self, T>
     + ShardingOperations<Self, T>
     + StopGradient<T>
     + Tag<T>
@@ -241,7 +241,7 @@ impl<
         + Select<T>
         + ManipulationOperations<T>
         + Placed
-        + Place<T>
+        + Place<V, T>
         + ShardingOperations<V, T>
         + StopGradient<T>
         + Tag<T>

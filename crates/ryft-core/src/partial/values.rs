@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::programs::{AtomId, Typed, Value};
+use crate::programs::{AtomId, Type, TypeError, Typed, Value};
 
 #[cfg(doc)]
 use crate::partial::contexts::PartialEvaluationContext;
@@ -15,7 +15,7 @@ use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::partitions::PartitionedProgram;
 
 #[cfg(doc)]
-use crate::programs::{Program, Type};
+use crate::programs::Program;
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
 /// interprets a [`Program`] over. Every [`Atom`](crate::Atom) and every intermediate result is either
@@ -108,7 +108,10 @@ pub enum PartialValueMaterialization {
 #[derive(Clone)]
 pub struct PartialEvaluationValue<V: Value> {
     /// Underlying [`PartialValue`] that represents the abstract known/unknown classification of the value.
-    pub(super) value: PartialValue<V>,
+    value: PartialValue<V>,
+
+    /// Staged type of a known value whose runtime type refines it.
+    declared_type: Option<Rc<V::Type>>,
 
     /// [`PartialValueMaterialization`] that describes how the underlying value is represented at the residual program
     /// boundary. This is deliberately separate from the underlying [`PartialValue`] because it answers a different
@@ -131,6 +134,7 @@ impl<V: Value> PartialEvaluationValue<V> {
     pub fn known(value: V) -> Self {
         Self {
             value: PartialValue::Known(value),
+            declared_type: None,
             materialization: Rc::new(Cell::new(PartialValueMaterialization::Undecided)),
         }
     }
@@ -140,6 +144,7 @@ impl<V: Value> PartialEvaluationValue<V> {
     pub fn known_input(value: V) -> Self {
         Self {
             value: PartialValue::Known(value),
+            declared_type: None,
             materialization: Rc::new(Cell::new(PartialValueMaterialization::Input { residual_atom: None })),
         }
     }
@@ -149,6 +154,7 @@ impl<V: Value> PartialEvaluationValue<V> {
     pub fn known_constant(value: V) -> Self {
         Self {
             value: PartialValue::Known(value),
+            declared_type: None,
             materialization: Rc::new(Cell::new(PartialValueMaterialization::Constant { residual_atom: None })),
         }
     }
@@ -158,14 +164,45 @@ impl<V: Value> PartialEvaluationValue<V> {
     pub fn variable(r#type: V::Type, residual_atom: AtomId) -> Self {
         Self {
             value: PartialValue::Unknown(r#type),
+            declared_type: None,
             materialization: Rc::new(Cell::new(PartialValueMaterialization::Variable { residual_atom })),
         }
+    }
+
+    /// Retains the staged type of this known result while keeping its concrete payload for eager work. A different
+    /// declaration needs its own residual input because other users of this value can keep its old type.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when the known value does not refine the declaration.
+    pub(super) fn with_declared_type(mut self, declaration: V::Type) -> Result<Self, TypeError> {
+        if self.is_unknown() || self.r#type().as_ref() == &declaration {
+            return Ok(self);
+        }
+
+        let actual = self.value.r#type();
+        if !declaration.is_refined_by(&actual) {
+            return Err(TypeError::invalid(format!(
+                "known result type {actual} does not refine declared type {declaration}",
+            )));
+        }
+
+        self.declared_type = (actual.as_ref() != &declaration).then(|| Rc::new(declaration));
+        self.materialization = Rc::new(Cell::new(PartialValueMaterialization::Input { residual_atom: None }));
+
+        Ok(self)
     }
 
     /// Returns the underlying [`PartialValue`].
     #[inline]
     pub fn value(&self) -> &PartialValue<V> {
         &self.value
+    }
+
+    /// Returns the staged declaration when it differs from the known value's type.
+    #[inline]
+    pub fn declared_type(&self) -> Option<&V::Type> {
+        self.declared_type.as_deref()
     }
 
     /// Returns the [`PartialValueMaterialization`] of this [`PartialEvaluationValue`].
@@ -209,7 +246,7 @@ impl<V: Value> Typed for PartialEvaluationValue<V> {
 
     #[inline]
     fn r#type(&self) -> Cow<'_, V::Type> {
-        self.value.r#type()
+        self.declared_type().map_or_else(|| self.value.r#type(), Cow::Borrowed)
     }
 }
 

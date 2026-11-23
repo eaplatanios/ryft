@@ -457,12 +457,15 @@ impl<C: Context> PartialEvaluationContext<C> {
         if let Some((_, imported)) = self.state.imported_known_values.borrow().get(&source_key) {
             return Ok(PartialTracer::new(self.clone(), imported.clone()));
         }
-        let imported = match partial.materialization() {
+        let mut imported = match partial.materialization() {
             PartialValueMaterialization::Constant { .. } => PartialEvaluationValue::known_constant(known.clone()),
             PartialValueMaterialization::Input { .. } => PartialEvaluationValue::known_input(known.clone()),
             PartialValueMaterialization::Undecided => PartialEvaluationValue::known(known.clone()),
             PartialValueMaterialization::Variable { .. } => unreachable!("known values never name residual variables"),
         };
+        if let Some(declaration) = partial.declared_type() {
+            imported = imported.with_declared_type(declaration.clone())?;
+        }
         self.state
             .imported_known_values
             .borrow_mut()
@@ -1355,7 +1358,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let mut residual_output_atoms: Vec<AtomId> = Vec::new();
         for output in outputs {
             let materialization = output.materialization();
-            match output.value {
+            match output.value() {
                 PartialValue::Known(value) => evaluation_outputs.push(PartialEvaluationOutput::Known(value)),
                 PartialValue::Unknown(_) => {
                     let PartialValueMaterialization::Variable { residual_atom } = materialization else {
@@ -1732,7 +1735,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// [`PartialValueMaterialization`]: an unknown is already a residual variable, a known value becomes an inline
     /// residual constant or a residual input (an [`Undecided`](PartialValueMaterialization::Undecided) value becomes
     /// an input), and the assignment is recorded in the value's shared slot so that every clone reuses it. Known values
-    /// that resolve to the same staged atom of the parent share one residual input.
+    /// with their original type that resolve to the same staged atom of the parent share one residual input.
     ///
     /// # Errors
     ///
@@ -1773,16 +1776,16 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
             atom
         } else {
-            // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
+            // A declared feeder may use a different type from other feeders for this known-side atom.
             let staged_atom = match self.state.parent.resolve(known) {
-                ValueResolution::Staged(atom) => Some(atom),
+                ValueResolution::Staged(atom) if value.declared_type().is_none() => Some(atom),
                 _ => None,
             };
             let existing = staged_atom.and_then(|staged| self.state.staged_feeders.borrow().get(&staged).copied());
             if let Some(atom) = existing {
                 atom
             } else {
-                let atom = self.state.builder.borrow_mut().add_input(known.r#type().into_owned());
+                let atom = self.state.builder.borrow_mut().add_input(value.r#type().into_owned());
                 self.state.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
                 if let Some(staged_atom) = staged_atom {
                     self.state.staged_feeders.borrow_mut().insert(staged_atom, atom);
@@ -1840,7 +1843,29 @@ where
             Ok(input_values) => {
                 let input_values = input_values.into_iter().cloned().collect::<Vec<_>>();
                 let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
-                let outputs = operation.partially_evaluate(self, &driver, input_values.as_slice());
+                let outputs = (|| {
+                    // Known-side execution can refine an input's type. Keep computing the staged signature from
+                    // its declaration so that, for example, an eager negation of a joined result retains the join.
+                    let declarations = if input_values.iter().any(|input| input.declared_type().is_some()) {
+                        let input_types =
+                            input_values.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                        Some(operation.infer_output_types(&input_types, &regions.region_interfaces())?)
+                    } else {
+                        None
+                    };
+                    let outputs = operation.partially_evaluate(self, &driver, &input_values)?;
+                    match declarations {
+                        Some(declarations) => {
+                            check_count!("output", outputs, declarations.len(), ProgramError);
+                            outputs
+                                .into_iter()
+                                .zip(declarations)
+                                .map(|(output, declaration)| output.with_declared_type(declaration).map_err(Into::into))
+                                .collect()
+                        }
+                        None => Ok(outputs),
+                    }
+                })();
                 match outputs {
                     Ok(outputs) => {
                         return Ok(outputs.into_iter().map(|value| PartialTracer::new(self.clone(), value)).collect());
@@ -2148,6 +2173,18 @@ impl<C: Context> PartialTracer<C> {
     #[inline]
     pub fn new(context: PartialEvaluationContext<C>, value: PartialEvaluationValue<C::Value>) -> Self {
         Self { context, state: PartialTracerState::Live(value) }
+    }
+
+    /// Retains a staged result declaration through eager evaluation of this value.
+    ///
+    /// # Errors
+    /// Returns a [`TypeError`] when a known result does not refine its declaration.
+    pub(crate) fn with_declared_type(self, declaration: C::Type) -> Result<Self, TypeError> {
+        let state = match self.state {
+            PartialTracerState::Live(value) => PartialTracerState::Live(value.with_declared_type(declaration)?),
+            state @ PartialTracerState::Poison { .. } => state,
+        };
+        Ok(Self { state, ..self })
     }
 
     /// Creates a poisoned [`PartialTracer`] deferring the provided error. Refer to the documentation of

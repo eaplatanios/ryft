@@ -1123,9 +1123,9 @@ impl<Static, Structure, Key> ExecutableSpecializationKey<Static, Structure, Key>
 /// Key of one retained staged specialization of a [`CompiledFunctionDispatcher`] (refer to
 /// [`CompiledFunctionDispatcher::call_in_context`]). Like [`ExecutableSpecializationKey`], it includes static
 /// parameters and input structure. It uses the effective staged input types and calling scope, because the closure
-/// resolves named axes and the default mesh against that scope. These types come from a [`DispatchInputs::Types`]
-/// signature (refer to [`CompilationDomain::dispatch_signature`]). The callee is lowered and dispatched as part of its
-/// enclosing computation, so executable dispatch policies such as shape bucketing do not apply to it.
+/// resolves named axes and the default mesh against that scope. These types come from a [`DispatchInputs::Call`]
+/// signature (refer to [`CompilationDomain::dispatch_signature`]). The callee is lowered and dispatched as part
+/// of its enclosing computation, so executable dispatch policies such as shape bucketing do not apply to it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StagedSpecializationKey<Static, Structure, T> {
     /// Host values declared static for the keyed specialization.
@@ -1135,7 +1135,7 @@ struct StagedSpecializationKey<Static, Structure, T> {
     input_structure: Structure,
 
     /// Effective staged input types.
-    input_types: Vec<T>,
+    input_types: Arc<[T]>,
 
     /// Scope of the calling context (i.e., its named axes and default mesh).
     scope: TracingScope,
@@ -1529,13 +1529,14 @@ where
     /// the dispatcher traces its closure into a staged specialization and retains it in a cache separate from its
     /// executables. The calling scope is the [`TracingScope`] of `context` (i.e., its named axes and default mesh),
     /// and the closure is traced in that scope so that it resolves them as it would if it were inlined. The effective
-    /// staged input types are the abstract input types after the declarations of [`Self::with_staged_input_types`] and
-    /// the [`DispatchInputs::Types`] signature of [`CompilationDomain::dispatch_signature`], which need no domain
-    /// instance, so a dispatcher that infers its domain need not have selected one. Host side effects of the closure
-    /// therefore run once per staged specialization. [`Self::clear_cache`] and [`Self::invalidate_specializations`]
-    /// remove staged specializations together with executable ones. A staged specialization owns the specialized
-    /// options that [`CompilationDomain::dispatch_signature`] returns, or the options of this dispatcher when it
-    /// returns none, and its calls pass those to [`CompilationDomain::call_operation`].
+    /// staged input types come from validating and applying the declarations of [`Self::with_staged_input_types`]
+    /// and deriving the [`DispatchInputs::Call`] signature of [`CompilationDomain::dispatch_signature`] with any
+    /// available runtime values. A dispatcher can stage a call before selecting its execution domain. Host side
+    /// effects of the closure run once per staged specialization. [`Self::clear_cache`] and
+    /// [`Self::invalidate_specializations`] remove staged specializations together with executable ones. A staged
+    /// specialization owns the specialized options that [`CompilationDomain::dispatch_signature`] returns, or the
+    /// options of this dispatcher when it returns none, and its calls pass those to
+    /// [`CompilationDomain::call_operation`].
     ///
     /// # Errors
     ///
@@ -1566,13 +1567,19 @@ where
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let input_structure = inputs.parameter_structure();
-        let input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let staged = self.staged_specialization(
-            static_parameters,
-            input_structure,
-            input_types,
-            TracingScope::from_context(context),
-        )?;
+        let staged = {
+            let mut call_inputs = inputs
+                .parameters()
+                .map(|input| (input.r#type().into_owned(), context.as_source_value(input)))
+                .collect::<Vec<_>>();
+            self.apply_staged_input_types(&input_structure, call_inputs.iter_mut().map(|(r#type, _)| r#type))?;
+            self.staged_specialization(
+                static_parameters,
+                input_structure,
+                DispatchInputs::Call(call_inputs),
+                TracingScope::from_context(context),
+            )?
+        };
         staged.call_in_context(context, inputs).map_err(Into::into)
     }
 
@@ -1644,7 +1651,7 @@ where
 
         let input_structure = inputs.parameter_structure();
         let mut runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.apply_staged_input_types(&input_structure, &mut runtime_input_types)?;
+        self.apply_staged_input_types(&input_structure, runtime_input_types.iter_mut())?;
 
         let mut runtime_inputs = inputs.parameters();
         let (dispatch_key, effective_input_types, specialized_options) = C::dispatch_signature(
@@ -1716,14 +1723,13 @@ where
     }
 
     /// Acquires or produces the staged specialization of [`Self::call_in_context`] for `static_parameters`, the
-    /// abstract `input_types` of inputs with `input_structure`, and the calling `scope`. It is independent of the
-    /// caller's context and value types, so every caller of this dispatcher shares one instantiation of its tracing
-    /// and caching code.
+    /// validated `inputs` with `input_structure` and the calling `scope`. Every caller of this dispatcher shares
+    /// this tracing and caching code.
     fn staged_specialization(
         &self,
         static_parameters: Static,
         input_structure: Input::ParameterStructure,
-        mut input_types: Vec<C::Type>,
+        inputs: DispatchInputs<'_, '_, C::Value>,
         scope: TracingScope,
     ) -> Result<StagedFunction<C, Input, Output>, C::Error>
     where
@@ -1734,10 +1740,7 @@ where
         DomainTracingContext<C, C::Value>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        self.apply_staged_input_types(&input_structure, &mut input_types)?;
-        let (_, input_types, specialized_options) =
-            C::dispatch_signature(DispatchInputs::Types(input_types), &self.state.options)?;
-        let input_types = input_types.to_vec();
+        let (_, input_types, specialized_options) = C::dispatch_signature(inputs, &self.state.options)?;
         let key = StagedSpecializationKey {
             static_parameters: static_parameters.clone(),
             input_structure,
@@ -1755,8 +1758,9 @@ where
             }
             Ok(SpecializationCacheEntry::Vacant(producer)) => {
                 statistics.staged_cache_misses.fetch_add(1, Ordering::Relaxed);
-                let StagedSpecializationKey { input_structure, input_types, scope, .. } = producer.key().clone();
-                let input_types = Input::from_parameters(input_structure, input_types).map_err(ProgramError::from)?;
+                let StagedSpecializationKey { input_structure, input_types, scope, .. } = producer.key();
+                let input_types = Input::from_parameters(input_structure.clone(), input_types.iter().cloned())
+                    .map_err(ProgramError::from)?;
                 statistics.traces.fetch_add(1, Ordering::Relaxed);
                 let tracing_start = Instant::now();
                 let staged = StagedFunction::<C, Input, Output>::stage_in_scope(
@@ -1764,7 +1768,7 @@ where
                     Vec::new(),
                     input_types,
                     specialized_options.unwrap_or_else(|| self.state.options.clone()),
-                    scope,
+                    scope.clone(),
                 );
                 accumulate_duration(tracing_start.elapsed(), &statistics.tracing_nanoseconds);
                 producer.insert(staged?.into_dispatched())
@@ -1785,11 +1789,14 @@ where
     /// Replaces the types of `input_types` that [`Self::with_staged_input_types`] declares with their declared staged
     /// types, after validating that each replaced type refines its declaration. Execution and calls share this
     /// contract, so that a declaration means the same thing for both. Inputs without declarations keep their types.
-    fn apply_staged_input_types(
+    fn apply_staged_input_types<'t, T: Iterator<Item = &'t mut C::Type>>(
         &self,
         input_structure: &Input::ParameterStructure,
-        input_types: &mut [C::Type],
-    ) -> Result<(), ProgramError> {
+        input_types: T,
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: 't,
+    {
         let Some(StagedInputTypes { structure, types }) = &self.state.staged_input_types else {
             return Ok(());
         };
@@ -1804,15 +1811,16 @@ where
 
         let declared = types
             .iter()
+            .zip(input_types)
             .enumerate()
-            .filter_map(|(index, r#type)| Some((index, r#type.as_ref()?)))
+            .filter_map(|(index, (staged_type, input_type))| Some((index, staged_type.as_ref()?, input_type)))
             .collect::<Vec<_>>();
-        for &(index, staged_type) in &declared {
-            if !staged_type.is_refined_by(&input_types[index]) {
-                let (path, _) = structure.named_parameters().nth(index).unwrap();
+        for (index, staged_type, input_type) in &declared {
+            if !staged_type.is_refined_by(input_type) {
+                let (path, _) = structure.named_parameters().nth(*index).unwrap();
                 return Err(ProgramError::from(TypeError::invalid(format!(
                     "compilation input `{}` has type `{}`, which does not refine its declared staged type `{}`",
-                    path, input_types[index], staged_type,
+                    path, input_type, staged_type,
                 ))));
             }
         }
@@ -1820,15 +1828,15 @@ where
         // Check the declarations together before replacing any types. Individual refinement checks cannot detect
         // conflicting runtime extents for an identity shared by multiple inputs, such as a dimension and an array.
         <C::Type as Type>::Refinements::new(
-            declared.iter().map(|(_, staged_type)| *staged_type),
-            declared.iter().map(|(index, _)| &input_types[*index]),
+            declared.iter().map(|(_, staged_type, _)| *staged_type),
+            declared.iter().map(|(_, _, input_type)| &**input_type),
         )
         .map_err(ProgramError::from)?;
 
         // Declared leaves specialize at their staged types so compatible runtime values reuse a trace.
         // Undeclared leaves keep their runtime types. Validate before lookup so cache hits obey the same contract.
-        for (index, staged_type) in declared {
-            input_types[index] = staged_type.clone();
+        for (_, staged_type, input_type) in declared {
+            *input_type = staged_type.clone();
         }
 
         Ok(())
@@ -2328,6 +2336,8 @@ mod tests {
             inputs: DispatchInputs<'_, '_, Self::Value>,
             _options: &(),
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
+            // All dispatcher calls in this fixture use symbolic inputs from the enclosing trace.
+            assert!(matches!(&inputs, DispatchInputs::Call(inputs) if inputs.iter().all(|(_, value)| value.is_none())));
             let input_types = inputs.into_types();
             let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types, None))
