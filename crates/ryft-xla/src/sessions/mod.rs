@@ -1225,7 +1225,7 @@ impl Context for Session {
         let dispatch_regions = regions
             .regions()
             .map(|region| {
-                let Ok(artifact) = region.transform::<DispatchRegionTransform, _, Infallible>((), |region, ()| {
+                let Ok(artifact) = region.transform::<DispatchRegion, _, Infallible>((), |region, ()| {
                     let mut seen = HashSet::new();
                     let mut constants = Vec::<RetainedArray>::new();
                     for region in region.computation_regions() {
@@ -2323,7 +2323,8 @@ impl SessionBuilder {
     }
 }
 
-/// Key and session constants of a region attached to an eager application.
+/// Key and session constants that [`Context::bind`] caches for an attached region. This type also identifies the
+/// region's eager dispatch transform namespace.
 #[derive(Clone, Debug, PartialEq)]
 struct DispatchRegion {
     /// Key of the region in the eager dispatch cache, whose session constants keep no storage alive (refer to
@@ -2335,12 +2336,9 @@ struct DispatchRegion {
     constants: Arc<[RetainedArray]>,
 }
 
-/// [`Transform`] marker for the [`DispatchRegion`] cached with a region by [`Context::bind`].
-struct DispatchRegionTransform;
-
-impl Transform<Region<Constant, Operation>> for DispatchRegionTransform {
+impl Transform<Region<Constant, Operation>> for DispatchRegion {
     type Arguments = ();
-    type Artifact = TransformArtifact<Constant, Operation, DispatchRegion>;
+    type Artifact = TransformArtifact<Constant, Operation, Self>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 1;
 }
