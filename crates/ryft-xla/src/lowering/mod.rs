@@ -1939,7 +1939,8 @@ pub(crate) enum EntryResultPlacement {
 /// the operation that owns that region, which the compiler is free to place differently. A result that is an entry
 /// argument is placed where that argument enters the program, which the caller knows and which also covers arguments
 /// without buffers (i.e., of the zero data type), whose placement the compiler cannot report. A result that returns a
-/// [`RetainedArray`] is likewise placed as that array, which enters the program as a hidden argument.
+/// [`RetainedArray`] is likewise placed as the hidden argument that supplies it, whose sharding
+/// `constant_sharding` returns.
 ///
 /// Operations that return the value of an input together with its placement are followed back to that input, so that a
 /// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
@@ -1962,13 +1963,15 @@ pub(crate) enum EntryResultPlacement {
 pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     output_count: usize,
+    constant_sharding: impl Fn(&RetainedArray) -> Sharding,
 ) -> Vec<Option<EntryResultPlacement>>
 where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
     let mut callee_placements = HashMap::new();
-    region_result_placements(program.entry_region_ref(), &mut callee_placements)[..output_count].to_vec()
+    region_result_placements(program.entry_region_ref(), &constant_sharding, &mut callee_placements)[..output_count]
+        .to_vec()
 }
 
 /// Returns the sharding with which the entry function of a program annotates a value at its boundary (i.e., an
@@ -3944,6 +3947,7 @@ where
 /// input costs one lookup per step rather than a scan of the inputs or of the outputs of an instruction.
 fn region_result_placements<O: LowerableOperationFamily>(
     region: RegionRef<'_, Constant, O>,
+    constant_sharding: &impl Fn(&RetainedArray) -> Sharding,
     callee_placements: &mut HashMap<RegionId, Rc<[Option<EntryResultPlacement>]>>,
 ) -> Rc<[Option<EntryResultPlacement>]> {
     let mut producers = vec![None; region.atoms().len()];
@@ -3962,7 +3966,7 @@ fn region_result_placements<O: LowerableOperationFamily>(
         loop {
             let Some((instruction_index, output_index)) = producers[value_id.index()] else {
                 if let Some(Constant::Session(constant)) = region.atoms()[value_id.index()].as_constant() {
-                    return Some(EntryResultPlacement::Target(constant.sharding().clone()));
+                    return Some(EntryResultPlacement::Target(constant_sharding(constant)));
                 }
                 return input_positions[value_id.index()].map(EntryResultPlacement::Argument);
             };
@@ -4009,7 +4013,11 @@ fn region_result_placements<O: LowerableOperationFamily>(
                 let placements = match callee_placements.get(&callee) {
                     Some(placements) => Rc::clone(placements),
                     None => {
-                        let placements = region_result_placements(region.with_id(callee).ok()?, callee_placements);
+                        let placements = region_result_placements(
+                            region.with_id(callee).ok()?,
+                            constant_sharding,
+                            callee_placements,
+                        );
                         callee_placements.insert(callee, Rc::clone(&placements));
                         placements
                     }

@@ -284,7 +284,8 @@ where
             .map(|sharding| sharding.map(entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = self.global_output_types.parameters().cloned().collect::<Vec<_>>();
-        let placements = entry_result_placements(&simplified_program, output_types.len());
+        let placements =
+            entry_result_placements(&simplified_program, output_types.len(), |constant| constant.sharding().clone());
         let result_annotations =
             entry_result_shardings(&output_types, result_shardings, &placements, &argument_shardings)?;
         let open_results = entry_open_results(&output_types, result_shardings, &placements, &result_annotations);

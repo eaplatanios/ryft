@@ -2564,7 +2564,8 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
                 && let Cow::Owned(sharding) = entered_argument_sharding(array.sharding()).map_err(invalid_argument)?
             {
                 let mesh = array.mesh().clone();
-                *array = array.clone().reshard_on_devices(context, &mesh, &sharding, false).map_err(invalid_argument)?;
+                *array =
+                    array.clone().reshard_on_devices(context, &mesh, &sharding, false).map_err(invalid_argument)?;
             }
         }
         driver
@@ -2613,12 +2614,21 @@ impl LowerableOperation for JitCallOperation<Type> {
                 // The callee receives the operand as its entry function holds an argument that arrives at the
                 // boundary sharding, with the pending reductions over auto mesh axes that an override may state
                 // completed (refer to `entered_argument_sharding`). An operand is a value of the caller, which never
-                // carries such a reduction, so the constraint neither introduces nor completes one.
-                let placement = self.boundary_input_placement(index, actual, declared);
-                match placement.map(|sharding| entered_argument_sharding(&sharding).map(Cow::into_owned)).transpose()? {
-                    Some(sharding) => lower_boundary_constraint(lowerer, value, ty, &sharding),
-                    None => Ok(value),
+                // carries such a reduction, so the constraint neither introduces nor completes one. The boundary is
+                // still admitted as it is stated, so that a call accepts exactly the operands that an execution of the
+                // callee places at its override (i.e., it introduces a pending sum, but never a pending maximum or
+                // minimum, refer to `validate_declared_pending_reduction`).
+                let Some(sharding) = self.boundary_input_placement(index, actual, declared).map(Cow::into_owned) else {
+                    return Ok(value);
+                };
+                let entered = entered_argument_sharding(&sharding)?.into_owned();
+                if entered != sharding {
+                    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+                    let stated = entry_boundary_sharding(&sharding)?;
+                    let (carried, data_type) = (actual.sharding(), actual.data_type());
+                    validate_declared_pending_reduction(&stated, carried, data_type, bound_manual_axes, "jit_call")?;
                 }
+                lower_boundary_constraint(lowerer, value, ty, &entered)
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {

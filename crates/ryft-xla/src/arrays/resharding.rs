@@ -1566,12 +1566,13 @@ impl Array {
             return Ok(None);
         }
         let plan = self.plan_shard_regions(&ShardLayout::new(&self.shape(), mesh, sharding)?)?;
-        let mut remote_regions = Vec::new();
+        // Validate every remote device ID before the first lookup so a missing layout cannot mask an invalid ID.
         for movement in plan.cross_host_moves() {
             cross_host_global_device_id(movement.source_device().id())?;
             cross_host_global_device_id(movement.destination_device().id())?;
-            remote_regions.push((movement.destination_shard_index(), movement.shape()));
         }
+        let remote_regions =
+            plan.cross_host_moves().map(|movement| (movement.destination_shard_index(), movement.shape()));
         let layouts = cross_host_layouts(resolve_layout, plan.element_type(), remote_regions)?;
         Ok(layouts.map(|layouts| (plan, layouts)))
     }
@@ -1986,10 +1987,8 @@ impl Array {
         let element_type = self.data_type().executable_buffer_type();
         let sources = self.shards().iter().map(ArrayShard::descriptor);
         if let Some(plan) = plan_exact_shard_put(element_type, sources, self.sharding(), &shape, mesh, sharding)? {
-            let cross_host_shards = plan
-                .cross_host_moves()
-                .map(|movement| (movement.destination_shard_index(), movement.shape()))
-                .collect::<Vec<_>>();
+            let cross_host_shards =
+                plan.cross_host_moves().map(|movement| (movement.destination_shard_index(), movement.shape()));
             if let Some(cross_host_layouts) = cross_host_layouts(resolve_layout, element_type, cross_host_shards)? {
                 return Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts });
             }
@@ -2274,8 +2273,11 @@ impl Array {
         let mut buffers = Vec::new();
         for shard in self.addressable_shards() {
             let Some(buffer) = shard.buffer() else {
-                return Err(ArrayError::MissingShardBuffer { shard_index: shard.index(), device_id: shard.device().id() }
-                    .into());
+                return Err(ArrayError::MissingShardBuffer {
+                    shard_index: shard.index(),
+                    device_id: shard.device().id(),
+                }
+                .into());
             };
             if !holds_unreduced_sum_identity(&mesh, shard.descriptor(), axis_indices) {
                 buffers.push(Arc::clone(buffer));
@@ -2896,12 +2898,12 @@ fn default_buffer_layout(
 /// Uses `resolve_layout` to obtain the default layout for buffers of `element_type` with each shape of
 /// `shards` (i.e., of pairs of the index of a destination shard and a shape that crosses processes for it), or `None`
 /// when `shards` is not empty and the plugin lacks the cross-host transfers extension or cannot report one of those
-/// layouts. Every process derives the same `shards` for a placement and queries the same plugin, so all of them get the
-/// same result.
+/// layouts. The first shard with each shape supplies the index for a single lookup of that shape. Every process derives
+/// the same `shards` for a placement and queries the same plugin, so all of them get the same result.
 fn cross_host_layouts(
     resolve_layout: &CrossHostLayoutResolver<'_>,
     element_type: BufferType,
-    shards: Vec<(ShardIndex, StaticShape)>,
+    shards: impl Iterator<Item = (ShardIndex, StaticShape)>,
 ) -> Result<Option<HashMap<StaticShape, ryft_pjrt::Layout>>, Error> {
     let mut layouts = HashMap::new();
     for (shard_index, shape) in shards {
@@ -3454,7 +3456,9 @@ mod tests {
             match strategy {
                 DevicePlacementStrategy::Bufferless => ("bufferless".to_string(), None, Vec::new()),
                 DevicePlacementStrategy::ProcessLocalValue => ("process-local value".to_string(), None, Vec::new()),
-                DevicePlacementStrategy::ExactShards { plan, .. } => ("exact shards".to_string(), Some(plan), Vec::new()),
+                DevicePlacementStrategy::ExactShards { plan, .. } => {
+                    ("exact shards".to_string(), Some(plan), Vec::new())
+                }
                 DevicePlacementStrategy::ShardRegions { plan, .. } => {
                     ("shard regions".to_string(), Some(plan), Vec::new())
                 }
@@ -4311,7 +4315,8 @@ mod tests {
         ];
         let shape = StaticShape::new(vec![4]);
         let decide = |data_type: DataType, mesh: &DeviceMesh, input: &Sharding, output: &Sharding| {
-            match split_introduced_sums(data_type, &shape, mesh, input, mesh, output) {
+            let introduction = split_introduced_sums(data_type, &shape, mesh, input, mesh, output);
+            match introduction {
                 Err(error) => format!("error: {error}"),
                 Ok(Some((first, _))) => match validate_reduction_transition(data_type, mesh, input, &first) {
                     Some(reason) => format!("host round trip: {reason}"),
@@ -4415,9 +4420,11 @@ mod tests {
             .iter()
             .flat_map(|prefix| rows.lines().map(move |row| format!("{prefix} {row}")))
             .collect::<Vec<_>>();
-        expected.extend(data_types.iter().flat_map(|data_type| {
-            size_one_rows.lines().map(move |row| format!("Explicit 1 {data_type} {row}"))
-        }));
+        expected.extend(
+            data_types
+                .iter()
+                .flat_map(|data_type| size_one_rows.lines().map(move |row| format!("Explicit 1 {data_type} {row}"))),
+        );
         assert_eq!(outcomes, expected);
 
         // The diagnostics name the data type, both states, the axis, the reason, and what the user can do. A value
@@ -4843,9 +4850,12 @@ mod tests {
         // placement, the programs that `to_placement` and `into_placement` compile in sessions of their own, which is
         // `+0` for a host round trip, and asserts that both read back the value of their source bit for bit, where
         // every NaN encoding of a format counts as one value, or lists their common error. A sum of floating point or
-        // complex values that the devices complete or introduce is compared as the contract of such sums states (refer
-        // to `crate::arrays::host`), so a negative zero also matches a positive one there, and the end of this test
-        // pins that difference. The axis type does not change the outcome, so both axis types must give the same row.
+        // complex values that the devices complete is compared as the contract of such sums states (refer to
+        // `crate::arrays::host`), so a negative zero also matches a positive one there, and the end of this test pins
+        // that difference. A sum that a placement introduces is compared bit for bit for every data type with an
+        // additive identity (e.g., `f32` and `c64` negative zeros and `f6e2m3fn` values, whose compiled introduction
+        // aborted or crashed the process before). The axis type does not change the outcome, so both axis types must
+        // give the same row.
         let client = cpu_client(4);
         let devices = client
             .addressable_devices()
@@ -4868,6 +4878,7 @@ mod tests {
                 DataType::F32 => f32_elements.map(|value| value.to_ne_bytes().to_vec()).to_vec(),
                 DataType::F8E5M2 => bytes(&[0x00, 0x80, 0x3c, 0xbc, 0x7c, 0xfc, 0x7e, 0x01, 0x7b, 0xfb]),
                 DataType::F8E4M3FNUZ => bytes(&[0x00, 0x80, 0x01, 0x40, 0xc0, 0x7f, 0xff, 0x38]),
+                DataType::F6E2M3FN => bytes(&[0x00, 0x20, 0x01, 0x08, 0x2a, 0x1f, 0x3f, 0x10]),
                 DataType::F8E8M0FNU => bytes(&[0, 1, 42, 127, 128, 255]),
                 DataType::C64 => c64_elements
                     .map(|(real, imaginary)| [real.to_ne_bytes(), imaginary.to_ne_bytes()].concat())
@@ -4907,6 +4918,7 @@ mod tests {
             DataType::F32,
             DataType::F8E5M2,
             DataType::F8E4M3FNUZ,
+            DataType::F6E2M3FN,
             DataType::F8E8M0FNU,
             DataType::C64,
         ];
@@ -5084,6 +5096,14 @@ mod tests {
                 f8e4m3fnuz max -> sum: +0 +0
                 f8e4m3fnuz sum -> sum split: +1 +1
                 f8e4m3fnuz max -> max split: +1 +1
+                f6e2m3fn sum -> none: +0 +0
+                f6e2m3fn max -> none: +0 +0
+                f6e2m3fn min -> none: +0 +0
+                f6e2m3fn none -> sum: +0 +0
+                f6e2m3fn none -> max: +0 +0
+                f6e2m3fn max -> sum: +0 +0
+                f6e2m3fn sum -> sum split: +1 +1
+                f6e2m3fn max -> max split: +1 +1
                 f8e8m0fnu sum -> none: +0 +0
                 f8e8m0fnu max -> none: +0 +0
                 f8e8m0fnu min -> none: +0 +0
@@ -5190,8 +5210,12 @@ mod tests {
                     Array::from_host_shards(&session, r#type.clone(), mesh.clone(), Some(pending.clone()), shards)
                         .unwrap();
                 let readback = decode(source.copy_to_host_bytes().unwrap());
-                let placed = decode(source.to_placement(&session, replicated.clone()).unwrap().copy_to_host_bytes().unwrap());
-                assert_eq!((data_type, axis_type, readback, placed), (data_type, axis_type, expected.to_vec(), expected.to_vec()));
+                let placed =
+                    decode(source.to_placement(&session, replicated.clone()).unwrap().copy_to_host_bytes().unwrap());
+                assert_eq!(
+                    (data_type, axis_type, readback, placed),
+                    (data_type, axis_type, expected.to_vec(), expected.to_vec())
+                );
             }
         }
     }

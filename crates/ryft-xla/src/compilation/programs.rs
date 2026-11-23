@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram};
+use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, Sharding, TypedProgram};
 use ryft_pjrt::LoadedExecutable;
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use ryft_core::{
     ArrayType, DeviceMesh, Parameter, ProgramError, Sharding, Type, TypeError, TypeIdentityRenaming, Typed,
@@ -47,12 +47,17 @@ use crate::arrays::{Array, ArrayParts};
 ///
 /// # Logical Identity
 ///
-/// Two retained arrays are equal when they retain the same logical array with the same commitment. Lowering passes
-/// each distinct retained array of a program as one hidden argument of its executable, and the identity of a program
-/// and its cache keys include its constants, so every process of a distributed program must decide alike whether two
-/// retained arrays are equal. The logical identity of an array is therefore decided by the operation that produced it,
-/// never by whether this process held buffers to copy or to reuse, and every function that returns an array from
-/// another array follows these rules on every process:
+/// Two retained arrays are equal when they retain the same logical array with the same declared type and the same
+/// commitment. The same array imported twice into one function with one type is one constant, and therefore one hidden
+/// argument, whereas the same array declared with two types (e.g., imported by a function that is compiled for a mesh
+/// of another topology than the mesh of the array, which declares it over its own mesh, and by one that is not) is two
+/// constants, each of which its executable receives with its own type. The declared type depends on the type and the
+/// mesh topology of the array alone, which every process shares. Lowering passes each distinct retained array of a
+/// program as one hidden argument of its executable, and the identity of a program and its cache keys include its
+/// constants, so every process of a distributed program must decide alike whether two retained arrays are equal. The
+/// logical identity of an array is therefore decided by the operation that produced it, never by whether this process
+/// held buffers to copy or to reuse, and every function that returns an array from another array follows these rules
+/// on every process:
 ///
 ///   - **Same Array:** A clone, a change of the session of an array (e.g., [`Session::place`] of an [`Array`] without
 ///     a destination and without a forced copy), and a placement whose destination is the mesh, the sharding, the
@@ -106,8 +111,8 @@ pub struct RetainedArray {
     /// Arrays that [`Self::to_array`] creates share it with the retained array.
     send_fence: Option<ExecutionFence>,
 
-    /// Whether the retained array is committed to its devices, which the arrays that [`Self::to_array`] creates keep.
-    /// It is part of the identity of this constant. Refer to [`Array::is_committed`] for more information.
+    /// Whether this retained array is committed to its devices (refer to [`Array::is_committed`]). It is part
+    /// of the identity of a constant and is preserved when [`Self::to_array`] reconstructs the array.
     committed: bool,
 
     /// Whether the process chose the devices of the retained array on its own, which the arrays that [`Self::to_array`]
@@ -117,6 +122,20 @@ pub struct RetainedArray {
 
     /// PJRT [`Client`] that owns the buffers of the retained array.
     client: &'static Client<'static>,
+
+    /// Placements of this retention of the array on other devices, by the mesh and the sharding of each, which
+    /// [`Self::placed`] records so that a function that receives the array on other devices places it once rather
+    /// than once for each lowering, execution, or replay. Clones of one retention share them, so they live exactly as
+    /// long as the programs that hold this constant (i.e., one placed copy for each distinct mesh and sharding on which
+    /// a function that holds the constant receives it, for as long as such a function or program lives), and they take
+    /// no part in its identity.
+    ///
+    /// The lock is held only to look a placement up and to record one, never while a placement is computed, so it is
+    /// never held while another lock is taken (e.g., a lock of a cache or of the work tracker of a session, which a
+    /// placement takes when it compiles and submits work), and it imposes no order on the other locks. A panic while it
+    /// is held leaves the list valid, because every critical section either reads it or appends one complete entry, so
+    /// a poisoned lock is recovered rather than propagated.
+    placements: Arc<Mutex<Vec<(DeviceMesh, Sharding, RetainedArray)>>>,
 }
 
 impl RetainedArray {
@@ -135,6 +154,7 @@ impl RetainedArray {
             committed: array.is_committed(),
             locally_assigned: array.is_locally_assigned(),
             client: array.client(),
+            placements: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -165,6 +185,7 @@ impl RetainedArray {
     }
 
     /// Returns a new [`Array`] that refers to the device buffers of this retained array and belongs to `session`.
+    /// The array keeps the commitment and the local assignment of this retained array.
     ///
     /// # Errors
     ///
@@ -192,6 +213,75 @@ impl RetainedArray {
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self { declared_type: self.declared_type.rename_identities(renaming)?, ..self.clone() })
+    }
+
+    /// Returns this retained array declared with `declared_type`, which must describe the same array. The declared
+    /// type is part of the identity of a retained array, so two retentions of one array with different declared types
+    /// are different constants. A function that is compiled for a mesh of another topology than the mesh of an array
+    /// that it imports declares that array with the type with which the function receives it on its own mesh (refer
+    /// to `imported_constant`). Lowering binds its hidden argument slot to the array placed on that mesh.
+    #[inline]
+    pub(crate) fn with_declared_type(&self, declared_type: ArrayType) -> Self {
+        Self { declared_type, ..self.clone() }
+    }
+
+    /// Returns a handle of this retained array that is equal to it (refer to its [`PartialEq`] implementation) but
+    /// keeps none of its buffers or placements alive, for keys of caches that must not keep a constant alive after the
+    /// programs that hold it are released. The weak identity of the storage keeps its address reserved, so a key with
+    /// such a handle never matches a constant of another array. It cannot be turned back into an array.
+    pub(crate) fn without_storage(&self) -> Self {
+        Self {
+            shards: Arc::from([]),
+            execution_fence: None,
+            send_fence: None,
+            placements: Arc::new(Mutex::new(Vec::new())),
+            ..self.clone()
+        }
+    }
+
+    /// Returns a retained copy of the array that `place` puts on `mesh` as `sharding`. Clones of the source share
+    /// the placement, including clones with a different declared type. The placement records the type and commitment
+    /// of the array that `place` returns. Each source keeps its own declared type and identity for use in the program.
+    ///
+    /// `place` runs without the lock of the placements, so two threads that place the same retention on the same mesh
+    /// and sharding at the same time may both place it, in which case the placement that is recorded first is kept and
+    /// returned to both, and the other one is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `place`.
+    pub(crate) fn placed<E>(
+        &self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        place: impl FnOnce() -> Result<Array, E>,
+    ) -> Result<Self, E> {
+        let find = |placements: &[(DeviceMesh, Sharding, RetainedArray)]| {
+            placements
+                .iter()
+                .find(|(placed_mesh, placed_sharding, _)| placed_mesh == mesh && placed_sharding == sharding)
+                .map(|(_, _, placed)| placed.clone())
+        };
+
+        if let Some(placed) = find(&self.placements.lock().unwrap_or_else(PoisonError::into_inner)) {
+            return Ok(placed);
+        }
+
+        let placed = RetainedArray::new(&place()?);
+        let mut placements = self.placements.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(placed) = find(&placements) {
+            return Ok(placed);
+        }
+
+        placements.push((mesh.clone(), sharding.clone(), placed.clone()));
+        Ok(placed)
+    }
+
+    /// Returns this retained array as a placement of it onto the devices where it already lives, which a program names
+    /// for every process. The result shares its buffers and is committed to its devices. Its assignment is known to
+    /// every process, so an executable sees the same placement facts whether the source already lived there or moved.
+    pub(crate) fn on_named_devices(&self) -> Self {
+        Self { committed: true, locally_assigned: false, ..self.clone() }
     }
 
     /// Validates that `client` owns the buffers of this retained array.
@@ -516,8 +606,8 @@ mod tests {
                     same(&array, &session.place(array.clone(), copy_on_device).unwrap()),
                 ),
                 ("donated forced copy", same(&array, &session.place(array.clone(), donated_copy).unwrap())),
-                ("unaliased", same(&array, &array.clone().into_unaliased(&session).unwrap())),
-                ("copied shard buffers", same(&array, &array.with_copied_shard_buffers(&session, |_| true).unwrap())),
+                ("unaliased", same(&array, &array.clone().into_unaliased().unwrap())),
+                ("copied shard buffers", same(&array, &array.with_copied_shard_buffers(|_| true).unwrap())),
                 (
                     "reshard on its own devices",
                     same(

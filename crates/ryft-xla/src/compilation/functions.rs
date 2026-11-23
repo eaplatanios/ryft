@@ -5385,9 +5385,14 @@ mod tests {
         let pending_sum_shards =
             mesh.devices().iter().map(|device| (device.id(), Arc::<[u8]>::from(values_to_bytes(&values))));
         let pending_sum_sharding = Some(pending_sum.clone());
-        let pending_sum_input =
-            Array::from_host_shards(&session, vector_type.clone(), mesh.clone(), pending_sum_sharding, pending_sum_shards)
-                .unwrap();
+        let pending_sum_input = Array::from_host_shards(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            pending_sum_sharding,
+            pending_sum_shards,
+        )
+        .unwrap();
         let rows = vec![
             Row {
                 name: "no overrides",
@@ -6095,7 +6100,18 @@ mod tests {
         // which replicates the split input of the dispatcher before the call, and a caller that runs as replicas
         // rejects an argument whose type records a split. The replay of a callee operation by operation gives a
         // `rematerialize` in the callee an eager input, whose type records its placement, while the body of the
-        // `rematerialize` was traced for the input type of the callee, which records none.
+        // `rematerialize` was traced for the input type of the callee, which records none. An argument with a pending
+        // sum over an auto mesh axis, which the input override of the callee states, is admitted by every entry point
+        // that applies the call itself, and the result that returns it is the completed value, as the callee completes
+        // the sum where the argument enters. A compiled caller receives its own argument without such a reduction,
+        // because it has no override that states one, so it rejects the argument where it enters, as an execution of
+        // the caller does, and a caller that runs as replicas rejects the boundary of the callee.
+        let unreduced_argument = "fails with `public argument #0 is unreduced along the mesh axes [\"x\"], which the \
+                                  executable cannot receive because a staged type does not record a pending reduction \
+                                  over auto mesh axes; reduce the argument (e.g., with `Array::to_placement` onto a \
+                                  sharding without unreduced axes), or place it over explicit mesh axes, before passing \
+                                  it to a compiled function or an eager operation`";
+        let pending = "input override that states the pending reduction of an argument";
         let other_devices = "fails with `\
             `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
@@ -6140,6 +6156,12 @@ mod tests {
                 "caller with a bounded dynamic argument",
                 split_arguments_of_replicas,
             ),
+            (pending, "nested call", unreduced_argument),
+            (pending, "nested call consumed by arithmetic", unreduced_argument),
+            (pending, "caller with a bounded dynamic argument", split_replicas),
+            (pending, "caller with a scan", unreduced_argument),
+            (pending, "caller with a condition", unreduced_argument),
+            (pending, "caller with a while loop", unreduced_argument),
         ];
 
         // The derivatives of a call agree in values with those of the function that the callee was compiled from, and
@@ -6162,7 +6184,11 @@ mod tests {
         // tangent and the cotangent of a split argument, as an input override does, except that the cotangent of an
         // argument whose type records its split is resharded back to that split. A compiled gradient follows the eager
         // cotangent, except where a caller compiled for other devices calls the callee and where the sum of a
-        // bufferless value does not lower.
+        // bufferless value does not lower. The tangent of an argument with a pending sum over an auto mesh axis that
+        // the input override of the callee states is completed at the boundary like the argument, and the cotangent
+        // takes the dual state of the override (refer to `Sharding::cotangent`), whereas the function that the callee
+        // was compiled from returns both with the pending sum of the argument, and a compiled gradient rejects such an
+        // argument where its caller receives it.
         let differences = |fields: &[(&str, &str, &str)]| {
             let fields = fields
                 .iter()
@@ -6172,6 +6198,8 @@ mod tests {
         let typed = |sharding: &str| format!("f32[4][sharding={sharding}]");
         let (replicated, split) = ("{mesh<['x'=2:auto]>, [{}]}", "{mesh<['x'=2:auto]>, [{'x'}]}");
         let canonical = "{mesh<['device'=1:auto]>, [{}]}";
+        let (unreduced, reduced) =
+            ("{mesh<['x'=2:auto]>, [{}], unreduced={'x'}}", "{mesh<['x'=2:auto]>, [{}], reduced={'x'}}");
         let (second, local) = ("{mesh<['x'=1:explicit]>, [{}]}", "{mesh<['x'=1:auto]>, [{}]}");
         let moved = |sharding: &str| {
             let r#type = typed(sharding);
@@ -6254,6 +6282,9 @@ mod tests {
                 ]),
             ),
             ("input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
+            (pending, "eager JVP tangent", differences(&[("sharding", replicated, unreduced)])),
+            (pending, "eager VJP cotangent", differences(&[("sharding", reduced, unreduced)])),
+            (pending, "compiled gradient", unreduced_argument.to_string()),
             ("other single device", "eager JVP tangent", moved(second)),
             (
                 "other single device",
