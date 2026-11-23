@@ -179,7 +179,7 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::host::{
-    CollectiveReduction, HostBufferSlice, PendingHostUpload, ReductionChange, collective_reduction,
+    HostBufferSlice, PendingHostUpload, ReductionChange, collective_reduction, holds_unreduced_sum_identity,
     requires_unreduced_sum_identity, run_host_uploads, unreduced_sum_identity, validate_mesh_device_processes,
 };
 use crate::arrays::metadata::validate_shard_layout;
@@ -1833,6 +1833,17 @@ impl Array {
                 )
                 .map_err(|error| (error, Some(self)))
             }
+            DevicePlacementStrategy::IntroducedSums { first, sharding: first_sharding, axis_indices } => {
+                // The first step places the value with the introduced axes replicated, and this process then gives
+                // its devices away from coordinate zero along them the additive identity. Before the first step has
+                // consumed anything, its error returns this array, and after it, only a source that is not donated.
+                let source = (!donate).then(|| self.clone());
+                let placed = self.place_with_strategy(*first, mesh, &first_sharding, memory, layout, donate)?;
+                placed
+                    .place_storage(memory, layout.cloned())
+                    .and_then(|placed| placed.with_introduced_sums(sharding, &axis_indices))
+                    .map_err(|error| (error, source))
+            }
             DevicePlacementStrategy::HostRoundTrip { reason, process_index } => {
                 let this_process = match self.client().process_index() {
                     Ok(process_index) => process_index,
@@ -1952,9 +1963,26 @@ impl Array {
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<DevicePlacementStrategy, Error> {
+        // A pending sum that the destination introduces is written as additive identities after a placement without it,
+        // whose own strategy is chosen here as well. That placement keeps every pending sum of this array that the
+        // destination keeps, so it introduces none, and a host round trip of it is the host round trip of the whole.
+        let shape = self.shape();
+        let introduction =
+            split_introduced_sums(self.data_type(), &shape, self.mesh(), self.sharding(), mesh, sharding)?;
+        if let Some((first_sharding, axis_indices)) = introduction {
+            let first = self.shared_device_placement_strategy(resolve_layout, mesh, &first_sharding)?;
+            if let DevicePlacementStrategy::HostRoundTrip { .. } = first {
+                return Ok(first);
+            }
+            return Ok(DevicePlacementStrategy::IntroducedSums {
+                first: Box::new(first),
+                sharding: first_sharding,
+                axis_indices,
+            });
+        }
+
         // Exact shards need the default layout of every shard that crosses processes, between whichever processes it
         // crosses, so that a process with only local copies declines whenever the processes that transfer decline.
-        let shape = self.shape();
         let element_type = self.data_type().executable_buffer_type();
         let sources = self.shards().iter().map(ArrayShard::descriptor);
         if let Some(plan) = plan_exact_shard_put(element_type, sources, self.sharding(), &shape, mesh, sharding)? {
@@ -2040,13 +2068,11 @@ impl Array {
         Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard })
     }
 
-    /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, and
-    /// returns the reason why it would not preserve the value of this array, if any (refer to
-    /// [`validate_reduction_transition`]), in which case the placement takes a host round trip instead. The errors are
-    /// [`ArrayError::MissingUnreducedSumIdentity`] when the destination introduces a pending sum that the data type of
-    /// this array cannot represent, which no strategy can do and which is checked first, so that the placement reports
-    /// what a host upload of the same value reports, [`ArrayError::ManualReshardingAxis`] when the destination mesh has
-    /// a `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
+    /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, which
+    /// introduces no pending sum (refer to [`split_introduced_sums`]), and returns the reason why it would not preserve
+    /// the value of this array, if any (refer to [`validate_reduction_transition`]), in which case the placement takes a
+    /// host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the destination mesh has a
+    /// `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
     /// the shards of this array or of the destination differ in size. These checks read only metadata that every
     /// process shares (refer to [`Self::device_placement_strategy`]).
     ///
@@ -2063,14 +2089,13 @@ impl Array {
         // into a replicated value and reshards a replicated value on the destination mesh.
         let (data_type, shape) = (self.data_type(), self.shape());
         let decline = if self.mesh() == destination_mesh {
-            validate_reduction_transition(data_type, &shape, destination_mesh, self.sharding(), destination_sharding)?
+            validate_reduction_transition(data_type, destination_mesh, self.sharding(), destination_sharding)
         } else {
             let rank = shape.rank();
             let replicated = Sharding::replicated(self.mesh().logical_mesh().clone(), rank);
-            let gather = validate_reduction_transition(data_type, &shape, self.mesh(), self.sharding(), &replicated)?;
+            let gather = validate_reduction_transition(data_type, self.mesh(), self.sharding(), &replicated);
             let replicated = Sharding::replicated(destination_mesh.logical_mesh().clone(), rank);
-            let reshard =
-                validate_reduction_transition(data_type, &shape, destination_mesh, &replicated, destination_sharding)?;
+            let reshard = validate_reduction_transition(data_type, destination_mesh, &replicated, destination_sharding);
             gather.or(reshard)
         };
 
@@ -2222,6 +2247,74 @@ impl Array {
         })
     }
 
+    /// Returns this array with the pending sums that `sharding` introduces, which is the sharding of this array with the
+    /// mesh axes at `axis_indices` added to its unreduced axes, where this array is replicated along those axes (i.e.,
+    /// the first step of [`DevicePlacementStrategy::IntroducedSums`]). The devices of this process at coordinate zero
+    /// along all of those axes keep their buffers, and each of its other devices receives a new buffer of the additive
+    /// identity of the data type (refer to [`unreduced_sum_identity`]), uploaded from the host in the memory and the
+    /// declared layout of this array and with the static shape of its shard, as a cross-host receive allocates it, so
+    /// the summands add up to the value of this array bit for bit, as a host upload with `sharding` splits a value.
+    /// Only metadata that every process shares decides which devices hold an identity, and each process uploads only to
+    /// its own devices, so no process waits for another. Nothing is read back and nothing is compiled.
+    ///
+    /// The result has the type, the commitment, and the locally assigned devices of this array, and its execution fence
+    /// joins the fence of this array with the readiness of every identity buffer, so that its readbacks and readiness
+    /// functions report a failed upload, and it keeps the send fence of this array. A buffer that this array shares
+    /// with its source stays shared only on the devices at coordinate zero, and the identity buffers alias nothing.
+    fn with_introduced_sums(self, sharding: &Sharding, axis_indices: &[usize]) -> Result<Self, Error> {
+        let session = self.session().clone();
+        let mesh = self.mesh().clone();
+        let r#type = self.r#type().into_owned().with_sharding(None)?;
+        let data_type = r#type.data_type();
+        let buffer_type = data_type.executable_buffer_type();
+        let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
+        let mut work = session.reserve_work();
+        let mut completion = PlacementCompletion::default();
+        let mut identities = Vec::<(usize, Arc<[u8]>)>::new();
+        let mut buffers = Vec::new();
+        for shard in self.addressable_shards() {
+            let Some(buffer) = shard.buffer() else {
+                return Err(ArrayError::MissingShardBuffer { shard_index: shard.index(), device_id: shard.device().id() }
+                    .into());
+            };
+            if !holds_unreduced_sum_identity(&mesh, shard.descriptor(), axis_indices) {
+                buffers.push(Arc::clone(buffer));
+                continue;
+            }
+
+            // The shards of one size share one host allocation of the identity, which PJRT retains until it has read
+            // it. A shard without elements reads no bytes, so it needs no identity.
+            let shape = shard.shape();
+            let count = shape.element_count()?;
+            let identity = match identities.iter().find(|(identity_count, _)| *identity_count == count) {
+                Some((_, identity)) => Arc::clone(identity),
+                None => {
+                    let element = match count {
+                        0 => Vec::new(),
+                        _ => unreduced_sum_identity(data_type)?
+                            .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?,
+                    };
+                    let identity = Arc::<[u8]>::from(element.repeat(count));
+                    identities.push((count, Arc::clone(&identity)));
+                    identity
+                }
+            };
+            let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let device = buffer.device()?;
+            let memory = device.memory(r#type.memory())?;
+            let uploaded =
+                session.client().buffer(identity, buffer_type, dimensions, None, memory, device_layout.clone())?;
+            work.track_buffer(&uploaded);
+            completion.track_buffer(&uploaded)?;
+            buffers.push(Arc::new(uploaded));
+        }
+        let mut output =
+            Self::from_addressable_buffers_internal(&session, r#type, Some(sharding.clone()), mesh, buffers, false)?;
+        output.execution_fence = completion.join(self.execution_fence.clone());
+        output.send_fence = self.send_fence.clone();
+        Ok(output.with_committed(self.is_committed()).with_locally_assigned(self.is_locally_assigned()))
+    }
+
     /// Places this array on the mesh of `reshard` according to its output sharding in three steps, which
     /// [`Self::shared_device_placement_strategy`] planned for every process.
     ///
@@ -2339,6 +2432,23 @@ enum DevicePlacementStrategy {
 
         /// Program that reshards the replicated copy on the destination mesh.
         reshard: ReshardProgram,
+    },
+
+    /// Places an array with `first` according to `sharding`, which is the destination sharding without the pending sums
+    /// that the destination introduces, and then gives the devices away from coordinate zero along the introduced mesh
+    /// axes (at `axis_indices` within the mesh) the additive identity of the data type, which each process uploads to
+    /// its own devices (refer to [`split_introduced_sums`] and [`Array::with_introduced_sums`]). The devices at
+    /// coordinate zero along all of them keep the value. This involves no arithmetic of XLA, so it introduces a pending
+    /// sum bit for bit for every data type that has an additive identity, also over devices of several processes.
+    IntroducedSums {
+        /// Strategy of the placement according to `sharding`, which is never a host round trip.
+        first: Box<DevicePlacementStrategy>,
+
+        /// Destination sharding without the pending sums that the destination introduces.
+        sharding: Sharding,
+
+        /// Indices within the destination mesh of the axes along which the destination introduces a pending sum.
+        axis_indices: Vec<usize>,
     },
 
     /// Reads an array back and uploads it again with the host functions that define what its reduction state means,
@@ -2751,20 +2861,22 @@ fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<
         .collect()
 }
 
-/// Returns a resolver that checks the cross-host transfers extension and queries the default layout only when called.
+/// Returns a lazy resolver for the layout that a cross-host receive allocates. On each call the resolver checks for
+/// the PJRT cross-host transfers extension before calling [`default_buffer_layout`].
 fn cross_host_layout_resolver<'o>(
     client: &'o Client<'_>,
 ) -> impl Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o {
     move |element_type, shard_index, shape| {
         client.cross_host_transfers_extension()?;
-        cross_host_default_layout(client, element_type, shard_index, shape)
+        default_buffer_layout(client, element_type, shard_index, shape)
     }
 }
 
-/// Returns the default layout that the PJRT plugin of `client` uses for a buffer of `element_type` with `shape`, which
-/// is the layout of the buffer that a cross-host receive of that shape allocates, or `None` when the plugin cannot
-/// report it. `shard_index` identifies the shard in the error for a shape that PJRT cannot represent.
-fn cross_host_default_layout(
+/// Returns the default layout that the PJRT plugin of `client` uses for a buffer of `element_type` with `shape`, or
+/// `None` when the plugin cannot report it. This lookup is independent of cross-host transfer support.
+/// [`cross_host_layout_resolver`] checks the extension for placement. `shard_index` identifies the shard in the
+/// error for a shape that PJRT cannot represent.
+fn default_buffer_layout(
     client: &Client<'_>,
     element_type: BufferType,
     shard_index: ShardIndex,
@@ -3023,62 +3135,89 @@ fn holds_one_value_per_slice(sharding: &Sharding) -> bool {
     sharding.unreduced_axes().is_empty() && sharding.varying_manual_axes().is_empty()
 }
 
-/// Validates that a compiled reshard on `mesh` (refer to [`ReshardProgram`]) takes a value of `data_type` and `shape`
-/// placed as `input` to `output` with the value that the meaning of its reduction state gives, as far as the reduction
-/// state (refer to [`ReductionState`]) along each non-manual mesh axis goes. That meaning is owned by
-/// [`crate::arrays::host`], whose section on pending reductions also states the contract of floating point sums. The
-/// program keeps the state of an axis as its contributions, which preserves every value, and it makes every other
-/// change with a collective of XLA (refer to [`ReshardProgram::compiled_mesh`]). The device path is taken exactly when
-/// that collective computes what the operation of the data type computes in a compiled program, up to the sign of a
-/// zero result, which is the case as follows.
-///
-///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
-///     [`CollectiveReduction::Exact`] (a maximum or minimum that drops NaN values is not).
-///   - **Introducing a pending sum:** XLA writes zero to the devices that hold the additive identity (refer to
-///     [`holds_unreduced_sum_identity`](crate::arrays::host::holds_unreduced_sum_identity)), which is the identity up
-///     to the sign of zero, so it is exact unless [`collective_reduction`] classifies the introduction as
-///     [`CollectiveReduction::Unsupported`].
-///   - **Introducing a pending maximum or minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
-///     `crate::lowering`, whose check would reject the program).
-///   - **Completing or introducing a completed reduction:** This changes no value.
-///
-/// The rule reads only the data type, the shape, the mesh, and the two shardings, so every process decides alike.
-///
-/// Returns the reason why the program does not give that value, if any, which makes the placement take a host round
-/// trip with the readback and upload of [`crate::arrays::host`].
+/// Returns how a placement of a value of `data_type` and `shape` on `source_mesh` with the sharding `input` onto `mesh`
+/// with the sharding `output` introduces pending sums, or [`None`] when it introduces none. It introduces one along
+/// each non-manual axis of `mesh` along which `output` has a pending sum that the value does not carry already (i.e.,
+/// every such axis when the meshes differ, because a placement across meshes moves the whole value). The result is the
+/// sharding of the first step of [`DevicePlacementStrategy::IntroducedSums`] (i.e., `output` without those axes among
+/// its unreduced axes, along which the value is then replicated) and the indices of those axes within `mesh`. Pending
+/// sums along axes of size one are introduced as well, which writes no identity. The rule reads only the data type,
+/// the shape, the meshes, and the shardings, so every process decides alike.
 ///
 /// # Errors
 ///
-/// Returns [`ArrayError::MissingUnreducedSumIdentity`] when `output` introduces a pending sum whose additive identity
-/// some device would have to hold (refer to [`requires_unreduced_sum_identity`]) and the data type has none, which
-/// a host upload of the same value rejects as well, so that no strategy can produce it.
-fn validate_reduction_transition(
+/// Returns [`ArrayError::MissingUnreducedSumIdentity`] when some device with a non-empty shard would have to hold the
+/// additive identity (refer to [`requires_unreduced_sum_identity`]) and the data type has none, which a host upload of
+/// the same value with `output` rejects as well, so that no strategy can produce it.
+fn split_introduced_sums(
     data_type: DataType,
     shape: &StaticShape,
+    source_mesh: &DeviceMesh,
+    input: &Sharding,
+    mesh: &DeviceMesh,
+    output: &Sharding,
+) -> Result<Option<(Sharding, Vec<usize>)>, Error> {
+    let sum = ReductionState::Unreduced(UnreducedKind::Sum);
+    let (mut axis_indices, mut introduced) = (Vec::new(), Vec::new());
+    for (axis_index, axis) in mesh.logical_mesh().axes().iter().enumerate() {
+        if axis.r#type() != MeshAxisType::Manual
+            && ReductionState::of(output, axis.name()) == sum
+            && (source_mesh != mesh || ReductionState::of(input, axis.name()) != sum)
+        {
+            axis_indices.push(axis_index);
+            introduced.push(axis.name());
+        }
+    }
+    if axis_indices.is_empty() {
+        return Ok(None);
+    }
+    if requires_unreduced_sum_identity(mesh, &ShardLayout::new(shape, mesh, output)?, &axis_indices) {
+        unreduced_sum_identity(data_type)?
+            .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?;
+    }
+    let kept = output.unreduced_axes().iter().filter(|axis| !introduced.contains(&axis.as_str())).cloned();
+    let first = output.clone().with_unreduced_axes(kept.collect::<Vec<_>>())?;
+    Ok(Some((first, axis_indices)))
+}
+
+/// Validates that a compiled reshard on `mesh` (refer to [`ReshardProgram`]) takes a value of `data_type` placed as
+/// `input` to `output` with the value that the meaning of its reduction state gives, as far as the reduction state
+/// (refer to [`ReductionState`]) along each non-manual mesh axis goes. That meaning is owned by
+/// [`crate::arrays::host`], whose section on pending reductions also states the contract of floating point sums. The
+/// program keeps the state of an axis as its contributions, which preserves every value, and it makes every other
+/// change with a collective of XLA (refer to [`ReshardProgram::compiled_mesh`]). The device path is taken exactly when
+/// that collective computes that meaning up to that contract, which is the case as follows.
+///
+///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
+///     [`CollectiveReduction::Exact`](crate::arrays::host::CollectiveReduction::Exact) (a maximum or minimum that
+///     drops NaN values is not).
+///   - **Introducing a pending sum:** No program of a placement does, because the planner introduces pending sums with
+///     additive identities after a placement without them (refer to [`split_introduced_sums`]), so `output` must not
+///     introduce one, and only the completion of a pending reduction of `input` along such an axis is validated.
+///   - **Introducing a pending maximum or minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
+///     `crate::lowering`, whose check would reject the program).
+///   - **Completing or introducing a completed reduction:** This changes no value.
+///   - **Axes of size one:** Completing a reduction of a single contribution changes no value, so such a completion is
+///     always made on the devices, as the lowering of compiled programs exempts it (refer to
+///     `validate_pending_reduction_change` in `crate::lowering`). XLA cannot introduce a pending maximum or minimum
+///     along such an axis either, so that is declined as along any other axis.
+///
+/// The rule reads only the data type, the mesh, and the two shardings, so every process decides alike. Returns the
+/// reason why the program does not give that value, if any, which makes the placement take a host round trip with the
+/// readback and upload of [`crate::arrays::host`].
+fn validate_reduction_transition(
+    data_type: DataType,
     mesh: &DeviceMesh,
     input: &Sharding,
     output: &Sharding,
-) -> Result<Option<Error>, Error> {
-    let decline = |axis: &str, from: ReductionState, to: ReductionState, reason: &str| {
-        Error::from(ProgramError::UnsupportedOperation {
-            message: format!(
-                "a compiled reshard cannot take `{data_type}` values from {from} to {to} along mesh axis `{axis}`, \
-                 because {reason}",
-            ),
-        })
-    };
-    let mut first_decline = None;
-    let mut introduced_sums = Vec::new();
-    for (axis_index, axis) in mesh.logical_mesh().axes().iter().enumerate() {
+) -> Option<Error> {
+    for axis in mesh.logical_mesh().axes() {
         let (from, to) = (ReductionState::of(input, axis.name()), ReductionState::of(output, axis.name()));
         if axis.r#type() == MeshAxisType::Manual || from == to {
             continue;
         }
-        if to == ReductionState::Unreduced(UnreducedKind::Sum) {
-            introduced_sums.push((axis_index, axis.name(), from));
-        }
         let completion = match from {
-            ReductionState::Unreduced(kind) => {
+            ReductionState::Unreduced(kind) if axis.size() > 1 => {
                 collective_reduction(data_type, ReductionChange::Complete(kind)).reason()
             }
             _ => None,
@@ -3090,31 +3229,19 @@ fn validate_reduction_transition(
             }
             _ => None,
         };
-        if first_decline.is_none()
-            && let Some(reason) = reason
-        {
-            first_decline = Some(decline(axis.name(), from, to, reason));
+        if let Some(reason) = reason {
+            return Some(Error::from(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot take `{data_type}` values from {from} to {to} along mesh axis `{}` on the devices, because \
+                     {reason}, and the host round trip that takes them exactly needs one process that owns every device \
+                     of the source and of the destination; complete the reduction while the devices of one process \
+                     hold the value, or in another data type",
+                    axis.name(),
+                ),
+            }));
         }
     }
-
-    // A split into summands writes the additive identity only to non-empty shards away from coordinate zero, so a data
-    // type without one is rejected exactly when a host upload of the same value with `output` rejects it.
-    let axis_indices = introduced_sums.iter().map(|(axis_index, _, _)| *axis_index).collect::<Vec<_>>();
-    if !axis_indices.is_empty()
-        && requires_unreduced_sum_identity(mesh, &ShardLayout::new(shape, mesh, output)?, &axis_indices)
-    {
-        unreduced_sum_identity(data_type)?
-            .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?;
-        let introduction = collective_reduction(data_type, ReductionChange::Introduce(UnreducedKind::Sum));
-        if first_decline.is_none()
-            && let CollectiveReduction::Unsupported(reason) | CollectiveReduction::DifferentNumber(reason) =
-                introduction
-        {
-            let (_, axis, from) = introduced_sums[0];
-            first_decline = Some(decline(axis, from, ReductionState::Unreduced(UnreducedKind::Sum), reason));
-        }
-    }
-    Ok(first_decline)
+    None
 }
 
 /// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
@@ -3290,7 +3417,7 @@ mod tests {
     // Work that crosses processes, which one process plans for its part of a placement. Its programs are the compiled
     // reshards that it runs, which every process that owns a device of their meshes must run alike.
     struct PlannedWork {
-        strategy: &'static str,
+        strategy: String,
         sends: Vec<PlannedTransfer>,
         receives: Vec<PlannedTransfer>,
         programs: Vec<ReshardProgram>,
@@ -3321,17 +3448,32 @@ mod tests {
         let strategy = source
             .device_placement_strategy(resolve_layout, mesh, sharding, process_index)
             .map_err(|error| error.to_string())?;
-        let (name, plan, programs) = match &strategy {
-            DevicePlacementStrategy::Bufferless => ("bufferless", None, Vec::new()),
-            DevicePlacementStrategy::ProcessLocalValue => ("process-local value", None, Vec::new()),
-            DevicePlacementStrategy::ExactShards { plan, .. } => ("exact shards", Some(plan), Vec::new()),
-            DevicePlacementStrategy::ShardRegions { plan, .. } => ("shard regions", Some(plan), Vec::new()),
-            DevicePlacementStrategy::CompiledReshard { program } => ("compiled reshard", None, vec![program]),
-            DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, reshard, .. } => {
-                ("compiled reshard across meshes", Some(replicas), gather.iter().chain([reshard]).collect())
+        // The additive identities of introduced sums are uploads of each process, so only their first step crosses
+        // processes.
+        fn work(strategy: &DevicePlacementStrategy) -> (String, Option<&ShardMovePlan>, Vec<&ReshardProgram>) {
+            match strategy {
+                DevicePlacementStrategy::Bufferless => ("bufferless".to_string(), None, Vec::new()),
+                DevicePlacementStrategy::ProcessLocalValue => ("process-local value".to_string(), None, Vec::new()),
+                DevicePlacementStrategy::ExactShards { plan, .. } => ("exact shards".to_string(), Some(plan), Vec::new()),
+                DevicePlacementStrategy::ShardRegions { plan, .. } => {
+                    ("shard regions".to_string(), Some(plan), Vec::new())
+                }
+                DevicePlacementStrategy::CompiledReshard { program } => {
+                    ("compiled reshard".to_string(), None, vec![program])
+                }
+                DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, reshard, .. } => (
+                    "compiled reshard across meshes".to_string(),
+                    Some(replicas),
+                    gather.iter().chain([reshard]).collect(),
+                ),
+                DevicePlacementStrategy::IntroducedSums { first, .. } => {
+                    let (name, plan, programs) = work(first);
+                    (format!("{name} with additive identities"), plan, programs)
+                }
+                DevicePlacementStrategy::HostRoundTrip { .. } => ("host round trip".to_string(), None, Vec::new()),
             }
-            DevicePlacementStrategy::HostRoundTrip { .. } => ("host round trip", None, Vec::new()),
-        };
+        }
+        let (name, plan, programs) = work(&strategy);
         let transfers = |moves: Vec<&ShardMove>| {
             moves
                 .into_iter()
@@ -3379,11 +3521,11 @@ mod tests {
                 return Ok(format!("error: {error}"));
             }
             Err(_) => {
-                let outcomes = works.iter().map(|work| work.as_ref().map(|work| work.strategy)).collect::<Vec<_>>();
+                let outcomes = works.iter().map(|work| work.as_ref().map(|work| &work.strategy)).collect::<Vec<_>>();
                 return Err(format!("processes disagree on failing: {outcomes:?}"));
             }
         };
-        let strategies = works.iter().map(|work| work.strategy).collect::<Vec<_>>();
+        let strategies = works.iter().map(|work| work.strategy.as_str()).collect::<Vec<_>>();
         let planned = if strategies.iter().all(|strategy| *strategy == strategies[0]) {
             strategies[0].to_string()
         } else {
@@ -4140,9 +4282,14 @@ mod tests {
     #[test]
     fn test_validate_reduction_transition() {
         // Every change of reduction state along the axis `x` of size two between no state, a pending reduction of each
-        // kind, and a completed reduction, for a data type of every class of the rule, as `.` for a compiled reshard,
-        // `h` for a host round trip, and `E` for an error. The rule reads neither the type of the axis nor anything
-        // that only one process knows.
+        // kind, and a completed reduction, for a data type of every class of the rule, as the planner decides it: `.`
+        // for a compiled reshard, `h` for a host round trip, `i` for the additive identities that introduce a pending
+        // sum after a placement that a compiled reshard (or a move) makes, and `E` for an error. An introduced sum
+        // takes the host round trip only when the placement without it does (e.g., to complete a pending maximum of
+        // `f32` values first). Before the introduction became exact, `f6e2m3fn` and `c64` introductions took the host
+        // round trip and the others a compiled reshard. The rule reads neither the type of the axis nor anything that
+        // only one process knows. Along an axis of size one, a completion changes no value, so it is always a compiled
+        // reshard, while XLA still cannot introduce a pending maximum or minimum.
         let client = cpu_client(2);
         let devices = client
             .addressable_devices()
@@ -4162,10 +4309,30 @@ mod tests {
             DataType::C64,
             DataType::F8E8M0FNU,
         ];
+        let shape = StaticShape::new(vec![4]);
+        let decide = |data_type: DataType, mesh: &DeviceMesh, input: &Sharding, output: &Sharding| {
+            match split_introduced_sums(data_type, &shape, mesh, input, mesh, output) {
+                Err(error) => format!("error: {error}"),
+                Ok(Some((first, _))) => match validate_reduction_transition(data_type, mesh, input, &first) {
+                    Some(reason) => format!("host round trip: {reason}"),
+                    None => "additive identities".to_string(),
+                },
+                Ok(None) => match validate_reduction_transition(data_type, mesh, input, output) {
+                    Some(reason) => format!("host round trip: {reason}"),
+                    None => "compiled reshard".to_string(),
+                },
+            }
+        };
+        let code = |decision: String| match decision.split(':').next().unwrap() {
+            "compiled reshard" => ".",
+            "host round trip" => "h",
+            "additive identities" => "i",
+            _ => "E",
+        };
         let mut outcomes = Vec::new();
-        for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
-            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        for (size, axis_type) in [(2, MeshAxisType::Auto), (2, MeshAxisType::Explicit), (1, MeshAxisType::Explicit)] {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", size, axis_type).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), devices[..size].to_vec()).unwrap();
             let replicated = Sharding::replicated(logical_mesh, 1);
             let pending = |kind: UnreducedKind| {
                 replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
@@ -4181,149 +4348,171 @@ mod tests {
                 for (name, input) in &states {
                     let codes = states
                         .iter()
-                        .map(|(_, output)| {
-                            match validate_reduction_transition(
-                                data_type,
-                                &StaticShape::new(vec![4]),
-                                &mesh,
-                                input,
-                                output,
-                            ) {
-                                Ok(None) => ".",
-                                Ok(Some(_)) => "h",
-                                Err(_) => "E",
-                            }
-                        })
+                        .map(|(_, output)| code(decide(data_type, &mesh, input, output)))
                         .collect::<Vec<_>>();
-                    outcomes.push(format!("{axis_type:?} {data_type} {name}: {}", codes.join(" ")));
+                    outcomes.push(format!("{axis_type:?} {size} {data_type} {name}: {}", codes.join(" ")));
                 }
             }
         }
         let rows = indoc! {"
-            bool none: . . h h .
+            bool none: . i h h .
             bool sum: . . h h .
-            bool max: . . . h .
-            bool min: . . h . .
-            bool reduced: . . h h .
-            u1 none: . . h h .
+            bool max: . i . h .
+            bool min: . i h . .
+            bool reduced: . i h h .
+            u1 none: . i h h .
             u1 sum: h . h h h
-            u1 max: . . . h .
-            u1 min: . . h . .
-            u1 reduced: . . h h .
-            i1 none: . . h h .
+            u1 max: . i . h .
+            u1 min: . i h . .
+            u1 reduced: . i h h .
+            i1 none: . i h h .
             i1 sum: h . h h h
             i1 max: h h . h h
             i1 min: h h h . h
-            i1 reduced: . . h h .
-            u2 none: . . h h .
+            i1 reduced: . i h h .
+            u2 none: . i h h .
             u2 sum: h . h h h
             u2 max: h h . h h
             u2 min: h h h . h
-            u2 reduced: . . h h .
-            i32 none: . . h h .
+            u2 reduced: . i h h .
+            i32 none: . i h h .
             i32 sum: . . h h .
-            i32 max: . . . h .
-            i32 min: . . h . .
-            i32 reduced: . . h h .
-            f6e2m3fn none: . h h h .
+            i32 max: . i . h .
+            i32 min: . i h . .
+            i32 reduced: . i h h .
+            f6e2m3fn none: . i h h .
             f6e2m3fn sum: h . h h h
             f6e2m3fn max: h h . h h
             f6e2m3fn min: h h h . h
-            f6e2m3fn reduced: . h h h .
-            f8e4m3fnuz none: . . h h .
+            f6e2m3fn reduced: . i h h .
+            f8e4m3fnuz none: . i h h .
             f8e4m3fnuz sum: . . h h .
             f8e4m3fnuz max: h h . h h
             f8e4m3fnuz min: h h h . h
-            f8e4m3fnuz reduced: . . h h .
-            f32 none: . . h h .
+            f8e4m3fnuz reduced: . i h h .
+            f32 none: . i h h .
             f32 sum: . . h h .
             f32 max: h h . h h
             f32 min: h h h . h
-            f32 reduced: . . h h .
-            c64 none: . h h h .
+            f32 reduced: . i h h .
+            c64 none: . i h h .
             c64 sum: . . h h .
             c64 max: h h . h h
             c64 min: h h h . h
-            c64 reduced: . h h h .
+            c64 reduced: . i h h .
             f8e8m0fnu none: . E h h .
             f8e8m0fnu sum: h . h h h
             f8e8m0fnu max: h E . h h
             f8e8m0fnu min: h E h . h
             f8e8m0fnu reduced: . E h h ."};
-        let expected = ["Auto", "Explicit"]
+        let size_one_rows = indoc! {"
+            none: . i h h .
+            sum: . . h h .
+            max: . i . h .
+            min: . i h . .
+            reduced: . i h h ."};
+        let mut expected = ["Auto 2", "Explicit 2"]
             .iter()
-            .flat_map(|axis_type| rows.lines().map(move |row| format!("{axis_type} {row}")))
+            .flat_map(|prefix| rows.lines().map(move |row| format!("{prefix} {row}")))
             .collect::<Vec<_>>();
+        expected.extend(data_types.iter().flat_map(|data_type| {
+            size_one_rows.lines().map(move |row| format!("Explicit 1 {data_type} {row}"))
+        }));
         assert_eq!(outcomes, expected);
 
-        // The diagnostics name the data type, both states, the axis, and the reason. A value without elements needs no
-        // additive identity, so even a data type without one introduces a pending sum.
+        // The diagnostics name the data type, both states, the axis, the reason, and what the user can do. A value
+        // without elements needs no additive identity, so even a data type without one introduces a pending sum.
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
         let replicated = Sharding::replicated(logical_mesh, 1);
         let pending = |kind: UnreducedKind| {
             replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
         };
-        let shape = StaticShape::new(vec![4]);
-        let outcome = |data_type: DataType, shape: &StaticShape, input: &Sharding, output: &Sharding| {
-            match validate_reduction_transition(data_type, shape, &mesh, input, output) {
-                Ok(None) => "compiled reshard".to_string(),
-                Ok(Some(reason)) => format!("host round trip: {reason}"),
-                Err(error) => format!("error: {error}"),
-            }
-        };
+        let empty = split_introduced_sums(
+            DataType::F8E8M0FNU,
+            &StaticShape::new(vec![0]),
+            &mesh,
+            &replicated,
+            &mesh,
+            &pending(UnreducedKind::Sum),
+        )
+        .unwrap()
+        .map(|(first, axis_indices)| (first.to_string(), axis_indices));
+        assert_eq!(empty, Some((replicated.to_string(), vec![0])));
+        let remedy = "and the host round trip that takes them exactly needs one process that owns every device of the \
+                      source and of the destination; complete the reduction while the devices of one process hold the \
+                      value, or in another data type";
         assert_eq!(
             [
-                outcome(DataType::U1, &shape, &pending(UnreducedKind::Sum), &replicated),
-                outcome(DataType::I1, &shape, &pending(UnreducedKind::Max), &replicated),
-                outcome(DataType::U2, &shape, &pending(UnreducedKind::Sum), &replicated),
-                outcome(DataType::F6E2M3FN, &shape, &pending(UnreducedKind::Sum), &replicated),
-                outcome(DataType::F8E8M0FNU, &shape, &pending(UnreducedKind::Sum), &replicated),
-                outcome(DataType::C64, &shape, &pending(UnreducedKind::Min), &replicated),
-                outcome(DataType::F32, &shape, &pending(UnreducedKind::Max), &replicated),
-                outcome(DataType::F32, &shape, &pending(UnreducedKind::Sum), &replicated),
-                outcome(DataType::F32, &shape, &replicated, &pending(UnreducedKind::Sum)),
-                outcome(DataType::F6E2M3FN, &shape, &replicated, &pending(UnreducedKind::Sum)),
-                outcome(DataType::C64, &shape, &replicated, &pending(UnreducedKind::Sum)),
-                outcome(DataType::I32, &shape, &replicated, &pending(UnreducedKind::Max)),
-                outcome(DataType::F8E8M0FNU, &shape, &replicated, &pending(UnreducedKind::Sum)),
-                outcome(DataType::F8E8M0FNU, &StaticShape::new(vec![0]), &replicated, &pending(UnreducedKind::Sum)),
+                decide(DataType::U1, &mesh, &pending(UnreducedKind::Sum), &replicated),
+                decide(DataType::I1, &mesh, &pending(UnreducedKind::Max), &replicated),
+                decide(DataType::U2, &mesh, &pending(UnreducedKind::Sum), &replicated),
+                decide(DataType::F6E2M3FN, &mesh, &pending(UnreducedKind::Sum), &replicated),
+                decide(DataType::F8E8M0FNU, &mesh, &pending(UnreducedKind::Sum), &replicated),
+                decide(DataType::C64, &mesh, &pending(UnreducedKind::Min), &replicated),
+                decide(DataType::F32, &mesh, &pending(UnreducedKind::Max), &replicated),
+                decide(DataType::F32, &mesh, &pending(UnreducedKind::Sum), &replicated),
+                decide(DataType::F32, &mesh, &replicated, &pending(UnreducedKind::Sum)),
+                decide(DataType::F6E2M3FN, &mesh, &replicated, &pending(UnreducedKind::Sum)),
+                decide(DataType::C64, &mesh, &replicated, &pending(UnreducedKind::Sum)),
+                decide(DataType::F32, &mesh, &pending(UnreducedKind::Max), &pending(UnreducedKind::Sum)),
+                decide(DataType::I32, &mesh, &replicated, &pending(UnreducedKind::Max)),
+                decide(DataType::F8E8M0FNU, &mesh, &replicated, &pending(UnreducedKind::Sum)),
             ]
             .join("\n"),
             [
-                "host round trip: a compiled reshard cannot take `u1` values from a pending `sum` reduction to no \
-                 reduction state along mesh axis `x`, because XLA adds one-bit integers as predicates (i.e., with a \
-                 logical or), while their sum wraps around",
-                "host round trip: a compiled reshard cannot take `i1` values from a pending `max` reduction to no \
-                 reduction state along mesh axis `x`, because XLA orders one-bit integers as predicates, which puts \
-                 `-1` above `0`",
-                "host round trip: a compiled reshard cannot take `u2` values from a pending `sum` reduction to no \
-                 reduction state along mesh axis `x`, because XLA does not compile reductions of two-bit integers",
-                "host round trip: a compiled reshard cannot take `f6e2m3fn` values from a pending `sum` reduction to \
-                 no reduction state along mesh axis `x`, because XLA does not compile reductions of six-bit floating \
-                 point values",
-                "host round trip: a compiled reshard cannot take `f8e8m0fnu` values from a pending `sum` reduction to \
-                 no reduction state along mesh axis `x`, because XLA does not add `f8e8m0fnu` values as the format \
-                 does (e.g., `2^-127 + 2^-127` gives NaN)",
-                "host round trip: a compiled reshard cannot take `c64` values from a pending `min` reduction to no \
-                 reduction state along mesh axis `x`, because XLA has no maximum or minimum reduction of complex \
-                 values",
-                "host round trip: a compiled reshard cannot take `f32` values from a pending `max` reduction to no \
-                 reduction state along mesh axis `x`, because XLA's maximum and minimum reductions drop NaN values, \
-                 which the maximum and minimum of a compiled program propagate",
-                "compiled reshard",
-                "compiled reshard",
-                "host round trip: a compiled reshard cannot take `f6e2m3fn` values from no reduction state to a \
-                 pending `sum` reduction along mesh axis `x`, because XLA aborts the process when it introduces a \
-                 pending sum of six-bit floating point values",
-                "host round trip: a compiled reshard cannot take `c64` values from no reduction state to a pending \
-                 `sum` reduction along mesh axis `x`, because XLA crashes the process when it introduces a pending sum \
-                 of complex values",
-                "host round trip: a compiled reshard cannot take `i32` values from no reduction state to a pending \
-                 `max` reduction along mesh axis `x`, because XLA can only introduce a pending `sum` reduction",
+                format!(
+                    "host round trip: cannot take `u1` values from a pending `sum` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA adds one-bit integers as predicates (i.e., with a \
+                     logical or), while their sum wraps around, {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `i1` values from a pending `max` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA orders one-bit integers as predicates, which puts \
+                     `-1` above `0`, {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `u2` values from a pending `sum` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA does not compile reductions of two-bit integers, \
+                     {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `f6e2m3fn` values from a pending `sum` reduction to no reduction \
+                     state along mesh axis `x` on the devices, because XLA does not compile reductions of six-bit \
+                     floating point values, {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `f8e8m0fnu` values from a pending `sum` reduction to no reduction \
+                     state along mesh axis `x` on the devices, because XLA does not add `f8e8m0fnu` values as the \
+                     format does (e.g., `2^-127 + 2^-127` gives NaN), {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `c64` values from a pending `min` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA has no maximum or minimum reduction of complex \
+                     values, {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `f32` values from a pending `max` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA's maximum and minimum reductions drop NaN values, \
+                     which the maximum and minimum of a compiled program propagate, {remedy}"
+                ),
+                "compiled reshard".to_string(),
+                "additive identities".to_string(),
+                "additive identities".to_string(),
+                "additive identities".to_string(),
+                format!(
+                    "host round trip: cannot take `f32` values from a pending `max` reduction to no reduction state \
+                     along mesh axis `x` on the devices, because XLA's maximum and minimum reductions drop NaN values, \
+                     which the maximum and minimum of a compiled program propagate, {remedy}"
+                ),
+                format!(
+                    "host round trip: cannot take `i32` values from no reduction state to a pending `max` reduction \
+                     along mesh axis `x` on the devices, because XLA can only introduce a pending `sum` reduction, \
+                     {remedy}"
+                ),
                 "error: type `f8e8m0fnu` has no additive identity to split a host value into summands along unreduced \
-                 axes",
-                "compiled reshard",
+                 axes"
+                    .to_string(),
             ]
             .join("\n"),
         );
@@ -4335,8 +4524,9 @@ mod tests {
         // rejects the changes that the same classification (`collective_reduction`) does not let the planner make on
         // the devices. Each such cell lowers the program that `Array::compile_reshard_on_same_mesh` stages, over the
         // mesh of `ReshardProgram::compiled_mesh`, for every data type with values, both axis types, and every pair of
-        // states (none, a pending sum, maximum, or minimum, and a completed reduction). Only lowering runs, so that a
-        // wrong plan cannot abort the test process.
+        // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a pending
+        // sum plans the program of its placement without that sum, whose identities are written without a program
+        // (refer to `split_introduced_sums`). Only lowering runs, so that a wrong plan cannot abort the test process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -4398,9 +4588,21 @@ mod tests {
             for data_type in data_types {
                 for input in &states {
                     for output in &states {
-                        match validate_reduction_transition(data_type, &shape, &mesh, input, output) {
-                            Ok(None) => planned += 1,
-                            Ok(Some(_)) | Err(_) => {
+                        let first;
+                        let output = match split_introduced_sums(data_type, &shape, &mesh, input, &mesh, output) {
+                            Ok(Some((sharding, _))) => {
+                                first = sharding;
+                                &first
+                            }
+                            Ok(None) => output,
+                            Err(_) => {
+                                declined += 1;
+                                continue;
+                            }
+                        };
+                        match validate_reduction_transition(data_type, &mesh, input, output) {
+                            None => planned += 1,
+                            Some(_) => {
                                 declined += 1;
                                 continue;
                             }
@@ -4423,7 +4625,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((planned, declined), (812, 788));
+        assert_eq!((planned, declined), (828, 772));
     }
 
     #[test]
@@ -4765,8 +4967,9 @@ mod tests {
                             source.to_placement(&session, target)
                         };
                         let programs = session.cached_program_count();
-                        // A sum that the devices complete or introduce follows the contract of floating point sums.
-                        let sum_contract = programs > 0 && matches!(name, "sum -> none" | "none -> sum" | "max -> sum");
+                        // A sum that the devices complete follows the contract of floating point sums, and one that they
+                        // introduce is exact.
+                        let sum_contract = programs > 0 && name == "sum -> none";
                         results.push(placed.and_then(|placed| {
                             assert_eq!(placed.sharding(), &destination, "{data_type} {name}");
                             let actual = placed.copy_to_host_bytes()?;
@@ -4804,7 +5007,7 @@ mod tests {
                 bool sum -> none: +1 +1
                 bool max -> none: +1 +1
                 bool min -> none: +1 +1
-                bool none -> sum: +1 +1
+                bool none -> sum: +0 +0
                 bool none -> max: +0 +0
                 bool max -> sum: +1 +1
                 bool sum -> sum split: +1 +1
@@ -4812,7 +5015,7 @@ mod tests {
                 u1 sum -> none: +0 +0
                 u1 max -> none: +1 +1
                 u1 min -> none: +1 +1
-                u1 none -> sum: +1 +1
+                u1 none -> sum: +0 +0
                 u1 none -> max: +0 +0
                 u1 max -> sum: +1 +1
                 u1 sum -> sum split: +1 +1
@@ -4820,7 +5023,7 @@ mod tests {
                 i1 sum -> none: +0 +0
                 i1 max -> none: +0 +0
                 i1 min -> none: +0 +0
-                i1 none -> sum: +1 +1
+                i1 none -> sum: +0 +0
                 i1 none -> max: +0 +0
                 i1 max -> sum: +0 +0
                 i1 sum -> sum split: +1 +1
@@ -4828,7 +5031,7 @@ mod tests {
                 u2 sum -> none: +0 +0
                 u2 max -> none: +0 +0
                 u2 min -> none: +0 +0
-                u2 none -> sum: +1 +1
+                u2 none -> sum: +0 +0
                 u2 none -> max: +0 +0
                 u2 max -> sum: +0 +0
                 u2 sum -> sum split: +1 +1
@@ -4836,7 +5039,7 @@ mod tests {
                 i4 sum -> none: +1 +1
                 i4 max -> none: +1 +1
                 i4 min -> none: +1 +1
-                i4 none -> sum: +1 +1
+                i4 none -> sum: +0 +0
                 i4 none -> max: +0 +0
                 i4 max -> sum: +1 +1
                 i4 sum -> sum split: +1 +1
@@ -4844,7 +5047,7 @@ mod tests {
                 u8 sum -> none: +1 +1
                 u8 max -> none: +1 +1
                 u8 min -> none: +1 +1
-                u8 none -> sum: +1 +1
+                u8 none -> sum: +0 +0
                 u8 none -> max: +0 +0
                 u8 max -> sum: +1 +1
                 u8 sum -> sum split: +1 +1
@@ -4852,7 +5055,7 @@ mod tests {
                 i32 sum -> none: +1 +1
                 i32 max -> none: +1 +1
                 i32 min -> none: +1 +1
-                i32 none -> sum: +1 +1
+                i32 none -> sum: +0 +0
                 i32 none -> max: +0 +0
                 i32 max -> sum: +1 +1
                 i32 sum -> sum split: +1 +1
@@ -4860,7 +5063,7 @@ mod tests {
                 f32 sum -> none: +1 +1
                 f32 max -> none: +0 +0
                 f32 min -> none: +0 +0
-                f32 none -> sum: +1 +1
+                f32 none -> sum: +0 +0
                 f32 none -> max: +0 +0
                 f32 max -> sum: +0 +0
                 f32 sum -> sum split: +1 +1
@@ -4868,7 +5071,7 @@ mod tests {
                 f8e5m2 sum -> none: +1 +1
                 f8e5m2 max -> none: +0 +0
                 f8e5m2 min -> none: +0 +0
-                f8e5m2 none -> sum: +1 +1
+                f8e5m2 none -> sum: +0 +0
                 f8e5m2 none -> max: +0 +0
                 f8e5m2 max -> sum: +0 +0
                 f8e5m2 sum -> sum split: +1 +1
@@ -4876,7 +5079,7 @@ mod tests {
                 f8e4m3fnuz sum -> none: +1 +1
                 f8e4m3fnuz max -> none: +0 +0
                 f8e4m3fnuz min -> none: +0 +0
-                f8e4m3fnuz none -> sum: +1 +1
+                f8e4m3fnuz none -> sum: +0 +0
                 f8e4m3fnuz none -> max: +0 +0
                 f8e4m3fnuz max -> sum: +0 +0
                 f8e4m3fnuz sum -> sum split: +1 +1
@@ -4902,8 +5105,9 @@ mod tests {
         // The two differences that the contract of floating point sums allows, pinned on the CPU plugin with the bit
         // patterns of `f32` values. Completing a sum of two negative zeros on the devices gives positive zero, because
         // the collective starts from positive zero, and the plugin flushes a subnormal sum to zero, as it does in every
-        // addition. Introducing a sum writes positive zero to the other device, so a negative zero reads back as a
-        // positive one. Both placements are compiled reshards.
+        // addition. Introducing a sum compiles nothing and writes negative zero, the additive identity, to the other
+        // device, so a negative zero reads back as it was (before, a compiled reshard wrote positive zero there, which
+        // turned it into a positive one).
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
@@ -4927,14 +5131,14 @@ mod tests {
         let bytes = values_to_bytes(&[-0f32, 1e-45, 1.]);
         let value = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated), bytes).unwrap();
         let introduced = value.to_placement(&session, Placement::new(mesh, unreduced).unwrap()).unwrap();
-        assert_eq!(session.cached_program_count(), 2);
+        assert_eq!(session.cached_program_count(), 1);
         assert_eq!(
             [bits(&summands), bits(&completed), bits(&value), bits(&introduced)],
             [
                 vec![0x8000_0000, 1, 0x4040_0000],
                 vec![0, 0, 0x4040_0000],
                 vec![0x8000_0000, 1, 0x3f80_0000],
-                vec![0, 1, 0x3f80_0000],
+                vec![0x8000_0000, 1, 0x3f80_0000],
             ],
         );
     }
@@ -7316,9 +7520,8 @@ mod tests {
         let values = [1f32, 2., 3., 4., 5., 6.];
         let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let default_layout = cross_host_default_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3]))
-            .unwrap()
-            .unwrap();
+        let default_layout =
+            default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3])).unwrap().unwrap();
         assert_eq!(default_layout, row_major.to_pjrt().unwrap());
         let upload = |session: &Session, layout: &Layout| {
             let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout.clone());
@@ -7386,9 +7589,8 @@ mod tests {
             assert_eq!(padded_buffer.unpadded_dimensions().unwrap(), [size as u64]);
             assert_eq!(padded_buffer.dynamic_dimensions().unwrap(), [0]);
             assert_eq!(padded_buffer.on_device_size_in_bytes().unwrap(), padded_size);
-            let default_layout = cross_host_default_layout(client, BufferType::F32, 0, &StaticShape::new(vec![size]))
-                .unwrap()
-                .unwrap();
+            let default_layout =
+                default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![size])).unwrap().unwrap();
             assert_eq!(padded_buffer.specification().unwrap().layout, default_layout);
             assert!(!is_cross_host_sendable(padded_buffer, &StaticShape::new(vec![size]), &default_layout).unwrap());
             let mut completion = PlacementCompletion::default();
@@ -8087,57 +8289,57 @@ mod tests {
             indoc! {"
                 shared replicated over both processes -> replicated over both processes: exact shards
                 shared replicated over both processes -> sharded over both processes: compiled reshard
-                shared replicated over both processes -> unreduced over both processes: compiled reshard
+                shared replicated over both processes -> unreduced over both processes: exact shards with additive identities
                 shared replicated over both processes -> replicated on process 0: exact shards
                 shared replicated over both processes -> sharded on process 1: shard regions
                 shared sharded over both processes -> replicated over both processes: compiled reshard
                 shared sharded over both processes -> sharded over both processes: exact shards
-                shared sharded over both processes -> unreduced over both processes: compiled reshard
+                shared sharded over both processes -> unreduced over both processes: compiled reshard with additive identities
                 shared sharded over both processes -> replicated on process 0: shard regions
                 shared sharded over both processes -> sharded on process 1: exact shards
                 shared on process 0 -> replicated over both processes: exact shards
                 shared on process 0 -> sharded over both processes: shard regions
-                shared on process 0 -> unreduced over both processes: compiled reshard across meshes
+                shared on process 0 -> unreduced over both processes: exact shards with additive identities
                 shared on process 0 -> replicated on process 0: exact shards
                 shared on process 0 -> sharded on process 1: shard regions
                 shared with a declared layout -> replicated over both processes: exact shards
                 shared with a declared layout -> sharded over both processes: compiled reshard across meshes
-                shared with a declared layout -> unreduced over both processes: compiled reshard across meshes
+                shared with a declared layout -> unreduced over both processes: exact shards with additive identities
                 shared with a declared layout -> replicated on process 0: exact shards
                 shared with a declared layout -> sharded on process 1: compiled reshard across meshes
                 shared sharded with a declared layout -> replicated over both processes: exact shards
                 shared sharded with a declared layout -> sharded over both processes: compiled reshard across meshes
-                shared sharded with a declared layout -> unreduced over both processes: compiled reshard across meshes
+                shared sharded with a declared layout -> unreduced over both processes: exact shards with additive identities
                 shared sharded with a declared layout -> replicated on process 0: exact shards
                 shared sharded with a declared layout -> sharded on process 1: compiled reshard across meshes
                 shared in pinned host memory -> replicated over both processes: exact shards
                 shared in pinned host memory -> sharded over both processes: shard regions
-                shared in pinned host memory -> unreduced over both processes: compiled reshard across meshes
+                shared in pinned host memory -> unreduced over both processes: exact shards with additive identities
                 shared in pinned host memory -> replicated on process 0: exact shards
                 shared in pinned host memory -> sharded on process 1: shard regions
                 shared in unpinned host memory -> replicated over both processes: exact shards
                 shared in unpinned host memory -> sharded over both processes: shard regions
-                shared in unpinned host memory -> unreduced over both processes: compiled reshard across meshes
+                shared in unpinned host memory -> unreduced over both processes: exact shards with additive identities
                 shared in unpinned host memory -> replicated on process 0: exact shards
                 shared in unpinned host memory -> sharded on process 1: shard regions
                 partially addressable import -> replicated over both processes: exact shards
                 partially addressable import -> sharded over both processes: shard regions
-                partially addressable import -> unreduced over both processes: compiled reshard across meshes
+                partially addressable import -> unreduced over both processes: exact shards with additive identities
                 partially addressable import -> replicated on process 0: exact shards
                 partially addressable import -> sharded on process 1: shard regions
                 partially addressable import with a declared layout -> replicated over both processes: exact shards
                 partially addressable import with a declared layout -> sharded over both processes: compiled reshard across meshes
-                partially addressable import with a declared layout -> unreduced over both processes: compiled reshard across meshes
+                partially addressable import with a declared layout -> unreduced over both processes: exact shards with additive identities
                 partially addressable import with a declared layout -> replicated on process 0: exact shards
                 partially addressable import with a declared layout -> sharded on process 1: compiled reshard across meshes
                 partially addressable import in pinned host memory -> replicated over both processes: exact shards
                 partially addressable import in pinned host memory -> sharded over both processes: shard regions
-                partially addressable import in pinned host memory -> unreduced over both processes: compiled reshard across meshes
+                partially addressable import in pinned host memory -> unreduced over both processes: exact shards with additive identities
                 partially addressable import in pinned host memory -> replicated on process 0: exact shards
                 partially addressable import in pinned host memory -> sharded on process 1: shard regions
                 partially addressable sharded import -> replicated over both processes: DISAGREE: shard regions: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 partially addressable sharded import -> sharded over both processes: exact shards
-                partially addressable sharded import -> unreduced over both processes: DISAGREE: compiled reshard across meshes: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
+                partially addressable sharded import -> unreduced over both processes: DISAGREE: shard regions with additive identities: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 partially addressable sharded import -> replicated on process 0: compiled reshard
                 partially addressable sharded import -> sharded on process 1: DISAGREE: exact shards: process 0 fails before it posts its transfers: array shard #0 on device 0 has no addressable buffer
                 process-local committed -> replicated over both processes: process-local value
@@ -8283,10 +8485,12 @@ mod tests {
         assert_eq!(
             outcomes,
             [
-                "over both processes: Ok(\"host round trip\"), owners [None, None], process 0 Err(\"a compiled reshard \
-                 cannot take `f32` values from a pending `max` reduction to no reduction state along mesh axis `x`, \
+                "over both processes: Ok(\"host round trip\"), owners [None, None], process 0 Err(\"cannot take `f32` \
+                 values from a pending `max` reduction to no reduction state along mesh axis `x` on the devices, \
                  because XLA's maximum and minimum reductions drop NaN values, which the maximum and minimum of a \
-                 compiled program propagate\")",
+                 compiled program propagate, and the host round trip that takes them exactly needs one process that \
+                 owns every device of the source and of the destination; complete the reduction while the devices of \
+                 one process hold the value, or in another data type\")",
                 "on process 1: Ok(\"host round trip\"), owners [Some(1), Some(1)], process 0 Ok(\"0 buffers\")",
             ],
         );
@@ -8318,15 +8522,15 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_host_default_layout() {
-        // A receive of a shard allocates the default layout of the plugin for its shape, which is row-major on CPU.
+    fn test_default_buffer_layout() {
+        // The CPU plugin reports row-major layouts through the default layout query.
         let client = cpu_client(1);
         assert_eq!(
-            cross_host_default_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3])).unwrap(),
+            default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3])).unwrap(),
             Some(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])).to_pjrt().unwrap()),
         );
         assert_eq!(
-            cross_host_default_layout(client, BufferType::Predicate, 0, &StaticShape::new(vec![4])).unwrap(),
+            default_buffer_layout(client, BufferType::Predicate, 0, &StaticShape::new(vec![4])).unwrap(),
             Some(Layout::Tiled(TiledLayout::new(vec![0], vec![])).to_pjrt().unwrap()),
         );
     }

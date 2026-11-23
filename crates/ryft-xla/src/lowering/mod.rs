@@ -2952,17 +2952,28 @@ fn validate_pending_reduction_change<'a, I: IntoIterator<Item = &'a String>>(
     let Some(reason) = compiled_reduction_rejection(data_type, change) else {
         return Ok(());
     };
-    let (verb, kind) = match change {
-        ReductionChange::Complete(kind) => ("complete", kind),
-        ReductionChange::Introduce(kind) => ("introduce", kind),
+    // A placement of a concrete array introduces a pending sum exactly on every mesh, while it completes a reduction
+    // exactly with a host round trip only where one process owns every device of the array and of the destination.
+    let (verb, kind, remedy) = match change {
+        ReductionChange::Complete(kind) => (
+            "complete",
+            kind,
+            "complete the reduction with a placement of the concrete array instead (e.g., `Array::to_placement`), \
+             which is exact where one process owns every device of the array and of the destination, or use another \
+             data type",
+        ),
+        ReductionChange::Introduce(kind) => (
+            "introduce",
+            kind,
+            "introduce the reduction with a placement of the concrete array instead (e.g., `Array::to_placement`), \
+             which writes additive identities exactly on every mesh, or use another data type",
+        ),
     };
     Err(Error::Lowering(LoweringError::UnsupportedOperation {
         operation: operation.to_string(),
         reason: format!(
             "the sharding `{sharding}` would {verb} a pending `{kind}` reduction of `{data_type}` values over mesh \
-             axes (i.e., {}), which XLA does not do as the data type means it, because {reason}; {verb} the reduction \
-             with a placement of the concrete array instead (e.g., `Array::to_placement`), which takes an exact path, \
-             or use another data type",
+             axes (i.e., {}), which XLA does not do as the data type means it, because {reason}; {remedy}",
             axes.join(", "),
         ),
     }))
@@ -6657,14 +6668,23 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string()
         };
-        let suffix = "; {} the reduction with a placement of the concrete array instead (e.g., `Array::to_placement`), \
-                      which takes an exact path, or use another data type";
         let message = |sharding: &str, verb: &str, kind: &str, data_type: &str, reason: &str| {
+            let remedy = match verb {
+                "complete" => {
+                    "complete the reduction with a placement of the concrete array instead (e.g., \
+                     `Array::to_placement`), which is exact where one process owns every device of the array and of \
+                     the destination, or use another data type"
+                }
+                _ => {
+                    "introduce the reduction with a placement of the concrete array instead (e.g., \
+                     `Array::to_placement`), which writes additive identities exactly on every mesh, or use another \
+                     data type"
+                }
+            };
             format!(
                 "cannot lower `input_shardings`: the sharding `{sharding}` would {verb} a pending `{kind}` reduction \
                  of `{data_type}` values over mesh axes (i.e., `x`), which XLA does not do as the data type means it, \
-                 because {reason}{}",
-                suffix.replace("{}", verb),
+                 because {reason}; {remedy}",
             )
         };
         let sum = "{mesh<['x'=2:auto]>, [{}], unreduced={'x'}}";

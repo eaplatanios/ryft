@@ -7,7 +7,7 @@ use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, LayoutError, Memory, Sharding, ShardingDimension,
     ShardingError, StaticShape, check_sharding,
 };
-use ryft_pjrt::{Buffer, Client, Error as PjrtError};
+use ryft_pjrt::{Buffer, Client, Error as PjrtError, Event};
 
 use crate::arrays::ArrayError;
 use crate::devices::MemoryExtension;
@@ -102,7 +102,9 @@ impl ArrayShard {
     /// Copies the bytes that the device of this [`ArrayShard`] holds to the host and returns them in dense row-major
     /// order, irrespective of the physical layout of the shard's [`Buffer`]. This function blocks the current thread
     /// until the copy completes. Bufferless [`DataType::Zero`] shards and shards with no elements produce no bytes
-    /// and issue no copy.
+    /// and issue no copy. A shard with no elements still waits for its buffer, so that a failure of the work that
+    /// produced that buffer (e.g., a failed host to device transfer) surfaces here as it does for the readback of
+    /// the whole array.
     ///
     /// These bytes are a tile of the [`Array`](crate::Array) that this shard belongs to, unless the [`Sharding`] of
     /// that array has unreduced axes, in which case they are the separate value that this device holds for that tile
@@ -129,17 +131,7 @@ impl ArrayShard {
                 }));
             }
         };
-
-        // Avoid asking PJRT for a zero byte copy of a dynamically sized buffer, whose size query fallback can expose
-        // the bound allocation and its trailer instead of the empty logical value.
-        let shape = self.shape();
-        if shape.as_slice().contains(&0) {
-            return Ok(Vec::new());
-        }
-
-        // Request row-major bytes explicitly, because the device buffer may have another physical layout.
-        let copy = buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?;
-        Ok(copy.r#await()?)
+        read_shard_to_host(buffer, &self.shape(), Event::r#await)
     }
 
     /// Consumes this [`ArrayShard`] and returns its [`Buffer`], which is `None` in the cases of [`Self::buffer`].
@@ -448,6 +440,29 @@ impl ShardLayout {
     }
 }
 
+/// Reads the shard with `shape` that `buffer` holds back to the host in dense row-major order, irrespective of the
+/// physical layout of `buffer`. `wait` waits for the copy to the host and returns its bytes (e.g., by awaiting its
+/// [`Event`], or through the work tracking of a session). This is the one reader of a single shard, which
+/// [`ArrayShard::copy_to_host_bytes`] and the host round trips of placements (refer to [`crate::arrays::resharding`])
+/// use alike.
+///
+/// A shard without elements issues no copy, because PJRT can answer a zero byte copy of a bounded-dynamic buffer with
+/// its bound allocation and its trailer rather than the empty logical value. This function then only waits for the
+/// readiness of `buffer`, so that a failure of the work that produced it (e.g., a failed host to device transfer)
+/// still surfaces, as it does for a shard with elements through its copy.
+pub(crate) fn read_shard_to_host(
+    buffer: &Buffer<'_>,
+    shape: &StaticShape,
+    wait: impl FnOnce(Event<Vec<u8>>) -> Result<Vec<u8>, PjrtError>,
+) -> Result<Vec<u8>, Error> {
+    if shape.as_slice().contains(&0) {
+        buffer.ready()?.r#await()?;
+        return Ok(Vec::new());
+    }
+    let host_layout = ryft_pjrt::Layout::dense_major_to_minor(shape.rank());
+    Ok(wait(buffer.copy_to_host(Some(host_layout))?)?)
+}
+
 /// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
 /// `shard_index_by_device`, returning the identifier of the device that owns it. The buffer must be owned by `client`,
 /// live on a device of the mesh in the process that the mesh expects, live in the memory that `r#type` requests, and
@@ -578,7 +593,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType};
-    use ryft_pjrt::BufferType;
+    use ryft_pjrt::{BufferSpecification, BufferType};
 
     use crate::Session;
     use crate::arrays::Array;
@@ -711,6 +726,31 @@ mod tests {
         let empty = replicated_array(&session, &mesh, DataType::F32, &[0], &[]);
         assert!(empty.shards()[0].buffer().is_some());
         assert_eq!(empty.shards()[0].copy_to_host_bytes().unwrap(), Vec::<u8>::new());
+
+        // A shard with no elements issues no copy, but it still waits for its buffer, so it reports a failure of the
+        // transfer that produced that buffer, as the readback of its whole array does.
+        let device = client.addressable_devices().unwrap().remove(0);
+        let specification = BufferSpecification::new(BufferType::U8, [0u64]);
+        let manager = client
+            .host_to_device_transfer_manager(vec![specification], device.default_memory().unwrap())
+            .unwrap();
+        let failed = Array::from_addressable_buffers(
+            &session,
+            ArrayType::new_static(DataType::U8, [0]),
+            DeviceMesh::new(LogicalMesh::single_device(), vec![Device::from_pjrt(&device).unwrap()]).unwrap(),
+            None,
+            vec![manager.retrieve_buffer(0).unwrap()],
+        )
+        .unwrap();
+        manager.set_error(0, PjrtError::aborted("transfer failed")).unwrap();
+        assert!(matches!(
+            failed.shards()[0].copy_to_host_bytes(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "transfer failed",
+        ));
+        assert!(matches!(
+            failed.copy_to_host_bytes(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "transfer failed",
+        ));
 
         // A remote shard has no buffer in the current process.
         let remote = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);

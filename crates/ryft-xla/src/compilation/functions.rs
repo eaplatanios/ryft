@@ -5380,6 +5380,14 @@ mod tests {
         .unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let identity = |(), x: CompileTracer| Ok::<_, Error>(x);
+        // An argument that carries a pending sum over an auto mesh axis, which only an input override can state.
+        let pending_sum = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let pending_sum_shards =
+            mesh.devices().iter().map(|device| (device.id(), Arc::<[u8]>::from(values_to_bytes(&values))));
+        let pending_sum_sharding = Some(pending_sum.clone());
+        let pending_sum_input =
+            Array::from_host_shards(&session, vector_type.clone(), mesh.clone(), pending_sum_sharding, pending_sum_shards)
+                .unwrap();
         let rows = vec![
             Row {
                 name: "no overrides",
@@ -5423,6 +5431,13 @@ mod tests {
                     Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]),
                 ),
                 input: upload(&vector_type, Some(&mesh), Some(&split), &values),
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "input override that states the pending reduction of an argument",
+                input_type: vector_type.clone(),
+                callee: compiled(&vector_type, Options::new(mesh.clone()).with_input_shardings(vec![pending_sum])),
+                input: pending_sum_input,
                 caller_mesh: mesh.clone(),
             },
             Row {

@@ -34,7 +34,9 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::compilation::domains::{boundary_input_type, commits_public_outputs, declared_input_sharding};
+use crate::compilation::domains::{
+    boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
+};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::lower_array_ir_type;
@@ -2553,8 +2555,20 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         // that take no array input (e.g., a `fill`) are replayed there rather than on the default mesh of the session,
         // as an execution of the callee places them.
         let session = context.with_device_mesh(decision.mesh().clone());
+        // An executable of the callee completes the pending reductions over auto mesh axes of an argument that an input
+        // override states where the argument enters (refer to `entered_argument_sharding`), so the replayed callee
+        // receives such an argument completed too, as do the results that return it.
+        let mut inputs = decision.inputs.into_owned();
+        for input in &mut inputs {
+            if let Value::Array(array) = input
+                && let Cow::Owned(sharding) = entered_argument_sharding(array.sharding()).map_err(invalid_argument)?
+            {
+                let mesh = array.mesh().clone();
+                *array = array.clone().reshard_on_devices(context, &mesh, &sharding, false).map_err(invalid_argument)?;
+            }
+        }
         driver
-            .interpret_region(&session, 0, decision.inputs.into_owned())?
+            .interpret_region(&session, 0, inputs)?
             .iter()
             .enumerate()
             .map(|(index, value)| match value.rename_type_identities(&renaming)? {
@@ -2596,7 +2610,12 @@ impl LowerableOperation for JitCallOperation<Type> {
                 let Type::Array(actual) = ty else { return Ok(value) };
                 let callee = lowerer.regions()[0].entry_region_ref();
                 let declared = &callee.interface().input_types()[index];
-                match self.boundary_input_placement(index, actual, declared).map(Cow::into_owned) {
+                // The callee receives the operand as its entry function holds an argument that arrives at the
+                // boundary sharding, with the pending reductions over auto mesh axes that an override may state
+                // completed (refer to `entered_argument_sharding`). An operand is a value of the caller, which never
+                // carries such a reduction, so the constraint neither introduces nor completes one.
+                let placement = self.boundary_input_placement(index, actual, declared);
+                match placement.map(|sharding| entered_argument_sharding(&sharding).map(Cow::into_owned)).transpose()? {
                     Some(sharding) => lower_boundary_constraint(lowerer, value, ty, &sharding),
                     None => Ok(value),
                 }

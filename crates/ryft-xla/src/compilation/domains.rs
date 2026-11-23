@@ -6,6 +6,7 @@
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -284,10 +285,11 @@ impl Session {
     }
 
     /// Returns `program`, a program that is lowered for `mesh`, with every array that it imports from a session (i.e.,
-    /// every session constant that its executable receives, refer to `collect_session_constants`) that is not on the
-    /// devices where the executable receives it replaced by that array placed there with the same declared type (refer
-    /// to [`placed_constant`]), together with the constant that each placement replaced, by placement, or [`None`]
-    /// when there is no such array, which is the common case and costs one walk of the regions that lowering emits.
+    /// every session constant that its executable receives, refer to `collect_session_constants`) replaced by that
+    /// array placed where the executable receives it with the same declared type (refer to [`placed_constant`], which
+    /// copies nothing for an array that is there already), together with the constant that each placement replaced,
+    /// by placement, or [`None`] when there is no such array, which is the common case and costs one walk of the
+    /// regions that lowering emits.
     ///
     /// An imported array follows the function that uses it, as an explicit capture does. A trace of a function that is
     /// compiled for `mesh` declares such an array with the type with which the function receives it on `mesh` where it
@@ -921,12 +923,29 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
     if sharding.unreduced_axes().is_empty() {
         return Ok(sharding);
     }
+    entered_argument_sharding(&sharding).map(Cow::into_owned)
+}
+
+/// Returns `sharding`, the placement with which an argument arrives at a function (e.g., an input sharding override),
+/// as the body of the function holds that argument once it has entered: without its pending reductions over auto mesh
+/// axes, which no value of a program carries, because types never record them. The lowering of the entry function
+/// completes such a reduction where the argument enters (refer to the lowering of entry arguments in
+/// `crate::lowering`), so the body of a function, and every result that returns the argument, holds the completed
+/// value. The lowering of a nested call and the region replay of its callee receive an operand at this sharding for
+/// the same reason (refer to [`JitCallOperation::boundary_input_sharding`]), and a pending reduction that a type records
+/// (i.e., over explicit or manual mesh axes) is kept. A sharding without pending reductions over auto mesh axes, which
+/// is the common case, is returned without a copy.
+///
+/// # Errors
+///
+/// Returns the error of removing the unreduced axes from `sharding`, which never fails for a valid sharding.
+pub(crate) fn entered_argument_sharding(sharding: &Sharding) -> Result<Cow<'_, Sharding>, Error> {
     let is_auto = |axis: &&String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
     if !sharding.unreduced_axes().iter().any(|axis| is_auto(&axis)) {
-        return Ok(sharding);
+        return Ok(Cow::Borrowed(sharding));
     }
     let unreduced_axes = sharding.unreduced_axes().iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
-    Ok(sharding.clone().with_unreduced_axes(unreduced_axes)?)
+    Ok(Cow::Owned(sharding.clone().with_unreduced_axes(unreduced_axes)?))
 }
 
 /// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
@@ -1037,15 +1056,21 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 }
 
 /// Returns `constant`, an array that a function captures (i.e., a session constant of its program), placed where the
-/// executable of the function that is compiled for `mesh` receives it, or [`None`] when it is there already or when the
-/// executable cannot receive it on `mesh` (e.g., a capture whose type records a split over a mesh of another topology,
-/// or one with a pending reduction over auto mesh axes, which lowering and admission reject). This is the one rule for
-/// where a capture is placed, which lowering (refer to `Session::with_session_constants_on_mesh`), the hidden
-/// arguments of the eager dispatch of a program, and the region replay of a callee follow. A capture over a logical
-/// mesh of the topology of `mesh` keeps its runtime placement on the devices of `mesh`, so that it adds no gather, and
-/// any other capture is placed as [`capture_sharding`] receives it (i.e., replicated over `mesh`). Each placement is
-/// computed once for each retention of the array and each mesh, and lives as long as the programs that hold the
-/// constant (refer to [`RetainedArray::placed`]), so no execution, eager call, or replay moves the capture again.
+/// executable of the function that is compiled for `mesh` receives it, or [`None`] when the executable cannot receive
+/// it on `mesh` (e.g., a capture whose type records a split over a mesh of another topology, or one with a pending
+/// reduction over auto mesh axes, which lowering and admission reject). This is the one rule for where a capture is
+/// placed, which lowering (refer to `Session::with_session_constants_on_mesh`), the hidden arguments of the eager
+/// dispatch of a program, and the region replay of a callee follow. A capture over a logical mesh of the topology of
+/// `mesh` keeps its runtime placement on the devices of `mesh`, so that it adds no gather, and any other capture is
+/// placed as [`capture_sharding`] receives it (i.e., replicated over `mesh`). Each placement is computed once for each
+/// retention of the array and each mesh, and lives as long as the programs that hold the constant (refer to
+/// [`RetainedArray::placed`]), so no execution, eager call, or replay moves the capture again. A capture that already
+/// lives on the devices of `mesh` with that placement is not copied, but it is still handed out as its placement onto
+/// the devices that the function names (refer to [`RetainedArray::on_named_devices`]), which shares its buffers and
+/// keeps nothing alive beyond the capture itself. Every process therefore holds the same facts for the capture of a
+/// function (i.e., committed to its devices and not locally assigned), whether a process placed it or found it there
+/// (e.g., a capture without a target on a function on the first device of the first process, which the first process
+/// finds on that device and every other process places there).
 ///
 /// # Errors
 ///
@@ -1067,7 +1092,7 @@ pub(crate) fn placed_constant(
     }
     let (target, sharding) = if constant.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
         if constant.mesh().devices() == mesh.devices() {
-            return Ok(None);
+            return Ok(Some(constant.on_named_devices()));
         }
         (DeviceMesh::new(constant.sharding().mesh().clone(), mesh.devices().to_vec())?, constant.sharding().clone())
     } else {
@@ -4798,7 +4823,8 @@ mod tests {
         };
         let direct = upload(Some(mesh.clone()));
         let first = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
-        let identity = crate::compile::<_, ArrayType, ArrayType>(|input| input, r#type, &session, first).unwrap();
+        let identity =
+            crate::compile::<_, ArrayType, ArrayType>(|input| input, r#type.clone(), &session, first.clone()).unwrap();
         let facts = |array: &Array| {
             let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
             let executed = identity.executable().execute(&session, array.clone()).map_err(|error| error.to_string());
@@ -4822,6 +4848,36 @@ mod tests {
                 false,
                 vec![3.0],
                 Err("public argument #0 is committed to devices [0, 1], but the executable requires [0]".to_string()),
+                Err("the cross-host transfers extension is not provided by the PJRT plugin".to_string()),
+            ),
+        );
+
+        // A capture that already lives on the devices of the function is not copied, but it is handed out with the same
+        // facts as a placement onto those devices, so that every process holds the same facts whether the capture
+        // started on the devices of the function or elsewhere (e.g., the same capture without a target, on the first
+        // device of the process that holds the function and on the device of another process).
+        let capture = upload(None);
+        let function = crate::compile_statefully_with_captures::<_, Type, Type>(
+            |captures, _| Ok(captures[0].clone()),
+            vec![Value::Array(capture.clone())],
+            Type::Array(r#type.clone()),
+            &session,
+            Options::new(first.clone()),
+        )
+        .unwrap();
+        let [Value::Array(found)] = function.executable().captures() else {
+            panic!("expected one captured array");
+        };
+        assert!(Arc::ptr_eq(found.shards()[0].buffer().unwrap(), capture.shards()[0].buffer().unwrap()));
+        assert_eq!(facts(found), facts(&upload(Some(first.clone()))));
+        assert_eq!(
+            facts(found),
+            (
+                vec![mesh.devices()[0]],
+                true,
+                false,
+                vec![3.0],
+                Ok(()),
                 Err("the cross-host transfers extension is not provided by the PJRT plugin".to_string()),
             ),
         );

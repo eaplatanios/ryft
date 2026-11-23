@@ -25,6 +25,33 @@ use crate::{Error, RetainedArray, RuntimeRequirement, Target, Type};
 
 // TODO(eaplatanios): Review this module.
 
+/// A hidden argument that binds an original IR constant to the array supplied to the executable.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionConstantBinding {
+    /// Constant that defines the declared type, identity, and placement behavior of the capture in the program.
+    source: RetainedArray,
+
+    /// Retained array at the placement where the executable receives this argument.
+    argument: RetainedArray,
+}
+
+impl SessionConstantBinding {
+    /// Binds `source` to the retained array `argument` that supplies its executable buffers.
+    pub(super) fn new(source: RetainedArray, argument: RetainedArray) -> Self {
+        Self { source, argument }
+    }
+
+    /// Returns the original constant as it appears in the IR.
+    pub(crate) fn source(&self) -> &RetainedArray {
+        &self.source
+    }
+
+    /// Returns the array that supplies the executable buffers.
+    pub(super) fn argument(&self) -> &RetainedArray {
+        &self.argument
+    }
+}
+
 /// StableHLO lowering and metadata of the call boundary produced before PJRT compilation.
 ///
 /// A [`Session`](crate::sessions::Session) lowers a staged program into this artifact with its effective compilation
@@ -68,20 +95,11 @@ pub struct LoweredProgram {
     /// Donation declarations for public inputs. Captures are never donatable.
     donation_flags: Arc<[bool]>,
 
-    /// Number of leading logical inputs supplied by the staged capture table, followed by the hidden arguments that
-    /// carry [`Self::session_constants`].
+    /// Number of leading logical inputs supplied by the staged capture table and [`Self::session_constants`].
     capture_count: usize,
 
-    /// Session constants of the lowered program, whose arrays the trailing [`Self::session_constants`]`.len()` of the
-    /// [`Self::capture_count`] capture arguments carry, in order.
-    session_constants: Arc<[RetainedArray]>,
-
-    /// Session constant of the program before lowering that each of [`Self::session_constants`] carries, in order,
-    /// which is that constant itself or the placement of that constant where the executable receives it (refer to
-    /// `placed_constant`). This is how a caller that holds the constants of the program it lowered (e.g., the eager
-    /// dispatch of an application, refer to `Session::bind`) learns which of them each hidden argument carries without
-    /// searching the placements of its constants.
-    session_constant_sources: Arc<[RetainedArray]>,
+    /// Binding for each session constant of the program in hidden argument order, following the staged capture table.
+    session_constants: Arc<[SessionConstantBinding]>,
 
     /// Effective sharding expected for every physical executable argument, including materialized captures first.
     expected_argument_shardings: Arc<[Sharding]>,
@@ -138,7 +156,7 @@ impl LoweredProgram {
     ///   - `reference_states`: External reference states of the program.
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
-    ///   - `session_constants`: Session constants whose arrays every execution passes as captures.
+    ///   - `session_constants`: Bindings of session constants to the arrays that execution passes as captures.
     ///   - `expected_argument_shardings`: Sharding that each physical argument must have at the call boundary.
     ///   - `output_shardings`: Declared sharding of each output.
     ///   - `open_outputs`: Whether the compiler chooses the placement of each output over auto mesh axes.
@@ -156,7 +174,7 @@ impl LoweredProgram {
         reference_states: Arc<[ExternalReferenceBinding]>,
         donation_flags: Arc<[bool]>,
         capture_count: usize,
-        session_constants: Arc<[RetainedArray]>,
+        session_constants: Arc<[SessionConstantBinding]>,
         expected_argument_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
         open_outputs: Arc<[bool]>,
@@ -178,7 +196,6 @@ impl LoweredProgram {
             requires_assertion_handler,
             donation_flags,
             capture_count,
-            session_constant_sources: session_constants.clone(),
             session_constants,
             expected_argument_shardings,
             output_shardings,
@@ -207,25 +224,6 @@ impl LoweredProgram {
             .fdo_profile = profile.bytes().to_vec();
         self.compilation_options.profile_version = profile.version();
         self
-    }
-
-    /// Returns this program with `sources` as the session constants of the program before lowering that its hidden
-    /// arguments carry (refer to [`Self::session_constant_sources`]), one for each of [`Self::session_constants`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `sources` does not have one constant for each hidden argument.
-    pub(crate) fn with_session_constant_sources(mut self, sources: Arc<[RetainedArray]>) -> Result<Self, Error> {
-        if sources.len() != self.session_constants.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "a lowered program with {} session constants cannot carry {} sources",
-                self.session_constants.len(),
-                sources.len(),
-            ))
-            .into());
-        }
-        self.session_constant_sources = sources;
-        Ok(self)
     }
 
     /// Returns this program with `stable_hlo` in place of its lowered module, for tests that compile a module which
@@ -276,19 +274,10 @@ impl LoweredProgram {
         &self.mesh
     }
 
-    /// Returns the handles of the session constants that the executable receives as hidden arguments after its
-    /// captures. The handles are shared so that callers can retain them without copying.
+    /// Returns the bindings of the session constants after the staged capture table, in hidden argument order.
     #[inline]
-    pub(crate) fn session_constants(&self) -> &Arc<[RetainedArray]> {
+    pub(crate) fn session_constants(&self) -> &[SessionConstantBinding] {
         &self.session_constants
-    }
-
-    /// Returns the session constant of the program before lowering that each of [`Self::session_constants`] carries,
-    /// in order, which is that constant itself or its placement where the executable receives it (refer to
-    /// `placed_constant`).
-    #[inline]
-    pub(crate) fn session_constant_sources(&self) -> &[RetainedArray] {
-        &self.session_constant_sources
     }
 
     /// Returns the effective PJRT compilation options that this program is compiled with.
