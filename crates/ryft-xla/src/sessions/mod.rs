@@ -31,12 +31,13 @@
 //! [`with_input_shardings`](crate::with_input_shardings) to the input types first if the options specify
 //! input sharding overrides.
 //!
-//! [`LoweredProgram`] contains StableHLO and the metadata needed for compilation. [`CompiledProgram`] contains the
-//! loaded executable and its invocation contract. These flat artifacts are distinct from the typed function handles
-//! in [`crate::compilation::functions`], which also retain input and output container structures. The session's
-//! [`CompilationCache`] coordinates artifact reuse, and [`CompilationKey`](crate::CompilationKey) records the
-//! exact computation and compilation configuration. [`CompilationAnalysis`](crate::CompilationAnalysis) and
-//! [`OptimizedProgram`](crate::OptimizedProgram) expose compiler diagnostics for a compiled program.
+//! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
+//! [`CompiledProgram`] contains the loaded executable and its invocation contract. These flat artifacts are distinct
+//! from the typed function handles in [`crate::compilation::functions`], which also retain input and output container
+//! structures. The session's [`CompilationCache`] coordinates artifact reuse, and
+//! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
+//! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
+//! expose compiler diagnostics for a compiled program.
 //!
 //! # Eager Execution
 //!
@@ -109,7 +110,7 @@ use ryft_core::{
     DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, EmptyRegionDriver,
     ImportingContext, InputRegionProvenance, InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext,
     NamedAxes, NamedAxis, NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement,
-    ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey, RegionRef, RegionRole, Sharding,
+    ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey, RegionRole, Sharding,
     SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform,
     TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation,
     decode_logical_bytes,
@@ -133,7 +134,7 @@ use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
     Array, ArrayShard, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
-    LowerableOperation, LoweredProgram, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
+    LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
 pub mod effects;
@@ -1035,10 +1036,36 @@ impl Context for Session {
             // to `captured_type`), so a session that runs on given devices (e.g., the session on which region replay
             // runs a callee on the devices of its call) receives it there.
             Constant::Session(constant) => match &self.mesh {
-                Some(mesh) if constant.r#type().sharding().is_none() => Ok(Value::Array(
-                    replayed_capture(self, &constant, mesh)
-                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?,
-                )),
+                Some(mesh) if constant.r#type().sharding().is_none() => placed_constant(self, &constant, mesh)
+                    .and_then(|placed| {
+                        // Reuse the placed capture for these devices, with the original capture's commitment. View
+                        // its buffers over the logical mesh of the call so replay can combine them with its values.
+                        let array = placed
+                            .as_ref()
+                            .unwrap_or(&constant)
+                            .to_array(self)?
+                            .with_committed(constant.is_committed());
+                        let runtime = array.sharding().clone();
+                        let unreduced_over_auto_axes = runtime
+                            .unreduced_axes()
+                            .iter()
+                            .any(|axis| runtime.mesh().axis_type(axis) == Some(MeshAxisType::Auto));
+
+                        // Leave a pending reduction over auto axes for the consuming operation to reject.
+                        if unreduced_over_auto_axes || array.mesh() == mesh {
+                            return Ok(array);
+                        }
+
+                        let sharding = if runtime.mesh().has_same_topology(mesh.logical_mesh()) {
+                            runtime.with_mesh(mesh.logical_mesh().clone())?
+                        } else {
+                            Sharding::replicated(mesh.logical_mesh().clone(), constant.r#type().rank())
+                        };
+
+                        array.reshard_on_devices(self, mesh, &sharding, false)
+                    })
+                    .map(Value::Array)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }),
                 _ => Ok(Value::Array(constant.to_array(self)?)),
             },
             Constant::Dimension(value) => Ok(Value::Dimension(Dimension::new(value, self.clone()))),
@@ -1193,8 +1220,68 @@ impl Context for Session {
         // Lowering passes the session constants of the lowered regions to the compiled program as hidden arguments,
         // which the arrays of `session_constants` supply. They are collected from the regions of this application and
         // not from a cached program, because a cached program may have been built from other handles of the same
-        // arrays.
-        let dispatch_regions = regions.regions().map(dispatch_region).collect::<Vec<_>>();
+        // arrays. Cache the metadata on each region. The dispatch key keeps storage-free identities so the cache
+        // cannot extend the lifetime of arrays captured by a function.
+        let dispatch_regions = regions
+            .regions()
+            .map(|region| {
+                let Ok(artifact) = region.transform::<DispatchRegionTransform, _, Infallible>((), |region, ()| {
+                    let mut seen = HashSet::new();
+                    let mut constants = Vec::<RetainedArray>::new();
+                    for region in region.computation_regions() {
+                        for atom in region.atoms() {
+                            if let Some(Constant::Session(constant)) = atom.as_constant()
+                                && seen.insert(constant)
+                            {
+                                constants.push(constant.clone());
+                            }
+                        }
+                    }
+                    let has_constants = region
+                        .contains_atom_in_closure(|atom| matches!(atom.as_constant(), Some(Constant::Session(_))));
+                    let key = if has_constants {
+                        let program = region.to_program();
+                        let regions = program
+                            .regions()
+                            .iter()
+                            .map(|region| {
+                                let atoms = region
+                                    .atoms()
+                                    .iter()
+                                    .map(|atom| match atom {
+                                        Atom::Constant(Constant::Session(constant)) => {
+                                            Atom::Constant(Constant::Session(constant.without_storage()))
+                                        }
+                                        atom => atom.clone(),
+                                    })
+                                    .collect();
+                                Region::new(
+                                    atoms,
+                                    region.input_ids().to_vec(),
+                                    region.output_ids().to_vec(),
+                                    region.instructions().to_vec(),
+                                )
+                            })
+                            .collect();
+
+                        // Equal constants preserve every invariant that the region satisfied.
+                        let program = FlatProgram::new(
+                            program.input_structure().clone(),
+                            program.output_structure().clone(),
+                            regions,
+                            program.entry(),
+                        )
+                        .unwrap();
+
+                        program.entry_region_ref().key()
+                    } else {
+                        region.key()
+                    };
+                    Ok(TransformArtifact::new(Vec::new(), DispatchRegion { key, constants: constants.into() }))
+                });
+                artifact.metadata().clone()
+            })
+            .collect::<Vec<_>>();
         let session_constants = dispatch_regions
             .iter()
             .enumerate()
@@ -1820,12 +1907,27 @@ impl Context for Session {
                             .compilation_cache()
                             .compile(self, &lowered)
                             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                        producer.insert(EagerDispatchEntry {
-                            program,
-                            constants: dispatch_constants(&lowered, &session_constants)?,
-                            mesh,
-                            outputs,
-                        })
+
+                        // Each hidden argument names its source constant. Record the first position of that constant
+                        // in the application so the cache can recover it at execution time.
+                        let mut slots = HashMap::with_capacity(session_constants.len());
+                        for (slot, constant) in session_constants.iter().enumerate() {
+                            slots.entry(constant).or_insert(slot);
+                        }
+                        let constants = lowered
+                            .session_constants()
+                            .iter()
+                            .map(|binding| {
+                                let source = binding.source();
+                                slots.get(source).copied().ok_or_else(|| {
+                                    ProgramError::MalformedProgram(format!(
+                                        "lowered session constant `{source}` comes from no session constant \
+                                         of the eager application",
+                                    ))
+                                })
+                            })
+                            .collect::<Result<_, _>>()?;
+                        producer.insert(EagerDispatchEntry { program, constants, mesh, outputs })
                     }
                 }
             }
@@ -2221,8 +2323,7 @@ impl SessionBuilder {
     }
 }
 
-// TODO(eaplatanios): Review from here.
-/// Key and session constants of a region attached to an eager application, as [`dispatch_region`] derives them.
+/// Key and session constants of a region attached to an eager application.
 #[derive(Clone, Debug, PartialEq)]
 struct DispatchRegion {
     /// Key of the region in the eager dispatch cache, whose session constants keep no storage alive (refer to
@@ -2234,7 +2335,7 @@ struct DispatchRegion {
     constants: Arc<[RetainedArray]>,
 }
 
-/// [`Transform`] marker under which [`dispatch_region`] retains the [`DispatchRegion`] of a region with it.
+/// [`Transform`] marker for the [`DispatchRegion`] cached with a region by [`Context::bind`].
 struct DispatchRegionTransform;
 
 impl Transform<Region<Constant, Operation>> for DispatchRegionTransform {
@@ -2242,128 +2343,6 @@ impl Transform<Region<Constant, Operation>> for DispatchRegionTransform {
     type Artifact = TransformArtifact<Constant, Operation, DispatchRegion>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 1;
-}
-
-/// Returns the key and the session constants of `region`, a region attached to an eager application, which depend on
-/// the region alone and so are derived once for each region and retained with it (e.g., once for the program of a
-/// compiled function that many eager calls call). A key holds its constants without storage, so that the eager
-/// dispatch cache never keeps the arrays that a function captures alive after the function and its programs are
-/// released, while it still matches exactly the applications whose regions hold those constants.
-fn dispatch_region(region: RegionRef<'_, Constant, Operation>) -> DispatchRegion {
-    let derive = |region: RegionRef<'_, Constant, Operation>| -> Result<_, Infallible> {
-        let mut seen = HashSet::new();
-        let mut constants = Vec::<RetainedArray>::new();
-        for region in region.computation_regions() {
-            for atom in region.atoms() {
-                if let Some(Constant::Session(constant)) = atom.as_constant()
-                    && seen.insert(constant)
-                {
-                    constants.push(constant.clone());
-                }
-            }
-        }
-        let has_constants =
-            region.contains_atom_in_closure(|atom| matches!(atom.as_constant(), Some(Constant::Session(_))));
-        let key = if has_constants {
-            let program = region.to_program();
-            let regions = program
-                .regions()
-                .iter()
-                .map(|region| {
-                    let atoms = region
-                        .atoms()
-                        .iter()
-                        .map(|atom| match atom {
-                            Atom::Constant(Constant::Session(constant)) => {
-                                Atom::Constant(Constant::Session(constant.without_storage()))
-                            }
-                            atom => atom.clone(),
-                        })
-                        .collect();
-                    Region::new(
-                        atoms,
-                        region.input_ids().to_vec(),
-                        region.output_ids().to_vec(),
-                        region.instructions().to_vec(),
-                    )
-                })
-                .collect();
-            // Replacing constants by equal constants keeps every program invariant that the region satisfied.
-            let program = FlatProgram::new(
-                program.input_structure().clone(),
-                program.output_structure().clone(),
-                regions,
-                program.entry(),
-            )
-            .unwrap();
-            program.entry_region_ref().key()
-        } else {
-            region.key()
-        };
-        Ok(TransformArtifact::new(Vec::new(), DispatchRegion { key, constants: constants.into() }))
-    };
-    let Ok(artifact) = region.transform::<DispatchRegionTransform, _, Infallible>((), |region, ()| derive(region));
-    artifact.metadata().clone()
-}
-
-/// Returns the position, among `constants` (the session constants of the regions of an eager application), of the
-/// constant that each hidden argument of `lowered` (the program that lowering gives the application) carries, which is
-/// what an [`EagerDispatchEntry`] holds. The lowered program names that constant for each of its hidden arguments
-/// (refer to [`LoweredProgram::session_constants`]), so each is found with one lookup in the application constants
-/// without placing anything. A constant that occurs in several regions takes the first of its positions.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when a hidden argument carries no constant of the application.
-fn dispatch_constants(lowered: &LoweredProgram, constants: &[RetainedArray]) -> Result<Arc<[usize]>, ProgramError> {
-    let mut slots = HashMap::with_capacity(constants.len());
-    for (slot, constant) in constants.iter().enumerate() {
-        slots.entry(constant).or_insert(slot);
-    }
-    lowered
-        .session_constants()
-        .iter()
-        .map(|binding| {
-            let source = binding.source();
-            slots.get(source).copied().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "lowered session constant `{source}` comes from no session constant of the eager application",
-                ))
-            })
-        })
-        .collect()
-}
-
-/// Returns `constant`, a capture of a compiled function whose type names no mesh, as an array of `session` on `mesh`,
-/// where the replay of the callee of a call on `mesh` combines it with values over the logical mesh of `mesh`. The
-/// capture is placed where an execution of the function on `mesh` receives it (refer to `placed_constant`), which keeps
-/// one placed copy for each retention and set of devices, and that placement is then viewed over the logical mesh of
-/// `mesh`, which shares its buffers. A capture with a pending reduction over auto mesh axes is left where it is, so
-/// that the operation that uses it rejects it.
-///
-/// # Errors
-///
-/// Returns the error of placing `constant`.
-fn replayed_capture(session: &Session, constant: &RetainedArray, mesh: &DeviceMesh) -> Result<Array, Error> {
-    // The callee commits nothing because of a capture, so the array takes the commitment of the constant, as the
-    // temporary handles of the lifted captures of a call do (refer to `JitCallOperation::eager_decision`), rather than
-    // that of its placement.
-    let placed = placed_constant(session, constant, mesh)?;
-    let array = placed.as_ref().unwrap_or(constant).to_array(session)?.with_committed(constant.is_committed());
-    let runtime = array.sharding().clone();
-    let unreduced_over_auto_axes = runtime
-        .unreduced_axes()
-        .iter()
-        .any(|axis| runtime.mesh().axis_type(axis) == Some(MeshAxisType::Auto));
-    if unreduced_over_auto_axes || array.mesh() == mesh {
-        return Ok(array);
-    }
-    let sharding = if runtime.mesh().has_same_topology(mesh.logical_mesh()) {
-        runtime.with_mesh(mesh.logical_mesh().clone())?
-    } else {
-        Sharding::replicated(mesh.logical_mesh().clone(), constant.r#type().rank())
-    };
-    array.reshard_on_devices(session, mesh, &sharding, false)
 }
 
 /// Marker of the devices that the placement requests of one attached region and its computation descendants name,
@@ -2378,8 +2357,6 @@ impl Transform<Region<Constant, Operation>> for RequestedPlacementMesh {
 
     const DEFAULT_CACHE_CAPACITY: usize = 1;
 }
-
-// TODO(eaplatanios): Review to here.
 
 /// Import path of [`ImportingContext`] through which a trace whose capture table holds constants rather
 /// than runtime values (i.e., one whose [`CapturingContext::Capture`] is [`Constant`], such as the body of a
@@ -2442,7 +2419,7 @@ struct EagerDispatchEntry {
     /// Compiled program of the eager application.
     program: Arc<CompiledProgram>,
 
-    /// Positions, among the session constants of the regions of the application (refer to [`dispatch_region`]), of
+    /// Positions, among the session constants of the regions of the application (refer to [`DispatchRegion`]), of
     /// the constants whose arrays, placed where the program receives them (refer to `placed_constant`), the compiled
     /// program receives as hidden arguments ahead of the array inputs of the application, in that order. Applications
     /// with equal keys have equal regions, so the same positions name their own constants, and the entry holds no
