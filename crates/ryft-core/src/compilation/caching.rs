@@ -2064,7 +2064,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             _options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
             let input_types = inputs.into_types();
@@ -2119,12 +2119,12 @@ mod tests {
             }
         }
 
-        fn artifact_exchange_leader(&self, _program: &TestLoweredProgram) -> usize {
-            self.exchange_leader
-        }
-
         fn persistent_cache_key(&self, key: &u8) -> Option<Vec<u8>> {
             self.persistent.then(|| vec![*key])
+        }
+
+        fn artifact_exchange_leader(&self, _program: &TestLoweredProgram) -> usize {
+            self.exchange_leader
         }
 
         fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {

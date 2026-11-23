@@ -59,7 +59,7 @@ use ryft_macros::Parameter;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
     ArrayType, Device, DeviceMesh, Dimension, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxisType, Placement,
-    Sharding, ShardingDimension, decode_logical_bytes,
+    Shape, Sharding, ShardingDimension, decode_logical_bytes,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -121,8 +121,9 @@ use crate::tracing::Tracer;
 ///     [`LogicalMesh::single_device`]), which is also the mesh that backends give such a value.
 ///   - A value without a tracked sharding stays without one.
 ///   - Without a memory, the output is in the default memory of the device (i.e., [`Memory::Device`]), so a value
-///     leaves any other memory (e.g., pinned host memory), as with JAX's eager `device_put` onto a device, and with
-///     a memory, it is in that memory (refer to [`Self::target_memory`]). This holds inside compiled functions too.
+///     leaves any other memory (e.g., pinned host memory), as with JAX's eager `device_put` onto another device or with
+///     `may_alias=False`, and with a memory, it is in that memory (refer to [`Self::target_memory`]). This holds inside
+///     compiled functions too.
 ///   - The output has no unreduced or reduced state. A completed reduction (i.e., a reduced axis of any size) leaves
 ///     the complete value on every device along its axis, and a pending reduction over mesh axes of size one has a
 ///     single contribution, so both are complete on one device. A pending reduction over a larger mesh axis (i.e., an
@@ -186,10 +187,11 @@ use crate::tracing::Tracer;
 /// describes each shard of the output (i.e., the buffer that one device holds), and the output declares no layout
 /// otherwise (e.g., the strides of a column shard of a matrix that a device target gathers into one whole shard), so
 /// that backends store it in their default layout. An omitted memory or layout of a source states nothing about it. A
-/// target layout must address the shape of the input. The rules of other operations that move values between memories
-/// (e.g., the dynamic padding of arrays, which moves an offset into the memory of the padded array) keep using
-/// [`TransferToMemoryOperation`](crate::TransferToMemoryOperation), which changes only the memory of its inputs,
-/// without the copy policy and the source of a placement.
+/// target layout must address the shape of each shard of the output (i.e., of each destination shard), not the shape of
+/// the whole input. The rules of other operations that move values between memories (e.g., the dynamic padding of
+/// arrays, which moves an offset into the memory of the padded array) keep using
+/// [`TransferToMemoryOperation`](crate::TransferToMemoryOperation), which changes
+/// only the memory of its inputs, without the copy policy and the source of a placement.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum PlacementRequest {
     /// Resolved [`Placement`] (i.e., a device mesh, a sharding over it, and optionally a memory and a layout).
@@ -253,8 +255,10 @@ impl PlacementRequest {
 
     /// Returns the [`Memory`] space that this request selects as the target of a placement, or [`None`] if the output
     /// keeps the memory of the value. A [`PlacementRequest::Device`] without a memory selects the default memory of its
-    /// device (i.e., [`Memory::Device`]), as JAX's eager `device_put` does for a bare device, so that it moves a value
-    /// out of any other memory (e.g., pinned host memory). Every other form selects the memory that it names. This is
+    /// device (i.e., [`Memory::Device`]), so that it moves a value out of any other memory (e.g., pinned host memory).
+    /// JAX's eager `device_put` does the same for a bare device that is another device than the one of the value, or
+    /// with `may_alias=False`, whereas on CPU it rejects a move to the same device under the default aliasing policy
+    /// with a memory kind error. Every other form selects the memory that it names. This is
     /// the one owner of that rule, which the type rule of [`PlaceOperation`] and the backends that execute a placement
     /// share.
     #[inline]
@@ -800,21 +804,7 @@ impl PlaceOperation {
                     )));
                 }
 
-                // The layout addresses the shards of the input, which its concrete sharding determines when it is
-                // known, and the sharding that its type tracks otherwise (which omits the auto axes along which the
-                // input may also be split, so it determines no shards over a mesh with an auto axis larger than one).
-                // The split that a placement source describes along auto axes is a hint, like its devices, so it only
-                // describes the shards of an input whose type tracks no sharding, and never makes a layout pass or fail
-                // for a split that the input does not have.
-                let (sharding, is_complete) = match (known_sharding, source.placement()) {
-                    (Some(sharding), _) => (Some(sharding), is_known_complete),
-                    (None, Some(placement)) => (Some(placement.sharding()), true),
-                    (None, None) => (None, false),
-                };
-
-                input.validate_shard_layout(layout, sharding, is_complete).map_err(|error| {
-                    TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` source layout is invalid: {error}"))
-                })?;
+                Self::validate_source_shard_layout(input, concrete_sharding, source, layout)?;
             }
         }
 
@@ -880,7 +870,30 @@ impl PlaceOperation {
                     PlacementRequest::InPlace { .. } => (input.sharding(), false),
                     _ => (sharding, is_complete),
                 };
-                if output.validate_shard_layout(layout, sharding, is_complete).is_err() {
+
+                // The type promises the inherited layout only if it holds for every shape that the type admits. A
+                // strided layout that addresses the shards of some extent addresses those of every smaller one, so it
+                // is checked at the largest extent of each dimension variable, and a variable without an upper bound
+                // admits no largest extent, so the layout is never promised for it.
+                let largest_dimensions = output
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dimension::Dynamic(variable) => {
+                            variable.bounds().upper().map(|upper| Dimension::Static(upper - 1))
+                        }
+                        Dimension::Static(_) => Some(dimension.clone()),
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let holds = largest_dimensions.is_some_and(|dimensions| {
+                    output
+                        .clone()
+                        .with_shape(Shape::new(dimensions))
+                        .validate_shard_layout(layout, sharding, is_complete)
+                        .is_ok()
+                });
+                if !holds {
                     output = output.with_layout(None::<Layout>);
                 }
             }
@@ -896,14 +909,17 @@ impl PlaceOperation {
     /// splits each extent evenly as far as the type of the value can tell, which is exactly for a static extent and for
     /// at least one extent of each dimension variable that its bounds admit and that splits every dimension of that
     /// variable evenly at once), made with the concrete sharding of the value, so it is what a backend calls when it
-    /// executes this operation on a concrete value (e.g., when an eager context binds it), where the reduction state and
-    /// the shards of the value are known more precisely than its type records them.
+    /// executes this operation on a concrete value (e.g., when an eager context binds it), where the reduction state
+    /// and the shards of the value are known more precisely than its type records them. When the target splits a
+    /// dimension variable, its target layout and the layout that its source asserts are then also checked at the
+    /// smallest extent of each such variable that splits its dimensions evenly, because a strided layout that addresses
+    /// the shards of some extent addresses those of every smaller one, so that all checks decide with the same extent.
     ///
     /// # Errors
     ///
-    /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], and one for a target that
-    /// splits a static extent of the value unevenly or the dimensions of a dimension variable unevenly for every extent
-    /// that its bounds admit.
+    /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], one for a target that splits a
+    /// static extent of the value unevenly or the dimensions of a dimension variable unevenly for every extent that its
+    /// bounds admit, and one for a target layout that addresses the shards of no extent that splits evenly.
     pub fn infer_output_type_requiring_even_splits(
         &self,
         input: &ArrayType,
@@ -911,8 +927,65 @@ impl PlaceOperation {
     ) -> Result<ArrayType, TypeError> {
         let output =
             Self::infer_output_type_allowing_uneven_splits(input, concrete_sharding, self.target(), self.source())?;
-        Self::validate_even_splits(input, self.target())?;
+
+        let extents = Self::validate_even_splits(input, self.target())?;
+        if extents.is_empty() {
+            return Ok(output);
+        }
+
+        let at_extents = |r#type: &ArrayType| {
+            let dimensions = r#type.shape().dimensions().iter().map(|dimension| match dimension {
+                Dimension::Dynamic(variable) => match extents.iter().find(|(other, _)| other == variable) {
+                    Some(&(_, extent)) => Dimension::Static(extent),
+                    None => dimension.clone(),
+                },
+                Dimension::Static(_) => dimension.clone(),
+            });
+            r#type.clone().with_shape(Shape::new(dimensions.collect()))
+        };
+
+        // An asserted source layout must address the shards of the input at the same extents, so that the source and
+        // the target have a common legal shape.
+        if let Some(source) = self.source()
+            && let Some(layout) = source.layout()
+        {
+            Self::validate_source_shard_layout(&at_extents(input), concrete_sharding, source, layout)?;
+        }
+
+        if let Some(target) = self.target()
+            && let (Some(placement), Some(layout)) = (target.placement(), target.layout())
+        {
+            at_extents(&output)
+                .validate_shard_layout(layout, Some(placement.sharding()), true)
+                .map_err(|error| {
+                    TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
+                })?;
+        }
+
         Ok(output)
+    }
+
+    /// Validates that the `layout` that `source` asserts addresses the shards of a value of type `input`, which its
+    /// concrete sharding (i.e., `concrete_sharding`) determines when it is known, and the sharding that its type tracks
+    /// otherwise (which omits the auto axes along which the input may also be split, so it determines no shards over a
+    /// mesh with an auto axis larger than one). The split that a placement source describes along auto axes is a hint,
+    /// like its devices, so it only describes the shards of an input whose type tracks no sharding, and never makes a
+    /// layout pass or fail for a split that the input does not have.
+    fn validate_source_shard_layout(
+        input: &ArrayType,
+        concrete_sharding: Option<&Sharding>,
+        source: &PlacementRequest,
+        layout: &Layout,
+    ) -> Result<(), TypeError> {
+        let (sharding, is_complete) = match (concrete_sharding, input.sharding(), source.placement()) {
+            (Some(sharding), _, _) => (Some(sharding), true),
+            (None, Some(sharding), _) => (Some(sharding), false),
+            (None, None, Some(placement)) => (Some(placement.sharding()), true),
+            (None, None, None) => (None, false),
+        };
+        input
+            .validate_shard_layout(layout, sharding, is_complete)
+            .map_err(|error| TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` source layout is invalid: {error}")))
     }
 
     /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
@@ -1029,7 +1102,13 @@ impl PlaceOperation {
     /// variable admit. Bounds that admit no such extent (e.g., an extent of five to seven split into four shards, or an
     /// extent of two or three whose dimensions are split into two and into three shards) prove that the split cannot be
     /// even. Dimensions of distinct variables are independent. Only a [`Placement`] target partitions dimensions.
-    fn validate_even_splits(input: &ArrayType, target: Option<&PlacementRequest>) -> Result<(), TypeError> {
+    ///
+    /// Returns the smallest such extent of each dimension variable of a partitioned dimension, in the order in which
+    /// the variables first occur.
+    fn validate_even_splits(
+        input: &ArrayType,
+        target: Option<&PlacementRequest>,
+    ) -> Result<Vec<(DimensionVariable, usize)>, TypeError> {
         fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
             while right != 0 {
                 (left, right) = (right, left % right);
@@ -1048,7 +1127,7 @@ impl PlaceOperation {
         }
 
         let Some(target) = target.and_then(PlacementRequest::placement).map(Placement::sharding) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
 
         // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh, which fits
@@ -1081,6 +1160,7 @@ impl PlaceOperation {
             }
         }
 
+        let mut extents = Vec::new();
         for (dimension, extent, shard_count) in splits {
             match extent {
                 Dimension::Static(extent) if extent % shard_count != 0 => {
@@ -1108,7 +1188,7 @@ impl PlaceOperation {
                         .and_then(|multiple| bounds.lower().div_ceil(multiple).checked_mul(multiple))
                         .filter(|&extent| bounds.contains(extent));
                     match (extent, dimensions.as_slice()) {
-                        (Some(_), _) => {}
+                        (Some(extent), _) => extents.push((variable.clone(), extent)),
                         (None, [_]) => {
                             return Err(TypeError::invalid(format!(
                                 "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent \
@@ -1134,7 +1214,7 @@ impl PlaceOperation {
             }
         }
 
-        Ok(())
+        Ok(extents)
     }
 }
 
@@ -2064,10 +2144,10 @@ impl<P: PlacementRequestParameter, S: Parameterized<P>> PlacementSources<P, S> f
 ///
 /// A single value accepts its target followed by an optional source. A [`Parameterized`] receiver accepts placements
 /// with the same structure (i.e., the same ordered parameter paths and containers without children) and preserves its
-/// structure and static fields. The universe parameter `T` defaults to the [`Capability`] universe of a single-value
-/// receiver, which is [`ArrayType`] for homogeneous arrays and [`ArrayIrType`] for array IR values. The leaf parameter
-/// `P` defaults to `Self`, so single-value bounds can use `Place<T>`. A structured receiver implements `Place<T, P>`
-/// for the universe `T` of its leaves.
+/// structure and static fields. The leaf parameter `P` defaults to `Self`, so single-value bounds can use `Place`, and
+/// a structured receiver implements `Place<P>` for its leaf type `P`. The universe parameter `T` defaults to the leaf's
+/// [`Capability`] universe, which is [`ArrayType`] for homogeneous arrays and [`ArrayIrType`] for array IR values, and
+/// a structure uses the same universe as its leaves.
 ///
 /// # Examples
 ///
@@ -2095,7 +2175,7 @@ impl<P: PlacementRequestParameter, S: Parameterized<P>> PlacementSources<P, S> f
 /// # Ok(())
 /// # }
 /// ```
-pub trait Place<T = <Self as Capability>::Universe, P: Parameter + Capability = Self>: Sized {
+pub trait Place<P: Parameter + Capability = Self, T = <P as Capability>::Universe>: Sized {
     /// Places each leaf on its corresponding target. The targets form a tree of one element type that converts into a
     /// [`PlacementRequest`] (refer to [`PlacementRequestParameter`]), such as [`Placement`]s, [`PlacementRequest`]s of
     /// any form, [`Device`]s, or [`Memory`] spaces, or their [`Option`]s, whose [`None`] leaves the leaf where it is.
@@ -2122,7 +2202,9 @@ pub trait Place<T = <Self as Capability>::Universe, P: Parameter + Capability = 
         Self: Parameterized<P, Family: ParameterizedFamily<Target> + ParameterizedFamily<Source>>;
 }
 
-impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>, S: Parameterized<P>> Place<T, P>
+// Keep the structural bound on the function as putting it on the trait shadows the concrete leaf family in generic
+// `V: Value + Place` code, preventing its targets and sources from normalizing to single requests.
+impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>, S: Parameterized<P>> Place<P, T>
     for S
 {
     fn place<Target: PlacementRequestParameter, Source: PlacementRequestParameter>(
@@ -4386,6 +4468,105 @@ mod tests {
                  which divide no extent in that range evenly",
             )),
         );
+    }
+
+    #[test]
+    fn test_place_operation_type_inference_strided_layouts_of_dynamic_splits() {
+        let mesh = mesh_x();
+        let infer = |strides: Vec<isize>, dimensions: Vec<Dimension>| {
+            let target = placement(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
+                .with_layout(Layout::Strided(StridedLayout::new(strides)));
+            let input_type = ArrayType::new(DataType::F32, Shape::new(dimensions));
+            PlaceOperation::new(target, None)
+                .infer_output_types(std::slice::from_ref(&input_type), &[])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let overlapping = format!(
+            "`{PLACE_OPERATION_NAME}` target layout is invalid: strided layout stride 0 on axis 0 is smaller than the \
+             4-byte span occupied by more minor axes and may alias array elements",
+        );
+
+        // For `f32[n, n]` with `1 <= n < 3` whose columns are split in two, the extent one splits unevenly and the
+        // strides `[0, 4]` overlap the rows of the shards of the extent two, so the layout is checked at the extent two,
+        // the smallest that splits evenly, and rejected as it is for the static extent two.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(3)).unwrap());
+        let dynamic = vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)];
+        let static_two = vec![Dimension::Static(2), Dimension::Static(2)];
+        assert_eq!(infer(vec![0, 4], dynamic.clone()), Err(overlapping.clone()));
+        assert_eq!(infer(vec![0, 4], static_two.clone()), Err(overlapping));
+        assert_eq!(infer(vec![8, 4], dynamic), Ok(()));
+        assert_eq!(infer(vec![8, 4], static_two), Ok(()));
+    }
+
+    #[test]
+    fn test_place_operation_type_inference_inherited_layouts_of_dynamic_dimensions() {
+        // `f32[n, 2]` whose rows are split in two is replicated without a target layout. The staged output type keeps
+        // the inherited layout only if it addresses the replicated output at the largest extent that `n` admits, so
+        // that the output type of every concrete value refines it. Before, the strides `[4, 8]` were kept because they
+        // hold at the lower bound, although they overlap on the replicated output of four rows, which drops them.
+        let mesh = mesh_x();
+        let split = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated],
+        )
+        .unwrap();
+        let operation = PlaceOperation::new(placement(&mesh, vec![ShardingDimension::Replicated; 2]), None);
+        let infer = |strides: Vec<isize>, rows: Dimension| {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![rows, Dimension::Static(2)]))
+                .with_sharding(split.clone())
+                .unwrap()
+                .with_layout(Layout::Strided(StridedLayout::new(strides)));
+            operation.infer_output_type_requiring_even_splits(&input_type, None).unwrap()
+        };
+        let bounded = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(2, Some(5)).unwrap()));
+        let unbounded = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::at_least(2)));
+        for (strides, rows, keeps_layout) in [
+            (vec![4, 8], bounded.clone(), false),
+            (vec![4, 16], bounded.clone(), true),
+            (vec![4, 16], unbounded, false),
+        ] {
+            let staged = infer(strides.clone(), rows.clone());
+            assert_eq!(staged.layout().is_some(), keeps_layout, "{strides:?} {rows}");
+            if rows == bounded {
+                for extent in [2, 4] {
+                    let concrete = infer(strides.clone(), Dimension::Static(extent));
+                    assert!(staged.is_refined_by(&concrete), "{strides:?} {extent}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_place_operation_type_inference_source_layouts_of_dynamic_splits() {
+        // For unsharded `f32[n, n]` with `1 <= n < 3` whose rows are split in two, the extent one splits unevenly, so
+        // an asserted source layout is checked at the extent two, where the strides `[4, 0]` overlap, and rejected as
+        // it is for the static extent two. Before, it was checked at the extent one, where it holds, so staging
+        // accepted a placement that no extent admits.
+        let mesh = mesh_x();
+        let target = placement(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+        let infer = |strides: Vec<isize>, dimensions: Vec<Dimension>| {
+            let source =
+                PlacementRequest::InPlace { memory: None, layout: Some(Layout::Strided(StridedLayout::new(strides))) };
+            PlaceOperation::new(target.clone(), source)
+                .infer_output_type_requiring_even_splits(&ArrayType::new(DataType::F32, Shape::new(dimensions)), None)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(3)).unwrap());
+        let dynamic = vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)];
+        let static_two = vec![Dimension::Static(2), Dimension::Static(2)];
+        let concrete_error = infer(vec![4, 0], static_two.clone()).unwrap_err();
+        assert_eq!(
+            concrete_error,
+            format!(
+                "`{PLACE_OPERATION_NAME}` source layout is invalid: strided layout stride 0 on axis 1 is smaller than \
+                 the 4-byte span occupied by more minor axes and may alias array elements",
+            ),
+        );
+        assert_eq!(infer(vec![4, 0], dynamic.clone()), Err(concrete_error));
+        assert_eq!(infer(vec![8, 4], dynamic), Ok(()));
+        assert_eq!(infer(vec![8, 4], static_two), Ok(()));
     }
 
     #[test]
@@ -8619,7 +8800,7 @@ mod tests {
     #[test]
     fn test_place_structured() {
         /// Exercises a single-value caller that specifies its universe.
-        fn place_array<V: Value + Place<ArrayType>>(input: &V, target: &Placement) -> Result<V, ProgramError> {
+        fn place_array<V: Value + Place>(input: &V, target: &Placement) -> Result<V, ProgramError> {
             input.place(target, None)
         }
 
@@ -8665,7 +8846,7 @@ mod tests {
 
         // Structures without leaves place nothing.
         assert!(Vec::<Array>::new().place(&Vec::<Placement>::new(), None).unwrap().is_empty());
-        assert_eq!(<() as Place<ArrayType, Array>>::place::<Placement, _>(&(), &(), Some(&())), Ok(()));
+        assert_eq!(<() as Place<Array>>::place::<Placement, _>(&(), &(), Some(&())), Ok(()));
     }
 
     #[test]

@@ -1650,14 +1650,11 @@ where
         };
 
         let input_structure = inputs.parameter_structure();
-        let mut runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.apply_staged_input_types(&input_structure, runtime_input_types.iter_mut())?;
-
-        let mut runtime_inputs = inputs.parameters();
-        let (dispatch_key, effective_input_types, specialized_options) = C::dispatch_signature(
-            DispatchInputs::Values { values: &mut runtime_inputs, types: runtime_input_types },
-            &self.state.options,
-        )?;
+        let mut runtime_inputs =
+            inputs.parameters().map(|input| (input.r#type().into_owned(), input)).collect::<Vec<_>>();
+        self.apply_staged_input_types(&input_structure, runtime_inputs.iter_mut().map(|(r#type, _)| r#type))?;
+        let (dispatch_key, effective_input_types, specialized_options) =
+            C::dispatch_signature(DispatchInputs::Values(runtime_inputs), &self.state.options)?;
 
         // Backend normalization can share dispatch keys, but static values and container structures remain distinct.
         let key = ExecutableSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
@@ -1729,7 +1726,7 @@ where
         &self,
         static_parameters: Static,
         input_structure: Input::ParameterStructure,
-        inputs: DispatchInputs<'_, '_, C::Value>,
+        inputs: DispatchInputs<'_, C::Value>,
         scope: TracingScope,
     ) -> Result<StagedFunction<C, Input, Output>, C::Error>
     where
@@ -2207,7 +2204,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             _options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
             let input_types = inputs.into_types();
@@ -2333,7 +2330,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             _options: &(),
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
             // All dispatcher calls in this fixture use symbolic inputs from the enclosing trace.
@@ -2377,7 +2374,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             _options: &CarriedOptions,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
             let input_types = inputs.into_types();

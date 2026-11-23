@@ -341,7 +341,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
             let input_types = inputs.into_types();
@@ -479,7 +479,7 @@ mod tests {
         type Error = ProgramError;
 
         fn dispatch_signature(
-            inputs: DispatchInputs<'_, '_, Self::Value>,
+            inputs: DispatchInputs<'_, Self::Value>,
             _options: &CarriedOptions,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
             let input_types = inputs.into_types();
