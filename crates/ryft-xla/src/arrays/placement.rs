@@ -56,10 +56,10 @@ use half::{bf16, f16};
 use ryft_core::{
     Array as CoreArray, ArrayType, BatchingPolicy, BatchingTracer, Complex, Context, Device, DeviceMesh,
     DifferentiationPolicy, DifferentiationTracer, Dimension, LogicalMesh, PLACE_OPERATION_NAME, Parameter,
-    ParameterError, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placed,
-    Placement, PlacementRequest, PlacementRequestParameter, ProjectedValue, Shape, Sharding, ShardingDimension, Tracer,
-    TypeError, Typed, UnreducedKind, Value as CoreValue, decode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4,
-    f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    ParameterError, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placement,
+    PlacementRequest, PlacementRequestParameter, ProjectedValue, Shape, Sharding, ShardingDimension, Tracer, TypeError,
+    Typed, UnreducedKind, Value as CoreValue, decode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
+    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Error as PjrtError};
@@ -94,12 +94,14 @@ use crate::{Error, FromPjrt, Session, Value};
 /// # use ryft_xla::PlacementOptions;
 /// let options = PlacementOptions::defaults()
 ///     .with_donate((true, false))
-///     .with_may_alias((None, Some(false)));
+///     .with_may_alias((None::<bool>, Some(false)));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacementOptions<Target = PlacementRequest, Source = PlacementRequest, Donate = bool, MayAlias = bool> {
-    /// Destination placement tree prefix. When absent, host leaves are uploaded to the default local device without
-    /// being [committed](Array::is_committed) to it, and [`Array`] leaves and traced leaves preserve their current
+    /// Destination placement tree prefix. When absent, host leaves are uploaded to the first addressable
+    /// device of the client of the session, whether or not the session has a default mesh, without being
+    /// [committed](Array::is_committed) to it, as devices that this process chose on its own (refer to
+    /// [`Array::is_locally_assigned`]), and [`Array`] leaves and traced leaves preserve their current
     /// placement and commitment.
     target: Option<Target>,
 
@@ -305,7 +307,9 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
         let _ = (source, donate, may_alias);
         let client = session.client();
         // A value without a destination lives on the first device only because nothing chose any, so it is not
-        // committed to that device, and operations move it to the devices of their committed inputs.
+        // committed to that device, and operations move it to the devices of their committed inputs. The first device
+        // is that of the client whether or not the session has a default mesh, as `jax.device_put` keeps such a value
+        // on its default device under `jax.set_mesh`.
         let host = value.into_host_array();
         // A host array holds materialized storage, which only a type with static extents can describe.
         let shape = host.r#type().static_shape().unwrap().as_slice().to_vec();
@@ -418,7 +422,7 @@ impl Placeable for Array {
 
 impl<C: Context<Type = ArrayType>> Placeable for Tracer<C>
 where
-    Tracer<C>: Placed + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
+    Tracer<C>: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
 {
     type Output = Self;
 
@@ -438,7 +442,7 @@ where
 impl<C: Context<Type = ArrayType>> Placeable for PartialTracer<C>
 where
     PartialTracer<C>:
-        Placed + ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
+        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
 {
     type Output = Self;
 
@@ -457,9 +461,8 @@ where
 
 impl<C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>> Placeable for DifferentiationTracer<C, P>
 where
-    DifferentiationTracer<C, P>: Placed
-        + ConcreteArrays
-        + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
+    DifferentiationTracer<C, P>:
+        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
 {
     type Output = Self;
 
@@ -479,7 +482,7 @@ where
 impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C>> Placeable for BatchingTracer<C, P>
 where
     BatchingTracer<C, P>:
-        Placed + ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
+        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
 {
     type Output = Self;
 
@@ -498,9 +501,8 @@ where
 
 impl<V> Placeable for ProjectedValue<ArrayType, V>
 where
-    ProjectedValue<ArrayType, V>: Placed
-        + ConcreteArrays
-        + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
+    ProjectedValue<ArrayType, V>:
+        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
 {
     type Output = Self;
 
@@ -632,19 +634,21 @@ impl Session {
     /// matches, and so does a node whose static metadata differs from that of `x`. An input without leaves is returned
     /// as it is once its options are validated.
     ///
-    /// With no destination, a host leaf goes to the first addressable device and an existing [`Array`] leaf keeps
-    /// its current placement. Use [`Self::placement`] to put a sharding on the session's default mesh. As in
-    /// JAX, every [`Array`] that is placed with a destination is [committed](Array::is_committed) to its devices, an
-    /// [`Array`] leaf without a destination keeps its commitment, and a host leaf without a destination is uncommitted,
-    /// so operations with committed inputs on other devices move it to those devices. Every resulting [`Array`] belongs
-    /// to this session, including an [`Array`] leaf that keeps its placement, so an [`Array`] leaf of another PJRT
-    /// client is rejected. A traced leaf executes its placement with the session of the arrays that it wraps (e.g.,
-    /// the input of a function that is batched or differentiated at such arrays, including every primal, tangent,
-    /// and packed batch), which cannot be replaced by this session. A traced leaf whose arrays belong to another PJRT
-    /// client is therefore rejected in the same way as such an [`Array`] leaf, and one whose arrays belong to another
-    /// session of the same client is rejected with a [`ryft_pjrt::Error::InvalidArgument`] error. Other handles of
-    /// this session (e.g., one with another default mesh) are accepted, and the results of a traced leaf stay attached
-    /// to the handles of the arrays that it wraps.
+    /// With no destination, a host leaf goes to the first addressable device, whether or not this session has a
+    /// [default mesh](Self::device_mesh), as `jax.device_put` keeps a host value on its default device under
+    /// `jax.set_mesh`, and an existing [`Array`] leaf keeps its current placement. A destination that names only a
+    /// memory or a layout uploads a host leaf to the same device. Use [`Self::placement`] to put a sharding on the
+    /// session's default mesh. As in JAX, every [`Array`] that is placed with a destination is
+    /// [committed](Array::is_committed) to its devices, an [`Array`] leaf without a destination keeps its commitment,
+    /// and a host leaf without a destination is uncommitted, so operations with committed inputs on other devices move
+    /// it to those devices. Every resulting [`Array`] belongs to this session, including an [`Array`] leaf that keeps
+    /// its placement, so an [`Array`] leaf of another PJRT client is rejected. A traced leaf executes its placement
+    /// with the session of the arrays that it wraps (e.g., the input of a function that is batched or differentiated at such
+    /// arrays, including every primal, tangent, and packed batch), which cannot be replaced by this session. A traced
+    /// leaf whose arrays belong to another PJRT client is therefore rejected in the same way as such an [`Array`] leaf,
+    /// and one whose arrays belong to another session of the same client is rejected with a
+    /// [`ryft_pjrt::Error::InvalidArgument`] error. Other handles of this session (e.g., one with another default mesh)
+    /// are accepted, and the results of a traced leaf stay attached to the handles of the arrays that it wraps.
     ///
     /// A [`PlacementRequest::Device`] destination leaves every leaf wholly on that device, as its documentation
     /// describes for concrete and traced leaves alike. An [`Array`] leaf on a mesh of one device keeps its logical mesh
@@ -665,8 +669,8 @@ impl Session {
     /// another memory. Its results are committed like those of every other destination, as JAX commits the result of
     /// `device_put` onto a memory space, eagerly and inside `jit`.
     ///
-    /// Inside a batched function, the placement of a batch item (refer to [`Placed`]) records how its batch is
-    /// distributed. A destination or source that is such a [`Placement`] keeps that record (refer to
+    /// Inside a batched function, the placement of a batch item (refer to [`Placed`](ryft_core::Placed)) records how
+    /// its batch is distributed. A destination or source that is such a [`Placement`] keeps that record (refer to
     /// [`Placement::batch_shardings`]), so that placing a batch item on its own placement leaves every batch item
     /// on the devices that hold it.
     ///
@@ -695,9 +699,9 @@ impl Session {
     /// (i.e., its devices, sharding, memory, and layout are unchanged), as JAX's `device_put` does without a device.
     /// That placement records the provided source. Without one, it records where the value concretely lives wherever
     /// it executes on a value that lives somewhere (e.g., when a differentiated function is evaluated on concrete
-    /// arrays, refer to [`Placed`]). Reverse mode differentiation moves the cotangent back to that source. Such a
-    /// placement is staged for every traced leaf, including one without a concrete placement and without a source, so
-    /// that its copy policy applies wherever the staged program executes on concrete arrays.
+    /// arrays, refer to [`Placed`](ryft_core::Placed)). Reverse mode differentiation moves the cotangent back to that
+    /// source. Such a placement is staged for every traced leaf, including one without a concrete placement and
+    /// without a source, so that its copy policy applies wherever the staged program executes on concrete arrays.
     ///
     /// A placement inside a compiled function must target the device mesh that the function is compiled for (refer to
     /// [`LoweringError::PlacementOutsideProgramMesh`](crate::LoweringError::PlacementOutsideProgramMesh)), so a
@@ -719,9 +723,12 @@ impl Session {
     /// destination of the cotangent, so inside a compiled function a source that names devices follows the rule of a
     /// destination (i.e., a device source must be the only device of the mesh that the function is compiled for, and a
     /// mesh or sharding source must be over the devices of that mesh, in its order and with its topology). Inside a
-    /// manual region (e.g., a `shard_map` body), where no value can be moved, a source must not name devices at all, and
-    /// only a source that names a memory or a layout is accepted there, as is a destination that names only those. A
-    /// function whose reverse mode could not be compiled is therefore rejected when it is compiled, with
+    /// manual region (e.g., a `shard_map` body), where no value can be moved, a destination may name only a memory or a
+    /// layout, and so may a source, unless transposition leaves the cotangent where it lives (i.e., the placement has
+    /// no destination or an in-place one, and the leaf varies along the manual axes of the region or carries reduction
+    /// state over them, refer to [`PlaceOperation::transposes_in_place`]), in which case a source may also name
+    /// devices, because the cotangent is never moved to them. A function whose reverse mode could not be compiled is
+    /// therefore rejected when it is compiled, with
     /// [`LoweringError::UnsupportedOperation`](crate::LoweringError::UnsupportedOperation), whereas JAX elides the
     /// devices of a `device_put` source inside `jit` and accepts it.
     ///
@@ -746,9 +753,11 @@ impl Session {
     /// records its reduction state and its shards along auto mesh axes that its type omits, exactly as they are for a
     /// traced leaf that wraps a concrete array (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]),
     /// as it is given. A traced leaf that wraps a concrete array then completes a source that names only a memory or
-    /// a layout with the concrete placement of that array (refer to [`PlacementRequest::resolve_source`]), so that
-    /// transposition returns the cotangent to its devices. An expected layout must therefore address the shape of
-    /// each shard of the leaf as far as its runtime sharding (or, for a staged leaf, its type) determines its shards.
+    /// a layout with the concrete placement of that array, and a device source of an array on one device with that
+    /// placement moved onto the device (refer to [`PlacementRequest::resolve_source`]), so that transposition returns
+    /// the cotangent to its devices and sees its runtime reduction state. An expected layout must therefore address
+    /// the shape of each shard of the leaf as far as its runtime sharding (or, for a staged leaf, its type) determines
+    /// its shards.
     /// It must equal the layout that the type of the leaf declares, if any. The type rule is the only check of a
     /// source, so the physical layouts of the buffers of a leaf whose type declares no layout are not inspected.
     /// A target that restates a pending or completed reduction of an [`Array`] leaf over an auto axis (e.g., its own
@@ -1117,12 +1126,13 @@ fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(),
 /// rule of [`PlaceOperation`] owns what each request does to the
 /// type of `value`, so that the type of the result does not depend on whether `value` wraps a concrete array. Without
 /// a source, the rule of [`PlaceOperation`] that places a traced value that wraps a concrete array records the
-/// placement of that array (refer to [`Placed`]) as the source, so that reverse mode differentiation moves the
-/// cotangent back there, and it completes a source that names only a memory or a layout with that placement rather
-/// than replacing it (refer to [`PlacementRequest::resolve_source`]), so that such a source never loses the devices of
-/// the value. That rule validates the requests as they are given with the type rule first, so this function does not
-/// validate them itself. Without a target, the value is placed without one, which leaves it where it is, with the
-/// source if one is provided.
+/// placement of that array (refer to [`Placed`](ryft_core::Placed)) as the source, so that reverse mode
+/// differentiation moves the cotangent back there. It completes a source that names only a memory or a layout with
+/// that placement rather than replacing it, and a device source of an array on one device with that placement moved
+/// onto the device (refer to [`PlacementRequest::resolve_source`]), so that such a source never loses the devices or
+/// the runtime reduction state of the value. That rule validates the requests as they are given with the type rule
+/// first, so this function does not validate them itself. Without a target, the value is placed without one, which
+/// leaves it where it is, with the source if one is provided.
 ///
 /// With `may_alias` set to `Some(false)`, the placement forces a copy (refer to
 /// [`PlaceOperation::with_may_alias`]), also without a target and a source, so that its result shares no buffer with
@@ -1139,7 +1149,7 @@ fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(),
 /// [`ryft_pjrt::Error::InvalidArgument`] error. The devices of the resolved placements cannot reveal either, because
 /// device IDs are only unique within one client. Other handles of the same session (e.g., ones with another default
 /// mesh) are accepted, and the results stay attached to the handles of the wrapped arrays.
-fn place_traced<V: Placed + ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, V>>>(
+fn place_traced<V: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, V>>>(
     value: V,
     session: &Session,
     target: Option<PlacementRequest>,
@@ -1206,7 +1216,7 @@ mod tests {
     use ryft_core::{
         Add, BatchAxis, DataType, DeviceMesh, DifferentiableType, DimensionBounds, DimensionVariable,
         Error as CoreError, Exp, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Operation as CoreOperation,
-        ParameterError, Place, PlaceOperation, ProgramError, ShardMapOptions, Sharding, ShardingDimension,
+        ParameterError, Place, PlaceOperation, Placed, ProgramError, ShardMapOptions, Sharding, ShardingDimension,
         ShardingError, StridedLayout, TiledLayout, Typed, ValueProjection, batch, differentiate_at, shard_map,
     };
     use ryft_pjrt::BufferType;
@@ -1828,6 +1838,61 @@ mod tests {
         let [Value::Array(staged)] = staged.as_slice() else { panic!("placing an array must produce an array") };
         assert!(staged.is_locally_assigned());
         assert!(!session.place(local, PlacementOptions::to(device)).unwrap().is_locally_assigned());
+    }
+
+    #[test]
+    fn test_session_place_uploads_host_values_without_target_to_first_device_of_client() {
+        // A host value that `Session::place` uploads without a destination (or with one that names only its storage)
+        // goes to the first addressable device of the client, whether or not the session has a default mesh, and is a
+        // choice of this process alone (i.e., locally assigned), uncommitted without a destination. The default mesh of
+        // a session is the analogue of `jax.set_mesh`, under which JAX 0.12.0.1 keeps such a value on its default
+        // device, uncommitted, for a mesh of one device and of two (`(Explicit,) device_put:
+        // SingleDeviceSharding(device=CpuDevice(id=0)) False`), while eager results without array inputs go to the
+        // mesh, committed, as `Array::from_host_buffer` without a mesh does here. Uploading onto the default mesh would
+        // treat the value of each process (e.g., its own data batch) as one global value that every process supplied.
+        let client = cpu_client(2);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let single = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let session = Session::builder().client(client).build().unwrap();
+        let describe = |array: Array| {
+            let devices = array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
+            assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
+            let (committed, locally_assigned) = (array.is_committed(), array.is_locally_assigned());
+            format!("devices {devices:?}, committed {committed}, locally assigned {locally_assigned}")
+        };
+        let mut outcomes = Vec::new();
+        for (name, session) in [
+            ("no default mesh", session.clone()),
+            ("default mesh on CPU 1", session.with_device_mesh(DeviceMesh::new(single, vec![devices[1]]).unwrap())),
+            ("default mesh on both CPUs", session.with_device_mesh(domain_mesh(client, "x", 2))),
+        ] {
+            let placed = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::defaults());
+            let pinned = PlacementOptions::to(Memory::Host { pinned: true });
+            let in_place = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), pinned);
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            let uploaded = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.]));
+            outcomes.push(format!("{name}: place {}", describe(placed.unwrap())));
+            outcomes.push(format!("{name}: place in place {}", describe(in_place.unwrap())));
+            outcomes.push(format!("{name}: from_host_buffer {}", describe(uploaded.unwrap())));
+        }
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                no default mesh: place devices [0], committed false, locally assigned true
+                no default mesh: place in place devices [0], committed true, locally assigned true
+                no default mesh: from_host_buffer devices [0], committed false, locally assigned true
+                default mesh on CPU 1: place devices [0], committed false, locally assigned true
+                default mesh on CPU 1: place in place devices [0], committed true, locally assigned true
+                default mesh on CPU 1: from_host_buffer devices [1], committed true, locally assigned false
+                default mesh on both CPUs: place devices [0], committed false, locally assigned true
+                default mesh on both CPUs: place in place devices [0], committed true, locally assigned true
+                default mesh on both CPUs: from_host_buffer devices [0, 1], committed true, locally assigned false"},
+        );
     }
 
     #[test]
