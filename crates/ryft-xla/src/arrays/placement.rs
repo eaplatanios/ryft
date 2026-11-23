@@ -123,8 +123,6 @@ pub struct PlacementOptions<Target = PlacementRequest, Source = PlacementRequest
     may_alias: Option<MayAlias>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, MayAlias> {
     /// Creates a new [`PlacementOptions`].
     #[inline]
@@ -138,9 +136,8 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
     }
 
     /// Returns these options with the destination tree prefix replaced by `target`, which can have another type than
-    /// the current one. The type of each other option is kept, so this extends typed options such as
-    /// [`Self::defaults`] without naming the types of the unrelated options (e.g.,
-    /// `PlacementOptions::defaults().with_target(device)`).
+    /// the current one. The type of each other option is kept, so this extends typed options such as [`Self::defaults`]
+    /// without naming the types of the unrelated options (e.g., `PlacementOptions::defaults().with_target(device)`).
     #[inline]
     pub fn with_target<NewTarget>(self, target: NewTarget) -> PlacementOptions<NewTarget, Source, Donate, MayAlias> {
         PlacementOptions::new(Some(target), self.source, self.donate, self.may_alias)
@@ -154,8 +151,8 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
     }
 
     /// Returns these options with the donation tree prefix replaced by `donate`, which can have another type than the
-    /// current one. The type of each other option is kept, as in [`Self::with_target`] (e.g.,
-    /// `PlacementOptions::to(device).with_donate(true)`).
+    /// current one. The type of each other option is kept, as in [`Self::with_target`]
+    /// (e.g., `PlacementOptions::to(device).with_donate(true)`).
     #[inline]
     pub fn with_donate<NewDonate>(self, donate: NewDonate) -> PlacementOptions<Target, Source, NewDonate, MayAlias> {
         PlacementOptions::new(self.target, self.source, Some(donate), self.may_alias)
@@ -205,10 +202,13 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
 }
 
 impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Source, Donate, MayAlias> {
+    #[inline]
     fn default() -> Self {
         Self::new(None, None, None, None)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl PlacementOptions {
     /// Creates [`Session::place`] options with the standard prefix types and all fields unset. Use this when the
