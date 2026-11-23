@@ -218,25 +218,21 @@ impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Sour
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Leaf types accepted by [`Session::place`].
-///
-/// A [`Placeable`] consumes one input leaf and produces one [`Self::Output`] leaf. `ryft` provides implementations for
-/// runtime [`Array`] leaves, host scalars of the [`ArrayElement`](ryft_core::ArrayElement) types that are
-/// [`Parameter`]s, and host arrays of the reference backend ([`ryft_core::Array`]), which are uploaded as dense arrays
-/// whatever their host layout is, and all of which produce runtime [`Array`] leaves. [`HostOrArray`] holds either kind
-/// of these leaves, including scalars of the other element types (e.g., complex scalars), so that one tree can mix
-/// them. `ryft` also provides implementations for the traced values of `ryft-core` that can hold arrays of this backend
-/// (i.e., [`Tracer`], [`PartialTracer`], [`DifferentiationTracer`], [`BatchingTracer`], and [`ProjectedValue`] over
-/// [`ArrayType`], which covers [`CompileTracer`](crate::CompileTracer)), so that the same call works inside compiled
-/// functions, differentiation, and batching. A traced leaf stays traced and records its placement through the
-/// [`PlaceDispatch`] primitive of the [`Place`](ryft_core::Place) capability (i.e., by staging a
-/// [`PlaceOperation`] whose copy policy follows the `may_alias` option of the leaf), and
-/// without a destination, that operation has no target and leaves the leaf where it is. Those implementations require
-/// the values that the traced values wrap to be ones whose concrete arrays this crate can find (i.e., [`Array`]s,
-/// [`Value`]s, host arrays of the reference backend, and the traced values above), so that a traced leaf over arrays
-/// of another PJRT client or of another session can be rejected.
+/// Represents [`Parameter`] types accepted by [`Session::place`]. A [`Placeable`] consumes one input leaf and
+/// produces one [`Self::Output`] leaf. Ryft provides implementations for runtime [`Array`] leaves, host scalars of the
+/// [`ArrayElement`](ryft_core::ArrayElement) types that are [`Parameter`]s, and host arrays of the reference backend
+/// (i.e., [`ryft_core::Array`]), which are uploaded as dense arrays whatever their host layout is, and all of which
+/// produce runtime [`Array`] leaves. [`HostOrArray`] holds either kind of these leaves, including scalars of the other
+/// element types (e.g., complex scalars), so that one tree can mix them. Ryft also provides implementations for the
+/// traced values of `ryft-core` that can hold arrays of this backend (i.e., [`Tracer`], [`PartialTracer`],
+/// [`DifferentiationTracer`], [`BatchingTracer`], and [`ProjectedValue`] over [`ArrayType`], which covers
+/// [`CompileTracer`](crate::CompileTracer)), so that the same call works inside compiled functions, differentiation,
+/// and batching. A traced leaf stays traced and records its placement through the [`PlaceDispatch`] primitive of the
+/// [`Place`](ryft_core::Place) capability (i.e., by staging a [`PlaceOperation`] whose copy policy follows the
+/// `may_alias` option of the leaf), and without a destination, that operation has no target and leaves the leaf where
+/// it is. Those implementations require the values that the traced values wrap to be ones whose concrete arrays this
+/// crate can find (i.e., [`Array`]s, [`Value`]s, host arrays of the reference backend, and the traced values above),
+/// so that a traced leaf over arrays of another PJRT client or of another session can be rejected.
 ///
 /// [`Placeable::place`] is the per-leaf primitive of [`Session::place`], like
 /// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding. It takes the leaf as an
@@ -249,8 +245,8 @@ pub trait Placeable: Parameter {
 
     /// Places `value` using the provided leafwise placement options. [`Session::place`] checks the donation and
     /// aliasing options of every leaf before it places any leaf, so implementations can assume that `donate` is
-    /// `false` whenever `may_alias` is `Some(true)`. The rank of a sharding and other checks that depend on the leaf
-    /// are handled by the implementation of this function.
+    /// `false` whenever `may_alias` is `Some(true)`. The rank of a sharding and other checks that depend on the
+    /// leaf are handled by the implementation of this function.
     ///
     /// # Parameters
     ///
@@ -268,11 +264,11 @@ pub trait Placeable: Parameter {
     /// cannot be placed by `session` as requested. This covers a leaf whose arrays belong to another PJRT client than
     /// `session`, a traced leaf whose arrays belong to another session (refer to [`Session::place`] for the rules of
     /// concrete and traced leaves), a `target` or `source` that the type rule of [`PlaceOperation`] rejects for a
-    /// concrete leaf, except for an uneven
-    /// split (i.e., a [`TypeError`] of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement
-    /// that fails to execute or to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`]
-    /// reject for a traced leaf). The leaf is consumed either way, and [`Session::place`] returns the first error of
-    /// any leaf as its own, after the leaves before it were placed.
+    /// concrete leaf, except for an uneven split (i.e., a
+    /// [`TypeError`] of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement that fails to
+    /// execute or to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`] reject for a
+    /// traced leaf). The leaf is consumed either way, and [`Session::place`] returns the first error of any leaf as
+    /// its own, after the leaves before it were placed.
     fn place(
         value: Self,
         session: &Session,
@@ -282,6 +278,8 @@ pub trait Placeable: Parameter {
         may_alias: Option<bool>,
     ) -> Result<Self::Output, Error>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: IntoHostArray + Parameter> Placeable for T {
     type Output = Array;
