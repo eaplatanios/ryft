@@ -344,12 +344,11 @@ mod tests {
             inputs: DispatchInputs<'_, Self::Value>,
             options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
-            let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayType]> = match &options.staged_input_type {
-                Some(input_type) => input_types.iter().map(|_| input_type.clone()).collect(),
-                None => input_types.into(),
-            };
-            Ok((input_types.clone(), input_types, None))
+            let mut input_types = inputs.into_types();
+            if let Some(input_type) = &options.staged_input_type {
+                Arc::make_mut(&mut input_types).fill(input_type.clone());
+            }
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {
@@ -483,8 +482,7 @@ mod tests {
             _options: &CarriedOptions,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
             let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types, None))
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {

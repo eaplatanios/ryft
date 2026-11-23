@@ -59,7 +59,8 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::control_flow::{
-    RegionReferenceSource, refine_control_flow_output_types, validate_control_flow_output_identity_scope,
+    ControlFlowType, RegionReferenceSource, common_control_flow_signature, refine_control_flow_output_types,
+    retrace_control_flow_region, validate_control_flow_output_identity_scope,
     validate_control_flow_region_input_refinement,
 };
 use crate::operations::differentiation::stop_gradient::StopGradient;
@@ -112,7 +113,7 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// Transposing it with respect to such an input fails as well, because the input's cotangent differs across devices and
 /// its mesh sum would run inside the branches. As for a `while` loop with a varying predicate, keeping collectives out
 /// of branches that devices may take differently is the program's responsibility.
-pub trait ConditionType: ShardableType {
+pub trait ConditionType: ControlFlowType + ShardableType {
     /// Returns whether this type represents a valid scalar Boolean predicate for [`ConditionOperation`].
     fn is_condition_predicate(&self) -> bool;
 
@@ -457,8 +458,9 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         // the first branch does not prevent specializing its peer. The facts that the inputs establish do not include
         // metadata such as shardings, which only replay propagates, so a branch already specialized at the inputs can
         // carry metadata that its pending peer lacks (e.g., `f32[4]` replayed at a sharded input). The pending peer
-        // then only needs to be refined by the specialized branch, and the final inference of the specialized condition
-        // rejects branches that still disagree after both are replayed. Original branches must agree exactly.
+        // then only needs to be refined by the specialized branch or to join with it, and the final inference of the
+        // specialized condition rejects branches that still disagree after both are replayed. Original branches must
+        // declare equal inputs and outputs that join, like those of the condition itself.
         // `Operation::validate_region_interfaces` separately requires them to declare the same input types,
         // so exactly one branch declaring the requested input types identifies a partially reconciled pair.
         let refined_signatures = region_interfaces
@@ -498,21 +500,35 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
             _ => None,
         };
         if !refined_signatures.is_ok_and(|signatures| {
-            let (agree, signature) = match pending {
+            let (agree, outputs) = match pending {
                 Some((pending, specialized)) => {
                     let (declared_inputs, declared_outputs) = &signatures[pending];
                     let (actual_inputs, actual_outputs) = &signatures[specialized];
-                    let agree = [(declared_inputs, actual_inputs), (declared_outputs, actual_outputs)].into_iter().all(
-                        |(declared, actual)| {
-                            declared.len() == actual.len()
-                                && declared.iter().zip(actual).all(|(declared, actual)| declared.is_refined_by(actual))
-                        },
-                    );
-                    (agree, &signatures[specialized])
+                    let agree = declared_inputs.len() == actual_inputs.len()
+                        && declared_inputs
+                            .iter()
+                            .zip(actual_inputs)
+                            .all(|(declared, actual)| declared.is_refined_by(actual))
+                        && declared_outputs.len() == actual_outputs.len()
+                        && declared_outputs.iter().zip(actual_outputs).all(|(declared, actual)| {
+                            declared.is_refined_by(actual) || declared.join_for_control_flow(actual).is_some()
+                        });
+                    (agree, actual_outputs.clone())
                 }
-                None => (signatures[0] == signatures[1], &signatures[0]),
+                None => {
+                    let ((true_inputs, true_outputs), (false_inputs, false_outputs)) = (&signatures[0], &signatures[1]);
+                    let outputs = common_control_flow_signature(
+                        format_args!("`{CONDITION_OPERATION_NAME}` branch output"),
+                        true_outputs,
+                        false_outputs,
+                    );
+                    match outputs {
+                        Ok(outputs) => (true_inputs == false_inputs, outputs),
+                        Err(_) => (false, Vec::new()),
+                    }
+                }
             };
-            agree && signature.1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
+            agree && outputs.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
         }) {
             return Ok(vec![None, None]);
         }
@@ -553,21 +569,25 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
 
         // Which input a branch forwards to a reference output is only visible in its body, so reference outputs are
         // refined by the input facts like value outputs rather than taking the type of one input. Output-defined
-        // identities stay symbolic, rather than inheriting facts about the entering values. Compare the two refined
-        // output signatures before checking their variation.
+        // identities stay symbolic, rather than inheriting facts about the entering values. The two refined output
+        // signatures must join. The joined types are the output types, whose variation is checked last.
         let [true_output_types, false_output_types] = [true_interface, false_interface].map(|interface| {
             refine_control_flow_output_types(branch_input_types, &input_types[1..], interface.output_types(), |_| None)
         });
         let (true_output_types, false_output_types) = (true_output_types?, false_output_types?);
-        check_types!(@same, format!("`{CONDITION_OPERATION_NAME}` branch output"), [
-            true_output_types,
-            false_output_types,
-        ]);
-        for output_type in &true_output_types {
+        let output_types = common_control_flow_signature(
+            format_args!("`{CONDITION_OPERATION_NAME}` branch output"),
+            &true_output_types,
+            &false_output_types,
+        )?;
+
+        for output_type in &output_types {
             output_type.validate_condition_output(&input_types[0])?;
         }
-        validate_control_flow_output_identity_scope(CONDITION_OPERATION_NAME, input_types, &true_output_types)?;
-        Ok(true_output_types)
+
+        validate_control_flow_output_identity_scope(CONDITION_OPERATION_NAME, input_types, &output_types)?;
+
+        Ok(output_types)
     }
 
     #[inline]
@@ -1119,7 +1139,8 @@ where
         // specializing the attached regions alone validates only their input interfaces.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        let output_count = self.validate_application(&input_types, branches)?.len();
+        let output_types = self.validate_application(&input_types, branches)?;
+        let output_count = output_types.len();
 
         // Both branches receive the same live input tangents. Equal primal signatures and reference roots give them the
         // same tangent slots, including reference tangents, which cannot be padded with invented allocation state.
@@ -1311,7 +1332,7 @@ where
         check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
         let mut primal_outputs = outputs;
         let tangent_outputs = primal_outputs.split_off(output_count);
-        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &output_activity)
+        context.control_flow_dual_outputs(primal_outputs, tangent_outputs, &output_activity, output_types)
     }
 }
 
@@ -1516,13 +1537,18 @@ where
             transposed_inputs.extend(cotangents.references().iter().cloned());
             transposed_inputs.extend(residuals);
 
-            // The shared transposed-branch handles are attached directly, so repeated binds of one transposed branch
-            // intern by `Arc` identity instead of copying it again.
+            // The output cotangents have the cotangent types of the joined outputs of the condition, while each
+            // transposed branch declares the cotangents of its own outputs, which may differ from them in untracked
+            // placement. Retrace a branch at the cotangent types when they do not refine its declared inputs (refer
+            // to `retrace_transposed_branch`). Attach the other branches directly so repeated binds can intern their
+            // shared handles by `Arc` identity.
+            let transposed_input_types =
+                transposed_inputs[1..].iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let branch_cotangents = context.bind(
                 O::from(ConditionOperation::new()),
                 AttachedRegions::Callees(&[
-                    transposed_branches[0].program().clone(),
-                    transposed_branches[1].program().clone(),
+                    retrace_transposed_branch(transposed_branches[0].program(), &transposed_input_types)?,
+                    retrace_transposed_branch(transposed_branches[1].program(), &transposed_input_types)?,
                 ]),
                 transposed_inputs.as_slice(),
             )?;
@@ -2675,6 +2701,38 @@ fn merge_condition_edges<T: Type>(edges: [&[(T, usize)]; 2]) -> (Vec<T>, [Vec<us
     (slot_types, own_slots)
 }
 
+/// Returns the transposed condition branch `program` with input types that the actual inputs of types `input_types`
+/// refine. The output cotangents that a transposed branch receives have the cotangent types of the joined outputs of
+/// the condition. These types may omit a sharding that the branch's own outputs, and thus its declared cotangents,
+/// carry. Such a branch is traced again with the joined cotangent types (refer to [`retrace_control_flow_region`]),
+/// so that both transposed branches declare the same input types. A branch whose declared input types the actual
+/// input types already refine is returned unchanged.
+fn retrace_transposed_branch<V: Value, O: Operation<Type = V::Type>>(
+    program: &Arc<Program<V, O, Vec<V>, Vec<V>>>,
+    input_types: &[V::Type],
+) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    let declared_input_types = program.input_types();
+    if declared_input_types.len() != input_types.len()
+        || declared_input_types
+            .iter()
+            .zip(input_types)
+            .all(|(declared, actual)| declared.is_refined_by(actual))
+    {
+        return Ok(program.clone());
+    }
+
+    let retraced_input_types = declared_input_types
+        .iter()
+        .zip(input_types)
+        .map(|(declared, actual)| if declared.is_refined_by(actual) { declared.clone() } else { actual.clone() })
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(retrace_control_flow_region(program, retraced_input_types)?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -2690,14 +2748,14 @@ mod tests {
         DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
         MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::axes::NamedAxis;
+    use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, RecursiveBatchingDriver, batch};
     use crate::captures::{CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
-        DotsSavable, ForwardModeDifferentiate, LinearizationTracer, NothingSavable, ReverseModeDifferentiate,
-        TransposedProgram, differentiate_at,
+        Differentiate, DotsSavable, ForwardModeDifferentiate, LinearizationTracer, NothingSavable,
+        ReverseModeDifferentiate, TransposedProgram, differentiate_at,
     };
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::GuardOperation;
@@ -2733,9 +2791,9 @@ mod tests {
         ResidualProducer, ResidualRejection,
     };
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation, ReferenceAnalysisError,
-        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceSource, ReferenceType, ReferenceView,
-        RegionDriver, RegionRef, TypeError,
+        EffectClasses, ExternalReferenceBinding, ProgramBuilder, Provenance, ProvenanceScope, ReferenceAccessOperation,
+        ReferenceAnalysisError, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceSource, ReferenceType,
+        ReferenceView, RegionDriver, RegionRef, TypeError,
     };
     use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
@@ -4195,6 +4253,108 @@ mod tests {
             assert_eq!(
                 context.bind(operation, branches.clone(), &[Array::scalar(predicate).unwrap(), input]),
                 Err(ProgramError::Type(expected.clone())),
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_type_inference_joins_branch_outputs_that_differ_in_untracked_placement() {
+        // One branch returns a constant replicated on a mesh without explicit axes, and the other returns its input,
+        // whose type records no sharding. The outputs differ in placement that the types do not track, so they join to
+        // the type without a sharding whichever branch comes first. Inference, construction, tracing, and eager binding
+        // all accept the branches, and an eager condition returns the value of the selected branch.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let declared_type = ArrayType::scalar(DataType::F64);
+        let placed_type = declared_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(declared_type.clone());
+        let output = builder.add_constant(Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap());
+        let placed_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(declared_type.clone());
+        let identity_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let input_types = [predicate_type.clone(), declared_type.clone()];
+        let operation = ConditionOperation::new();
+        for (placed_first, branches) in [
+            (true, [placed_branch.clone(), identity_branch.clone()]),
+            (false, [identity_branch.clone(), placed_branch.clone()]),
+        ] {
+            let interfaces = branches.each_ref().map(|program| program.interface().clone());
+            assert_eq!(operation.infer_output_types(&input_types, &interfaces), Ok(vec![declared_type.clone()]));
+            assert_eq!(operation.infer_region_input_types(&input_types, &interfaces), Ok(vec![None, None]));
+
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let regions = branches.each_ref().map(|branch| builder.import_region(branch.entry_region_ref()));
+            let predicate = builder.add_input(predicate_type.clone());
+            let input = builder.add_input(declared_type.clone());
+            let outputs =
+                builder.add_instruction(operation, regions.to_vec(), vec![predicate, input], None).unwrap().to_vec();
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+            assert_eq!(program.output_types(), vec![declared_type.clone()]);
+
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let predicate = context.input(predicate_type.clone());
+            let input = context.input(declared_type.clone());
+            let traced = context.bind(operation, branches.clone(), &[predicate, input]).unwrap();
+            assert_eq!(traced[0].r#type().as_ref(), &declared_type);
+
+            let placed_output = Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap();
+            let input = Array::from_elements::<f64>(declared_type.clone(), &[1.0]).unwrap();
+            for predicate in [false, true] {
+                let expected = if predicate == placed_first { placed_output.clone() } else { input.clone() };
+                assert_eq!(
+                    EagerContext::<Array, ArrayOperation<Array>>::new().bind(
+                        operation,
+                        branches.clone(),
+                        &[Array::scalar(predicate).unwrap(), input.clone()],
+                    ),
+                    Ok(vec![expected]),
+                );
+            }
+        }
+        assert_eq!(
+            placed_branch.to_string(),
+            indoc! {"
+            lambda %0:f64[] .
+            let %1:f64[][sharding={mesh<['devices'=2:auto]>, []}] = const 2.0
+            in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_condition_type_inference_rejects_branch_outputs_that_do_not_join() {
+        // Branch outputs that differ in a placement that their types track (i.e., different shardings over a mesh with
+        // an explicit axis) do not join, so inference rejects them with the mismatch of the two signatures in either
+        // order and region input inference declines to specialize them.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F64, [2]);
+        let replicated_type = vector_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let split_type = vector_type
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let branch = |output_type: &ArrayType| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            builder.add_input(vector_type.clone());
+            let output = builder.add_constant(Array::from_elements::<f64>(output_type.clone(), &[1.0, 2.0]).unwrap());
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let input_types = [ArrayType::scalar(DataType::Boolean), vector_type.clone()];
+        for (true_type, false_type) in [(&replicated_type, &split_type), (&split_type, &replicated_type)] {
+            let interfaces = [branch(true_type), branch(false_type)].map(|program| program.interface().clone());
+            assert_eq!(
+                ConditionOperation::new().infer_output_types(&input_types, &interfaces),
+                Err(TypeError::invalid(format!(
+                    "`condition` branch output type signature mismatch: expected [{true_type}] but got [{false_type}]",
+                ))),
+            );
+            assert_eq!(
+                ConditionOperation::new().infer_region_input_types(&input_types, &interfaces),
+                Ok(vec![None, None]),
             );
         }
     }
@@ -7233,6 +7393,73 @@ mod tests {
             ]
             in (%2)"},
         );
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_joins_branch_outputs_that_differ_in_untracked_placement() {
+        // One branch returns a constant replicated on a mesh without explicit axes, and the other returns its input.
+        // A concrete predicate folds the selected branch, and an unknown predicate keeps both branches in a residual
+        // condition whose output has the joined type, in either branch order.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let placed_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let placed_output = Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(scalar_type.clone());
+        let output = builder.add_constant(placed_output.clone());
+        let placed_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let identity_branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let input = Array::scalar(1.0f64).unwrap();
+        for (placed_first, branches) in [
+            (true, vec![placed_branch.clone(), identity_branch.clone()]),
+            (false, vec![identity_branch.clone(), placed_branch.clone()]),
+        ] {
+            for predicate in [true, false] {
+                let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+                let predicate_tracer = context.lift(Array::scalar(predicate).unwrap()).unwrap();
+                let input_tracer = context.lift(input.clone()).unwrap();
+                let outputs = context
+                    .bind(ConditionOperation::new(), branches.clone(), &[predicate_tracer, input_tracer])
+                    .unwrap();
+                let PartialValue::Known(output) = outputs[0].value().unwrap().value() else {
+                    panic!("expected a known output")
+                };
+                assert_eq!(output, if predicate == placed_first { &placed_output } else { &input });
+            }
+
+            let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+            let predicate =
+                PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::Boolean), 0));
+            let input = PartialTracer::new(context.clone(), context.unknown_input(scalar_type.clone(), 1));
+            let outputs = context.bind(ConditionOperation::new(), branches.clone(), &[predicate, input]).unwrap();
+            let evaluation = finish_partial_evaluation(context, Vec::new(), outputs);
+            let placed = indoc! {"
+                {
+                        lambda %0:f64[] .
+                        let %1:f64[][sharding={mesh<['devices'=2:auto]>, []}] = const 2.0
+                        in (%1)
+                    }"};
+            let identity = indoc! {"
+                {
+                        lambda %0:f64[] .
+                        in (%0)
+                    }"};
+            let (true_branch, false_branch) = if placed_first { (placed, identity) } else { (identity, placed) };
+            assert_eq!(
+                evaluation.program.to_string(),
+                formatdoc! {"
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={true_branch},
+                        false={false_branch},
+                    ]
+                    in (%2)"},
+            );
+        }
     }
 
     #[test]
@@ -10579,6 +10806,63 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_batching_joins_branch_outputs_that_differ_in_untracked_placement() {
+        // One branch scales its input by a constant replicated on a mesh without explicit axes, which places its
+        // output, while the other scales it by an unplaced constant. A replicated predicate keeps one condition over
+        // the batched branches, whose outputs join, and a mapped predicate selects between the outputs of both
+        // branches per item, in either branch order.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let placed_scale_branch = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let factor = builder.add_constant(Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let input = Array::vector(vec![1.0, 4.0, 9.0]).unwrap();
+        for (placed_first, branches) in [
+            (true, [placed_scale_branch(), scalar_scale_branch(3.0)]),
+            (false, [scalar_scale_branch(3.0), placed_scale_branch()]),
+        ] {
+            let (placed, unplaced) = (vec![2.0, 8.0, 18.0], vec![3.0, 12.0, 27.0]);
+            for predicate in [true, false] {
+                let output = batch(
+                    |(predicate, input)| {
+                        let operation = ArrayOperation::Condition(ConditionOperation::new());
+                        Ok(input.context().bind(operation, branches.to_vec(), &[predicate, input.clone()])?.remove(0))
+                    },
+                    (Array::scalar(predicate).unwrap(), input.clone()),
+                    (BatchAxis::replicated(), BatchAxis::new(0)),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                let expected = if predicate == placed_first { &placed } else { &unplaced };
+                assert_eq!(output.elements::<f64>().unwrap(), *expected);
+            }
+            let predicates = Array::from_elements::<bool>(
+                ArrayType::new_static(DataType::Boolean, [3]),
+                &[placed_first, !placed_first, placed_first],
+            )
+            .unwrap();
+            let output = batch(
+                |(predicate, input)| {
+                    let operation = ArrayOperation::Condition(ConditionOperation::new());
+                    Ok(input.context().bind(operation, branches.to_vec(), &[predicate, input.clone()])?.remove(0))
+                },
+                (predicates, input.clone()),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.elements::<f64>().unwrap(), vec![2.0, 12.0, 18.0]);
+        }
+    }
+
+    #[test]
     fn test_condition_batching_compares_refined_branch_outputs() {
         // The batched branches compare their outputs after refinement by the batched inputs, whether the predicate is
         // replicated (and stays a condition) or mapped (and becomes a `select`): an `f64[2, 3]` input makes the
@@ -12647,6 +12931,195 @@ mod tests {
                     if message
                         == "`condition` branch output type signature mismatch: expected [f64[4]] but got [f64[3]]",
             ));
+        }
+    }
+
+    #[test]
+    fn test_condition_differentiation_joins_branch_outputs_that_differ_in_untracked_placement() {
+        // Like a device backend, this eager context executes known branches but leaves their predicates opaque to
+        // partial evaluation. That keeps the tangent condition staged even when the chosen primal branch is known.
+        #[derive(Clone)]
+        struct OpaquePredicateContext(EagerContext<Array, ArrayOperation<Array>>);
+
+        impl Domain for OpaquePredicateContext {
+            type Type = ArrayType;
+            type Value = Array;
+            type Constant = Array;
+            type Operation = ArrayOperation<Array>;
+        }
+
+        impl Context for OpaquePredicateContext {
+            fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
+                self.0.lift(constant)
+            }
+
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Array, Self::Operation>>>(
+                &self,
+                operation: O,
+                regions: R,
+                inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
+                self.0.bind(operation, regions, inputs)
+            }
+
+            fn is_eager(&self) -> bool {
+                true
+            }
+
+            fn provenance(&self) -> Provenance {
+                self.0.provenance()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+                self.0.invoke_with_provenance_origin(origin, function)
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+                self.0.invoke_with_provenance_scope(scope, function)
+            }
+        }
+
+        impl NamedAxes for OpaquePredicateContext {
+            fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+                self.0.named_axis(name)
+            }
+
+            fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+                self.0.named_axes()
+            }
+        }
+
+        impl MeshContext for OpaquePredicateContext {
+            fn default_mesh(&self) -> Option<LogicalMesh> {
+                self.0.default_mesh()
+            }
+        }
+
+        // One branch scales its input by a constant replicated on a mesh without explicit axes, which places its
+        // output, while the other scales it by an unplaced constant. Forward and reverse mode differentiate the joined
+        // condition in either branch order, and their derivatives agree with finite differences.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let placed_scale_branch = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let factor = builder.add_constant(Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        assert_eq!(placed_scale_branch().output_types(), vec![placed_type.clone()]);
+
+        // The forward derivative is the tangent of the selected branch's output, which keeps the placement of that
+        // output, while the reverse derivative is the cotangent of the unplaced input.
+        let placed = Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap();
+        let unplaced = Array::scalar(2.0f64).unwrap();
+        let scaled = Array::scalar(3.0f64).unwrap();
+        for (input, branches, expected_forward, expected_reverse) in [
+            (4.0, [placed_scale_branch(), scalar_scale_branch(3.0)], &placed, &unplaced),
+            (-4.0, [placed_scale_branch(), scalar_scale_branch(3.0)], &scaled, &scaled),
+            (4.0, [scalar_scale_branch(3.0), placed_scale_branch()], &scaled, &scaled),
+            (-4.0, [scalar_scale_branch(3.0), placed_scale_branch()], &placed, &unplaced),
+        ] {
+            let at = Array::scalar(input).unwrap();
+            let forward = differentiate_at(at.clone())
+                .jacobian_forward(|input| stage_runtime_predicate_condition(input, branches.clone()))
+                .unwrap();
+            let reverse = differentiate_at(at.clone())
+                .jacobian_reverse(|input| stage_runtime_predicate_condition(input, branches.clone()))
+                .unwrap();
+            assert_eq!(forward.into_values(), vec![expected_forward.clone()]);
+            assert_eq!(reverse.into_values(), vec![expected_reverse.clone()]);
+
+            // Linearization must carry the control-flow declaration through a consumer of the joined value.
+            let context = OpaquePredicateContext(EagerContext::new());
+            let (primal, pushforward) = context
+                .differentiate_at(at.clone())
+                .linearize(|input| Ok(-stage_runtime_predicate_condition(input, branches.clone())?))
+                .unwrap();
+            assert_eq!(primal.r#type(), expected_forward.r#type());
+            let declared_type = ArrayType::scalar(DataType::F64);
+            assert_eq!(pushforward.program().output_types(), vec![declared_type.clone()]);
+            assert_eq!(pushforward.apply(Array::scalar(1.0f64).unwrap()).unwrap(), -expected_forward.clone());
+            let (_, pullback) = context
+                .differentiate_at(at.clone())
+                .vjp(|input| Ok(-stage_runtime_predicate_condition(input, branches.clone())?))
+                .unwrap();
+            assert_eq!(pullback.linear_program().output_types(), vec![declared_type.clone()]);
+            let seed = Array::from_elements(primal.r#type().into_owned(), &[1.0f64]).unwrap();
+            let cotangent = pullback.apply(seed).unwrap();
+            assert_eq!(
+                Concretizable::<f64>::concretize(cotangent.as_value().unwrap()).unwrap(),
+                -Concretizable::<f64>::concretize(expected_reverse).unwrap(),
+            );
+
+            // Ordinary elementwise rules infer from the joined declaration. The nonlinear rules also use the joined
+            // primal as a saved coefficient or compute a coefficient from it.
+            let consumers = |input: LinearizationTracer<OpaquePredicateContext>| {
+                let joined = stage_runtime_predicate_condition(input.clone(), branches.clone())?;
+                Ok((joined.clone() + input, joined.clone() * joined.clone(), joined.sin()?))
+            };
+            let ((sum, square, sine), pushforward) = context.differentiate_at(at.clone()).linearize(consumers).unwrap();
+            let scale = Concretizable::<f64>::concretize(expected_forward).unwrap();
+            let joined = input * scale;
+            let derivatives = [scale + 1.0, 2.0 * joined * scale, joined.cos() * scale];
+            let concrete_type = expected_forward.r#type();
+            assert_eq!(pushforward.program().output_types(), vec![declared_type.clone(); 3]);
+
+            let (sum_tangent, square_tangent, sine_tangent) =
+                pushforward.apply(Array::scalar(1.0f64).unwrap()).unwrap();
+            for (value, expected) in [
+                (sum, joined + input),
+                (square, joined * joined),
+                (sine, joined.sin()),
+                (sum_tangent, derivatives[0]),
+                (square_tangent, derivatives[1]),
+                (sine_tangent, derivatives[2]),
+            ] {
+                assert_eq!(value.r#type(), concrete_type);
+                let actual = Concretizable::<f64>::concretize(&value).unwrap();
+                assert!((actual - expected).abs() < 1e-12, "expected {expected}, got {actual}");
+            }
+
+            // A public tangent that merely refines the staged input type still fails the tangent boundary.
+            assert!(matches!(
+                pushforward.apply(placed.clone()),
+                Err(ProgramError::MalformedProgram(message)) if message == format!(
+                    "pushforward tangent 0 has type {placed_type} but its primal boundary requires tangent type {declared_type}",
+                ),
+            ));
+
+            // The pullback accepts seeds at the concrete outputs' sharding even when its program uses the joined
+            // declaration. Seed each output independently to check every consumer's contribution.
+            let (_, pullback) = context.differentiate_at(at.clone()).vjp(consumers).unwrap();
+            assert_eq!(pullback.linear_program().output_types(), vec![declared_type.clone(); 3]);
+            let cotangent_type = concrete_type.cotangent().unwrap();
+            let one = Array::from_elements(cotangent_type.clone(), &[1.0f64]).unwrap();
+            let zero = Array::from_elements(cotangent_type.clone(), &[0.0f64]).unwrap();
+            let mismatched_type = if cotangent_type.sharding().is_some() { declared_type } else { placed_type.clone() };
+            let mismatched = Array::from_elements(mismatched_type.clone(), &[1.0f64]).unwrap();
+            let apply = |[sum, square, sine]: [Array; 3]| pullback.apply((sum, square, sine));
+            for (index, expected) in derivatives.into_iter().enumerate() {
+                let mut seeds = std::array::from_fn(|_| zero.clone());
+                seeds[index] = one.clone();
+                let cotangent = apply(seeds.clone()).unwrap();
+                let actual = Concretizable::<f64>::concretize(cotangent.as_value().unwrap()).unwrap();
+                assert!((actual - expected).abs() < 1e-12, "output {index}: expected {expected}, got {actual}");
+
+                seeds[index] = mismatched.clone();
+                assert!(matches!(
+                    apply(seeds),
+                    Err(ProgramError::MalformedProgram(message)) if message == format!(
+                        "pullback cotangent {index} has type {mismatched_type} but its primal boundary requires cotangent type {cotangent_type}",
+                    ),
+                ));
+            }
+            check_gradient!(
+                |input| stage_runtime_predicate_condition(input, branches.clone()),
+                at = at,
+                step = 1e-6,
+                tolerance = 1e-6,
+            );
         }
     }
 
@@ -15214,6 +15687,84 @@ mod tests {
             ]),
             Ok(vec![Array::scalar(30.0f64).unwrap(), Array::scalar(12.0f64).unwrap()]),
         );
+    }
+
+    #[test]
+    fn test_condition_transposition_joins_branch_outputs_that_differ_in_untracked_placement() {
+        // One branch scales its input by a constant replicated on a mesh without explicit axes, which places its
+        // output, while the other scales it by an unplaced constant. The output cotangent has the joined type, which
+        // records no sharding, so both transposed branches receive it at that type in either branch order.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let placed_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let scale_branch = |factor: Array| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let factor = builder.add_constant(factor);
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let placed_factor = Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap();
+        let unplaced_factor = Array::scalar(3.0f64).unwrap();
+        for (placed_first, factors) in
+            [(true, [placed_factor.clone(), unplaced_factor.clone()]), (false, [unplaced_factor, placed_factor])]
+        {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let branches = factors.map(|factor| builder.import_program(scale_branch(factor)));
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+            let input = builder.add_input(scalar_type.clone());
+            let outputs = builder
+                .add_instruction(ConditionOperation::new(), branches.to_vec(), vec![predicate, input], None)
+                .unwrap()
+                .to_vec();
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap();
+            assert_eq!(program.output_types(), vec![scalar_type.clone()]);
+
+            // Linearization gives the tangent and the cotangent the types of the joined output and of the input.
+            let linearization = program.linearize().unwrap();
+            assert_eq!(linearization.tangent().output_types(), vec![scalar_type.clone()]);
+            assert_eq!(linearization.pullback().unwrap().into_program().output_types(), vec![scalar_type.clone()]);
+
+            let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+            let placed_branch = indoc! {"
+                {
+                        lambda %0:f64[] .
+                        let %1:f64[][sharding={mesh<['devices'=2:auto]>, []}] = const 2.0
+                            %2:f64[][sharding={mesh<['devices'=2:auto]>, []}] = mul %1 %0
+                            %3:f64[] = broadcast [output_type=f64[], output_axes=[]] %2
+                        in (%3)
+                    }"};
+            let unplaced_branch = indoc! {"
+                {
+                        lambda %0:f64[] .
+                        let %1:f64[] = const 3.0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    }"};
+            let (true_branch, false_branch) =
+                if placed_first { (placed_branch, unplaced_branch) } else { (unplaced_branch, placed_branch) };
+            assert_eq!(
+                transposed.to_string(),
+                formatdoc! {"
+                    lambda %0:f64[], %1:bool[] .
+                    let %2:f64[] = condition %1 %0 [
+                        true={true_branch},
+                        false={false_branch},
+                    ]
+                    in (%2)"},
+            );
+            for predicate in [true, false] {
+                let expected = if predicate == placed_first { 10.0 } else { 15.0 };
+                assert_eq!(
+                    transposed
+                        .interpret(vec![Array::scalar(5.0f64).unwrap(), Array::scalar(predicate).unwrap()])
+                        .map(|outputs| outputs[0].elements::<f64>().unwrap()),
+                    Ok(vec![expected]),
+                );
+            }
+        }
     }
 
     #[test]

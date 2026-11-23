@@ -2068,8 +2068,7 @@ mod tests {
             _options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), Self::Error> {
             let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types, None))
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error> {

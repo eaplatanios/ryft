@@ -2208,8 +2208,7 @@ mod tests {
             _options: &Self::Options,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>, Option<Self::Options>), Self::Error> {
             let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayIrType]> = input_types.into();
-            Ok((input_types.clone(), input_types, None))
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, ProgramError> {
@@ -2269,6 +2268,18 @@ mod tests {
             "call"
         }
 
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("callee")] }
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ArrayType],
+            region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(region_interfaces[0].output_types().to_vec())
+        }
+
         fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
             let operation_formatter = OperationFormatter::new(formatter, indentation, self.name())?;
             match self.marker {
@@ -2281,18 +2292,6 @@ mod tests {
                 }),
                 None => Ok(()),
             }
-        }
-
-        fn region_slots(&self) -> &'static [RegionSlot] {
-            const { &[RegionSlot::computation("callee")] }
-        }
-
-        fn infer_output_types(
-            &self,
-            _input_types: &[ArrayType],
-            region_interfaces: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            Ok(region_interfaces[0].output_types().to_vec())
         }
     }
 
@@ -2336,8 +2335,7 @@ mod tests {
             // All dispatcher calls in this fixture use symbolic inputs from the enclosing trace.
             assert!(matches!(&inputs, DispatchInputs::Call(inputs) if inputs.iter().all(|(_, value)| value.is_none())));
             let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types, None))
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {
@@ -2378,8 +2376,7 @@ mod tests {
             _options: &CarriedOptions,
         ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>, Option<Self::Options>), ProgramError> {
             let input_types = inputs.into_types();
-            let input_types: Arc<[ArrayType]> = input_types.into();
-            Ok((input_types.clone(), input_types, None))
+            Ok((Arc::clone(&input_types), input_types, None))
         }
 
         fn call_operation(

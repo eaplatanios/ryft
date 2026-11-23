@@ -30,10 +30,10 @@ pub enum DispatchInputs<'v, V: Value + 'v> {
 }
 
 impl<V: Value> DispatchInputs<'_, V> {
-    /// Consumes this request and returns its effective input types, discarding any runtime value borrows.
-    /// Backends whose dispatch policies depend only on types can use this function for every request.
+    /// Consumes this request and returns its effective input types in a shared slice, discarding runtime value
+    /// borrows. Backends that key dispatch by these types can share the slice with the key.
     #[inline]
-    pub fn into_types(self) -> Vec<V::Type> {
+    pub fn into_types(self) -> Arc<[V::Type]> {
         match self {
             Self::Call(inputs) => inputs.into_iter().map(|(r#type, _)| r#type).collect(),
             Self::Values(inputs) => inputs.into_iter().map(|(r#type, _)| r#type).collect(),
@@ -601,13 +601,15 @@ mod tests {
                 DimensionBounds::new(0, Some(5)).unwrap(),
             ))]),
         );
-        assert_eq!(DispatchInputs::<Array>::Call(vec![(declared.clone(), None)]).into_types(), vec![declared.clone()]);
+        let declared_types: Arc<[_]> = [declared.clone()].into();
+        assert_eq!(DispatchInputs::<Array>::Call(vec![(declared.clone(), None)]).into_types(), declared_types);
 
-        // Runtime dispatch retains the validated declaration rather than re-extracting a concrete extent of 2.
-        assert_eq!(DispatchInputs::Values(vec![(declared.clone(), &input)]).into_types(), vec![declared]);
+        // Runtime dispatch preserves the validated symbolic declaration for a concrete input of extent 2.
+        assert_eq!(DispatchInputs::Values(vec![(declared, &input)]).into_types(), declared_types);
 
-        assert_eq!(DispatchInputs::<Array>::Call(Vec::new()).into_types(), Vec::<ArrayType>::new());
-        assert_eq!(DispatchInputs::<Array>::Values(Vec::new()).into_types(), Vec::<ArrayType>::new());
+        let empty_types: Arc<[ArrayType]> = [].into();
+        assert_eq!(DispatchInputs::<Array>::Call(Vec::new()).into_types(), empty_types);
+        assert_eq!(DispatchInputs::<Array>::Values(Vec::new()).into_types(), empty_types);
     }
 
     #[test]

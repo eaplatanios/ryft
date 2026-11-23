@@ -70,21 +70,22 @@
 use std::fmt::Display;
 use std::ops::Range;
 
-use crate::arrays::{ArrayIrType, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayType, MeshAxisType};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::Context;
+use crate::contexts::{Context, StagingContext};
 use crate::macros::check_count;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::programs::{
-    Operation, ProgramError, ReferenceId, ReferenceRoot, RegionRef, Type, TypeError, TypeIdentityPosition,
+    Operation, Program, ProgramError, ReferenceId, ReferenceRoot, RegionRef, Type, TypeError, TypeIdentityPosition,
     TypeRefinements, Value,
 };
+use crate::tracing::{Tracer, TracingContext};
 
 pub mod condition;
 pub mod scan;
@@ -97,6 +98,52 @@ pub use scan::{
 };
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions, WhilePredicate, WhileType, r#while};
+
+/// Type-family policy for selecting a common result or carry type at a control-flow boundary. The default requires
+/// exact equality. The array families can forget sharding when the types agree on every other component and control
+/// flow permits the difference in placement. The selected type must be independent of input order and both types must
+/// refine it. Distinct reference and dimension types keep the equality rule.
+pub trait ControlFlowType: Type {
+    /// Returns the common result or carry declaration for `self` and `other`, if control flow accepts the pair.
+    #[inline]
+    fn join_for_control_flow(&self, other: &Self) -> Option<Self> {
+        (self == other).then(|| self.clone())
+    }
+}
+
+impl ControlFlowType for ArrayType {
+    fn join_for_control_flow(&self, other: &Self) -> Option<Self> {
+        if self == other {
+            return Some(self.clone());
+        }
+
+        // JAX compares two recorded shardings when either mesh has an explicit axis. Keep that requirement even
+        // when dropping both shardings would otherwise produce a common supertype.
+        if let (Some(left), Some(right)) = (self.sharding(), other.sharding())
+            && [left, right]
+                .iter()
+                .any(|sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit))
+        {
+            return None;
+        }
+
+        let common = self.clone().with_sharding(None).ok()?;
+        let unsharded_other = other.clone().with_sharding(None).ok()?;
+
+        // Equality of the candidates keeps shape, data type, layout, and memory exact. Refinement also checks that
+        // removing the sharding preserves manual variation and reduction state.
+        (common == unsharded_other && common.is_refined_by(self) && common.is_refined_by(other)).then_some(common)
+    }
+}
+
+impl ControlFlowType for ArrayIrType {
+    fn join_for_control_flow(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Array(left), Self::Array(right)) => left.join_for_control_flow(right).map(Self::Array),
+            _ => (self == other).then(|| self.clone()),
+        }
+    }
+}
 
 /// Operations that convert loop residuals to and from their array storage representation. When partial evaluation
 /// or differentiation splits a loop body, the later computation may need values produced by the earlier computation.
@@ -603,6 +650,75 @@ pub(crate) fn stabilize_loop_carry_batch_axes<C: Context, P: BatchingPolicy<C>, 
     Ok(None)
 }
 
+/// Returns the common control-flow declaration for each position of two signatures.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] when the signatures differ in length or have a pair without a common declaration.
+fn common_control_flow_signature<D: Display, T: ControlFlowType>(
+    descriptor: D,
+    expected: &[T],
+    actual: &[T],
+) -> Result<Vec<T>, TypeError> {
+    if expected.len() == actual.len()
+        && let Some(common) = expected
+            .iter()
+            .zip(actual)
+            .map(|(left, right)| left.join_for_control_flow(right))
+            .collect::<Option<Vec<_>>>()
+    {
+        return Ok(common);
+    }
+
+    Err(TypeError::invalid(format!(
+        "{} type signature mismatch: expected [{}] but got [{}]",
+        descriptor,
+        expected.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        actual.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+    )))
+}
+
+/// Traces the attached control flow region `program` again at the input types `input_types`, replaying each of its
+/// instructions so that every instruction infers its output types from those input types rather than from the input
+/// types that `program` declares. Transformation rules use this when the values that will enter a region they built
+/// have types that its declared input types are not refined by, but that join with them. For example, a condition
+/// receives cotangents of its joined output types, while each transposed branch declares cotangents of its own outputs.
+/// The caller must verify that the types join before replay, which skips region-entry validation.
+fn retrace_control_flow_region<V: Value, O: Operation<Type = V::Type>>(
+    program: &Program<V, O, Vec<V>, Vec<V>>,
+    input_types: Vec<V::Type>,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    // A region without inputs has no input types to retrace it at.
+    if input_types.is_empty() {
+        return Ok(program.clone());
+    }
+
+    let region = program.entry_region_ref();
+    let (_, retraced) = TracingContext::<V, O>::trace(
+        |inputs: Vec<Tracer<TracingContext<V, O>>>| {
+            let context = inputs[0].context().clone();
+            region.interpret_with::<_, ProgramError, _, _>(
+                inputs,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, inputs| {
+                    let regions = instruction
+                        .regions()
+                        .iter()
+                        .map(|region_id| region.with_id(*region_id).map(RegionRef::to_program))
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+                    context.bind(instruction.operation().clone(), regions, inputs)
+                },
+            )
+        },
+        input_types,
+    )?;
+
+    Ok(retraced)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -615,7 +731,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout,
     };
     use crate::axes::Axis;
     use crate::batching::{
@@ -632,14 +749,14 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{
         Atom, AttachedRegions, InstructionId, Operation, Program, ProgramBuilder, ProgramError, ReferenceAnalysisError,
-        ReferenceId, ReferenceRoot, ReferenceType, Region, RegionDriver, RegionId, RegionLiveness, RegionRef,
+        ReferenceId, ReferenceRoot, ReferenceType, Region, RegionDriver, RegionId, RegionLiveness, RegionRef, Type,
         TypeError, Typed, TypedProgram, Value, ValueDirectDispatch, ValueId,
     };
     use crate::tracing::TracingContext;
 
     use super::{
-        CONDITION_OPERATION_NAME, RegionReferenceSource, ResidualStorageOperation, SCAN_OPERATION_NAME,
-        WHILE_OPERATION_NAME, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
+        CONDITION_OPERATION_NAME, ControlFlowType, RegionReferenceSource, ResidualStorageOperation,
+        SCAN_OPERATION_NAME, WHILE_OPERATION_NAME, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
         refine_control_flow_output_types, stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
         validate_control_flow_region_input_refinement, validate_loop_reference_carry_batch_axis,
         validate_loop_reference_carry_roots,
@@ -820,6 +937,112 @@ mod tests {
         ) -> Result<P::Batch, BatchingError> {
             P::align_batch_axis(context, batch, axis)
         }
+    }
+
+    #[test]
+    fn test_array_type_join_for_control_flow() {
+        let plain = ArrayType::new_static(DataType::F32, [4]);
+        let with = |sharding: Sharding| plain.clone().with_sharding(sharding).unwrap();
+        let auto = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let other_auto = LogicalMesh::new(vec![MeshAxis::new("b", 4, MeshAxisType::Auto).unwrap()]).unwrap();
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let manual = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let auto_replicated = with(Sharding::replicated(auto, 1));
+        let other_auto_replicated = with(Sharding::replicated(other_auto, 1));
+        let explicit_replicated = with(Sharding::replicated(explicit.clone(), 1));
+        let explicit_split = with(Sharding::new(explicit.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap());
+        let pending = with(Sharding::replicated(explicit.clone(), 1).with_unreduced_axes(["x"]).unwrap());
+        let completed = with(Sharding::replicated(explicit, 1).with_reduced_axes(["x"]).unwrap());
+        let varying = with(Sharding::replicated(manual, 1).with_varying_manual_axes(["m"]).unwrap());
+
+        // Each row lists a pair and its join, which the reverse pair must give as well. The JAX lines are the outcomes
+        // of `lax.cond` over branches with the corresponding types (pinned JAX 0.12.0.1 on 4 CPU devices), where JAX
+        // expresses the pair.
+        let rows = [
+            // No mesh in either branch: OK.
+            (&plain, &plain, Some(&plain)),
+            // A compiled function without a mesh in one branch and an eager array on an automatic mesh in the other.
+            (&plain, &auto_replicated, Some(&plain)),
+            (&plain, &other_auto_replicated, Some(&plain)),
+            // A type without a mesh joins with any placement, as `cmp_shape_shd_mat_memsp` compares shardings only
+            // when both types have a mesh.
+            (&plain, &explicit_replicated, Some(&plain)),
+            (&plain, &explicit_split, Some(&plain)),
+            // A type without a sharding cannot record reduction state or manual variation (JAX's `mat` equality).
+            (&plain, &pending, None),
+            (&plain, &completed, None),
+            (&plain, &varying, None),
+            (&auto_replicated, &auto_replicated, Some(&auto_replicated)),
+            // Automatic meshes in both branches with different placements: OK.
+            (&auto_replicated, &other_auto_replicated, Some(&plain)),
+            // An explicit mesh in one branch requires equal shardings.
+            (&auto_replicated, &explicit_replicated, None),
+            (&auto_replicated, &explicit_split, None),
+            (&auto_replicated, &pending, None),
+            (&auto_replicated, &completed, None),
+            (&auto_replicated, &varying, None),
+            (&other_auto_replicated, &explicit_replicated, None),
+            (&other_auto_replicated, &varying, None),
+            // Explicit mesh with the same sharding in both branches: OK.
+            (&explicit_replicated, &explicit_replicated, Some(&explicit_replicated)),
+            // Explicit mesh, `P('x')` in one branch and `P(None)` in the other: `TypeError: cond branches must have
+            // equal output types but they differ.`
+            (&explicit_replicated, &explicit_split, None),
+            (&explicit_split, &explicit_split, Some(&explicit_split)),
+            (&explicit_replicated, &pending, None),
+            (&explicit_split, &varying, None),
+            (&pending, &pending, Some(&pending)),
+            (&pending, &completed, None),
+            (&completed, &completed, Some(&completed)),
+            (&varying, &varying, Some(&varying)),
+        ];
+        for (left, right, joined) in rows {
+            assert_eq!(left.join_for_control_flow(right).as_ref(), joined, "{left} joined with {right}");
+            assert_eq!(right.join_for_control_flow(left).as_ref(), joined, "{right} joined with {left}");
+
+            // Both branch types refine the selected declaration.
+            if let Some(joined) = joined {
+                assert!(joined.is_refined_by(left) && joined.is_refined_by(right), "{joined} for {left} and {right}");
+            }
+        }
+
+        // Every component other than the sharding must be equal.
+        let layout = Layout::Strided(StridedLayout::new(vec![1]));
+        let strided = plain.clone().with_layout(layout.clone());
+        assert_eq!(auto_replicated.join_for_control_flow(&auto_replicated.clone().with_data_type(DataType::F64)), None);
+        assert_eq!(auto_replicated.join_for_control_flow(&ArrayType::new_static(DataType::F32, [2])), None);
+        assert_eq!(auto_replicated.join_for_control_flow(&strided), None);
+        assert_eq!(
+            auto_replicated.join_for_control_flow(&plain.clone().with_memory(Memory::Host { pinned: true })),
+            None
+        );
+        assert_eq!(strided.join_for_control_flow(&auto_replicated.clone().with_layout(layout)), Some(strided.clone()));
+    }
+
+    #[test]
+    fn test_array_ir_type_join_for_control_flow() {
+        // Arrays join by the array rule, while dimensions and references join only when they are equal.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let plain = ArrayType::new_static(DataType::F32, [4]);
+        let placed = plain.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let dimension = ArrayIrType::Dimension(DimensionType::from(Dimension::Static(4)));
+        let reference = ArrayIrType::Reference(ReferenceType::new(plain.clone()));
+        let placed_reference = ArrayIrType::Reference(ReferenceType::new(placed.clone()));
+        assert_eq!(
+            ArrayIrType::Array(placed.clone()).join_for_control_flow(&ArrayIrType::Array(plain.clone())),
+            Some(ArrayIrType::Array(plain.clone())),
+        );
+        assert_eq!(
+            ArrayIrType::Array(plain.clone()).join_for_control_flow(&ArrayIrType::Array(placed.clone())),
+            Some(ArrayIrType::Array(plain.clone())),
+        );
+        assert_eq!(dimension.join_for_control_flow(&dimension), Some(dimension.clone()));
+        assert_eq!(reference.join_for_control_flow(&reference), Some(reference.clone()));
+        assert_eq!(reference.join_for_control_flow(&placed_reference), None);
+        assert_eq!(placed_reference.join_for_control_flow(&reference), None);
+        assert_eq!(reference.join_for_control_flow(&ArrayIrType::Array(plain.clone())), None);
+        assert_eq!(ArrayIrType::Array(plain).join_for_control_flow(&reference), None);
+        assert_eq!(dimension.join_for_control_flow(&ArrayIrType::Array(ArrayType::scalar(DataType::I64))), None);
     }
 
     #[test]

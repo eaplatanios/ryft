@@ -70,9 +70,10 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::control_flow::select::Select;
 use crate::operations::control_flow::{
-    ResidualStorageOperation, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
-    refine_control_flow_output_types, stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
-    validate_control_flow_region_input_refinement, validate_loop_reference_carry_roots,
+    ControlFlowType, ResidualStorageOperation, canonicalize_loop_carry_batch_axes, common_control_flow_signature,
+    loop_carry_passthrough_mask, refine_control_flow_output_types, stabilize_loop_carry_batch_axes,
+    validate_control_flow_output_identity_scope, validate_control_flow_region_input_refinement,
+    validate_loop_reference_carry_roots,
 };
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::slicing::DynamicUpdateSlice;
@@ -132,7 +133,7 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// its manual mesh axes run different numbers of iterations, so every array state element (and, for [`ArrayIrType`],
 /// every reference referent) must vary over each manual mesh axis that the predicate varies over (refer to
 /// [`Sharding::varying_manual_axes`]). A first-class dimension carries no manual variation and is not checked.
-pub trait WhileType: Type + ArrayMemberType + From<ArrayType> {
+pub trait WhileType: ControlFlowType + ArrayMemberType + From<ArrayType> {
     /// Validates the type family's restrictions on using a value of this type as the predicate of a loop over state
     /// of types `state_types`. [`WhileOperation`] validates the predicate count and the state signatures separately.
     /// For example, [`ArrayType`] requires a Boolean predicate whose shape is a prefix of every state shape, and state
@@ -275,13 +276,13 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Selects between `on_true` and `on_false` per element under this Boolean predicate, broadcasting the predicate
     /// against their shape along its leading (i.e., prefix) axes.
     ///
-    /// The candidates must have the same type. [`Select::select`] instead uses ordinary elementwise broadcasting
-    /// and promotion.
+    /// The types of the candidates must join (refer to [`ControlFlowType::join_for_control_flow`]). The selection
+    /// has their joined type. [`Select::select`] instead uses ordinary elementwise broadcasting and promotion.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when this value is not a Boolean predicate whose shape is a prefix of the shape of
-    /// `on_true` and `on_false`, when the two candidates have different types or (under a batched predicate) do not
+    /// `on_true` and `on_false`, when the types of the two candidates do not join or (under a batched predicate) do not
     /// vary over every manual mesh axis that the predicate varies over, or when this value does not have a concrete
     /// value.
     #[inline]
@@ -314,7 +315,10 @@ impl WhilePredicate for Array {
     fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let predicate_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
-        if on_true.r#type() != on_false.r#type() {
+
+        // The candidate is an output of the body and the carried value is the state, whose types may differ in
+        // untracked placement only, so the selection has their joined type.
+        let Some(output_type) = on_true.r#type().join_for_control_flow(&on_false.r#type()) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`select` requires congruent inputs, but got `{}` and `{}`",
@@ -322,7 +326,7 @@ impl WhilePredicate for Array {
                     on_false.r#type(),
                 ),
             });
-        }
+        };
 
         validate_while_predicate_type_and_shape(self.r#type().as_ref(), [on_true.r#type().as_ref()])?;
 
@@ -365,7 +369,7 @@ impl WhilePredicate for Array {
             output_bytes[source_range.clone()].copy_from_slice(&source[source_range]);
         }
 
-        Ok(Self::new_unchecked(on_true.r#type().into_owned(), Arc::new(output_bytes)))
+        Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
     }
 }
 
@@ -643,10 +647,24 @@ impl<T: WhileType> WhileOperation<T> {
             )));
         }
         condition_output_types[0].validate_while_predicate(state_types)?;
-        check_types!(@same, format!("`{WHILE_OPERATION_NAME}` body output"), [
+
+        // Every iteration after the first enters both regions with the outputs of the body, so the body outputs must
+        // join with the state into the state itself. They may then differ from it only in placement that it does not
+        // track (e.g., a sharded body output for a state without a sharding), which every region entry admits. A state
+        // that tracks such placement is not the join of a body output that differs from it, and is rejected with the
+        // mismatch of the two signatures. The `While` capability traces its regions at the joined state instead.
+        let state_and_body_output_types = common_control_flow_signature(
+            format_args!("`{WHILE_OPERATION_NAME}` body output"),
             state_types,
             body_interface.output_types(),
-        ]);
+        )?;
+        if state_and_body_output_types != state_types {
+            check_types!(@same, format!("`{WHILE_OPERATION_NAME}` body output"), [
+                state_types,
+                body_interface.output_types(),
+            ]);
+        }
+
         if condition_output_types[0].is_batched_while_predicate()
             && (!condition_interface.effects().is_empty() || !body_interface.effects().is_empty())
         {
@@ -655,6 +673,7 @@ impl<T: WhileType> WhileOperation<T> {
                  cannot be masked for finished batch items",
             )));
         }
+
         if condition_output_types[0].is_batched_while_predicate()
             && (condition_interface.has_deferred_work() || body_interface.has_deferred_work())
         {
@@ -663,6 +682,7 @@ impl<T: WhileType> WhileOperation<T> {
                  batch items would repeat its transformation obligation",
             )));
         }
+
         Ok((condition_interface, body_interface))
     }
 
@@ -1660,7 +1680,7 @@ where
         // The rule requests all nested-computation work through its driver (region `0` is the condition and region `1`
         // the body), which keeps its bounds free of the operation family's own semantic traits.
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
+        let output_types = self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
         if context.primal().is_eager() {
@@ -1690,13 +1710,7 @@ where
             let condition = &condition;
             let body = &body;
             let state_count = inputs.len();
-            let mut primal_carries = Vec::with_capacity(state_count);
-            let mut tangent_carries = Vec::with_capacity(state_count);
-            for input in inputs {
-                primal_carries.push(input.primal().clone());
-                tangent_carries.push(input.tangent().clone());
-            }
-
+            let mut carries = inputs.to_vec();
             let mut completed_iterations = 0;
             loop {
                 if self.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
@@ -1705,7 +1719,8 @@ where
 
                 // Concretize the condition on the current concrete primal carries to decide whether
                 // another iteration runs.
-                let mut condition_outputs = condition.interpret_in_context(context.primal(), primal_carries.clone())?;
+                let primals = carries.iter().map(|carry| carry.primal().clone()).collect::<Vec<_>>();
+                let mut condition_outputs = condition.interpret_in_context(context.primal(), primals)?;
                 check_count!("output", condition_outputs, 1, ProgramError);
                 let predicate = match condition_outputs.remove(0).concretize() {
                     Ok(predicate) => predicate,
@@ -1723,13 +1738,8 @@ where
                         }
                         let remaining = WhileOperation::new()
                             .with_iteration_bound(self.iteration_bound().map(|bound| bound - completed_iterations))?;
-                        let duals = primal_carries
-                            .into_iter()
-                            .zip(tangent_carries)
-                            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        return WhileJvp::new(driver, &remaining, &duals)?
-                            .bind(condition, body, context, driver, &duals);
+                        return WhileJvp::new(driver, &remaining, &carries, output_types)?
+                            .bind(condition, body, context, driver, &carries);
                     }
                 };
 
@@ -1742,14 +1752,9 @@ where
                 // concrete nested-loop iteration counts, after which replaying its fused JVP would execute primal
                 // effects a second time. Direct dual interpretation lets a nested while recurse through this eager
                 // rule and executes every primal operation once.
-                let input_duals = primal_carries
-                    .drain(..)
-                    .zip(tangent_carries.drain(..))
-                    .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-                    .collect::<Result<Vec<_>, _>>()?;
                 let body_region = body.entry_region_ref();
-                let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
-                    input_duals,
+                carries = body_region.interpret_with::<_, ProgramError, _, _>(
+                    carries,
                     |_, constant| {
                         Ok(DifferentiationDual::new_with_zero_tangent(context.primal().lift(constant.clone())?)?)
                     },
@@ -1765,23 +1770,14 @@ where
                         Ok(output_duals)
                     },
                 )?;
-                check_count!("output", output_duals, state_count, ProgramError);
-                for dual in output_duals {
-                    let (primal, tangent) = dual.into_parts();
-                    primal_carries.push(primal);
-                    tangent_carries.push(tangent);
-                }
+                check_count!("output", carries, state_count, ProgramError);
                 completed_iterations += 1;
             }
 
-            return primal_carries
-                .into_iter()
-                .zip(tangent_carries)
-                .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-                .collect::<Result<Vec<_>, _>>();
+            return Ok(carries);
         }
 
-        WhileJvp::new(driver, self, inputs)?.bind(&condition, &body, context, driver, inputs)
+        WhileJvp::new(driver, self, inputs, output_types)?.bind(&condition, &body, context, driver, inputs)
     }
 }
 
@@ -2005,10 +2001,11 @@ where
         let state_count = state_values.len();
         let initial_state_types = state_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
-        // Trace both functions over the current state types until those types reach a manual-variation fixed point.
-        // Both are traced on every pass so that their input signatures agree with the final state types. Variation
-        // only grows, and each pass that does not converge adds at least one manual axis to one state element, which
-        // bounds the number of passes.
+        // Trace both functions over the current state types until those types reach a fixed point of their manual
+        // variation and of their joins with the returned types. Both are traced on every pass so that their input
+        // signatures agree with the final state types. Variation only grows and a join only removes a sharding that
+        // records no variation, so each pass that does not converge either adds at least one manual axis to one state
+        // element or removes the sharding of one, which bounds the number of passes.
         let mut state_types = initial_state_types.clone();
         let mut remaining_widenings = None;
         let (condition_program, body_program) = loop {
@@ -2033,8 +2030,13 @@ where
                 .and_then(ArrayType::sharding)
                 .cloned();
 
-            // Align every state element with its next value and with the predicate. The incoming value's aligned type
-            // is the state type of the next pass, and the returned value's alignment is staged at the end of the body.
+            // Align every state element with its next value and with the predicate. The join of the aligned incoming
+            // and returned types, or the incoming type when they do not join, is the state type of the next pass.
+            // The returned value's alignment is staged at the end of the body. Every later iteration enters both
+            // functions with the returned values, so a state element whose body returns a value that differs from it in
+            // untracked placement only (e.g., the output of a compiled function for a state that records the placement
+            // of an eager array) is traced again at the joined type, which records no sharding. A value traced at the
+            // joined type may be placed anywhere that its type does not constrain.
             let mut next_state_types = Vec::with_capacity(state_count);
             let (_, body_program) = NestedTracingContext::trace(
                 self.clone(),
@@ -2058,7 +2060,11 @@ where
                         if let Some(sharding) = &predicate_sharding {
                             pair = Tracer::align_manual_variation_to(&pair, sharding)?;
                         }
-                        next_state_types.push(pair[0].r#type().into_owned());
+                        let incoming_type = pair[0].r#type();
+                        let next_type = incoming_type
+                            .join_for_control_flow(&pair[1].r#type())
+                            .unwrap_or_else(|| incoming_type.into_owned());
+                        next_state_types.push(next_type);
                         next_values.push(pair.pop().unwrap());
                     }
                     Ok(next_values)
@@ -2074,7 +2080,7 @@ where
                     .map(|sharding| sharding.mesh().axes().len())
                     .max()
                     .unwrap_or(0);
-                state_count.saturating_mul(axes.max(1))
+                state_count.saturating_mul(axes.max(1) + 1)
             });
             if next_state_types == state_types {
                 break (condition_program, body_program);
@@ -2360,6 +2366,9 @@ struct WhileJvp<C: Context> {
     /// and output tangent slots. Every state element is a carry, so its output tangent liveness is also the converged
     /// tangent liveness of the state.
     activity: TangentActivity<C>,
+
+    /// Validated primal result declarations shared by the primal and tangent loop boundaries.
+    output_types: Vec<C::Type>,
 }
 
 impl<C: Context<Type: DifferentiableType + WhileType> + Zero<C::Value>> WhileJvp<C>
@@ -2389,7 +2398,8 @@ where
     for<'t> <&'t ArrayType as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
     /// Creates a new [`WhileJvp`] by analyzing the forward mode activity of an application of `operation` to the input
-    /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body.
+    /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body. The original
+    /// application supplies its validated `output_types`.
     ///
     /// # Errors
     ///
@@ -2399,6 +2409,7 @@ where
         driver: &D,
         operation: &WhileOperation<C::Type>,
         inputs: &[DifferentiationDual<C::Value>],
+        output_types: Vec<C::Type>,
     ) -> Result<Self, DifferentiationError> {
         let body = driver.region(1)?;
         let state_count = body.input_ids().len();
@@ -2406,7 +2417,7 @@ where
         let input_tangent_liveness = inputs.iter().map(|input| !input.tangent().is_zero()).collect();
         let (_, activity) =
             TangentActivity::from_loop_body(driver, body, input_tangent_liveness, 0..state_count, 0..state_count)?;
-        Ok(Self { operation: *operation, activity })
+        Ok(Self { operation: *operation, activity, output_types })
     }
 
     /// Stages the forward mode application of this loop with the condition and body programs `condition` and `body` to
@@ -3155,7 +3166,12 @@ where
         let tangent_outputs = context.tangent().bind(tangent_scan, vec![scan_body], tangent_scan_inputs.as_slice())?;
         check_count!("output", tangent_outputs, invariant_carry_count + tangent_state_count, ProgramError);
         let tangent_outputs = tangent_outputs.into_iter().skip(invariant_carry_count).collect();
-        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
+        context.control_flow_dual_outputs(
+            primal_outputs,
+            tangent_outputs,
+            activity.output_tangent_liveness(),
+            self.output_types.clone(),
+        )
     }
 
     /// Stages one fused doubled-state forward mode `while` for the condition program
@@ -3271,7 +3287,12 @@ where
                 outputs.into_iter().map(|output| context.tangent_to_primal(output)).collect::<Result<Vec<_>, _>>()?;
             (primal_outputs, tangent_outputs)
         };
-        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
+        context.control_flow_dual_outputs(
+            primal_outputs,
+            tangent_outputs,
+            activity.output_tangent_liveness(),
+            self.output_types.clone(),
+        )
     }
 }
 
@@ -5406,6 +5427,91 @@ mod tests {
                 ]
                 in (%1)"},
         );
+    }
+
+    #[test]
+    fn test_while_type_inference_joins_body_outputs_that_differ_in_untracked_placement() {
+        // The body scales the state by a constant replicated on a mesh without explicit axes, which places its output,
+        // while the state records no sharding. The output joins with the state into the state itself, so the loop keeps
+        // the state type, evaluates eagerly, and differentiates in forward and reverse mode. The loop runs two iterations
+        // from `3`, so `f(x) = 4 x`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let state_type = ArrayType::scalar(DataType::F64);
+        let placed_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+        let state = builder.add_input(state_type.clone());
+        let factor = builder.add_constant(Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap());
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, factor], None).unwrap()[0];
+        let body: TestProgram = builder.build(vec![scaled], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(body.output_types(), vec![placed_type.clone()]);
+        let operation = WhileOperation::new().with_iteration_bound(2).unwrap();
+        let regions = vec![scalar_threshold_condition(100.0), body];
+        let interfaces = regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>();
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&state_type), &interfaces), Ok(vec![state_type]));
+        // Eager interpretation masks each update with the predicate, which gives the state the joined type, while the
+        // eager dual loop of forward mode carries the outputs of the body, which keep their placement.
+        assert_eq!(
+            bind_while(operation, regions.clone(), &[Array::scalar(3.0).unwrap()]),
+            Ok(vec![Array::scalar(12.0).unwrap()]),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(3.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
+                bind_while(operation, regions.clone(), &[x]).map(|mut outputs| outputs.remove(0))
+            }),
+            Ok((
+                Array::from_elements::<f64>(placed_type.clone(), &[12.0]).unwrap(),
+                Array::from_elements::<f64>(placed_type.clone(), &[4.0]).unwrap(),
+            )),
+        );
+        check_gradient!(
+            |x| bind_while(operation, regions.clone(), &[x]).map(|mut outputs| outputs.remove(0)),
+            at = Array::scalar(3.0).unwrap(),
+            step = 1e-4,
+            tolerance = 1e-3,
+        );
+        let program = trace_while_value_and_gradient(operation, regions, ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            program.interpret(Array::scalar(3.0).unwrap()),
+            Ok((Array::scalar(12.0).unwrap(), Array::scalar(4.0).unwrap())),
+        );
+
+        // A state that records the placement is not the join of a body output that records none, and neither is one
+        // whose explicit split the body output does not record, so both loops are rejected with today's mismatch.
+        let constant_body = |state_type: &ArrayType, output: Array| {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            builder.add_input(state_type.clone());
+            let output = builder.add_constant(output);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let false_condition = |state_type: &ArrayType| {
+            let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+            builder.add_input(state_type.clone());
+            let predicate = builder.add_constant(Array::scalar(false).unwrap());
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F64, [2]);
+        let replicated_type = vector_type.clone().with_sharding(Sharding::replicated(explicit.clone(), 1)).unwrap();
+        let split_type = vector_type
+            .with_sharding(Sharding::new(explicit, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        for (state_type, output) in [
+            (placed_type.clone(), Array::scalar(1.0f64).unwrap()),
+            (replicated_type.clone(), Array::from_elements::<f64>(split_type.clone(), &[1.0, 2.0]).unwrap()),
+            (split_type.clone(), Array::from_elements::<f64>(replicated_type.clone(), &[1.0, 2.0]).unwrap()),
+        ] {
+            let output_type = output.r#type().into_owned();
+            let interfaces = [false_condition(&state_type), constant_body(&state_type, output)]
+                .map(|region| region.interface().clone());
+            assert_eq!(
+                WhileOperation::new().infer_output_types(std::slice::from_ref(&state_type), &interfaces),
+                Err(TypeError::invalid(format!(
+                    "`while` body output type signature mismatch: expected [{state_type}] but got [{output_type}]",
+                ))),
+            );
+        }
     }
 
     #[test]
@@ -10303,6 +10409,8 @@ mod tests {
                 Ok(&self.0)
             }
         }
+
+        impl ControlFlowType for CustomType {}
 
         impl WhileType for CustomType {
             fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
@@ -16277,6 +16385,63 @@ mod tests {
         assert_eq!(
             program.interpret((Array::scalar(0i64).unwrap(), Array::scalar(1f32).unwrap())),
             Ok((Array::scalar(3i64).unwrap(), Array::scalar(8f32).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_while_while_joins_state_with_body_outputs_that_differ_in_untracked_placement() {
+        // The state enters the loop replicated on a mesh without explicit axes, and the body returns an unplaced
+        // value. Every later iteration carries that value, so both functions are traced again at the joined state type,
+        // which records no sharding, and the placed initial state refines it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let (_, program) = TestTracingContext::trace(
+            |(count, value)| {
+                r#while(
+                    |(count, _)| {
+                        count.less_than(&StagingContext::constant(count.context(), Array::scalar(2i64).unwrap()))
+                    },
+                    |(count, _)| {
+                        let one = StagingContext::constant(count.context(), Array::scalar(1i64).unwrap());
+                        let three = StagingContext::constant(count.context(), Array::scalar(3f32).unwrap());
+                        Ok((count + one, three))
+                    },
+                    (count, value),
+                    WhileOptions::new(),
+                )
+            },
+            (ArrayType::scalar(DataType::I64), placed_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i64[], %1:f32[][sharding={mesh<['devices'=2:auto]>, []}] .
+                let %2:i64[], %3:f32[] = while %0 %1 [
+                    condition={
+                        lambda %0:i64[], %1:f32[] .
+                        let %2:i64[] = const 2
+                            %3:bool[] = compare [direction=LessThan] %0 %2
+                        in (%3)
+                    },
+                    body={
+                        lambda %0:i64[], %1:f32[] .
+                        let %2:i64[] = const 1
+                            %3:f32[] = const 3.0
+                            %4:i64[] = add %0 %2
+                        in (%4, %3)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        let placed_value = Array::from_elements::<f32>(placed_type, &[1.0]).unwrap();
+        assert_eq!(
+            program.interpret((Array::scalar(0i64).unwrap(), placed_value.clone())),
+            Ok((Array::scalar(2i64).unwrap(), Array::scalar(3f32).unwrap())),
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(5i64).unwrap(), placed_value.clone())),
+            Ok((Array::scalar(5i64).unwrap(), placed_value.clone())),
         );
     }
 
