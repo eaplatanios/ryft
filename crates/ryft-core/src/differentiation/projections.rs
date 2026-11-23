@@ -1609,9 +1609,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionOperation,
-        DimensionValue,
+        DimensionValue, LogicalMesh, Sharding,
     };
-    use crate::axes::{LogicalMesh, Sharding};
     use crate::batching::{BatchAxis, BatchAxisSpecification, batch_in_parent};
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{FusedDifferentiationPolicy, PartitionedDifferentiationPolicy};

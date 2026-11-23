@@ -58,8 +58,8 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
-    ArrayType, Device, DeviceMesh, Dimension, Layout, LogicalMesh, Memory, MeshAxisType, Placement, Sharding,
-    ShardingDimension, decode_logical_bytes,
+    ArrayType, Device, DeviceMesh, Dimension, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxisType, Placement,
+    Sharding, ShardingDimension, decode_logical_bytes,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -103,9 +103,12 @@ use crate::tracing::Tracer;
 /// mesh that a program is compiled for). The type rule of [`PlaceOperation`] is the single owner of what a request
 /// does to the type of a value, and executing a placement must produce a value of exactly that type, so that eager
 /// execution, the replay of a staged program, compilation, and the transformations of a placement agree. In particular,
-/// a request never changes the reduction state of a value on any path, a concrete value included (refer to
-/// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so a value whose reduction is pending or complete
-/// must be reduced or resharded by the operations that own reductions before a request can drop that state.
+/// a placement target restates the reduction state of a value and an in-place target keeps it on every path, a
+/// concrete value included (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), so a value whose
+/// reduction is pending or complete must be reduced or resharded by the operations that own reductions before such a
+/// request can drop that state. A device target is the one request that drops reduction state, and only the state that
+/// one device completes (i.e., a completed reduction over a mesh axis of any size and a pending one over mesh axes of
+/// size one, refer to the device targets below).
 ///
 /// # Device Targets
 ///
@@ -474,8 +477,8 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 ///
 /// Unlike a [`ReshardOperation`](crate::ReshardOperation), which redistributes a value over the mesh that it already
 /// lives on, a placement may move the value to another mesh, so the target mesh need not define the axes of the input's
-/// mesh. A placement still changes only where a value lives and never its reduction state, so the target sharding must
-/// restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the
+/// mesh. A [`Placement`] target still changes only where a value lives and never its reduction state, so its sharding
+/// must restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the
 /// target mesh must define each of those axes with the same size and type as the input's mesh (refer to
 /// [`Self::infer_output_type_allowing_uneven_splits`], through which backends also apply every check of this rule but
 /// the even split below to the concrete values that they place outside a program). Every shard of a partitioned
@@ -486,7 +489,9 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// eagerly and inside `jit`. Unlike JAX, a backend may still split a concrete value unevenly when it places that value
 /// outside this operation. A dynamic extent is only known when a backend places a concrete value, so type inference
 /// rejects a split of it only when no extent that its bounds admit splits evenly (e.g., an extent of five to seven
-/// into four shards), and backends check it when they place the value.
+/// into four shards), and backends check it when they place the value. Dimensions that share a [`DimensionVariable`]
+/// share their extent, so one extent must split all of them evenly (e.g., an `f32[n, n]` with `2 <= n < 4` whose
+/// dimensions are split into two and into three shards is rejected, and one with `2 <= n < 7` is accepted).
 ///
 /// A value inside a manual region lives on the devices of that region, so it cannot be moved, and nothing can be moved
 /// into such a region either. Types show such values through their variation along [`MeshAxisType::Manual`] mesh axes
@@ -889,16 +894,16 @@ impl PlaceOperation {
     /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule of
     /// this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the target
     /// splits each extent evenly as far as the type of the value can tell, which is exactly for a static extent and for
-    /// at least one extent that the bounds of a dynamic extent admit), made with the concrete sharding of the value,
-    /// so it is what a backend calls when it executes this operation on a concrete value (e.g., when an eager context
-    /// binds it), where the reduction state and the shards of the value are known more precisely than its type records
-    /// them.
+    /// at least one extent of each dimension variable that its bounds admit and that splits every dimension of that
+    /// variable evenly at once), made with the concrete sharding of the value, so it is what a backend calls when it
+    /// executes this operation on a concrete value (e.g., when an eager context binds it), where the reduction state and
+    /// the shards of the value are known more precisely than its type records them.
     ///
     /// # Errors
     ///
     /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], and one for a target that
-    /// splits a static extent of the value unevenly or a dynamic extent unevenly for every extent that its bounds
-    /// admit.
+    /// splits a static extent of the value unevenly or the dimensions of a dimension variable unevenly for every extent
+    /// that its bounds admit.
     pub fn infer_output_type_requiring_even_splits(
         &self,
         input: &ArrayType,
@@ -917,17 +922,18 @@ impl PlaceOperation {
     /// changes reduction state.
     ///
     /// Reduction state records pending (i.e., unreduced) or completed (i.e., reduced) cross-device reductions, and a
-    /// placement changes where a value lives but never that state. The sharding of a [`Placement`] target therefore
-    /// restates the unreduced axes, the reduced axes, and the unreduced kind of `input` exactly, and so does the
-    /// sharding of a [`Placement`] source, which describes the input. The state is restated by axis name, so the target
-    /// and source meshes must also define every axis that carries it identically (e.g., an explicit unreduced axis must
-    /// not become an auto axis, over which array types record no reduction state, so that the output would silently
-    /// lose its pending reduction, nor an axis of another size). A [`PlacementRequest::Device`] target leaves a value
-    /// that lives wholly on one device, which completes a reduced axis of any size and an unreduced axis of size one,
-    /// whereas an unreduced axis of a larger size describes contributions on more devices than one, which a placement
-    /// does not combine, so such an input must be reduced first. A [`PlacementRequest::InPlace`] target keeps the
-    /// sharding of `input` exactly, so it restates its reduction state by construction. An input without a tracked
-    /// sharding has no reduction state.
+    /// placement changes where a value lives but not that state, except for the state that one device completes when a
+    /// device target leaves the value there (refer to the end of this paragraph). The sharding of a [`Placement`]
+    /// target therefore restates the unreduced axes, the reduced axes, and the unreduced kind of `input` exactly, and
+    /// so does the sharding of a [`Placement`] source, which describes the input. The state is restated by axis name,
+    /// so the target and source meshes must also define every axis that carries it identically (e.g., an explicit
+    /// unreduced axis must not become an auto axis, over which array types record no reduction state, so that the
+    /// output would silently lose its pending reduction, nor an axis of another size). A [`PlacementRequest::Device`]
+    /// target leaves a value that lives wholly on one device, which completes a reduced axis of any size and an
+    /// unreduced axis of size one, whereas an unreduced axis of a larger size describes contributions on more devices
+    /// than one, which a placement does not combine, so such an input must be reduced first.
+    /// A [`PlacementRequest::InPlace`] target keeps the sharding of `input` exactly, so it restates
+    /// its reduction state by construction. An input without a tracked sharding has no reduction state.
     ///
     /// The reduction state of `input` is that of `input_sharding`, which is the concrete sharding of the value
     /// when it is known, and which then also records the reduction state over auto mesh axes that the type omits,
@@ -1011,28 +1017,71 @@ impl PlaceOperation {
         Ok(())
     }
 
-    /// Validates that a placement of a value of type `input` onto `target` can split each
-    /// extent of the value evenly, which is the one check of the type rule of [`PlaceOperation`] that
+    /// Validates that a placement of a value of type `input` onto `target` can split each extent of the value evenly,
+    /// which is the one check of the type rule of [`PlaceOperation`] that
     /// [`Self::infer_output_type_allowing_uneven_splits`] does not make. Every shard of a partitioned dimension of a
     /// value has the same extent, so for each dimension that the target sharding partitions, the number of shards along
     /// it (i.e., the product of the sizes of the mesh axes that shard it, which includes auto axes, which the output
     /// type does not record but along which the value is still split) must divide its extent. That number must divide
-    /// a static extent, and it must divide at least one extent that the bounds of a dynamic extent admit, because a
-    /// dynamic extent is only known when a backend places a concrete value, which is when it is checked. Bounds that
-    /// admit no such extent (e.g., an extent of five to seven split into four shards) prove that the split cannot be
-    /// even. Only a [`Placement`] target partitions dimensions.
+    /// a static extent. A dynamic extent is only known when a backend places a concrete value, which is when it is
+    /// checked, and the dimensions that share its [`DimensionVariable`] all have that one extent, so the least common
+    /// multiple of the numbers of shards of those dimensions must divide at least one extent that the bounds of the
+    /// variable admit. Bounds that admit no such extent (e.g., an extent of five to seven split into four shards, or an
+    /// extent of two or three whose dimensions are split into two and into three shards) prove that the split cannot be
+    /// even. Dimensions of distinct variables are independent. Only a [`Placement`] target partitions dimensions.
     fn validate_even_splits(input: &ArrayType, target: Option<&PlacementRequest>) -> Result<(), TypeError> {
+        fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+            while right != 0 {
+                (left, right) = (right, left % right);
+            }
+            left
+        }
+
+        // Joins `items` into an English list (e.g., `a`, `a and b`, or `a, b, and c`).
+        fn join(items: &[String]) -> String {
+            match items {
+                [] => String::new(),
+                [item] => item.clone(),
+                [first, second] => format!("{first} and {second}"),
+                [rest @ .., last] => format!("{}, and {}", rest.join(", "), last),
+            }
+        }
+
         let Some(target) = target.and_then(PlacementRequest::placement).map(Placement::sharding) else {
             return Ok(());
         };
-        for (dimension, (extent, sharding)) in input.shape().dimensions().iter().zip(target.dimensions()).enumerate() {
-            let ShardingDimension::Sharded(axis_names) = sharding else {
-                continue;
-            };
 
-            // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh,
-            // which fits `usize`, and it is at least one, because every mesh axis has at least one device.
-            let shard_count = axis_names.iter().filter_map(|name| target.mesh().axis_size(name)).product::<usize>();
+        // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh, which fits
+        // `usize`, and it is at least one, because every mesh axis has at least one device.
+        let splits = input
+            .shape()
+            .dimensions()
+            .iter()
+            .zip(target.dimensions())
+            .enumerate()
+            .filter_map(|(dimension, (extent, sharding))| match sharding {
+                ShardingDimension::Sharded(axis_names) => Some((
+                    dimension,
+                    extent,
+                    axis_names.iter().filter_map(|name| target.mesh().axis_size(name)).product::<usize>(),
+                )),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => None,
+            })
+            .collect::<Vec<_>>();
+
+        // The partitioned dimensions of each dimension variable, with their numbers of shards, which are checked
+        // together where the first of them occurs, so that errors are reported in the order of the dimensions.
+        let mut variables = Vec::<(&DimensionVariable, Vec<(usize, usize)>)>::new();
+        for &(dimension, extent, shard_count) in &splits {
+            if let Dimension::Dynamic(variable) = extent {
+                match variables.iter_mut().find(|(other, _)| *other == variable) {
+                    Some((_, dimensions)) => dimensions.push((dimension, shard_count)),
+                    None => variables.push((variable, vec![(dimension, shard_count)])),
+                }
+            }
+        }
+
+        for (dimension, extent, shard_count) in splits {
             match extent {
                 Dimension::Static(extent) if extent % shard_count != 0 => {
                     return Err(TypeError::invalid(format!(
@@ -1040,23 +1089,51 @@ impl PlaceOperation {
                          into {shard_count} shards, which do not divide it evenly",
                     )));
                 }
+                Dimension::Static(_) => {}
                 Dimension::Dynamic(variable) => {
-                    // The smallest multiple of the number of shards that is not below the lower bound is the extent
-                    // that decides whether the bounds admit an even split, and one that does not fit `usize` exceeds
-                    // every extent.
+                    let (_, dimensions) = variables.iter().find(|(other, _)| *other == variable).unwrap();
+                    if dimensions[0].0 != dimension {
+                        continue;
+                    }
+
+                    // The smallest multiple of the least common multiple of the numbers of shards that is not below the
+                    // lower bound is the extent that decides whether the bounds admit an even split of every dimension
+                    // of the variable, and a multiple that does not fit `usize` exceeds every extent.
                     let bounds = variable.bounds();
-                    let multiple = bounds.lower().div_ceil(shard_count).checked_mul(shard_count);
-                    if !multiple.is_some_and(|multiple| bounds.contains(multiple)) {
-                        return Err(TypeError::invalid(format!(
-                            "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent \
-                             {variable} in {bounds} into {shard_count} shards, which divide no extent in that range \
-                             evenly",
-                        )));
+                    let extent = dimensions
+                        .iter()
+                        .try_fold(1usize, |multiple, &(_, count)| {
+                            (multiple / greatest_common_divisor(multiple, count)).checked_mul(count)
+                        })
+                        .and_then(|multiple| bounds.lower().div_ceil(multiple).checked_mul(multiple))
+                        .filter(|&extent| bounds.contains(extent));
+                    match (extent, dimensions.as_slice()) {
+                        (Some(_), _) => {}
+                        (None, [_]) => {
+                            return Err(TypeError::invalid(format!(
+                                "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent \
+                                 {variable} in {bounds} into {shard_count} shards, which divide no extent in that \
+                                 range evenly",
+                            )));
+                        }
+                        (None, dimensions) => {
+                            let indices = dimensions.iter().map(|(index, _)| format!("#{index}")).collect::<Vec<_>>();
+                            let counts = dimensions.iter().map(|(_, count)| count.to_string()).collect::<Vec<_>>();
+                            return Err(TypeError::invalid(format!(
+                                "`{}` target sharding splits dimensions {} with extent {} in {} into {} shards, \
+                                 which together divide no extent in that range evenly",
+                                PLACE_OPERATION_NAME,
+                                join(&indices),
+                                variable,
+                                bounds,
+                                join(&counts),
+                            )));
+                        }
                     }
                 }
-                Dimension::Static(_) => {}
             }
         }
+
         Ok(())
     }
 }
@@ -4202,6 +4279,112 @@ mod tests {
                      1",
                 ),
             }],
+        );
+    }
+
+    #[test]
+    fn test_place_operation_type_inference_repeated_dimension_variables() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let devices = DeviceMesh::new(mesh.clone(), (0..12).map(|id| Device::new(id, 0)).collect()).unwrap();
+        let target = |dimensions: Vec<ShardingDimension>| {
+            Placement::new(devices.clone(), Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
+        };
+        let variable = |lower, upper| DimensionVariable::new("n", DimensionBounds::new(lower, Some(upper)).unwrap());
+        let infer = |target: &Placement, dimensions: Vec<Dimension>| {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(dimensions));
+            PlaceOperation::new(target.clone(), None)
+                .infer_output_types(std::slice::from_ref(&input_type), &[])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        let x_y = target(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]);
+
+        // The dimensions of one dimension variable share its extent, so for `2 <= n < 4`, a split of the first into two
+        // shards and of the second into three is rejected, as it is for both extents that the bounds permit, and the
+        // bounds `2 <= n < 7` admit the extent six, which splits both evenly.
+        let n = variable(2, 4);
+        assert_eq!(
+            infer(&x_y, vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone())]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimensions #0 and #1 with extent n in [2, 4) into 2 \
+                 and 3 shards, which together divide no extent in that range evenly",
+            )),
+        );
+        assert_eq!(
+            infer(&x_y, vec![Dimension::Static(2), Dimension::Static(2)]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimension #1 with extent 2 into 3 shards, which do \
+                 not divide it evenly",
+            )),
+        );
+        assert_eq!(
+            infer(&x_y, vec![Dimension::Static(3), Dimension::Static(3)]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimension #0 with extent 3 into 2 shards, which do \
+                 not divide it evenly",
+            )),
+        );
+        let n = variable(2, 7);
+        assert_eq!(infer(&x_y, vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)]), Ok(()));
+        assert_eq!(infer(&x_y, vec![Dimension::Static(6), Dimension::Static(6)]), Ok(()));
+
+        // Dimensions of distinct variables are independent, even when their names and bounds are equal.
+        assert_eq!(infer(&x_y, vec![Dimension::Dynamic(variable(2, 4)), Dimension::Dynamic(variable(2, 4))]), Ok(()));
+
+        // A variable that occurs three times needs one extent that splits all three dimensions evenly.
+        let x_y_z = target(vec![
+            ShardingDimension::sharded(["x"]),
+            ShardingDimension::sharded(["y"]),
+            ShardingDimension::sharded(["z"]),
+        ]);
+        let n = variable(2, 6);
+        assert_eq!(
+            infer(&x_y_z, vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimensions #0, #1, and #2 with extent n in [2, 6) \
+                 into 2, 3, and 2 shards, which together divide no extent in that range evenly",
+            )),
+        );
+        let n = variable(2, 7);
+        assert_eq!(
+            infer(&x_y_z, vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)]),
+            Ok(()),
+        );
+
+        // Static extents are checked on their own, also next to dynamic ones, and a dimension of a variable that the
+        // target does not split constrains nothing, while errors follow the order of the dimensions.
+        let x_y_replicated = target(vec![
+            ShardingDimension::sharded(["x"]),
+            ShardingDimension::sharded(["y"]),
+            ShardingDimension::Replicated,
+        ]);
+        let n = variable(1, 3);
+        assert_eq!(
+            infer(
+                &x_y_replicated,
+                vec![Dimension::Dynamic(n.clone()), Dimension::Static(6), Dimension::Dynamic(n.clone())],
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            infer(&x_y_replicated, vec![Dimension::Dynamic(n.clone()), Dimension::Static(4), Dimension::Dynamic(n)]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimension #1 with extent 4 into 3 shards, which do \
+                 not divide it evenly",
+            )),
+        );
+        let n = variable(3, 4);
+        assert_eq!(
+            infer(&x_y_replicated, vec![Dimension::Dynamic(n.clone()), Dimension::Static(4), Dimension::Dynamic(n)]),
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` target sharding splits dimension #0 with extent n in [3, 4) into 2 shards, \
+                 which divide no extent in that range evenly",
+            )),
         );
     }
 

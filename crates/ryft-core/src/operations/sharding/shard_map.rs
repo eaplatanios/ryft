@@ -291,6 +291,7 @@ use crate::axes::{MeshContext, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
+use crate::captures::CapturePlacementContext;
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
@@ -5246,7 +5247,8 @@ impl<C> ShardMap for C
 where
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>
         + NamedAxes
-        + MeshContext,
+        + MeshContext
+        + CapturePlacementContext,
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
     TracingContext<C::Constant, C::Operation>:
@@ -7471,7 +7473,8 @@ fn bind_shard_map<C, F, Input, Output>(
 where
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>
         + NamedAxes
-        + MeshContext,
+        + MeshContext
+        + CapturePlacementContext,
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     Input: Parameterized<<C::Value as ValueProjection<ArrayType>>::Projected>,
     Input::Family: ParameterizedFamily<ProjectedValue<ArrayType, DomainTracer<C>>>,

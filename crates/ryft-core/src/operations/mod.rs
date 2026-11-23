@@ -97,7 +97,7 @@ pub use constants::{
 pub use control_flow::scan::scan;
 pub use control_flow::r#while::r#while;
 pub use control_flow::{
-    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ResidualStorageOperation,
+    CONDITION_OPERATION_NAME, Condition, ConditionOperation, ConditionType, ControlFlowType, ResidualStorageOperation,
     SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, Scan, ScanInterpretationDomain, ScanIterationCount, ScanOperation,
     ScanOptions, ScanType, Select, SelectOperation, WHILE_OPERATION_NAME, While, WhileOperation, WhileOptions,
     WhilePredicate, WhileType,

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::axes::{MeshContext, NamedAxes};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
+use crate::captures::CapturePlacementContext;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType, TranspositionContext};
 use crate::operations::collectives::CollectiveOperation;
@@ -29,6 +30,7 @@ use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 pub trait CompositeCallContext:
     NamedAxes
     + MeshContext
+    + CapturePlacementContext
     + Context<
         Type: Eq
                   + Hash
@@ -49,6 +51,7 @@ pub trait CompositeCallContext:
 impl<C> CompositeCallContext for C where
     C: NamedAxes
         + MeshContext
+        + CapturePlacementContext
         + Context<
             Type: Eq
                       + Hash
@@ -1577,13 +1580,11 @@ where
     /// `input`, which is exactly the context the call is staged into. It is therefore never named at a construction or
     /// call site, while the stored closures still pin the tracers that this universe must produce.
     ///
-    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded
-    /// with the [`TracingScope`] of `C` (i.e., the named axes, the default mesh, and the enclosing manual axes that
-    /// [`NamedAxes::named_axes`], [`MeshContext::default_mesh`], and [`MeshContext::manual_axes`] report). Code in the
-    /// closures therefore resolves the axes of enclosing transforms (e.g., an `axis_index` or a collective over the
-    /// axis of an enclosing `batch`), the mesh of an enclosing manual region, and the axes that enclosing manual
-    /// regions made manual (even when a `batch` level shadows one of them) as it would if it were inlined. Rules
-    /// traced in different scopes may differ, so calls in different scopes register separate rule definitions.
+    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded with the
+    /// [`TracingScope`] of `C`. The closures resolve the axes of enclosing transforms (e.g., an `axis_index` or a
+    /// collective over an enclosing `batch` axis), the default mesh, the axes marked manual by enclosing regions (even
+    /// when a `batch` level shadows one of them), and the capture placement as if they were inlined. Rules traced in
+    /// different scopes may differ, so calls in different scopes register separate definitions.
     ///
     /// # Errors
     ///

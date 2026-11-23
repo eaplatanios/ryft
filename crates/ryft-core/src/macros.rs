@@ -2421,7 +2421,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                     ::std::slice::from_ref(inputs[0].primal()),
                 )?;
                 $crate::check_count!("output", primals, 1, ProgramError);
-                Ok(vec![$crate::DifferentiationDual::new(primals.remove(0), inputs[0].tangent().clone())?])
+                Ok(vec![inputs[0].unary_linear_output(self, primals.remove(0), inputs[0].tangent().clone())?])
             }
         }
 
