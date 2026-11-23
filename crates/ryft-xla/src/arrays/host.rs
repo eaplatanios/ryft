@@ -25,6 +25,37 @@
 //! value, and they reject an array whose devices can hold different values of one tile along a varying manual mesh
 //! axis, which one host value cannot represent. [`ArrayShard::copy_to_host_bytes`] reads the value of one device.
 //!
+//! # Pending Reductions
+//!
+//! This module defines what the contributions of an array with a pending reduction of kind [`UnreducedKind`] and data
+//! type [`DataType`] mean, and every other path that creates, moves, or completes such contributions must preserve
+//! that meaning. The value is the combination of the contributions in ascending order of their coordinates along the
+//! unreduced axes with the arithmetic of [`ryft_core::Array`], in the accumulation type of the kind and the data type
+//! and rounded to the data type once, and a host value is split into summands by writing the additive identity of the
+//! data type to the devices that holds the unreduced additive identity, which is rejected with
+//! [`ArrayError::MissingUnreducedSumIdentity`] for a data type without such an identity. The device placements of
+//! [`crate::arrays::resharding`] read these functions to decide which changes of reduction state a compiled program
+//! makes and which need this module instead, and they introduce a pending sum by writing these identities themselves.
+//!
+//! For the sums of floating point and complex values that a collective completes, a device placement may differ from
+//! this meaning in the following ways only, which together are the contract of such sums. (i) The sign of a zero
+//! result: the collective starts from positive zero, so two negative zeros sum to positive zero. The maxima and minima
+//! of [`DataType::F4E2M1FN`] values differ in the same way, because the collective returns the first of two zeros
+//! rather than ordering negative zero below positive zero. (ii) What every computation of XLA does to floating point
+//! values on its platform (e.g., the CPU plugin flushes subnormal `f32` and `bf16` values to zero in any addition).
+//! (iii) The order and the precision of accumulation, which are those of the collective of the platform. On the CPU
+//! plugin, which is where this meaning was measured, they are the ones above (ascending coordinates, `f32` for `bf16`,
+//! `f16` for the narrower formats, and the data type itself otherwise), so a readback and a placement of the same array
+//! agree there, while a compiled `reduce` of the same values, which accumulates every format narrower than `f32` in
+//! `f32`, can differ for `f16` and the narrower formats. A compiled program that completes the same reduction (e.g.,
+//! a sum of an unreduced argument) computes what the device placement computes. (iv) A pending maximum or minimum of
+//! floating point values that a compiled program completes (e.g., an argument whose input sharding states one over auto
+//! mesh axes) follows the treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN
+//! values), because no compiled program has an exact alternative, whereas a device placement takes a host round trip
+//! for it. Every other change gives this meaning bit for bit, where all NaN encodings of a format count as one value,
+//! because the arithmetic of [`ryft_core::Array`] does not keep NaN payloads in narrow formats either. That includes
+//! every introduction of a pending sum by a device placement, which writes the identities of this module.
+//!
 //! # Completion
 //!
 //! Uploads return as soon as PJRT has accepted them, so the returned arrays can hold pending buffers. Readbacks are
@@ -61,8 +92,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayAddressing, ArrayType, DataType, DeviceMesh, Max, Min, Or, ProgramError, Sharding,
-    Typed, UnreducedKind,
+    Add, Array as CoreArray, ArrayAddressing, ArrayType, ConvertElementType, DataType, DeviceMesh, Max, Min, Or,
+    ProgramError, Sharding, Typed, UnreducedKind,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
@@ -648,12 +679,12 @@ impl Array {
             contributions.into_iter().map(|(slices, _, bytes)| (slices, bytes)).collect::<Vec<_>>()
         } else {
             // Combine the contributions to each tile elementwise using the sharding's unreduced kind, in ascending
-            // order of their unreduced coordinates. That order does not depend on which replica of each contribution
-            // this process holds, so every process computes the same bytes even for floating point sums, which do not
-            // associate. Boolean values do not support addition, so their sums combine with logical or instead, whose
-            // identity is `false`.
+            // order of their unreduced coordinates and in the accumulation type of the kind and the data type, rounding
+            // once at the end. That order does not depend on which replica of each contribution this process holds, so
+            // every process computes the same bytes even for floating point sums, which do not associate.
             contributions.sort_by(|(_, left, _), (_, right, _)| left.cmp(right));
             let unreduced_kind = self.sharding().unreduced_kind();
+            let accumulation_type = unreduced_accumulation_type(unreduced_kind, element_type);
 
             // The tiles are indexed by their slices, so that each contribution finds its tile without a scan.
             let mut tiles = Vec::<(Vec<Range<usize>>, CoreArray)>::new();
@@ -661,15 +692,15 @@ impl Array {
             for (slices, _, bytes) in contributions {
                 let shape = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
                 let contribution = CoreArray::new(ArrayType::new_static(element_type, shape), bytes)?;
+                let contribution = if accumulation_type == element_type {
+                    contribution
+                } else {
+                    contribution.convert_element_type(accumulation_type)?
+                };
                 match tile_indices.get(&slices) {
                     Some(&index) => {
                         let tile = &mut tiles[index].1;
-                        *tile = match unreduced_kind {
-                            UnreducedKind::Sum if element_type == DataType::Boolean => Or::or(&*tile, &contribution)?,
-                            UnreducedKind::Sum => Add::add(&*tile, &contribution)?,
-                            UnreducedKind::Max => Max::max(&*tile, &contribution)?,
-                            UnreducedKind::Min => Min::min(&*tile, &contribution)?,
-                        }
+                        *tile = combine_unreduced_contributions(unreduced_kind, tile, &contribution)?;
                     }
                     None => {
                         tile_indices.insert(slices.clone(), tiles.len());
@@ -678,7 +709,14 @@ impl Array {
                 }
             }
 
-            tiles.into_iter().map(|(slices, tile)| (slices, tile.logical_bytes())).collect()
+            tiles
+                .into_iter()
+                .map(|(slices, tile)| {
+                    let tile =
+                        if accumulation_type == element_type { tile } else { tile.convert_element_type(element_type)? };
+                    Ok((slices, tile.logical_bytes()))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
         };
 
         // Reuse a single full tile's bytes when the copies and any reduction already produced the complete value.
@@ -940,9 +978,20 @@ impl HostBufferUploads {
         }
 
         // Each process uploads only the shards of the devices that the mesh assigns to it, so a device of this process
-        // that the mesh assigns to another process would receive no buffer at all.
+        // that the mesh assigns to another process would receive no buffer at all. The lookup table of the PJRT devices
+        // that this process can upload to directly serves that validation and the uploads, so that an upload enumerates
+        // the devices of its client once.
         let client = session.client();
-        validate_mesh_device_processes(client, &mesh)?;
+        let client_process_index = client.process_index()?;
+        let addressable_devices = client.addressable_devices()?;
+        let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
+        for device in addressable_devices {
+            addressable_device_by_id.insert(device.id()?, device);
+        }
+
+        validate_mesh_device_processes_with(client, &mesh, client_process_index, |device_id| {
+            addressable_device_by_id.contains_key(&device_id)
+        })?;
 
         if r#type.data_type().is_zero() {
             return Ok(Self {
@@ -953,14 +1002,6 @@ impl HostBufferUploads {
                 device_layout: None,
                 shards: Vec::new(),
             });
-        }
-
-        // Build a lookup table for the PJRT devices that this process can upload to directly.
-        let client_process_index = client.process_index()?;
-        let addressable_devices = client.addressable_devices()?;
-        let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
-        for device in addressable_devices {
-            addressable_device_by_id.insert(device.id()?, device);
         }
 
         // Derive the global shard layout and plan uploads only for the shards owned by this process.
@@ -986,51 +1027,15 @@ impl HostBufferUploads {
             .filter(|(_, axis)| summed_axes.contains(axis.name()))
             .map(|(axis_index, _)| axis_index)
             .collect::<Vec<_>>();
-        let holds_identity = |shard: &ShardDescriptor| {
-            mesh.device_coordinates(shard.index())
-                .is_some_and(|coordinates| unreduced_axis_indices.iter().any(|&axis| coordinates[axis] != 0))
-        };
+        let holds_identity =
+            |shard: &ShardDescriptor| holds_unreduced_sum_identity(&mesh, shard, &unreduced_axis_indices);
 
         // The identity is needed only when some device, on this or another process, receives a non-empty shard that
         // must hold it. An unreduced axis of size one or an array without elements writes none, so those placements
         // also accept data types without an identity. Deciding this from the global layout makes every process agree.
-        let needs_identity = layout
-            .descriptors()
-            .iter()
-            .any(|shard| holds_identity(shard) && !shard.shape().as_slice().contains(&0));
-        let additive_identity = if needs_identity {
-            // Use negative zero for each signed floating-point component so adding the identity preserves negative
-            // zero. FNUZ types have only unsigned zero. Sub-byte elements occupy the low bits of one host byte.
-            // Boolean sums combine with logical or, whose identity is `false`.
-            match data_type {
-                DataType::Token | DataType::Zero | DataType::F8E8M0FNU => {
-                    return Err(ArrayError::MissingUnreducedSumIdentity { data_type }.into());
-                }
-                DataType::Boolean => vec![0x00],
-                DataType::I1
-                | DataType::I2
-                | DataType::I4
-                | DataType::I8
-                | DataType::I16
-                | DataType::I32
-                | DataType::I64
-                | DataType::U1
-                | DataType::U2
-                | DataType::U4
-                | DataType::U8
-                | DataType::U16
-                | DataType::U32
-                | DataType::U64 => vec![0u8; data_type.size_in_bytes()?],
-                DataType::F4E2M1FN => vec![0x08],
-                DataType::F6E2M3FN | DataType::F6E3M2FN => vec![0x20],
-                DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E4M3FN | DataType::F8E5M2 => vec![0x80],
-                DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ => vec![0x00],
-                DataType::BF16 | DataType::F16 => 0x8000u16.to_ne_bytes().to_vec(),
-                DataType::F32 => (-0f32).to_ne_bytes().to_vec(),
-                DataType::F64 => (-0f64).to_ne_bytes().to_vec(),
-                DataType::C64 => [(-0f32).to_ne_bytes(); 2].concat(),
-                DataType::C128 => [(-0f64).to_ne_bytes(); 2].concat(),
-            }
+        let additive_identity = if requires_unreduced_sum_identity(&mesh, &layout, &unreduced_axis_indices) {
+            unreduced_sum_identity(data_type)?
+                .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?
         } else {
             Vec::new()
         };
@@ -1148,6 +1153,262 @@ struct HostShardUpload {
 
     /// Source of the bytes to upload to this shard.
     source: HostShardSource,
+}
+
+/// Returns the data type in which the contributions of a pending reduction of `kind` to a value of `data_type` are
+/// combined (refer to [`combine_unreduced_contributions`]), after which the result is rounded to `data_type` once. It
+/// is the accumulation type of the collective of the CPU plugin that completes such a sum, as measured with three to
+/// eight contributions whose sum depends on the precision of accumulation (scratchpad `review3/fix18/accumulate.log`):
+/// [`DataType::BF16`] sums accumulate in [`DataType::F32`], and the sums of the floating point formats narrower than
+/// sixteen bits accumulate in [`DataType::F16`] (measured for every eight-bit format with a zero, and for
+/// [`DataType::F4E2M1FN`], whose sums of up to eight values the measurement could not tell apart from wider
+/// accumulation). [`DataType::F8E8M0FNU`], whose sums the collective does not compute as the format does (its values
+/// are below the range of [`DataType::F16`]), keeps its own arithmetic. Every other data type and kind, including
+/// [`DataType::F16`], [`DataType::F32`], [`DataType::F64`], and the complex types, combines in its own type.
+fn unreduced_accumulation_type(kind: UnreducedKind, data_type: DataType) -> DataType {
+    match (kind, data_type) {
+        (UnreducedKind::Sum, DataType::BF16) => DataType::F32,
+        (
+            UnreducedKind::Sum,
+            DataType::F4E2M1FN
+            | DataType::F6E2M3FN
+            | DataType::F6E3M2FN
+            | DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E4M3FN
+            | DataType::F8E4M3FNUZ
+            | DataType::F8E4M3B11FNUZ
+            | DataType::F8E5M2
+            | DataType::F8E5M2FNUZ,
+        ) => DataType::F16,
+        _ => data_type,
+    }
+}
+
+/// Combines `contribution` into `tile`, which are two contributions to one tile of an array with a pending reduction of
+/// `kind` (or `tile` is the combination of the earlier contributions), both converted to the accumulation type of the
+/// kind and the data type (refer to [`unreduced_accumulation_type`]), with the arithmetic of [`ryft_core::Array`] for
+/// that type. This, in ascending order of the coordinates of the contributions and rounded to the data type once at
+/// the end, is what such a pending reduction means (refer to the module documentation). Sums of [`DataType::Boolean`]
+/// values combine with logical or, whose identity is `false`, because Boolean values do not support addition. Every
+/// other data type uses its own addition, maximum, or minimum (e.g., sums of integers wrap in their width, so two
+/// contributions of `1` to a [`DataType::U1`] value sum to `0`, and maxima and minima of floating point values
+/// propagate NaN values and order negative zero below positive zero).
+fn combine_unreduced_contributions(
+    kind: UnreducedKind,
+    tile: &CoreArray,
+    contribution: &CoreArray,
+) -> Result<CoreArray, Error> {
+    Ok(match kind {
+        UnreducedKind::Sum if tile.r#type().data_type() == DataType::Boolean => Or::or(tile, contribution)?,
+        UnreducedKind::Sum => Add::add(tile, contribution)?,
+        UnreducedKind::Max => Max::max(tile, contribution)?,
+        UnreducedKind::Min => Min::min(tile, contribution)?,
+    })
+}
+
+/// Change of the reduction state of a value that a collective of XLA makes on the devices,
+/// which [`collective_reduction`] classifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReductionChange {
+    /// Completes a pending reduction of this kind (e.g., an all-reduce where a compiled program receives a value whose
+    /// pending reduction its types do not record, or the gather of a placement).
+    Complete(UnreducedKind),
+
+    /// Introduces a pending reduction of this kind (e.g., a sharding that adds unreduced axes to a value).
+    Introduce(UnreducedKind),
+}
+
+/// How a collective of XLA makes a [`ReductionChange`] for one data type, compared with what that change means (refer
+/// to the section on pending reductions of this module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectiveReduction {
+    /// The collective computes this meaning up to the contract of the section on pending reductions of this module
+    /// (i.e., the sign of a zero result of a floating point sum or of a maximum or minimum of [`DataType::F4E2M1FN`]
+    /// values, the treatment of floating point values on the platform, and the order and precision of accumulation
+    /// of its collective).
+    Exact,
+
+    /// The collective completes a maximum or minimum of floating point values and can drop NaN values, which the
+    /// `max` and `min` of a compiled program propagate. No compiled program has an exact alternative.
+    DropsNan,
+
+    /// The collective computes another number, for the reason given.
+    DifferentNumber(&'static str),
+
+    /// XLA does not compile the collective, aborts or crashes the process, or fails when it runs, for the reason given.
+    Unsupported(&'static str),
+
+    /// The change introduces a pending sum of a data type without an additive identity (refer to
+    /// [`unreduced_sum_identity`]), which has no meaning.
+    MissingIdentity,
+}
+
+impl CollectiveReduction {
+    /// Returns why the collective does not make the change as this module means it, or [`None`] when it does
+    /// (i.e., for [`Self::Exact`]).
+    pub(crate) fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Exact => None,
+            Self::DropsNan => Some(
+                "XLA's maximum and minimum reductions drop NaN values, which the maximum and minimum of a compiled \
+                 program propagate",
+            ),
+            Self::DifferentNumber(reason) | Self::Unsupported(reason) => Some(reason),
+            Self::MissingIdentity => Some("the data type has no additive identity to split a value into summands"),
+        }
+    }
+}
+
+/// Classifies how a collective of XLA makes `change` for values of `data_type`, which is the one owner of that fact:
+/// the device placements of [`crate::arrays::resharding`] take the device path only for [`CollectiveReduction::Exact`]
+/// and otherwise a host round trip with this module or an error, and the lowering of compiled programs (refer to
+/// `validate_pending_reduction_change` in `crate::lowering`) lowers [`CollectiveReduction::Exact`] and
+/// [`CollectiveReduction::DropsNan`] and rejects the rest before anything is compiled. The cases were decided by
+/// measurement on the CPU plugin (every pair of encodings of each data type of at most eight bits, special values of
+/// the wider ones, and three to eight contributions whose sum depends on the order and the precision of accumulation,
+/// each in its own process; refer to `.tasks/plan_placement_decisions.md`), and the classification is applied on every
+/// platform, where it is unverified. The cells most likely to differ elsewhere are the maxima and minima of floating
+/// point values (XLA on CUDA has native extrema that order signed zeros, refer to `FloatExtremumForm::for_combiner` in
+/// `crate::operations::extrema`, and may keep NaN values), the order and precision in which sums accumulate, the sign
+/// of zero results, and the flush of subnormal values, which is a fact of the CPU plugin:
+///
+///   - **Predicates:** XLA stores [`DataType::I1`] and [`DataType::U1`] values as predicates (refer to
+///     [`DataTypeExtension::executable_buffer_type`]), whose sum is a logical or rather than an addition that wraps
+///     around, and whose order puts `-1` above `0`. The maxima and minima of [`DataType::U1`] are those of the type.
+///   - **Collectives That Fail:** XLA does not compile the reductions of two-bit integers and of six-bit floating
+///     point values, it aborts the process when it introduces a pending sum of six-bit floating point values and
+///     crashes it for complex values, and the CPU plugin has no maximum or minimum reduction of complex values, which
+///     fails when the program runs.
+///   - **Different Numbers:** The sum of [`DataType::F8E8M0FNU`] values is not that of the format
+///     (e.g., `2^-127 + 2^-127` gives NaN).
+///   - **NaN Values:** The maxima and minima of every floating point format with NaN values drop them.
+///     [`DataType::F4E2M1FN`] has none, so its maxima and minima differ only in the sign of a zero result
+///     (the collective returns the first of two zeros), which the contract allows, so they are exact.
+///   - **Introducing a maximum or minimum:** XLA cannot (it aborts the process), which is
+///     [`CollectiveReduction::Unsupported`] for every data type.
+///
+/// Every other change is [`CollectiveReduction::Exact`], up to the contract of floating point sums.
+pub(crate) fn collective_reduction(data_type: DataType, change: ReductionChange) -> CollectiveReduction {
+    use CollectiveReduction::{DifferentNumber, DropsNan, Exact, MissingIdentity, Unsupported};
+    let two_bit = "XLA does not compile reductions of two-bit integers";
+    let six_bit = "XLA does not compile reductions of six-bit floating point values";
+    let extremum = |kind: UnreducedKind| matches!(kind, UnreducedKind::Max | UnreducedKind::Min);
+    match (data_type, change) {
+        (_, ReductionChange::Introduce(kind)) if extremum(kind) => {
+            Unsupported("XLA can only introduce a pending `sum` reduction")
+        }
+        (DataType::F6E2M3FN | DataType::F6E3M2FN, ReductionChange::Introduce(_)) => {
+            Unsupported("XLA aborts the process when it introduces a pending sum of six-bit floating point values")
+        }
+        (DataType::C64 | DataType::C128, ReductionChange::Introduce(_)) => {
+            Unsupported("XLA crashes the process when it introduces a pending sum of complex values")
+        }
+        (DataType::Token | DataType::Zero | DataType::F8E8M0FNU, ReductionChange::Introduce(_)) => MissingIdentity,
+        (_, ReductionChange::Introduce(_)) => Exact,
+        (DataType::I1 | DataType::U1, ReductionChange::Complete(UnreducedKind::Sum)) => DifferentNumber(
+            "XLA adds one-bit integers as predicates (i.e., with a logical or), while their sum wraps around",
+        ),
+        (DataType::I1, ReductionChange::Complete(_)) => {
+            DifferentNumber("XLA orders one-bit integers as predicates, which puts `-1` above `0`")
+        }
+        (DataType::I2 | DataType::U2, ReductionChange::Complete(_)) => Unsupported(two_bit),
+        (DataType::F6E2M3FN | DataType::F6E3M2FN, ReductionChange::Complete(_)) => Unsupported(six_bit),
+        (DataType::F8E8M0FNU, ReductionChange::Complete(UnreducedKind::Sum)) => DifferentNumber(
+            "XLA does not add `f8e8m0fnu` values as the format does (e.g., `2^-127 + 2^-127` gives NaN)",
+        ),
+        (DataType::C64 | DataType::C128, ReductionChange::Complete(kind)) if extremum(kind) => {
+            Unsupported("XLA has no maximum or minimum reduction of complex values")
+        }
+        (
+            DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E4M3FN
+            | DataType::F8E4M3FNUZ
+            | DataType::F8E4M3B11FNUZ
+            | DataType::F8E5M2
+            | DataType::F8E5M2FNUZ
+            | DataType::F8E8M0FNU
+            | DataType::BF16
+            | DataType::F16
+            | DataType::F32
+            | DataType::F64,
+            ReductionChange::Complete(kind),
+        ) if extremum(kind) => DropsNan,
+        (_, ReductionChange::Complete(_)) => Exact,
+    }
+}
+
+/// Returns why a compiled program cannot make `change` for values of `data_type` with a collective of XLA, or [`None`]
+/// when it can, which is the rule of every lowering that emits such a collective: a compiled program has no host round
+/// trip, so it accepts [`CollectiveReduction::Exact`] and [`CollectiveReduction::DropsNan`] (no compiled program has an
+/// exact alternative to the latter) and rejects every other class before anything is compiled. Its readers are the
+/// lowering of a sharding that changes the reduction state of a value (refer to `validate_pending_reduction_change`
+/// in `crate::lowering`) and the lowering of every collective that reduces with the combiner of XLA (i.e., the
+/// `all_reduce` of `parallel_reduce` and the `reduce_scatter` of `parallel_sum_scatter`, which complete a sum,
+/// a maximum, or a minimum as a pending reduction of that kind is completed).
+pub(crate) fn compiled_reduction_rejection(data_type: DataType, change: ReductionChange) -> Option<&'static str> {
+    match collective_reduction(data_type, change) {
+        CollectiveReduction::Exact | CollectiveReduction::DropsNan => None,
+        classification => classification.reason(),
+    }
+}
+
+/// Returns the encoding of one element of the additive identity of `data_type`, which a split of a host
+/// value into summands writes to the devices away from coordinate zero along the summed axes (refer to
+/// [`holds_unreduced_sum_identity`]), or [`None`] for a data type without one (i.e., [`DataType::F8E8M0FNU`], whose
+/// every encoding is a nonzero number, and the data types without values). The identity is negative zero for each
+/// component of the floating point and complex types that have signed zeros, because adding positive zero would turn
+/// a negative zero into a positive one, and plain zero for the integer types and for the floating point types with a
+/// single zero. Sums of [`DataType::Boolean`] values combine with logical or, whose identity is `false`. Elements
+/// narrower than a byte occupy the low bits of one byte.
+pub(super) fn unreduced_sum_identity(data_type: DataType) -> Result<Option<Vec<u8>>, Error> {
+    Ok(Some(match data_type {
+        DataType::Token | DataType::Zero | DataType::F8E8M0FNU => return Ok(None),
+        DataType::Boolean => vec![0x00],
+        DataType::I1
+        | DataType::I2
+        | DataType::I4
+        | DataType::I8
+        | DataType::I16
+        | DataType::I32
+        | DataType::I64
+        | DataType::U1
+        | DataType::U2
+        | DataType::U4
+        | DataType::U8
+        | DataType::U16
+        | DataType::U32
+        | DataType::U64 => vec![0u8; data_type.size_in_bytes()?],
+        DataType::F4E2M1FN => vec![0x08],
+        DataType::F6E2M3FN | DataType::F6E3M2FN => vec![0x20],
+        DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E4M3FN | DataType::F8E5M2 => vec![0x80],
+        DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ => vec![0x00],
+        DataType::BF16 | DataType::F16 => 0x8000u16.to_ne_bytes().to_vec(),
+        DataType::F32 => (-0f32).to_ne_bytes().to_vec(),
+        DataType::F64 => (-0f64).to_ne_bytes().to_vec(),
+        DataType::C64 => [(-0f32).to_ne_bytes(); 2].concat(),
+        DataType::C128 => [(-0f64).to_ne_bytes(); 2].concat(),
+    }))
+}
+
+/// Returns whether the device of `shard`, a shard of a placement on `mesh`, holds the additive identity when a value
+/// is split into summands along the mesh axes at `axis_indices` (i.e., whether it lies away from coordinate zero along
+/// one of them). The devices at coordinate zero along all of them hold the value itself.
+pub(super) fn holds_unreduced_sum_identity(mesh: &DeviceMesh, shard: &ShardDescriptor, axis_indices: &[usize]) -> bool {
+    mesh.device_coordinates(shard.index())
+        .is_some_and(|coordinates| axis_indices.iter().any(|&axis| coordinates[axis] != 0))
+}
+
+/// Returns whether a split of a value into summands along the mesh axes at `axis_indices` writes the additive identity
+/// to any device of `layout`, a placement on `mesh`, on this or another process, which is the case when one of them
+/// holds the identity (refer to [`holds_unreduced_sum_identity`]) in a shard with elements. An axis of size one or a
+/// value without elements writes none. The rule reads only the global layout, so every process decides alike.
+pub(super) fn requires_unreduced_sum_identity(mesh: &DeviceMesh, layout: &ShardLayout, axis_indices: &[usize]) -> bool {
+    layout
+        .descriptors()
+        .iter()
+        .any(|shard| holds_unreduced_sum_identity(mesh, shard, axis_indices) && !shard.shape().as_slice().contains(&0))
 }
 
 /// Describes how to obtain the bytes for one addressable shard from a host buffer or a repeated additive identity.
@@ -1652,10 +1913,26 @@ pub(super) fn validate_mesh_device_processes(client: &Client<'_>, mesh: &DeviceM
     if mesh.devices().iter().any(|device| device.process_index() == process_index) {
         let addressable_device_ids =
             client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
-        for device in mesh.devices().iter().filter(|device| device.process_index() == process_index) {
-            if !addressable_device_ids.contains(&device.id()) {
-                return Err(ArrayError::NonAddressableDevice { device_id: device.id(), process_index }.into());
-            }
+        validate_mesh_device_processes_with(client, mesh, process_index, |device_id| {
+            addressable_device_ids.contains(&device_id)
+        })
+    } else {
+        validate_mesh_device_processes_with(client, mesh, process_index, |_| true)
+    }
+}
+
+/// Implements [`validate_mesh_device_processes`] for `client`, whose process has index `process_index`, given whether
+/// `client` addresses the device with an identifier (e.g., from a table of its addressable devices that the caller
+/// built anyway, which a host upload does, so that it enumerates the devices of its client once).
+fn validate_mesh_device_processes_with<A: Fn(DeviceId) -> bool>(
+    client: &Client<'_>,
+    mesh: &DeviceMesh,
+    process_index: usize,
+    addressable: A,
+) -> Result<(), Error> {
+    for device in mesh.devices().iter().filter(|device| device.process_index() == process_index) {
+        if !addressable(device.id()) {
+            return Err(ArrayError::NonAddressableDevice { device_id: device.id(), process_index }.into());
         }
     }
 

@@ -611,7 +611,8 @@ impl Array {
     ///     logical mesh of a sharding out over the first addressable devices).
     ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
     ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
-    ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted.
+    ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted, and it goes to
+    ///     the first addressable device of the client whether or not the session has a default mesh.
     ///   - **Committed Inputs:** It is the result of an eager operation with a committed array input or a committed
     ///     array that the operation captures, or an output of a compiled function with a committed public argument.
     ///     The arrays that a compiled function captures never commit its outputs, whether it is executed directly or
