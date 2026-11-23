@@ -1930,12 +1930,13 @@ impl Array {
     /// one part of its metadata that the processes do not share, so it is placed with
     /// [`DevicePlacementStrategy::ProcessLocalValue`], in which every process places its own value on its own
     /// destination devices with local work only, and no process plans a transfer or a collective. Every process knows
-    /// the fact for its own array and computes the same one (refer to [`Self::is_locally_assigned`]). There is
-    /// one refinement. When every destination device belongs to this process, such an array takes the strategy that [`Self::shared_device_placement_strategy`] chooses for it, if one
-    /// applies, because that strategy then moves nothing between processes and needs no other process (e.g., a compiled
-    /// reshard on the devices of this process rather than a host round trip). Every other process places nothing on
-    /// those devices, whatever it chooses for its own value, so the transfers and programs of all processes still
-    /// match. Any other array is placed with the strategies of [`Self::shared_device_placement_strategy`].
+    /// the fact for its own array and computes the same one (refer to [`Self::is_locally_assigned`]). There is one
+    /// refinement. When every destination device belongs to this process, such an array takes the strategy that
+    /// [`Self::shared_device_placement_strategy`] chooses for it, if one applies, because that strategy then moves
+    /// nothing between processes and needs no other process (e.g., a compiled reshard on the devices of this process
+    /// rather than a host round trip). Every other process places nothing on those devices, whatever it chooses for its
+    /// own value, so the transfers and programs of all processes still match. Any other array is placed with the
+    /// strategies of [`Self::shared_device_placement_strategy`].
     ///
     /// What only one process knows does not change the strategy. The chosen strategy handles it instead (e.g., a
     /// buffer whose physical layout differs from the default layout of a cross-host receive is converted on its device
@@ -2073,9 +2074,9 @@ impl Array {
         Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard })
     }
 
-    /// Returns [`DevicePlacementStrategy::HostRoundTrip`] for placing this array on `mesh` for `reason`. Only one process
-    /// can read the value back and upload it again, so the host round trip is available only when every device of
-    /// both ends belongs to one process, which this function names when there is one.
+    /// Returns [`DevicePlacementStrategy::HostRoundTrip`] for placing this array on `mesh` for `reason`. Only one
+    /// process can read the value back and upload it again, so the host round trip is available only when every device
+    /// of both ends belongs to one process, which this function names when there is one.
     fn host_round_trip(&self, mesh: &DeviceMesh, reason: Error) -> DevicePlacementStrategy {
         let first_process = self.mesh().devices()[0].process_index();
         let process_index = self
@@ -2094,12 +2095,12 @@ impl Array {
     /// (i.e., on [`coordinate_zero_mesh`]), because every other device receives the additive identity and needs
     /// nothing else. It starts from the first of the following that applies:
     ///
-    ///   1. **Restriction:** When this array is on `mesh` and replicated along every introduced axis (i.e., no dimension
-    ///      is split along it and it carries no pending reduction there), the shards of its devices at coordinate zero
-    ///      already hold its whole value with the same placement along every other axis, so the first step starts from
-    ///      that restriction (refer to [`Self::restricted_to`]) on the same mesh, which keeps every pending reduction of
-    ///      this array that the destination keeps as a pure move. When the restriction already has `first_sharding`,
-    ///      there is no first step at all, so nothing moves and nothing is compiled.
+    ///   1. **Restriction:** When this array is on `mesh` and replicated along every introduced axis (i.e., no
+    ///      dimension is split along it and it carries no pending reduction there), the shards of its devices at
+    ///      coordinate zero already hold its whole value with the same placement along every other axis, so the first
+    ///      step starts from that restriction (refer to [`Self::restricted_to`]) on the same mesh, which keeps every
+    ///      pending reduction of this array that the destination keeps as a pure move. When the restriction already has
+    ///      `first_sharding`, there is no first step at all, so nothing moves and nothing is compiled.
     ///   2. **One value per slice:** Otherwise, an array that holds one value per slice is placed from where it is onto
     ///      the devices at coordinate zero (e.g., with exact shards or shard regions, which move only what those
     ///      devices need, or a gather and copies of the gathered value to those devices).
@@ -2131,7 +2132,20 @@ impl Array {
         let (first_mesh, first_sharding, view, first) = if replicated_along_introduced_axes {
             let first_mesh = coordinate_zero_mesh(mesh, &axis_indices)?;
             let first_sharding = sharding_on_mesh(first_sharding, first_mesh.logical_mesh())?;
-            if sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())? == first_sharding {
+            // A runtime array stores an unconstrained dimension replicated, so such a dimension already places the
+            // value as a replicated one does.
+            let closed = |sharding: &Sharding| -> Result<Sharding, Error> {
+                let dimensions = sharding
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+                        dimension => dimension.clone(),
+                    })
+                    .collect();
+                Ok(sharding.with_dimensions(dimensions)?)
+            };
+            if closed(&sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())?)? == closed(&first_sharding)? {
                 (first_mesh, first_sharding, None, None)
             } else {
                 let view = self.restricted_to(&first_mesh)?;
@@ -2172,8 +2186,14 @@ impl Array {
             .filter(|shard| mesh.devices().contains(&shard.device()))
             .filter_map(|shard| shard.buffer().cloned())
             .collect();
-        let array =
-            Self::from_addressable_buffers_internal(self.session(), r#type, Some(sharding), mesh.clone(), buffers, false)?;
+        let array = Self::from_addressable_buffers_internal(
+            self.session(),
+            r#type,
+            Some(sharding),
+            mesh.clone(),
+            buffers,
+            false,
+        )?;
         Ok(Self {
             execution_fence: self.execution_fence.clone(),
             send_fence: self.send_fence.clone(),
@@ -2185,8 +2205,8 @@ impl Array {
 
     /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, which
     /// introduces no pending sum (refer to [`split_introduced_sums`]), and returns the reason why it would not preserve
-    /// the value of this array, if any (refer to [`validate_reduction_transition`]), in which case the placement takes a
-    /// host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the destination mesh has a
+    /// the value of this array, if any (refer to [`validate_reduction_transition`]), in which case the placement takes
+    /// a host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the destination mesh has a
     /// `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
     /// the shards of this array or of the destination differ in size. These checks read only metadata that every
     /// process shares (refer to [`Self::device_placement_strategy`]).
@@ -2378,7 +2398,12 @@ impl Array {
     /// joins the fence of this array with the readiness of every identity buffer, so that its readbacks and readiness
     /// functions report a failed upload, and it keeps the send fence of this array. A buffer that this array shares
     /// with its source stays shared only on the devices at coordinate zero, and the identity buffers alias nothing.
-    fn with_introduced_sums(self, mesh: &DeviceMesh, sharding: &Sharding, axis_indices: &[usize]) -> Result<Self, Error> {
+    fn with_introduced_sums(
+        self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        axis_indices: &[usize],
+    ) -> Result<Self, Error> {
         let session = self.session().clone();
         let client = session.client();
         let process_index = client.process_index()?;
@@ -2430,9 +2455,10 @@ impl Array {
                 }
                 devices = Some(by_id);
             }
-            let device = devices.as_ref().and_then(|devices| devices.get(&device_id)).ok_or_else(|| {
-                Error::from(ArrayError::NonAddressableDevice { device_id, process_index })
-            })?;
+            let device = devices
+                .as_ref()
+                .and_then(|devices| devices.get(&device_id))
+                .ok_or_else(|| Error::from(ArrayError::NonAddressableDevice { device_id, process_index }))?;
             let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
             let memory = device.memory(r#type.memory())?;
             let uploaded = client.buffer(identity, buffer_type, dimensions, None, memory, device_layout.clone())?;
@@ -3353,8 +3379,8 @@ fn coordinate_zero_mesh(mesh: &DeviceMesh, axis_indices: &[usize]) -> Result<Dev
     Ok(DeviceMesh::new(LogicalMesh::new(axes)?, devices)?)
 }
 
-/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with the
-/// same names and types, some of which may have another size (e.g., the logical mesh of [`coordinate_zero_mesh`]),
+/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with
+/// the same names and types, some of which may have another size (e.g., the logical mesh of [`coordinate_zero_mesh`]),
 /// with the same placement, reduction state, and manual variation. Unlike [`Sharding::with_mesh`], which requires the
 /// same topology, this lets a sharding that splits no dimension along a resized axis describe the same shards on the
 /// devices that remain.
@@ -4698,9 +4724,9 @@ mod tests {
                 ),
                 format!(
                     "host round trip: cannot take `f8e8m0fnu` values from a pending `sum` reduction to no reduction \
-                     state along mesh axis `x` on the devices, because the arithmetic of XLA for `f8e8m0fnu` values, in \
-                     any compiled program, is not that of the host readback that defines the value (e.g., `2^-127 + \
-                     2^-127` gives NaN in XLA), {host}; {complete}"
+                     state along mesh axis `x` on the devices, because the arithmetic of XLA for `f8e8m0fnu` values, \
+                     in any compiled program, is not that of the host readback that defines the value (e.g., `2^-127 \
+                     + 2^-127` gives NaN in XLA), {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `c64` values from a pending `min` reduction to no reduction state \
@@ -4739,9 +4765,10 @@ mod tests {
         // rejects the changes that the same classification (`collective_reduction`) does not let the planner make on
         // the devices. Each such cell lowers the program that `Array::compile_reshard_on_same_mesh` stages, over the
         // mesh of `ReshardProgram::compiled_mesh`, for every data type with values, both axis types, and every pair of
-        // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a pending
-        // sum plans the program of its placement without that sum, whose identities are written without a program
-        // (refer to `split_introduced_sums`). Only lowering runs, so that a wrong plan cannot abort the test process.
+        // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a
+        // pending sum plans the program of its placement without that sum, whose identities are written without a
+        // program (refer to `split_introduced_sums`). Only lowering runs, so that a wrong plan cannot abort the test
+        // process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -5187,8 +5214,8 @@ mod tests {
                             source.to_placement(&session, target)
                         };
                         let programs = session.cached_program_count();
-                        // A sum that the devices complete follows the contract of floating point sums, and one that they
-                        // introduce is exact.
+                        // A sum that the devices complete follows the contract of floating point sums, and one that
+                        // they introduce is exact.
                         let sum_contract = programs > 0 && name == "sum -> none";
                         results.push(placed.and_then(|placed| {
                             assert_eq!(placed.sharding(), &destination, "{data_type} {name}");
@@ -5368,6 +5395,128 @@ mod tests {
                 vec![0x8000_0000, 1, 0x3f80_0000],
                 vec![0x8000_0000, 1, 0x3f80_0000],
             ],
+        );
+    }
+
+    #[test]
+    fn test_array_to_placement_introduces_pending_sums_only_on_devices_at_coordinate_zero() {
+        // A placement that introduces a pending sum places the value only on the devices at coordinate zero along the
+        // introduced axes (here `y`, so devices 0 and 2 of the 2x2 mesh) and gives the others the additive identity,
+        // uploaded on their own. A source that already holds the value there with the destination placement along the
+        // other axes (e.g., replicated, or with a pending sum along `x` that the destination keeps) needs no move and
+        // no program, so those devices keep the buffers of the source and the placement creates only its result.
+        // Before, the first step placed the value with `y` replicated on all four devices, which compiled a reshard
+        // for the kept sum along `x` (`+1` program) and copied the value to devices that then discarded it.
+        let client = cpu_client(4);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let split_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let pending = |axes: &[&str]| replicated.clone().with_unreduced_axes(axes.iter().copied()).unwrap();
+        let single_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let single = DeviceMesh::new(single_mesh, vec![devices[0]]).unwrap();
+        let (value, other) = ([1f32, 2., 3., 4.], [10f32, 20., 30., 40.]);
+        let zeros = vec![0f32; 4];
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let mut outcomes = Vec::new();
+        for name in ["replicated", "sum along x", "split along y", "on device 0"] {
+            let session = Session::builder().client(client).build().unwrap();
+            let (source, destination) = match name {
+                "replicated" => {
+                    let source = Array::from_host_buffer(
+                        &session,
+                        r#type.clone(),
+                        mesh.clone(),
+                        Some(replicated.clone()),
+                        values_to_bytes(&value),
+                    );
+                    (source, pending(&["y"]))
+                }
+                "sum along x" => {
+                    let contributions = devices.iter().enumerate().map(|(index, device)| {
+                        let values = if index < 2 { &value } else { &other };
+                        (device.id(), Arc::<[u8]>::from(values_to_bytes(values)))
+                    });
+                    let source = Array::from_host_shards(
+                        &session,
+                        r#type.clone(),
+                        mesh.clone(),
+                        Some(pending(&["x"])),
+                        contributions,
+                    );
+                    (source, pending(&["x", "y"]))
+                }
+                "split along y" => {
+                    let source = Array::from_host_buffer(
+                        &session,
+                        r#type.clone(),
+                        mesh.clone(),
+                        Some(split_y.clone()),
+                        values_to_bytes(&value),
+                    );
+                    (source, pending(&["y"]))
+                }
+                _ => {
+                    let source = Array::from_host_buffer(
+                        &session,
+                        r#type.clone(),
+                        single.clone(),
+                        None,
+                        values_to_bytes(&value),
+                    );
+                    (source, pending(&["x", "y"]))
+                }
+            };
+            let source = source.unwrap();
+            let source_buffers =
+                source.addressable_shards().filter_map(ArrayShard::buffer).cloned().collect::<Vec<_>>();
+            let (programs, arrays) = (session.cached_program_count(), session.array_statistics().created_arrays);
+            let placed = source.to_placement(&session, Placement::new(mesh.clone(), destination.clone()).unwrap());
+            let placed = placed.unwrap();
+            assert_eq!((placed.mesh(), placed.sharding()), (&mesh, &destination), "{name}");
+            let shared = placed
+                .addressable_shards()
+                .enumerate()
+                .filter(|(_, shard)| {
+                    let buffer = shard.buffer().unwrap();
+                    source_buffers.iter().any(|source| Arc::ptr_eq(source, buffer))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            outcomes.push(format!(
+                "{name}: +{} programs, +{} arrays, devices sharing a source buffer {shared:?}",
+                session.cached_program_count() - programs,
+                session.array_statistics().created_arrays - arrays,
+            ));
+            let expected = match name {
+                "sum along x" => vec![value.to_vec(), zeros.clone(), other.to_vec(), zeros.clone()],
+                "on device 0" => vec![value.to_vec(), zeros.clone(), zeros.clone(), zeros.clone()],
+                _ => vec![value.to_vec(), zeros.clone(), value.to_vec(), zeros.clone()],
+            };
+            assert_eq!(shard_values(&placed), expected, "{name}");
+            let bits = values_from_bytes::<f32>(&placed.shards()[1].copy_to_host_bytes().unwrap())
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>();
+            assert_eq!(bits, vec![0x8000_0000; 4], "{name}");
+        }
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                replicated: +0 programs, +1 arrays, devices sharing a source buffer [0, 2]
+                sum along x: +0 programs, +1 arrays, devices sharing a source buffer [0, 2]
+                split along y: +2 programs, +8 arrays, devices sharing a source buffer []
+                on device 0: +0 programs, +2 arrays, devices sharing a source buffer [0]"},
         );
     }
 
@@ -8510,12 +8659,12 @@ mod tests {
         // Every transfer and program that one process plans has its counterpart on the other process. The processes
         // choose the same strategy, except that a process whose own value lies on its devices and whose devices hold
         // the whole destination places it with the strategy of a shared source, which moves nothing between processes.
-        // A partial import reaches its first transfer in production whenever another local replica serves a missing
-        // one or a missing tile is only copied locally, which in pinned host memory includes the staging of each sent
-        // replica in device memory. A disagreement names the strategy of each process. The partially addressable sharded import has no local buffer
-        // at all for its first tile, so process 0 stops before its transfers wherever that tile must leave the
-        // process or feed a gather, while process 1 waits for its receive, which is the accepted limit of the PJRT
-        // cross-host transfers that `.tasks/plan_placement_decisions.md` records.
+        // A partial import reaches its first transfer in production whenever another local replica serves a missing one
+        // or a missing tile is only copied locally, which in pinned host memory includes the staging of each sent
+        // replica in device memory. A disagreement names the strategy of each process. The partially addressable
+        // sharded import has no local buffer at all for its first tile, so process 0 stops before its transfers
+        // wherever that tile must leave the process or feed a gather, while process 1 waits for its receive, which is
+        // the accepted limit of the PJRT cross-host transfers that `.tasks/plan_placement_decisions.md` records.
         assert_eq!(
             outcomes.join("\n"),
             indoc! {"

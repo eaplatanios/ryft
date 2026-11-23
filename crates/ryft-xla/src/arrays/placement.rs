@@ -276,8 +276,6 @@ pub trait Placeable: Parameter {
     ) -> Result<Self::Output, Error>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: IntoHostArray + Parameter> Placeable for T {
     type Output = Array;
 
@@ -292,17 +290,19 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
         // A host value has no placement to validate and no device buffers to donate or share.
         let _ = (source, donate, may_alias);
         let client = session.client();
+
         // A value without a destination lives on the first device only because nothing chose any, so it is not
         // committed to that device, and operations move it to the devices of their committed inputs. The first device
         // is that of the client whether or not the session has a default mesh, as `jax.device_put` keeps such a value
         // on its default device under `jax.set_mesh`.
         let host = self.into_host_array();
+
         // A host array holds materialized storage, which only a type with static extents can describe.
         let shape = host.r#type().static_shape().unwrap().as_slice().to_vec();
         let element_type = host.r#type().data_type();
 
-        // The upload of a host value onto a destination is the placement of a value that has no tracked sharding and
-        // lives in device memory without a declared layout, which is how a host value is uploaded without a
+        // The upload of a host value onto a destination is the placement of a value that has no tracked sharding
+        // and lives in device memory without a declared layout, which is how a host value is uploaded without a
         // destination, so the type rule of `place` validates the destination against that type before anything is
         // uploaded, except that the destination may split a dimension unevenly (refer to `Session::place`).
         let rank = shape.len();
@@ -311,6 +311,7 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
             let r#type = ArrayType::new_static(element_type, shape.clone());
             PlaceOperation::infer_output_type_allowing_uneven_splits(&r#type, None, Some(target), None)?;
         }
+
         // The upload takes dense row-major bytes, which is how a host array without a layout is stored, so only an
         // array with a layout is decoded into a copy. Its storage can be mutated safely, so the decoding and the upload
         // validate it rather than trust it.
@@ -318,11 +319,12 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
             Some(_) => Cow::Owned(decode_logical_bytes(host.r#type().as_ref(), host.storage_bytes())?),
             None => Cow::Borrowed(host.storage_bytes()),
         };
+
         // An in-place destination names no devices, so it uploads the value to the same device as an upload without
         // a destination, in the storage that it names, and it commits the result like every other destination, as JAX
-        // commits the result of `device_put` onto a memory space.
-        // A value without a destination, or with one that names only its storage, lives on a device that this process
-        // chose on its own (refer to `Array::is_locally_assigned`).
+        // commits the result of `device_put` onto a memory space. A value without a destination, or with one that names
+        // only its storage, lives on a device that this process chose on its own (refer to
+        // `Array::is_locally_assigned`).
         let committed = target.is_some();
         let locally_assigned = matches!(target, None | Some(PlacementRequest::InPlace { .. }));
         let default_device = || -> Result<Device, Error> {
@@ -333,6 +335,7 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
                 .ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
             Ok(Device::from_pjrt(device)?)
         };
+
         let memory = target.as_ref().and_then(PlacementRequest::target_memory).unwrap_or_default();
         let (placement, layout) = match target {
             Some(PlacementRequest::Resolved(placement)) => {
@@ -345,10 +348,12 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
             }
             None => (single_device_placement(default_device()?, rank)?, None),
         };
+
         let r#type = ArrayType::new(element_type, Shape::new(shape.iter().copied().map(Dimension::Static).collect()))
             .with_memory(memory)
             .with_layout(layout);
         let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
+
         Ok(Array::from_host_buffer(session, r#type, mesh, Some(sharding), bytes)?
             .with_committed(committed)
             .with_locally_assigned(locally_assigned))
@@ -373,6 +378,7 @@ impl Placeable for Array {
         let rank = r#type.rank();
         let target = target.map(|target| pad_placement_request(target, rank)).transpose()?;
         let source = source.map(|source| pad_placement_request(source, rank)).transpose()?;
+
         // Runtime sharding supplies the reduction state and shard shapes along auto axes that the type omits.
         PlaceOperation::infer_output_type_allowing_uneven_splits(
             &r#type,
@@ -387,8 +393,9 @@ impl Placeable for Array {
             Some(false) => value.addressable_shards().filter_map(ArrayShard::buffer).map(Arc::downgrade).collect(),
             _ => Vec::new(),
         };
-        // The destination resolves against the array in the one place that also keeps the locally assigned devices of an
-        // array that an in-place destination leaves where it is.
+
+        // The destination resolves against the array in the one place that also keeps the locally assigned devices
+        // of an array that an in-place destination leaves where it is.
         let output = match target {
             Some(target) => value.run_placement_request(session, target, donate)?,
             None => value,
@@ -398,7 +405,7 @@ impl Placeable for Array {
         // shards that stay on their devices. Holding the buffers of this leaf that are still alive makes them shared,
         // so that `into_unaliased` copies exactly those, and not the buffers that the placement created.
         if may_alias == Some(false) {
-            let _buffers = buffers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            let _ = buffers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
             output.into_unaliased()
         } else {
             Ok(output)
@@ -504,6 +511,8 @@ where
         place_traced(self, session, target, source, donate, may_alias)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Leaf of [`Session::place`] that is either a host value or a runtime [`Array`]. A [`Parameterized`] tree has one leaf
 /// type, so a tuple of a host scalar and an [`Array`] is not a tree that [`Session::place`] accepts, whereas a tuple
