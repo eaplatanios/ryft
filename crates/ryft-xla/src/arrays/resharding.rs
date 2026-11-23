@@ -168,9 +168,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, CastOperation, Concatenate, DataType, Device, DeviceMesh, DimensionError, Layout, Memory, MeshAxisType,
-    PLACE_OPERATION_NAME, Placeholder, Placement, PlacementRequest, ProgramError, Sharding, Slice, StaticShape,
-    TiledLayout, TypeError, Typed, UnreducedKind,
+    ArrayType, CastOperation, Concatenate, DataType, Device, DeviceMesh, DimensionError, Layout, LogicalMesh, Memory,
+    MeshAxis, MeshAxisType, PLACE_OPERATION_NAME, Placeholder, Placement, PlacementRequest, ProgramError, Sharding,
+    ShardingDimension, Slice, StaticShape, TiledLayout, TypeError, Typed, UnreducedKind,
 };
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{
@@ -179,8 +179,9 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::host::{
-    HostBufferSlice, PendingHostUpload, ReductionChange, collective_reduction, holds_unreduced_sum_identity,
-    requires_unreduced_sum_identity, run_host_uploads, unreduced_sum_identity, validate_mesh_device_processes,
+    CollectiveReduction, HostBufferSlice, PendingHostUpload, ReductionChange, collective_reduction,
+    holds_unreduced_sum_identity, requires_unreduced_sum_identity, run_host_uploads, unreduced_sum_identity,
+    validate_mesh_device_processes,
 };
 use crate::arrays::metadata::validate_shard_layout;
 use crate::arrays::placement::{resolve_array_placement, single_device_placement};
@@ -1834,15 +1835,39 @@ impl Array {
                 )
                 .map_err(|error| (error, Some(self)))
             }
-            DevicePlacementStrategy::IntroducedSums { first, sharding: first_sharding, axis_indices } => {
-                // The first step places the value with the introduced axes replicated, and this process then gives
-                // its devices away from coordinate zero along them the additive identity. Before the first step has
-                // consumed anything, its error returns this array, and after it, only a source that is not donated.
+            DevicePlacementStrategy::IntroducedSums {
+                mesh: first_mesh,
+                sharding: first_sharding,
+                view,
+                first,
+                axis_indices,
+            } => {
+                // The first step places the value on the devices at coordinate zero along the introduced axes, from
+                // this array or from its restriction to those devices (which holds the same value, and which the
+                // host fallback can read back as well), and this process then gives its other devices the additive
+                // identity. An error of the first step returns its input, and a later one only a source that is not
+                // donated.
                 let source = (!donate).then(|| self.clone());
-                let placed = self.place_with_strategy(*first, mesh, &first_sharding, memory, layout, donate)?;
+                let input = match view {
+                    Some(view) => {
+                        drop(self);
+                        *view
+                    }
+                    None => self,
+                };
+                let placed = match first {
+                    Some(first) => {
+                        input.place_with_strategy(*first, &first_mesh, &first_sharding, memory, layout, donate)?
+                    }
+                    None if input.r#type().memory() == memory && input.layout() == layout => input,
+                    None => match input.restricted_to(&first_mesh) {
+                        Ok(view) => view,
+                        Err(error) => return Err((error, source)),
+                    },
+                };
                 placed
                     .place_storage(memory, layout.cloned())
-                    .and_then(|placed| placed.with_introduced_sums(sharding, &axis_indices))
+                    .and_then(|placed| placed.with_introduced_sums(mesh, sharding, &axis_indices))
                     .map_err(|error| (error, source))
             }
             DevicePlacementStrategy::HostRoundTrip { reason, process_index } => {
@@ -1964,22 +1989,13 @@ impl Array {
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<DevicePlacementStrategy, Error> {
-        // A pending sum that the destination introduces is written as additive identities after a placement without it,
-        // whose own strategy is chosen here as well. That placement keeps every pending sum of this array that the
-        // destination keeps, so it introduces none, and a host round trip of it is the host round trip of the whole.
+        // A pending sum that the destination introduces is written as additive identities after a first step that
+        // places the value without it on the devices at coordinate zero along the introduced axes only.
         let shape = self.shape();
         let introduction =
             split_introduced_sums(self.data_type(), &shape, self.mesh(), self.sharding(), mesh, sharding)?;
         if let Some((first_sharding, axis_indices)) = introduction {
-            let first = self.shared_device_placement_strategy(resolve_layout, mesh, &first_sharding)?;
-            if let DevicePlacementStrategy::HostRoundTrip { .. } = first {
-                return Ok(first);
-            }
-            return Ok(DevicePlacementStrategy::IntroducedSums {
-                first: Box::new(first),
-                sharding: first_sharding,
-                axis_indices,
-            });
+            return self.introduced_sums_strategy(resolve_layout, mesh, &first_sharding, axis_indices);
         }
 
         // Exact shards need the default layout of every shard that crosses processes, between whichever processes it
@@ -2012,17 +2028,7 @@ impl Array {
             return Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts });
         }
         if let Some(reason) = compiled? {
-            // Only one process can read the value back and upload it again, so the host round trip is available only
-            // when every device of both ends belongs to one process.
-            let first_process = self.mesh().devices()[0].process_index();
-            let process_index = self
-                .mesh()
-                .devices()
-                .iter()
-                .chain(mesh.devices())
-                .all(|device| device.process_index() == first_process)
-                .then_some(first_process);
-            return Ok(DevicePlacementStrategy::HostRoundTrip { reason, process_index });
+            return Ok(self.host_round_trip(mesh, reason));
         }
         if self.mesh() == mesh {
             let (input, output) = (self.sharding().clone(), sharding.clone());
@@ -2065,6 +2071,116 @@ impl Array {
         }
         let reshard = ReshardProgram { mesh: mesh.clone(), input: replicated_on_destination, output: sharding.clone() };
         Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard })
+    }
+
+    /// Returns [`DevicePlacementStrategy::HostRoundTrip`] for placing this array on `mesh` for `reason`. Only one process
+    /// can read the value back and upload it again, so the host round trip is available only when every device of
+    /// both ends belongs to one process, which this function names when there is one.
+    fn host_round_trip(&self, mesh: &DeviceMesh, reason: Error) -> DevicePlacementStrategy {
+        let first_process = self.mesh().devices()[0].process_index();
+        let process_index = self
+            .mesh()
+            .devices()
+            .iter()
+            .chain(mesh.devices())
+            .all(|device| device.process_index() == first_process)
+            .then_some(first_process);
+        DevicePlacementStrategy::HostRoundTrip { reason, process_index }
+    }
+
+    /// Chooses [`DevicePlacementStrategy::IntroducedSums`] for placing this array on `mesh` with a sharding that is
+    /// `first_sharding` plus pending sums along the mesh axes at `axis_indices` (refer to [`split_introduced_sums`]).
+    /// Its first step places the value with `first_sharding` on the devices at coordinate zero along those axes only
+    /// (i.e., on [`coordinate_zero_mesh`]), because every other device receives the additive identity and needs
+    /// nothing else. It starts from the first of the following that applies:
+    ///
+    ///   1. **Restriction:** When this array is on `mesh` and replicated along every introduced axis (i.e., no dimension
+    ///      is split along it and it carries no pending reduction there), the shards of its devices at coordinate zero
+    ///      already hold its whole value with the same placement along every other axis, so the first step starts from
+    ///      that restriction (refer to [`Self::restricted_to`]) on the same mesh, which keeps every pending reduction of
+    ///      this array that the destination keeps as a pure move. When the restriction already has `first_sharding`,
+    ///      there is no first step at all, so nothing moves and nothing is compiled.
+    ///   2. **One value per slice:** Otherwise, an array that holds one value per slice is placed from where it is onto
+    ///      the devices at coordinate zero (e.g., with exact shards or shard regions, which move only what those
+    ///      devices need, or a gather and copies of the gathered value to those devices).
+    ///   3. **Destination mesh:** Otherwise (i.e., an array with a pending reduction that it does not hold replicated
+    ///      along the introduced axes, such as a pending maximum along one of them), the first step places the value
+    ///      on all of `mesh` with the introduced axes replicated, whose strategy keeps or completes the pending
+    ///      reductions of this array as a placement without introduced sums does, and the devices away from coordinate
+    ///      zero then discard what they received.
+    ///
+    /// A host round trip of the first step is a host round trip of the whole placement. The choice reads only the
+    /// metadata that every process shares, and a process that owns no device at coordinate zero takes part only in
+    /// what the first step plans for it (e.g., the sends of its shards to those devices).
+    fn introduced_sums_strategy(
+        &self,
+        resolve_layout: &CrossHostLayoutResolver<'_>,
+        mesh: &DeviceMesh,
+        first_sharding: &Sharding,
+        axis_indices: Vec<usize>,
+    ) -> Result<DevicePlacementStrategy, Error> {
+        let introduced = axis_indices.iter().map(|&index| mesh.logical_mesh().axes()[index].name()).collect::<Vec<_>>();
+        let replicated_along_introduced_axes = self.mesh() == mesh
+            && introduced.iter().all(|axis| {
+                !self.sharding().unreduced_axes().contains(*axis)
+                    && !self.sharding().dimensions().iter().any(|dimension| match dimension {
+                        ShardingDimension::Sharded(axes) => axes.iter().any(|name| name == axis),
+                        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+                    })
+            });
+        let (first_mesh, first_sharding, view, first) = if replicated_along_introduced_axes {
+            let first_mesh = coordinate_zero_mesh(mesh, &axis_indices)?;
+            let first_sharding = sharding_on_mesh(first_sharding, first_mesh.logical_mesh())?;
+            if sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())? == first_sharding {
+                (first_mesh, first_sharding, None, None)
+            } else {
+                let view = self.restricted_to(&first_mesh)?;
+                let first = view.shared_device_placement_strategy(resolve_layout, &first_mesh, &first_sharding)?;
+                (first_mesh, first_sharding, Some(Box::new(view)), Some(first))
+            }
+        } else if holds_one_value_per_slice(self.sharding()) {
+            let first_mesh = coordinate_zero_mesh(mesh, &axis_indices)?;
+            let first_sharding = sharding_on_mesh(first_sharding, first_mesh.logical_mesh())?;
+            let first = self.shared_device_placement_strategy(resolve_layout, &first_mesh, &first_sharding)?;
+            (first_mesh, first_sharding, None, Some(first))
+        } else {
+            let first = self.shared_device_placement_strategy(resolve_layout, mesh, first_sharding)?;
+            (mesh.clone(), first_sharding.clone(), None, Some(first))
+        };
+        if let Some(DevicePlacementStrategy::HostRoundTrip { reason, .. }) = first {
+            return Ok(self.host_round_trip(mesh, reason));
+        }
+        Ok(DevicePlacementStrategy::IntroducedSums {
+            mesh: first_mesh,
+            sharding: first_sharding,
+            view,
+            first: first.map(Box::new),
+            axis_indices,
+        })
+    }
+
+    /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
+    /// of this array with some axes of size one (refer to [`coordinate_zero_mesh`]), along which this array must be
+    /// replicated, so that the shards of those devices hold its whole value. The result shares the buffers of those
+    /// devices, has the sharding of this array over `mesh`, and keeps the fences, the commitment, and the locally
+    /// assigned devices of this array. Nothing moves.
+    fn restricted_to(&self, mesh: &DeviceMesh) -> Result<Self, Error> {
+        let sharding = sharding_on_mesh(self.sharding(), mesh.logical_mesh())?;
+        let r#type = self.r#type().into_owned().with_sharding(None)?;
+        let buffers = self
+            .addressable_shards()
+            .filter(|shard| mesh.devices().contains(&shard.device()))
+            .filter_map(|shard| shard.buffer().cloned())
+            .collect();
+        let array =
+            Self::from_addressable_buffers_internal(self.session(), r#type, Some(sharding), mesh.clone(), buffers, false)?;
+        Ok(Self {
+            execution_fence: self.execution_fence.clone(),
+            send_fence: self.send_fence.clone(),
+            committed: self.committed,
+            locally_assigned: self.locally_assigned,
+            ..array
+        })
     }
 
     /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, which
@@ -2246,40 +2362,46 @@ impl Array {
         })
     }
 
-    /// Returns this array with the pending sums that `sharding` introduces, which is the sharding of this array with the
-    /// mesh axes at `axis_indices` added to its unreduced axes, where this array is replicated along those axes (i.e.,
-    /// the first step of [`DevicePlacementStrategy::IntroducedSums`]). The devices of this process at coordinate zero
-    /// along all of those axes keep their buffers, and each of its other devices receives a new buffer of the additive
-    /// identity of the data type (refer to [`unreduced_sum_identity`]), uploaded from the host in the memory and the
-    /// declared layout of this array and with the static shape of its shard, as a cross-host receive allocates it, so
-    /// the summands add up to the value of this array bit for bit, as a host upload with `sharding` splits a value.
-    /// Only metadata that every process shares decides which devices hold an identity, and each process uploads only to
-    /// its own devices, so no process waits for another. Nothing is read back and nothing is compiled.
+    /// Returns the array on `mesh` with `sharding` whose devices at coordinate zero along the mesh axes at
+    /// `axis_indices` hold the buffers that this array holds on the same devices, and whose other devices hold the
+    /// additive identity of the data type, which is how [`DevicePlacementStrategy::IntroducedSums`] ends. This array is
+    /// the result of its first step (or the source itself when there is none), which holds the value without the sums
+    /// that `sharding` introduces along those axes on at least the devices at coordinate zero (i.e., on
+    /// [`coordinate_zero_mesh`], or on `mesh` with those axes replicated). Each other device of this process receives a
+    /// new buffer of the identity (refer to [`unreduced_sum_identity`]), uploaded from the host in the memory and the
+    /// declared layout of this array and with the static shape of its destination shard, as a cross-host receive
+    /// allocates it, so the summands add up to the value of this array bit for bit, as a host upload with `sharding`
+    /// splits a value. Only metadata that every process shares decides which devices hold an identity, and each process
+    /// uploads only to its own devices, so no process waits for another. Nothing is read back and nothing is compiled.
     ///
     /// The result has the type, the commitment, and the locally assigned devices of this array, and its execution fence
     /// joins the fence of this array with the readiness of every identity buffer, so that its readbacks and readiness
     /// functions report a failed upload, and it keeps the send fence of this array. A buffer that this array shares
     /// with its source stays shared only on the devices at coordinate zero, and the identity buffers alias nothing.
-    fn with_introduced_sums(self, sharding: &Sharding, axis_indices: &[usize]) -> Result<Self, Error> {
+    fn with_introduced_sums(self, mesh: &DeviceMesh, sharding: &Sharding, axis_indices: &[usize]) -> Result<Self, Error> {
         let session = self.session().clone();
-        let mesh = self.mesh().clone();
+        let client = session.client();
+        let process_index = client.process_index()?;
         let r#type = self.r#type().into_owned().with_sharding(None)?;
         let data_type = r#type.data_type();
         let buffer_type = data_type.executable_buffer_type();
         let device_layout = r#type.layout().map(ToPjrt::to_pjrt).transpose()?;
+        let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
+        let held = self
+            .addressable_shards()
+            .filter_map(|shard| shard.buffer().map(|buffer| (shard.device().id(), buffer)))
+            .collect::<HashMap<_, _>>();
+        let mut devices = None;
         let mut work = session.reserve_work();
         let mut completion = PlacementCompletion::default();
         let mut identities = Vec::<(usize, Arc<[u8]>)>::new();
         let mut buffers = Vec::new();
-        for shard in self.addressable_shards() {
-            let Some(buffer) = shard.buffer() else {
-                return Err(ArrayError::MissingShardBuffer {
-                    shard_index: shard.index(),
-                    device_id: shard.device().id(),
-                }
-                .into());
-            };
-            if !holds_unreduced_sum_identity(&mesh, shard.descriptor(), axis_indices) {
+        for shard in layout.descriptors().iter().filter(|shard| shard.device().process_index() == process_index) {
+            let device_id = shard.device().id();
+            if !holds_unreduced_sum_identity(mesh, shard, axis_indices) {
+                let buffer = held.get(&device_id).ok_or_else(|| {
+                    Error::from(ArrayError::MissingShardBuffer { shard_index: shard.index(), device_id })
+                })?;
                 buffers.push(Arc::clone(buffer));
                 continue;
             }
@@ -2301,17 +2423,31 @@ impl Array {
                     identity
                 }
             };
+            if devices.is_none() {
+                let mut by_id = HashMap::new();
+                for device in client.addressable_devices()? {
+                    by_id.insert(device.id()?, device);
+                }
+                devices = Some(by_id);
+            }
+            let device = devices.as_ref().and_then(|devices| devices.get(&device_id)).ok_or_else(|| {
+                Error::from(ArrayError::NonAddressableDevice { device_id, process_index })
+            })?;
             let dimensions = shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let device = buffer.device()?;
             let memory = device.memory(r#type.memory())?;
-            let uploaded =
-                session.client().buffer(identity, buffer_type, dimensions, None, memory, device_layout.clone())?;
+            let uploaded = client.buffer(identity, buffer_type, dimensions, None, memory, device_layout.clone())?;
             work.track_buffer(&uploaded);
             completion.track_buffer(&uploaded)?;
             buffers.push(Arc::new(uploaded));
         }
-        let mut output =
-            Self::from_addressable_buffers_internal(&session, r#type, Some(sharding.clone()), mesh, buffers, false)?;
+        let mut output = Self::from_addressable_buffers_internal(
+            &session,
+            r#type,
+            Some(sharding.clone()),
+            mesh.clone(),
+            buffers,
+            false,
+        )?;
         output.execution_fence = completion.join(self.execution_fence.clone());
         output.send_fence = self.send_fence.clone();
         Ok(output.with_committed(self.is_committed()).with_locally_assigned(self.is_locally_assigned()))
@@ -2436,18 +2572,26 @@ enum DevicePlacementStrategy {
         reshard: ReshardProgram,
     },
 
-    /// Places an array with `first` according to `sharding`, which is the destination sharding without the pending sums
-    /// that the destination introduces, and then gives the devices away from coordinate zero along the introduced mesh
-    /// axes (at `axis_indices` within the mesh) the additive identity of the data type, which each process uploads to
-    /// its own devices (refer to [`split_introduced_sums`] and [`Array::with_introduced_sums`]). The devices at
-    /// coordinate zero along all of them keep the value. This involves no arithmetic of XLA, so it introduces a pending
-    /// sum bit for bit for every data type that has an additive identity, also over devices of several processes.
+    /// Places an array on the devices at coordinate zero along the introduced mesh axes (at `axis_indices` within the
+    /// destination mesh) according to the destination sharding without the pending sums that the destination
+    /// introduces, and then gives the other devices of the destination the additive identity of the data type, which
+    /// each process uploads to its own devices (refer to [`Array::introduced_sums_strategy`] and
+    /// [`Array::with_introduced_sums`]). This involves no arithmetic of XLA, so it introduces a pending sum bit for bit
+    /// for every data type that has an additive identity, also over devices of several processes.
     IntroducedSums {
-        /// Strategy of the placement according to `sharding`, which is never a host round trip.
-        first: Box<DevicePlacementStrategy>,
+        /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
+        /// to [`coordinate_zero_mesh`]), or the destination mesh when the array cannot be placed there directly.
+        mesh: DeviceMesh,
 
-        /// Destination sharding without the pending sums that the destination introduces.
+        /// Destination sharding without the pending sums that the destination introduces, over `mesh`.
         sharding: Sharding,
+
+        /// Restriction of the array to `mesh` that `first` starts from (refer to [`Array::restricted_to`]), if any.
+        view: Option<Box<Array>>,
+
+        /// Strategy of the first step, which is never a host round trip, or [`None`] when the restriction of the array
+        /// to `mesh` already has `sharding`.
+        first: Option<Box<DevicePlacementStrategy>>,
 
         /// Indices within the destination mesh of the axes along which the destination introduces a pending sum.
         axis_indices: Vec<usize>,
@@ -3182,6 +3326,46 @@ fn split_introduced_sums(
     Ok(Some((first, axis_indices)))
 }
 
+/// Returns the mesh of the devices of `mesh` at coordinate zero along its axes at `axis_indices`, in the order of
+/// `mesh`, whose logical mesh is that of `mesh` with those axes of size one, so that every sharding over `mesh` that
+/// neither splits a dimension along those axes nor reduces over them places a value on it as on those devices of `mesh`
+/// (refer to [`sharding_on_mesh`]). It is `mesh` itself when those axes have size one already.
+fn coordinate_zero_mesh(mesh: &DeviceMesh, axis_indices: &[usize]) -> Result<DeviceMesh, Error> {
+    let axes = mesh
+        .logical_mesh()
+        .axes()
+        .iter()
+        .enumerate()
+        .map(|(index, axis)| {
+            if axis_indices.contains(&index) { MeshAxis::new(axis.name(), 1, axis.r#type()) } else { Ok(axis.clone()) }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let devices = mesh
+        .devices()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            mesh.device_coordinates(*index)
+                .is_some_and(|coordinates| axis_indices.iter().all(|&axis| coordinates[axis] == 0))
+        })
+        .map(|(_, device)| *device)
+        .collect();
+    Ok(DeviceMesh::new(LogicalMesh::new(axes)?, devices)?)
+}
+
+/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with the
+/// same names and types, some of which may have another size (e.g., the logical mesh of [`coordinate_zero_mesh`]),
+/// with the same placement, reduction state, and manual variation. Unlike [`Sharding::with_mesh`], which requires the
+/// same topology, this lets a sharding that splits no dimension along a resized axis describe the same shards on the
+/// devices that remain.
+fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, Error> {
+    Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
+        .with_unreduced_axes(sharding.unreduced_axes().clone())?
+        .with_unreduced_kind(sharding.unreduced_kind())?
+        .with_reduced_axes(sharding.reduced_axes().clone())?
+        .with_varying_manual_axes(sharding.varying_manual_axes().clone())?)
+}
+
 /// Validates that a compiled reshard on `mesh` (refer to [`ReshardProgram`]) takes a value of `data_type` placed as
 /// `input` to `output` with the value that the meaning of its reduction state gives, as far as the reduction state
 /// (refer to [`ReductionState`]) along each non-manual mesh axis goes. That meaning is owned by
@@ -3191,8 +3375,7 @@ fn split_introduced_sums(
 /// that collective computes that meaning up to that contract, which is the case as follows.
 ///
 ///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
-///     [`CollectiveReduction::Exact`](crate::arrays::host::CollectiveReduction::Exact) (a maximum or minimum that
-///     drops NaN values is not).
+///     [`CollectiveReduction::Exact`] (a maximum or minimum that drops NaN values is not).
 ///   - **Introducing a pending sum:** No program of a placement does, because the planner introduces pending sums with
 ///     additive identities after a placement without them (refer to [`split_introduced_sums`]), so `output` must not
 ///     introduce one, and only the completion of a pending reduction of `input` along such an axis is validated.
@@ -3213,6 +3396,9 @@ fn validate_reduction_transition(
     input: &Sharding,
     output: &Sharding,
 ) -> Option<Error> {
+    // Each class of decline names what the user can do where no single process owns both ends.
+    let host = "the host round trip that makes it exactly needs one process that owns every device of the source and \
+                of the destination";
     for axis in mesh.logical_mesh().axes() {
         let (from, to) = (ReductionState::of(input, axis.name()), ReductionState::of(output, axis.name()));
         if axis.r#type() == MeshAxisType::Manual || from == to {
@@ -3220,24 +3406,39 @@ fn validate_reduction_transition(
         }
         let completion = match from {
             ReductionState::Unreduced(kind) if axis.size() > 1 => {
-                collective_reduction(data_type, ReductionChange::Complete(kind)).reason()
+                match collective_reduction(data_type, ReductionChange::Complete(kind)) {
+                    CollectiveReduction::DropsNan => Some((
+                        CollectiveReduction::DropsNan.reason().unwrap_or_default(),
+                        "complete the reduction while the devices of one process hold the value, or in a compiled \
+                         program, which drops NaN values as the collective does",
+                    )),
+                    classification => classification.reason().map(|reason| {
+                        (
+                            reason,
+                            "complete the reduction while the devices of one process hold the value, or in another \
+                             data type",
+                        )
+                    }),
+                }
             }
             _ => None,
         };
-        let reason = match (completion, to) {
-            (Some(reason), _) => Some(reason),
+        let decline = match (completion, to) {
+            (Some(decline), _) => Some(decline),
             (None, ReductionState::Unreduced(kind @ (UnreducedKind::Max | UnreducedKind::Min))) => {
-                collective_reduction(data_type, ReductionChange::Introduce(kind)).reason()
+                collective_reduction(data_type, ReductionChange::Introduce(kind)).reason().map(|reason| {
+                    let remedy = "make this placement where one process owns every device of the source and of the \
+                                  destination";
+                    (reason, remedy)
+                })
             }
             _ => None,
         };
-        if let Some(reason) = reason {
+        if let Some((reason, remedy)) = decline {
             return Some(Error::from(ProgramError::UnsupportedOperation {
                 message: format!(
                     "cannot take `{data_type}` values from {from} to {to} along mesh axis `{}` on the devices, because \
-                     {reason}, and the host round trip that takes them exactly needs one process that owns every device \
-                     of the source and of the destination; complete the reduction while the devices of one process \
-                     hold the value, or in another data type",
+                     {reason}, and {host}; {remedy}",
                     axis.name(),
                 ),
             }));
@@ -3470,9 +3671,12 @@ mod tests {
                     Some(replicas),
                     gather.iter().chain([reshard]).collect(),
                 ),
-                DevicePlacementStrategy::IntroducedSums { first, .. } => {
+                DevicePlacementStrategy::IntroducedSums { first: Some(first), .. } => {
                     let (name, plan, programs) = work(first);
                     (format!("{name} with additive identities"), plan, programs)
+                }
+                DevicePlacementStrategy::IntroducedSums { first: None, .. } => {
+                    ("additive identities".to_string(), None, Vec::new())
                 }
                 DevicePlacementStrategy::HostRoundTrip { .. } => ("host round trip".to_string(), None, Vec::new()),
             }
@@ -4446,9 +4650,13 @@ mod tests {
         .unwrap()
         .map(|(first, axis_indices)| (first.to_string(), axis_indices));
         assert_eq!(empty, Some((replicated.to_string(), vec![0])));
-        let remedy = "and the host round trip that takes them exactly needs one process that owns every device of the \
-                      source and of the destination; complete the reduction while the devices of one process hold the \
-                      value, or in another data type";
+        let host = "and the host round trip that makes it exactly needs one process that owns every device of the \
+                    source and of the destination";
+        let complete = "complete the reduction while the devices of one process hold the value, or in another data \
+                        type";
+        let compiled = "complete the reduction while the devices of one process hold the value, or in a compiled \
+                        program, which drops NaN values as the collective does";
+        let anywhere = "make this placement where one process owns every device of the source and of the destination";
         assert_eq!(
             [
                 decide(DataType::U1, &mesh, &pending(UnreducedKind::Sum), &replicated),
@@ -4471,37 +4679,38 @@ mod tests {
                 format!(
                     "host round trip: cannot take `u1` values from a pending `sum` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA adds one-bit integers as predicates (i.e., with a \
-                     logical or), while their sum wraps around, {remedy}"
+                     logical or), while their sum wraps around, {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `i1` values from a pending `max` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA orders one-bit integers as predicates, which puts \
-                     `-1` above `0`, {remedy}"
+                     `-1` above `0`, {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `u2` values from a pending `sum` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA does not compile reductions of two-bit integers, \
-                     {remedy}"
+                     {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `f6e2m3fn` values from a pending `sum` reduction to no reduction \
                      state along mesh axis `x` on the devices, because XLA does not compile reductions of six-bit \
-                     floating point values, {remedy}"
+                     floating point values, {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `f8e8m0fnu` values from a pending `sum` reduction to no reduction \
-                     state along mesh axis `x` on the devices, because XLA does not add `f8e8m0fnu` values as the \
-                     format does (e.g., `2^-127 + 2^-127` gives NaN), {remedy}"
+                     state along mesh axis `x` on the devices, because the arithmetic of XLA for `f8e8m0fnu` values, in \
+                     any compiled program, is not that of the host readback that defines the value (e.g., `2^-127 + \
+                     2^-127` gives NaN in XLA), {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `c64` values from a pending `min` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA has no maximum or minimum reduction of complex \
-                     values, {remedy}"
+                     values, {host}; {complete}"
                 ),
                 format!(
                     "host round trip: cannot take `f32` values from a pending `max` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA's maximum and minimum reductions drop NaN values, \
-                     which the maximum and minimum of a compiled program propagate, {remedy}"
+                     which the maximum and minimum of a compiled program propagate, {host}; {compiled}"
                 ),
                 "compiled reshard".to_string(),
                 "additive identities".to_string(),
@@ -4510,15 +4719,14 @@ mod tests {
                 format!(
                     "host round trip: cannot take `f32` values from a pending `max` reduction to no reduction state \
                      along mesh axis `x` on the devices, because XLA's maximum and minimum reductions drop NaN values, \
-                     which the maximum and minimum of a compiled program propagate, {remedy}"
+                     which the maximum and minimum of a compiled program propagate, {host}; {compiled}"
                 ),
                 format!(
                     "host round trip: cannot take `i32` values from no reduction state to a pending `max` reduction \
                      along mesh axis `x` on the devices, because XLA can only introduce a pending `sum` reduction, \
-                     {remedy}"
+                     {host}; {anywhere}"
                 ),
-                "error: type `f8e8m0fnu` has no additive identity to split a host value into summands along unreduced \
-                 axes"
+                "error: type `f8e8m0fnu` has no additive identity to split a value into summands along unreduced axes"
                     .to_string(),
             ]
             .join("\n"),
@@ -5011,7 +5219,7 @@ mod tests {
             assert_eq!(outcomes_by_axis_type[0], outcomes_by_axis_type[1], "{data_type}");
             rows.extend(outcomes_by_axis_type.swap_remove(0));
         }
-        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a host value into summands along \
+        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
                                 unreduced axes";
         assert_eq!(
             rows.join("\n"),

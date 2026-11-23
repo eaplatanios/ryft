@@ -7,7 +7,7 @@
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -858,25 +858,29 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
 }
 
 /// Returns `sharding`, the placement with which an argument arrives at a function (e.g., an input sharding override),
-/// as the body of the function holds that argument once it has entered: without its pending reductions over auto mesh
-/// axes, which no value of a program carries, because types never record them. The lowering of the entry function
-/// completes such a reduction where the argument enters (refer to the lowering of entry arguments in
-/// `crate::lowering`), so the body of a function, and every result that returns the argument, holds the completed
-/// value. The lowering of a nested call and the region replay of its callee receive an operand at this sharding for
-/// the same reason (refer to [`JitCallOperation::boundary_input_sharding`]), and a pending reduction that a type records
-/// (i.e., over explicit or manual mesh axes) is kept. A sharding without pending reductions over auto mesh axes, which
-/// is the common case, is returned without a copy.
+/// as the body of the function holds that argument once it has entered: without its reduction state over auto mesh
+/// axes (i.e., its pending reductions and its completed-reduction markers over them), which no value of a program
+/// carries, because types never record reduction state over auto mesh axes. The lowering of the entry function
+/// completes such a pending reduction where the argument enters (refer to the lowering of entry arguments in
+/// `crate::lowering`), and a completed-reduction marker states nothing about the buffers, so the body of a function,
+/// and every result that returns the argument, holds the completed value without either. The lowering of a nested
+/// call and the region replay of its callee receive an operand at this sharding for the same reason (refer to
+/// [`JitCallOperation::boundary_input_sharding`]). The dimensions, including their splits along auto mesh axes, and the
+/// reduction state that a type records (i.e., over explicit or manual mesh axes) are kept, unlike
+/// [`Sharding::without_auto_axes`], which also drops the splits along auto mesh axes. A sharding without reduction state
+/// over auto mesh axes, which is the common case, is returned without a copy.
 ///
 /// # Errors
 ///
-/// Returns the error of removing the unreduced axes from `sharding`, which never fails for a valid sharding.
+/// Returns the error of removing the axes from `sharding`, which never fails for a valid sharding.
 pub(crate) fn entered_argument_sharding(sharding: &Sharding) -> Result<Cow<'_, Sharding>, Error> {
-    let is_auto = |axis: &&String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
-    if !sharding.unreduced_axes().iter().any(|axis| is_auto(&axis)) {
+    let is_auto = |axis: &String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
+    if !sharding.unreduced_axes().iter().chain(sharding.reduced_axes()).any(is_auto) {
         return Ok(Cow::Borrowed(sharding));
     }
-    let unreduced_axes = sharding.unreduced_axes().iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
-    Ok(Cow::Owned(sharding.clone().with_unreduced_axes(unreduced_axes)?))
+    let kept = |axes: &BTreeSet<String>| axes.iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
+    let unreduced = sharding.clone().with_unreduced_axes(kept(sharding.unreduced_axes()))?;
+    Ok(Cow::Owned(unreduced.with_reduced_axes(kept(sharding.reduced_axes()))?))
 }
 
 /// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
@@ -1494,7 +1498,10 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                 }
                 if !use_shardy_partitioner && mesh.devices().len() > 1 {
                     // The effective boundary of an input is its override or otherwise where the executable of the
-                    // callee places it (refer to `JitCallOperation::boundary_input_sharding`).
+                    // callee places it (refer to `JitCallOperation::boundary_input_sharding`), and the lowering of the
+                    // call constrains the operand to it as the callee holds it once it has entered, without reduction
+                    // state over auto mesh axes (refer to `entered_argument_sharding`), which is what the replicas
+                    // must enforce.
                     let callee = region.with_id(instruction.regions()[0])?;
                     let mut shardings = Vec::new();
                     for (index, (input, declared)) in
@@ -1503,7 +1510,7 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                         if let Type::Array(actual) = region.atoms()[input.index()].r#type().as_ref()
                             && let Some(sharding) = call.boundary_input_sharding(index, actual, declared)
                         {
-                            shardings.push(sharding.into_owned());
+                            shardings.push(entered_argument_sharding(&sharding)?.into_owned());
                         }
                     }
                     shardings.extend(

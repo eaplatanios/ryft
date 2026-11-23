@@ -234,25 +234,22 @@ impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Sour
 /// crate can find (i.e., [`Array`]s, [`Value`]s, host arrays of the reference backend, and the traced values above),
 /// so that a traced leaf over arrays of another PJRT client or of another session can be rejected.
 ///
-/// [`Placeable::place`] is the per-leaf primitive of [`Session::place`], like
-/// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding. It takes the leaf as an
-/// ordinary first argument instead of a receiver, so that it does not shadow [`Place::place`](ryft_core::Place::place)
-/// on traced values. Call it as `P::place(leaf, session, ...)`.
+/// [`Placeable::place_parameter`] is the per-leaf primitive of [`Session::place`], like
+/// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding.
 pub trait Placeable: Parameter {
     /// Leaf type that placing this leaf produces, which is [`Array`] for host values and runtime arrays, and the leaf
     /// type itself for traced values.
     type Output: Parameter;
 
-    /// Places `value` using the provided leafwise placement options. [`Session::place`] checks the donation and
+    /// Places this leaf using the provided leafwise placement options. [`Session::place`] checks the donation and
     /// aliasing options of every leaf before it places any leaf, so implementations can assume that `donate` is
     /// `false` whenever `may_alias` is `Some(true)`. The rank of a sharding and other checks that depend on the
     /// leaf are handled by the implementation of this function.
     ///
     /// # Parameters
     ///
-    ///   - `value`: Leaf to place.
-    ///   - `session`: [`Session`] that provides the PJRT client used to materialize any needed destination buffers and
-    ///     the cache of any compiled reshard executables.
+    ///   - `session`: Destination [`Session`] that supplies the PJRT client and reshard cache. It also identifies
+    ///     the session of concrete arrays that a traced leaf may wrap.
     ///   - `target`: Destination placement for this leaf, if one was specified.
     ///   - `source`: Source placement for this leaf, if one was specified.
     ///   - `donate`: Whether a compiled reshard may reuse the buffers of this leaf for the result.
@@ -269,8 +266,8 @@ pub trait Placeable: Parameter {
     /// execute or to stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`] reject for a
     /// traced leaf). The leaf is consumed either way, and [`Session::place`] returns the first error of any leaf as
     /// its own, after the leaves before it were placed.
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
@@ -284,8 +281,8 @@ pub trait Placeable: Parameter {
 impl<T: IntoHostArray + Parameter> Placeable for T {
     type Output = Array;
 
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
@@ -299,7 +296,7 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
         // committed to that device, and operations move it to the devices of their committed inputs. The first device
         // is that of the client whether or not the session has a default mesh, as `jax.device_put` keeps such a value
         // on its default device under `jax.set_mesh`.
-        let host = value.into_host_array();
+        let host = self.into_host_array();
         // A host array holds materialized storage, which only a type with static extents can describe.
         let shape = host.r#type().static_shape().unwrap().as_slice().to_vec();
         let element_type = host.r#type().data_type();
@@ -361,8 +358,8 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
 impl Placeable for Array {
     type Output = Array;
 
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
@@ -371,7 +368,7 @@ impl Placeable for Array {
     ) -> Result<Array, Error> {
         // The result belongs to `session` even when it is this leaf or shares its buffers, so associate the leaf with
         // `session` first, which also rejects an array of another PJRT client.
-        let value = value.with_session(session)?;
+        let value = self.with_session(session)?;
         let r#type = value.r#type();
         let rank = r#type.rank();
         let target = target.map(|target| pad_placement_request(target, rank)).transpose()?;
@@ -416,15 +413,15 @@ where
     type Output = Self;
 
     #[inline]
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self, Error> {
-        place_traced(value, session, target, source, donate, may_alias)
+        place_traced(self, session, target, source, donate, may_alias)
     }
 }
 
@@ -436,15 +433,15 @@ where
     type Output = Self;
 
     #[inline]
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self, Error> {
-        place_traced(value, session, target, source, donate, may_alias)
+        place_traced(self, session, target, source, donate, may_alias)
     }
 }
 
@@ -456,15 +453,15 @@ where
     type Output = Self;
 
     #[inline]
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self, Error> {
-        place_traced(value, session, target, source, donate, may_alias)
+        place_traced(self, session, target, source, donate, may_alias)
     }
 }
 
@@ -476,15 +473,15 @@ where
     type Output = Self;
 
     #[inline]
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self, Error> {
-        place_traced(value, session, target, source, donate, may_alias)
+        place_traced(self, session, target, source, donate, may_alias)
     }
 }
 
@@ -496,15 +493,15 @@ where
     type Output = Self;
 
     #[inline]
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self, Error> {
-        place_traced(value, session, target, source, donate, may_alias)
+        place_traced(self, session, target, source, donate, may_alias)
     }
 }
 
@@ -562,17 +559,17 @@ impl From<Array> for HostOrArray {
 impl Placeable for HostOrArray {
     type Output = Array;
 
-    fn place(
-        value: Self,
+    fn place_parameter(
+        self,
         session: &Session,
         target: Option<PlacementRequest>,
         source: Option<PlacementRequest>,
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array, Error> {
-        match value {
-            Self::Host(value) => <CoreArray as Placeable>::place(value, session, target, source, donate, may_alias),
-            Self::Array(value) => <Array as Placeable>::place(value, session, target, source, donate, may_alias),
+        match self {
+            Self::Host(value) => value.place_parameter(session, target, source, donate, may_alias),
+            Self::Array(value) => value.place_parameter(session, target, source, donate, may_alias),
         }
     }
 }
@@ -772,9 +769,8 @@ impl Session {
     /// [`PlacementRequest::InPlace`] destination or source that names neither a memory nor a
     /// layout, with a [`TypeError`] whose message is that of the type rule of [`PlaceOperation`] for such a target or
     /// source, whereas one that names a memory or a layout is accepted on every path. Any other error belongs to one
-    /// leaf (refer to [`Placeable::place`]), and it is returned when that leaf is placed, after the leaves before it
-    /// were placed. Their results are dropped, but the transfers and donations that placing them started are not
-    /// undone.
+    /// leaf (refer to [`Placeable::place_parameter`]) and is returned after the preceding leaves have been placed.
+    /// Placement drops those results and leaves already submitted transfers and donations to complete.
     pub fn place<
         P: Placeable,
         Input: Parameterized<P>,
@@ -856,8 +852,7 @@ impl Session {
         let mut donate_values = donate_values.into_iter();
         let mut may_alias_values = may_alias_values.into_iter();
         for parameter in x.into_parameters() {
-            output_parameters.push(P::place(
-                parameter,
+            output_parameters.push(parameter.place_parameter(
                 self,
                 target_values.next().unwrap(),
                 source_values.next().unwrap(),
@@ -1103,9 +1098,8 @@ fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(),
     Ok(())
 }
 
-/// Places the traced `value` through its [`PlaceDispatch`] primitive. This implements [`Placeable::place`] for every traced
-/// value type, so that they all handle the placement options identically (refer to [`Session::place`] for the resulting
-/// behavior).
+/// Places the traced `value` through its [`PlaceDispatch`] primitive. This implements [`Placeable::place_parameter`]
+/// for every traced value type so they all handle placement options identically (refer to [`Session::place`]).
 ///
 /// Every destination and source is staged in the form that it was given,
 /// whether or not `value` wraps a concrete array, so a bare device stays a [`PlacementRequest::Device`] and a bare

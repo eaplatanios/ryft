@@ -50,7 +50,7 @@ use ryft_mlir::{
     TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder, WalkResult,
 };
 
-use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
+use crate::arrays::host::{CollectiveReduction, ReductionChange, collective_reduction, compiled_reduction_rejection};
 use crate::devices::MemoryExtension;
 use crate::lowering::compositions::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
@@ -2014,14 +2014,15 @@ pub(crate) fn entry_boundary_sharding(sharding: &Sharding) -> Result<Sharding, E
 /// placement. Provided overrides are not checked against `output_types`, so that a count mismatch is still reported
 /// when the module is lowered.
 ///
-/// A placement that the program gives a result never keeps a pending reduction that the result type does not record
-/// (i.e., one over auto mesh axes). No value of a program carries such a reduction: an argument whose input sharding
-/// override states one is reduced where it enters the program (refer to the lowering of entry arguments, which
-/// constrains it to its placement with only the unreduced axes that its type records), so a result that returns that
-/// argument, directly, through operations that keep its placement, or through a call whose boundary states the
-/// reduction, returns the reduced value. Annotating the result with the placement of the argument as it arrives would
-/// instead make the executable introduce the pending reduction again, and return an array whose runtime sharding
-/// states a reduction that its type does not record and that every consumer of the array rejects.
+/// A placement that the program gives a result never keeps reduction state that the result type does not record (i.e.,
+/// a pending reduction or a completed-reduction marker over auto mesh axes). No value of a program carries such state:
+/// an argument whose input sharding override states a pending reduction is reduced where it enters the program (refer
+/// to the lowering of entry arguments, which constrains it to its placement with only the unreduced axes that its type
+/// records), and a marker states nothing about the buffers, so a result that returns that argument, directly, through
+/// operations that keep its placement, or through a call whose boundary states the state, returns the completed value.
+/// Annotating the result with the placement of the argument as it arrives would instead make the executable introduce
+/// the pending reduction again, and return an array whose runtime sharding states a reduction that its type does not
+/// record and that every consumer of the array rejects, or whose marker makes every consumer move it again.
 pub(crate) fn entry_result_shardings(
     output_types: &[ArrayType],
     result_shardings: Option<&[Sharding]>,
@@ -2041,11 +2042,14 @@ pub(crate) fn entry_result_shardings(
                     }
                     None => None,
                 };
-                let recorded_axes = output_type.unreduced_axes();
+                let (unreduced_axes, reduced_axes) = (output_type.unreduced_axes(), output_type.reduced_axes());
                 match placement {
-                    Some(sharding) if sharding.unreduced_axes().iter().any(|axis| !recorded_axes.contains(axis)) => {
-                        let reduced = sharding.clone().with_unreduced_axes(recorded_axes.iter().cloned())?;
-                        entry_boundary_sharding(&reduced).map(Some)
+                    Some(sharding)
+                        if sharding.unreduced_axes().iter().any(|axis| !unreduced_axes.contains(axis))
+                            || sharding.reduced_axes().iter().any(|axis| !reduced_axes.contains(axis)) =>
+                    {
+                        let unreduced = sharding.clone().with_unreduced_axes(unreduced_axes.iter().cloned())?;
+                        entry_boundary_sharding(&unreduced.with_reduced_axes(reduced_axes.iter().cloned())?).map(Some)
                     }
                     placement => placement.or(output_type.sharding()).map(entry_boundary_sharding).transpose(),
                 }
@@ -2955,9 +2959,15 @@ fn validate_pending_reduction_change<'a, I: IntoIterator<Item = &'a String>>(
     let Some(reason) = compiled_reduction_rejection(data_type, change) else {
         return Ok(());
     };
-    // A placement of a concrete array introduces a pending sum exactly on every mesh, while it completes a reduction
-    // exactly with a host round trip only where one process owns every device of the array and of the destination.
+    // A placement of a concrete array introduces a pending sum exactly on every mesh, except for a data type without an
+    // additive identity, which nothing can split into summands, while it completes a reduction exactly with a host
+    // round trip only where one process owns every device of the array and of the destination.
     let (verb, kind, remedy) = match change {
+        ReductionChange::Introduce(kind)
+            if collective_reduction(data_type, change) == CollectiveReduction::MissingIdentity =>
+        {
+            ("introduce", kind, "use a data type that has an additive identity")
+        }
         ReductionChange::Complete(kind) => (
             "complete",
             kind,
@@ -6677,8 +6687,11 @@ pub(crate) mod tests {
                 .to_string()
         };
         let message = |sharding: &str, verb: &str, kind: &str, data_type: &str, reason: &str| {
-            let remedy = match verb {
-                "complete" => {
+            // Nothing can split a data type without an additive identity into summands, so only another data type
+            // helps there.
+            let remedy = match (verb, data_type) {
+                ("introduce", "f8e8m0fnu") => "use a data type that has an additive identity",
+                ("complete", _) => {
                     "complete the reduction with a placement of the concrete array instead (e.g., \
                      `Array::to_placement`), which is exact where one process owns every device of the array and of \
                      the destination, or use another data type"

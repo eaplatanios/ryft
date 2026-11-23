@@ -39,22 +39,25 @@
 //!
 //! For the sums of floating point and complex values that a collective completes, a device placement may differ from
 //! this meaning in the following ways only, which together are the contract of such sums. (i) The sign of a zero
-//! result: the collective starts from positive zero, so two negative zeros sum to positive zero. The maxima and minima
-//! of [`DataType::F4E2M1FN`] values differ in the same way, because the collective returns the first of two zeros
-//! rather than ordering negative zero below positive zero. (ii) What every computation of XLA does to floating point
-//! values on its platform (e.g., the CPU plugin flushes subnormal `f32` and `bf16` values to zero in any addition).
-//! (iii) The order and the precision of accumulation, which are those of the collective of the platform. On the CPU
-//! plugin, which is where this meaning was measured, they are the ones above (ascending coordinates, `f32` for `bf16`,
-//! `f16` for the narrower formats, and the data type itself otherwise), so a readback and a placement of the same array
-//! agree there, while a compiled `reduce` of the same values, which accumulates every format narrower than `f32` in
-//! `f32`, can differ for `f16` and the narrower formats. A compiled program that completes the same reduction (e.g.,
-//! a sum of an unreduced argument) computes what the device placement computes. (iv) A pending maximum or minimum of
-//! floating point values that a compiled program completes (e.g., an argument whose input sharding states one over auto
-//! mesh axes) follows the treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN
-//! values), because no compiled program has an exact alternative, whereas a device placement takes a host round trip
-//! for it. Every other change gives this meaning bit for bit, where all NaN encodings of a format count as one value,
-//! because the arithmetic of [`ryft_core::Array`] does not keep NaN payloads in narrow formats either. That includes
-//! every introduction of a pending sum by a device placement, which writes the identities of this module.
+//! result: the collective starts from positive zero, so two negative zeros sum to positive zero. A compiled program
+//! that introduces a pending sum (e.g., with an output sharding or a `constrain_sharding`) lets XLA write positive zero
+//! to the devices away from coordinate zero, so a negative zero that it introduces reads back as a positive one, while
+//! a device placement writes the identities of this module and keeps it. The maxima and minima of
+//! [`DataType::F4E2M1FN`] values differ in the same way, because the collective returns the first of two zeros rather
+//! than ordering negative zero below positive zero. (ii) What every computation of XLA does to floating point values on
+//! its platform (e.g., the CPU plugin flushes subnormal `f32` and `bf16` values to zero in any addition). (iii) The
+//! order and the precision of accumulation, which are those of the collective of the platform. On the CPU plugin, which
+//! is where this meaning was measured, they are the ones above (ascending coordinates, `f32` for `bf16`, `f16` for the
+//! narrower formats, and the data type itself otherwise), so a readback and a placement of the same array agree there,
+//! while a compiled `reduce` of the same values, which accumulates every format narrower than `f32` in `f32`, can
+//! differ for `f16` and the narrower formats. A compiled program that completes the same reduction (e.g., a sum of an
+//! unreduced argument) computes what the device placement computes. (iv) A pending maximum or minimum of floating point
+//! values that a compiled program completes (e.g., an argument whose input sharding states one over auto mesh axes)
+//! follows the treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN values),
+//! because no compiled program has an exact alternative, whereas a device placement takes a host round trip for it.
+//! Every other change gives this meaning bit for bit, where all NaN encodings of a format count as one value, because
+//! the arithmetic of [`ryft_core::Array`] does not keep NaN payloads in narrow formats either. That includes every
+//! introduction of a pending sum by a device placement, which writes the identities of this module.
 //!
 //! # Completion
 //!
@@ -1280,8 +1283,11 @@ impl CollectiveReduction {
 ///     point values, it aborts the process when it introduces a pending sum of six-bit floating point values and
 ///     crashes it for complex values, and the CPU plugin has no maximum or minimum reduction of complex values, which
 ///     fails when the program runs.
-///   - **Different Numbers:** The sum of [`DataType::F8E8M0FNU`] values is not that of the format
-///     (e.g., `2^-127 + 2^-127` gives NaN).
+///   - **Different Numbers:** The arithmetic of XLA for [`DataType::F8E8M0FNU`] values, in any compiled program and not
+///     only in collectives, differs from that of [`ryft_core::Array`] that the host readback uses (e.g., `x + x` and
+///     `x * x` give NaN for `x = 2^-127`, which `ml_dtypes` also gives for the product), so the sum collective is
+///     rejected, because placements compare with that readback. Products are not pending reductions and are not
+///     guarded.
 ///   - **NaN Values:** The maxima and minima of every floating point format with NaN values drop them.
 ///     [`DataType::F4E2M1FN`] has none, so its maxima and minima differ only in the sign of a zero result
 ///     (the collective returns the first of two zeros), which the contract allows, so they are exact.
@@ -1315,7 +1321,8 @@ pub(crate) fn collective_reduction(data_type: DataType, change: ReductionChange)
         (DataType::I2 | DataType::U2, ReductionChange::Complete(_)) => Unsupported(two_bit),
         (DataType::F6E2M3FN | DataType::F6E3M2FN, ReductionChange::Complete(_)) => Unsupported(six_bit),
         (DataType::F8E8M0FNU, ReductionChange::Complete(UnreducedKind::Sum)) => DifferentNumber(
-            "XLA does not add `f8e8m0fnu` values as the format does (e.g., `2^-127 + 2^-127` gives NaN)",
+            "the arithmetic of XLA for `f8e8m0fnu` values, in any compiled program, is not that of the host readback \
+             that defines the value (e.g., `2^-127 + 2^-127` gives NaN in XLA)",
         ),
         (DataType::C64 | DataType::C128, ReductionChange::Complete(kind)) if extremum(kind) => {
             Unsupported("XLA has no maximum or minimum reduction of complex values")
@@ -2318,9 +2325,8 @@ mod tests {
 
         // Every encoding of `F8E8M0FNU` is a nonzero number, so it cannot be split into summands.
         let data_type = DataType::F8E8M0FNU;
-        let message = format!(
-            "type `{data_type}` has no additive identity to split a host value into summands along unreduced axes"
-        );
+        let message =
+            format!("type `{data_type}` has no additive identity to split a value into summands along unreduced axes");
         let blocking = upload(data_type, vec![0]).map(|_| ());
         let background = upload_in_background(data_type, vec![0]).map(|_| ());
         for result in [blocking, background] {

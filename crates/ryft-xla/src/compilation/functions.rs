@@ -2259,9 +2259,9 @@ mod tests {
         ResidualInputSource, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection,
         ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, ShardMapOptions, Sharding,
         ShardingDimension, Sin, Slice, Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation,
-        Trace, Tracer, TracingContext, TranspositionContext, Typed, TypedProgram, Value as CoreValue, ValueProjection,
-        WhileOptions, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize,
-        scan, shard_map, softmax_cross_entropy_with_target_logits, r#while,
+        Trace, Tracer, TracingContext, TranspositionContext, Typed, TypedProgram, UnreducedKind, Value as CoreValue,
+        ValueProjection, WhileOptions, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at,
+        rematerialize, scan, shard_map, softmax_cross_entropy_with_target_logits, r#while,
     };
     use ryft_macros::Parameterized;
 
@@ -5393,6 +5393,23 @@ mod tests {
             pending_sum_shards,
         )
         .unwrap();
+        // An argument that carries a pending maximum over an auto mesh axis, one of whose contributions holds a NaN,
+        // which the collective that completes the maximum in a compiled program drops (giving `[2, 3, 4, 5]`), while
+        // the exact maximum that a placement computes on the host keeps it (giving `[NaN, 3, 4, 5]`).
+        let pending_maximum = pending_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let pending_maximum_shards = mesh
+            .devices()
+            .iter()
+            .zip([[f32::NAN, 1.0, 2.0, 3.0], [2.0, 3.0, 4.0, 5.0]])
+            .map(|(device, contribution)| (device.id(), Arc::<[u8]>::from(values_to_bytes(&contribution))));
+        let pending_maximum_input = Array::from_host_shards(
+            &session,
+            vector_type.clone(),
+            mesh.clone(),
+            Some(pending_maximum.clone()),
+            pending_maximum_shards,
+        )
+        .unwrap();
         let rows = vec![
             Row {
                 name: "no overrides",
@@ -5443,6 +5460,13 @@ mod tests {
                 input_type: vector_type.clone(),
                 callee: compiled(&vector_type, Options::new(mesh.clone()).with_input_shardings(vec![pending_sum])),
                 input: pending_sum_input,
+                caller_mesh: mesh.clone(),
+            },
+            Row {
+                name: "input override that states the pending maximum of an argument",
+                input_type: vector_type.clone(),
+                callee: compiled(&vector_type, Options::new(mesh.clone()).with_input_shardings(vec![pending_maximum])),
+                input: pending_maximum_input,
                 caller_mesh: mesh.clone(),
             },
             Row {

@@ -485,8 +485,9 @@ mod tests {
         );
         assert_eq!(
             lower(DataType::F8E8M0FNU),
-            Err("`parallel_sum_scatter` cannot sum `f8e8m0fnu` values over mesh axis `x`, because XLA does not add \
-                 `f8e8m0fnu` values as the format does (e.g., `2^-127 + 2^-127` gives NaN)"
+            Err("`parallel_sum_scatter` cannot sum `f8e8m0fnu` values over mesh axis `x`, because the arithmetic of \
+                 XLA for `f8e8m0fnu` values, in any compiled program, is not that of the host readback that defines the \
+                 value (e.g., `2^-127 + 2^-127` gives NaN in XLA)"
                 .to_string()),
         );
         assert_eq!(lower(DataType::I4), Ok(()));

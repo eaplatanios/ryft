@@ -49,8 +49,8 @@ use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};
 use crate::{
-    Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
-    Session, Type, Value,
+    Array, CompileTracer, CompiledFunction, Constant, Error, ExecutionError, LowerableOperation,
+    LowerableOperationFamily, Lowerer, LoweringError, Options, Session, Type, Value,
 };
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
@@ -2429,7 +2429,9 @@ pub fn transpose_primal_jit_call<
         // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
         // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of the
         // override of its primal, as the cotangent types of those primals record it, and each known primal value is
-        // placed at the override itself.
+        // placed at the override itself. An input cotangent that the transposed call returns is the cotangent of the
+        // argument as the callee holds it once it has entered, so it carries no reduction state over auto mesh axes,
+        // which no type records (refer to `entered_argument_sharding`).
         let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
         let output_cotangent_shardings = outputs
             .iter()
@@ -2456,7 +2458,13 @@ pub fn transpose_primal_jit_call<
             .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
             .map(|(&index, _)| cotangent_sharding(operation.input_sharding(index)))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(TypeError::from)?;
+            .map_err(TypeError::from)?
+            .into_iter()
+            .map(|sharding| {
+                sharding.map(|sharding| entered_argument_sharding(&sharding).map(Cow::into_owned)).transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
     }
     let transposed_call = Operation::JitCall(transposed_call);
@@ -2555,17 +2563,12 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         // that take no array input (e.g., a `fill`) are replayed there rather than on the default mesh of the session,
         // as an execution of the callee places them.
         let session = context.with_device_mesh(decision.mesh().clone());
-        // An executable of the callee completes the pending reductions over auto mesh axes of an argument that an input
-        // override states where the argument enters (refer to `entered_argument_sharding`), so the replayed callee
-        // receives such an argument completed too, as do the results that return it.
+        // The replayed callee receives every argument as an executable of the callee holds it once it has entered
+        // (refer to `entered_argument`), as do the results that return it.
         let mut inputs = decision.inputs.into_owned();
         for input in &mut inputs {
-            if let Value::Array(array) = input
-                && let Cow::Owned(sharding) = entered_argument_sharding(array.sharding()).map_err(invalid_argument)?
-            {
-                let mesh = array.mesh().clone();
-                *array =
-                    array.clone().reshard_on_devices(context, &mesh, &sharding, false).map_err(invalid_argument)?;
+            if let Value::Array(array) = input {
+                *array = entered_argument(context, array.clone()).map_err(invalid_argument)?;
             }
         }
         driver
@@ -2581,6 +2584,32 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
             })
             .collect()
     }
+}
+
+/// Returns `array`, an argument that a call places at the boundary sharding of its callee (e.g., an input override that
+/// states a pending reduction over auto mesh axes), as an executable of the callee holds it once it has entered, which
+/// the replay of the callee gives its body. The entry of an executable completes the reduction state over auto mesh
+/// axes of such an argument with a collective (refer to `entered_argument_sharding`), whose result is the result of a
+/// compiled program rather than the exact value of a placement (e.g., a pending maximum of floating point values whose
+/// contributions hold a NaN completes to the maximum of the other contributions there, while the exact value that
+/// `Array::to_placement` computes on the host is NaN). The argument is therefore completed by the same entry, the
+/// executable of an identity whose input override is the runtime sharding of the argument, which admits and rejects
+/// exactly what the entry of the callee admits and rejects (e.g., a completion that the element type cannot make),
+/// with the same errors. The executable is compiled through the compilation cache of `session`, so repeated replays
+/// share it. Any other argument, which is the common case, is returned as it is after one check of its sharding.
+///
+/// # Errors
+///
+/// Returns the error of compiling or executing that identity.
+fn entered_argument(session: &Session, array: Array) -> Result<Array, Error> {
+    if let Cow::Borrowed(_) = entered_argument_sharding(array.sharding())? {
+        return Ok(array);
+    }
+    let options = Options::new(array.mesh().clone()).with_input_shardings(vec![array.sharding().clone()]);
+    let r#type = array.r#type().into_owned();
+    let identity: CompiledFunction<ArrayType, ArrayType> =
+        crate::compile_with_options(|input: CompileTracer| input, r#type, session, options)?;
+    identity.executable().execute(session, array)
 }
 
 // A call of a compiled function places the values that cross the boundary of its callee as the effective boundary
@@ -2612,23 +2641,15 @@ impl LowerableOperation for JitCallOperation<Type> {
                 let callee = lowerer.regions()[0].entry_region_ref();
                 let declared = &callee.interface().input_types()[index];
                 // The callee receives the operand as its entry function holds an argument that arrives at the
-                // boundary sharding, with the pending reductions over auto mesh axes that an override may state
-                // completed (refer to `entered_argument_sharding`). An operand is a value of the caller, which never
-                // carries such a reduction, so the constraint neither introduces nor completes one. The boundary is
-                // still admitted as it is stated, so that a call accepts exactly the operands that an execution of the
-                // callee places at its override (i.e., it introduces a pending sum, but never a pending maximum or
-                // minimum, refer to `validate_declared_pending_reduction`).
+                // boundary sharding, with the reduction state over auto mesh axes that an override may state completed
+                // (refer to `entered_argument_sharding`). An operand is a value of the caller, which never carries such
+                // a state, because the entry of the outermost program completes it or admission rejects it, so the
+                // constraint neither introduces nor completes a reduction over auto mesh axes, of any kind. Only the
+                // outputs of a call can still introduce one (refer to `lower_boundary_constraint`).
                 let Some(sharding) = self.boundary_input_placement(index, actual, declared).map(Cow::into_owned) else {
                     return Ok(value);
                 };
-                let entered = entered_argument_sharding(&sharding)?.into_owned();
-                if entered != sharding {
-                    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
-                    let stated = entry_boundary_sharding(&sharding)?;
-                    let (carried, data_type) = (actual.sharding(), actual.data_type());
-                    validate_declared_pending_reduction(&stated, carried, data_type, bound_manual_axes, "jit_call")?;
-                }
-                lower_boundary_constraint(lowerer, value, ty, &entered)
+                lower_boundary_constraint(lowerer, value, ty, entered_argument_sharding(&sharding)?.as_ref())
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
@@ -10014,9 +10035,13 @@ mod tests {
     #[test]
     fn test_jit_call_operation_lower_rejects_boundaries_that_introduce_pending_extrema() {
         // XLA aborts the process when it exports a sharding that introduces a pending maximum or minimum, so the
-        // boundary of a nested call rejects one that its operand or its result does not carry, as the result shardings
-        // of an entry function do. The caller uses the result of the call, so the override does not reach its own
-        // result shardings. Lowering alone is checked here, so that a missing rejection cannot abort the test process.
+        // boundary of a nested call rejects one that its result does not carry, as the result shardings of an entry
+        // function do. The caller uses the result of the call, so the override does not reach its own result
+        // shardings. An input override introduces nothing: the callee holds its argument as it has entered, with the
+        // pending reduction over auto mesh axes that the override states completed (refer to
+        // `entered_argument_sharding`), and the operand of the call is a completed value of the caller, so the call
+        // lowers and constrains the operand replicated. Lowering alone is checked here, so that a missing rejection
+        // cannot abort the test process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
@@ -10037,7 +10062,7 @@ mod tests {
                 options,
             )
             .unwrap();
-            outer.into_inner().lower(&session).map(|_| ())
+            outer.into_inner().lower(&session).map(|lowered| lowered.stable_hlo().to_string())
         };
 
         // A type never records reduction state over an auto mesh axis, so no value carries one there.
@@ -10052,16 +10077,20 @@ mod tests {
                 };
                 let inner = stage(|x| x, vector_type.clone(), options).unwrap();
                 let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]);
-                assert_eq!(
-                    lower(inner, options, true).unwrap_err().to_string(),
-                    format!(
-                        "cannot lower `jit_call`: the sharding `{{mesh<['x'=2:auto]>, [{{}}], unreduced={{'x'}}, \
-                         unreduced_kind={kind}}}` declares a pending `{kind}` reduction over mesh axes (i.e., `x`) \
-                         along which the value does not carry one, and XLA can only introduce a pending `sum` \
-                         reduction (types never record reduction state over auto mesh axes, so a pending `{kind}` \
-                         reduction over them is never carried)",
+                let lowered = lower(inner, options, true).map_err(|error| error.to_string());
+                match overrides_output {
+                    true => assert_eq!(
+                        lowered,
+                        Err(format!(
+                            "cannot lower `jit_call`: the sharding `{{mesh<['x'=2:auto]>, [{{}}], unreduced={{'x'}}, \
+                             unreduced_kind={kind}}}` declares a pending `{kind}` reduction over mesh axes (i.e., \
+                             `x`) along which the value does not carry one, and XLA can only introduce a pending \
+                             `sum` reduction (types never record reduction state over auto mesh axes, so a pending \
+                             `{kind}` reduction over them is never carried)",
+                        )),
                     ),
-                );
+                    false => assert_eq!(lowered.as_deref(), Ok(ENTERED_OPERAND_MODULE)),
+                }
             }
         }
 
@@ -10075,6 +10104,10 @@ mod tests {
         let options = Options::new(mesh.clone()).with_input_shardings(vec![maximum]);
         assert!(lower(inner, options, false).is_ok());
     }
+
+    /// Module of a caller with a replicated input override over the auto mesh axis `x` that adds two results of a call
+    /// whose input override states a pending maximum or minimum over `x`, whose operand the call constrains replicated.
+    const ENTERED_OPERAND_MODULE: &str = "PLACEHOLDER";
 
     #[test]
     fn test_jit_call_operation_interpret() {

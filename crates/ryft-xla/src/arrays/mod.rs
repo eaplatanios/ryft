@@ -93,7 +93,7 @@ pub enum ArrayError {
     )]
     UnevenReshardingShards { shape: StaticShape, sharding: Sharding },
 
-    #[error("type `{data_type}` has no additive identity to split a host value into summands along unreduced axes")]
+    #[error("type `{data_type}` has no additive identity to split a value into summands along unreduced axes")]
     MissingUnreducedSumIdentity { data_type: DataType },
 
     #[error("device {device_id} is not present in the device mesh")]
