@@ -7734,7 +7734,9 @@ where
                 .collect::<Result<Vec<_>, ProgramError>>()
         },
         local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
-        TracingScope::new(outer_named_axes, Some(mesh.clone())).with_manual_axes(manual_axes),
+        TracingScope::new(outer_named_axes, Some(mesh.clone()))
+            .with_manual_axes(manual_axes)
+            .with_capture_placement(context.capture_placement()),
     )?;
     let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
     let body = body.into_simplified()?;

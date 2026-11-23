@@ -71,10 +71,10 @@ impl<C> CompositeCallContext for C where
 const NAMED_OUTPUT_STRUCTURE_CAPACITY: usize = 16;
 
 /// Retained definitions registered by a [`Composite`] in its selected operation family, one per input and output
-/// parameter structure and [`TracingScope`] (i.e., the named axes, the default mesh, and the enclosing manual axes)
-/// where the calls are made. Their handles live as long as the composite, so calls with the same structure and scope
-/// share specialization caches. The mutex synchronizes access to the registration handles, which are not themselves
-/// [`Sync`].
+/// parameter structure and [`TracingScope`] (i.e., the named axes, the default mesh, the enclosing manual axes, and
+/// the capture placement) where the calls are made. Their handles live as long as the composite, so calls with the same
+/// structure and scope share specialization caches. The mutex synchronizes access to the registration handles, which
+/// are not themselves [`Sync`].
 struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStructure> {
     /// Registrations for the selected family and parameter structure types.
     entries: Mutex<Vec<CompositeRegistration<V, O, InputStructure, OutputStructure>>>,
@@ -1753,9 +1753,9 @@ where
         // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The primal
         // and the rules are traced in fresh traces, which are seeded with the scope of the calling context (i.e., the
         // named axes that are visible where the function is called, such as the axis of an enclosing batching level,
-        // the default mesh, and the enclosing manual axes), so that they resolve the same names, mesh, and manual axes
-        // as the function would if it were inlined. Rules traced in different scopes may differ, so the scope is part
-        // of the registration key.
+        // the default mesh, the enclosing manual axes, and the capture placement), so that they resolve the same names,
+        // mesh, manual axes, and captured types as the function would if it were inlined. Rules traced in different
+        // scopes may differ, so the scope is part of the registration key.
         let scope = TracingScope::from_context(&first.domain());
         let (output_types, primal) =
             DomainTracingContext::<C>::trace_in_scope(&*self.primal, input_types.clone(), scope.clone())?;

@@ -50,8 +50,8 @@ pub use batching::{
     check_batching_rule_consistency,
 };
 pub use captures::{
-    CaptureConstant, CaptureReference, CapturingContext, ClosedProgram, ImportingContext, SameContext, ThroughCapture,
-    ThroughParent,
+    CaptureConstant, CapturePlacement, CaptureReference, CapturingContext, ClosedProgram, ImportingContext,
+    SameContext, ThroughCapture, ThroughParent,
 };
 pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangeError,

@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::captures::CaptureConstant;
+use crate::captures::{CaptureConstant, CapturePlacement};
 use crate::compilation::functions::{
     CompilationTracer, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
@@ -106,6 +106,41 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>, Option<Self::Options>), Self::Error>;
+
+    /// Returns the [`CapturePlacement`] of the function that staging with `options` compiles, which replaces that of
+    /// the scope that the function is staged in and seeds its trace and every trace nested in it (e.g., the body of a
+    /// [`rematerialize`](crate::rematerialize) call). Refer to
+    /// [`NamedAxes::capture_placement`](crate::NamedAxes::capture_placement) for more information.
+    /// Like [`Self::dispatch_signature`], this function needs no domain instance. The default returns
+    /// [`CapturePlacement::Preserve`].
+    #[inline]
+    fn capture_placement(options: &Self::Options) -> CapturePlacement {
+        let _ = options;
+        CapturePlacement::Preserve
+    }
+
+    /// Returns the constant that a function staged under [`CapturePlacement::FollowCall`] (refer to
+    /// [`Self::capture_placement`]) holds for `capture`, a runtime value that enters its trace, in place of a capture,
+    /// or [`None`] to register `capture` in the capture table of the staged program as usual. Every runtime value that
+    /// enters such a trace goes through it, a value that the function captures explicitly and a value that its trace
+    /// or a trace nested in it imports alike (refer to
+    /// [`CapturingContext::capture`](crate::CapturingContext::capture)), so that a backend gives a captured value one
+    /// type however it enters. A backend uses it for a capture that the function receives with another type than its
+    /// own (e.g., an array whose type names a mesh that the function must not depend on), so that the function is
+    /// traced with the type that it receives the capture with, while the backend materializes the capture only if it
+    /// survives the pruning of the staged program. The returned constant must describe `capture`, and the function
+    /// receives it as a tracer of that constant in the position of `capture`. Like [`Self::dispatch_signature`],
+    /// this function needs no domain instance. The default returns [`None`], and a trace under
+    /// [`CapturePlacement::Preserve`] never calls it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `capture` cannot become a constant that it should become.
+    #[inline]
+    fn capture_constant(capture: &Self::Value) -> Result<Option<Self::Constant>, ProgramError> {
+        let _ = capture;
+        Ok(None)
+    }
 
     /// Returns the operation that calls a staged function whose lifted program is
     /// `callee` and whose options are `options`, given `operation`, which is the call that

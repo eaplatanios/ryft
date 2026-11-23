@@ -100,9 +100,11 @@ impl<C: CompilationDomain> StagedProgram<C> {
     /// # Parameters
     ///
     ///   - `function`: Fallible closure to trace with symbolic captures and flat inputs.
-    ///   - `captures`: Runtime values to register in the source program's capture table.
+    ///   - `captures`: Runtime values to register in the source program's capture table, except those that
+    ///     [`CompilationDomain::capture_constant`] stages as constants instead.
     ///   - `input_types`: Flat abstract public input signature.
-    ///   - `options`: Options retained for lowering and compilation.
+    ///   - `options`: Options retained for lowering and compilation, whose capture placement (refer to
+    ///     [`CompilationDomain::capture_placement`]) replaces that of `scope`.
     ///   - `scope`: [`TracingScope`] to trace in.
     ///
     /// # Errors
@@ -130,12 +132,23 @@ impl<C: CompilationDomain> StagedProgram<C> {
         validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
 
         // A fresh context isolates this trace. Runtime captures stay in its side table, while the program stores typed
-        // references to their slots. The closure receives both those constant payloads and their tracers.
-        let context = DomainTracingContext::<C, C::Value>::new().with_scope(scope);
+        // references to their slots. The closure receives both those constant payloads and their tracers. The capture
+        // placement that the domain selects for `options` replaces that of `scope`, because the function receives its
+        // captures as it is compiled wherever it is staged.
+        let scope = scope.with_capture_placement(C::capture_placement(&options));
+
+        // Under `CapturePlacement::FollowCall`, every runtime value that enters the trace, an explicit capture and an
+        // import alike, takes the constant that `CompilationDomain::capture_constant` gives it, if any (refer to
+        // `CapturingContext::capture`).
+        let context = DomainTracingContext::<C, C::Value>::new()
+            .with_scope(scope)
+            .with_capture_constant(C::capture_constant);
         let capture_table = context.captures().clone();
         let builder = context.builder().clone();
-        let capture_constants =
-            captures.into_iter().map(|capture| context.capture(capture)).collect::<Result<Vec<_>, _>>()?;
+        let capture_constants = captures
+            .into_iter()
+            .map(|capture| context.capture(capture).map_err(C::Error::from))
+            .collect::<Result<Vec<_>, C::Error>>()?;
         let capture_tracers = capture_constants
             .iter()
             .cloned()
@@ -748,7 +761,13 @@ impl<C: CompilationDomain, Input: Parameterized<C::Type>, Output: Parameterized<
         &self.state.program
     }
 
-    /// Returns the concrete runtime captures supplied before public inputs on every call.
+    /// Returns the concrete runtime values supplied before public inputs on every call, which are the
+    /// captures of the staged source program followed by the hidden captures that lowering introduced (refer to
+    /// [`CompilationDomain::compile`]). A captured value for which [`CompilationDomain::capture_constant`] gives a
+    /// constant is not a capture of the source program, and when the program refers to it through that constant, the
+    /// backend may supply it as a hidden capture instead (e.g., the XLA backend holds every captured array whose type
+    /// records nothing beyond replication as a session constant, and its executable receives each such array that the
+    /// program uses among the hidden captures).
     #[inline]
     pub fn captures(&self) -> &[C::Value] {
         &self.state.captures
@@ -2126,7 +2145,7 @@ mod tests {
         DimensionType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape,
     };
     use crate::axes::NamedAxis;
-    use crate::captures::CaptureReference;
+    use crate::captures::{CapturePlacement, CaptureReference};
     use crate::compilation::domains::{Compile, jit};
     use crate::compilation::tests::{
         CarriedDomain, CarriedOptions, TestCompiledProgram, TestDomain, TestOptions, compile_from_one_call_site,
@@ -2506,6 +2525,22 @@ mod tests {
         .unwrap();
         assert_eq!(observed.into_inner(), Some((named_axes, Some(mesh))));
         assert_eq!(staged.output_types(), &[ArrayType::scalar(DataType::F64)]);
+
+        // The capture placement that the domain selects for the options replaces that of the scope, so a function of a
+        // domain that preserves capture types preserves them inside a scope that follows the call.
+        let observed = Cell::new(None);
+        StagedProgram::<TestDomain>::stage_in_scope(
+            |_, _, inputs| {
+                observed.set(Some(inputs[0].context().capture_placement()));
+                Ok(inputs)
+            },
+            Vec::new(),
+            vec![ArrayType::scalar(DataType::F64)],
+            TestOptions::default(),
+            TracingScope::default().with_capture_placement(CapturePlacement::FollowCall),
+        )
+        .unwrap();
+        assert_eq!(observed.get(), Some(CapturePlacement::Preserve));
     }
 
     #[test]
