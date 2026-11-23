@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::axes::{MeshContext, NamedAxes};
-use crate::captures::{CapturingContext, ClosedProgram, ImportingContext};
+use crate::captures::{CapturePlacementContext, CapturingContext, ClosedProgram, ImportingContext};
 use crate::compilation::domains::{CompilationDomain, DispatchInputs, StatefulCompilationDomain};
 use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
@@ -1500,7 +1500,8 @@ where
         V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
             + NamedAxes
-            + MeshContext,
+            + MeshContext
+            + CapturePlacementContext,
         Input::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<V>: Parameterized<V, Family = Input::Family, ParameterStructure = Input::ParameterStructure>,
         Output::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
@@ -1554,7 +1555,8 @@ where
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
             + NamedAxes
-            + MeshContext,
+            + MeshContext
+            + CapturePlacementContext,
         Input::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,
         Input::To<V>: Parameterized<V, Family = Input::Family, ParameterStructure = Input::ParameterStructure>,
         Output::Family: ParameterizedFamily<V> + ParameterizedFamily<CompilationTracer<C>>,

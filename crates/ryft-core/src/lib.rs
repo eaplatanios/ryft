@@ -50,8 +50,8 @@ pub use batching::{
     check_batching_rule_consistency,
 };
 pub use captures::{
-    CaptureConstant, CapturePlacement, CaptureReference, CapturingContext, ClosedProgram, ImportingContext,
-    SameContext, ThroughCapture, ThroughParent,
+    CaptureConstant, CapturePlacement, CapturePlacementContext, CaptureReference, CapturingContext, ClosedProgram,
+    ImportingContext, SameContext, ThroughCapture, ThroughParent,
 };
 pub use compilation::{
     AnalyzableCompilationDomain, CompilationArtifactExchange, CompilationArtifactExchangeError,
@@ -118,7 +118,7 @@ pub use operations::{
     CompositeBody, CompositeCallContext, CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeKey,
     CompositeOperation, CompositeTransposeOperation, CompositeVjp, Concatenate, ConcatenateOperation, Condition,
     ConditionOperation, ConditionType, Conjugate, ConjugateOperation, Constant, ConstantOperation, ConstantOperations,
-    ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, ConvertElementType,
+    ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation, ControlFlowType, ConvertElementType,
     ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind, CumulativeOperation, CustomCall,
     CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching, CustomCallInputOutputAlias, CustomCallOperation,
     CustomCallUnrolling, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource,

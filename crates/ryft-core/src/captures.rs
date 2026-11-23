@@ -230,8 +230,8 @@ impl<T: Type> CaptureConstant for CaptureReference<T> {
 /// Policy for the type with which a function that is being traced receives an array that enters its trace from outside
 /// (i.e., an array that it captures explicitly or that its trace, or a trace nested in it, imports). It is part of the
 /// [`TracingScope`](crate::TracingScope) of a trace, which every trace nested in it inherits (refer to
-/// [`NamedAxes::capture_placement`](crate::NamedAxes::capture_placement)), and [`CapturingContext::capture`]
-/// consults it before it registers a runtime value in the capture table.
+/// [`CapturePlacementContext::capture_placement`]). [`CapturingContext::capture`] consults the policy
+/// before registering a runtime value in the capture table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CapturePlacement {
     /// The array keeps its own type, including its sharding. This is the policy of plain traces and eager regions.
@@ -246,6 +246,78 @@ pub enum CapturePlacement {
     /// with this policy, and the mesh on which the function receives such arrays comes from its compilation options
     /// when it is lowered.
     FollowCall,
+}
+
+/// Context that reports the [`CapturePlacement`] in scope for captures and imports. Fresh traces copy this policy
+/// through [`TracingScope::from_context`](crate::TracingScope::from_context). Root traces use their seeded policy.
+/// Nested traces inherit their parent's policy unless seeded with [`CapturePlacement::FollowCall`], and transforms
+/// forward the policy of the context in which they import values. Mesh retyping leaves the policy unchanged.
+pub trait CapturePlacementContext: Context {
+    /// Returns the effective policy for the type with which this context receives an array from outside its trace.
+    /// The default, [`CapturePlacement::Preserve`], keeps the array's type in an eager context or a plain trace.
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        CapturePlacement::Preserve
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> CapturePlacementContext for EagerContext<V, O> where Self: Context {}
+
+impl<C: CapturePlacementContext + ContextProjection<T>, T: Type> CapturePlacementContext for ProjectedContext<C, T> {
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        self.parent().capture_placement()
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, Capture> CapturePlacementContext for TracingContext<V, O, Capture>
+where
+    Self: Context,
+{
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        self.local_capture_placement()
+    }
+}
+
+impl<C: CapturePlacementContext> CapturePlacementContext for NestedTracingContext<C> {
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        match self.local_capture_placement() {
+            CapturePlacement::Preserve => self.parent().capture_placement(),
+            CapturePlacement::FollowCall => CapturePlacement::FollowCall,
+        }
+    }
+}
+
+impl<C: CapturePlacementContext> CapturePlacementContext for PartialEvaluationContext<C>
+where
+    Self: Context,
+{
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        self.parent().capture_placement()
+    }
+}
+
+impl<C: CapturePlacementContext, P: BatchingPolicy<C>> CapturePlacementContext for BatchingContext<C, P>
+where
+    Self: Context,
+{
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        self.parent().capture_placement()
+    }
+}
+
+impl<C: CapturePlacementContext, P: DifferentiationPolicy<C>> CapturePlacementContext for DifferentiationContext<C, P>
+where
+    Self: Context,
+{
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        self.primal().capture_placement()
+    }
 }
 
 /// [`Context`] that can register runtime values as captures (e.g., for a [`Program`] that is being built). The returned
@@ -850,8 +922,10 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape,
     };
+    use crate::axes::MeshContext;
     use crate::batching::BatchAxis;
     use crate::contexts::StagingContext;
     use crate::interpretation::InterpretableOperation;
@@ -864,7 +938,7 @@ mod tests {
         TypeIdentityRenaming, TypedProgram, ValueDirectDispatch, ValueProjection,
     };
     use crate::tests::{TestArrayContext, TestArrayTracingContext, TestRegionOperation};
-    use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
+    use crate::tracing::{NestedTracingContext, Tracer, TracingContext, TracingScope};
 
     use super::*;
 
@@ -920,6 +994,86 @@ mod tests {
             renamed.r#type().as_ref(),
             &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target)])),
         );
+    }
+
+    #[test]
+    fn test_capture_placement_context() {
+        assert_eq!(TestArrayContext::new().capture_placement(), CapturePlacement::Preserve);
+        assert_eq!(TestArrayTracingContext::new().capture_placement(), CapturePlacement::Preserve);
+        assert_eq!(NestedTracingContext::new(TestArrayContext::new()).capture_placement(), CapturePlacement::Preserve);
+
+        // The capture placement is seeded independently of the meshes, every wrapper context forwards it, a nested
+        // trace inherits it unless its scope selects `FollowCall`, a scope captured from a context carries it, so that
+        // a body traced in that scope (e.g., the body of a `rematerialize` call) sees it, and mesh retypings leave it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let retyped = mesh.with_axis_types(["x"], MeshAxisType::Auto).unwrap();
+        let follow_call = CapturePlacement::FollowCall;
+        let (_, program) = TestArrayTracingContext::trace_with_context_in_scope(
+            |context, ()| {
+                assert_eq!(context.default_mesh(), None);
+                assert_eq!(context.capture_placement(), follow_call);
+                assert_eq!(ProjectedContext::<_, ArrayType>::new(context.clone()).capture_placement(), follow_call);
+                assert_eq!(PartialEvaluationContext::new(context.clone()).capture_placement(), follow_call);
+                assert_eq!(BatchingContext::new(context.clone(), 3).capture_placement(), follow_call);
+                assert_eq!(DifferentiationContext::fused(context.clone()).capture_placement(), follow_call);
+                let primal = PartialEvaluationContext::new(context.clone());
+                assert_eq!(DifferentiationContext::partitioned(primal).capture_placement(), follow_call);
+                assert_eq!(NestedTracingContext::new(context.clone()).capture_placement(), follow_call);
+                assert_eq!(TracingScope::from_context(context).capture_placement(), follow_call);
+                let (_, nested) = NestedTracingContext::trace_in_scope(
+                    context.clone(),
+                    |inputs: Vec<Tracer<_>>| {
+                        assert_eq!(inputs[0].context().capture_placement(), follow_call);
+                        Ok(inputs)
+                    },
+                    vec![ArrayType::scalar(DataType::F64)],
+                    TracingScope::default(),
+                )
+                .unwrap();
+                assert_eq!(nested.to_string(), "lambda %0:f64[] .\nin (%0)");
+                let (_, root) = TestArrayTracingContext::trace_with_context_in_scope(
+                    |body, ()| {
+                        assert_eq!(body.capture_placement(), follow_call);
+                        Ok(())
+                    },
+                    (),
+                    TracingScope::from_context(context),
+                )
+                .unwrap();
+                assert_eq!(root.to_string(), "lambda  .\nin ()");
+                context.with_retyped_mesh(&mesh, &retyped, || {
+                    assert_eq!(context.capture_placement(), follow_call);
+                });
+                Ok(())
+            },
+            (),
+            TracingScope::default().with_capture_placement(follow_call),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "lambda  .\nin ()");
+
+        // A nested trace whose scope selects `FollowCall` reports it inside a parent that preserves capture types.
+        let (_, program) = TestArrayTracingContext::trace_with_context_in_scope(
+            |context, ()| {
+                assert_eq!(context.capture_placement(), CapturePlacement::Preserve);
+                let (_, nested) = NestedTracingContext::trace_in_scope(
+                    context.clone(),
+                    |inputs: Vec<Tracer<_>>| {
+                        assert_eq!(inputs[0].context().capture_placement(), follow_call);
+                        Ok(inputs)
+                    },
+                    vec![ArrayType::scalar(DataType::F64)],
+                    TracingScope::default().with_capture_placement(follow_call),
+                )
+                .unwrap();
+                assert_eq!(nested.to_string(), "lambda %0:f64[] .\nin (%0)");
+                Ok(())
+            },
+            (),
+            TracingScope::default(),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "lambda  .\nin ()");
     }
 
     #[test]

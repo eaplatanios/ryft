@@ -272,11 +272,12 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     /// [`DifferentiationContext`]. Use this function from a family-level operation dispatcher when the operation is
     /// [`Region`]-free and every input and output belongs to the same projectable member type `T`. It projects primal
     /// values and live tangent values into the member value family, carries structural-zero tangents as types without
-    /// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
-    /// back into the heterogeneous value family. This named adapter always selects [`DifferentiableOperation::jvp`],
+    /// materializing values, and projects any staged primal declarations through the borrowed type conversion.
+    /// It runs the member's existing [`DifferentiableOperation`] rule and lifts the resulting duals back into the
+    /// heterogeneous value family. This named adapter always selects [`DifferentiableOperation::jvp`],
     /// including when the context is constructing a reverse derivative. Use
-    /// [`jvp_for_transpose_projected_operation`](Self::jvp_for_transpose_projected_operation) to select the reverse
-    /// rule explicitly.
+    /// [`jvp_for_transpose_projected_operation`](Self::jvp_for_transpose_projected_operation)
+    /// to select the reverse rule explicitly.
     ///
     /// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit
     /// family-level Jacobian-Vector Product (JVP) rule instead. A member operation that declares
@@ -299,6 +300,8 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
     where
         C: ContextProjection<T, Type: DifferentiableType>,
+        for<'t> &'t T: TryFrom<&'t C::Type>,
+        for<'t> <&'t T as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
     {
         DifferentiationRule::Jvp.apply_projected(self, operation, inputs)
     }
@@ -326,6 +329,8 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
     where
         C: ContextProjection<T, Type: DifferentiableType>,
+        for<'t> &'t T: TryFrom<&'t C::Type>,
+        for<'t> <&'t T as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
     {
         DifferentiationRule::JvpForTranspose.apply_projected(self, operation, inputs)
     }
@@ -500,7 +505,11 @@ impl DifferentiationRule {
         context: &DifferentiationContext<C, P>,
         operation: &O,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        for<'t> &'t T: TryFrom<&'t C::Type>,
+        for<'t> <&'t T as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
+    {
         if !operation.region_slots().is_empty() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -519,7 +528,13 @@ impl DifferentiationRule {
                     MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
                     MaybeZero::Value(value) => {
                         let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
-                        DifferentiationDual::new(primal, tangent)
+                        let declaration = input
+                            .declared_primal_type()
+                            .map(<&T>::try_from)
+                            .transpose()
+                            .map_err(Into::<TypeError>::into)?
+                            .cloned();
+                        DifferentiationDual::new_with_primal_declaration(primal, MaybeZero::Value(tangent), declaration)
                     }
                 }
             })
@@ -529,6 +544,7 @@ impl DifferentiationRule {
         outputs
             .into_iter()
             .map(|output| {
+                let declaration = output.declared_primal_type().cloned().map(Into::into);
                 let (primal, tangent) = output.into_parts();
                 let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
                 let tangent = match tangent {
@@ -537,7 +553,7 @@ impl DifferentiationRule {
                         MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
                     }
                 };
-                DifferentiationDual::new(primal, tangent)
+                DifferentiationDual::new_with_primal_declaration(primal, tangent, declaration)
             })
             .collect::<Result<Vec<_>, _>>()
     }
@@ -1595,6 +1611,7 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionOperation,
         DimensionValue,
     };
+    use crate::axes::{LogicalMesh, Sharding};
     use crate::batching::{BatchAxis, BatchAxisSpecification, batch_in_parent};
     use crate::contexts::EagerContext;
     use crate::differentiation::forward::{FusedDifferentiationPolicy, PartitionedDifferentiationPolicy};
@@ -1861,6 +1878,31 @@ mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == "cannot import an unknown value from another \
                 partial-evaluation context",
         ));
+    }
+
+    #[test]
+    fn test_differentiation_context_jvp_projected_operation_preserves_primal_declaration() {
+        let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(ArrayIrContext::new()));
+        let unplaced = ArrayType::scalar(DataType::F64);
+        let placed = unplaced.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0)).unwrap();
+        let primal = context.primal().lift(Array::from_elements(placed.clone(), &[2.0f64]).unwrap().into()).unwrap();
+        let declaration = ArrayIrType::from(unplaced);
+        let tangent =
+            PartialTracer::new(context.tangent().clone(), context.tangent().unknown_input(declaration.clone(), 0));
+        let input = DifferentiationDual::new_with_primal_declaration(
+            primal,
+            MaybeZero::Value(tangent),
+            Some(declaration.clone()),
+        )
+        .unwrap();
+
+        let output = context
+            .jvp_projected_operation(&ArrayOperation::<Array>::Neg(NegOperation::new()), &[input])
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.primal().r#type().into_owned(), ArrayIrType::from(placed));
+        assert_eq!(output.tangent().as_value().unwrap().r#type().as_ref(), &declaration);
+        assert_eq!(output.declared_primal_type(), Some(&declaration));
     }
 
     #[test]

@@ -276,6 +276,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::arrays::{ArrayIrType, ArrayType, Memory};
 use crate::axes::{MeshContext, NamedAxes};
+use crate::captures::CapturePlacementContext;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationRule;
 use crate::differentiation::forward::DifferentiableOperation;
@@ -365,9 +366,8 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     /// Stages one call of this [`RematerializedFunction`] on the provided `input` value and returns its output value.
     /// The [`Context`] `C` that the call is staged into is the [`Domain`](Value::Domain) of the values
     /// in `input`, so it is never named at a construction or call site. The body is traced in a fresh trace that is
-    /// seeded with the [named axes](NamedAxes::named_axes) and the [default mesh](MeshContext::default_mesh) in scope
-    /// in `C`, so that it resolves the axes and the mesh of enclosing transforms and manual regions as it would if it
-    /// were inlined.
+    /// seeded with the [`TracingScope`] of `C`, so it resolves named axes, meshes, and capture placement as it would
+    /// if it were inlined.
     ///
     /// # Errors
     ///
@@ -377,7 +377,10 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     /// or when the staged [`RematerializeOperation`] rejects the call.
     pub fn call<
         V: Value<Type = C::Type, Domain = C>,
-        C: Context<Type: 'static, Value = V, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes + MeshContext,
+        C: Context<Type: 'static, Value = V, Operation: From<RematerializeOperation<C::Type>>>
+            + NamedAxes
+            + MeshContext
+            + CapturePlacementContext,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
@@ -423,7 +426,10 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
     /// [configured reference](Self::with_policy_reference), when tracing the body fails,
     /// or when the staged [`RematerializeOperation`] rejects the call.
     pub fn call_in_context<
-        C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes + MeshContext,
+        C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>>
+            + NamedAxes
+            + MeshContext
+            + CapturePlacementContext,
         InputValues: Parameterized<C::Value, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
@@ -455,7 +461,10 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
 
     /// Traces the body at `input_types` and binds one call of it to `input_values` in `context`.
     fn call_impl<
-        C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes + MeshContext,
+        C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>>
+            + NamedAxes
+            + MeshContext
+            + CapturePlacementContext,
     >(
         &self,
         context: &C,

@@ -2927,7 +2927,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, tangent.clone()),
                     ),
                 };
-                Ok(vec![$crate::DifferentiationDual::new(primals.remove(0), tangent)?])
+                Ok(vec![inputs[0].unary_linear_output(operation, primals.remove(0), tangent)?])
             }
         }
 

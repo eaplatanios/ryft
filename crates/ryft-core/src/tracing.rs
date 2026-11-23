@@ -76,7 +76,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::LogicalMesh;
 use crate::axes::{MeshContext, MeshRetypings, NamedAxes, NamedAxis};
-use crate::captures::CapturePlacement;
+use crate::captures::{CapturePlacement, CapturePlacementContext};
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::operations::GuardOperation;
@@ -294,7 +294,7 @@ pub struct TracingScope {
     /// reports them.
     manual_axes: Vec<(String, NamedAxis)>,
 
-    /// Policy for the type of the arrays that enter the trace. Refer to [`NamedAxes::capture_placement`]
+    /// Policy for the type of the arrays that enter the trace. Refer to [`CapturePlacementContext::capture_placement`]
     /// for more information.
     capture_placement: CapturePlacement,
 }
@@ -315,7 +315,7 @@ impl TracingScope {
     /// Creates the [`TracingScope`] of `context` (i.e., the named axes, the default mesh, the enclosing manual axes,
     /// and the capture placement that it has in scope).
     #[inline]
-    pub fn from_context<C: NamedAxes + MeshContext>(context: &C) -> Self {
+    pub fn from_context<C: NamedAxes + MeshContext + CapturePlacementContext>(context: &C) -> Self {
         Self::new(context.named_axes(), context.default_mesh())
             .with_manual_axes(context.manual_axes())
             .with_capture_placement(context.capture_placement())
@@ -330,7 +330,7 @@ impl TracingScope {
     }
 
     /// Returns this [`TracingScope`] with its capture placement replaced by `capture_placement`.
-    /// Refer to [`NamedAxes::capture_placement`] for more information.
+    /// Refer to [`CapturePlacementContext::capture_placement`] for more information.
     #[inline]
     pub fn with_capture_placement(mut self, capture_placement: CapturePlacement) -> Self {
         self.capture_placement = capture_placement;
@@ -356,7 +356,7 @@ impl TracingScope {
         &self.manual_axes
     }
 
-    /// Returns the capture placement in this [`TracingScope`]. Refer to [`NamedAxes::capture_placement`]
+    /// Returns the capture placement in this [`TracingScope`]. Refer to [`CapturePlacementContext::capture_placement`]
     /// for more information.
     #[inline]
     pub fn capture_placement(&self) -> CapturePlacement {
@@ -457,11 +457,10 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         }
     }
 
-    /// Returns this fresh [`TracingContext`] seeded with the named axes, the default mesh, the manual axes, and the
-    /// capture placement of `scope`, which its [`NamedAxes`] and [`MeshContext`] implementations resolve. Staging uses
-    /// it to trace a function in the scope of the context that calls it, so that the function resolves them as it would
-    /// if it were inlined there. Seed a context before tracing anything into it, because the scope is fixed for its
-    /// lifetime and shared by its clones.
+    /// Returns this fresh [`TracingContext`] seeded with the named axes, default mesh, manual axes, and capture
+    /// placement of `scope`. Staging uses it to trace a function in the scope of its caller, so the function resolves
+    /// them as it would if it were inlined. Seed a context before tracing anything into it, because the scope is fixed
+    /// for its lifetime and shared by its clones.
     #[inline]
     pub(crate) fn with_scope(mut self, scope: TracingScope) -> Self {
         let TracingScope { named_axes, default_mesh, manual_axes, capture_placement } = scope;
@@ -662,11 +661,9 @@ where
     }
 
     /// Traces `function` against `input_type` like
-    /// [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes), but seeds the trace's context
-    /// with the named axes and the default mesh of `scope`, which its [`NamedAxes`] and [`MeshContext`] implementations
-    /// return. Functions that trace code in a fresh trace instead of in the context that they are called in seed that
-    /// trace with the default mesh of the calling context, like they seed it with its named axes, and a `shard_map`
-    /// body is seeded with the mesh of its map.
+    /// [`trace_with_context_and_named_axes`](Self::trace_with_context_and_named_axes), with the named axes, default
+    /// mesh, manual axes, and capture placement of `scope`. Functions that create a fresh trace seed it with their
+    /// caller's scope. A `shard_map` body is seeded with the mesh of its map.
     #[allow(clippy::type_complexity)]
     pub fn trace_with_context_in_scope<
         F: FnOnce(&Self, Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -961,8 +958,8 @@ struct TracingContextState<V: Value, O: Operation<Type = V::Type>, C> {
     /// [`TracingContext`]'s lifetime and shared across cloned contexts.
     manual_axes: Rc<Vec<(String, NamedAxis)>>,
 
-    /// [`CapturePlacement`] this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation
-    /// (refer to [`NamedAxes::capture_placement`]). Ordinary traces are seeded with [`CapturePlacement::Preserve`],
+    /// [`CapturePlacement`] this [`TracingContext`] was seeded with (refer to
+    /// [`CapturePlacementContext::capture_placement`]). Ordinary traces are seeded with [`CapturePlacement::Preserve`],
     /// and traces of functions that are staged for compilation with the placement that their domain selects.
     capture_placement: CapturePlacement,
 
@@ -1032,7 +1029,7 @@ pub struct NestedTracingContext<C: Context> {
     /// of the manual axes of the parent context.
     manual_axes: Rc<Vec<(String, NamedAxis)>>,
 
-    /// [`CapturePlacement`] this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`]
+    /// [`CapturePlacement`] this [`NestedTracingContext`] was seeded with, resolved by its [`CapturePlacementContext`]
     /// implementation. When it is [`CapturePlacement::Preserve`], the capture placement of the parent context applies.
     capture_placement: CapturePlacement,
 

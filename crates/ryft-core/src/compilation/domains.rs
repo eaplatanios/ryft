@@ -110,8 +110,8 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Returns the [`CapturePlacement`] of the function that staging with `options` compiles, which replaces that of
     /// the scope that the function is staged in and seeds its trace and every trace nested in it (e.g., the body of a
     /// [`rematerialize`](crate::rematerialize) call). Refer to
-    /// [`NamedAxes::capture_placement`](crate::NamedAxes::capture_placement) for more information.
-    /// Like [`Self::dispatch_signature`], this function needs no domain instance. The default returns
+    /// [`CapturePlacementContext::capture_placement`](crate::CapturePlacementContext::capture_placement) for more
+    /// information. Like [`Self::dispatch_signature`], this function needs no domain instance. The default returns
     /// [`CapturePlacement::Preserve`].
     #[inline]
     fn capture_placement(options: &Self::Options) -> CapturePlacement {
