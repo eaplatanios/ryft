@@ -477,13 +477,11 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// function that it stages holds for a runtime value that enters it (refer to [`Self::capture_constant`]). Seed it
     /// before tracing anything into the context, as [`Self::with_scope`].
     #[inline]
-    pub(crate) fn with_capture_constant(mut self, capture_constant: CaptureConstantFunction<V, C>) -> Self {
+    pub(crate) fn with_capture_constant(mut self, capture_constant: fn(&C) -> Result<Option<V>, ProgramError>) -> Self {
         Rc::make_mut(&mut self.state).capture_constant = Some(capture_constant);
         self
     }
 
-    // TODO(eaplatanios): Should `TracingContext::capture_constant` be renamed to `local_capture_constant`
-    //  and moved to right after `local_capture_placement`?
     /// Returns the constant that the function that this trace stages holds for `value`, a runtime value that enters
     /// the trace, or [`None`] when the trace was seeded with [`CapturePlacement::Preserve`] or with no function that
     /// gives such constants, or when the function holds `value` as an ordinary capture.
@@ -973,7 +971,7 @@ struct TracingContextState<V: Value, O: Operation<Type = V::Type>, C> {
     /// [`CompilationDomain::capture_constant`](crate::CompilationDomain::capture_constant)), which
     /// [`capture`](crate::CapturingContext::capture) consults before it registers the value in the
     /// capture table. Staging sets it for the domain that it compiles for, and ordinary traces have none.
-    capture_constant: Option<CaptureConstantFunction<V, C>>,
+    capture_constant: Option<fn(&C) -> Result<Option<V>, ProgramError>>,
 
     /// Mesh retypings that are active in this trace (added via [`MeshContext::with_retyped_mesh`]), which its
     /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report.
@@ -1003,11 +1001,6 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContextState<V,
         }
     }
 }
-
-/// Function that gives the constant that a function staged under [`CapturePlacement::FollowCall`] holds for a runtime
-/// value of type `C` that enters its trace, in the constant type `V` of that trace (refer to
-/// [`CompilationDomain::capture_constant`](crate::CompilationDomain::capture_constant)).
-pub(crate) type CaptureConstantFunction<V, C> = fn(&C) -> Result<Option<V>, ProgramError>;
 
 /// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed in an
 /// *enclosing* [`Context`]'s universe rather than in a raw `(V, O)` type universe of its own. Where [`TracingContext`]
