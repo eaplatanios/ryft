@@ -562,19 +562,33 @@ impl ArrayType {
     /// stride of an `f32[n]` with `1 <= n <= 8`), which the backend that places a concrete value validates against the
     /// shards that it creates. The shards are only determined when `sharding` describes every mesh axis, which
     /// `is_complete` states (e.g., the runtime sharding of a concrete value), or when its mesh has no
-    /// [`MeshAxisType::Auto`] axis larger than one, along which a value may be split without its type
-    /// recording it. Otherwise, only the rank of a strided layout is validated here.
+    /// [`MeshAxisType::Auto`] axis larger than one, along which a value may be split without its type recording it.
+    /// Otherwise, only the rank of a strided layout is validated here. A `sharding` of another rank than this type
+    /// describes no shards of it, so it is rejected for every layout rather than falling back to that rank check
+    /// (callers such as the type rule of [`PlaceOperation`](crate::PlaceOperation) validate the rank of a requested
+    /// sharding themselves, and this function does not rely on them).
     ///
     /// # Errors
     ///
-    /// Returns the [`TypeError`] of [`Self::validate_layout`] for the largest shard, or one for a strided layout whose
-    /// rank is not the rank of this type when the shards are not determined.
+    /// Returns [`ShardingError::ShardingRankMismatch`] for a `sharding` whose rank is not the rank of this type, the
+    /// [`TypeError`] of [`Self::validate_layout`] for the largest shard, and one for a strided layout whose rank is not
+    /// the rank of this type when the shards are not determined.
     pub fn validate_shard_layout(
         &self,
         layout: &Layout,
         sharding: Option<&Sharding>,
         is_complete: bool,
     ) -> Result<(), TypeError> {
+        if let Some(sharding) = sharding
+            && sharding.rank() != self.rank()
+        {
+            return Err(ShardingError::ShardingRankMismatch {
+                sharding_rank: sharding.rank(),
+                array_rank: self.rank(),
+            }
+            .into());
+        }
+
         let shard_shape = match (layout, sharding) {
             (Layout::Tiled(_), _) | (_, None) => Some(self.shape().clone()),
             (Layout::Strided(_), Some(sharding)) => {
@@ -605,9 +619,10 @@ impl ArrayType {
                         })
                     })
                     .collect::<Vec<_>>();
-                (is_determined && dimensions.len() == self.rank()).then(|| Shape::new(dimensions))
+                is_determined.then(|| Shape::new(dimensions))
             }
         };
+
         match (layout, shard_shape) {
             (_, Some(shape)) => self.clone().with_shape(shape).with_layout(layout.clone()).validate_layout(),
             (Layout::Strided(strided), None) if strided.rank() != self.rank() => Err(TypeError::invalid(format!(
@@ -2106,6 +2121,18 @@ mod tests {
             matrix.validate_shard_layout(&strided(vec![4]), Some(&auto_replicated), false),
             Err(TypeError::invalid("strided layout rank 1 does not match array rank 2")),
         );
+
+        // A sharding of another rank than the type does not describe its shards, so it is rejected for every layout,
+        // whether or not it describes every mesh axis (e.g., an all-zero stride would otherwise pass as a rank check).
+        for rank in [1, 3] {
+            let sharding = Sharding::replicated(explicit.clone(), rank);
+            let mismatch =
+                Err(TypeError::from(ShardingError::ShardingRankMismatch { sharding_rank: rank, array_rank: 2 }));
+            for is_complete in [false, true] {
+                assert_eq!(matrix.validate_shard_layout(&strided(vec![0, 0]), Some(&sharding), is_complete), mismatch);
+                assert_eq!(matrix.validate_shard_layout(&tiled, Some(&sharding), is_complete), mismatch);
+            }
+        }
     }
 
     #[test]

@@ -355,8 +355,10 @@ pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
     logical_mesh: LogicalMesh,
 
-    /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
-    devices: Vec<Device>,
+    /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`]. They are shared so that
+    /// cloning a [`DeviceMesh`] costs the same whatever the number of devices is (e.g., one placement request is
+    /// cloned for each parameter of a structure that is placed as a whole).
+    devices: Arc<[Device]>,
 }
 
 impl DeviceMesh {
@@ -375,7 +377,7 @@ impl DeviceMesh {
             }
         }
 
-        Ok(Self { logical_mesh, devices })
+        Ok(Self { logical_mesh, devices: devices.into() })
     }
 
     /// Returns the logical mesh topology that defines the names, sizes, and types of the mesh axes.
@@ -625,7 +627,7 @@ mod tests {
         let devices = vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)];
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         assert_eq!(&mesh.logical_mesh, &logical_mesh);
-        assert_eq!(&mesh.devices, &devices);
+        assert_eq!(mesh.devices(), &devices);
         assert_eq!(mesh.rank(), 2);
         assert_eq!(mesh.axis_size("x"), Some(2));
         assert_eq!(mesh.axis_size("y"), Some(2));

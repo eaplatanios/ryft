@@ -26,7 +26,23 @@ pub struct ArrayAddressing {
 }
 
 impl ArrayAddressing {
-    /// Creates a new [`ArrayAddressing`] for the provided [`ArrayType`].
+    /// Creates a new [`ArrayAddressing`] for the provided [`ArrayType`]. A [`Layout::Strided`] must keep the elements
+    /// of the array apart, which is checked with a nesting rule. The axes with an extent larger than one are ordered by
+    /// the magnitude of their byte strides, and each stride must be at least the byte span that the elements along all
+    /// axes with smaller strides occupy (i.e., the element width plus, for each such axis, its stride times its extent
+    /// minus one). Every layout that passes this rule addresses disjoint bytes for distinct elements, but the rule is
+    /// conservative and rejects some layouts whose byte ranges are disjoint because the axes interleave rather than
+    /// nest. For example, an `f32[3, 2]` with byte strides `[8, 12]` addresses its six elements at the disjoint offsets
+    /// 0, 12, 8, 20, 16, and 28, while the stride 12 is smaller than the 20-byte span of the three elements along the
+    /// axis with stride 8, so it is rejected. Such layouts are a limit of the strided extension rather than invalid
+    /// storage, and the same elements can be stored with strides that nest (e.g., the row-major `[8, 4]` or the
+    /// column-major `[4, 12]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] for a dynamically sized type, for a logical or physical size that cannot be
+    /// represented, for a malformed tiled layout, and for a strided layout whose rank is not the rank of the type
+    /// or that the nesting rule above rejects.
     pub fn new(r#type: ArrayType) -> Result<Self, ProgramError> {
         if r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
             return Err(TypeError::invalid(format!(
@@ -55,6 +71,7 @@ impl ArrayAddressing {
                     ))
                     .into());
                 }
+
                 let mut seen = vec![false; rank];
                 for axis in layout.minor_to_major() {
                     if *axis >= rank || seen[*axis] {
@@ -65,6 +82,7 @@ impl ArrayAddressing {
                     }
                     seen[*axis] = true;
                 }
+
                 let mut dimension_count = rank;
                 for (tile_index, tile) in layout.tiles().iter().enumerate() {
                     if tile.dimensions().is_empty() || tile.dimensions().len() > dimension_count {
@@ -76,6 +94,7 @@ impl ArrayAddressing {
                         ))
                         .into());
                     }
+
                     let mut sized_count = 0usize;
                     for (position, dimension) in tile.dimensions().iter().enumerate() {
                         match dimension {
@@ -108,6 +127,7 @@ impl ArrayAddressing {
                     ))
                     .into());
                 }
+
                 if addressing.element_count() != 0 && addressing.element_byte_width() != 0 {
                     let mut axes = layout
                         .strides()
@@ -121,11 +141,15 @@ impl ArrayAddressing {
                     for (stride, axis) in axes {
                         if stride < occupied_span {
                             return Err(TypeError::invalid(format!(
-                                "strided layout stride {} on axis {} is smaller than the {}-byte span occupied by more minor axes and may alias array elements",
-                                layout.strides()[axis], axis, occupied_span,
+                                "strided layout stride {} on axis {} is smaller than the {}-byte span \
+                                 occupied by more minor axes and may alias array elements",
+                                layout.strides()[axis],
+                                axis,
+                                occupied_span,
                             ))
                             .into());
                         }
+
                         occupied_span = (addressing.dimension(axis) - 1)
                             .checked_mul(stride)
                             .and_then(|span| occupied_span.checked_add(span))
