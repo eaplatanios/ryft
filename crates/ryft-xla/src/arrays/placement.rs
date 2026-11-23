@@ -92,7 +92,7 @@ use crate::{Error, FromPjrt, Session, Value};
 ///
 /// ```rust
 /// # use ryft_xla::PlacementOptions;
-/// let options = PlacementOptions::defaults()
+/// let options = PlacementOptions::default()
 ///     .with_donate((true, false))
 ///     .with_may_alias((None::<bool>, Some(false)));
 /// ```
@@ -136,8 +136,8 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
     }
 
     /// Returns these options with the destination tree prefix replaced by `target`, which can have another type than
-    /// the current one. The type of each other option is kept, so this extends typed options such as [`Self::defaults`]
-    /// without naming the types of the unrelated options (e.g., `PlacementOptions::defaults().with_target(device)`).
+    /// the current one. Each other option keeps its type, so `PlacementOptions::default().with_target(device)` uses
+    /// the standard types for the other options without annotations.
     #[inline]
     pub fn with_target<NewTarget>(self, target: NewTarget) -> PlacementOptions<NewTarget, Source, Donate, MayAlias> {
         PlacementOptions::new(Some(target), self.source, self.donate, self.may_alias)
@@ -160,7 +160,7 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
 
     /// Returns these options with the aliasing tree prefix replaced by `may_alias`, which can have another type than
     /// the current one. The type of each other option is kept, as in [`Self::with_target`], so that, for example,
-    /// `PlacementOptions::defaults().with_may_alias(false)` requests a forced copy without a destination and without
+    /// `PlacementOptions::default().with_may_alias(false)` requests a forced copy without a destination and without
     /// naming the type of a destination. Both `false` and `Some(false)` request a forced copy, and [`None`] leaves
     /// the option unspecified.
     #[inline]
@@ -201,6 +201,16 @@ impl<Target, Source, Donate, MayAlias> PlacementOptions<Target, Source, Donate, 
     }
 }
 
+impl<Target> PlacementOptions<Target> {
+    /// Creates [`Session::place`] options with only the destination tree prefix `target` (e.g., a [`Device`], a
+    /// [`Memory`](ryft_core::Memory), a [`PlacementRequest`], or a tuple of optional placements). The other options
+    /// use the standard prefix types and are unset, so this needs no generic type annotations.
+    #[inline]
+    pub fn to(target: Target) -> Self {
+        Self::new(Some(target), None, None, None)
+    }
+}
+
 impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Source, Donate, MayAlias> {
     #[inline]
     fn default() -> Self {
@@ -209,25 +219,6 @@ impl<Target, Source, Donate, MayAlias> Default for PlacementOptions<Target, Sour
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-impl PlacementOptions {
-    /// Creates [`Session::place`] options with the standard prefix types and all fields unset. Use this when the
-    /// call site leaves the prefix types unconstrained (e.g., `session.place(value, PlacementOptions::defaults())`).
-    #[inline]
-    pub fn defaults() -> Self {
-        Self::default()
-    }
-}
-
-impl<Target> PlacementOptions<Target> {
-    /// Creates [`Session::place`] options with only the destination tree prefix `target` (e.g., a [`Device`], a
-    /// [`Memory`](ryft_core::Memory), a [`PlacementRequest`], or a tuple of optional placements). The other options
-    /// are unset and their types follow [`Self::defaults`], so this needs no generic type annotations.
-    #[inline]
-    pub fn to(target: Target) -> Self {
-        Self::new(Some(target), None, None, None)
-    }
-}
 
 /// Leaf types accepted by [`Session::place`].
 ///
@@ -1461,9 +1452,9 @@ mod tests {
     }
 
     #[test]
-    fn test_placement_options_defaults() {
-        assert_eq!(PlacementOptions::defaults().into_parts(), (None, None, None, None));
-        assert_eq!(PlacementOptions::default(), PlacementOptions::defaults());
+    fn test_placement_options_default() {
+        assert_eq!(PlacementOptions::default().into_parts(), (None, None, None, None));
+        assert_eq!(PlacementOptions::default(), <PlacementOptions as Default>::default());
         assert_eq!(PlacementOptions::<Device>::default().into_parts(), (None, None, None, None));
     }
 
@@ -1479,7 +1470,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // The destination changes its type, and the other options keep theirs.
-        let options = PlacementOptions::defaults().with_may_alias(Some(false)).with_target((Some(devices[1]), None));
+        let options = PlacementOptions::default().with_may_alias(Some(false)).with_target((Some(devices[1]), None));
         assert_eq!(options.clone().into_parts(), (Some((Some(devices[1]), None)), None, None, Some(Some(false))));
         let (placed, uploaded) = session.place((1f32, 2f32), options).unwrap();
         assert_eq!(placed.mesh().devices(), [devices[1]]);
@@ -1506,10 +1497,10 @@ mod tests {
         assert_eq!(options.clone().into_parts(), (Some(devices[1]), Some(devices[0]), None, None));
         let moved = session.place(array.clone(), options).unwrap();
         assert_eq!(moved.mesh().devices(), [devices[1]]);
-        let kept = session.place(array.clone(), PlacementOptions::defaults().with_source(devices[1])).unwrap();
+        let kept = session.place(array.clone(), PlacementOptions::default().with_source(devices[1])).unwrap();
         assert_eq!(kept.mesh().devices(), [devices[0]]);
         let pinned = PlacementRequest::from(Memory::Host { pinned: true });
-        let error = session.place(array.clone(), PlacementOptions::defaults().with_source(pinned)).unwrap_err();
+        let error = session.place(array.clone(), PlacementOptions::default().with_source(pinned)).unwrap_err();
         assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
         assert_eq!(
             error.to_string(),
@@ -1522,7 +1513,7 @@ mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let array = session.place(2.5f32, PlacementOptions::defaults()).unwrap();
+        let array = session.place(2.5f32, PlacementOptions::default()).unwrap();
         let buffer = Arc::downgrade(array.shards()[0].buffer().unwrap());
 
         // The donation changes its type, and a donated leaf is consumed.
@@ -1532,7 +1523,7 @@ mod tests {
         assert_eq!(placed.mesh().devices(), [device]);
         assert_eq!(shard_values(&placed), vec![vec![2.5]]);
         assert!(buffer.upgrade().is_none());
-        let options = PlacementOptions::defaults().with_donate((true, false));
+        let options = PlacementOptions::default().with_donate((true, false));
         assert_eq!(options.into_parts(), (None, None, Some((true, false)), None));
     }
 
@@ -1540,41 +1531,41 @@ mod tests {
     fn test_placement_options_with_may_alias() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let array = session.place(2.5f32, PlacementOptions::defaults()).unwrap();
+        let array = session.place(2.5f32, PlacementOptions::default()).unwrap();
 
         let shares_buffer =
             |placed: &Array| Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap());
 
         // A forced copy needs no destination, and the copy shares no buffer with the input.
-        let options = PlacementOptions::defaults().with_may_alias(Some(false));
+        let options = PlacementOptions::default().with_may_alias(Some(false));
         assert_eq!(options.clone().into_parts(), (None, None, None, Some(Some(false))));
         let copied = session.place(array.clone(), options).unwrap();
         assert!(!shares_buffer(&copied));
         assert_eq!(copied.mesh(), array.mesh());
         assert_eq!(copied.r#type(), array.r#type());
         assert_eq!(shard_values(&copied), vec![vec![2.5]]);
-        let kept = session.place(array.clone(), PlacementOptions::defaults().with_may_alias(Some(true))).unwrap();
+        let kept = session.place(array.clone(), PlacementOptions::default().with_may_alias(Some(true))).unwrap();
         assert!(shares_buffer(&kept));
 
         // Plain `bool` aliasing options are accepted as well, and they mean what their `Some` forms mean.
-        let options = PlacementOptions::defaults().with_may_alias(false);
+        let options = PlacementOptions::default().with_may_alias(false);
         assert_eq!(options.clone().into_parts(), (None, None, None, Some(false)));
         let copied = session.place(array.clone(), options).unwrap();
         assert!(!shares_buffer(&copied));
         assert_eq!(copied.mesh(), array.mesh());
         assert_eq!(shard_values(&copied), vec![vec![2.5]]);
-        let kept = session.place(array.clone(), PlacementOptions::defaults().with_may_alias(true)).unwrap();
+        let kept = session.place(array.clone(), PlacementOptions::default().with_may_alias(true)).unwrap();
         assert!(shares_buffer(&kept));
 
         // So are tuple prefixes of plain `bool` options.
-        let options = PlacementOptions::defaults().with_may_alias((false, true));
+        let options = PlacementOptions::default().with_may_alias((false, true));
         let (copied, kept) = session.place((array.clone(), array.clone()), options).unwrap();
         assert!(!shares_buffer(&copied));
         assert_eq!(shard_values(&copied), vec![vec![2.5]]);
         assert!(shares_buffer(&kept));
 
         // An optional leaf can leave its branch unspecified while the other branch requests a copy.
-        let options = PlacementOptions::defaults().with_may_alias((None, Some(false)));
+        let options = PlacementOptions::default().with_may_alias((None, Some(false)));
         let (kept, copied) = session.place((array.clone(), array.clone()), options).unwrap();
         assert!(shares_buffer(&kept));
         assert!(!shares_buffer(&copied));
@@ -1625,7 +1616,7 @@ mod tests {
         let (complex_array, low_precision_array, array) = session
             .place(
                 (HostOrArray::from(complex), HostOrArray::from(low_precision), HostOrArray::from(array)),
-                PlacementOptions::defaults(),
+                PlacementOptions::default(),
             )
             .unwrap();
         assert_eq!(complex_array.data_type(), DataType::C64);
@@ -1755,13 +1746,13 @@ mod tests {
 
         // Without a destination, a host leaf is uploaded to the first local device without being committed to it, also
         // when the session has a mesh.
-        let scalar = session.place(2.5f32, PlacementOptions::defaults()).unwrap();
-        let flag = session.place(true, PlacementOptions::defaults()).unwrap();
+        let scalar = session.place(2.5f32, PlacementOptions::default()).unwrap();
+        let flag = session.place(true, PlacementOptions::default()).unwrap();
         assert_eq!(scalar.r#type().into_owned().with_sharding(None).unwrap(), ArrayType::scalar(DataType::F32));
         assert_eq!(scalar.mesh().devices(), [Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()]);
         assert!(!scalar.is_committed());
         let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 2));
-        assert!(!meshed_session.place(2.5f32, PlacementOptions::defaults()).unwrap().is_committed());
+        assert!(!meshed_session.place(2.5f32, PlacementOptions::default()).unwrap().is_committed());
         assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
         assert_eq!(flag.data_type(), DataType::Boolean);
         assert_eq!(flag.copy_to_host_bytes().unwrap(), vec![1u8]);
@@ -1788,7 +1779,7 @@ mod tests {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let matrix = CoreArray::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap();
-        let array = session.place(matrix, PlacementOptions::defaults()).unwrap();
+        let array = session.place(matrix, PlacementOptions::default()).unwrap();
         assert_eq!(
             array.r#type().into_owned().with_sharding(None).unwrap(),
             ArrayType::new_static(DataType::F32, [2, 3]),
@@ -1810,7 +1801,7 @@ mod tests {
         ] {
             let mut host = CoreArray::new(r#type, vec![1]).unwrap();
             host.storage_bytes_mut()[0] = 2;
-            let error = session.place(host, PlacementOptions::defaults()).unwrap_err();
+            let error = session.place(host, PlacementOptions::default()).unwrap_err();
             assert_eq!(error.to_string(), "array element 0 has invalid `bool` byte encoding [2]");
         }
     }
@@ -1824,14 +1815,14 @@ mod tests {
 
         // A host value uploaded without a destination, or with one that names only its storage, lives on a device that
         // this process chose on its own, and a destination that names a device does not.
-        let local = session.place(1f32, PlacementOptions::defaults()).unwrap();
+        let local = session.place(1f32, PlacementOptions::default()).unwrap();
         assert!(local.is_locally_assigned());
         assert!(session.place(1f32, PlacementOptions::to(pinned)).unwrap().is_locally_assigned());
         assert!(!session.place(1f32, PlacementOptions::to(device)).unwrap().is_locally_assigned());
 
         // An array keeps the fact without a destination and with an in-place one, eagerly and when a staged in-place
         // placement executes on it, and a destination that names a device clears it.
-        assert!(session.place(local.clone(), PlacementOptions::defaults()).unwrap().is_locally_assigned());
+        assert!(session.place(local.clone(), PlacementOptions::default()).unwrap().is_locally_assigned());
         assert!(session.place(local.clone(), PlacementOptions::to(pinned)).unwrap().is_locally_assigned());
         let staged =
             session.bind(PlaceOperation::new(pinned, None), Vec::new(), &[Value::Array(local.clone())]).unwrap();
@@ -1871,7 +1862,7 @@ mod tests {
             ("default mesh on CPU 1", session.with_device_mesh(DeviceMesh::new(single, vec![devices[1]]).unwrap())),
             ("default mesh on both CPUs", session.with_device_mesh(domain_mesh(client, "x", 2))),
         ] {
-            let placed = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::defaults());
+            let placed = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default());
             let pinned = PlacementOptions::to(Memory::Host { pinned: true });
             let in_place = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), pinned);
             let r#type = ArrayType::new_static(DataType::F32, [2]);
@@ -2245,7 +2236,7 @@ mod tests {
 
         // An uncommitted array on one device stays on that device and is committed, and `Array::to_placement` accepts
         // a bare memory as well.
-        let single = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::defaults()).unwrap();
+        let single = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
         assert!(!single.is_committed());
         for moved in [
             session.place(single.clone(), PlacementOptions::to(pinned)).unwrap(),
@@ -2306,7 +2297,7 @@ mod tests {
     fn test_session_place_validates_source_storage_on_every_path() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let array = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::defaults()).unwrap();
+        let array = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
         let device = array.mesh().devices()[0];
         let pinned = Memory::Host { pinned: true };
         let options = |source: &PlacementRequest| {
@@ -2487,7 +2478,7 @@ mod tests {
             Err("array `$[0]` cannot be donated while `may_alias` is `Some(true)`".to_string()),
         );
         assert!(matches!(
-            session.place(input, PlacementOptions::defaults().with_source(Memory::Host { pinned: true })),
+            session.place(input, PlacementOptions::default().with_source(Memory::Host { pinned: true })),
             Err(Error::Core(error)) if matches!(error.as_ref(), CoreError::Type(_)),
         ));
     }
@@ -2580,7 +2571,7 @@ mod tests {
         // Root option prefixes cover the input without leaves, which is returned as it is.
         let options = PlacementOptions::new(Some(device.clone()), Some(device.clone()), Some(true), Some(Some(false)));
         assert_eq!(session.place(Vec::<Array>::new(), options).unwrap().len(), 0);
-        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::defaults()).unwrap().len(), 0);
+        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::default()).unwrap().len(), 0);
         assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::to(device.clone())).unwrap().len(), 0);
 
         // An option prefix with an element for an input without elements matches no node of that input.
@@ -2654,11 +2645,11 @@ mod tests {
         // An empty option node must match an empty node of the input at the same path. This holds for every option.
         let options = PlacementOptions::to(vec![vec![devices[1]], Vec::new()]);
         assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::defaults().with_source(vec![vec![devices[0]], Vec::new()]);
+        let options = PlacementOptions::default().with_source(vec![vec![devices[0]], Vec::new()]);
         assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::defaults().with_donate(vec![vec![false], Vec::new()]);
+        let options = PlacementOptions::default().with_donate(vec![vec![false], Vec::new()]);
         assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::defaults().with_may_alias(vec![vec![None], Vec::new()]);
+        let options = PlacementOptions::default().with_may_alias(vec![vec![None], Vec::new()]);
         assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
 
         // An empty option node does not match an input without that node, even when neither has leaves.
@@ -3019,7 +3010,7 @@ mod tests {
         )
         .unwrap();
 
-        let copied_array = session.place(source_array, PlacementOptions::defaults()).unwrap();
+        let copied_array = session.place(source_array, PlacementOptions::default()).unwrap();
         let expected_visualization =
             format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
 
@@ -3308,7 +3299,7 @@ mod tests {
         let source = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
         let place = |source: PlacementRequest| {
             session
-                .place(array.clone(), PlacementOptions::defaults().with_source(source))
+                .place(array.clone(), PlacementOptions::default().with_source(source))
                 .map(|placed| placed.r#type().into_owned())
         };
 
@@ -3481,7 +3472,7 @@ mod tests {
 
         // A staged leaf wraps no arrays, so any session can place it.
         let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-            |input: ArrayTracer| other_session.place(input, PlacementOptions::defaults()).unwrap(),
+            |input: ArrayTracer| other_session.place(input, PlacementOptions::default()).unwrap(),
             ArrayType::new_static(DataType::F32, [2]),
         );
         assert!(traced.is_ok());
@@ -5712,7 +5703,7 @@ mod tests {
         .unwrap();
         let source =
             PlacementRequest::InPlace { memory: None, layout: Some(Layout::Strided(StridedLayout::new(vec![8, 4]))) };
-        let options = || PlacementOptions::defaults().with_source(source.clone());
+        let options = || PlacementOptions::default().with_source(source.clone());
         let source_request = source.clone();
         let error = RefCell::new(None::<String>);
         let invalid = Err(format!(

@@ -564,13 +564,13 @@ mod tests {
         let device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
         let rows = clients.map(|client| {
             let session = Session::builder().client(client).build().unwrap();
-            let local = session.place(4f32, PlacementOptions::defaults()).unwrap();
+            let local = session.place(4f32, PlacementOptions::default()).unwrap();
             let array = session.place(local.clone(), PlacementOptions::to(device)).unwrap();
             let holds_buffer = client.process_index().unwrap() == 0;
             assert_eq!(array.addressable_shards().count(), usize::from(holds_buffer));
-            let copy = PlacementOptions::defaults().with_may_alias(false);
+            let copy = PlacementOptions::default().with_may_alias(false);
             let copy_on_device = PlacementOptions::to(device).with_may_alias(false);
-            let donated_copy = PlacementOptions::defaults().with_donate(true).with_may_alias(false);
+            let donated_copy = PlacementOptions::default().with_donate(true).with_may_alias(false);
 
             // Commitment is part of the identity of a retained array but not of the logical array, so the input is
             // compared with the commitment of each result.
@@ -581,7 +581,7 @@ mod tests {
                 ("clone", same(&array, &array.clone())),
                 (
                     "place without a destination",
-                    same(&array, &session.place(array.clone(), PlacementOptions::defaults()).unwrap()),
+                    same(&array, &session.place(array.clone(), PlacementOptions::default()).unwrap()),
                 ),
                 (
                     "place on its own placement",

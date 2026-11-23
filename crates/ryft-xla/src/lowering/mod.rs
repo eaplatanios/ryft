@@ -7663,10 +7663,10 @@ pub(crate) mod tests {
         let first_device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
         let modules = clients.map(|client| {
             let session = Session::builder().client(client).build().unwrap();
-            let scalar = session.place(4f32, PlacementOptions::defaults()).unwrap();
+            let scalar = session.place(4f32, PlacementOptions::default()).unwrap();
             let first = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
             let second = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
-            let copy = session.place(first.clone(), PlacementOptions::defaults().with_may_alias(false)).unwrap();
+            let copy = session.place(first.clone(), PlacementOptions::default().with_may_alias(false)).unwrap();
             if client.process_index().unwrap() == 0 {
                 let buffer = scalar.shards()[0].buffer().unwrap();
                 assert!(Arc::ptr_eq(first.shards()[0].buffer().unwrap(), buffer));

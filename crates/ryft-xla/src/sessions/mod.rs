@@ -5778,7 +5778,7 @@ pub(crate) mod tests {
         let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
-        let scalar = session.place(2f32, PlacementOptions::defaults()).unwrap();
+        let scalar = session.place(2f32, PlacementOptions::default()).unwrap();
         let committed = f32_scalar(&session, &second_mesh, 3.0);
         let operation = Operation::Array(AddOperation::new().into());
         let inputs = [Value::Array(scalar.clone()), Value::Array(committed.clone())];
@@ -5828,7 +5828,7 @@ pub(crate) mod tests {
         // An uncommitted input on the same device but on a mesh with another axis moves to the mesh of the committed
         // input, and its shard keeps its buffer.
         let committed = f32_scalar(&session, &mesh, 3.0);
-        let uncommitted = session.place(2f32, PlacementOptions::defaults()).unwrap();
+        let uncommitted = session.place(2f32, PlacementOptions::default()).unwrap();
         assert_ne!(uncommitted.mesh(), &mesh);
         assert_eq!(uncommitted.mesh().devices(), mesh.devices());
         let moved = session
@@ -6022,7 +6022,7 @@ pub(crate) mod tests {
     fn test_session_bind_commits_results_independently_of_capture_order_and_cache_history() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let input = session.place(1f32, PlacementOptions::defaults()).unwrap();
+        let input = session.place(1f32, PlacementOptions::default()).unwrap();
         let committed = input.clone().with_committed(true);
         assert!(!input.is_committed());
 
