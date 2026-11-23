@@ -453,7 +453,8 @@ impl<C: Context> PartialEvaluationContext<C> {
                 "cannot import an unknown value from another partial-evaluation context".to_string(),
             )
         })?;
-        let source_key = Rc::as_ptr(&partial.materialization) as usize;
+        let source_slot = partial.materialization_slot();
+        let source_key = Rc::as_ptr(source_slot) as usize;
         if let Some((_, imported)) = self.state.imported_known_values.borrow().get(&source_key) {
             return Ok(PartialTracer::new(self.clone(), imported.clone()));
         }
@@ -469,7 +470,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.state
             .imported_known_values
             .borrow_mut()
-            .insert(source_key, (partial.materialization.clone(), imported.clone()));
+            .insert(source_key, (Rc::clone(source_slot), imported.clone()));
         Ok(PartialTracer::new(self.clone(), imported))
     }
 
@@ -1358,7 +1359,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let mut residual_output_atoms: Vec<AtomId> = Vec::new();
         for output in outputs {
             let materialization = output.materialization();
-            match output.value() {
+            match output.into_value() {
                 PartialValue::Known(value) => evaluation_outputs.push(PartialEvaluationOutput::Known(value)),
                 PartialValue::Unknown(_) => {
                     let PartialValueMaterialization::Variable { residual_atom } = materialization else {
@@ -1796,7 +1797,7 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         // Record the assignment in the value's shared slot so that every clone of this value reuses the same
         // residual atom instead of materializing the value again.
-        value.materialization.set(match constant {
+        value.materialization_slot().set(match constant {
             true => PartialValueMaterialization::Constant { residual_atom: Some(atom) },
             false => PartialValueMaterialization::Input { residual_atom: Some(atom) },
         });
@@ -2230,11 +2231,13 @@ impl<C: Context> PartialEq for PartialTracer<C> {
     fn eq(&self, other: &Self) -> bool {
         match (&self.state, &other.state) {
             (PartialTracerState::Live(left), PartialTracerState::Live(right)) => {
-                Rc::ptr_eq(&left.materialization, &right.materialization)
+                Rc::ptr_eq(left.materialization_slot(), right.materialization_slot())
             }
-            // Poisoned values never compare equal: equality answers identity questions for analyses such as the
-            // loop-invariance probes, and a deferred error has no identity to assert.
-            _ => false,
+            _ => {
+                // Poisoned values never compare equal: equality answers identity questions for analyses such as the
+                // loop-invariance probes, and a deferred error has no identity to assert.
+                false
+            }
         }
     }
 }
@@ -2702,8 +2705,8 @@ mod tests {
         let configured = target.clone().with_reference_placement(ReferencePlacement::Stage);
         let imported_again = configured.import_known(&known).unwrap();
         assert!(Rc::ptr_eq(
-            &imported.value().unwrap().materialization,
-            &imported_again.value().unwrap().materialization,
+            imported.value().unwrap().materialization_slot(),
+            imported_again.value().unwrap().materialization_slot(),
         ));
 
         let reference = parent.input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());

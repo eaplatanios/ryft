@@ -5,23 +5,11 @@ use std::rc::Rc;
 
 use crate::programs::{AtomId, Type, TypeError, Typed, Value};
 
-#[cfg(doc)]
-use crate::partial::contexts::PartialEvaluationContext;
-
-#[cfg(doc)]
-use crate::partial::evaluations::PartialEvaluation;
-
-#[cfg(doc)]
-use crate::partial::partitions::PartitionedProgram;
-
-#[cfg(doc)]
-use crate::programs::Program;
-
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
-/// interprets a [`Program`] over. Every [`Atom`](crate::Atom) and every intermediate result is either
+/// interprets a [`Program`](crate::Program) over. Every [`Atom`](crate::Atom) and every intermediate result is either
 /// [`Known`](Self::Known) (i.e., a concrete value available now) or [`Unknown`](Self::Unknown) (i.e., only its
 /// [`Type`] is available until the residual program runs). For more information on partial evaluation, refer to
-/// the documentation of [`Program::partially_evaluate`].
+/// the documentation of [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 #[derive(Clone, Debug)]
 pub enum PartialValue<V: Value> {
     /// [`Value`] that is fully known at partial-evaluation time and can be folded forward.
@@ -67,9 +55,9 @@ impl<V: Value> Typed for PartialValue<V> {
 }
 
 /// Represents the way in which a [`PartialEvaluationValue`] is represented when _residual_ work depends on it.
-/// A [`PartialValue`] only records whether a value is known now or unknown until a residual [`Program`] runs.
-/// [`PartialValueMaterialization`] records how that value is represented at the residual boundary. Each materialization
-/// lives in a slot shared by every clone of one logical [`PartialEvaluationValue`], and so the residual
+/// A [`PartialValue`] only records whether a value is known now or unknown until a residual [`Program`](crate::Program)
+/// runs. [`PartialValueMaterialization`] records how that value is represented at the residual boundary. Each
+/// materialization lives in a slot shared by every clone of one logical [`PartialEvaluationValue`], and so the residual
 /// [`Atom`](crate::Atom) assigned when a known value is first materialized (as a residual input or an inline residual
 /// constant) is visible to every later consumer of the same value, which reuses that atom instead of materializing the
 /// value again. By contrast, [`Variable`](Self::Variable) values were *created* in the residual program and so always
@@ -77,7 +65,7 @@ impl<V: Value> Typed for PartialValue<V> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialValueMaterialization {
     /// Known value with no residual materialization decision yet. If residual work depends on it, the corresponding
-    /// [`PartialEvaluationContext`] will materialize it as a fresh residual input.
+    /// [`PartialEvaluationContext`](crate::PartialEvaluationContext) will materialize it as a fresh residual input.
     Undecided,
 
     /// Known value that should be materialized as a residual program input.
@@ -104,7 +92,8 @@ pub enum PartialValueMaterialization {
     },
 }
 
-/// Represents the [`Value`] type used by [`PartialEvaluationContext`]s while partially evaluating [`Program`]s.
+/// Represents the [`Value`] type used by [`PartialEvaluationContext`](crate::PartialEvaluationContext)s
+/// while partially evaluating [`Program`](crate::Program)s.
 #[derive(Clone)]
 pub struct PartialEvaluationValue<V: Value> {
     /// Underlying [`PartialValue`] that represents the abstract known/unknown classification of the value.
@@ -125,7 +114,7 @@ pub struct PartialEvaluationValue<V: Value> {
     /// long after the value has been cloned and shared, and so the write must go through `&self`. Because
     /// [`PartialValueMaterialization`] is a small [`Copy`] value, [`Cell`] suffices without
     /// [`RefCell`](std::cell::RefCell)'s borrow tracking.
-    pub(super) materialization: Rc<Cell<PartialValueMaterialization>>,
+    materialization: Rc<Cell<PartialValueMaterialization>>,
 }
 
 impl<V: Value> PartialEvaluationValue<V> {
@@ -228,6 +217,18 @@ impl<V: Value> PartialEvaluationValue<V> {
     pub fn as_known(&self) -> Option<&V> {
         self.value.as_known()
     }
+
+    /// Consumes this value and returns its underlying [`PartialValue`].
+    #[inline]
+    pub(super) fn into_value(self) -> PartialValue<V> {
+        self.value
+    }
+
+    /// Borrows the shared slot used to identify this value and record its residual atom.
+    #[inline]
+    pub(super) fn materialization_slot(&self) -> &Rc<Cell<PartialValueMaterialization>> {
+        &self.materialization
+    }
 }
 
 impl<V: Value> Debug for PartialEvaluationValue<V> {
@@ -236,7 +237,7 @@ impl<V: Value> Debug for PartialEvaluationValue<V> {
         formatter
             .debug_struct("PartialEvaluationValue")
             .field("value", &self.value)
-            .field("materialization", &self.materialization.get())
+            .field("materialization", &self.materialization())
             .finish()
     }
 }
@@ -250,17 +251,20 @@ impl<V: Value> Typed for PartialEvaluationValue<V> {
     }
 }
 
-/// Input of a partially evaluated (i.e., a _residual_) [`Program`] (i.e., an input of a [`PartialEvaluation`]).
-/// The residual program's inputs are the original program's surviving unknown inputs followed by the known values
-/// (i.e., the residuals) that its unknown subcomputation consumes.
+/// Input of a partially evaluated (i.e., a _residual_) [`Program`](crate::Program) (i.e., an input of a
+/// [`PartialEvaluation`](crate::PartialEvaluation)). The residual program's inputs are the original program's surviving
+/// unknown inputs followed by the known values (i.e., the residuals) that its unknown subcomputation consumes.
 ///
-/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
+/// For more information on partial evaluation, refer to the documentation of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialEvaluationInput<V> {
     /// Residual input fed by a value that partial evaluation folded to a concrete known residual value. Note that a
     /// reference-typed known feeder is the live reference handle itself, threaded by identity and never as a snapshot
     /// of its contents, so that the residual program accesses the state as it is when the residual program runs. Refer
-    /// to the documentation of [`PartialEvaluation::known_reference_inputs`] for more information.
+    /// to the documentation of
+    /// [`PartialEvaluation::known_reference_inputs`](crate::PartialEvaluation::known_reference_inputs)
+    /// for more information.
     Known(V),
 
     /// Residual input fed by an unknown input of the original program, identified by that input's index in the
@@ -280,12 +284,13 @@ impl<V> PartialEvaluationInput<V> {
     }
 }
 
-/// Descriptor for one original output after partial evaluation. Partial evaluation splits the original outputs
-/// into those it could fold to a known value and those that remain computed by the residual [`Program`]. A
-/// [`PartialEvaluation`] stores these descriptors in original output order so that it can reconstruct the full
-/// result after interpreting the residual program.
+/// Descriptor for one original output after partial evaluation. Partial evaluation splits the original
+/// outputs into those it could fold to a known value and those that remain computed by the residual
+/// [`Program`](crate::Program). A [`PartialEvaluation`](crate::PartialEvaluation) stores these descriptors
+/// in original output order so that it can reconstruct the full result after interpreting the residual program.
 ///
-/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
+/// For more information on partial evaluation, refer to the documentation of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialEvaluationOutput<V> {
     /// Output that was folded to a concrete value during partial evaluation.
@@ -307,11 +312,13 @@ impl<V> PartialEvaluationOutput<V> {
     }
 }
 
-/// Source of a residual program input of a [`PartitionedProgram`] obtained via [`PartitionedProgram::residual_inputs`].
-/// [`Program::partition`] produces only [`UnknownInput`](Self::UnknownInput) and [`ResidualEdge`](Self::ResidualEdge)
-/// sources, with edges numbered in residual input order. [`PartitionedProgram::forward_residuals`] additionally
-/// produces [`KnownInput`](Self::KnownInput) and [`KnownOutput`](Self::KnownOutput) sources for residual inputs that
-/// would otherwise repeat a value that the caller of the partition already has.
+/// Source of a residual program input of a [`PartitionedProgram`](crate::PartitionedProgram)
+/// obtained via [`PartitionedProgram::residual_inputs`](crate::PartitionedProgram::residual_inputs).
+/// [`Program::partition`](crate::Program::partition) produces only [`UnknownInput`](Self::UnknownInput)
+/// and [`ResidualEdge`](Self::ResidualEdge) sources, with edges numbered in residual input order.
+/// [`PartitionedProgram::forward_residuals`](crate::PartitionedProgram::forward_residuals) additionally produces
+/// [`KnownInput`](Self::KnownInput) and [`KnownOutput`](Self::KnownOutput) sources for residual inputs that would
+/// otherwise repeat a value that the caller of the partition already has.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResidualInputSource {
     /// Original (i.e., pre-partitioning) unknown input `index`, which the residual program receives directly.
@@ -321,7 +328,8 @@ pub enum ResidualInputSource {
 
     /// Original known input `index`, which the residual program receives directly instead of through
     /// a residual edge that would return it unchanged. The index addresses the original boundary, even when
-    /// [`PartitionedProgram::known_input_indices`] no longer contains it because the known program does not use it.
+    /// [`PartitionedProgram::known_input_indices`](crate::PartitionedProgram::known_input_indices) no longer contains
+    /// it because the known program does not use it.
     KnownInput(usize),
 
     /// Fully known output `index` (i.e., known program output `index`), which the residual program receives instead
@@ -411,7 +419,7 @@ mod tests {
         let value = PartialEvaluationValue::known_input(Array::scalar(2.0f64).unwrap());
         let clone = value.clone();
         let materialization = PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(3)) };
-        value.materialization.set(materialization);
+        value.materialization_slot().set(materialization);
         assert_eq!(value.materialization(), materialization);
         assert_eq!(clone.materialization(), materialization);
 
