@@ -70,8 +70,9 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{DynamicZero, Zero};
 use crate::operations::control_flow::{
-    ResidualStorageOperation, canonicalize_loop_carry_batch_axes, loop_carry_passthrough_mask,
-    refine_control_flow_output_types, stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
+    ControlFlowType, ResidualStorageOperation, canonicalize_loop_carry_batch_axes, common_control_flow_signature,
+    loop_carry_passthrough_mask, refine_control_flow_output_types, retrace_control_flow_region,
+    stabilize_loop_carry_batch_axes, validate_control_flow_output_identity_scope,
     validate_control_flow_region_input_refinement, validate_loop_reference_carry_roots,
 };
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
@@ -121,6 +122,7 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 pub trait ScanType:
     Type<Identity = DimensionVariable>
     + ArrayMemberType
+    + ControlFlowType
     + ReferenceMemberType<Referent: ArrayMemberType>
     + From<ArrayType>
     + Into<ArrayIrType>
@@ -189,10 +191,25 @@ pub trait ScanType:
         scan.declared_input_types(body_input_types)?;
         scan.declared_output_types(body_output_types)?;
         let body_input_types = &body_input_types[1..];
-        check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
+
+        // Every iteration after the first enters the body with its carry outputs, so they must join with the carry
+        // inputs into the carry inputs themselves. They may then differ from them only in placement that the carry
+        // inputs do not track (e.g., a sharded carry output for a carry input without a sharding), which every body
+        // entry admits. A carry input that tracks such placement is not the join of a carry output that differs from
+        // it, and is rejected with the mismatch of the two signatures. The `Scan` capability traces its body at the
+        // joined carries instead.
+        let carry_types = common_control_flow_signature(
+            format_args!("`{SCAN_OPERATION_NAME}` body carry"),
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
-        ]);
+        )?;
+        if carry_types != &body_input_types[..carry_count] {
+            check_types!(@same, format!("`{SCAN_OPERATION_NAME}` body carry"), [
+                &body_input_types[..carry_count],
+                &body_output_types[..carry_count],
+            ]);
+        }
+
         Self::validate_scan_body_members(body_input_types, body_output_types)
     }
 
@@ -392,12 +409,16 @@ pub trait ScanType:
             Some(extent) => Dimension::Static(extent),
             None => iteration_count.clone(),
         };
-        let output_types = ScanOperation {
+        let mut output_types = ScanOperation {
             iteration_count: effective_iteration_count,
             stacked_axis_shardings: stacked_axis_shardings.to_vec(),
             ..scan
         }
         .declared_output_types(body_output_types)?;
+
+        // A scan that runs no iterations returns its initial carries, so the carries have the types of the carry
+        // inputs, which are the joins of the carry inputs and outputs (refer to `validate_scan_body_type_signature`).
+        output_types[..carry_count].clone_from_slice(&body_input_types[1..=carry_count]);
 
         // The facts that the inputs establish then refine the outputs (refer to `refine_control_flow_output_types`).
         // This is a separate step from the iteration count refinement above: the stacked outputs' leading axis
@@ -2278,7 +2299,7 @@ where
         // so the complete primal application is validated before any tangent work.
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, body)?;
+        let output_types = self.validate_application(&input_types, body)?;
 
         // Separate-context linearization splits the scan boundary into a primal scan and a tangent scan, and forwarding
         // a carry can leave a staged scan dead, so the relationships that the primal input types leave unproven are
@@ -2309,7 +2330,8 @@ where
         // forwarding unchanged carries from their guarded inputs.
         let output_live = jvp.activity.output_tangent_liveness();
         let tangent_outputs = primal_outputs.split_off(output_live.len());
-        let mut outputs = DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, output_live)?;
+        let mut outputs =
+            context.control_flow_dual_outputs(primal_outputs, tangent_outputs, output_live, output_types)?;
         self.forward_carries(body, &inputs, &mut outputs);
         Ok(outputs)
     }
@@ -2692,6 +2714,29 @@ where
                 })?);
             }
             let retained_carry_count = retained_carries.len();
+
+            // The carry seeds have the cotangent types of the carries of this scan, which are the joins of the carry
+            // inputs and outputs of its body (refer to `ScanType::validate_scan_body_type_signature`), while the
+            // transposition of the body declares the cotangents of its carry outputs, which may record a placement
+            // that those joins do not. Such a reversed body is traced again at the types of the carry seeds (refer
+            // to `retrace_control_flow_region`), so that its carry outputs join with its carry inputs into them.
+            let reversed_body = {
+                let mut input_types = reversed_body.input_types().to_vec();
+                let mut retrace = false;
+                for (declared, actual) in input_types[1..=retained_carry_count].iter_mut().zip(&reversed_inputs) {
+                    let actual = actual.r#type();
+                    if !declared.is_refined_by(&actual) && declared.join_for_control_flow(&actual).is_some() {
+                        *declared = actual.into_owned();
+                        retrace = true;
+                    }
+                }
+
+                if retrace {
+                    Arc::new(retrace_control_flow_region(&reversed_body, input_types)?)
+                } else {
+                    reversed_body
+                }
+            };
 
             // The reversed scan stacks the cotangents of the stacked inputs, so each of its stacked axes takes the
             // placement of that input's scan axis (replicated for an unsharded stack), not the placement that this
@@ -3131,12 +3176,23 @@ where
                             ),
                         });
                     }
+
+                    // The join of the aligned incoming and returned carry types, or the incoming type when they do
+                    // not join, is the carry type of the next pass. Every later iteration enters the body with the
+                    // returned carries, so a carry that the body returns with a type that differs from it in untracked
+                    // placement only is traced again at the joined type, which records no sharding. A value traced at
+                    // the joined type may be placed anywhere that its type does not constrain.
                     let mut next_carries = Vec::with_capacity(carry_count);
                     for (incoming, returned) in state_values.into_iter().zip(next_carry.into_parameters()) {
                         let mut pair = Tracer::align_manual_variation(&[incoming, returned])?;
-                        next_input_types.push(pair.remove(0).r#type().into_owned());
+                        let incoming_type = pair[0].r#type();
+                        let next_type = incoming_type
+                            .join_for_control_flow(&pair[1].r#type())
+                            .unwrap_or_else(|| incoming_type.into_owned());
+                        next_input_types.push(next_type);
                         next_carries.push(pair.pop().unwrap());
                     }
+
                     output_structure = Some(output.parameter_structure());
                     next_carries.extend(output.into_parameters());
                     Ok(next_carries)
@@ -3151,7 +3207,7 @@ where
                     .map(|sharding| sharding.mesh().axes().len())
                     .max()
                     .unwrap_or(0);
-                carry_count.saturating_mul(axes.max(1))
+                carry_count.saturating_mul(axes.max(1) + 1)
             });
             if next_input_types == body_input_types[1..1 + carry_count] {
                 break (program, output_structure.unwrap());
@@ -6834,6 +6890,99 @@ mod tests {
         assert_eq!(
             program.interpret(array(Array::from_elements::<f32>(sharded_type, &[7.0]).unwrap())),
             Ok(array(Array::scalar(1f32).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_inference_joins_carry_outputs_that_differ_in_untracked_placement() {
+        // The body scales its carry by a constant replicated on a mesh without explicit axes, which places its carry
+        // output, while its carry input records no sharding. The carry output joins with the carry input into the carry
+        // input itself, so the scan keeps the carry input type, evaluates, and differentiates in forward and reverse
+        // mode. Over `[2, 3, 4]` the carry is `c · 2 · 3 · 4 · 2³ = 192 c` and the stacked outputs are the products
+        // before scaling.
+        /// Returns the type of the constant `2` replicated on a mesh without explicit axes.
+        fn placed_type() -> ArrayType {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+            ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap()
+        }
+
+        /// Builds the body that maps `[carry, x]` to `[carry · x · 2, carry · x]` with a placed factor `2`.
+        fn placed_scaling_body() -> TestProgram {
+            scalar_body(2, |builder, inputs| {
+                let factor = builder.add_constant(Array::from_elements::<f64>(placed_type(), &[2.0]).unwrap());
+                let product = builder
+                    .add_instruction(MulOperation::new(), Vec::new(), vec![inputs[1], inputs[2]], None)
+                    .unwrap()[0];
+                let scaled =
+                    builder.add_instruction(MulOperation::new(), Vec::new(), vec![product, factor], None).unwrap()[0];
+                vec![scaled, product]
+            })
+        }
+
+        /// Returns the final carry of the scan of [`placed_scaling_body`] over `[2, 3, 4]` from `initial`.
+        fn scaled_product<V: Value<Type = ArrayType>>(initial: V) -> Result<V, ProgramError>
+        where
+            V::Domain: Context<Type = ArrayType, Constant = Array, Operation = TestOperation>,
+        {
+            let values = initial.domain().lift(Array::vector(vec![2.0, 3.0, 4.0]).unwrap())?;
+            let operation = TestOperation::Scan(TestScanOperation::new(1, 3));
+            Ok(initial.domain().bind(operation, vec![placed_scaling_body()], &[initial, values])?.remove(0))
+        }
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let placed_type = placed_type();
+        let body = placed_scaling_body();
+        assert_eq!(body.output_types(), vec![placed_type.clone(), scalar_type.clone()]);
+        let stacked_type = ArrayType::new_static(DataType::F64, [3]);
+        let program =
+            scan_program(TestScanOperation::new(1, 3), body.clone(), vec![scalar_type.clone(), stacked_type.clone()]);
+        assert_eq!(program.output_types(), vec![scalar_type.clone(), stacked_type]);
+        let values = Array::vector(vec![2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::scalar(1.0).unwrap(), values.clone()]),
+            Ok(vec![
+                Array::from_elements::<f64>(placed_type.clone(), &[192.0]).unwrap(),
+                Array::vector(vec![2.0, 12.0, 96.0]).unwrap(),
+            ]),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(1.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), scaled_product),
+            Ok((
+                Array::from_elements::<f64>(placed_type.clone(), &[192.0]).unwrap(),
+                Array::from_elements::<f64>(placed_type.clone(), &[192.0]).unwrap(),
+            )),
+        );
+        // The reverse Jacobian replays a transposed seed slot typed at the joined carry, using a basis at the
+        // concrete primal output's placement.
+        let at = Array::scalar(1.0f64).unwrap();
+        let (primal, pushforward) = differentiate_at(at.clone()).linearize(scaled_product).unwrap();
+        assert_eq!(primal.r#type().as_ref(), &placed_type);
+        assert_eq!(pushforward.program().output_types(), vec![scalar_type.clone()]);
+        let jacobian = differentiate_at(at).jacobian_reverse(scaled_product).unwrap();
+        assert_eq!(jacobian.into_values(), vec![Array::scalar(192.0f64).unwrap()]);
+        check_gradient!(scaled_product, at = Array::scalar(1.0).unwrap(), step = 1e-4, tolerance = 1e-3);
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.interpret(vec![
+                Array::scalar(1.0).unwrap(),
+                Array::vector(vec![0.0, 0.0, 0.0]).unwrap(),
+                values.clone(),
+            ]),
+            Ok(vec![Array::scalar(192.0).unwrap()]),
+        );
+
+        // A carry input that records the placement is not the join of a carry output that records none, so the body
+        // is rejected with the mismatch of the two carry signatures.
+        let mut builder = ProgramBuilder::<Array, TestOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64));
+        builder.add_input(placed_type.clone());
+        let replacement = builder.add_constant(Array::scalar(1.0f64).unwrap());
+        let body: TestProgram = builder.build(vec![replacement], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        assert_eq!(
+            TestScanOperation::new(1, 3).infer_output_types(&[placed_type.clone()], &[body.interface().clone()]),
+            Err(TypeError::invalid(format!(
+                "`scan` body carry type signature mismatch: expected [{placed_type}] but got [f64[]]",
+            ))),
         );
     }
 
