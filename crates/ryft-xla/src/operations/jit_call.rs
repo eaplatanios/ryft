@@ -14,18 +14,19 @@ use ryft_core::{
     CaptureConstant, CastOperation, CompositeKey, Concretizable, ConstrainShardingOperation, Context,
     CotangentAccumulator, CotangentDestinations, Device, DeviceMesh, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero,
-    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance,
-    ParallelReduceOperation, Parameterized, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram, PlaceOperation, Placement,
-    Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramError, ReductionKind, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
-    RematerializationOptimizationBarrier, ReshardOperation, ResidualDemandSplit, ResidualInputSource,
-    ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension, StagedCallOperation, TangentActivity,
-    Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TransposedProgramCotangent,
-    TranspositionContext, TranspositionDriver, Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements,
-    Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection, Zero,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, MeshAxisType,
+    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OperationPayloadProjection,
+    OutputRegionProvenance, ParallelReduceOperation, Parameterized, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
+    PlaceOperation, Placement, Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramError, ReductionKind,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness,
+    RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier, ReshardOperation, ResidualDemandSplit,
+    ResidualInputSource, ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension, StagedCallOperation,
+    StagingContext, TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
+    TransposedProgramCotangent, TranspositionContext, TranspositionDriver, Type as CoreType, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection,
+    Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -33,20 +34,21 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::compilation::domains::{commits_public_outputs, declared_input_sharding};
-use crate::execution::{validate_committed_input_devices, validate_input_reduction};
+use crate::compilation::domains::{boundary_input_type, commits_public_outputs, declared_input_sharding};
+use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::lower_array_ir_type;
 use crate::lowering::{
     CollectiveLoweringState, EffectTokens, collect_session_constants, entry_boundary_sharding,
-    has_placement_requests_in_region, has_untracked_auto_axes,
+    has_placement_requests_in_region, has_untracked_auto_axes, validate_declared_pending_reduction,
 };
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};
 use crate::{
-    Array, Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    Session, Type, Value,
 };
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
@@ -427,12 +429,14 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     (refer to `collect_nested_sharding_mesh`). Compiling a caller for other devices than those of a call that names
 ///     devices, or for the replicas of a bounded dynamic program while an override splits a value, fails with an exact
 ///     error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible device assignment.
-///   - Eager dispatch and eager interpretation require committed public arguments to be on the physical devices of
-///     a call that names devices. They move captures and uncommitted arguments to those devices and apply the input
-///     and output sharding overrides. Eager dispatch places every other input as the executable of the callee
-///     does (refer to `boundary_input_sharding`), which is as the callee input type records for a function compiled
-///     for its input types (replicated for a type without a sharding), and as the input is for a call of a `jit`
-///     dispatcher, whose executables are specialized for the placements of their inputs.
+///   - Eager dispatch and eager interpretation take one placement decision for each application (refer to
+///     `eager_decision`), which admits the arguments as an execution does (their client, their committed devices,
+///     and their reduction state), selects the devices of the call, moves captures and uncommitted arguments to them,
+///     applies the input and output sharding overrides, and states whether the arguments commit the results and
+///     whether this process alone chose their devices. Every other input is placed as the executable of the callee
+///     places it (refer to `boundary_input_sharding`), which is as the callee input type records for a function
+///     compiled for its input types (replicated for a type without a sharding), and as the input is for a call of a
+///     `jit` dispatcher, whose executables are specialized for the placements of their inputs.
 ///   - The type rule of the call accepts every input whose type refines the callee input type up to the placement that
 ///     its sharding describes, so every context that binds a call accepts the same inputs (refer to
 ///     `validate_call_input_types`). It rejects an input whose unreduced or reduced axes differ from those of the
@@ -447,14 +451,14 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     linearization, the known and residual calls of a split, or a transposed call) also keeps the effective
 ///     boundary of every input of the original call that it receives, and places no input that the transform adds
 ///     (e.g., a residual), because its declared input types are only traced types (refer to
-///     `with_derived_boundary_shardings`). Partial evaluation treats a call as forwarding one of its inputs only when
-///     the call names no devices and does not place that input at its boundary, so that the call could not move it
-///     (refer to `forward_jit_call_inputs`).
+///     `with_derived_boundary_shardings`). Partial evaluation treats a call as forwarding one of its inputs only where
+///     the placement decision of every application returns that input unchanged (refer to
+///     `returns_input_unchanged`).
 ///
 /// The boundary takes part in equality and hashing, but a call of a function that names no devices and that is not a
 /// `jit` dispatcher hashes and renders exactly as it did before boundaries existed. A call that a transform derives
-/// renders the boundary that it keeps only when that boundary places an input, so the rendering of a call does not
-/// identify it, and the structural deduplication of callees compares the calls that they contain by equality.
+/// always renders the boundary that it keeps, so that it never renders like an ordinary call, which places its inputs
+/// differently. The structural deduplication of callees still compares the calls that they contain by equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation<T: CoreType> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
@@ -632,6 +636,31 @@ impl<T: CoreType> JitCallOperation<T> {
     #[inline]
     pub(crate) fn mesh(&self) -> Option<&DeviceMesh> {
         self.mesh.as_ref()
+    }
+
+    /// Returns the device mesh that this call of `callee` names (refer to [`Self::mesh`]), which is the mesh that it
+    /// records when it has a sharding override or when `callee` requests a placement that names devices (refer to
+    /// `has_placement_requests_in_region`), and [`None`] otherwise. The mesh is recorded when the function is staged,
+    /// from its whole program, so a call whose outputs pruning dropped (refer to `pruned_program`) can record a mesh
+    /// that only a request of a dropped output named, which this function no longer reports, as JAX lowers a nested
+    /// `jit` function pruned to the outputs that its caller uses and so without the shardings of the dropped ones.
+    pub(crate) fn names_devices<V, O>(&self, callee: RegionRef<'_, V, O>) -> Option<&DeviceMesh>
+    where
+        V: CoreValue<Type = Type>,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection,
+    {
+        let mesh = self.mesh.as_ref()?;
+        let overrides = [&self.input_shardings, &self.output_shardings]
+            .into_iter()
+            .flatten()
+            .any(|shardings| shardings.iter().any(Option::is_some));
+        (overrides || has_placement_requests_in_region(callee, false)).then_some(mesh)
+    }
+
+    /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
+    /// [`Self::names_devices`]).
+    pub(crate) fn without_mesh(&self) -> Self {
+        Self { mesh: None, ..self.clone() }
     }
 
     /// Returns whether this call leaves each input without a sharding override placed as it is (refer to
@@ -874,20 +903,129 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
     }
 }
 
+/// Placement decision of one eager application of a call (i.e., an eager call of a compiled function, refer to
+/// `Session::bind`, or the replay of its callee by a region interpreter, refer to the interpretation of
+/// [`JitCallOperation`]), which [`JitCallOperation::eager_decision`] makes once from the call, its callee, and the
+/// actual arguments. It states the facts that the types of the arguments omit, and every eager path
+/// consumes it instead of deriving any of them again, so that the paths agree with one another and with an execution
+/// of the callee. Partial evaluation, which sees types only, forwards an input through a call only where this decision
+/// returns it unchanged whatever the arguments are (refer to [`JitCallOperation::returns_input_unchanged`]).
+pub(crate) struct EagerCallDecision<'o> {
+    /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
+    /// their committed public arguments agree on their devices, and none carries a pending reduction that its boundary
+    /// cannot receive) and placed on [`Self::mesh`] as an execution of the callee places them.
+    inputs: Cow<'o, [Value]>,
+
+    /// Devices on which the application runs, borrowed from the argument that selected them when one did. An eager
+    /// call compiles its callee for these devices and the replay of the callee runs its operations on them.
+    mesh: Cow<'o, DeviceMesh>,
+
+    /// Whether every result of the application is committed, which is when a public argument is committed or when the
+    /// callee commits its public outputs on [`Self::mesh`] (i.e., when the call requests a placement or runs on more
+    /// than one device, refer to [`commits_public_outputs`]), as the executable of the callee commits them.
+    committed: bool,
+
+    /// Whether this process alone chose [`Self::mesh`] (refer to `Session::assigns_placement_locally`), which every
+    /// result of the application states (refer to [`Array::is_locally_assigned`]).
+    locally_assigned: bool,
+}
+
+impl<'o> EagerCallDecision<'o> {
+    /// Returns the arguments as the application receives them (refer to [`EagerCallDecision`]).
+    #[inline]
+    pub(crate) fn inputs(&self) -> &[Value] {
+        &self.inputs
+    }
+
+    /// Returns the devices on which the application runs.
+    #[inline]
+    pub(crate) fn mesh(&self) -> &DeviceMesh {
+        &self.mesh
+    }
+
+    /// Returns whether every result of the application is committed.
+    #[inline]
+    pub(crate) fn committed(&self) -> bool {
+        self.committed
+    }
+
+    /// Returns whether this process alone chose the devices of the application.
+    #[inline]
+    pub(crate) fn locally_assigned(&self) -> bool {
+        self.locally_assigned
+    }
+}
+
 impl JitCallOperation<Type> {
-    /// Prepares the inputs of an eager call, including calls replayed by a region interpreter. An explicit boundary
-    /// checks the devices of committed public arguments before placing inputs. Otherwise the public arguments
-    /// select the devices and the lifted captures follow them, as closed-over constants do in JAX.
+    /// Returns the placement decision of an eager application of this call of `callee` on `inputs`, executed by
+    /// `session` (refer to [`EagerCallDecision`]). This is the one place that decides where an eager call runs, which
+    /// arguments it admits, where they move, whether its results are committed, and whether its devices were chosen by
+    /// this process alone, for an eager call and for the replay of its callee alike.
+    ///
+    ///   - Every argument, captures included, must belong to the client of `session`, which an execution requires too
+    ///     (refer to `validate_input_clients`).
+    ///   - A call whose callee names devices runs on them. Its committed public arguments must already be on them, and
+    ///     every input is placed there as its effective boundary sharding requests (refer to
+    ///     [`Self::boundary_input_sharding`]), or keeps its sharding when the mesh topologies agree and is replicated
+    ///     otherwise. Its devices are named for every process, so they are not locally assigned.
+    ///   - Any other call runs where its public arguments are, as JAX runs a `jit` function without shardings.
+    ///     Committed public arguments must agree on their devices, as JAX rejects a `jit` call whose committed
+    ///     arguments are on different devices ("Received incompatible devices for jitted computation"), and they
+    ///     select the devices.
+    ///     Without one, uncommitted public arguments on the same devices keep them, and otherwise the session default
+    ///     supplies them, which, for a call without public array arguments, is where the session places a value
+    ///     without array inputs over the logical mesh of the outputs of the callee (refer to
+    ///     `Session::device_mesh_for`), as for any other eager operation without array inputs. The lifted captures
+    ///     move there, as closed-over constants do in JAX (refer to `capture_inputs`), and so do the uncommitted public
+    ///     arguments that live elsewhere, through the one rule by which uncommitted operands follow committed ones
+    ///     (refer to `Session::place_uncommitted_inputs`). Each input with an effective boundary sharding is then
+    ///     placed as it requests.
+    ///
+    /// The arguments are admitted before anything moves, and whether or not anything moves: an argument that carries a
+    /// pending reduction that the executable of the callee cannot receive is rejected wherever it is (refer to
+    /// `validate_input_reduction`), because a reshard never completes a pending reduction, so the replay of the
+    /// callee, which runs no executable, rejects what an eager call and an execution reject. The results are
+    /// committed when a public argument is committed or when the callee commits its public outputs on the selected
+    /// devices (refer to [`Self::requests_placement`] and [`commits_public_outputs`]).
     ///
     /// # Errors
     ///
-    /// Returns the error from selecting the mesh or placing an argument or capture on it.
-    pub(crate) fn eager_inputs<'o>(
+    /// Returns the error of admitting an argument, of selecting the default devices, or of moving an input.
+    pub(crate) fn eager_decision<'o>(
         &self,
         session: &Session,
         inputs: &'o [Value],
-        declared: &[Type],
-    ) -> Result<Cow<'o, [Value]>, Error> {
+        callee: RegionRef<'_, Constant, Operation>,
+    ) -> Result<EagerCallDecision<'o>, Error> {
+        fn array(input: &Value) -> Option<&Array> {
+            match input {
+                Value::Array(array) => Some(array),
+                Value::Dimension(_) | Value::Reference(_) => None,
+            }
+        }
+        validate_input_clients(session, inputs.iter().map(array), self.capture_count)?;
+        let interface = callee.interface();
+        let declared = interface.input_types();
+        // Admission is decided here, once, from the arguments as they arrive and before any of them moves, whether or
+        // not the application moves it, so that every application that does not run the executable of the callee
+        // (e.g., the replay of the callee) still rejects what that executable rejects. A pending reduction that a type
+        // records is judged by the type rule of the call first, as when the call is staged, and the common case of
+        // arguments without one costs one branch for each argument.
+        let pending = |input: &Value| array(input).is_some_and(|array| !array.sharding().unreduced_axes().is_empty());
+        if inputs.iter().any(pending) {
+            let types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            validate_call_input_types(JIT_CALL_OPERATION_NAME, declared, &types)?;
+            for (index, (input, declared)) in inputs.iter().zip(declared.iter()).enumerate() {
+                if let Value::Array(array) = input {
+                    self.validate_input_admission(index, array, declared)?;
+                }
+            }
+        }
+        let public_arrays = inputs.iter().skip(self.capture_count).filter_map(array);
+        let committed = |mesh: &DeviceMesh| {
+            public_arrays.clone().any(Array::is_committed)
+                || commits_public_outputs(mesh, self.requests_placement(callee))
+        };
         if let Some(mesh) = &self.mesh {
             for (index, input) in inputs.iter().skip(self.capture_count).enumerate() {
                 if let Value::Array(array) = input {
@@ -902,35 +1040,38 @@ impl JitCallOperation<Type> {
                 .enumerate()
                 .map(|(index, input)| match input {
                     Value::Array(array) => {
-                        // A reshard to the boundary never completes a pending reduction, so an input that the boundary
-                        // expects reduced is rejected as an execution rejects it, before anything is moved.
-                        if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), &declared[index]) {
-                            validate_input_reduction(array, &sharding, index, self.capture_count)?;
-                        }
                         self.boundary_input(session, mesh, index, array.clone(), &declared[index]).map(Value::Array)
                     }
                     _ => Ok(input.clone()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Cow::Owned(placed));
+            return Ok(EagerCallDecision {
+                inputs: Cow::Owned(placed),
+                mesh: Cow::Owned(mesh.clone()),
+                committed: committed(mesh),
+                locally_assigned: false,
+            });
         }
 
-        // Committed public arguments fix the devices of the call, so they must agree on them with one another, as
-        // JAX rejects a `jit` call whose committed arguments are on different devices ("Received incompatible devices
-        // for jitted computation").
-        let mut committed =
+        let mut committed_arguments =
             inputs.iter().skip(self.capture_count).enumerate().filter_map(|(index, input)| match input {
                 Value::Array(array) if array.is_committed() => Some((index, array)),
                 _ => None,
             });
-        if let Some((first_index, first)) = committed.next() {
-            for (index, array) in committed {
+        let first_committed = committed_arguments.next();
+        if let Some((first_index, first)) = first_committed {
+            for (index, array) in committed_arguments {
                 if array.mesh().devices() != first.mesh().devices() {
-                    let devices = |array: &Array| array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
+                    // Each device is rendered by its `Display` implementation, which names its process when it is not
+                    // process zero.
+                    let devices = |array: &Array| {
+                        let devices = array.mesh().devices().iter().map(Device::to_string).collect::<Vec<_>>();
+                        format!("[{}]", devices.join(", "))
+                    };
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
-                            "public argument #{index} is committed to devices {:?}, but public argument \
-                             #{first_index} is committed to devices {:?}",
+                            "public argument #{index} is committed to devices {}, but public argument \
+                             #{first_index} is committed to devices {}",
                             devices(array),
                             devices(first),
                         ),
@@ -939,19 +1080,69 @@ impl JitCallOperation<Type> {
                 }
             }
         }
-        let mut prepared = self.capture_inputs(session, inputs)?;
+        let mesh = match first_committed {
+            Some((_, committed)) => Cow::Borrowed(committed.mesh()),
+            None => match public_arrays.clone().next() {
+                Some(first) if public_arrays.clone().all(|other| other.mesh().devices() == first.mesh().devices()) => {
+                    Cow::Borrowed(first.mesh())
+                }
+                Some(_) => Cow::Owned(session.device_mesh_for(&[], None)?),
+                None => {
+                    let logical_mesh = interface.output_types().iter().find_map(|r#type| match r#type {
+                        Type::Array(r#type) => r#type.sharding().map(Sharding::mesh),
+                        _ => None,
+                    });
+                    Cow::Owned(session.device_mesh_for(&[], logical_mesh)?)
+                }
+            },
+        };
+        let mut prepared = self.capture_inputs(session, inputs, &mesh)?;
+
+        // Uncommitted public arguments that live elsewhere follow the committed ones, or move to the default devices,
+        // exactly as the operands of any other eager operation do, so that every input of the callee is on the devices
+        // where it runs, including an input that the callee returns as it is. Arrays produced by the same program, or
+        // cloned from one array, share their mesh allocation, so the common case of arguments on one mesh only compares
+        // pointers, as the operands of other eager operations do (refer to `Session::place_uncommitted_inputs`).
+        let shares_mesh = |mesh: &DeviceMesh, other: &DeviceMesh| std::ptr::eq(mesh, other) || mesh == other;
+        let mut prepared_arrays = prepared.iter().filter_map(array);
+        let first_mesh = prepared_arrays.next().map(Array::mesh);
+        let moves = match first_mesh {
+            Some(first_mesh) if !prepared_arrays.all(|other| shares_mesh(other.mesh(), first_mesh)) => {
+                let arrays = prepared.iter().filter_map(array).cloned().collect::<Vec<_>>();
+                let moved = session.place_uncommitted_inputs(&arrays, &[], None)?;
+                let moves = moved.is_some();
+                let arrays = match moved {
+                    Some(moved) => {
+                        let mut replacements = moved.iter();
+                        for input in prepared.to_mut().iter_mut() {
+                            if let Value::Array(array) = input {
+                                *array = replacements.next().expect("one replacement for each array input").clone();
+                            }
+                        }
+                        moved
+                    }
+                    None => arrays,
+                };
+                session.validate_input_placement(&arrays, &[])?;
+                moves
+            }
+            _ => false,
+        };
+        let public_arrays = prepared.iter().skip(self.capture_count).filter_map(array);
+        let locally_assigned = session.assigns_placement_locally(public_arrays, &[], false, moves);
+
         for (index, declared) in declared.iter().enumerate().skip(self.capture_count) {
             let Some(Value::Array(array)) = prepared.get(index) else { continue };
             if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared)
                 && array.sharding() != sharding.as_ref()
             {
-                validate_input_reduction(array, &sharding, index, self.capture_count)?;
                 let mesh = DeviceMesh::new(sharding.mesh().clone(), array.mesh().devices().to_vec())?;
                 let placed = array.clone().reshard_on_devices(session, &mesh, &sharding, false)?;
                 prepared.to_mut()[index] = Value::Array(placed);
             }
         }
-        Ok(prepared)
+        let committed = committed(&mesh);
+        Ok(EagerCallDecision { inputs: prepared, mesh, committed, locally_assigned })
     }
 
     /// Returns the effective boundary sharding of callee input `index` (refer to [`Self::boundary_input_sharding`])
@@ -986,14 +1177,117 @@ impl JitCallOperation<Type> {
         (self.derived_input_shardings.is_some() || self.keeps_input_placements).then(|| array.sharding().clone())
     }
 
-    /// Returns whether the caller chose the result devices locally. An explicit call boundary names devices for
-    /// every process. An unpinned call inherits the device assignment of its public arguments or the session default.
-    pub(crate) fn results_are_locally_assigned(&self, session: &Session, inputs: &[Value]) -> bool {
-        let operands = inputs.iter().skip(self.capture_count).filter_map(|input| match input {
-            Value::Array(array) => Some(array),
-            Value::Dimension(_) | Value::Reference(_) => None,
-        });
-        self.mesh.is_none() && session.assigns_placement_locally(operands, &[])
+    /// Validates that `array`, the argument at `index` of an eager application of this call for a callee input of type
+    /// `declared`, carries no pending reduction that the executable of the callee cannot receive, by the rule with which
+    /// an execution admits its arguments (refer to [`validate_input_reduction`]). That executable receives the argument
+    /// at its eager placement (refer to [`Self::eager_input_placement`]), or else as `declared` places it (refer to
+    /// [`declared_input_sharding`]). An input override of the callee is the argument sharding of that executable as
+    /// stated, including a pending reduction over auto mesh axes that it states, which the executable completes where
+    /// the argument enters, as a direct execution of the callee does. Any other placement is received without the
+    /// pending reductions over auto mesh axes, which no type records (refer to [`Sharding::without_auto_axes`]), so
+    /// such an argument is rejected. An argument without a pending reduction, which is the common case, costs one
+    /// branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError::UnreducedAutoAxisArgument`] or [`ExecutionError::UnreducedAutoAxisCapture`] for such
+    /// an argument.
+    fn validate_input_admission(&self, index: usize, array: &Array, declared: &Type) -> Result<(), ExecutionError> {
+        if array.sharding().unreduced_axes().is_empty() {
+            return Ok(());
+        }
+        let expected = match (self.eager_input_placement(index, array, declared), declared) {
+            (Some(placement), _) if self.input_sharding(index).is_some() => placement,
+            (Some(placement), _) => placement.without_auto_axes(),
+            (None, Type::Array(declared)) => declared_input_sharding(declared, array.sharding().mesh()),
+            (None, Type::Dimension(_) | Type::Reference(_)) => return Ok(()),
+        };
+        validate_input_reduction(array, &expected, index, self.capture_count)
+    }
+
+    /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the callee
+    /// names devices (refer to [`Self::with_boundary`]) or requests a placement anywhere in the regions that lowering
+    /// emits for it, including one that only moves a value to another memory (refer to
+    /// `has_placement_requests_in_region`). Every such request commits every result of the call (refer to
+    /// [`commits_public_outputs`]), which the placement decision of an eager application (refer to
+    /// [`Self::eager_decision`]) and the forwarding of partial evaluation (refer to [`Self::returns_input_unchanged`])
+    /// read from here. The requests of a callee depend on the callee alone, so they are derived once for each callee
+    /// and retained with it (refer to `placement_requests`), and repeated applications only look them up.
+    pub(crate) fn requests_placement<V, O>(&self, callee: RegionRef<'_, V, O>) -> bool
+    where
+        V: CoreValue<Type = Type>,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection,
+    {
+        self.mesh.is_some() || has_placement_requests_in_region(callee, true)
+    }
+
+    /// Returns, for each input of an application of this call to arguments of types `input_types`, whether the call
+    /// returns that input unchanged whatever the arguments of those types are, which is the static projection of its
+    /// placement decision (refer to [`Self::eager_decision`]) that partial evaluation consults before it replaces an
+    /// output of the call that returns an input by that input (refer to `forward_jit_call_inputs`). The forwarded value
+    /// must have the devices, the placement, and the commitment that the call would give it, and no admission check of
+    /// the call may disappear with it, which types alone establish only when:
+    ///
+    ///   - the callee names no devices (a call that names devices can move and place every value that crosses it),
+    ///   - the callee requests no placement at all, because any request, including one that only moves a value to
+    ///     another memory, commits every output of the call (refer to [`commits_public_outputs`]),
+    ///   - the input is the only public array argument of the call, because a sibling argument that is committed
+    ///     selects the devices of the call, moves an uncommitted input onto them, and commits every result, and two
+    ///     committed arguments on different devices are rejected, none of which the types of the arguments record and
+    ///     all of which would be lost with the call once its last output is forwarded,
+    ///   - the input is not a lifted capture, which the call moves to where it runs and returns uncommitted,
+    ///   - the type of the input records a sharding over a mesh without auto axes, because the call rejects an argument
+    ///     with a pending reduction that the executable of its callee cannot receive (refer to
+    ///     `validate_input_admission`), which a type records over explicit and manual mesh axes, where the type rule of
+    ///     the call checks it when the call is staged, but never over auto mesh axes, including those of a type without
+    ///     a sharding, whose value may live on any mesh, so that only such a type proves that the call admits every
+    ///     argument of it, and
+    ///   - the boundary does not place the input (refer to [`Self::boundary_input_placement`]).
+    ///
+    /// An argument of another client is rejected by the call and returned by the forwarded value, as by any program
+    /// that returns its argument, and every consumer of that value that executes rejects it.
+    ///
+    /// These conditions hold whatever the known side of the partial evaluation is. An eager known side folds the call,
+    /// which takes its placement decision on the concrete arguments, before any output is forwarded, so forwarding
+    /// loses no admission check there. A staged known side compiles nothing by
+    /// itself, and the program that it stages may be compiled, where the boundary of the outer executable admits every
+    /// argument, or interpreted eagerly (e.g., by [`Program::interpret_in_context`](ryft_core::Program) or by the
+    /// replay of a region), where each call takes its own placement decision on the concrete arguments, so that a
+    /// sibling argument, or a pending reduction that no type records, changes what the call returns there or whether
+    /// it returns at all, which types alone cannot show at partition time. A call that is not forwarded stays in the
+    /// known program and takes its placement decision, admission included, whenever that program is interpreted.
+    pub(crate) fn returns_input_unchanged<V, O>(
+        &self,
+        callee: RegionRef<'_, V, O>,
+        input_types: &[Cow<'_, Type>],
+    ) -> Vec<bool>
+    where
+        V: CoreValue<Type = Type>,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection,
+    {
+        let public_array_count = input_types
+            .iter()
+            .skip(self.capture_count)
+            .filter(|r#type| matches!(r#type.as_ref(), Type::Array(_)))
+            .count();
+        if public_array_count != 1 || self.requests_placement(callee) {
+            return vec![false; input_types.len()];
+        }
+        let declared = callee.input_types();
+        input_types
+            .iter()
+            .enumerate()
+            .map(|(position, r#type)| match r#type.as_ref() {
+                Type::Array(actual) if position >= self.capture_count => {
+                    let records_reduction_state = actual.sharding().is_some_and(|sharding| {
+                        sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto)
+                    });
+                    records_reduction_state
+                        && self.boundary_input_placement(position, actual, &declared[position]).is_none()
+                }
+                _ => false,
+            })
+            .collect()
     }
 
     /// Places an input on the boundary's devices after all committed public arguments have passed the device check,
@@ -1023,49 +1317,23 @@ impl JitCallOperation<Type> {
         array.reshard_on_devices(session, mesh, &sharding, false)
     }
 
-    /// Returns the device mesh on which `session` executes this call eagerly, with public arguments `inputs`, which is
-    /// the mesh of the call when its callee names devices. Otherwise the call runs where its public array arguments
-    /// are. A committed public argument selects its devices, and uncommitted public arguments on the same devices keep
-    /// them. With no public array argument, or with uncommitted arguments on different devices, the session default
-    /// supplies them. Eager dispatch moves the lifted captures to this mesh before it chooses where to run the call
-    /// (refer to `capture_inputs`), and region replay runs the operations of the callee on it, so that the two agree
-    /// (e.g., on where an operation of the callee without array inputs, such as a `fill`, places its result).
+    /// Returns `inputs`, the inputs of this call that `session` executes eagerly on `target` when its callee names no
+    /// devices (refer to [`Self::eager_decision`]), with the arrays of the lifted capture prefix moved to `target`. A
+    /// capture keeps its logical mesh and sharding when the device count matches, and is replicated otherwise. The
+    /// temporary handle contributes no commitment to the call.
     ///
     /// # Errors
     ///
-    /// Returns the error of selecting the default devices of `session`.
-    fn execution_mesh(&self, session: &Session, inputs: &[Value]) -> Result<DeviceMesh, Error> {
-        if let Some(mesh) = &self.mesh {
-            return Ok(mesh.clone());
-        }
-        let operands = inputs.iter().skip(self.capture_count).filter_map(|input| match input {
-            Value::Array(array) => Some(array),
-            Value::Dimension(_) | Value::Reference(_) => None,
-        });
-        Ok(match operands.clone().find(|array| array.is_committed()) {
-            Some(committed) => committed.mesh().clone(),
-            None => match operands.clone().next() {
-                Some(first) if operands.clone().all(|other| other.mesh().devices() == first.mesh().devices()) => {
-                    first.mesh().clone()
-                }
-                _ => session.device_mesh_for(&[], None)?,
-            },
-        })
-    }
-
-    /// Returns `inputs`, the inputs of this call that `session` executes eagerly, with the arrays of the lifted capture
-    /// prefix moved to where the call runs (refer to `execution_mesh`) when the callee names no devices. The capture
-    /// keeps its logical mesh and sharding when the device count matches, and is replicated otherwise. The temporary
-    /// handle contributes no commitment to the call.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of moving a capture (e.g., for a capture of another client).
-    fn capture_inputs<'o>(&self, session: &Session, inputs: &'o [Value]) -> Result<Cow<'o, [Value]>, Error> {
+    /// Returns the error of moving a capture.
+    fn capture_inputs<'o>(
+        &self,
+        session: &Session,
+        inputs: &'o [Value],
+        target: &DeviceMesh,
+    ) -> Result<Cow<'o, [Value]>, Error> {
         if self.capture_count == 0 || inputs.len() < self.capture_count {
             return Ok(Cow::Borrowed(inputs));
         }
-        let target = self.execution_mesh(session, inputs)?;
         let mut prepared = Cow::Borrowed(inputs);
         for (index, input) in inputs[..self.capture_count].iter().enumerate() {
             let Value::Array(array) = input else { continue };
@@ -1284,8 +1552,7 @@ impl<T: ArrayMemberType + From<ArrayType>> CoreOperation for JitCallOperation<T>
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
-        let derived_input_shardings =
-            self.derived_input_shardings.as_deref().filter(|shardings| shardings.iter().any(Option::is_some));
+        let derived_input_shardings = self.derived_input_shardings.as_deref();
         if self.capture_count == 0
             && self.output_types.is_none()
             && self.mesh.is_none()
@@ -1296,7 +1563,9 @@ impl<T: ArrayMemberType + From<ArrayType>> CoreOperation for JitCallOperation<T>
         } else {
             // Boundary shardings and the devices that the callee names render only when present, so that calls of
             // callees that name no devices render as before. A position without an override renders as `_`. The
-            // effective boundary that a derived call keeps renders only when it places an input.
+            // effective boundary of a call that a transform derived always renders, even when it places no input,
+            // because such a call leaves its inputs where they are while an ordinary call places them as its callee
+            // input types record, so the two lower differently and must not render alike.
             let render_shardings = |shardings: &[Option<Sharding>]| {
                 shardings
                     .iter()
@@ -1320,7 +1589,7 @@ impl<T: ArrayMemberType + From<ArrayType>> CoreOperation for JitCallOperation<T>
                     operation.list("derived_input_shardings", render_shardings(shardings))?;
                 }
                 if let Some(mesh) = &self.mesh {
-                    operation.list("devices", mesh.devices().iter().map(|device| device.id()))?;
+                    operation.list("devices", mesh.devices())?;
                 }
                 if self.keeps_input_placements {
                     operation.field("keeps_input_placements", true)?;
@@ -1552,6 +1821,8 @@ impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<Type>
 where
     C: Context<Type = Type>,
     C::Operation: From<Self>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = Type, Constant = C::Constant, Operation = C::Operation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -1585,6 +1856,8 @@ where
             &original.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
+        let refined = with_boundary_input_types(original, &boundary)?;
+        let original = refined.as_ref().map_or(original, CoreProgram::entry_region_ref);
         let (callee, axes) = driver
             .batch_program(context, original, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
@@ -1603,22 +1876,22 @@ where
         // batch dimension of each batched value (refer to `batched_boundary_sharding`), and the leading extent input
         // has none.
         let derived_input_shardings = Some(
-            std::iter::once(None)
+            std::iter::once(Ok(None))
                 .chain(inputs.iter().zip(&boundary).map(|(input, sharding)| {
                     let packed = array_type(&input.value().r#type());
                     batched_boundary_sharding(sharding.as_ref(), &input.batch_axis(), packed.as_ref())
                 }))
-                .collect(),
+                .collect::<Result<_, _>>()?,
         );
         let operation =
             Self { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..operation };
         let operation = if let Some(mesh) = self.mesh() {
-            let input_shardings = std::iter::once(None)
+            let input_shardings = std::iter::once(Ok(None))
                 .chain(inputs.iter().enumerate().map(|(index, input)| {
                     let packed = array_type(&input.value().r#type());
                     batched_boundary_sharding(self.input_sharding(index), &input.batch_axis(), packed.as_ref())
                 }))
-                .collect();
+                .collect::<Result<_, _>>()?;
             let output_types = callee.output_types();
             let output_shardings = axes
                 .iter()
@@ -1627,7 +1900,7 @@ where
                     let packed = output_types.get(index).and_then(array_type);
                     batched_boundary_sharding(self.output_sharding(index), axis, packed.as_ref())
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
         } else {
             operation
@@ -1646,6 +1919,8 @@ impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation<ArrayTyp
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<JitCallOperation<ArrayType>>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
@@ -1674,10 +1949,12 @@ where
                 .iter()
                 .map(|input| BatchAxis::from_optional_position(input.batch_axis_position()))
                 .collect::<Vec<_>>();
+            let original = driver.region(0)?;
+            let refined = with_boundary_input_types(original, &boundary)?;
             let (batched_callee, output_axes) = driver
                 .batch_program(
                     context,
-                    driver.region(0)?,
+                    refined.as_ref().map_or(original, CoreProgram::entry_region_ref),
                     input_batch_axes.as_slice(),
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )?
@@ -1706,7 +1983,7 @@ where
                     let packed = input.value().r#type();
                     batched_boundary_sharding(sharding.as_ref(), &axis, Some(packed.as_ref()))
                 })
-                .collect(),
+                .collect::<Result<_, _>>()?,
         );
         let operation =
             Self { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..operation };
@@ -1719,7 +1996,7 @@ where
                     let packed = input.value().r#type();
                     batched_boundary_sharding(self.input_sharding(index), &axis, Some(packed.as_ref()))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let output_types = batched_callee.output_types();
             let output_shardings = output_axes
                 .iter()
@@ -1728,7 +2005,7 @@ where
                     let axis = BatchAxis::from_optional_position(*axis);
                     batched_boundary_sharding(self.output_sharding(index), &axis, output_types.get(index))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
         } else {
             operation
@@ -2117,9 +2394,10 @@ pub fn transpose_primal_jit_call<
     // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
     // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
     // traced through fresh-root contexts.
-    // Each output cotangent has the boundary sharding of its output and each known input value that of its input, and
-    // the cotangent references have none, as JAX's `_pjit_transpose` gives the cotangents the shardings of their
-    // primals. Each returned linear input cotangent has the sharding of its input, whichever other inputs have a
+    // Each output cotangent has the cotangent sharding of the boundary sharding of its output and each known input
+    // value the boundary sharding of its input, and the cotangent references have none, as JAX's `_pjit_transpose`
+    // gives the cotangents the cotangent shardings of their primals (`to_ct_spec`). Each returned linear input
+    // cotangent has the cotangent sharding of its input, whichever other inputs have a
     // structurally zero or absent cotangent, which returns nothing (refer to `TransposedProgramCotangent`).
     let mut transposed_call =
         JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
@@ -2145,26 +2423,38 @@ pub fn transpose_primal_jit_call<
             .collect(),
     );
     if let Some(mesh) = operation.mesh() {
+        // An override places a primal value, and the cotangent of that value has the dual reduction state (refer to
+        // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
+        // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of the
+        // override of its primal, as the cotangent types of those primals record it, and each known primal value is
+        // placed at the override itself.
+        let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
         let output_cotangent_shardings = outputs
             .iter()
             .zip(output_types.iter())
             .enumerate()
             .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
-            .map(|(index, _)| operation.output_sharding(index).cloned());
+            .map(|(index, _)| cotangent_sharding(operation.output_sharding(index)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypeError::from)?;
         let reference_shardings = cotangents.references().iter().map(|_| None);
         let known_input_shardings = inputs
             .iter()
             .enumerate()
             .filter(|(_, input)| input.as_known().is_some())
             .map(|(index, _)| operation.input_sharding(index).cloned());
-        let input_shardings =
-            output_cotangent_shardings.chain(reference_shardings).chain(known_input_shardings).collect();
+        let input_shardings = output_cotangent_shardings
+            .into_iter()
+            .chain(reference_shardings)
+            .chain(known_input_shardings)
+            .collect();
         let output_shardings = input_indices
             .iter()
             .zip(transposed_callee.cotangents())
             .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
-            .map(|(&index, _)| operation.input_sharding(index).cloned())
-            .collect();
+            .map(|(&index, _)| cotangent_sharding(operation.input_sharding(index)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypeError::from)?;
         transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
     }
     let transposed_call = Operation::JitCall(transposed_call);
@@ -2240,8 +2530,10 @@ where
 // PJRT client. This mirrors JAX dispatching a `jit`-compiled function called from eager code straight to the compiled
 // executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
 // entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
-// through this same session. Both entry points prepare the call arguments before running the callee. Region replay
-// also applies output overrides and the call's commitment to the results of the individually dispatched operations.
+// through this same session. Both entry points take the placement decision of the call (refer to
+// `JitCallOperation::eager_decision`) before running the callee, so they run it on the same devices with the same
+// admitted and placed arguments, including those that the callee returns as they are. Region replay also applies
+// output overrides and the call's commitment to the results of the individually dispatched operations.
 impl InterpretableOperation<Session> for JitCallOperation<Type> {
     fn interpret<D: InterpretationDriver<Session>>(
         &self,
@@ -2252,24 +2544,17 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         let callee = driver.region(0)?;
         let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
         let invalid_argument = |error: Error| ProgramError::InvalidArgument { message: error.to_string() };
-        let locally_assigned = self.results_are_locally_assigned(context, inputs);
-        let mesh = self.execution_mesh(context, inputs).map_err(invalid_argument)?;
-        let inputs = self
-            .eager_inputs(context, inputs, callee.interface().input_types())
-            .map_err(invalid_argument)?
-            .into_owned();
-        // The results are committed exactly as an execution of the call commits them, which is when a public argument
-        // is committed or when the compiled program commits its public outputs (refer to `commits_public_outputs`),
-        // and not as the replayed operations commit their own results on the pinned session below.
-        let requests_placement = self.mesh.is_some() || has_placement_requests_in_region(callee, true);
-        let committed = commits_public_outputs(&mesh, requests_placement)
-            || inputs.iter().any(|input| matches!(input, Value::Array(array) if array.is_committed()));
-        // The callee runs on the devices on which an eager execution of the call runs (refer to `execution_mesh`), so
-        // the operations of the callee that take no array input (e.g., a `fill`) are replayed there rather than on the
-        // default mesh of the session, as an execution of the callee places them.
-        let session = context.with_device_mesh(mesh);
+        let decision = self.eager_decision(context, inputs, callee).map_err(invalid_argument)?;
+        // The results are committed exactly as the decision states, as an eager call commits them, and not as the
+        // replayed operations commit their own results on the pinned session below.
+        let committed = decision.committed();
+        let locally_assigned = decision.locally_assigned();
+        // The callee runs on the devices on which an eager execution of the call runs, so the operations of the callee
+        // that take no array input (e.g., a `fill`) are replayed there rather than on the default mesh of the session,
+        // as an execution of the callee places them.
+        let session = context.with_device_mesh(decision.mesh().clone());
         driver
-            .interpret_region(&session, 0, inputs)?
+            .interpret_region(&session, 0, decision.inputs.into_owned())?
             .iter()
             .enumerate()
             .map(|(index, value)| match value.rename_type_identities(&renaming)? {
@@ -3152,31 +3437,72 @@ where
     })
 }
 
+/// Returns `callee`, the callee of a call whose effective boundary is `boundary` (refer to
+/// `JitCallOperation::effective_input_boundary`), with each input type that declares no sharding refined to the
+/// sharding of its boundary, as far as a type records it, or [`None`] when no input type changes. The batching rules
+/// of a call batch this callee rather than the original one, so that type inference records the placement that the
+/// batch dimension of each mapped input has at the boundary of the batched call on the values that the batched callee
+/// computes, as it does for a callee whose input type declares that sharding (e.g., the batch split along an explicit
+/// mesh axis of a callee compiled for an item type without a sharding stays on its outputs instead of being gathered).
+/// The batched callee is a derived program whose input types are only traced types, so refining them changes no
+/// boundary of the original call. A sharding over auto mesh axes refines a type only as far as types record it (i.e.,
+/// with those axes replicated), and a sharding that does not refine the type (e.g., one with a pending reduction) is
+/// not applied.
+fn with_boundary_input_types<T, V, O>(
+    callee: RegionRef<'_, V, O>,
+    boundary: &[Option<Sharding>],
+) -> Result<Option<CoreProgram<V, O, Vec<V>, Vec<V>>>, ProgramError>
+where
+    T: ArrayMemberType + From<ArrayType>,
+    V: CoreValue<Type = T>,
+    O: CoreOperation<Type = T>,
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+{
+    let declared = callee.input_types();
+    let mut refined = None::<Vec<T>>;
+    for (index, (declared_type, sharding)) in declared.iter().zip(boundary).enumerate() {
+        let (Ok(array_type), Some(sharding)) = (declared_type.as_array_type(), sharding) else { continue };
+        // A boundary that states more than a placement (e.g., a pending reduction) does not refine a type without a
+        // sharding, which describes a reduced value, and is left to the boundary of the batched call.
+        let Some(boundary_type) = boundary_input_type(array_type, sharding) else { continue };
+        refined.get_or_insert_with(|| declared.to_vec())[index] = T::from(boundary_type);
+    }
+    refined.map(|refined| callee.to_program().specialize(&refined)).transpose()
+}
+
 /// Returns `sharding`, the boundary sharding of each item of a value that batching maps along `axis`, with the batch
 /// dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding or when
 /// the batch dimension cannot be inserted. The per-item override states nothing about the batch dimension, because an
 /// explicit placement under batching applies to each batch item, so the batch dimension keeps the placement that
 /// `packed`, the type of the batched value, records for it (e.g., split along a mesh axis by the batch specification),
 /// and is replicated when that type records none (e.g., over auto mesh axes, which types never record).
+///
+/// # Errors
+///
+/// Returns the error of [`Sharding::batched`] for a batch placement that conflicts with `sharding` (e.g., a batch split
+/// along a mesh axis along which `sharding` already splits each item), which no placement of the batched value can
+/// satisfy, as [`CompiledFunction::batch`](crate::CompiledFunction::batch) rejects it.
 fn batched_boundary_sharding(
     sharding: Option<&Sharding>,
     axis: &BatchAxis,
     packed: Option<&ArrayType>,
-) -> Option<Sharding> {
-    let sharding = sharding?;
+) -> Result<Option<Sharding>, BatchingError> {
+    let Some(sharding) = sharding else {
+        return Ok(None);
+    };
     let Some(axis) = axis.axis() else {
-        return Some(sharding.clone());
+        return Ok(Some(sharding.clone()));
     };
     let rank = sharding.dimensions().len() as i128 + 1;
     let position = if axis.value() < 0 { axis.value() + rank } else { axis.value() };
-    let position = usize::try_from(position).ok().filter(|&position| (position as i128) < rank)?;
+    let Some(position) = usize::try_from(position).ok().filter(|&position| (position as i128) < rank) else {
+        return Ok(None);
+    };
     let batch_dimension = packed
         .and_then(ArrayType::sharding)
         .filter(|packed| packed.rank() as i128 == rank && packed.mesh().has_same_topology(sharding.mesh()))
         .map_or(ShardingDimension::Replicated, |packed| packed.dimensions()[position].clone());
-    let mut dimensions = sharding.dimensions().to_vec();
-    dimensions.insert(position, batch_dimension);
-    sharding.with_dimensions(dimensions).ok()
+    sharding.batched(position, batch_dimension).map(Some)
 }
 
 /// Manual mesh axes along which inputs of a call vary beyond what the callee input types declare (e.g., a value of a
@@ -3388,46 +3714,35 @@ where
 
 /// Returns `outputs`, the outputs of `operation`, a call of `callee` with `inputs`, with every output that `callee`
 /// returns by forwarding one of its inputs replaced by that call input, like the input forwarding of JAX's `pjit`
-/// staging rule. An all-known call that partial evaluation keeps whole under a residual policy uses this, so that the
-/// residual planner sees such an output as the call input that it is, rather than as an output of the call that it
-/// would save separately (e.g., a primal input that the primal call of a linearized callee returns as a residual).
-/// Logical types do not record placements along auto mesh axes nor devices, so a call that names devices forwards
-/// nothing, because it can move and place every value that crosses it (refer to [`JitCallOperation`]), unlike its
-/// input, and any other call forwards no input that it places at its boundary (refer to
-/// [`JitCallOperation::boundary_input_placement`]). That includes an input whose type records no sharding of a call of
-/// a function compiled for an input type without a sharding, which is neither a call that a transform derived nor a
-/// call of a `jit` dispatcher: the executable of such a function places that input replicated over the mesh where the
-/// call runs, which the type of the input does not show, so the call can move it.
-fn forward_jit_call_inputs<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>, W: CoreValue<Type = Type>>(
+/// staging rule, wherever the call provably returns that input unchanged (refer to
+/// [`JitCallOperation::returns_input_unchanged`]). An all-known call that partial evaluation keeps whole under a
+/// residual policy uses this, so that the residual planner sees such an output as the call input that it is, rather
+/// than as an output of the call that it would save separately (e.g., a primal input that the primal call of a
+/// linearized callee returns as a residual).
+fn forward_jit_call_inputs<V, O, W>(
     operation: &JitCallOperation<Type>,
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
     outputs: Vec<PartialEvaluationValue<W>>,
-) -> Vec<PartialEvaluationValue<W>> {
-    if operation.mesh().is_some() {
+) -> Vec<PartialEvaluationValue<W>>
+where
+    V: CoreValue<Type = Type>,
+    O: CoreOperation<Type = Type> + OperationPayloadProjection,
+    W: CoreValue<Type = Type>,
+{
+    let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
+    let unchanged = operation.returns_input_unchanged(callee, &input_types);
+    if !unchanged.contains(&true) {
         return outputs;
     }
-    let declared = callee.input_types();
     outputs
         .into_iter()
         .zip(callee.output_ids())
-        .map(|(output, atom)| {
-            let Some(position) = callee.input_ids().iter().position(|input| input == atom) else { return output };
-            let input = &inputs[position];
-            let placed = match input.r#type().as_ref() {
-                Type::Array(actual) => {
-                    let unknown_placement = position >= operation.capture_count()
-                        && !operation.keeps_input_placements()
-                        && operation.derived_input_shardings.is_none()
-                        && operation.input_sharding(position).is_none()
-                        && actual.sharding().is_none()
-                        && matches!(&declared[position], Type::Array(declared) if declared.sharding().is_none());
-                    unknown_placement
-                        || operation.boundary_input_placement(position, actual, &declared[position]).is_some()
-                }
-                _ => false,
-            };
-            if !placed && input.r#type() == output.r#type() { input.clone() } else { output }
+        .map(|(output, atom)| match callee.input_ids().iter().position(|input| input == atom) {
+            Some(position) if unchanged[position] && *input_types[position] == *output.r#type() => {
+                inputs[position].clone()
+            }
+            _ => output,
         })
         .collect()
 }
@@ -3632,6 +3947,11 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 /// of an input without one, refer to [`JitCallOperation::boundary_input_sharding`]), and returns the constrained value.
 /// The constraint is the sharding with which the called function annotates that position of its own boundary (refer to
 /// [`entry_boundary_sharding`]), closed over auto mesh axes. Values that are not arrays are returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOperation`] when the boundary sharding declares a pending maximum or minimum
+/// that `r#type` does not record (refer to [`validate_declared_pending_reduction`]), which XLA cannot introduce.
 fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     value: ValueRef<'b, 'c, 't>,
@@ -3644,7 +3964,17 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // The override states the placement along every mesh axis, so it is lowered for a type that tracks no placement,
     // with which a constraint is not merged (refer to `ConstrainShardingOperation::lowered_sharding`).
     let untracked_type = array_type.clone().with_sharding(None)?;
-    let constraint = ConstrainShardingOperation::new(entry_boundary_sharding(sharding)?);
+    let declared = entry_boundary_sharding(sharding)?;
+    // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
+    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+    validate_declared_pending_reduction(
+        &declared,
+        array_type.sharding(),
+        array_type.data_type(),
+        bound_manual_axes,
+        "jit_call",
+    )?;
+    let constraint = ConstrainShardingOperation::new(declared);
     let types = std::slice::from_ref(&untracked_type);
     Ok(constraint.lower(lowerer, &[value], types, types)?.remove(0))
 }
@@ -3662,15 +3992,15 @@ mod tests {
         BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, ConvertElementTypeOperation,
         CosOperation, CotangentDestinationKind, CotangentDestinations, CustomCallOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EagerInterpretationDriver,
-        EffectClass, EffectClasses, Fill, InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero,
-        Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, NoStorage, NothingSavable,
-        Operation as CoreOperation, OutputRegionProvenance, PartialEvaluation, PartialEvaluationContext,
-        PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Place, PlaceOperation, Placeholder,
-        PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, Reduce,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        CustomRuleRegistration, DataType, Device, DifferentiableType, Differentiate, DifferentiationError, Dimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation,
+        EagerInterpretationDriver, EffectClass, EffectClasses, Fill, InputRegionProvenance, IotaOperation,
+        Linearization, LogicalMesh, MaybeZero, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite,
+        NegOperation, NoStorage, NothingSavable, Operation as CoreOperation, OutputRegionProvenance, PartialEvaluation,
+        PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Place, PlaceOperation,
+        Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver,
+        Reduce, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface,
         RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate, ResidualDecision,
         ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection, SaveOnlyTheseNames,
@@ -4821,6 +5151,25 @@ mod tests {
                 ]
                 in (%2)"},
         );
+        // Each device renders its process when it is not process zero, so two calls whose meshes differ only in the
+        // process of a device render differently, as they compare unequal.
+        let remote_mesh =
+            DeviceMesh::new(device_mesh.logical_mesh().clone(), vec![Device::new(0, 0), Device::new(1, 1)]).unwrap();
+        let remote = JitCallOperation::<Type>::new(1).with_boundary(Some(&remote_mesh), vec![None, None], vec![None]);
+        assert_ne!(remote, pinned);
+        assert_eq!(
+            render(remote),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = jit_call [capture_count=1, devices=[0, 1@1]] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
         assert_eq!(
             render(pinned.with_kept_input_placements()),
             indoc! {"
@@ -5681,7 +6030,7 @@ mod tests {
             known_program.to_string(),
             indoc! {"
                 lambda %0:f64[4] .
-                let %1:f64[4] = jit_call %0 [
+                let %1:f64[4] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[4] .
                         let %1:f64[4] = add %0 %0
@@ -5694,7 +6043,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4] = jit_call %0 %1 [
+                let %2:f64[4], %3:f64[4] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[4], %1:f64[4] .
                         let %2:f64[4] = mul %0 %0
@@ -5790,7 +6139,7 @@ mod tests {
             evaluation.program().to_string(),
             formatdoc! {"
                 lambda %0:{array_type}, %1:{array_type} .
-                let %2:{array_type} = jit_call %0 %1 [
+                let %2:{array_type} = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={{
                         lambda %0:{array_type}, %1:{array_type} .
                         let %2:{array_type} = mul %1 %0
@@ -6005,7 +6354,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[4] .
-                    let %1:f64[4] = jit_call %0 [
+                    let %1:f64[4] = jit_call [derived_input_shardings=[_]] %0 [
                         callee={
                             lambda %0:f64[4] .
                             let %1:f64[4] = sin %0
@@ -6016,7 +6365,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[4], %1:f64[4] .
-                    let %2:f64[4] = jit_call %0 %1 [
+                    let %2:f64[4] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f64[4], %1:f64[4] .
                             let %2:f64[4] = mul %1 %0
@@ -6153,7 +6502,7 @@ mod tests {
             known_program.to_string(),
             indoc! {"
                 lambda %0:f64[4] .
-                let %1:f64[4] = jit_call %0 [
+                let %1:f64[4] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[4] .
                         let %1:f64[4] = add %0 %0
@@ -6166,7 +6515,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4] = jit_call %0 %1 [
+                let %2:f64[4] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[4], %1:f64[4] .
                         let %2:f64[4] = mul %1 %0
@@ -6244,7 +6593,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f64[4] .
-                    let %1:f64[] = jit_call %0 [
+                    let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                         callee={
                             lambda %0:f64[4] .
                             let %1:f64[] = dot [
@@ -6257,7 +6606,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = jit_call %0 %1 [
+                    let %2:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = cos %1
@@ -6347,7 +6696,7 @@ mod tests {
                 ]
                 known={
                     lambda %0:f32[1024] .
-                    let %1:f32[1024] = jit_call %0 [
+                    let %1:f32[1024] = jit_call [derived_input_shardings=[_]] %0 [
                         callee={
                             lambda %0:f32[1024] .
                             let %1:f32[1024] = sin %0
@@ -6359,7 +6708,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f32[64, 1024], %1:f32[1024] .
-                    let %2:f32[64, 1024] = jit_call %1 [
+                    let %2:f32[64, 1024] = jit_call [derived_input_shardings=[_]] %1 [
                         callee={
                             lambda %0:f32[1024] .
                             let %1:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %0
@@ -6394,7 +6743,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[64, 1024], %1:f32[1024] .
-                let %2:f32[64, 1024], %3:f32[1024] = jit_call %1 [
+                let %2:f32[64, 1024], %3:f32[1024] = jit_call [derived_input_shardings=[_]] %1 [
                     callee={
                         lambda %0:f32[1024] .
                         let %1:f32[1024] = sin %0
@@ -6409,7 +6758,7 @@ mod tests {
                 let %2:f32[64, 1024] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 [
                     body={
                         lambda %0:f32[64, 1024], %1:f32[1024] .
-                        let %2:f32[64, 1024] = jit_call %1 [
+                        let %2:f32[64, 1024] = jit_call [derived_input_shardings=[_]] %1 [
                             callee={
                                 lambda %0:f32[1024] .
                                 let %1:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %0
@@ -6802,7 +7151,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                let %3:f32[2, 2], %4:f32[2, 2] = jit_call %1 %2 [
+                let %3:f32[2, 2], %4:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %1 %2 [
                     callee=^0={
                         lambda %0:f32[2, 2], %1:f32[2, 2] .
                         let %2:f32[2, 2] = dot [
@@ -6815,7 +7164,7 @@ mod tests {
                         in (%6, %2)
                     },
                 ]
-                    %5:f32[2, 2], %6:f32[2, 2] = jit_call %3 %2 [
+                    %5:f32[2, 2], %6:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %3 %2 [
                         callee=^0,
                     ]
                     %7:f32[2, 2] = mul %0 %5
@@ -6824,7 +7173,7 @@ mod tests {
                 let %4:f32[2, 2] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
-                        let %4:f32[2, 2] = jit_call %1 %2 [
+                        let %4:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %1 %2 [
                             callee=^0={
                                 lambda %0:f32[2, 2], %1:f32[2, 2] .
                                 let %2:f32[2, 2] = sin %1
@@ -6834,7 +7183,7 @@ mod tests {
                                 in (%5)
                             },
                         ]
-                            %5:f32[2, 2] = jit_call %4 %3 [
+                            %5:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %4 %3 [
                                 callee=^0,
                             ]
                             %6:f32[2, 2] = mul %5 %0
@@ -6872,10 +7221,10 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2] = jit_call %1 %2 [
+                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %1 %2 [
                     callee={
                         lambda %0:f32[2, 2], %1:f32[2, 2] .
-                        let %2:f32[2, 2], %3:f32[2, 2] = jit_call %0 %1 [
+                        let %2:f32[2, 2], %3:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                             callee=^0={
                                 lambda %0:f32[2, 2], %1:f32[2, 2] .
                                 let %2:f32[2, 2] = dot [
@@ -6889,7 +7238,7 @@ mod tests {
                             },
                         ]
                             %4:f32[2, 2] = sin %0
-                            %5:f32[2, 2], %6:f32[2, 2] = jit_call %4 %1 [
+                            %5:f32[2, 2], %6:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %4 %1 [
                                 callee=^0,
                             ]
                             %7:f32[2, 2] = add %2 %5
@@ -6902,10 +7251,10 @@ mod tests {
                 let %4:f32[2, 2] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
-                        let %4:f32[2, 2] = jit_call %1 %2 %3 [
+                        let %4:f32[2, 2] = jit_call [derived_input_shardings=[_, _, _]] %1 %2 %3 [
                             callee={
                                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                                let %3:f32[2, 2] = jit_call %0 %1 [
+                                let %3:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                                     callee=^0={
                                         lambda %0:f32[2, 2], %1:f32[2, 2] .
                                         let %2:f32[2, 2] = sin %1
@@ -6916,7 +7265,7 @@ mod tests {
                                     },
                                 ]
                                     %4:f32[2, 2] = sin %0
-                                    %5:f32[2, 2] = jit_call %4 %2 [
+                                    %5:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %4 %2 [
                                         callee=^0,
                                     ]
                                     %6:f32[2, 2] = add %3 %5
@@ -7002,6 +7351,70 @@ mod tests {
 
         let client = execution_client();
         assert_residual_demand_linearizations_match(client, &repeated(4, Some(policy)), &repeated(4, None), &[0]);
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_keeps_calls_with_several_public_arguments_under_a_staged_known_side() {
+        // The callee `g(w, b) = (w, w ⊙ b)` returns its first argument and has two public array arguments, and its call
+        // is one that a transform derived, whose boundary places neither argument (e.g., the primal call of a linearized
+        // callee). Partitioning a caller with both inputs known stages the known side, and partial evaluation keeps `w`
+        // as an output of the call instead of forwarding the argument, because a staged known program may later be
+        // interpreted eagerly, where a committed `b` selects the devices of the call, moves `w` there, and commits it
+        // (refer to `JitCallOperation::returns_input_unchanged`). The known program therefore returns the output of the
+        // call, which a residual planner then plans as a value of its own.
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let left = builder.add_input(residual_demand_matrix_type());
+            let right = builder.add_input(residual_demand_matrix_type());
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(
+                        vec![left, output],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 2],
+                    )
+                    .unwrap(),
+            )
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let w = builder.add_input(residual_demand_matrix_type());
+        let b = builder.add_input(residual_demand_matrix_type());
+        let callee_region = builder.intern_callee(&callee, None).unwrap();
+        let derived = JitCallOperation::<Type> {
+            derived_input_shardings: Some(Arc::from(vec![None, None])),
+            ..JitCallOperation::new(0)
+        };
+        let outputs = builder
+            .add_instruction(Operation::JitCall(derived), vec![callee_region], vec![w, b], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let partition = program
+            .partition_with_residual_policy(&[true, true], &ResidualPolicyReference::new(NothingSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0), Known(1)]]
+                known={
+                    lambda %0:f32[2, 2], %1:f32[2, 2] .
+                    let %2:f32[2, 2], %3:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                        callee={
+                            lambda %0:f32[2, 2], %1:f32[2, 2] .
+                            let %2:f32[2, 2] = mul %0 %1
+                            in (%0, %2)
+                        },
+                    ]
+                    in (%2, %3)
+                }
+                residual={
+                    lambda  .
+                    in ()
+                }"},
+        );
     }
 
     #[test]
@@ -7116,7 +7529,7 @@ mod tests {
             partition.known_program().to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[], %2:bf16[] = jit_call %0 [
+                let %1:f32[], %2:bf16[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f32[] .
                         let %1:bf16[] = convert_element_type [data_type=bf16] %0
@@ -7141,7 +7554,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                let %2:f32[], %3:bf16[] = jit_call %0 [
+                let %2:f32[], %3:bf16[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f32[] .
                         let %1:bf16[] = convert_element_type [data_type=bf16] %0
@@ -7158,7 +7571,7 @@ mod tests {
                 let %2:f32[] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 [
                     body={
                         lambda %0:f32[], %1:bf16[] .
-                        let %2:f32[] = jit_call %1 [
+                        let %2:f32[] = jit_call [derived_input_shardings=[_]] %1 [
                             callee={
                                 lambda %0:bf16[] .
                                 let %1:f32[] = convert_element_type [data_type=f32] %0
@@ -7311,7 +7724,7 @@ mod tests {
             format!("{}\n{}", partition.known_program(), partition.residual_program()),
             indoc! {"
                 lambda %0:f32[2, 2] .
-                let %1:f32[2, 2] = jit_call %0 [
+                let %1:f32[2, 2] = jit_call [derived_input_shardings=[_]] %0 [
                     callee=^0={
                         lambda %0:f32[2, 2] .
                         let %1:f32[2, 2] = dot [
@@ -7321,12 +7734,12 @@ mod tests {
                         in (%2)
                     },
                 ]
-                    %2:f32[2, 2] = jit_call %0 [
+                    %2:f32[2, 2] = jit_call [derived_input_shardings=[_]] %0 [
                         callee=^0,
                     ]
                 in (%1, %0, %2)
                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
-                let %4:f32[2, 2] = jit_call %0 %1 %2 [
+                let %4:f32[2, 2] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee=^0={
                         lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
                         let %3:f32[2, 2] = mul %0 %1
@@ -7334,7 +7747,7 @@ mod tests {
                         in (%4)
                     },
                 ]
-                    %5:f32[2, 2] = jit_call %4 %3 %2 [
+                    %5:f32[2, 2] = jit_call [derived_input_shardings=[_, _, _]] %4 %3 %2 [
                         callee=^0,
                     ]
                 in (%5)"},
@@ -7729,7 +8142,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2] = jit_call %1 %2 [
+                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %1 %2 [
                     callee=^0={
                         lambda %0:f32[2, 2], %1:f32[2, 2] .
                         let %2:f32[2, 2] = dot [
@@ -7744,14 +8157,14 @@ mod tests {
                         in (%6, %1, %7, %8, %4, %3)
                     },
                 ]
-                    %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2], %14:f32[2, 2] = jit_call %3 %2 [
+                    %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2], %14:f32[2, 2] = jit_call [derived_input_shardings=[_, _]] %3 %2 [
                         callee=^0,
                     ]
                     %15:f32[2, 2] = mul %0 %9
                 in (%15, %4, %5, %6, %7, %8, %10, %11, %12, %13, %14, %9, %0)
                 lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2], %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2] .
                 let %14:f32[2, 2] = mul %12 %0
-                    %15:f32[2, 2] = jit_call %1 %2 %3 %4 %5 %6 [
+                    %15:f32[2, 2] = jit_call [derived_input_shardings=[_]] %1 %2 %3 %4 %5 %6 [
                         callee=^0={
                             lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2] .
                             let %6:f32[2, 2] = dot [
@@ -7767,7 +8180,7 @@ mod tests {
                             in (%13)
                         },
                     ]
-                    %16:f32[2, 2] = jit_call %15 %7 %8 %9 %10 %11 [
+                    %16:f32[2, 2] = jit_call [derived_input_shardings=[_]] %15 %7 %8 %9 %10 %11 [
                         callee=^0,
                     ]
                     %17:f32[2, 2] = mul %13 %16
@@ -7879,7 +8292,8 @@ mod tests {
                 |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
                     let parent = inputs[0].context();
                     let extent = parent.constant(Constant::Dimension(DimensionValue::constant(2).unwrap()));
-                    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent)
+                        .with_axis_sharding(ShardingDimension::sharded(["x"]));
                     let outputs = call.batch(&context, &driver, &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?])?;
                     Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
                 },
@@ -7889,26 +8303,36 @@ mod tests {
             let Operation::JitCall(call) = program.instructions()[0].operation() else {
                 panic!("expected jit_call");
             };
-            call.derived_input_shardings.as_deref().map(<[_]>::to_vec)
+            (call.derived_input_shardings.as_deref().map(<[_]>::to_vec), program.output_types()[0].to_string())
         };
 
         // The batched callee is created by batching, so the batched call is a derived call, which places each item
         // where the original call places it, with the batch dimension placed as the batched value is, rather than as
         // the traced types of the batched callee say. The callee declares an item type without a sharding, which the
-        // original call places replicated over the mesh where it runs, so the batch stays split. A derived original
-        // call keeps its own boundary, and a call of a `jit` dispatcher places nothing. The leading extent input has
-        // no boundary.
+        // original call places replicated over the mesh where it runs, so the batch stays split. The batched callee is
+        // batched from the callee with that boundary as its input type, so its result records the split too, as it
+        // would for a callee that declares its input replicated. A derived original call keeps its own boundary, and a
+        // call of a `jit` dispatcher places nothing, so the types of their batched callees record no placement. The
+        // leading extent input has no boundary.
         let derived = |shardings: Vec<Option<Sharding>>| JitCallOperation::<Type> {
             derived_input_shardings: Some(Arc::from(shardings)),
             ..JitCallOperation::new(0)
         };
-        assert_eq!(batched(JitCallOperation::new(0)), Some(vec![None, Some(batch_split.clone())]));
+        let split_output = "f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}]".to_string();
+        let unplaced_output = "f32[2, 4]".to_string();
+        assert_eq!(
+            batched(JitCallOperation::new(0)),
+            (Some(vec![None, Some(batch_split.clone())]), split_output.clone()),
+        );
         assert_eq!(
             batched(derived(vec![Some(Sharding::replicated(mesh.clone(), 1))])),
-            Some(vec![None, Some(batch_split)])
+            (Some(vec![None, Some(batch_split)]), split_output),
         );
-        assert_eq!(batched(derived(vec![None])), Some(vec![None, None]));
-        assert_eq!(batched(JitCallOperation::new(0).with_kept_input_placements()), Some(vec![None, None]));
+        assert_eq!(batched(derived(vec![None])), (Some(vec![None, None]), unplaced_output.clone()));
+        assert_eq!(
+            batched(JitCallOperation::new(0).with_kept_input_placements()),
+            (Some(vec![None, None]), unplaced_output),
+        );
     }
 
     #[test]
@@ -7960,7 +8384,7 @@ mod tests {
             let expected = if replicated {
                 indoc! {"
                     lambda %0:f32[] .
-                    let %1:u64[3], %2:f32[] = jit_call %0 [
+                    let %1:u64[3], %2:f32[] = jit_call [derived_input_shardings=[_]] %0 [
                         callee={
                             lambda %0:f32[] .
                             let %1:u64[3] = iota [type=u64[3], dimension=0]
@@ -7971,7 +8395,7 @@ mod tests {
             } else {
                 indoc! {"
                     lambda  .
-                    let %0:u64[3] = jit_call [
+                    let %0:u64[3] = jit_call [derived_input_shardings=[]] [
                         callee={
                             lambda  .
                             let %0:u64[3] = iota [type=u64[3], dimension=0]
@@ -8045,7 +8469,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4], %2:f64[4], %3:f64[4] .
-                let %4:f64[4], %5:f64[4] = jit_call [capture_count=1] %0 %1 %3 [
+                let %4:f64[4], %5:f64[4] = jit_call [capture_count=1, derived_input_shardings=[_, _, _]] %0 %1 %3 [
                     callee={
                         lambda %0:f64[4], %1:f64[4], %2:f64[4] .
                         let %3:f64[4] = mul %0 %1
@@ -8132,7 +8556,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:ref<f32[]>, %2:f32[], %3:ref<f32[]>, %4:f32[] .
-                let %5:f32[], %6:f32[] = jit_call [capture_count=1] %0 %1 %2 %3 %4 [
+                let %5:f32[], %6:f32[] = jit_call [capture_count=1, derived_input_shardings=[_, _, _, _, _]] %0 %1 %2 %3 %4 [
                     callee={
                         lambda %0:ref<f32[]>, %1:ref<f32[]>, %2:f32[], %3:ref<f32[]>, %4:f32[] .
                         let () = reference_add_update %1 %2
@@ -8179,7 +8603,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
-                let %3:ref<f32[]>, %4:f32[], %5:f32[] = jit_call [capture_count=1] %0 %1 %2 [
+                let %3:ref<f32[]>, %4:f32[], %5:f32[] = jit_call [capture_count=1, derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee={
                         lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
                         let %3:f32[] = add %1 %1
@@ -8221,7 +8645,7 @@ mod tests {
             program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4], %2:f64[4] .
-                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 %2 [
+                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee={
                         lambda %0:f64[4], %1:f64[4], %2:f64[4] .
                         let %3:f64[4] = sin %0
@@ -8265,7 +8689,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 %1 [
+                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[4], %1:f64[4] .
                         let %2:f64[4] = sin %0
@@ -8312,7 +8736,7 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4], %4:f64[4], %5:f64[4], %6:f64[4] = jit_call %0 %1 [
+                let %2:f64[4], %3:f64[4], %4:f64[4], %5:f64[4], %6:f64[4] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[4], %1:f64[4] .
                         let %2:f64[4] = sin %0
@@ -8460,7 +8884,7 @@ mod tests {
             linearization.primal().to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                let %1:f32[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 [
+                let %1:f32[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = sin %0
@@ -8474,7 +8898,7 @@ mod tests {
             linearization.tangent().to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_]] %0 %1 [
                     callee={
                         lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %0
@@ -8615,7 +9039,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:f32[] = jit_call %0 [
+                let %1:f32[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f32[] .
                         in (%0)
@@ -8683,7 +9107,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:ref<f32[]> .
-                let %2:ref<f32[]>, %3:f32[] = jit_call %0 %1 [
+                let %2:ref<f32[]>, %3:f32[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f32[], %1:ref<f32[]> .
                         let () = reference_add_update %1 %0
@@ -8783,7 +9207,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[live] .
-                let %1:f64[live] = jit_call %0 [
+                let %1:f64[live] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[live] .
                         in (%0)
@@ -8852,7 +9276,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
+                let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[] .
                         in (%0)
@@ -8872,7 +9296,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = jit_call %0 %1 [
+                let %2:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = add %0 %1
@@ -8948,7 +9372,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda  .
-                let () = jit_call [
+                let () = jit_call [derived_input_shardings=[]] [
                     callee={
                         lambda  .
                         let %0:f64[] = zero [type=f64[]]
@@ -9016,7 +9440,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:ref<f64[]> .
-                let %2:ref<f64[]>, %3:f64[] = jit_call %0 %1 [
+                let %2:ref<f64[]>, %3:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[], %1:ref<f64[]> .
                         let () = reference_add_update %1 %0
@@ -9037,7 +9461,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:ref<f64[]> .
-                let %1:ref<f64[]>, %2:f64[] = jit_call %0 [
+                let %1:ref<f64[]>, %2:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:ref<f64[]> .
                         let %1:f64[] = reference_read %0
@@ -9096,7 +9520,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[], %2:f64[3] = jit_call %0 [
+                let %1:f64[], %2:f64[3] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[] .
                         let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
@@ -9183,7 +9607,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = jit_call %0 %1 [
+                let %2:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = zero_like %1
@@ -9264,7 +9688,7 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
+                let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[] .
                         let %1:f64[] = rematerialize %0 [
@@ -9295,7 +9719,7 @@ mod tests {
                 let %1:f64[] = rematerialize %0 [
                     body={
                         lambda %0:f64[] .
-                        let %1:f64[] = jit_call %0 [
+                        let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                             callee={
                                 lambda %0:f64[] .
                                 let %1:f64[] = add %0 %0
@@ -9345,7 +9769,7 @@ mod tests {
             pullback.program().to_string(),
             indoc! {"
             lambda %0:f32[] .
-            let %1:f32[] = jit_call %0 [
+            let %1:f32[] = jit_call [derived_input_shardings=[_]] %0 [
                 callee={
                     lambda %0:f32[] .
                     in (%0)
@@ -9450,6 +9874,177 @@ mod tests {
             assert_eq!(first.sharding(), &split);
             assert_eq!(first.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.0; 4]);
         }
+    }
+
+    #[test]
+    fn test_jit_call_operation_transpose_places_cotangents_at_the_cotangent_shardings_of_overrides() {
+        // A function that moves its scalar input to device memory and returns it, compiled with an inferred boundary,
+        // has the same derivatives when that boundary is stated as an input override, an output override, or both,
+        // for every reduction state of its argument. A tangent has the sharding of its primal, while the cotangent of a
+        // value with a pending sum has a completed one and the reverse (refer to `Sharding::cotangent`), so the
+        // transposed call places each cotangent that crosses the boundary at the cotangent sharding of the override of
+        // its primal, and keeps each known primal value at the override itself. The inferred boundary of an argument is
+        // the sharding of its type, which records reduction state over explicit axes only.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let describe = |array: Array| -> Result<String, Error> {
+            let values = array.copy_to_host()?.elements::<f32>()?;
+            Ok(format!("{} {values:?}", array.sharding()))
+        };
+        let columns = ["JVP", "eager VJP", "gradient", "gradient of a caller", "second order gradient"];
+        let mut outcomes = Vec::new();
+        for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
+            let mesh = two_device_mesh(client, axis_type);
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+            let pending = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+            let states = [
+                ("no state", replicated.clone()),
+                ("pending sum", pending.clone()),
+                ("completed sum", replicated.clone().with_reduced_axes(["x"]).unwrap()),
+                ("pending maximum", pending.with_unreduced_kind(UnreducedKind::Max).unwrap()),
+            ];
+            for (state, sharding) in states {
+                let r#type = ArrayType::scalar(DataType::F32).with_sharding(sharding.without_auto_axes()).unwrap();
+                let inferred = r#type.sharding().unwrap().clone();
+                let shards =
+                    mesh.devices().iter().map(|device| (device.id(), Arc::<[u8]>::from(1f32.to_ne_bytes().as_slice())));
+                let input =
+                    Array::from_host_shards(&session, r#type.clone(), mesh.clone(), Some(sharding), shards).unwrap();
+                let derivatives = |options: Options| {
+                    let function: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+                        |x: CompileTracer| x.place(&Memory::Device, None).unwrap(),
+                        r#type.clone(),
+                        &session,
+                        options,
+                    )
+                    .unwrap();
+                    let caller = || -> Result<CompiledFunction<ArrayType, ArrayType>, Error> {
+                        compile(|x| function.call(x).unwrap(), r#type.clone(), &session, mesh.clone())
+                    };
+                    [
+                        function
+                            .jvp(&session)
+                            .and_then(|jvp| jvp.executable().execute(&session, (input.clone(), input.clone())))
+                            .and_then(|(_, tangent)| describe(tangent)),
+                        session
+                            .differentiate_at(Value::Array(input.clone()))
+                            .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+                            .and_then(|(output, pullback)| Ok(pullback.apply_materialized(output)?))
+                            .map_err(Error::from)
+                            .and_then(|cotangent| describe(ValueProjection::<ArrayType>::into_projected(cotangent)?)),
+                        function
+                            .gradient(&session)
+                            .and_then(|gradient| gradient.executable().execute(&session, input.clone()))
+                            .and_then(describe),
+                        caller()
+                            .and_then(|caller| caller.gradient(&session))
+                            .and_then(|gradient| gradient.executable().execute(&session, input.clone()))
+                            .and_then(describe),
+                        caller()
+                            .and_then(|caller| caller.gradient(&session))
+                            .and_then(|gradient| gradient.gradient(&session))
+                            .and_then(|gradient| gradient.executable().execute(&session, input.clone()))
+                            .and_then(describe),
+                    ]
+                    .map(|derivative| derivative.map_err(|error| error.to_string()))
+                };
+                let options = Options::new(mesh.clone());
+                let references = derivatives(options.clone());
+                let boundaries = [
+                    ("input override", options.clone().with_input_shardings(vec![inferred.clone()])),
+                    ("output override", options.clone().with_output_shardings(vec![inferred.clone()])),
+                    (
+                        "input and output overrides",
+                        options.with_input_shardings(vec![inferred.clone()]).with_output_shardings(vec![inferred]),
+                    ),
+                ];
+                for (boundary, options) in boundaries {
+                    for ((column, derivative), reference) in columns.iter().zip(derivatives(options)).zip(&references) {
+                        let outcome = match derivative == *reference {
+                            true => "agrees".to_string(),
+                            false => format!("has {derivative:?} instead of {reference:?}"),
+                        };
+                        outcomes.push(format!("{axis_type:?} {state}, {boundary}, {column}: {outcome}"));
+                    }
+                }
+            }
+        }
+        let mut expected = Vec::new();
+        for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
+            for state in ["no state", "pending sum", "completed sum", "pending maximum"] {
+                for boundary in ["input override", "output override", "input and output overrides"] {
+                    for column in columns {
+                        expected.push(format!("{axis_type:?} {state}, {boundary}, {column}: agrees"));
+                    }
+                }
+            }
+        }
+        assert_eq!(outcomes.join("\n"), expected.join("\n"));
+    }
+
+    #[test]
+    fn test_jit_call_operation_lower_rejects_boundaries_that_introduce_pending_extrema() {
+        // XLA aborts the process when it exports a sharding that introduces a pending maximum or minimum, so the
+        // boundary of a nested call rejects one that its operand or its result does not carry, as the result shardings
+        // of an entry function do. The caller uses the result of the call, so the override does not reach its own
+        // result shardings. Lowering alone is checked here, so that a missing rejection cannot abort the test process.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let pending = |mesh: &DeviceMesh, kind: UnreducedKind| {
+            Sharding::replicated(mesh.logical_mesh().clone(), 1)
+                .with_unreduced_axes(["x"])
+                .unwrap()
+                .with_unreduced_kind(kind)
+                .unwrap()
+        };
+        let lower = |inner: StagedFunction<ArrayType, ArrayType>, options: Options, adds: bool| {
+            let outer: StagedFunction<ArrayType, ArrayType> = stage(
+                move |x: CompileTracer| {
+                    let y = inner.call(x).unwrap();
+                    if adds { y.clone() + y } else { y }
+                },
+                vector_type.clone(),
+                options,
+            )
+            .unwrap();
+            outer.into_inner().lower(&session).map(|_| ())
+        };
+
+        // A type never records reduction state over an auto mesh axis, so no value carries one there.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        for kind in [UnreducedKind::Max, UnreducedKind::Min] {
+            for overrides_output in [true, false] {
+                let options = Options::new(mesh.clone());
+                let options = match overrides_output {
+                    true => options.with_output_shardings(vec![pending(&mesh, kind)]),
+                    false => options.with_input_shardings(vec![pending(&mesh, kind)]),
+                };
+                let inner = stage(|x| x, vector_type.clone(), options).unwrap();
+                let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]);
+                assert_eq!(
+                    lower(inner, options, true).unwrap_err().to_string(),
+                    format!(
+                        "cannot lower `jit_call`: the sharding `{{mesh<['x'=2:auto]>, [{{}}], unreduced={{'x'}}, \
+                         unreduced_kind={kind}}}` declares a pending `{kind}` reduction over mesh axes (i.e., `x`) \
+                         along which the value does not carry one, and XLA can only introduce a pending `sum` \
+                         reduction (types never record reduction state over auto mesh axes, so a pending `{kind}` \
+                         reduction over them is never carried)",
+                    ),
+                );
+            }
+        }
+
+        // A boundary that keeps the pending maximum that its operand and its result carry over an explicit mesh axis
+        // introduces nothing (the caller returns the result as it is, because `add` takes no pending maximum).
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let maximum = pending(&mesh, UnreducedKind::Max);
+        let typed = vector_type.clone().with_sharding(maximum.clone()).unwrap();
+        let options = Options::new(mesh.clone()).with_output_shardings(vec![maximum.clone()]);
+        let inner = stage(|x| x, typed, options).unwrap();
+        let options = Options::new(mesh.clone()).with_input_shardings(vec![maximum]);
+        assert!(lower(inner, options, false).is_ok());
     }
 
     #[test]
@@ -9605,7 +10200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_operation_eager_inputs_reject_reduction_state_over_auto_axes() {
+    fn test_jit_call_operation_eager_decision_rejects_reduction_state_over_auto_axes() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let session = Session::builder().client(client).build().unwrap();
@@ -9650,8 +10245,9 @@ mod tests {
                     .unwrap_err()
                     .to_string(),
                 "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
-                 because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, \
-                 or place it over explicit mesh axes, before passing it to a compiled function",
+                 because a staged type does not record a pending reduction over auto mesh axes; reduce the argument \
+                 (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it over explicit \
+                 mesh axes, before passing it to a compiled function or an eager operation",
             );
             assert!(function.call(input(&replicated)).is_ok());
         }
@@ -9788,6 +10384,55 @@ mod tests {
                 .to_string(),
             },
         );
+    }
+
+    #[test]
+    fn test_jit_call_operation_eager_decision_without_array_arguments() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let observe = |outputs: Result<Vec<Value>, ProgramError>| {
+            let outputs = outputs.unwrap();
+            let [Value::Array(output)] = outputs.as_slice() else {
+                panic!("expected one array output");
+            };
+            let values = output.copy_to_host().unwrap().elements::<i32>().unwrap();
+            (output.mesh().clone(), output.is_committed(), output.is_locally_assigned(), values)
+        };
+
+        // A call of a callee without inputs that names no devices runs where the session places a value without array
+        // inputs over the logical mesh of its outputs (refer to `Session::device_mesh_for`), which is the first device
+        // of the client for a named mesh of one device and the first two devices for a mesh of two devices, and the
+        // results are committed exactly when they live on more than one device. An eager call and the replay of its
+        // callee by a region interpreter run it on the same devices and give its results the same facts.
+        for (axis, size) in [("a", 1), ("x", 2)] {
+            let logical_mesh =
+                LogicalMesh::new(vec![MeshAxis::new(axis, size, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let r#type = ArrayType::new_static(DataType::I32, [2])
+                .with_sharding(Sharding::replicated(logical_mesh.clone(), 1))
+                .unwrap();
+            let callee = {
+                let mut builder = ArrayIrProgramBuilder::new();
+                let iota = IotaOperation::<ArrayType>::new(r#type, 0).unwrap();
+                let output = builder.add_instruction(iota, Vec::new(), Vec::new(), None).unwrap()[0];
+                Arc::new(
+                    builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap(),
+                )
+            };
+            let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+            let call = JitCallOperation::new(0);
+            let mesh = DeviceMesh::new(logical_mesh, devices[..size].to_vec()).unwrap();
+            let expected = (mesh, size > 1, true, vec![0, 1]);
+            let bound =
+                session.bind(Operation::JitCall(call.clone()), AttachedRegions::Callees(&[callee.clone()]), &[]);
+            assert_eq!(observe(bound), expected);
+            assert_eq!(observe(call.interpret(&session, &EagerInterpretationDriver::new(&regions), &[])), expected);
+        }
     }
 
     #[test]

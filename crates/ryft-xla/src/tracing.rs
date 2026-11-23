@@ -29,7 +29,7 @@ use ryft_core::{
 
 use crate::lowering::{
     collect_session_constants, entry_boundary_sharding, entry_open_results, entry_result_placements,
-    entry_result_shardings,
+    entry_result_shardings, pruned_program,
 };
 use crate::{Constant, Error, Program, Session, Tracer, Type};
 
@@ -207,10 +207,10 @@ where
     /// arguments that precede the inputs and are annotated with the placements of those arrays, as compilation for a
     /// [`Session`] passes them.
     ///
-    /// The traced program is pruned before lowering (refer to
-    /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), which drops dead outputs of instructions that carry
-    /// regions together with the body computation that only they use (e.g., the dead primal outputs of a forward mode
-    /// `shard_map` whose residuals feed a gradient), and is then simplified. A `shard_map` whose ordinary
+    /// The traced program is pruned before lowering, as the compilation of a [`Session`] prunes it (refer to
+    /// `pruned_program`), which drops dead outputs of instructions that carry regions together with the body
+    /// computation that only they use (e.g., the dead primal outputs of a forward mode `shard_map` whose residuals feed
+    /// a gradient), and is then simplified. A `shard_map` whose ordinary
     /// outputs are all dead but whose body has observable effects (e.g., prints with the
     /// [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary outputs and lowers
     /// to a manual computation that only threads its effect token.
@@ -225,16 +225,19 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Core`] when pruning or simplifying the traced program fails. Lowering failures use the
-    /// corresponding [`Error`] variants (e.g., for an invalid function name, mismatched signature shardings, unresolved
-    /// references or state, or operations that the backend cannot lower).
+    /// Returns [`Error::Core`] when pruning or simplifying the traced program fails, or when the program imports an
+    /// array whose type names a mesh of another topology than the meshes of the signature, because a plain trace keeps
+    /// the type of an array that it imports (a function compiled through a [`Session`], whose captures follow its call,
+    /// receives it where it runs instead). Lowering failures use the corresponding [`Error`] variants (e.g., for an
+    /// invalid function name, mismatched signature shardings, unresolved references or state, or operations that the
+    /// backend cannot lower).
     pub fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
         argument_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
-        let simplified_program = self.program.clone().into_pruned()?.into_simplified()?;
+        let simplified_program = pruned_program(&self.program)?;
         let argument_shardings: Vec<_> = match argument_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => self.global_input_types.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
@@ -242,6 +245,37 @@ where
         // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
         // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
         let session_constants = collect_session_constants(&simplified_program);
+
+        // A plain trace preserves the types of the arrays that enter it (`CapturePlacement::Preserve`), so an array
+        // that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of another
+        // topology cannot hold it. This is reported with its cause and the way forward, rather than as the disagreement
+        // of the meshes that lowering would find.
+        let signature_mesh = argument_shardings
+            .iter()
+            .flatten()
+            .chain(result_shardings.into_iter().flatten())
+            .chain(self.global_output_types.parameters().filter_map(ArrayType::sharding))
+            .map(Sharding::mesh)
+            .next();
+        if let Some(signature_mesh) = signature_mesh {
+            for constant in &session_constants {
+                let declared_type = constant.r#type();
+                if let Some(sharding) = declared_type.sharding()
+                    && !sharding.mesh().has_same_topology(signature_mesh)
+                {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "the traced program imports an array of type `{declared_type}`, whose mesh does not have \
+                             the topology of the mesh `{signature_mesh}` of the signature of the module, because a \
+                             plain `trace` keeps the type of an array that it imports; stage or compile the function \
+                             for a device mesh over `{signature_mesh}` through a `Session` instead (e.g., with \
+                             `stage` or `compile`), which receives the array on that mesh",
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
         let capture_types = session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
         let argument_annotations = session_constants
             .iter()
@@ -574,6 +608,47 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_traced_program_to_mlir_module_with_signature_shardings_rejects_imports_over_other_topologies() {
+        // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
+        // cannot hold an array over two devices, and the error names the cause and the way forward.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        let array_type = ArrayType::new_static(DataType::F32, [4]);
+        let array = Array::from_host_buffer(
+            &session,
+            array_type.clone().with_sharding(sharding.clone()).unwrap(),
+            None,
+            Some(sharding),
+            values_to_bytes(&[0f32, 1., 2., 3.]),
+        )
+        .unwrap();
+        let traced = trace_with_context::<_, ArrayType, ArrayType>(
+            |context, _| {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
+                Ok(ValueProjection::<ArrayType>::into_projected(imported)?)
+            },
+            array_type,
+        )
+        .unwrap();
+        let signature = Sharding::replicated(LogicalMesh::single_device(), 1);
+        let signatures = Some(std::slice::from_ref(&signature));
+        assert_eq!(
+            traced
+                .to_mlir_module_with_signature_shardings("main", signatures, signatures)
+                .unwrap_err()
+                .to_string(),
+            "the traced program imports an array of type `f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]`, whose mesh \
+             does not have the topology of the mesh `['device'=1:auto]` of the signature of the module, because a \
+             plain `trace` keeps the type of an array that it imports; stage or compile the function for a device \
+             mesh over `['device'=1:auto]` through a `Session` instead (e.g., with `stage` or `compile`), which \
+             receives the array on that mesh",
         );
     }
 

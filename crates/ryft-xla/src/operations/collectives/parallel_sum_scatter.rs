@@ -1,13 +1,14 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CollectiveMode, Dimension, MemberOperation, Operation, ParallelSumScatterOperation, ProgramError,
-    ReductionKind,
+    ReductionKind, UnreducedKind,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
+use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{
@@ -95,7 +96,11 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
 }
 
 /// Lowers one traced `parallel_sum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the
-/// named mesh axis's replica groups.
+/// named mesh axis's replica groups. The reduce-scatter adds with the combiner of XLA that the all-reduce of a
+/// `parallel_reduce` sum and the completion of a pending sum use, so a data type for which that sum is not what the
+/// data type means (e.g., one-bit integers, which XLA adds as predicates) is rejected before anything is compiled, by
+/// the rule that every collective that reduces shares (refer to [`compiled_reduction_rejection`]). The transpose of a
+/// `parallel_all_gather` is such a sum scatter, so it reaches the same check.
 fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ParallelSumScatterOperation,
     collective_state: &CollectiveLoweringState,
@@ -105,6 +110,17 @@ fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let data_type = output_array_type.data_type();
+    if let Some(reason) = compiled_reduction_rejection(data_type, ReductionChange::Complete(UnreducedKind::Sum)) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{}` cannot sum `{data_type}` values over mesh axis `{}`, because {reason}",
+                operation.name(),
+                operation.axes(),
+            ),
+        }
+        .into());
+    }
     let (replica_groups, _) = collective_replica_groups(
         collective_state,
         operation.axes(),
@@ -411,5 +427,71 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
         }
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_operation_lower_rejects_data_types_that_the_reduce_scatter_does_not_sum() {
+        // The reduce-scatter adds with the combiner of XLA, which adds one-bit integers as predicates, so on two
+        // devices the tiled sum scatter of `[1, 1, 1, 0]` gave `[1, 1]` for `u1` and `i1` (a logical or, where the sum
+        // wraps around to `[0, 1]`) and NaN for `f8e8m0fnu`, and XLA does not compile it for two-bit integers and
+        // six-bit floating point values. Lowering alone is checked, because the rejected collectives give wrong numbers
+        // or fail to compile.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let lower = |data_type: DataType| {
+            let (mesh, sharding) = (mesh.clone(), sharding.clone());
+            let traced: TracedProgram<ArrayType, ArrayType> = trace(
+                move |x: ArrayTracer| {
+                    shard_map(
+                        |local_x: ArrayTracer| {
+                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled())
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap()
+                },
+                ArrayType::new_static(data_type, [4]),
+            )
+            .unwrap();
+            traced.to_mlir_module("main").map(|_| ()).map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            lower(DataType::U1),
+            Err("`parallel_sum_scatter` cannot sum `u1` values over mesh axis `x`, because XLA adds one-bit integers \
+                 as predicates (i.e., with a logical or), while their sum wraps around"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(DataType::I1),
+            Err("`parallel_sum_scatter` cannot sum `i1` values over mesh axis `x`, because XLA adds one-bit integers \
+                 as predicates (i.e., with a logical or), while their sum wraps around"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(DataType::U2),
+            Err("`parallel_sum_scatter` cannot sum `u2` values over mesh axis `x`, because XLA does not compile \
+                 reductions of two-bit integers"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(DataType::F6E2M3FN),
+            Err("`parallel_sum_scatter` cannot sum `f6e2m3fn` values over mesh axis `x`, because XLA does not \
+                 compile reductions of six-bit floating point values"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(DataType::F8E8M0FNU),
+            Err("`parallel_sum_scatter` cannot sum `f8e8m0fnu` values over mesh axis `x`, because XLA does not add \
+                 `f8e8m0fnu` values as the format does (e.g., `2^-127 + 2^-127` gives NaN)"
+                .to_string()),
+        );
+        assert_eq!(lower(DataType::I4), Ok(()));
+        assert_eq!(lower(DataType::F4E2M1FN), Ok(()));
+        assert_eq!(lower(DataType::BF16), Ok(()));
+        assert_eq!(lower(DataType::C64), Ok(()));
     }
 }

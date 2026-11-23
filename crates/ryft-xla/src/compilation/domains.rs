@@ -6,15 +6,16 @@
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
-    ArrayOperation, ArrayType, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh, Dimension,
-    DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, LogicalMesh, Memory,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
-    ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram,
-    Type as CoreType, TypeError, Typed, TypedProgram,
+    ArrayOperation, ArrayType, Atom, CapturePlacement, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh,
+    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, LogicalMesh, Memory,
+    MeshAxisType, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest,
+    ProgramError, ReferenceDischargeResult, Region, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension,
+    ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -25,16 +26,17 @@ use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
 use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
 use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredProgram};
-use crate::execution::ExecutionPlan;
+use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::{
     collect_session_constants, contains_unresolved_references, contains_unresolved_state, entry_boundary_sharding,
-    entry_open_results, entry_result_placements, entry_result_shardings, has_placement_requests,
+    entry_open_results, entry_result_placements, entry_result_shardings, has_placement_requests, pruned_program,
+    render_devices,
 };
 use crate::{
     Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
-    OpShardingExtension, Operation, Session, Type, Value,
+    OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -83,6 +85,24 @@ impl CompilationDomain for Session {
         }
     }
 
+    // Every compiled function places its captures where its call runs (refer to `captured_type`). The mesh on which it
+    // receives them comes from `options` when it is lowered.
+    fn capture_placement(_options: &Options) -> CapturePlacement {
+        CapturePlacement::FollowCall
+    }
+
+    // A capture follows the call of the function that captures it, so the function receives every capture whose type
+    // records nothing beyond replication with a type that names no mesh (refer to `captured_type`), as a session
+    // constant of that type, whose array lowering places only if the function uses it. Every runtime array that enters
+    // the trace of a compiled function takes this route, an explicit capture and an import alike. A capture whose type
+    // records more (e.g., a split over explicit mesh axes) stays an ordinary capture with its own type, and one that the
+    // function cannot receive on its mesh is rejected by lowering only if the function uses it.
+    fn capture_constant(capture: &Value) -> Result<Option<Constant>, ProgramError> {
+        let Value::Array(array) = capture else { return Ok(None) };
+        let Some(captured_type) = captured_type(&array.r#type()) else { return Ok(None) };
+        Ok(Some(Constant::Session(RetainedArray::new(array).with_declared_type(captured_type))))
+    }
+
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
         self.lower_staged_program(staged)
     }
@@ -116,6 +136,7 @@ impl Session {
     /// [`CompilationDomain::lower`].
     fn lower_staged_program(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Error> {
         let program = staged.lifted_program()?;
+        let program = program.as_ref();
         let capture_count = staged.source_program().captures().len();
         let input_types = staged.input_types();
         let output_types = staged.output_types();
@@ -127,7 +148,7 @@ impl Session {
                     .to_string(),
             }));
         }
-        validate_reference_outputs(program.as_ref(), capture_count, output_types)?;
+        validate_reference_outputs(program, capture_count, output_types)?;
         validate_output_shardings(output_types, options)?;
 
         // The captures that survive pruning are placed as `capture_sharding` resolves them, which is as they are at
@@ -141,11 +162,12 @@ impl Session {
             .enumerate()
             .map(|(index, capture)| match capture {
                 Value::Array(array) => {
+                    admit_capture(array.sharding(), index, capture_count)?;
                     let sharding = capture_sharding(
                         &format!("capture #{index}"),
                         &array.r#type(),
                         array.sharding(),
-                        options.mesh(),
+                        options.mesh().logical_mesh(),
                     )?;
                     Ok((&sharding != array.sharding() || sharding.references_auto_axis()).then_some(sharding))
                 }
@@ -159,19 +181,67 @@ impl Session {
         } else {
             options
         };
-        let lowered_program = self.lower_program(program.as_ref(), capture_count, options)?;
-        let lowered_output_types = lowered_program.output_types().to_vec();
+        let lowered_program = self.lower_program(program, capture_count, options)?;
+        // A compiled function accepts exactly the arguments that its declared input types describe, so the public input
+        // types of its executable are those types, which lowering never changes.
+        let lowered_input_types = lowered_program.input_types();
+        let lowered_public_input_types =
+            &lowered_input_types[lowered_input_types.len().saturating_sub(input_types.len())..];
+        if lowered_public_input_types.len() != input_types.len()
+            || input_types
+                .iter()
+                .zip(lowered_public_input_types)
+                .any(|(declared, lowered)| <&ArrayType>::try_from(declared).is_ok_and(|declared| declared != lowered))
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the public input types `{}` of the executable are not the declared input types `{}` of the function",
+                lowered_public_input_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                input_types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+            ))
+            .into());
+        }
         // Lowering gives the program outputs the types of the output sharding overrides without their auto mesh axes,
         // so the staged output types are checked against the lowered ones with those same overrides applied.
         let declared_output_types =
             apply_signature_shardings(output_types.to_vec(), options.output_shardings(), "output")?;
-        validate_output_types(&declared_output_types, &lowered_output_types)?;
+        validate_output_types(&declared_output_types, lowered_program.output_types())?;
         Ok(lowered_program)
     }
 
     /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
     /// session.
     pub(crate) fn lower_program(
+        &self,
+        program: &FlatProgram,
+        capture_count: usize,
+        options: &Options,
+    ) -> Result<LoweredProgram, Error> {
+        // Every step below sees the program that lowering emits, without its dead instructions (refer to
+        // `pruned_program`), as the analysis of its placement requests does.
+        let program = &pruned_program(program)?;
+        let placed_program = self.with_session_constants_on_mesh(program, options.mesh())?;
+        let lowered = self.lower_pruned_program(
+            placed_program.as_ref().map_or(program, |(program, _)| program),
+            capture_count,
+            options,
+        )?;
+
+        // Each hidden argument carries a session constant of `program` or its placement, which the caller that holds
+        // the constants of `program` reads from the lowered program rather than searching the placements.
+        let Some((_, sources)) = placed_program else {
+            return Ok(lowered);
+        };
+        let sources = lowered
+            .session_constants()
+            .iter()
+            .map(|constant| sources.get(constant).unwrap_or(constant).clone())
+            .collect::<Arc<[_]>>();
+        lowered.with_session_constant_sources(sources)
+    }
+
+    /// Lowers `program`, a program without dead instructions whose session constants are placed where its executable
+    /// receives them (refer to [`Self::lower_program`]).
+    fn lower_pruned_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
@@ -211,6 +281,65 @@ impl Session {
         // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
         let discharged = program.clone().discharge_references_in_capture_lifted_program(capture_count)?;
         self.lower_discharged_program(&discharged, options)
+    }
+
+    /// Returns `program`, a program that is lowered for `mesh`, with every array that it imports from a session (i.e.,
+    /// every session constant that its executable receives, refer to `collect_session_constants`) that is not on the
+    /// devices where the executable receives it replaced by that array placed there with the same declared type (refer
+    /// to [`placed_constant`]), together with the constant that each placement replaced, by placement, or [`None`]
+    /// when there is no such array, which is the common case and costs one walk of the regions that lowering emits.
+    ///
+    /// An imported array follows the function that uses it, as an explicit capture does. A trace of a function that is
+    /// compiled for `mesh` declares such an array with the type with which the function receives it on `mesh` where it
+    /// imports it (refer to `imported_constant`), so that tracing, type inference, lowering, and export all see one
+    /// type, and only the arrays that survive the pruning of the program are placed here, once for each retention and
+    /// mesh. The decision reads the type, the placement, and the devices of each array, which every process shares. An
+    /// array whose declared type names a mesh of another topology (e.g., one that a plain trace imported) is left as it
+    /// is, and lowering rejects it with the ordinary type and topology errors, because no type is ever rewritten here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of turning a session constant back into an array, of placing it on `mesh`, or of rebuilding
+    /// `program`.
+    #[allow(clippy::type_complexity)]
+    fn with_session_constants_on_mesh(
+        &self,
+        program: &FlatProgram,
+        mesh: &DeviceMesh,
+    ) -> Result<Option<(FlatProgram, HashMap<RetainedArray, RetainedArray>)>, Error> {
+        let mut placed_constants = HashMap::new();
+        for constant in collect_session_constants(program) {
+            if let Some(placed) = placed_constant(self, &constant, mesh)? {
+                placed_constants.insert(constant, placed);
+            }
+        }
+        if placed_constants.is_empty() {
+            return Ok(None);
+        }
+        let regions = program
+            .regions()
+            .iter()
+            .map(|region| {
+                let atoms = region
+                    .atoms()
+                    .iter()
+                    .map(|atom| match atom {
+                        Atom::Constant(Constant::Session(constant)) if placed_constants.contains_key(constant) => {
+                            Atom::Constant(Constant::Session(placed_constants[constant].clone()))
+                        }
+                        atom => atom.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let input_ids = region.input_ids().to_vec();
+                let output_ids = region.output_ids().to_vec();
+                Region::new(atoms, input_ids, output_ids, region.instructions().to_vec())
+            })
+            .collect::<Vec<_>>();
+        let input_structure = program.input_structure().clone();
+        let output_structure = program.output_structure().clone();
+        let program = FlatProgram::new(input_structure, output_structure, regions, program.entry())?;
+        let sources = placed_constants.into_iter().map(|(constant, placed)| (placed, constant)).collect();
+        Ok(Some((program, sources)))
     }
 
     /// Lowers one validated reference discharge artifact through the ordinary array-only XLA path.
@@ -382,7 +511,10 @@ impl Session {
             "output",
         )?;
         // Executable arguments are placed as their runtime arrays are, or as an input override requests, including
-        // over the auto mesh axes that their types never record. Session constants are placed as their retained arrays.
+        // over the auto mesh axes that their types never record. A runtime placement drops a pending reduction over
+        // those axes, which no value of the program can carry, whereas an input override, which states the placement
+        // with which the argument arrives, keeps it (refer to `receivable_argument_sharding`). Session constants are
+        // placed as their retained arrays.
         let source_capture_count = lowered_capture_count - session_constants.len();
         let logical_argument_shardings = effective_input_types
             .iter()
@@ -394,15 +526,25 @@ impl Session {
                     let constant_index = index - source_capture_count;
                     let constant = &session_constants[constant_index];
                     constant.validate_client(self.client())?;
+                    admit_capture(constant.sharding(), index, lowered_capture_count)?;
                     let description = format!("retained array #{constant_index}");
-                    Some(capture_sharding(&description, &constant.r#type(), constant.sharding(), options.mesh())?)
+                    Some(capture_sharding(
+                        &description,
+                        &constant.r#type(),
+                        constant.sharding(),
+                        options.mesh().logical_mesh(),
+                    )?)
                 } else {
                     let index = index - lowered_capture_count;
-                    options.input_shardings().and_then(|shardings| shardings.get(index).cloned()).or_else(|| {
-                        options.input_placements().and_then(|placements| placements.get(index).cloned().flatten())
-                    })
+                    if let Some(sharding) = options.input_shardings().and_then(|shardings| shardings.get(index)) {
+                        return Ok(sharding.clone());
+                    }
+                    options.input_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 };
-                Ok(placement.unwrap_or_else(|| declared_input_sharding(array_type, options.mesh().logical_mesh())))
+                match placement {
+                    Some(placement) => receivable_argument_sharding(placement),
+                    None => Ok(declared_input_sharding(array_type, options.mesh().logical_mesh())),
+                }
             })
             .collect::<Result<Vec<_>, Error>>()?;
         // The executable expects the buffers of every argument to be split evenly (refer to `validate_even_sharding`),
@@ -763,6 +905,46 @@ impl CompilationCacheDomain for Session {
     }
 }
 
+/// Returns `sharding`, the placement of an argument of an executable that comes from a runtime array or a capture
+/// rather than from an input sharding override, without its unreduced axes that are auto mesh axes. Types do not record
+/// a pending reduction over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither the argument nor a value
+/// that the program computes from it can carry one, and Shardy rejects a program that drops it without a reshard (e.g.,
+/// an eager `sin` of such an argument, which eager dispatch places as its runtime array is). The executable therefore
+/// receives such an argument reduced, and argument preparation rejects an argument whose runtime sharding still has the
+/// reduction pending (refer to `validate_input_reduction`), for compiled functions, `jit` dispatchers, and eager
+/// operations alike. An input sharding override states the placement with which its argument arrives, which the
+/// boundary of the executable keeps, so that a program can complete the reduction (e.g., the reshard that
+/// [`Array::to_placement`](crate::Array::to_placement) compiles from an override with a pending reduction to one
+/// without it), and it is never passed here. A sharding without unreduced axes, which is the common case, is returned
+/// as it is.
+fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
+    if sharding.unreduced_axes().is_empty() {
+        return Ok(sharding);
+    }
+    let is_auto = |axis: &&String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
+    if !sharding.unreduced_axes().iter().any(|axis| is_auto(&axis)) {
+        return Ok(sharding);
+    }
+    let unreduced_axes = sharding.unreduced_axes().iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
+    Ok(sharding.clone().with_unreduced_axes(unreduced_axes)?)
+}
+
+/// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
+/// capture or the array of a session constant), as the input at `index` of its executable, whose first `capture_count`
+/// inputs are captures. This is the rule by which an execution admits an argument (refer to
+/// `validate_capture_reduction`), applied to every capture that a function uses before it is placed on the mesh of the
+/// function, whatever the mesh of the function, so that a capture with a pending reduction over auto mesh axes is
+/// rejected with the error with which an execution rejects such an argument, rather than reduced by the placement that
+/// moves it onto another topology.
+///
+/// # Errors
+///
+/// Returns [`ExecutionError::UnreducedAutoAxisCapture`] for such a capture.
+fn admit_capture(sharding: &Sharding, index: usize, capture_count: usize) -> Result<(), Error> {
+    let expected = receivable_argument_sharding(sharding.clone())?;
+    validate_capture_reduction(sharding, &expected, index, capture_count).map_err(Error::Execution)
+}
+
 /// Returns the sharding with which the executable of a function compiled for `mesh` receives an array that the function
 /// captures, an explicit capture or an array that its program imports (i.e., a session constant) alike, whose type is
 /// `array_type` and whose runtime array is placed as `sharding`. A capture never decides where the function runs, and
@@ -776,9 +958,10 @@ impl CompilationCacheDomain for Session {
 /// devices of the arrays that it closes over. `description` names the capture in the error (e.g., "capture #0").
 ///
 /// Only the captures that survive the pruning of the staged program are resolved, so that a capture that the
-/// function does not use places nothing and fails nothing. An imported array keeps the type that it was imported with,
-/// so one whose type names a mesh of another topology still fails the topology check of lowering through the types of
-/// the values computed from it.
+/// function does not use places nothing and fails nothing. A capture over a logical mesh of another topology that the
+/// function receives replicated is traced with the type that [`captured_type`] gives it, and lowering places it on
+/// `mesh` before it is resolved (refer to `Session::with_session_constants_on_mesh`), so it is resolved as a capture of
+/// the topology of `mesh`.
 ///
 /// # Errors
 ///
@@ -789,9 +972,9 @@ pub(crate) fn capture_sharding(
     description: &str,
     array_type: &ArrayType,
     sharding: &Sharding,
-    mesh: &DeviceMesh,
+    mesh: &LogicalMesh,
 ) -> Result<Sharding, Error> {
-    if sharding.mesh().has_same_topology(mesh.logical_mesh()) {
+    if sharding.mesh().has_same_topology(mesh) {
         return Ok(sharding.clone());
     }
     let stored = array_type.sharding().map(entry_boundary_sharding).transpose()?;
@@ -800,11 +983,111 @@ pub(crate) fn capture_sharding(
             message: format!(
                 "{description} has the type `{array_type}` over a mesh of another topology than the mesh `{}` that \
                  the function is compiled for, whose placement it cannot keep",
-                mesh.logical_mesh(),
+                mesh,
             ),
         }));
     }
-    Ok(Sharding::replicated(mesh.logical_mesh().clone(), array_type.rank()))
+    Ok(Sharding::replicated(mesh.clone(), array_type.rank()))
+}
+
+/// Returns the type with which a function traced under [`CapturePlacement::FollowCall`] receives, and is traced with,
+/// an array that it captures or imports, whose type is `array_type`, or [`None`] when the function receives the array
+/// with `array_type` itself. A capture follows the call of the function, so when its type records nothing beyond
+/// replication (i.e., its stored placement is replicated, refer to `entry_boundary_sharding`, which includes the
+/// canonical mesh of an uncommitted array and a split along auto mesh axes only, which types never record) the function
+/// receives it with `array_type` without a sharding, as it receives a public argument whose type declares none, and the
+/// types of the values that it computes from it name no mesh of the capture. A call of a function that names no
+/// devices therefore runs where its caller runs whatever the devices of its captures, as JAX computes
+/// `jit(lambda x: x + c)` on the devices of `x` whether `c` is uncommitted or committed elsewhere. A capture whose type
+/// records more (i.e., a split, a pending reduction, or manual variation), or whose stored placement cannot be
+/// computed, keeps its own type, and lowering checks that the function can receive it on the mesh of its options (refer
+/// to [`capture_sharding`]). This is the single rule for the type of a captured array inside a compiled function, which
+/// every route by which an array enters the trace of a compiled function shares (refer to `Session::capture_constant`
+/// and [`imported_constant`]), and lowering places such an array where the function runs (refer to
+/// `Session::with_session_constants_on_mesh`).
+pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
+    let stored = array_type.sharding().map(entry_boundary_sharding).transpose().ok()?;
+    if !stored.as_ref().is_none_or(Sharding::is_replicated) {
+        return None;
+    }
+    let captured_type = array_type.clone().with_sharding(None).ok()?;
+    (captured_type != *array_type).then_some(captured_type)
+}
+
+/// Returns the constant that a trace whose capture placement is `capture_placement` (refer to
+/// [`NamedAxes::capture_placement`](ryft_core::NamedAxes::capture_placement)) stages for `value`, a runtime value
+/// that it imports. An array becomes a [`Constant::Session`] that is declared with the type with which the function
+/// receives it under [`CapturePlacement::FollowCall`] (refer to [`captured_type`]), or with its own type under
+/// [`CapturePlacement::Preserve`] (e.g., in a plain trace or an eager region) or when its type records more than
+/// replication, in which case lowering checks it if the function uses it. Every other value becomes its ordinary
+/// constant.
+///
+/// # Errors
+///
+/// Returns the error of turning `value` into a constant.
+pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacement) -> Result<Constant, ProgramError> {
+    let constant = value.constant()?;
+    let (Constant::Session(retained), CapturePlacement::FollowCall) = (&constant, capture_placement) else {
+        return Ok(constant);
+    };
+    match captured_type(&retained.r#type()) {
+        Some(captured_type) => Ok(Constant::Session(retained.with_declared_type(captured_type))),
+        None => Ok(constant),
+    }
+}
+
+/// Returns `constant`, an array that a function captures (i.e., a session constant of its program), placed where the
+/// executable of the function that is compiled for `mesh` receives it, or [`None`] when it is there already or when the
+/// executable cannot receive it on `mesh` (e.g., a capture whose type records a split over a mesh of another topology,
+/// or one with a pending reduction over auto mesh axes, which lowering and admission reject). This is the one rule for
+/// where a capture is placed, which lowering (refer to `Session::with_session_constants_on_mesh`), the hidden
+/// arguments of the eager dispatch of a program, and the region replay of a callee follow. A capture over a logical
+/// mesh of the topology of `mesh` keeps its runtime placement on the devices of `mesh`, so that it adds no gather, and
+/// any other capture is placed as [`capture_sharding`] receives it (i.e., replicated over `mesh`). Each placement is
+/// computed once for each retention of the array and each mesh, and lives as long as the programs that hold the
+/// constant (refer to [`RetainedArray::placed`]), so no execution, eager call, or replay moves the capture again.
+///
+/// # Errors
+///
+/// Returns the error of moving `constant`.
+pub(crate) fn placed_constant(
+    session: &Session,
+    constant: &RetainedArray,
+    mesh: &DeviceMesh,
+) -> Result<Option<RetainedArray>, Error> {
+    let follows_mesh = constant
+        .r#type()
+        .sharding()
+        .is_none_or(|sharding| sharding.mesh().has_same_topology(mesh.logical_mesh()));
+    // A capture that the function cannot admit (refer to `admit_capture`) is left as it is, so that its admission
+    // rejects it rather than a placement that completes its pending reduction.
+    let pending_auto_reduction = receivable_argument_sharding(constant.sharding().clone())? != *constant.sharding();
+    if !follows_mesh || pending_auto_reduction {
+        return Ok(None);
+    }
+    let (target, sharding) = if constant.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
+        if constant.mesh().devices() == mesh.devices() {
+            return Ok(None);
+        }
+        (DeviceMesh::new(constant.sharding().mesh().clone(), mesh.devices().to_vec())?, constant.sharding().clone())
+    } else {
+        let declared_type = constant.r#type();
+        let Ok(sharding) = capture_sharding("a capture", &declared_type, constant.sharding(), mesh.logical_mesh())
+        else {
+            return Ok(None);
+        };
+        (mesh.clone(), sharding)
+    };
+    // The placed copy lives on devices that the mesh of the function names for every process, so it is committed to
+    // them and not locally assigned, as an array that a placement onto named devices gives is, whatever the commitment
+    // and the local assignment of the captured array are. What the capture means to the regions that hold it (i.e.,
+    // whether it is committed for them) is a separate fact, which the placement declares (refer to
+    // `RetainedArray::placed`), and a capture never commits the results of a function nor selects its devices.
+    let placed = constant.placed(&target, &sharding, || {
+        let placed = constant.to_array(session)?.reshard_on_devices(session, &target, &sharding, false)?;
+        Ok::<_, Error>(placed.with_committed(true).with_locally_assigned(false))
+    })?;
+    Ok(Some(placed))
 }
 
 /// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
@@ -818,6 +1101,24 @@ pub(crate) fn declared_input_sharding(input_type: &ArrayType, mesh: &LogicalMesh
         .sharding()
         .cloned()
         .unwrap_or_else(|| Sharding::replicated(mesh.clone(), input_type.shape().rank()))
+}
+
+/// Returns `input_type`, the declared type of an input of a compiled function, refined by `boundary`, the placement
+/// with which the executable of the function receives it (e.g., the input override or [`declared_input_sharding`]),
+/// when `input_type` records no sharding, and [`None`] when it records one or when `boundary` states more than such a
+/// type can (e.g., a pending reduction, which a type without a sharding never describes). The refined type records the
+/// placement of `boundary` without its auto mesh axes, which types never record. A transform that inserts a dimension
+/// into each item of an input (e.g., batching, which places the new dimension as its batch specification requests,
+/// refer to [`ArrayType::batched`]) starts from this type, so that the placement of the new dimension is kept for an
+/// item type that records none, as JAX places the batch of `jit(vmap(jit(f), spmd_axis_name='x'))` along `x`. Every
+/// entry point that batches a compiled function (i.e., `CompiledFunction::batch` and the batching rule of a call of
+/// one) refines its item types by this rule.
+pub(crate) fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Option<ArrayType> {
+    if input_type.sharding().is_some() {
+        return None;
+    }
+    let boundary_type = input_type.clone().with_sharding(boundary.without_auto_axes()).ok()?;
+    input_type.is_refined_by(&boundary_type).then_some(boundary_type)
 }
 
 /// Returns `input_types` with the input sharding overrides of `options` (i.e., [`Options::input_shardings`])
@@ -1275,7 +1576,6 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
             // A source is validated exactly like the same target, because transposition turns it into the target of the
             // cotangent (refer to `PlacementRequest`), so that a program is rejected when it is compiled rather than
             // when it is differentiated. A rejected source is reported as such, since nothing is moved to it forward.
-            let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>();
             for (request, is_source) in [(place.target(), false), (place.source(), true)] {
                 let unsupported = |reason: String| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
@@ -1290,11 +1590,11 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                         return Err(if is_source {
                             unsupported(format!(
                                 "its source names the device {}, which is not the only device of the mesh `{}` over \
-                                 the devices {:?} that the program is compiled for, and transposition would return \
+                                 the devices {} that the program is compiled for, and transposition would return \
                                  the cotangent to it",
-                                device.id(),
+                                device,
                                 mesh.logical_mesh(),
-                                device_ids(mesh),
+                                render_devices(mesh.devices()),
                             ))
                         } else {
                             Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
@@ -1310,12 +1610,12 @@ fn validate_placements(program: &FlatProgram, mesh: &DeviceMesh, use_shardy_part
                         {
                             return Err(if is_source {
                                 unsupported(format!(
-                                    "its source names the devices {:?} of mesh `{}`, which are not the devices {:?} \
+                                    "its source names the devices {} of mesh `{}`, which are not the devices {} \
                                      of the mesh `{}` that the program is compiled for, and transposition would \
                                      return the cotangent to them",
-                                    device_ids(placement_mesh),
+                                    render_devices(placement_mesh.devices()),
                                     placement_mesh.logical_mesh(),
-                                    device_ids(mesh),
+                                    render_devices(mesh.devices()),
                                     mesh.logical_mesh(),
                                 ))
                             } else {
@@ -1456,6 +1756,7 @@ mod tests {
         ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation, StagedFunction,
         WhileOperation,
     };
+    use ryft_pjrt::BufferType;
     use ryft_pjrt::protos::Precision;
 
     #[cfg(feature = "mps")]
@@ -1470,7 +1771,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
         Array, CompiledFunctionDispatcher, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation,
-        ProgramBuilder, RetainedArray, Session, Type, Value, jit_with_options,
+        Options, ProgramBuilder, RetainedArray, Session, Type, Value, jit_with_options,
     };
 
     #[cfg(feature = "mps")]
@@ -2720,6 +3021,69 @@ mod tests {
     }
 
     #[test]
+    fn test_session_lower_program_ignores_dead_placements() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .into_iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
+
+        // A `place` that no result uses is not part of the program that lowering emits, as JAX removes a dead
+        // `device_put` before it looks at shardings, whether a branch drops its result or the condition returns it as
+        // an output that the program does not use. It neither fails the validation of placements onto another device
+        // nor commits the results, and the program agrees with the analysis of its placement requests.
+        for returns_placement in [false, true] {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let placed = builder
+                .add_instruction(
+                    PlaceOperation::new(PlacementRequest::from(devices[1]), None),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            let (outputs, output_count) =
+                if returns_placement { (vec![negated, placed], 2) } else { (vec![negated], 1) };
+            let branch = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; output_count])
+                .unwrap();
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let predicate = builder.add_input(predicate_type.clone().into());
+            let true_region = builder.import_region(branch.entry_region_ref());
+            let false_region = builder.import_region(branch.entry_region_ref());
+            let output = builder
+                .add_instruction(
+                    ConditionOperation::new(),
+                    vec![true_region, false_region],
+                    vec![predicate, input],
+                    None,
+                )
+                .unwrap()[0];
+            let program: FlatProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+            assert!(!has_placement_requests(&program, true));
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            assert_eq!(lowered.committed_outputs(), [false]);
+            let compiled = session.compile_program(&lowered).unwrap();
+            let outputs = session
+                .execute_program(
+                    &compiled,
+                    vec![f32_scalar(&session, &mesh, 2.0), boolean_scalar(&session, &mesh, true)],
+                )
+                .unwrap();
+            assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![-2.0]);
+        }
+    }
+
+    #[test]
     fn test_session_lower_program_ignores_dynamic_types_in_dormant_regions() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -3555,6 +3919,64 @@ mod tests {
     }
 
     #[test]
+    fn test_session_lower_program_keeps_pending_reductions_of_input_overrides() {
+        // An input sharding override states the placement with which its argument arrives, a pending sum over an auto
+        // axis included, so the boundary of the executable keeps it and the program can complete it (e.g., the reshard
+        // that `Array::to_placement` compiles from such a source onto a sharding without unreduced axes). A runtime
+        // placement with the same pending sum is dropped instead, because no value of the program can carry it, and
+        // argument preparation then rejects an argument with that sum pending.
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [1]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let contributions = || {
+            let buffers = client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .zip([1.0f32, 2.0])
+                .map(|(device, value)| {
+                    client.buffer(value.to_ne_bytes().as_slice(), BufferType::F32, [1], None, device, None).unwrap()
+                })
+                .collect();
+            Array::from_addressable_buffers(
+                &session,
+                vector_type.clone(),
+                mesh.clone(),
+                Some(unreduced.clone()),
+                buffers,
+            )
+            .unwrap()
+        };
+        let options = Options::new(mesh.clone())
+            .with_input_shardings(vec![unreduced.clone()])
+            .with_output_shardings(vec![replicated.clone()]);
+        let function: crate::CompiledFunction<ArrayType, ArrayType> =
+            crate::compile_with_options(|x| x, vector_type.clone(), &session, options).unwrap();
+        let output = function.executable().execute(&session, contributions()).unwrap();
+        assert_eq!(output.sharding(), &replicated);
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0]);
+
+        // `Array::to_placement` and `Array::into_placement` take the compiled path for such a source, and each compiles
+        // its reshard once.
+        let placement = Placement::new(mesh.clone(), replicated.clone()).unwrap();
+        for consumes in [false, true] {
+            let mut program_counts = Vec::new();
+            for _ in 0..2 {
+                let output = match consumes {
+                    false => contributions().to_placement(&session, placement.clone()),
+                    true => contributions().into_placement(&session, placement.clone()),
+                };
+                assert_eq!(output.unwrap().copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0]);
+                program_counts.push(session.cached_program_count());
+            }
+            assert_eq!(program_counts[0], program_counts[1]);
+        }
+    }
+
+    #[test]
     fn test_session_lower_program_uses_retained_array_sharding() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4344,6 +4766,65 @@ mod tests {
         let open_compiled = session.compile_program(&open_lowered).unwrap();
         assert_eq!(open_compiled.output_shardings(), &[along_x]);
         assert!(session.validate_cached_program(&open_lowered, &open_compiled).is_ok());
+    }
+
+    #[test]
+    fn test_placed_constant_places_captures_on_the_devices_that_the_function_names() {
+        // An uncommitted capture that this process uploaded on its first device is placed on both devices of a
+        // function compiled for them, and that placement, which the executable passes and exposes among its captures,
+        // has the facts of an array that is placed on those devices directly: it is committed to them, so that an
+        // executable on one of them rejects it, and every process knows its devices, so that a move to a device of
+        // another process plans a transfer (which the CPU plugin cannot make) instead of returning no shards.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let r#type = ArrayType::scalar(DataType::F32);
+        let upload = |mesh: Option<DeviceMesh>| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh, None, 3f32.to_ne_bytes()).unwrap()
+        };
+        let capture = upload(None);
+        assert!(!capture.is_committed());
+        assert!(capture.is_locally_assigned());
+        let function = crate::compile_statefully_with_captures::<_, Type, Type>(
+            |captures, _| Ok(captures[0].clone()),
+            vec![Value::Array(capture)],
+            Type::Array(r#type.clone()),
+            &session,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let [Value::Array(placed)] = function.executable().captures() else {
+            panic!("expected one captured array");
+        };
+        let direct = upload(Some(mesh.clone()));
+        let first = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
+        let identity = crate::compile::<_, ArrayType, ArrayType>(|input| input, r#type, &session, first).unwrap();
+        let facts = |array: &Array| {
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            let executed = identity.executable().execute(&session, array.clone()).map_err(|error| error.to_string());
+            let moved =
+                array.to_placement(&session, Device::new(99, 1)).map(|array| array.addressable_shards().count());
+            (
+                array.mesh().devices().to_vec(),
+                array.is_committed(),
+                array.is_locally_assigned(),
+                values,
+                executed.map(|_| ()),
+                moved.map_err(|error| error.to_string()),
+            )
+        };
+        assert_eq!(facts(placed), facts(&direct));
+        assert_eq!(
+            facts(placed),
+            (
+                mesh.devices().to_vec(),
+                true,
+                false,
+                vec![3.0],
+                Err("public argument #0 is committed to devices [0, 1], but the executable requires [0]".to_string()),
+                Err("the cross-host transfers extension is not provided by the PJRT plugin".to_string()),
+            ),
+        );
     }
 
     #[test]

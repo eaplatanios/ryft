@@ -1389,7 +1389,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
+                let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[] .
                         let %1:f64[] = mul %0 %0
@@ -1402,14 +1402,14 @@ mod tests {
                 let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
                     body={
                         lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = jit_call %1 [
+                        let %2:f64[] = jit_call [derived_input_shardings=[_]] %1 [
                             callee={
                                 lambda %0:f64[] .
                                 let %1:f64[] = mul %0 %0
                                 in (%1)
                             },
                         ]
-                            %3:f64[] = jit_call %0 %1 [
+                            %3:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                                 callee={
                                     lambda %0:f64[], %1:f64[] .
                                     let %2:f64[] = mul %1 %0

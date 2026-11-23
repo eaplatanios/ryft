@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, Sharding, TypedProgram};
+use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram};
 use ryft_pjrt::LoadedExecutable;
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 
@@ -75,6 +75,13 @@ pub struct LoweredProgram {
     /// Session constants of the lowered program, whose arrays the trailing [`Self::session_constants`]`.len()` of the
     /// [`Self::capture_count`] capture arguments carry, in order.
     session_constants: Arc<[RetainedArray]>,
+
+    /// Session constant of the program before lowering that each of [`Self::session_constants`] carries, in order,
+    /// which is that constant itself or the placement of that constant where the executable receives it (refer to
+    /// `placed_constant`). This is how a caller that holds the constants of the program it lowered (e.g., the eager
+    /// dispatch of an application, refer to `Session::bind`) learns which of them each hidden argument carries without
+    /// searching the placements of its constants.
+    session_constant_sources: Arc<[RetainedArray]>,
 
     /// Effective sharding expected for every physical executable argument, including materialized captures first.
     expected_argument_shardings: Arc<[Sharding]>,
@@ -171,6 +178,7 @@ impl LoweredProgram {
             requires_assertion_handler,
             donation_flags,
             capture_count,
+            session_constant_sources: session_constants.clone(),
             session_constants,
             expected_argument_shardings,
             output_shardings,
@@ -199,6 +207,25 @@ impl LoweredProgram {
             .fdo_profile = profile.bytes().to_vec();
         self.compilation_options.profile_version = profile.version();
         self
+    }
+
+    /// Returns this program with `sources` as the session constants of the program before lowering that its hidden
+    /// arguments carry (refer to [`Self::session_constant_sources`]), one for each of [`Self::session_constants`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `sources` does not have one constant for each hidden argument.
+    pub(crate) fn with_session_constant_sources(mut self, sources: Arc<[RetainedArray]>) -> Result<Self, Error> {
+        if sources.len() != self.session_constants.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "a lowered program with {} session constants cannot carry {} sources",
+                self.session_constants.len(),
+                sources.len(),
+            ))
+            .into());
+        }
+        self.session_constant_sources = sources;
+        Ok(self)
     }
 
     /// Returns this program with `stable_hlo` in place of its lowered module, for tests that compile a module which
@@ -254,6 +281,14 @@ impl LoweredProgram {
     #[inline]
     pub(crate) fn session_constants(&self) -> &Arc<[RetainedArray]> {
         &self.session_constants
+    }
+
+    /// Returns the session constant of the program before lowering that each of [`Self::session_constants`] carries,
+    /// in order, which is that constant itself or its placement where the executable receives it (refer to
+    /// `placed_constant`).
+    #[inline]
+    pub(crate) fn session_constant_sources(&self) -> &[RetainedArray] {
+        &self.session_constant_sources
     }
 
     /// Returns the effective PJRT compilation options that this program is compiled with.
@@ -344,6 +379,13 @@ impl LoweredProgram {
     #[inline]
     pub(super) fn open_outputs(&self) -> &[bool] {
         &self.open_outputs
+    }
+
+    /// Returns whether executions of this lowering commit each logical output to its devices whatever the commitment
+    /// of their inputs (refer to [`CompiledProgram::committed_outputs`]).
+    #[inline]
+    pub(super) fn committed_outputs(&self) -> &[bool] {
+        &self.committed_outputs
     }
 
     /// Returns the exact live execution facts for selected kernels, absent for ordinary executables.
@@ -438,8 +480,8 @@ pub struct CompiledProgram {
     /// never record. It also covers the hidden final reference states after the public result.
     output_shardings: Arc<[Sharding]>,
 
-    /// Whether executions of the lowering that this program serves commit each logical output to its devices whatever
-    /// the commitment of their inputs (refer to [`Self::committed_outputs`]).
+    /// Whether executions commit each logical output to its devices whatever the commitment of their inputs (refer to
+    /// [`Self::committed_outputs`]).
     committed_outputs: Arc<[bool]>,
 
     /// Concrete device mesh used for compilation and execution.
@@ -524,11 +566,8 @@ impl CompiledProgram {
     }
 
     /// Creates a compiled program from an `executable` that was loaded from its serialized form and from the
-    /// invocation contract that was persisted with it. Which outputs executions always commit is a property of the
-    /// lowering that a program serves rather than of its executable (refer to [`Self::committed_outputs`]), so the
-    /// persisted flags are those of the lowering that the serialized program served. A program that is executed on its
-    /// own keeps that commitment contract, and a program that the compilation cache reuses for another lowering takes
-    /// the flags of that lowering instead (refer to [`Self::rebound_to`]).
+    /// invocation contract that was persisted with it, including the outputs that its executions always commit, which
+    /// are part of its compilation key (refer to [`Self::committed_outputs`]).
     ///
     /// # Parameters
     ///
@@ -609,21 +648,17 @@ impl CompiledProgram {
         }
     }
 
-    /// Returns `program` itself if it already has the boundary of `lowered` and commits the same outputs, and otherwise
-    /// a program that takes its boundary types, reference states, signature, and committed outputs from `lowered` and
-    /// shares everything else, including its executable, with `program`. A program that was compiled for another
-    /// lowering has the same boundary up to the identities of its dimension variables, and callers compare boundary
-    /// types by identity. Which outputs executions always commit is not part of the compilation key, because it does
-    /// not change the executable (e.g., an input sharding override and a runtime input placement with the same
-    /// sharding, or two aliases of the same captured buffers of which only one is committed, compile to the same
-    /// executable), so it comes from `lowered` as well.
+    /// Returns `program` itself if it already has the boundary of `lowered`, and otherwise a program that takes its
+    /// boundary types, reference states, and signature from `lowered` and shares everything else, including its
+    /// executable, with `program`. A program that was compiled for another lowering has the same boundary up to the
+    /// identities of its dimension variables, and callers compare boundary types by identity. It commits the same
+    /// outputs, because they are part of the compilation key (refer to [`Self::committed_outputs`]).
     pub(super) fn rebound_to(program: Arc<Self>, lowered: &LoweredProgram) -> Arc<Self> {
         let same_inputs =
             Arc::ptr_eq(&program.input_types, &lowered.input_types) || program.input_types == lowered.input_types;
         let same_outputs =
             Arc::ptr_eq(&program.output_types, &lowered.output_types) || program.output_types == lowered.output_types;
-        let same_committed_outputs = program.committed_outputs == lowered.committed_outputs;
-        if same_inputs && same_outputs && same_committed_outputs {
+        if same_inputs && same_outputs {
             program
         } else {
             Arc::new(Self {
@@ -631,7 +666,6 @@ impl CompiledProgram {
                 output_types: Arc::clone(&lowered.output_types),
                 reference_states: Arc::clone(&lowered.reference_states),
                 signature: lowered.signature.clone(),
-                committed_outputs: Arc::clone(&lowered.committed_outputs),
                 ..Self::clone(&program)
             })
         }
@@ -726,14 +760,16 @@ impl CompiledProgram {
         &self.output_shardings
     }
 
-    /// Returns whether executions of the lowering that this program serves commit each logical output to its devices
-    /// whatever the commitment of their inputs. This is the case for every public output of a lowering that requests a
+    /// Returns whether executions of this program commit each logical output to its devices whatever the commitment of
+    /// their inputs. This is the case for every public output of a lowering that requests a
     /// placement explicitly anywhere (i.e., through an input or output sharding override, or through a `place` with a
     /// target or a `constrain_sharding` in any region that it emits), as JAX commits the results of `jit` functions
     /// with explicit shardings. It is also the case for every output, including the hidden final reference states, of
     /// a lowering for a mesh of more than one device, as JAX commits every result of a computation on more than one
     /// device. The arrays that a lowering captures never commit its outputs, as JAX ignores the commitment of the
-    /// arrays that a `jit` function closes over.
+    /// arrays that a `jit` function closes over. Lowerings of the same module can differ in these flags (e.g., the
+    /// identity and a placement onto the memory that a device array is already in, which lowers to nothing), so they
+    /// are part of the compilation key, and a cached program serves only lowerings that commit the same outputs.
     #[inline]
     pub(crate) fn committed_outputs(&self) -> &[bool] {
         &self.committed_outputs
@@ -892,6 +928,9 @@ pub(super) struct InvocationMetadata<'o> {
     /// Runtime placement of every logical output, including the hidden final reference states.
     output_shardings: &'o [Sharding],
 
+    /// Whether executions commit each logical output whatever the commitment of their inputs.
+    committed_outputs: &'o [bool],
+
     /// Whether the compiler chooses the placement of each logical output over auto mesh axes, which only a lowering
     /// records (refer to [`LoweredProgram::open_outputs`]). A compiled program records the placement that the compiler
     /// chose instead, so it has [`None`] here.
@@ -938,6 +977,8 @@ impl InvocationMetadata<'_> {
             Some("argument shardings")
         } else if !self.has_compatible_output_shardings(other) {
             Some("output shardings")
+        } else if self.committed_outputs != other.committed_outputs {
+            Some("committed outputs")
         } else if self.mesh != other.mesh {
             Some("device mesh")
         } else if self.kernel_execution_facts != other.kernel_execution_facts {
@@ -993,6 +1034,7 @@ impl<'o> From<&'o CompiledProgram> for InvocationMetadata<'o> {
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
             output_shardings: &program.output_shardings,
+            committed_outputs: &program.committed_outputs,
             open_outputs: None,
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
@@ -1014,6 +1056,7 @@ impl<'o> From<&'o LoweredProgram> for InvocationMetadata<'o> {
             capture_count: program.capture_count,
             expected_argument_shardings: &program.expected_argument_shardings,
             output_shardings: &program.output_shardings,
+            committed_outputs: &program.committed_outputs,
             open_outputs: Some(&program.open_outputs),
             mesh: &program.mesh,
             requires_assertion_handler: program.requires_assertion_handler,
@@ -1087,6 +1130,7 @@ mod tests {
             capture_count: 0,
             expected_argument_shardings: &[],
             output_shardings: &[],
+            committed_outputs: &[],
             open_outputs: None,
             mesh: &mesh,
             requires_assertion_handler: false,
@@ -1096,6 +1140,10 @@ mod tests {
         assert_eq!(
             current.incompatible_field(InvocationMetadata { signature: &other_signature, ..current }),
             Some("executable signature"),
+        );
+        assert_eq!(
+            current.incompatible_field(InvocationMetadata { committed_outputs: &[true], ..current }),
+            Some("committed outputs"),
         );
         assert_eq!(
             current.incompatible_field(InvocationMetadata { capture_count: 1, ..current }),
@@ -1149,6 +1197,7 @@ mod tests {
             capture_count: 0,
             expected_argument_shardings: &[],
             output_shardings: &[],
+            committed_outputs: &[],
             open_outputs: None,
             mesh: &mesh,
             requires_assertion_handler: false,

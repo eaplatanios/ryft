@@ -263,11 +263,10 @@ pub trait CapturingContext: Context {
 
     /// Returns the constant payload through which the program that this [`CapturingContext`] builds holds `value`.
     /// That is usually a reference to a new entry for `value` that this function appends to the current captures
-    /// table. A trace that stages a function under
-    /// [`CapturePlacement::FollowCall`](crate::CapturePlacement::FollowCall) first asks the domain that it compiles for
-    /// whether the function holds `value` as a constant of its own instead (refer to
-    /// [`CompilationDomain::capture_constant`](crate::CompilationDomain::capture_constant)), and when the domain gives
-    /// one (e.g., the XLA backend gives a session constant for an array whose type records nothing beyond
+    /// table. A trace that stages a function under [`CapturePlacement::FollowCall`] first asks the domain that it
+    /// compiles for whether the function holds `value` as a constant of its own instead (refer to
+    /// [`CompilationDomain::capture_constant`](crate::CompilationDomain::capture_constant)), and when the domain
+    /// gives one (e.g., the XLA backend gives a session constant for an array whose type records nothing beyond
     /// replication), this function returns that constant and appends nothing to the captures table.
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError>;
 }

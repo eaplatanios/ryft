@@ -51,8 +51,11 @@
 //!
 //! The captured runtime arrays of the called function enter the calling context through [`ImportingContext`] and
 //! become leading inputs of the call. An eager parent uses the arrays directly. A root trace registers them in its own
-//! capture table, so they become captures of the enclosing program rather than literals. Transform contexts import
-//! them through their parent and then treat them like constants (i.e., as replicated under batching, with a
+//! capture table, so they become captures of the enclosing program rather than literals, except that the trace of a
+//! compiled function, whose captures follow its call, holds an array whose type records nothing beyond replication as
+//! a session constant instead (refer to `Session::capture_constant`), which its executable receives among its hidden
+//! arguments when its program uses it, so that such an array takes no entry in the capture table. Transform contexts
+//! import them through their parent and then treat them like constants (i.e., as replicated under batching, with a
 //! structurally zero tangent under differentiation, and as known under partial evaluation).
 //!
 //! Some bodies are traced over constants alone (i.e., in a `TracingContext<Constant, Operation>`), such as the bodies
@@ -197,7 +200,7 @@ use ryft_core::{
 use ryft_pjrt::Execution;
 
 use crate::compilation::CompilationError;
-use crate::compilation::domains::{capture_sharding, with_input_shardings};
+use crate::compilation::domains::{boundary_input_type, declared_input_sharding, with_input_shardings};
 use crate::compilation::options::Options;
 use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
 use crate::compilation::programs::CompiledProgram;
@@ -1588,8 +1591,16 @@ where
             .collect::<Vec<_>>();
 
         // Insert the batch axis into the type of every mapped input leaf with the requested placement, normalizing it
-        // against the batched rank as `batch` does for its inputs.
+        // against the batched rank as `batch` does for its inputs. The requested placement is first validated against
+        // the placement with which this function receives the item (refer to `declared_input_sharding`), whatever the
+        // item type records, so that a request that no placement can satisfy (e.g., one that names a mesh axis that
+        // the mesh of this function lacks, or one that the placement of the item already uses) is rejected with the
+        // error of `Sharding::batched`, as it is for an item type that records a sharding. An item type that records
+        // no sharding is then refined by that placement (refer to `boundary_input_type`), as the batching rule of a
+        // call of this function refines it, so that the batch axis keeps its placement. A valid placement that no type
+        // can record (i.e., along an auto mesh axis) leaves the item type as it is.
         let batch_sharding = sharding.clone().unwrap_or_else(ShardingDimension::replicated);
+        let mesh = staged.options().mesh().logical_mesh().clone();
         let batched_input_types = input_types
             .into_parameters()
             .zip(&input_batch_axes)
@@ -1597,7 +1608,18 @@ where
                 None => Ok(r#type),
                 Some(axis) => {
                     let position = axis.normalize(r#type.rank() + 1).map_err(ProgramError::from)?;
-                    Ok(r#type.batched(position, Dimension::Static(extent), batch_sharding.clone())?)
+                    let dimension = Dimension::Static(extent);
+                    let refined = match &sharding {
+                        Some(_) => {
+                            let boundary = declared_input_sharding(&r#type, &mesh);
+                            match boundary.batched(position, batch_sharding.clone())?.references_auto_axis() {
+                                true => None,
+                                false => boundary_input_type(&r#type, &boundary),
+                            }
+                        }
+                        None => None,
+                    };
+                    Ok(refined.as_ref().unwrap_or(&r#type).batched(position, dimension, batch_sharding.clone())?)
                 }
             })
             .collect::<Result<Vec<_>, BatchingError>>()
@@ -2148,29 +2170,6 @@ where
     session.compile_staged_function(staged)
 }
 
-/// Returns `capture`, a capture of a function that is staged for `mesh`, with the type with which the function is
-/// traced. A capture over a logical mesh of another topology that the executable receives replicated over `mesh`
-/// (refer to [`capture_sharding`]) is replicated over `mesh` here, once, because the function is traced with the type
-/// of the capture, which would otherwise name a mesh that the function does not run on. Every other capture is
-/// returned as it is. A capture over a logical mesh of the topology of `mesh` is moved onto the devices of `mesh` by an
-/// execution, with its placement. A capture whose placement the function cannot keep is rejected only if it survives
-/// the pruning of the staged program (refer to `Session::lower_staged_program`), so that a function that ignores it
-/// compiles.
-///
-/// # Errors
-///
-/// Returns the error of moving a capture.
-fn placed_capture(capture: Array, mesh: &DeviceMesh) -> Result<Array, Error> {
-    if capture.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
-        return Ok(capture);
-    }
-    let Ok(sharding) = capture_sharding("a capture", &capture.r#type(), capture.sharding(), mesh) else {
-        return Ok(capture);
-    };
-    let session = capture.session().clone();
-    capture.reshard_on_devices(&session, mesh, &sharding, false)
-}
-
 /// Traces `function` into a [`StagedFunction`] over the internal array IR type family. The closure sees public
 /// [`CompileTracer`]s, and its outputs receive the output sharding overrides of `options` (refer to `place_outputs`).
 /// This is the shared implementation of [`stage`], [`stage_with_captures`], and [`compile_with_flat_captures`].
@@ -2206,10 +2205,9 @@ where
     ProgramParameterValues<Out, StatefulCompileTracer>:
         Parameterized<StatefulCompileTracer, To<Type> = ProgramParameters<Out>, To<Constant> = ProgramConstants<Out>>,
 {
-    let captures = captures
-        .into_iter()
-        .map(|capture| placed_capture(capture, options.mesh()).map(Value::Array))
-        .collect::<Result<Vec<_>, Error>>()?;
+    // A capture over a logical mesh of another topology than the mesh of the function is staged with the type with
+    // which the function receives it and placed only if the function uses it (refer to `Session::capture_constant`).
+    let captures = captures.into_iter().map(Value::Array).collect::<Vec<_>>();
     let input_structure = input_types.parameter_structure();
     let input_types =
         ProgramParameters::<In>::from_parameters(input_structure, input_types.into_parameters().map(Type::from))
@@ -2241,13 +2239,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, AddOperation, Array as CoreArray, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast,
-        CaptureReference, Compare, ComparisonDirection, Condition, Context, ConvertElementType, Cos,
+        CaptureReference, Compare, ComparisonDirection, CompositeKey, Condition, Context, ConvertElementType, Cos,
         CotangentAccumulator, CotangentDestinationKind, DataType, Device, DifferentiableType, Differentiate,
         DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable,
         DomainTracer, Dot, DotDimensionNumbers, DotsSavable, EagerInterpretationDriver, ErasedOperation,
@@ -2269,6 +2268,7 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
+    use crate::lowering::collect_session_constants;
     use crate::sessions::tests::{
         domain_mesh, read_first_shard, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
@@ -2282,6 +2282,20 @@ mod tests {
     };
 
     use super::*;
+
+    /// Returns the number of runtime captures of the staged program of `function` and the number of distinct arrays
+    /// that its session constants hold, which is how a function holds a capture whose type records nothing beyond
+    /// replication (refer to `Session::capture_constant`).
+    fn captured_arrays<In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
+        function: &CompiledFunction<In, Out>,
+    ) -> (usize, usize)
+    where
+        In::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+        Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
+    {
+        let program = function.source_program().to_program_with_lifted_captures().unwrap();
+        (function.source_program().captures().len(), collect_session_constants(&program).len())
+    }
 
     /// Traces `f(reference, update) = { reference += update; read(reference) }` over a `ref<f32[]>` and an `f32[]` into
     /// the XLA program universe, so that program transforms of a program with references can be replayed into a
@@ -3373,7 +3387,7 @@ mod tests {
         let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         assert_eq!(engine.cached_program_count(), 1, "only the outer program should be compiled");
-        assert_eq!(outer.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&outer), (0, 1));
 
         let input_value = 0.5f32;
         let input = Array::from_host_buffer(
@@ -3448,7 +3462,8 @@ mod tests {
         assert_eq!(
             inner.lifted_program().unwrap().to_string(),
             indoc! {"
-                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                lambda  .
+                let %0:f32[] = const session:f32[]
                 in (%0)"},
         );
 
@@ -3938,7 +3953,7 @@ mod tests {
         let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        assert_eq!(outer.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&outer), (0, 1));
 
         let input = Array::from_host_buffer(
             &engine,
@@ -4002,7 +4017,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outer.source_program().captures().len(), 2);
+        assert_eq!(captured_arrays(&outer), (0, 2));
 
         let input = Array::from_host_buffer(
             &engine,
@@ -4338,9 +4353,11 @@ mod tests {
         for placement in [None, Some(&first), Some(&second)] {
             let input = upload(placement, [1.0, 3.0]);
             let called = function.call(input.clone()).unwrap();
-            let mut interpreted = JitCallOperation::new(1)
-                .interpret(&session, &driver, &[Value::Array(capture.clone()), Value::Array(input.clone())])
-                .unwrap();
+            // The capture is replicated, so the function holds it as a session constant of a type that names no mesh,
+            // which region replay places on the devices of the call.
+            assert_eq!(captured_arrays(&function), (0, 1));
+            let mut interpreted =
+                JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
             let interpreted = ValueProjection::<ArrayType>::into_projected(interpreted.remove(0)).unwrap();
             assert_eq!(interpreted.mesh(), called.mesh());
             assert_eq!(interpreted.sharding(), called.sharding());
@@ -4502,6 +4519,191 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_function_captures_follow_the_call() {
+        // A capture whose type records nothing beyond replication names no mesh in the types of the function, so a
+        // function that names no devices runs where its call runs whatever the devices of its captures, as JAX 0.12.0.1
+        // returns `[11, 22]` on both devices, committed, for `jit(lambda x: x + c)(y)` with `y` on two devices and `c`
+        // closed over, uncommitted or committed to those devices, directly and nested in another `jit` function.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
+        let pair_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let pair_type = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(pair_mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let upload = |r#type: &ArrayType, mesh: Option<&DeviceMesh>, values: [f32; 2]| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh.cloned(), None, values_to_bytes(&values)).unwrap()
+        };
+        let uncommitted = upload(&vector_type, None, [10.0, 20.0]);
+        let committed = upload(&pair_type, Some(&pair_mesh), [10.0, 20.0]);
+        let pair_input = upload(&pair_type, Some(&pair_mesh), [1.0, 2.0]);
+        let single_input = upload(&vector_type, None, [1.0, 2.0]);
+        let observe = |array: Array| {
+            let devices = array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
+            (devices, array.is_committed(), array.copy_to_host().unwrap().elements::<f32>().unwrap())
+        };
+        let mut program_counts = Vec::new();
+        for capture in [uncommitted.clone(), committed.clone()] {
+            let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+                |captures, x| x + captures[0].clone(),
+                vec![capture],
+                vector_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap();
+            assert_eq!(function.output_types(), [vector_type.clone()]);
+            // The capture never changes the public signature of the executable.
+            let lowered = function.function.lowered().lowered_program();
+            assert_eq!(lowered.input_types()[lowered.input_types().len() - 1], vector_type);
+            assert_eq!(lowered.session_constants().len(), 1);
+            program_counts.push(session.cached_program_count());
+            let callee = function.clone();
+            let caller: CompiledFunction<ArrayType, ArrayType> =
+                compile(move |y| callee.call(y).unwrap(), pair_type.clone(), &session, pair_mesh.clone()).unwrap();
+            program_counts.push(session.cached_program_count());
+            for output in [
+                function.call(pair_input.clone()).unwrap(),
+                function.call(pair_input.clone()).unwrap(),
+                caller.executable().execute(&session, pair_input.clone()).unwrap(),
+            ] {
+                assert_eq!(observe(output), (vec![0, 1], true, vec![11.0, 22.0]));
+            }
+            program_counts.push(session.cached_program_count());
+            for output in [
+                function.call(single_input.clone()).unwrap(),
+                function.call(single_input.clone()).unwrap(),
+                function.executable().execute(&session, single_input.clone()).unwrap(),
+            ] {
+                assert_eq!(observe(output), (vec![0], false, vec![11.0, 22.0]));
+            }
+            program_counts.push(session.cached_program_count());
+        }
+        // The function, its caller, and its eager call on the two devices each compile once, an eager call on its own
+        // device reuses the executable of the function, and the function and its caller with the committed capture
+        // reuse the executables with the uncommitted one, whose modules and argument placements are the same (each
+        // request still passes its own array as the hidden argument).
+        assert_eq!(program_counts, [1, 2, 3, 3, 3, 3, 3, 3]);
+
+        // The same array captured twice is one hidden argument, and a capture that the function does not use is none.
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+            |captures, x| x + captures[0].clone() + captures[1].clone(),
+            vec![committed.clone(), committed.clone()],
+            vector_type.clone(),
+            &session,
+            single_device_mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(function.function.lowered().lowered_program().session_constants().len(), 1);
+        assert_eq!(observe(function.executable().execute(&session, single_input.clone()).unwrap()).2, [21.0, 42.0]);
+        let function: CompiledFunction<ArrayType, ArrayType> =
+            compile_with_captures(|_, x| x, vec![committed], vector_type.clone(), &session, single_device_mesh)
+                .unwrap();
+        assert_eq!(function.function.lowered().lowered_program().session_constants().len(), 0);
+    }
+
+    #[test]
+    fn test_compiled_function_call_releases_captures_with_the_function() {
+        // A capture lives as long as a function or a program that holds it. The eager dispatch cache keeps the program
+        // of every eager call, but its keys and entries hold captures without their storage, so it never keeps a
+        // capture alive, whether the call runs on the device of the capture or on other devices, where the capture
+        // is placed once for its retention and released with it.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
+        let pair_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let pair_type = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(pair_mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let upload = |r#type: &ArrayType, mesh: Option<&DeviceMesh>, values: [f32; 2]| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh.cloned(), None, values_to_bytes(&values)).unwrap()
+        };
+        let single_input = upload(&vector_type, None, [1.0, 2.0]);
+        let pair_input = upload(&pair_type, Some(&pair_mesh), [1.0, 2.0]);
+        for input in [single_input, pair_input] {
+            let capture = upload(&vector_type, None, [10.0, 20.0]);
+            let buffer = Arc::downgrade(capture.shards()[0].buffer().unwrap());
+            let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+                |captures, x| x + captures[0].clone(),
+                vec![capture],
+                vector_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap();
+            let output = function.call(input.clone()).unwrap();
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [11.0, 22.0]);
+            assert!(buffer.upgrade().is_some());
+            drop((function, output));
+            assert!(buffer.upgrade().is_none(), "the capture of a call on {:?} is still alive", input.mesh());
+        }
+    }
+
+    #[test]
+    fn test_compiled_function_places_captures_once_for_each_mesh() {
+        // A capture that is not on the devices where a function receives it is placed there once for its retention
+        // and mesh (refer to `placed_constant`), whether it is on the same devices, on other devices of the same mesh
+        // topology, or on a mesh of another topology, so that repeated executions, eager calls, and replays of the
+        // callee, after the first application of each path, create the same arrays wherever the capture lives.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let single = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let pair_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |mesh: &DeviceMesh| {
+            Array::from_host_buffer(&session, vector_type.clone(), mesh.clone(), None, values_to_bytes(&[10f32, 20.0]))
+                .unwrap()
+        };
+        let input =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32, 2.0])).unwrap();
+        let mut created = Vec::new();
+        for capture in [upload(&single(devices[0])), upload(&single(devices[1])), upload(&pair_mesh)] {
+            let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+                |captures, x| x + captures[0].clone(),
+                vec![capture],
+                vector_type.clone(),
+                &session,
+                single(devices[0]),
+            )
+            .unwrap();
+            let callee = Arc::new(function.source_program().to_program_with_lifted_captures().unwrap());
+            let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+            let driver = EagerInterpretationDriver::new(&regions);
+            let replay = || {
+                JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
+            };
+            let paths: [&dyn Fn(); 3] = [
+                &|| drop(function.executable().execute(&session, input.clone()).unwrap()),
+                &|| drop(function.call(input.clone()).unwrap()),
+                &replay,
+            ];
+            for path in paths {
+                path();
+                let before = session.array_statistics().created_arrays;
+                for _ in 0..3 {
+                    path();
+                }
+                created.push(session.array_statistics().created_arrays - before);
+            }
+        }
+        // An execution creates its result, and an eager call and a replay also create a handle of the placed capture
+        // that refers to its buffers, the same count wherever the capture lives, so none of them moves it again.
+        assert_eq!(created, [3, 6, 6, 3, 6, 6, 3, 6, 6]);
+    }
+
+    #[test]
     fn test_compile_with_captures_places_captures_where_the_function_runs() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4593,28 +4795,317 @@ mod tests {
         assert_eq!(output.mesh(), &single_device_mesh);
         assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
 
-        // An array that a nested body imports keeps the type that it was imported with, which names the mesh of the
-        // array, so an array split along an auto axis of another topology fails the topology check of lowering even
-        // though the executable could receive it replicated (a recorded limit).
+        // A capture that the function ignores is never read, even when this process holds none of its buffers.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let capture =
-            Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(split), values_to_bytes(&values))
+            Array::from_addressable_buffers(&session, vector_type.clone(), mesh, Some(split), Vec::new()).unwrap();
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+            |_, x: CompileTracer| x,
+            vec![capture],
+            vector_type.clone(),
+            &session,
+            single_device_mesh.clone(),
+        )
+        .unwrap();
+        let output = function.executable().execute(&session, input.clone()).unwrap();
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        // An array that a nested body imports follows the function as an explicit capture does, because the trace of
+        // the function gives it the type with which the function receives it where it imports it, so the values that
+        // the function computes from it are typed over the mesh of the function. Direct execution, an eager call, and
+        // a nested call all return it on the device of the function, as JAX does. An imported array whose type records
+        // a split over a mesh of another topology cannot keep it, as for a capture.
+        let compile_importing = |axis_type: MeshAxisType| {
+            let mesh = two_device_mesh(client, axis_type);
+            let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let split_type = match axis_type {
+                MeshAxisType::Explicit => vector_type.clone().with_sharding(split.clone()).unwrap(),
+                _ => vector_type.clone(),
+            };
+            let capture =
+                Array::from_host_buffer(&session, split_type, mesh, Some(split), values_to_bytes(&values)).unwrap();
+            let body = rematerialize(move |x: Tracer<TracingContext<Constant, Operation>>| {
+                ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))
+            });
+            compile::<_, ArrayType, ArrayType>(
+                move |x: CompileTracer| {
+                    ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
+                },
+                vector_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+        };
+        let function = compile_importing(MeshAxisType::Auto).unwrap();
+        let caller: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| function.call(x).unwrap(), vector_type.clone(), &session, single_device_mesh.clone()).unwrap();
+        for output in [
+            function.executable().execute(&session, input.clone()).unwrap(),
+            function.call(input.clone()).unwrap(),
+            caller.executable().execute(&session, input.clone()).unwrap(),
+        ] {
+            assert_eq!(output.mesh(), &single_device_mesh);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+        }
+        assert_eq!(
+            compile_importing(MeshAxisType::Explicit).map(|_| ()).unwrap_err().to_string(),
+            "retained array #0 has the type `f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]` over a mesh of \
+             another topology than the mesh `['device'=1:auto]` that the function is compiled for, whose placement it \
+             cannot keep",
+        );
+
+        // A replicated array of two devices that the function combines with its input on one device enters with the
+        // type of the function whether it is captured explicitly or imported inside a `rematerialize` body, and both
+        // compute on the device of the function, as JAX computes `[0, 2, 4, 6]` on CPU 0.
+        for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
+            let mesh = two_device_mesh(client, axis_type);
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let capture_type = vector_type.clone().with_sharding(replicated.clone()).unwrap();
+            let capture =
+                Array::from_host_buffer(&session, capture_type, mesh, Some(replicated), values_to_bytes(&values))
+                    .unwrap();
+            let input_type =
+                vector_type.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 1)).unwrap();
+            let input = Array::from_host_buffer(
+                &session,
+                input_type.clone(),
+                single_device_mesh.clone(),
+                None,
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            let imported = capture.clone();
+            let body = rematerialize(move |x: Tracer<TracingContext<Constant, Operation>>| {
+                ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(imported.clone()))
+            });
+            let importing: CompiledFunction<ArrayType, ArrayType> = compile(
+                move |x: CompileTracer| {
+                    x.clone()
+                        + ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
+                },
+                input_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap();
+            let capturing: CompiledFunction<ArrayType, ArrayType> = compile_with_captures(
+                |mut captures, x: CompileTracer| x + captures.remove(0),
+                vec![capture],
+                input_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap();
+            for function in [&importing, &capturing] {
+                for output in [
+                    function.executable().execute(&session, input.clone()).unwrap(),
+                    function.call(input.clone()).unwrap(),
+                ] {
+                    assert_eq!(output.mesh(), &single_device_mesh);
+                    assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.0, 2.0, 4.0, 6.0]);
+                }
+            }
+        }
+
+        // An import never changes the signature of the function: an identity whose input is declared over a mesh of
+        // two devices fails to compile on one device with the same error whether or not the function also returns an
+        // independently imported array of that mesh, which follows the function.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let declared_type = vector_type.clone().with_sharding(replicated.clone()).unwrap();
+        let capture =
+            Array::from_host_buffer(&session, declared_type.clone(), mesh, Some(replicated), values_to_bytes(&values))
                 .unwrap();
-        let body = rematerialize(|x: Tracer<TracingContext<Constant, Operation>>| {
+        let body = rematerialize(move |x: Tracer<TracingContext<Constant, Operation>>| {
             ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))
         });
-        let function = compile::<_, ArrayType, ArrayType>(
-            |x: CompileTracer| {
-                ValueProjection::<ArrayType>::into_projected(body.call(x.into_value()).unwrap()).unwrap()
+        let identity =
+            compile::<_, ArrayType, ArrayType>(|x| x, declared_type.clone(), &session, single_device_mesh.clone());
+        let importing = compile::<_, ArrayType, (ArrayType, ArrayType)>(
+            move |x: CompileTracer| {
+                let imported =
+                    ValueProjection::<ArrayType>::into_projected(body.call(x.clone().into_value()).unwrap()).unwrap();
+                (x, imported)
             },
-            vector_type.clone(),
+            declared_type,
             &session,
             single_device_mesh.clone(),
         );
         assert_eq!(
-            function.map(|_| ()).unwrap_err().to_string(),
+            identity.map(|_| ()).unwrap_err().to_string(),
+            "mesh mismatch; expected `LogicalMesh { axes: [MeshAxis { name: \"device\", size: 1, type: Auto }] }` but \
+             got `LogicalMesh { axes: [MeshAxis { name: \"x\", size: 2, type: Auto }] }`",
+        );
+        assert_eq!(
+            importing.map(|_| ()).unwrap_err().to_string(),
             "mesh `['x'=2:auto]` does not have the topology of the module mesh `['device'=1:auto]`",
         );
+    }
+
+    #[test]
+    fn test_compile_types_imported_arrays_that_follow_the_call_at_every_entry_point() {
+        // An array that a body nested in a compiled function imports from a mesh of another topology is typed as the
+        // function receives it under `CapturePlacement::FollowCall` (refer to `NamedAxes::capture_placement`)
+        // wherever the body is traced: in a `rematerialize` body, in a composite, in a `scan` body nested in such a
+        // body, under forward mode differentiation, and under batching. Each combines it with the input of the function
+        // on its single device.
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
+        let values = [0f32, 1.0, 2.0, 3.0];
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let capture_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
+        let capture =
+            Array::from_host_buffer(&session, capture_type.clone(), mesh, Some(replicated), values_to_bytes(&values))
+                .unwrap();
+        let project = |value: Body| ValueProjection::<ArrayType>::into_projected(value);
+        let add_capture = {
+            let capture = capture.clone();
+            move |x: Body| -> Result<Body, ProgramError> {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))?;
+                Ok((project(x)? + project(imported)?).into_value())
+            }
+        };
+        let rematerialized = rematerialize(add_capture.clone());
+        let composed = composite(add_capture.clone());
+        let scanned_capture = capture.clone();
+        let scanned = rematerialize(move |x: Body| {
+            let capture = scanned_capture.clone();
+            let (carry, ()) = scan(
+                move |_, carry, _| {
+                    let imported = ImportingContext::<Session, ThroughSession>::import(
+                        carry.context(),
+                        Value::Array(capture.clone()),
+                    )?;
+                    let carry = ValueProjection::<ArrayType>::into_projected(carry)?;
+                    Ok(((carry + ValueProjection::<ArrayType>::into_projected(imported)?).into_value(), ()))
+                },
+                x.clone(),
+                x,
+                ScanOptions::new(),
+            )?;
+            Ok(carry)
+        });
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 1))
+            .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            input_type.clone(),
+            single_device_mesh.clone(),
+            None,
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let run = |function: CompiledFunction<ArrayType, ArrayType>| {
+            let output = function.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!(output.mesh(), &single_device_mesh);
+            output.copy_to_host().unwrap().elements::<f32>().unwrap()
+        };
+        let compile_on_device = |function: &dyn Fn(StatefulCompileTracer) -> StatefulCompileTracer| {
+            compile::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| ValueProjection::<ArrayType>::into_projected(function(x.into_value())).unwrap(),
+                input_type.clone(),
+                &session,
+                single_device_mesh.clone(),
+            )
+            .unwrap()
+        };
+        assert_eq!(run(compile_on_device(&|x| rematerialized.call(x).unwrap())), vec![0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(run(compile_on_device(&|x| composed.call(x).unwrap())), vec![0.0, 2.0, 4.0, 6.0]);
+        assert_eq!(run(compile_on_device(&|x| scanned.call(x).unwrap())), vec![0.0, 5.0, 10.0, 15.0]);
+        assert_eq!(
+            run(compile_on_device(&|x| {
+                differentiate_at(x.clone()).jvp(x, |x| Ok(rematerialized.call(x)?)).unwrap().0
+            })),
+            vec![0.0, 2.0, 4.0, 6.0],
+        );
+        assert_eq!(
+            run(compile_on_device(&|x| {
+                let extent = BatchAxisSpecification::default()
+                    .with_extent(x.context().lift(Constant::Dimension(DimensionValue::constant(2).unwrap())).unwrap());
+                batch(|x| rematerialized.call(x), x, BatchAxis::replicated(), BatchAxis::replicated(), extent).unwrap()
+            })),
+            vec![0.0, 2.0, 4.0, 6.0],
+        );
+
+        // A plain trace preserves the types of the arrays that enter it, so an import there keeps the type of its
+        // array.
+        let traced = crate::trace_with_context::<_, ArrayType, ArrayType>(
+            |context, _| {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(context, Value::Array(capture.clone()))?;
+                Ok(ValueProjection::<ArrayType>::into_projected(imported)?)
+            },
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(traced.global_output_types(), &capture_type);
+    }
+
+    #[test]
+    fn test_compile_shares_composite_definitions_across_meshes() {
+        // The scope of a composite call records whether captures follow the call but not the mesh that the calling
+        // function is compiled for, so one named composite called by functions compiled for meshes of different
+        // topologies registers one definition and traces its body once. The array that the body imports is typed as
+        // it follows the call, and lowering places it where each function runs.
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let values = [0f32, 1.0, 2.0, 3.0];
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let capture_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
+        let capture =
+            Array::from_host_buffer(&session, capture_type, mesh.clone(), Some(replicated), values_to_bytes(&values))
+                .unwrap();
+        let traces = Arc::new(AtomicUsize::new(0));
+        let composed = {
+            let traces = traces.clone();
+            composite(move |x: Body| -> Result<Body, ProgramError> {
+                traces.fetch_add(1, Ordering::SeqCst);
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(x.context(), Value::Array(capture.clone()))?;
+                let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                Ok((x + ValueProjection::<ArrayType>::into_projected(imported)?).into_value())
+            })
+            .with_named_composite(CompositeKey::new("ryft.tests.composite_follow_call_import", 1), |x: Type| Ok(x))
+        };
+        let input_type = ArrayType::new_static(DataType::F32, [4]);
+        let compile_on = |device_mesh: DeviceMesh| {
+            compile::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| {
+                    ValueProjection::<ArrayType>::into_projected(composed.call(x.into_value()).unwrap()).unwrap()
+                },
+                input_type.clone(),
+                &session,
+                device_mesh,
+            )
+            .unwrap()
+        };
+        let on_single_device = compile_on(single_device_mesh.clone());
+        let on_two_devices = compile_on(mesh.clone());
+        assert_eq!(traces.load(Ordering::SeqCst), 1);
+        for (function, device_mesh) in [(on_single_device, single_device_mesh), (on_two_devices, mesh)] {
+            let input = Array::from_host_buffer(
+                &session,
+                input_type.clone(),
+                device_mesh.clone(),
+                None,
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            let output = function.executable().execute(&session, input).unwrap();
+            assert_eq!(output.mesh(), &device_mesh);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![0.0, 2.0, 4.0, 6.0]);
+        }
     }
 
     #[test]
@@ -4663,15 +5154,96 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_function_call_names_no_devices_when_pruning_drops_its_requests() {
+        // `g(x) = (sin(x), place(x, CPU 1))`, compiled for CPU 1, names that device, but `h(x) = g(x).0` drops the only
+        // output that the placement computes, so its call of `g`, pruned to the first output, names no devices, as JAX
+        // 0.12.0.1 lowers `jit(lambda x: g(x)[0])` without the dropped placement (`{CpuDevice(id=0)} False` for an
+        // uncommitted `x`). `h` therefore compiles for CPU 0 and runs where its argument runs, and a direct execution
+        // of `h` compiled for CPU 1 runs there without committing its result. An eager call of `g` itself runs all of
+        // `g`, which names CPU 1, and commits its results there (refer to the departure on devices inside a compiled
+        // function), whichever result its caller then uses.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let single = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let second = devices[1];
+        let g: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
+            move |x: CompileTracer| (x.sin().unwrap(), x.place(&second, None).unwrap()),
+            vector_type.clone(),
+            &session,
+            single(devices[1]),
+        )
+        .unwrap();
+        let input =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[0f32, 0.0])).unwrap();
+        let observe =
+            |array: Array| (array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>(), array.is_committed());
+        let mut observed = Vec::new();
+        for device in devices.clone() {
+            let callee = g.clone();
+            let h: CompiledFunction<ArrayType, ArrayType> =
+                compile(move |x| callee.call(x).unwrap().0, vector_type.clone(), &session, single(device)).unwrap();
+            observed.push(observe(h.executable().execute(&session, input.clone()).unwrap()));
+            observed.push(observe(h.call(input.clone()).unwrap()));
+        }
+        observed.push(observe(g.call(input.clone()).unwrap().0));
+        assert_eq!(observed, [(vec![0], false), (vec![0], false), (vec![1], false), (vec![0], false), (vec![1], true)],);
+    }
+
+    #[test]
+    fn test_compiled_function_commits_outputs_only_for_live_placement_requests() {
+        // `f(x) = (x, place(x, DeviceMemory))` commits both of its results, and a wrapper that returns only the first
+        // one requests no placement, because no result of the wrapper depends on the placement, so an uncommitted
+        // argument leaves its result uncommitted, as JAX 0.12.0.1 returns `(True, True, False)` for the analogous
+        // `jit` functions.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let input = Array::from_host_buffer(&session, vector_type.clone(), None, None, [0u8; 16]).unwrap();
+        let placing: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
+            |x: CompileTracer| (x.clone(), x.place(&Memory::Device, None).unwrap()),
+            vector_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let wrapper: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| placing.call(x).unwrap().0, vector_type.clone(), &session, mesh.clone()).unwrap();
+        let (first, second) = placing.call(input.clone()).unwrap();
+        assert_eq!(
+            (
+                first.is_committed(),
+                second.is_committed(),
+                wrapper.call(input.clone()).unwrap().is_committed(),
+                wrapper.executable().execute(&session, input).unwrap().is_committed(),
+            ),
+            (true, true, false, false),
+        );
+    }
+
+    #[test]
     fn test_compiled_function_call_agrees_with_execution_at_every_entry_point() {
-        // What an entry point observes of the result of a callee.
-        #[derive(Debug, PartialEq)]
+        // What an entry point observes of the result of a callee, including the facts that its type omits: whether it
+        // is committed, whether this process alone chose its devices, and whether it belongs to the session's client.
+        #[derive(Clone, Debug, PartialEq)]
         struct Observation {
             devices: Vec<Device>,
             shapes: Vec<String>,
             sharding: String,
+            r#type: String,
+            memory: Vec<String>,
             values: Vec<Vec<f32>>,
             committed: bool,
+            locally_assigned: bool,
+            owned_by_session: bool,
         }
 
         // Callee of a row, which is a function compiled ahead of time or a `jit` dispatcher.
@@ -4796,6 +5368,16 @@ mod tests {
             )
             .unwrap()
         };
+        // A function that places its input in device memory beside returning it, whose placement a wrapper that only
+        // returns the first result drops, so that the wrapper requests no placement, as JAX lowers a nested `jit`
+        // function pruned to the outputs that its caller uses.
+        let placing: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
+            |x: CompileTracer| (x.clone(), x.place(&Memory::Device, None).unwrap()),
+            vector_type.clone(),
+            &session,
+            first_canonical_mesh.clone(),
+        )
+        .unwrap();
         let values = [1.0f32, 2.0, 3.0, 4.0];
         let identity = |(), x: CompileTracer| Ok::<_, Error>(x);
         let rows = vec![
@@ -5002,6 +5584,21 @@ mod tests {
                 caller_mesh: second_mesh.clone(),
             },
             Row {
+                name: "placement whose result the caller drops",
+                input_type: vector_type.clone(),
+                callee: Callee::Compiled(
+                    compile(
+                        |x| placing.call(x).unwrap().0,
+                        vector_type.clone(),
+                        &session,
+                        first_canonical_mesh.clone(),
+                    )
+                    .unwrap(),
+                ),
+                input: upload(&vector_type, None, None, &values),
+                caller_mesh: first_canonical_mesh.clone(),
+            },
+            Row {
                 name: "declared split input of a replicated argument",
                 input_type: explicit_replicated_type.clone(),
                 callee: compiled(&split_type, Options::new(explicit_mesh.clone())),
@@ -5096,6 +5693,15 @@ mod tests {
                 devices: array.shards().iter().map(ArrayShard::device).collect(),
                 shapes: array.shards().iter().map(|shard| shard.shape().to_string()).collect(),
                 sharding: array.sharding().to_string(),
+                r#type: array.r#type().to_string(),
+                memory: array
+                    .shards()
+                    .iter()
+                    .map(|shard| match shard.buffer() {
+                        Some(buffer) => buffer.memory().unwrap().kind().unwrap().into_owned(),
+                        None => String::new(),
+                    })
+                    .collect(),
                 values: array
                     .shards()
                     .iter()
@@ -5108,6 +5714,8 @@ mod tests {
                     })
                     .collect(),
                 committed: array.is_committed(),
+                locally_assigned: array.is_locally_assigned(),
+                owned_by_session: std::ptr::eq(array.client(), session.client()),
             }
         };
         let observe_derivative = |array: &Array| {
@@ -5173,6 +5781,20 @@ mod tests {
             "caller with a while loop",
         ];
         let derivative_columns = ["eager JVP tangent", "eager VJP cotangent", "compiled gradient"];
+        let eager_columns = [
+            "eager call",
+            "interpretation of the staged caller",
+            "nested interpretation",
+            "partial evaluation with a known input",
+            "partial evaluation with an unknown input",
+            "eager JVP",
+            "eager VJP",
+        ];
+        let runs_where_its_arguments_are = [
+            "committed capture of an uncommitted input",
+            "closed-over committed constant",
+            "placement whose result the caller drops",
+        ];
 
         let mut outcomes = Vec::new();
         for row in &rows {
@@ -5180,15 +5802,6 @@ mod tests {
             let executed = callee.execute(&session, row.input.clone()).unwrap();
             let expected = observe(&executed, false);
 
-            // Each row requests placement through either the callee or a public argument on a shared mesh, except for
-            // the rows of an uncommitted input and a callee that names no devices, whose eager call runs where this
-            // process chose to put the input, while a direct execution runs on the devices that the callee was
-            // compiled for.
-            let chosen_locally = ["committed capture of an uncommitted input", "closed-over committed constant"];
-            assert_eq!(
-                callee.call(row.input.clone()).map(|output| output.is_locally_assigned()),
-                Ok(executed.is_locally_assigned() || chosen_locally.contains(&row.name)),
-            );
             // The staged caller takes the captures of the callee as leading inputs, which its call receives first.
             let staged: StagedFunction<ArrayType, ArrayType> =
                 stage(|x| callee.call(x).unwrap(), row.input_type.clone(), Options::new(row.caller_mesh.clone()))
@@ -5354,10 +5967,31 @@ mod tests {
                 .map_err(|error| error.to_string()),
             ];
             for (column, observation) in columns.iter().zip(observations) {
+                // A call of a callee that names no devices runs where its arguments are (registered as "A call of a
+                // compiled function runs where its caller runs unless the function names devices"), so where an entry
+                // point runs it eagerly on an uncommitted argument, this process alone chose its devices, while an
+                // execution and every compiled caller run on devices that a mesh named.
+                let expected = Observation {
+                    locally_assigned: expected.locally_assigned
+                        || (runs_where_its_arguments_are.contains(&row.name) && eager_columns.contains(column)),
+                    ..expected.clone()
+                };
                 let outcome = match observation {
                     Ok(observation) if observation == expected => "agrees".to_string(),
                     Ok(observation)
-                        if (&observation.devices, observation.committed) == (&expected.devices, expected.committed) =>
+                        if (
+                            &observation.devices,
+                            &observation.memory,
+                            observation.committed,
+                            observation.locally_assigned,
+                            observation.owned_by_session,
+                        ) == (
+                            &expected.devices,
+                            &expected.memory,
+                            expected.committed,
+                            expected.locally_assigned,
+                            expected.owned_by_session,
+                        ) =>
                     {
                         format!("is placed as `{}` instead of `{}`", observation.sharding, expected.sharding)
                     }
@@ -5702,6 +6336,326 @@ mod tests {
             observe(&caller.executable().execute(&session, split_input.clone()).unwrap(), false),
             observe(&replicated_callee.executable().execute(&session, split_input).unwrap(), false),
         );
+
+        // Rows of a callee with two arguments, the sibling of each of which can decide where the other runs, whether
+        // the results are committed, and whether the call is admitted at all, which the types of the arguments do not
+        // record. Every entry point that runs the call on the arguments themselves agrees with an execution of the
+        // callee, which rejects arguments committed to different devices and arguments of another client, including
+        // partial evaluation, which may forward an argument through the call only where the call provably returns it
+        // unchanged (refer to `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
+        let pair_type =
+            vector_type.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 1)).unwrap();
+        let pair_callee: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compile(|pair| pair, (pair_type.clone(), pair_type.clone()), &session, second_canonical_mesh.clone())
+                .unwrap();
+        let other_session = Session::builder().client(other_cpu_client(3)).build().unwrap();
+        let pair_upload = |session: &Session, mesh: Option<&DeviceMesh>| {
+            Array::from_host_buffer(session, pair_type.clone(), mesh.cloned(), None, values_to_bytes(&values)).unwrap()
+        };
+        let pair_rows = [
+            (
+                "uncommitted and committed arguments",
+                pair_upload(&session, None),
+                pair_upload(&session, Some(&second_canonical_mesh)),
+            ),
+            (
+                "arguments committed to different devices",
+                pair_upload(&session, Some(&first_canonical_mesh)),
+                pair_upload(&session, Some(&second_canonical_mesh)),
+            ),
+            ("argument of another client", pair_upload(&other_session, None), pair_upload(&session, None)),
+        ];
+        let pair_columns = [
+            "eager call",
+            "interpretation of the staged caller",
+            "nested interpretation",
+            "partial evaluation with known inputs",
+        ];
+        let observe_pair = |outputs: Result<Vec<Value>, String>| {
+            outputs.and_then(|outputs| outputs.into_iter().map(observe_value).collect::<Result<Vec<_>, _>>())
+        };
+        let mut pair_outcomes = Vec::new();
+        for (name, first, second) in &pair_rows {
+            let expected = pair_callee
+                .executable()
+                .execute(&session, (first.clone(), second.clone()))
+                .map(|(first, second)| vec![observe(&first, false), observe(&second, false)])
+                .map_err(|error| error.to_string());
+            let staged: StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = stage(
+                |pair| pair_callee.call(pair).unwrap(),
+                (pair_type.clone(), pair_type.clone()),
+                Options::new(second_canonical_mesh.clone()),
+            )
+            .unwrap();
+            let program = staged.source_program().to_program_with_lifted_captures().unwrap();
+            let inputs = vec![Value::Array(first.clone()), Value::Array(second.clone())];
+            let call = program
+                .instructions()
+                .iter()
+                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .unwrap();
+            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let call_callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
+            let call_regions = AttachedRegions::Callees(std::slice::from_ref(&call_callee));
+            let observations = [
+                pair_callee
+                    .call((first.clone(), second.clone()))
+                    .map(|(first, second)| vec![Value::Array(first), Value::Array(second)])
+                    .map_err(|error| error.to_string()),
+                program.interpret_in_context(&session, inputs.clone()).map_err(|error| error.to_string()),
+                operation
+                    .interpret(&session, &EagerInterpretationDriver::new(&call_regions), &inputs)
+                    .map_err(|error| error.to_string()),
+                program
+                    .partition_with_residual_policy(&[true, true], &ResidualPolicyReference::new(NothingSavable))
+                    .and_then(|partition| partition.known_program().interpret_in_context(&session, inputs.clone()))
+                    .map_err(|error| error.to_string()),
+            ]
+            .map(observe_pair);
+            for (column, observation) in pair_columns.iter().zip(observations) {
+                let outcome = match (&observation, &expected) {
+                    (Ok(observation), Ok(expected)) if observation == expected => "agrees".to_string(),
+                    (Err(_), Err(_)) => "agrees".to_string(),
+                    _ => format!("disagrees with {expected:?} as {observation:?}"),
+                };
+                pair_outcomes.push(format!("{name}, {column}: {outcome}"));
+            }
+        }
+        let expected_pair_outcomes = pair_rows
+            .iter()
+            .flat_map(|(name, _, _)| pair_columns.iter().map(move |column| format!("{name}, {column}: agrees")))
+            .collect::<Vec<_>>();
+        assert_eq!(pair_outcomes.join("\n"), expected_pair_outcomes.join("\n"));
+
+        // Rows of an argument that an execution of the callee rejects, because it carries a pending reduction that the
+        // boundary of the callee cannot receive, which is a pending sum over an auto mesh axis, which no type records,
+        // or one over an explicit mesh axis that the callee input type does not declare. Every entry point that applies
+        // the call to that argument rejects it too, including those that never run the executable of the callee (i.e.,
+        // the replay of the callee, partial evaluation, which may forward the argument through the call, a `jit` caller,
+        // which is specialized for the argument, and the interpretation of a caller that drops the result of the call),
+        // because a call admits its arguments before, and independently of, any decision to move one of them (refer to
+        // `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
+        let pending_sum = |mesh: &DeviceMesh| {
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+            let r#type = vector_type.clone().with_sharding(sharding.without_auto_axes()).unwrap();
+            let shards = mesh.devices().iter().map(|device| (device.id(), Arc::<[u8]>::from(values_to_bytes(&values))));
+            let input =
+                Array::from_host_shards(&session, r#type.clone(), mesh.clone(), Some(sharding), shards).unwrap();
+            (r#type, input)
+        };
+        let single_auto_mesh = single_device_mesh(devices[0], MeshAxisType::Auto);
+        let rejected_row = |name, callee, (input_type, input), caller_mesh: &DeviceMesh| Row {
+            name,
+            input_type,
+            callee,
+            input,
+            caller_mesh: caller_mesh.clone(),
+        };
+        let rejected_rows = [
+            rejected_row(
+                "argument unreduced over an auto axis",
+                compiled(&vector_type, Options::new(mesh.clone())),
+                pending_sum(&mesh),
+                &mesh,
+            ),
+            rejected_row(
+                "dispatcher argument unreduced over an auto axis",
+                Callee::Dispatcher(jit_with_options(identity, &session, Options::new(mesh.clone()))),
+                pending_sum(&mesh),
+                &mesh,
+            ),
+            rejected_row(
+                "argument unreduced over an auto axis of one device",
+                compiled(&vector_type, Options::new(single_auto_mesh.clone())),
+                pending_sum(&single_auto_mesh),
+                &single_auto_mesh,
+            ),
+            rejected_row(
+                "dispatcher argument unreduced over an auto axis of one device",
+                Callee::Dispatcher(jit_with_options(identity, &session, Options::new(single_auto_mesh.clone()))),
+                pending_sum(&single_auto_mesh),
+                &single_auto_mesh,
+            ),
+            rejected_row(
+                "argument unreduced over an explicit axis that the callee does not declare",
+                compiled(&vector_type, Options::new(explicit_mesh.clone())),
+                pending_sum(&explicit_mesh),
+                &explicit_mesh,
+            ),
+            rejected_row(
+                "dispatcher argument unreduced over an explicit axis that the callee does not declare",
+                Callee::Dispatcher(jit_with_options(
+                    identity,
+                    &session,
+                    Options::new(explicit_mesh.clone()).with_input_shardings(vec![explicit_replicated.clone()]),
+                )),
+                pending_sum(&explicit_mesh),
+                &explicit_mesh,
+            ),
+        ];
+        let rejected_columns = [
+            "eager call",
+            "nested call",
+            "interpretation of the staged caller",
+            "nested interpretation",
+            "partial evaluation with a known input",
+            "partial evaluation with an unknown input",
+            "eager JVP",
+            "eager VJP",
+            "`jit` caller",
+            "interpretation of a caller that drops the result",
+        ];
+        let mut rejected_outcomes = Vec::new();
+        for row in &rejected_rows {
+            let callee = &row.callee;
+            let expected = callee.execute(&session, row.input.clone()).map(|output| observe(&output, false));
+            let staged = |drops_result: bool| {
+                stage_with_flat_captures(
+                    |_, _, x: CompileTracer| {
+                        let output = callee.call(x.clone())?;
+                        Ok(if drops_result { x } else { output })
+                    },
+                    Vec::new(),
+                    row.input_type.clone(),
+                    Options::new(row.caller_mesh.clone()),
+                )
+            };
+            // The staged caller, with the captures of the callee as leading inputs, and its inputs.
+            let lifted = |drops_result: bool| {
+                staged(drops_result).and_then(|caller: StagedFunction<ArrayType, ArrayType>| {
+                    let program = caller.source_program().to_program_with_lifted_captures()?;
+                    let mut inputs = caller.source_program().captures().to_vec();
+                    inputs.push(Value::Array(row.input.clone()));
+                    Ok((program, inputs))
+                })
+            };
+            let partially_evaluated = |input_known: bool| {
+                let (program, inputs) = lifted(false).map_err(|error| error.to_string())?;
+                let mut known = vec![true; inputs.len()];
+                known[inputs.len() - 1] = input_known;
+                program
+                    .partition_with_residual_policy(&known, &ResidualPolicyReference::new(NothingSavable))
+                    .and_then(|partition| evaluate_partition(partition, &inputs))
+                    .map_err(|error| error.to_string())
+                    .and_then(observe_value)
+            };
+            let interpreted = |drops_result: bool| {
+                let (program, inputs) = lifted(drops_result).map_err(|error| error.to_string())?;
+                program
+                    .interpret_in_context(&session, inputs)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut outputs| observe_value(outputs.remove(0)))
+            };
+            let replayed = || {
+                let (program, inputs) = lifted(false).map_err(|error| error.to_string())?;
+                let call = program
+                    .instructions()
+                    .iter()
+                    .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                    .unwrap();
+                let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+                let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
+                operation
+                    .interpret(&session, &EagerInterpretationDriver::new(&AttachedRegions::Callees(&[callee])), &inputs)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut outputs| observe_value(outputs.remove(0)))
+            };
+            let caller: CompiledFunctionDispatcher<_, (), ArrayType, ArrayType> =
+                jit(|(), x: CompileTracer| Ok::<_, Error>(callee.call(x)?), &session, row.caller_mesh.clone());
+            let observations: [Result<Observation, String>; 10] = [
+                callee
+                    .call(row.input.clone())
+                    .map(|output| observe(&output, false))
+                    .map_err(|error| error.to_string()),
+                staged(false)
+                    .and_then(|caller| session.compile_staged_function(caller))
+                    .and_then(|caller| caller.executable().execute(&session, row.input.clone()))
+                    .map(|output| observe(&output, false))
+                    .map_err(|error| error.to_string()),
+                interpreted(false),
+                replayed(),
+                partially_evaluated(true),
+                partially_evaluated(false),
+                session
+                    .differentiate_at(Value::Array(row.input.clone()))
+                    .jvp(Value::Array(row.input.clone()), |x| {
+                        Ok(callee.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value())
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|(output, _)| observe_value(output)),
+                session
+                    .differentiate_at(Value::Array(row.input.clone()))
+                    .vjp(|x| Ok(callee.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+                    .map_err(|error| error.to_string())
+                    .and_then(|(output, _)| observe_value(output)),
+                caller
+                    .execute((), row.input.clone())
+                    .map(|output| observe(&output, false))
+                    .map_err(|error| error.to_string()),
+                interpreted(true),
+            ];
+            for (column, observation) in rejected_columns.iter().zip(observations) {
+                let outcome = match (&observation, &expected) {
+                    (Ok(observation), Ok(expected)) if observation == expected => "agrees".to_string(),
+                    (Err(_), Err(_)) => "agrees".to_string(),
+                    (Ok(observation), Err(_)) if observation == &observe(&row.input, false) => {
+                        "accepts the argument".to_string()
+                    }
+                    _ => format!("disagrees with {expected:?} as {observation:?}"),
+                };
+                rejected_outcomes.push(format!("{}, {column}: {outcome}", row.name));
+            }
+            // Every row is an argument that an execution rejects.
+            assert!(expected.is_err(), "{}", row.name);
+        }
+        // A caller whose result does not depend on the call never applies it, so the interpretation of such a caller
+        // returns its argument as an execution of the caller does without the call (registered as "A program applies
+        // only the calls that its results depend on"). An argument whose type records the pending reduction is
+        // rejected by the type rule of the call when the caller is staged.
+        let dropped = |row: &str, column: &str| {
+            column == "interpretation of a caller that drops the result" && row.contains("unreduced over an auto axis")
+        };
+        let expected_rejected_outcomes = rejected_rows
+            .iter()
+            .flat_map(|row| {
+                rejected_columns.iter().map(move |column| match dropped(row.name, column) {
+                    true => format!("{}, {column}: accepts the argument", row.name),
+                    false => format!("{}, {column}: agrees", row.name),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejected_outcomes.join("\n"), expected_rejected_outcomes.join("\n"));
+
+        // An eager operation with regions whose regions or whose committed capture select devices that a placement
+        // names gives its result the facts of a direct placement onto those devices, including that this process did
+        // not choose them alone, so that a later transfer to another process is planned as a shared transfer (refer to
+        // `Session::assigns_placement_locally`).
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let scalar = Array::from_host_buffer(&session, scalar_type, None, None, 7f32.to_ne_bytes()).unwrap();
+        let true_predicate = Array::from_host_buffer(&session, predicate_type.clone(), None, None, [1u8]).unwrap();
+        let direct = scalar.place(&second_device, None).unwrap();
+        let conditional = Value::Array(true_predicate)
+            .condition(
+                |value| value.place(&second_device, None),
+                |value| value.place(&second_device, None),
+                Value::Array(scalar.clone()),
+            )
+            .unwrap();
+        let captured = direct.clone();
+        let doubled = rematerialize(|input: Tracer<TracingContext<Constant, Operation>>| {
+            let captured =
+                ImportingContext::<Session, ThroughSession>::import(input.context(), Value::Array(captured.clone()))?;
+            let sum = ValueProjection::<ArrayType>::into_projected(input)? + ValueProjection::into_projected(captured)?;
+            Ok(sum.into_value())
+        })
+        .call(Value::Array(scalar))
+        .unwrap();
+        let facts = |array: &Array| {
+            let observation = observe(array, false);
+            (observation.devices, observation.committed, observation.locally_assigned, observation.owned_by_session)
+        };
+        assert_eq!(facts(&ValueProjection::<ArrayType>::into_projected(conditional).unwrap()), facts(&direct));
+        assert_eq!(facts(&ValueProjection::<ArrayType>::into_projected(doubled).unwrap()), facts(&direct));
     }
 
     #[test]
@@ -6392,7 +7346,8 @@ mod tests {
         )
         .unwrap();
         // The gradient of the caller constrains the input to the boundary of its call of the function as well, which
-        // is replicated too. Neither gradient constrains the residual `%5` (respectively `%6`).
+        // is replicated too. Neither gradient constrains the residual `%3` (respectively `%4`), and neither lowers the
+        // primal output of the function that differentiation drops (refer to `pruned_program`).
         let direct = indoc! {r#"
             module {
               sdy.mesh @mesh = <["x"=2]>
@@ -6401,15 +7356,12 @@ mod tests {
                 %0 = sdy.sharding_constraint %cst <@mesh, []> : tensor<f32>
                 %1 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
                 %2 = sdy.sharding_constraint %1 <@mesh, [{"x"}]> : tensor<4xf32>
-                %3 = stablehlo.sine %2 : tensor<4xf32>
-                %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %4 = stablehlo.reduce(%3 init: %cst_0) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
-                %5 = stablehlo.cosine %2 : tensor<4xf32>
-                %6 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                %7 = stablehlo.multiply %5, %6 : tensor<4xf32>
-                %8 = sdy.sharding_constraint %7 <@mesh, [{"x"}]> : tensor<4xf32>
-                %9 = stablehlo.broadcast_in_dim %8, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
-                return %9 : tensor<4xf32>
+                %3 = stablehlo.cosine %2 : tensor<4xf32>
+                %4 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                %5 = stablehlo.multiply %3, %4 : tensor<4xf32>
+                %6 = sdy.sharding_constraint %5 <@mesh, [{"x"}]> : tensor<4xf32>
+                %7 = stablehlo.broadcast_in_dim %6, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
+                return %7 : tensor<4xf32>
               }
             }
         "#};
@@ -6422,15 +7374,12 @@ mod tests {
                 %1 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
                 %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<4xf32>
                 %3 = sdy.sharding_constraint %2 <@mesh, [{"x"}]> : tensor<4xf32>
-                %4 = stablehlo.sine %3 : tensor<4xf32>
-                %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %5 = stablehlo.reduce(%4 init: %cst_0) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
-                %6 = stablehlo.cosine %3 : tensor<4xf32>
-                %7 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                %8 = stablehlo.multiply %6, %7 : tensor<4xf32>
-                %9 = sdy.sharding_constraint %8 <@mesh, [{"x"}]> : tensor<4xf32>
-                %10 = stablehlo.broadcast_in_dim %9, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
-                return %10 : tensor<4xf32>
+                %4 = stablehlo.cosine %3 : tensor<4xf32>
+                %5 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                %6 = stablehlo.multiply %4, %5 : tensor<4xf32>
+                %7 = sdy.sharding_constraint %6 <@mesh, [{"x"}]> : tensor<4xf32>
+                %8 = stablehlo.broadcast_in_dim %7, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
+                return %8 : tensor<4xf32>
               }
             }
         "#};
@@ -7050,7 +7999,7 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:bool[][sharding={mesh<['x'=1:auto]>, []}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:bool[][sharding={mesh<['x'=1:auto]>, []}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = neg %1
@@ -7070,7 +8019,7 @@ mod tests {
                             in (%4, %3, %5)
                         },
                     ]
-                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %7 [
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:bool[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %1 %0 %2 [
@@ -7170,7 +8119,7 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:dimension<extent ∈ [1, 5)> = jit_call %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:dimension<extent ∈ [1, 5)> = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
@@ -7184,7 +8133,7 @@ mod tests {
                             in (%3, %2)
                         },
                     ]
-                    %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 [
+                    %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %4 %6 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<extent ∈ [1, 5)> .
                             let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, iteration_count=extent, reverse=true] %0 %1 [
@@ -7245,10 +8194,10 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                            let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}], %4:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                            let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}], %4:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                                 callee={
                                     lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                     let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = mul %0 %0
@@ -7259,10 +8208,10 @@ mod tests {
                             in (%3, %4, %5)
                         },
                     ]
-                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %4 %6 %7 [
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 %2 [
+                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                                 callee={
                                     lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                     let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %2 %0
@@ -7399,7 +8348,7 @@ mod tests {
         .unwrap();
         let gradient: CompiledFunction<ArrayType, ArrayType> = inner.gradient(&engine).unwrap();
 
-        assert_eq!(gradient.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&gradient), (0, 1));
 
         let input = Array::from_host_buffer(&engine, input_type, mesh, None, values_to_bytes::<f32>(&[3.0]).as_slice())
             .unwrap();
@@ -7544,7 +8493,7 @@ mod tests {
             jvp_compiled.source_program().program().to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = sin %0
@@ -7640,7 +8589,7 @@ mod tests {
         let jvp_compiled: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             inner.jvp(&engine).unwrap();
 
-        assert_eq!(jvp_compiled.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&jvp_compiled), (0, 1));
 
         let primal = Array::from_host_buffer(
             &engine,
@@ -7871,7 +8820,7 @@ mod tests {
                 BatchAxisSpecification::default().with_extent(3),
             )
             .unwrap();
-        assert_eq!(batched.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&batched), (0, 1));
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 2]).with_sharding(replicated(2)).unwrap();
         let output = batched
             .executable()
@@ -7934,18 +8883,24 @@ mod tests {
         let uncompiled = ValueProjection::<ArrayType>::into_projected(uncompiled).unwrap();
 
         // The requested placement splits the batch items across `x`, exactly like uncompiled batching of an input
-        // whose batch dimension is sharded along `x`. A replicated input or output override of the function places
-        // each batch item as its replicated type does and says nothing about the batch dimension, so it changes
-        // nothing.
+        // whose batch dimension is sharded along `x`, whether or not the item type records a sharding, because an item
+        // type without one is first refined by the placement with which the function receives it, as the batching rule
+        // of a call refines it (refer to `boundary_input_type`), and as JAX splits the batch of
+        // `jit(vmap(jit(sin), spmd_axis_name='x'))`. A replicated input or output override of the function places each
+        // batch item as its replicated type does and says nothing about the batch dimension, so it changes nothing.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let options = Options::new(mesh.clone());
-        for options in [
-            options.clone(),
-            options.clone().with_output_shardings(vec![replicated.clone()]),
-            options.with_input_shardings(vec![replicated]),
-        ] {
+        let item_types = [vector_type.clone(), ArrayType::new_static(DataType::F32, [3])];
+        for (item_type, options) in item_types.iter().flat_map(|item_type| {
+            [
+                options.clone(),
+                options.clone().with_output_shardings(vec![replicated.clone()]),
+                options.clone().with_input_shardings(vec![replicated.clone()]),
+            ]
+            .map(|options| (item_type.clone(), options))
+        }) {
             let function: CompiledFunction<ArrayType, ArrayType> =
-                compile_with_options(|x| x.sin().unwrap(), vector_type.clone(), &engine, options).unwrap();
+                compile_with_options(|x| x.sin().unwrap(), item_type, &engine, options).unwrap();
             let batched = function
                 .batch(
                     &engine,
@@ -7959,6 +8914,97 @@ mod tests {
             assert_eq!(executed.r#type(), uncompiled.r#type());
             assert_eq!(read_sharded_f32_array(&executed), read_sharded_f32_array(&uncompiled));
         }
+    }
+
+    #[test]
+    fn test_compiled_function_batch_rejects_invalid_batch_shardings() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let item_type = ArrayType::new_static(DataType::F32, [4]);
+        let batch_type = ArrayType::new_static(DataType::F32, [2, 4]);
+        let batch_axis =
+            |sharding: ShardingDimension| BatchAxisSpecification::default().with_extent(2).with_sharding(sharding);
+        let batched = |function: &CompiledFunction<ArrayType, ArrayType>, sharding: ShardingDimension| {
+            function
+                .batch(&session, BatchAxis::new(0), BatchAxis::new(0), batch_axis(sharding))
+                .and_then(|batched| batched.input_signature())
+                .map_err(|error| error.to_string())
+        };
+
+        // A batch placement that names a mesh axis that the mesh of the function does not have, or one that the placement of
+        // each item already uses, is invalid whatever the item type records, so it is rejected whether the function
+        // infers the boundary of its input or states it as an override, as `Sharding::batched` rejects it for an item
+        // type that records a sharding.
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let options = Options::new(mesh.clone());
+        for options in [
+            options.clone(),
+            options.clone().with_output_shardings(vec![replicated.clone()]),
+            options.clone().with_input_shardings(vec![replicated.clone()]),
+        ] {
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile_with_options(|x| x.place(&Memory::Device, None).unwrap(), item_type.clone(), &session, options)
+                    .unwrap();
+            assert_eq!(
+                batched(&function, ShardingDimension::sharded(["missing"])),
+                Err("unknown mesh axis name: `missing`".to_string()),
+            );
+            assert_eq!(
+                batched(&function, ShardingDimension::sharded(["x", "x"])),
+                Err("mesh axis name `x` appears more than once".to_string()),
+            );
+        }
+        let function: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
+            |x| x.place(&Memory::Device, None).unwrap(),
+            item_type.clone(),
+            &session,
+            Options::new(mesh.clone()).with_input_shardings(vec![split.clone()]),
+        )
+        .unwrap();
+        assert_eq!(
+            batched(&function, ShardingDimension::sharded(["x"])),
+            Err("mesh axis name `x` appears more than once".to_string()),
+        );
+
+        // The batching rule of a call of the function shares the rule, so it rejects a batch that the placement of
+        // each item already splits along the same axis instead of dropping the boundary of the call.
+        let batch_split = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let caller = stage_with_flat_captures(
+            |_, _, x: CompileTracer| {
+                let output = batch(
+                    |x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()),
+                    x.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default(),
+                )
+                .map_err(ProgramError::from)?;
+                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
+            },
+            Vec::new(),
+            batch_type.clone().with_sharding(batch_split).unwrap(),
+            Options::new(mesh.clone()),
+        );
+        assert_eq!(
+            caller.map(|_: StagedFunction<ArrayType, ArrayType>| ()).map_err(|error| error.to_string()),
+            Err("mesh axis name `x` appears more than once".to_string()),
+        );
+
+        // A placement along an auto mesh axis is valid, but no type can record it, so the item type is left as it is.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let function: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x| x.place(&Memory::Device, None).unwrap(), item_type.clone(), &session, mesh.clone()).unwrap();
+        assert_eq!(batched(&function, ShardingDimension::sharded(["x"])), Ok(batch_type));
+        assert_eq!(
+            batched(&function, ShardingDimension::sharded(["missing"])),
+            Err("unknown mesh axis name: `missing`".to_string()),
+        );
     }
 
     #[test]
@@ -8070,12 +9116,13 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        assert_eq!(compiled.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&compiled), (0, 1));
         assert_eq!(
             compiled.source_program().to_program_with_lifted_captures().unwrap().to_string(),
             indoc! {"
-                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}] .
-                let %2:f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}] = broadcast [output_type=f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}], output_axes=[]] %0
+                lambda %0:f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}] .
+                let %1:f32[] = const session:f32[]
+                    %2:f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}] = broadcast [output_type=f32[2, 3][sharding={mesh<['x'=1:auto]>, [{}, {}]}], output_axes=[]] %1
                 in (%2)"},
         );
         let input =
@@ -8941,7 +9988,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(jvp_compiled.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&jvp_compiled), (0, 1));
 
         let primal = Array::from_host_buffer(
             &engine,
@@ -9237,12 +10284,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(compiled.source_program().captures().len(), 1);
+        assert_eq!(captured_arrays(&compiled), (0, 1));
         assert_eq!(
             compiled.source_program().to_program_with_lifted_captures().unwrap().to_string(),
             indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] .
-                let %2:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] = add %1 %0
+                lambda %0:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] .
+                let %1:f32[4] = const session:f32[4]
+                    %2:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] = add %0 %1
                 in (%2)"},
         );
 

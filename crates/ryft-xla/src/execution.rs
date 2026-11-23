@@ -66,15 +66,17 @@ pub enum ExecutionError {
 
     #[error(
         "public argument #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
-         because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, or place \
-         it over explicit mesh axes, before passing it to a compiled function"
+         because a staged type does not record a pending reduction over auto mesh axes; reduce the argument (e.g., \
+         with `Array::to_placement` onto a sharding without unreduced axes), or place it over explicit mesh axes, \
+         before passing it to a compiled function or an eager operation"
     )]
     UnreducedAutoAxisArgument { index: usize, axes: Vec<String> },
 
     #[error(
         "captured array #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
-         because a staged type does not record a pending reduction over auto mesh axes; reduce the array, or place it \
-         over explicit mesh axes, before a compiled function captures it"
+         because a staged type does not record a pending reduction over auto mesh axes; reduce the array (e.g., with \
+         `Array::to_placement` onto a sharding without unreduced axes), or place it over explicit mesh axes, before \
+         a compiled function or an eager operation captures it"
     )]
     UnreducedAutoAxisCapture { index: usize, axes: Vec<String> },
 
@@ -532,8 +534,8 @@ impl Session {
         // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
         // carry final reference states are returned verbatim.
         let mut resources = Some(self.prepare_execution_resources(program)?);
-        let committed = inputs.iter().skip(program.capture_count()).any(Array::is_committed);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
+        let committed = prepared.committed;
         let (arguments, input_fences, input_refinements, physical_output_count) = prepared.into_arguments()?;
         let execution =
             self.execute_pjrt_buffers(program, arguments, input_fences, physical_output_count, &mut resources, |_| {})?;
@@ -637,18 +639,12 @@ impl Session {
                 actual: inputs.len(),
             }));
         }
-        // The buffers of an array of another client must never reach PJRT, and nothing else tells them apart, because two
-        // clients can number their devices alike, so that the mesh, the sharding, and the layout of such an array can
-        // match the executable's. Check every input, captures included, before anything observes, erases, converts, or
-        // donates it. The session owns the program (refer to `Self::validate_program_owner`).
-        if let Some(index) = inputs.iter().position(|input| !std::ptr::eq(input.client(), self.client())) {
-            let capture_count = program.capture_count();
-            return Err(Error::Execution(if index < capture_count {
-                ExecutionError::CaptureClientMismatch { index }
-            } else {
-                ExecutionError::ArgumentClientMismatch { index: index - capture_count }
-            }));
-        }
+        // Check every input, captures included, before anything observes, erases, converts, or donates it. The session
+        // owns the program (refer to `Self::validate_program_owner`).
+        validate_input_clients(self, inputs.iter().map(Some), program.capture_count())?;
+        // Outputs are committed when a public argument is (refer to `Self::reconstruct_compiled_outputs`), which is
+        // decided here, once, for every execution path.
+        let committed = inputs.iter().skip(program.capture_count()).any(Array::is_committed);
         let plan = program.plan();
 
         // Static input types establish no refinements, so refining them reduces to comparing every component except
@@ -807,6 +803,7 @@ impl Session {
             donation_flags,
             input_refinements,
             physical_output_count: program.signature().array_output_count(),
+            committed,
         })
     }
 
@@ -997,9 +994,9 @@ impl Session {
                     .map(ValueProjection::<ArrayType>::into_projected)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(ProgramError::from)?;
-                committed = arrays.iter().skip(program.capture_count()).any(Array::is_committed);
                 let prepared_execution =
                     self.prepare_compiled_execution(program, arrays, donation_overrides.as_slice())?;
+                committed = prepared_execution.committed;
 
                 let guards = bindings
                     .iter()
@@ -1723,6 +1720,25 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
     Ok(devices)
 }
 
+/// Checks that every array among `inputs`, whose first `capture_count` positions are captures, belongs to the PJRT
+/// client of `session`, where [`None`] marks an input that is not an array. The buffers of an array of another client
+/// must never reach PJRT, and nothing else tells them apart, because two clients can number their devices alike, so
+/// that the mesh, the sharding, and the layout of such an array can match those that a call expects. This is the client
+/// admission of every call boundary: of an execution (refer to `Session::prepare_compiled_execution`) and of an eager
+/// call or its region replay (refer to `JitCallOperation::eager_decision`), so that they reject such an array alike.
+pub(crate) fn validate_input_clients<'a>(
+    session: &Session,
+    inputs: impl IntoIterator<Item = Option<&'a Array>>,
+    capture_count: usize,
+) -> Result<(), ExecutionError> {
+    let foreign = |input: Option<&Array>| input.is_some_and(|input| !std::ptr::eq(input.client(), session.client()));
+    match inputs.into_iter().position(foreign) {
+        Some(index) if index < capture_count => Err(ExecutionError::CaptureClientMismatch { index }),
+        Some(index) => Err(ExecutionError::ArgumentClientMismatch { index: index - capture_count }),
+        None => Ok(()),
+    }
+}
+
 /// Checks the commitment of a public argument against the physical devices of a fixed call boundary.
 /// The order identifies the device assigned to each partition. Logical mesh names and shardings can differ.
 pub(crate) fn validate_committed_input_devices(
@@ -1748,14 +1764,42 @@ pub(crate) fn validate_committed_input_devices(
 /// so an executable that was compiled for the type of such an input expects it reduced, and nothing could carry the
 /// reduction across its boundary. Such an input is rejected with [`ExecutionError::UnreducedAutoAxisArgument`] or
 /// [`ExecutionError::UnreducedAutoAxisCapture`] instead. An input without a pending reduction, which is the common
-/// case, costs one branch.
+/// case, costs one branch. Compilation applies the same rule to every array that a function captures, through
+/// [`validate_capture_reduction`].
 pub(crate) fn validate_input_reduction(
     input: &Array,
     expected: &Sharding,
     index: usize,
     capture_count: usize,
 ) -> Result<(), ExecutionError> {
-    let sharding = input.sharding();
+    validate_reduction(input.sharding(), expected, index, capture_count)
+}
+
+/// Validates that an array that a function captures (i.e., an explicit capture or the array of a session constant),
+/// whose runtime array is placed as `sharding`, can enter the executable of that function as its input at `index`,
+/// whose first `capture_count` inputs are captures, by the rule of [`validate_input_reduction`]. The executable
+/// receives a capture as it receives an argument without an input sharding override, which drops a pending reduction
+/// over auto mesh axes (refer to `receivable_argument_sharding` in `crate::compilation::domains`), so such a capture is
+/// rejected with [`ExecutionError::UnreducedAutoAxisCapture`], whatever the mesh of the function. Compilation applies
+/// it before it places a capture on the mesh of the function, because that placement would otherwise complete the
+/// reduction silently, as an execution never does for an argument.
+pub(crate) fn validate_capture_reduction(
+    sharding: &Sharding,
+    expected: &Sharding,
+    index: usize,
+    capture_count: usize,
+) -> Result<(), ExecutionError> {
+    validate_reduction(sharding, expected, index, capture_count)
+}
+
+/// Shared rule of [`validate_input_reduction`] and [`validate_capture_reduction`] for an input whose runtime array is
+/// placed as `sharding`.
+fn validate_reduction(
+    sharding: &Sharding,
+    expected: &Sharding,
+    index: usize,
+    capture_count: usize,
+) -> Result<(), ExecutionError> {
     if sharding.unreduced_axes().is_empty() {
         return Ok(());
     }
@@ -1850,6 +1894,9 @@ struct PreparedExecution {
 
     /// Physical result count expected from every addressable device.
     physical_output_count: usize,
+
+    /// Whether a public argument is committed, which commits every output of the execution.
+    committed: bool,
 }
 
 impl PreparedExecution {
@@ -1915,13 +1962,14 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
+        Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
         CompiledFunction, ConstrainSharding, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh,
         Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
         DynamicSliceOperation, Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis, MeshAxisType, Place,
         Placeholder, Placement, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation, ReferenceType, Shape,
-        ShardMapBoundary, Sharding, ShardingDimension, ShardingError, StagedFunction, StaticShape, TiledLayout, Typed,
+        ShardMapBoundary, Sharding, ShardingDimension, ShardingError, Sin, StagedFunction, StaticShape, TiledLayout,
+        Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -1940,6 +1988,7 @@ mod tests {
         Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET,
         Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions,
         RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully, compile_statefully_with_captures,
+        compile_with_captures,
     };
 
     use super::*;
@@ -2867,14 +2916,15 @@ mod tests {
         assert!(!execute(&lower(double, Options::new(mesh.clone()))));
 
         // A function that places its input as an override requests and one that places it as its runtime array is
-        // placed compile to the same executable, which the second one reuses from the cache, but only the first one
-        // requests the placement of its output explicitly.
+        // placed lower to the same module, but only the first one requests the placement of its output explicitly, so
+        // their compilation keys differ and neither reuses the program of the other from the cache, in either order.
         let requested = lower(double, Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]));
         let observed =
             lower(double, Options::new(mesh.clone()).with_input_placements(vec![Some(sharded.clone())].into()));
-        assert_eq!(
-            session.compilation_key(requested.lowered_program()).unwrap(),
-            session.compilation_key(observed.lowered_program()).unwrap(),
+        assert_eq!(requested.lowered_program().stable_hlo(), observed.lowered_program().stable_hlo());
+        assert!(
+            session.compilation_key(requested.lowered_program()).unwrap()
+                != session.compilation_key(observed.lowered_program()).unwrap(),
         );
         session.clear_cache();
         assert!(execute(&requested));
@@ -3504,8 +3554,8 @@ mod tests {
         }
 
         // Direct and asynchronous executions of a compiled function reject the argument the same way. An eager call runs
-        // in the session of its first argument, so the argument of the other client comes second, and the eager
-        // dispatch of the session rejects it before it reaches the execution.
+        // in the session of its first argument, so the argument of the other client comes second, and the placement
+        // decision of the call rejects it with the error of an execution before anything moves.
         let add = crate::compile::<_, (ArrayType, ArrayType), ArrayType>(
             |(left, right)| left + right,
             (scalar_type.clone(), scalar_type.clone()),
@@ -3528,11 +3578,7 @@ mod tests {
         );
         assert_eq!(
             add.call((local.clone(), foreign.clone())).unwrap_err(),
-            ProgramError::InvalidArgument {
-                message: "received incompatible devices for eager XLA execution: input #1 is owned by a different \
-                          PJRT client than this session's client"
-                    .to_string(),
-            },
+            ProgramError::InvalidArgument { message: second_error.to_string() },
         );
 
         // A stateful execution rejects a public argument of the other client before it binds its references, which
@@ -3734,12 +3780,84 @@ mod tests {
         let stateful_inputs = vec![reference.clone(), Value::Array(unreduced)];
         assert!(is_rejected(session.execute_statefully(&stateful, stateful_inputs).r#await().map(|_| ())));
         assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
-        assert_eq!(
-            ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["x".to_string()] }.to_string(),
-            "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
-             because a staged type does not record a pending reduction over auto mesh axes; reduce the argument, or \
-             place it over explicit mesh axes, before passing it to a compiled function",
-        );
+        let message = "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
+                       because a staged type does not record a pending reduction over auto mesh axes; reduce the \
+                       argument (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
+                       over explicit mesh axes, before passing it to a compiled function or an eager operation";
+        let error = ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["x".to_string()] };
+        assert_eq!(error.to_string(), message);
+
+        // An eager call moves its argument to the boundary of its callee before it compiles anything, and the same
+        // admission rule rejects it there.
+        assert!(matches!(
+            function.call(input(&replicated.clone().with_unreduced_axes(["x"]).unwrap())),
+            Err(ProgramError::InvalidArgument { message: actual }) if actual == message,
+        ));
+
+        // An eager operation receives its inputs placed as their runtime arrays are, but the types of the values that
+        // its program computes from them cannot record such a reduction either, so the same admission rule rejects
+        // such an input of every eager operation that compiles a program, whether the eager dispatch cache of the
+        // session already holds that program or not. A placement without a target compiles nothing and returns the
+        // value as it is, and a placement of the array onto a sharding without unreduced axes completes the reduction.
+        let unreduced = input(&replicated.clone().with_unreduced_axes(["x"]).unwrap());
+        for _ in 0..2 {
+            assert_eq!(
+                unreduced.clone().sin().map(|_| ()),
+                Err(ProgramError::InvalidArgument { message: message.to_string() }),
+            );
+        }
+        assert_eq!(unreduced.clone().place(&None::<Placement>, None).unwrap().sharding(), unreduced.sharding());
+        let placement = Placement::new(mesh.clone(), replicated.clone()).unwrap();
+        let reduced = unreduced.to_placement(&session, placement).unwrap();
+        assert_eq!(reduced.sharding(), &replicated);
+        assert_eq!(reduced.copy_to_host_bytes().unwrap(), 3f32.to_ne_bytes().to_vec());
+
+        // A captured array is admitted by the same rule as an argument, for a pending sum, maximum, or minimum alike,
+        // whether the function is compiled for the mesh of the array or for a mesh of another topology (here, one
+        // device), so that placing it on the mesh of the function never completes its reduction silently. Its
+        // placement is known when the function is compiled, so compilation rejects it. An argument in the same state is
+        // rejected by a function compiled for a mesh of another topology too, by a direct execution for its committed
+        // devices, which it checks first, and by an eager call, which runs on those devices, for its reduction.
+        let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
+        for kind in [UnreducedKind::Sum, UnreducedKind::Max, UnreducedKind::Min] {
+            let pending = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+            for function_mesh in [mesh.clone(), single_device_mesh.clone()] {
+                let compiled = compile_with_captures::<_, ArrayType, ArrayType>(
+                    |captures: Vec<CompileTracer>, x: CompileTracer| x.add(&captures[0]).unwrap(),
+                    vec![input(&pending)],
+                    scalar_type.clone(),
+                    &session,
+                    function_mesh.clone(),
+                );
+                assert!(
+                    matches!(
+                        compiled,
+                        Err(Error::Execution(ExecutionError::UnreducedAutoAxisCapture { index: 0, ref axes }))
+                            if *axes == vec!["x".to_string()],
+                    ),
+                    "{kind:?} on {:?}: {:?}",
+                    function_mesh.logical_mesh(),
+                    compiled.map(|_| ()),
+                );
+            }
+        }
+        let other_topology = crate::compile::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| x.place(&None::<Placement>, None).unwrap(),
+            scalar_type.clone(),
+            &session,
+            single_device_mesh,
+        )
+        .unwrap();
+        let unreduced = input(&replicated.clone().with_unreduced_axes(["x"]).unwrap());
+        assert!(matches!(
+            other_topology.executable().execute(&session, unreduced.clone()),
+            Err(Error::Execution(ExecutionError::CommittedInputDeviceMismatch { index: 0, ref actual, ref expected }))
+                if *actual == vec![0, 1] && *expected == vec![0],
+        ));
+        assert!(matches!(
+            other_topology.call(unreduced),
+            Err(ProgramError::InvalidArgument { message: actual }) if actual == message,
+        ));
 
         // A value that is reduced along the auto axis is replicated along it, which is what the executable expects.
         let reduced = input(&replicated.with_reduced_axes(["x"]).unwrap());

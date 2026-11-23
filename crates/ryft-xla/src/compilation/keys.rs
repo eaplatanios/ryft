@@ -75,7 +75,8 @@ impl DispatchKey {
 /// unrelated call sites happen to share the same input signature.
 ///
 /// Dynamic dimensions are numbered by first occurrence, so diagnostic variable names do not affect identity.
-/// Compilation options, shardings, target facts, runtime requirements, and effect metadata remain part of the key.
+/// Compilation options, shardings, the outputs that executions commit, target facts, runtime requirements, and effect
+/// metadata remain part of the key.
 /// This complete compilation identity is distinct from a [`DispatchKey`], which selects a retained specialization.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompilationKey {
@@ -120,6 +121,7 @@ impl LoweredProgram {
                 .map(PersistentSharding::from)
                 .collect(),
             output_shardings: self.output_shardings().iter().map(PersistentSharding::from).collect(),
+            committed_outputs: self.committed_outputs(),
             mesh: PersistentDeviceMesh::from(self.mesh()),
             device_kinds: self.device_kinds(),
             kernel_execution_facts: self.kernel_execution_facts(),
@@ -558,6 +560,11 @@ struct PersistentKey<'o> {
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
 
+    /// Whether executions commit each logical output whatever the commitment of their inputs, which lowerings of the
+    /// same module can differ in (e.g., the identity and a placement onto the memory that a device array is already
+    /// in, which lowers to nothing but commits the result).
+    committed_outputs: &'o [bool],
+
     /// Concrete compilation and execution mesh.
     mesh: PersistentDeviceMesh,
 
@@ -768,10 +775,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer, Compile,
-        CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation, DataType,
+        CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation, DataType, Device,
         Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, Placeholder, ReduceOperation, ReductionKind, ReferenceType,
-        Shape, Sharding, ShardingDimension, Sin, StaticShape,
+        DimensionVariable, DynamicBroadcastOperation, LogicalMesh, Memory, Place, Placeholder, ReduceOperation,
+        ReductionKind, ReferenceType, Shape, Sharding, ShardingDimension, Sin, StaticShape,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionOverride};
     #[cfg(feature = "cuda-13")]
@@ -787,8 +794,8 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
-        Array, Constant, CustomCallOperationExtension, Dimension, Error, Operation, ProgramBuilder, RuntimeRequirement,
-        Session, Type, Value,
+        Array, CompileTracer, Constant, CustomCallOperationExtension, Dimension, Error, FromPjrt, Operation,
+        ProgramBuilder, RuntimeRequirement, Session, Type, Value,
     };
 
     use super::*;
@@ -874,6 +881,52 @@ mod tests {
         assert_eq!(session.compilation_key(&first).unwrap(), session.compilation_key(&duplicate).unwrap());
         assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_abi).unwrap());
         assert_ne!(session.compilation_key(&first).unwrap(), session.compilation_key(&changed_identifier).unwrap());
+    }
+
+    #[test]
+    fn test_lowered_program_compilation_key_includes_committed_outputs() {
+        let client = cpu_client(2);
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let memory_placement = |x: CompileTracer| x.place(&Memory::Device, None).unwrap();
+
+        // A placement that only names the memory where a device array already is lowers to nothing, so the function
+        // that requests it lowers to the module of the identity, but it commits every result of that function.
+        let session = Session::builder().client(client).build().unwrap();
+        let lower = |function: fn(CompileTracer) -> CompileTracer| {
+            let staged =
+                crate::stage::<_, ArrayType, ArrayType>(function, vector_type.clone(), Options::new(mesh.clone()))
+                    .unwrap()
+                    .into_inner();
+            staged.lower(&session).unwrap().lowered_program().clone()
+        };
+        let placed = lower(memory_placement);
+        let identity = lower(|x| x);
+        assert_eq!(placed.stable_hlo(), identity.stable_hlo());
+        assert_eq!((placed.committed_outputs(), identity.committed_outputs()), (&[true][..], &[false][..]));
+        assert!(session.compilation_key(&placed).unwrap() != session.compilation_key(&identity).unwrap());
+
+        // An eager call therefore commits the results of each function as its direct execution does, whichever of the
+        // two functions the compilation cache of the session sees first.
+        for placed_first in [false, true] {
+            let session = Session::builder().client(client).build().unwrap();
+            let compile =
+                |function: fn(CompileTracer) -> CompileTracer| -> crate::CompiledFunction<ArrayType, ArrayType> {
+                    crate::compile(function, vector_type.clone(), &session, mesh.clone()).unwrap()
+                };
+            let input = Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32; 4]))
+                .unwrap();
+            let functions = if placed_first {
+                [(true, compile(memory_placement)), (false, compile(|x| x))]
+            } else {
+                [(false, compile(|x| x)), (true, compile(memory_placement))]
+            };
+            for (committed, function) in functions {
+                assert_eq!(function.executable().execute(&session, input.clone()).unwrap().is_committed(), committed);
+                assert_eq!(function.call(input.clone()).unwrap().is_committed(), committed);
+            }
+        }
     }
 
     #[test]

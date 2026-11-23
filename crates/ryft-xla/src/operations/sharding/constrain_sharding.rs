@@ -46,6 +46,21 @@ pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(lower_constraint(&[input_value], &replicated, axes, bound_manual_axes, block, location, true)?[0])
 }
 
+/// Lowers a tensor placement constraint of `input_value` to `sharding`, whose dimensions must all be replicated or
+/// split, with every dimension closed, so that the constraint states the whole placement of the value, including along
+/// auto axes, after excluding the mesh axes bound by enclosing manual regions, and returns the constrained value. A
+/// constraint that declares a pending reduction uses it, because Shardy drops the pending reduction of a value whose
+/// constraint leaves a dimension open (refer to `lower_pending_reduction_constraint`).
+pub(crate) fn lower_closed_sharding_constraint<'b, 'c: 'b, 't: 'c>(
+    input_value: ValueRef<'b, 'c, 't>,
+    sharding: &Sharding,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    Ok(lower_constraint(&[input_value], sharding, &[], bound_manual_axes, block, location, false)?[0])
+}
+
 impl LowerableOperation for ConstrainShardingOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

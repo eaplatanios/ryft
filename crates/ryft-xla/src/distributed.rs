@@ -2130,8 +2130,9 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_array_to_placement_agrees_on_strategy_cuda_process_helper() {
-        // Compilation artifact exchange that requires sharing every artifact with the other rank, so that neither rank
-        // can compile operations for its own shards. A placement that compiled anything would publish an artifact.
+        // Compilation artifact exchange that requires sharing every artifact with the other rank. A rank leads the
+        // compilation of a program over its own devices, so it publishes the conversion of its own shard and never
+        // waits for an artifact of the other rank. A placement that switched to a program over both ranks would wait.
         struct SharedCompilationExchange {
             process_index: usize,
         }
@@ -2146,7 +2147,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             }
 
             fn publish(&self, _: &[u8], _: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
-                panic!("a placement of whole shards must not compile a program");
+                Ok(())
             }
 
             fn receive(&self, _: &[u8], _: Duration) -> Result<Option<Vec<u8>>, CompilationArtifactExchangeError> {
@@ -2177,8 +2178,8 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
 
             // Rank 0 holds `[[1, 2, 3], [4, 5, 6]]` in a column-major buffer, which the type does not declare, so only
             // rank 0 knows that its buffer is not in the row-major layout that the receive of rank 1 allocates. Rank 1
-            // only receives. Both ranks choose whole shards from the shared metadata, and rank 0, which cannot compile
-            // a conversion of its own, converts its buffer through host memory rather than switching to a compiled
+            // only receives. Both ranks choose whole shards from the shared metadata, and rank 0 converts its buffer
+            // with a program over its own device, which it leads and publishes, rather than switching to a compiled
             // reshard that rank 1 would never join.
             let buffers = if rank == 0 {
                 let device = client.addressable_devices().unwrap().remove(0);
@@ -2202,7 +2203,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let placed = source.to_placement(&session, target).unwrap();
             placed.block_until_ready().unwrap();
             assert_eq!(placed.mesh(), &destination_mesh);
-            assert_eq!(session.cached_program_count(), 0);
+            assert_eq!(session.cached_program_count(), if rank == 0 { 1 } else { 0 });
             let shards =
                 placed.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
             if rank == 0 {
@@ -2390,67 +2391,79 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
             let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
 
-            // Rank 0 runs a bounded-dynamic identity on `[11, 22]`, whose result buffer is padded to the bound of its
-            // dimension, and rank 1 holds only the metadata of that result. The CUDA plugin sends as many bytes as the
-            // allocation of the sender holds, while the receiver allocates the two elements of the shard, so rank 0
-            // must send an exactly sized copy for rank 1 to receive the two values in a buffer of eight bytes.
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            let source = if rank == 0 {
-                let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(1024)).unwrap());
-                let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-                let identity: crate::CompiledFunction<ArrayType, ArrayType> = crate::compile_with_options(
-                    |input| input,
-                    dynamic_type,
-                    &session,
-                    Options::new(source_mesh.clone()),
-                )
-                .unwrap_or_else(|error| panic!("rank {rank} failed to compile the bounded-dynamic identity: {error}"));
-                let input = Array::from_host_buffer(
-                    &session,
-                    r#type.clone(),
-                    source_mesh.clone(),
-                    Some(replicated.clone()),
-                    values_to_bytes(&[11f32, 22.]),
-                )
-                .unwrap();
-                let padded = identity
-                    .executable()
-                    .execute(&session, input)
-                    .unwrap_or_else(|error| panic!("rank {rank} failed to run the bounded-dynamic identity: {error}"));
-                let buffer = padded.shards()[0].buffer().unwrap();
-                println!(
-                    "probe: rank {rank} source: unpadded={:?} padded={}",
-                    buffer.unpadded_dimensions().unwrap(),
-                    buffer.on_device_size_in_bytes().unwrap() > 8,
-                );
-                padded
-            } else {
-                let sharding = Some(replicated.clone());
-                Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), sharding, Vec::new()).unwrap()
-            };
-            let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
-            let placed = source
-                .to_placement(&session, target)
-                .and_then(|placed| placed.block_until_ready().map(|()| placed))
-                .unwrap_or_else(|error| panic!("rank {rank} failed to send the padded shard: {error}"));
-            let shards = placed
-                .addressable_shards()
-                .map(|shard| {
-                    let buffer = shard.buffer().unwrap();
-                    let bytes = shard
-                        .copy_to_host_bytes()
-                        .unwrap_or_else(|error| panic!("rank {rank} failed to read the received shard: {error}"));
-                    (
-                        buffer.dimensions().unwrap().to_vec(),
-                        buffer.on_device_size_in_bytes().unwrap(),
-                        values_from_bytes::<f32>(&bytes),
+            // Rank 0 runs a bounded-dynamic identity whose result buffer is allocated for the bound of its dimension
+            // with a trailer that records its extent, and rank 1 holds only the metadata of that result. The CUDA plugin
+            // sends as many bytes as the allocation of the sender holds, while the receiver allocates a static buffer of
+            // the shard, so rank 0 must send a static copy of exactly that size. This holds for an extent below the
+            // bound, where the physical dimensions of the dynamic buffer differ from the shape of the shard, and at the
+            // maximum extent, where they are equal but the allocation still holds the trailer. Each step prints the
+            // number of received elements and whether they are `0, 1, 2, ...`, and a failure names the rank and step.
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(1024)).unwrap());
+            let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+            let identity: crate::CompiledFunction<ArrayType, ArrayType> =
+                crate::compile_with_options(|input| input, dynamic_type, &session, Options::new(source_mesh.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("rank {rank} failed to compile the bounded-dynamic identity: {error}")
+                    });
+            for size in [2usize, 1023] {
+                let step = format!("extent {size}");
+                let r#type = ArrayType::new_static(DataType::F32, [size]);
+                let values = (0..size).map(|value| value as f32).collect::<Vec<_>>();
+                let source = if rank == 0 {
+                    let input = Array::from_host_buffer(
+                        &session,
+                        r#type.clone(),
+                        source_mesh.clone(),
+                        Some(replicated.clone()),
+                        values_to_bytes(&values),
                     )
-                })
-                .collect::<Vec<_>>();
-            println!("probe: rank {rank} placed: {shards:?}");
-            session
-                .synchronize()
-                .unwrap_or_else(|error| panic!("rank {rank} failed to synchronize after the transfer: {error}"));
+                    .unwrap_or_else(|error| panic!("rank {rank} failed to upload the input of the {step}: {error}"));
+                    let padded = identity.executable().execute(&session, input).unwrap_or_else(|error| {
+                        panic!("rank {rank} failed to run the identity for the {step}: {error}")
+                    });
+                    let buffer = padded.shards()[0].buffer().unwrap();
+                    println!(
+                        "probe: rank {rank} {step} source: unpadded={:?} dynamic={:?} larger={}",
+                        buffer.unpadded_dimensions().unwrap(),
+                        buffer.dynamic_dimensions().unwrap(),
+                        buffer.on_device_size_in_bytes().unwrap() > 4 * size,
+                    );
+                    padded
+                } else {
+                    let sharding = Some(replicated.clone());
+                    Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), sharding, Vec::new())
+                        .unwrap_or_else(|error| {
+                            panic!("rank {rank} failed to import the source of the {step}: {error}")
+                        })
+                };
+                let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
+                let placed = source
+                    .to_placement(&session, target)
+                    .and_then(|placed| placed.block_until_ready().map(|()| placed))
+                    .unwrap_or_else(|error| {
+                        panic!("rank {rank} failed to send the dynamic shard of the {step}: {error}")
+                    });
+                let shards = placed
+                    .addressable_shards()
+                    .map(|shard| {
+                        let buffer = shard.buffer().unwrap();
+                        let bytes = shard.copy_to_host_bytes().unwrap_or_else(|error| {
+                            panic!("rank {rank} failed to read the received shard of the {step}: {error}")
+                        });
+                        let received = values_from_bytes::<f32>(&bytes);
+                        (
+                            buffer.dimensions().unwrap().to_vec(),
+                            buffer.on_device_size_in_bytes().unwrap(),
+                            received.len(),
+                            received == values,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                println!("probe: rank {rank} {step} placed: {shards:?}");
+                session
+                    .synchronize()
+                    .unwrap_or_else(|error| panic!("rank {rank} failed to synchronize after the {step}: {error}"));
+            }
         });
     }
 
@@ -2471,9 +2484,12 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         assert_eq!(
             probes,
             indoc! {r#"
-                rank 0 source: unpadded=[2] padded=true
-                rank 0 placed: []
-                rank 1 placed: [([2], 8, [11.0, 22.0])]"#},
+                rank 0 extent 2 source: unpadded=[2] dynamic=[0] larger=true
+                rank 0 extent 2 placed: []
+                rank 0 extent 1023 source: unpadded=[1023] dynamic=[0] larger=true
+                rank 0 extent 1023 placed: []
+                rank 1 extent 2 placed: [([2], 8, 2, true)]
+                rank 1 extent 1023 placed: [([1023], 4092, 1023, true)]"#},
         );
     }
 

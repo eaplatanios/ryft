@@ -33,17 +33,21 @@
 //!
 //! The source of a placement is informative about devices. It states where the value is expected to live when the
 //! placement is created, which transposition needs in order to move the cotangent back to those devices, because types
-//! do not record them, and transposition swaps the source and the target. Type inference checks a source against
-//! what the input type tracks (i.e., its sharding, memory, and declared layout), and only against it, while backends
-//! that execute a placement on a concrete value move it from wherever it actually lives. When a placement omits its
-//! source, the rule that executes it on a value that concretely lives somewhere (i.e., interpretation, batching, or
-//! differentiation) records the [`Placed`] placement of that value instead, so concrete backend arrays record where
-//! they actually live, while staged values leave the source unknown, and a source that names only a memory or a layout
-//! is completed with that placement (refer to [`PlacementRequest::resolve_source`]) after the placement is validated
-//! as it is given (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]). Inside batched functions,
-//! the placement of a batch item also records how its batch is distributed (refer to [`Placement::batch_shardings`]),
-//! so a source inferred from a batch item is lifted back to where the packed value lives, an explicit target places
-//! every batch item where it says, and a placement without a target leaves the packed value where it is.
+//! do not record them, and transposition swaps the source and the target. The type rule never compares a source with
+//! the devices of the input. It checks the sharding, memory, and layout that a source names against the input type, and
+//! it checks the reduction state of a source, together with the shards that a source layout must address, against the
+//! concrete sharding of the input when that sharding is known (e.g., the runtime sharding of a backend array, which
+//! also records the auto mesh axes that types omit) and against the input type otherwise (refer to
+//! [`PlaceOperation::infer_output_type_allowing_uneven_splits`], which owns these checks). Backends that execute a
+//! placement on a concrete value move it from wherever it actually lives. When a placement omits its source, the rule
+//! that executes it on a value that concretely lives somewhere (i.e., interpretation, batching, or differentiation)
+//! records the [`Placed`] placement of that value instead, so concrete backend arrays record where they actually live,
+//! while staged values leave the source unknown, and a source that names only a memory or a layout is completed with
+//! that placement (refer to [`PlacementRequest::resolve_source`]) after the placement is validated as it is given
+//! (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]). Inside batched functions, the placement
+//! of a batch item also records how its batch is distributed (refer to [`Placement::batch_shardings`]), so a source
+//! inferred from a batch item is lifted back to where the packed value lives, an explicit target places every batch
+//! item where it says, and a placement without a target leaves the packed value where it is.
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -62,7 +66,9 @@ use crate::batching::{
     BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy, BatchingTracer,
 };
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
@@ -277,24 +283,48 @@ impl PlacementRequest {
     /// concrete placement of the value. An in-place source names only the storage in which the value is expected, so
     /// it is completed with the devices and the sharding of the concrete placement, and becomes that placement with
     /// the memory and the layout that the source names. Every other source names devices itself, so it is returned as
-    /// it is. A source that says nothing about devices therefore never makes the transpose of a placement forget the
-    /// devices to which the cotangent returns, which the concrete placement alone tells. The rules of
-    /// [`PlaceOperation`] that place a value with a concrete placement (i.e., interpretation, batching, and
+    /// it is, except for a device source of a value that concretely lives on one device, which becomes the concrete
+    /// placement moved onto the device that the source names (with the memory and the layout that the source names, as
+    /// for an in-place source). The source therefore keeps the device to which the cotangent returns and also carries
+    /// the sharding of the value over every mesh axis, including its reduction state over [`MeshAxisType::Auto`] mesh
+    /// axes, which the type of the value omits and which transposition must preserve or reject (e.g., a pending
+    /// minimum over an auto axis of size one, which has no cotangent). A source that says nothing about devices
+    /// therefore never makes the transpose of a placement forget the devices to which the cotangent returns, which
+    /// the concrete placement alone tells, and no source makes it forget the reduction state of the value. The rules
+    /// of [`PlaceOperation`] that place a value with a concrete placement (i.e., interpretation, batching, and
     /// differentiation) record their sources through this function, and only after they validate the placement as it
     /// is given (refer to [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), because a completed source
     /// can hide a request that the type rule rejects (e.g., an in-place source that names nothing becomes a valid
     /// placement).
     pub fn resolve_source(source: Option<Self>, placement: Option<Placement>) -> Option<Self> {
+        let with_storage = |placement: Placement, memory: Option<Memory>, layout: Option<Layout>| {
+            let placement = match memory {
+                Some(memory) => placement.with_memory(memory),
+                None => placement,
+            };
+            match layout {
+                Some(layout) => placement.with_layout(layout),
+                None => placement,
+            }
+        };
         match (source, placement) {
             (Some(Self::InPlace { memory, layout }), Some(placement)) => {
-                let placement = match memory {
-                    Some(memory) => placement.with_memory(memory),
-                    None => placement,
-                };
-                Some(Self::Resolved(match layout {
-                    Some(layout) => placement.with_layout(layout),
-                    None => placement,
-                }))
+                Some(Self::Resolved(with_storage(placement, memory, layout)))
+            }
+            (Some(Self::Device { device, memory, layout }), Some(placement))
+                if placement.mesh().devices().len() == 1 =>
+            {
+                // The logical mesh of the concrete placement has one device, so it accepts the device of the source,
+                // and its sharding and recorded batch shardings were valid over it, so they stay valid.
+                let batch_shardings = placement.batch_shardings().to_vec();
+                let (mesh, sharding, placement_layout, placement_memory) = placement.into_parts();
+                let mesh = DeviceMesh::new(mesh.logical_mesh().clone(), vec![device]).unwrap();
+                let mut moved = Placement::new(mesh, sharding).unwrap();
+                for batch_sharding in batch_shardings {
+                    moved = moved.with_batch_sharding(batch_sharding).unwrap();
+                }
+                let moved = with_storage(moved, placement_memory, placement_layout);
+                Some(Self::Resolved(with_storage(moved, memory, layout)))
             }
             (Some(source), _) => Some(source),
             (None, placement) => placement.map(Self::Resolved),
@@ -304,11 +334,11 @@ impl PlacementRequest {
 
 impl Display for PlacementRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // A device is rendered by its globally unique ID, as the devices of a placement are.
+        // A device is rendered as the devices of a placement are (refer to the rendering of `Device`).
         match self {
             Self::Resolved(placement) => write!(formatter, "{placement}"),
             Self::Device { device, memory, layout } => {
-                write!(formatter, "device({}", device.id())?;
+                write!(formatter, "device({device}")?;
                 if let Some(memory) = memory {
                     write!(formatter, ", memory={memory}")?;
                 }
@@ -455,7 +485,8 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// [`Place`], the replay of a staged program, its transformations, and compilation), as JAX's `device_put` requires
 /// eagerly and inside `jit`. Unlike JAX, a backend may still split a concrete value unevenly when it places that value
 /// outside this operation. A dynamic extent is only known when a backend places a concrete value, so type inference
-/// accepts any split of it and backends check it when they place the value.
+/// rejects a split of it only when no extent that its bounds admit splits evenly (e.g., an extent of five to seven
+/// into four shards), and backends check it when they place the value.
 ///
 /// A value inside a manual region lives on the devices of that region, so it cannot be moved, and nothing can be moved
 /// into such a region either. Types show such values through their variation along [`MeshAxisType::Manual`] mesh axes
@@ -473,18 +504,20 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// single [`Device`] whose mesh is not known (e.g., a device that a caller names for a value whose devices are not
 /// known while it is traced), or an in-place request, which names only the storage in which the input is expected
 /// (refer to [`PlacementRequest`]). It states where the input is expected to live when the operation is created, and
-/// transposition uses it to move the cotangent back there. Type inference checks it against what the input type tracks.
-/// The sharding of a [`Placement`] source must have the rank of the input, must not describe a value inside a manual
-/// region, and must restate the reduction state of the input exactly (i.e., its unreduced axes, reduced axes, and
-/// unreduced kind, which are empty and a sum for an input without a tracked sharding) over a mesh that defines those
-/// axes like the input's mesh. When the input type tracks a sharding, the source sharding without its auto axes must
-/// also equal it. A device source is rejected for an input that its type tracks over a mesh of more than one device.
-/// These checks guarantee that the cotangent that transposition moves back to the source devices has the cotangent
-/// type of the input (up to a placement-only broadcast for an input without a tracked sharding). The memory and the
-/// layout that a source of any form names are checked against the input type as [`PlacementRequest`] states. Backends
-/// that execute the operation on a concrete value move the value from wherever it actually lives, without comparing
-/// the devices of that placement with the source on any path, as JAX never compares them either, so a source that
-/// names other devices sends the cotangent to the devices that it names.
+/// transposition uses it to move the cotangent back there. Type inference checks it against the input type and, for its
+/// reduction state and the shards that its layout addresses, against the concrete sharding of the input when that is
+/// known (refer to [`Self::infer_output_type_allowing_uneven_splits`]). The sharding of a [`Placement`] source must
+/// have the rank of the input, must not describe a value inside a manual region, and must restate the reduction state
+/// of the input exactly (i.e., its unreduced axes, reduced axes, and unreduced kind, which are empty and a sum for an
+/// input without a tracked sharding) over a mesh that defines those axes like the input's mesh. When the input type
+/// tracks a sharding, the source sharding without its auto axes must also equal it. A device source is rejected for an
+/// input that its type tracks over a mesh of more than one device. These checks guarantee that the cotangent that
+/// transposition moves back to the source devices has the cotangent type of the input (up to a placement-only broadcast
+/// for an input without a tracked sharding). The memory and the layout that a source of any form names are checked
+/// against the input type as [`PlacementRequest`] states. Backends that execute the operation on a concrete value move
+/// the value from wherever it actually lives, without comparing the devices of that placement with the source on any
+/// path, as JAX never compares them either, so a source that names other devices sends the cotangent to the devices
+/// that it names.
 ///
 /// The operation also carries a copy policy (refer to [`Self::with_may_alias`]), which is the Ryft analogue of the
 /// `copy_semantics` of JAX's `device_put` primitive. By default, the output may share storage with the input (e.g.,
@@ -607,14 +640,15 @@ impl PlaceOperation {
     /// Validates a placement of a value of type `input` onto `target`, which states that the value lives
     /// on `source`, and returns the type of the placed value. This is the type rule of [`PlaceOperation`] (refer to
     /// [`Operation::infer_output_types`]) except for one check, which is that a [`Placement`] target splits each static
-    /// extent evenly, and the type rule makes that check after this function. Backends call this function for the
-    /// placement of a concrete value outside a program (e.g., a frontend that places an array, or that uploads a host
-    /// value to a destination, which it validates as the placement of a value with the type of that host value), so
-    /// that such a placement checks everything that the type rule checks, in the same order and with the same errors,
-    /// and splits a dimension unevenly only where it places a concrete value. The interpretation, batching, and
-    /// differentiation rules of [`PlaceOperation`] also call it to validate a placement as it is given before they
-    /// complete its source with the placement of a concrete value (refer to [`PlacementRequest::resolve_source`]),
-    /// so that the completed source never hides a request that the type rule rejects.
+    /// extent evenly and each dynamic extent evenly for at least one extent that its bounds admit, and the type rule
+    /// makes that check after this function. Backends call this function for the placement of a concrete value outside
+    /// a program (e.g., a frontend that places an array, or that uploads a host value to a destination, which it
+    /// validates as the placement of a value with the type of that host value), so that such a placement checks
+    /// everything that the type rule checks, in the same order and with the same errors, and splits a dimension
+    /// unevenly only where it places a concrete value. The interpretation, batching, and differentiation rules of
+    /// [`PlaceOperation`] also call it to validate a placement as it is given before they complete its source with the
+    /// placement of a concrete value (refer to [`PlacementRequest::resolve_source`]), so that the completed source
+    /// never hides a request that the type rule rejects.
     ///
     /// `concrete_sharding` is the sharding over every mesh axis of the concrete value that is placed, when it is known
     /// (i.e., the sharding of its [`Placed`] placement, such as the runtime sharding of a backend array), and [`None`]
@@ -626,14 +660,17 @@ impl PlaceOperation {
     /// check, and the output type, uses the type of the input alone, so the output type never depends on it. The
     /// placement of the input along auto axes is never compared with a source, whose devices and auto axes are
     /// informative (e.g., a cotangent can be split along auto axes otherwise than the source of the transposed
-    /// placement says). Without a concrete sharding, a source restates the reduction state of the input over the axes
-    /// that its type records, and its reduction state over auto axes, which the type cannot describe, is not checked.
+    /// placement says). A source layout therefore addresses the shards that the concrete sharding determines, or,
+    /// without it, those that the type of the input determines, and the shards that a source placement describes only
+    /// for an input whose type tracks no sharding. Without a concrete sharding, a source restates the reduction state
+    /// of the input over the axes that its type records, and its reduction state over auto axes, which the type cannot
+    /// describe, is not checked.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] for every request that [`Operation::infer_output_types`] rejects, except for a target
-    /// that splits a static extent unevenly, and for every request that the concrete sharding shows to change the
-    /// reduction state of the value or to have a layout that does not address its shards.
+    /// that splits an extent unevenly, and for every request that the concrete sharding shows to change the reduction
+    /// state of the value or to have a layout that does not address its shards.
     pub fn infer_output_type_allowing_uneven_splits(
         input: &ArrayType,
         concrete_sharding: Option<&Sharding>,
@@ -758,12 +795,16 @@ impl PlaceOperation {
                     )));
                 }
 
-                // The sharding of a placement source describes every mesh axis, and so does the concrete sharding of
-                // the input, while the sharding that the input type tracks omits the auto axes along which the input
-                // may also be split.
-                let (sharding, is_complete) = match source.placement() {
-                    Some(placement) => (Some(placement.sharding()), true),
-                    None => (known_sharding, is_known_complete),
+                // The layout addresses the shards of the input, which its concrete sharding determines when it is
+                // known, and the sharding that its type tracks otherwise (which omits the auto axes along which the
+                // input may also be split, so it determines no shards over a mesh with an auto axis larger than one).
+                // The split that a placement source describes along auto axes is a hint, like its devices, so it only
+                // describes the shards of an input whose type tracks no sharding, and never makes a layout pass or fail
+                // for a split that the input does not have.
+                let (sharding, is_complete) = match (known_sharding, source.placement()) {
+                    (Some(sharding), _) => (Some(sharding), is_known_complete),
+                    (None, Some(placement)) => (Some(placement.sharding()), true),
+                    (None, None) => (None, false),
                 };
 
                 input.validate_shard_layout(layout, sharding, is_complete).map_err(|error| {
@@ -845,16 +886,19 @@ impl PlaceOperation {
     }
 
     /// Validates this operation for a concrete value of type `input` whose sharding over every mesh axis is
-    /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule
-    /// of this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the
-    /// target splits each static extent evenly), made with the concrete sharding of the value, so it is what a backend
-    /// calls when it executes this operation on a concrete value (e.g., when an eager context binds it), where the
-    /// reduction state and the shards of the value are known more precisely than its type records them.
+    /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule of
+    /// this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the target
+    /// splits each extent evenly as far as the type of the value can tell, which is exactly for a static extent and for
+    /// at least one extent that the bounds of a dynamic extent admit), made with the concrete sharding of the value,
+    /// so it is what a backend calls when it executes this operation on a concrete value (e.g., when an eager context
+    /// binds it), where the reduction state and the shards of the value are known more precisely than its type records
+    /// them.
     ///
     /// # Errors
     ///
     /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], and one for a target that
-    /// splits a static extent of the value unevenly.
+    /// splits a static extent of the value unevenly or a dynamic extent unevenly for every extent that its bounds
+    /// admit.
     pub fn infer_output_type_requiring_even_splits(
         &self,
         input: &ArrayType,
@@ -967,31 +1011,50 @@ impl PlaceOperation {
         Ok(())
     }
 
-    /// Validates that a placement of a value of type `input` onto `target` splits each static
+    /// Validates that a placement of a value of type `input` onto `target` can split each
     /// extent of the value evenly, which is the one check of the type rule of [`PlaceOperation`] that
     /// [`Self::infer_output_type_allowing_uneven_splits`] does not make. Every shard of a partitioned dimension of a
     /// value has the same extent, so for each dimension that the target sharding partitions, the number of shards along
     /// it (i.e., the product of the sizes of the mesh axes that shard it, which includes auto axes, which the output
-    /// type does not record but along which the value is still split) must divide its static extent. A dynamic extent
-    /// is only known when a backend places a concrete value, which is when it is checked. Only a [`Placement`] target
-    /// partitions dimensions.
+    /// type does not record but along which the value is still split) must divide its extent. That number must divide
+    /// a static extent, and it must divide at least one extent that the bounds of a dynamic extent admit, because a
+    /// dynamic extent is only known when a backend places a concrete value, which is when it is checked. Bounds that
+    /// admit no such extent (e.g., an extent of five to seven split into four shards) prove that the split cannot be
+    /// even. Only a [`Placement`] target partitions dimensions.
     fn validate_even_splits(input: &ArrayType, target: Option<&PlacementRequest>) -> Result<(), TypeError> {
         let Some(target) = target.and_then(PlacementRequest::placement).map(Placement::sharding) else {
             return Ok(());
         };
         for (dimension, (extent, sharding)) in input.shape().dimensions().iter().zip(target.dimensions()).enumerate() {
-            let (Dimension::Static(extent), ShardingDimension::Sharded(axis_names)) = (extent, sharding) else {
+            let ShardingDimension::Sharded(axis_names) = sharding else {
                 continue;
             };
 
             // The product is over distinct axes of one mesh, so it never exceeds the device count of that mesh,
-            // which fits `usize`.
+            // which fits `usize`, and it is at least one, because every mesh axis has at least one device.
             let shard_count = axis_names.iter().filter_map(|name| target.mesh().axis_size(name)).product::<usize>();
-            if extent % shard_count != 0 {
-                return Err(TypeError::invalid(format!(
-                    "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent {extent} into \
-                     {shard_count} shards, which do not divide it evenly",
-                )));
+            match extent {
+                Dimension::Static(extent) if extent % shard_count != 0 => {
+                    return Err(TypeError::invalid(format!(
+                        "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent {extent} \
+                         into {shard_count} shards, which do not divide it evenly",
+                    )));
+                }
+                Dimension::Dynamic(variable) => {
+                    // The smallest multiple of the number of shards that is not below the lower bound is the extent
+                    // that decides whether the bounds admit an even split, and one that does not fit `usize` exceeds
+                    // every extent.
+                    let bounds = variable.bounds();
+                    let multiple = bounds.lower().div_ceil(shard_count).checked_mul(shard_count);
+                    if !multiple.is_some_and(|multiple| bounds.contains(multiple)) {
+                        return Err(TypeError::invalid(format!(
+                            "`{PLACE_OPERATION_NAME}` target sharding splits dimension #{dimension} with extent \
+                             {variable} in {bounds} into {shard_count} shards, which divide no extent in that range \
+                             evenly",
+                        )));
+                    }
+                }
+                Dimension::Static(_) => {}
             }
         }
         Ok(())
@@ -1345,13 +1408,26 @@ impl_differentiable_operation! {
                 _ => input_type.sharding(),
             };
 
+            // A value that is unreduced with a kind other than a sum has no cotangent, which the cotangent type of the
+            // input above already shows when its type records that state, and which only the source shows over auto
+            // mesh axes. It is reported with the type of the input carrying the state of the source, as it would be
+            // over explicit axes.
+            if let Some(sharding) = input_sharding
+                && sharding.cotangent().is_err()
+            {
+                let primal_type = input_type.as_ref().clone().with_sharding_unchecked(Some(sharding.clone()));
+                return Err(DifferentiationError::UndefinedCotangentType { primal_type: primal_type.to_string() });
+            }
+
             // A device target leaves a value without reduction state, so the output cotangent has none either, and the
             // broadcast below gives the input cotangent the cotangent dual of the reduction state of the input back.
-            // That is exact over mesh axes of size one, where the one device that holds the cotangent is the only
-            // contribution of an unreduced cotangent, and over the axes along which the input is unreduced, whose
+            // That is exact over explicit mesh axes of size one, where the one device that holds the cotangent is the
+            // only contribution of an unreduced cotangent, and over the axes along which the input is unreduced, whose
             // reduced cotangent is complete on every device. The cotangent of an input that is reduced over a larger
             // axis is unreduced over it, and its contributions on the devices along that axis must sum to the output
-            // cotangent, which a placement that leaves the complete cotangent on each of them cannot produce.
+            // cotangent, which a placement that leaves the complete cotangent on each of them cannot produce. Over
+            // auto mesh axes, of any size, the type of the input cotangent cannot carry the dual state at all,
+            // so the broadcast cannot restore it, and such a transposition is rejected below.
             let has_device_target = matches!(operation.target(), Some(PlacementRequest::Device { .. }));
             if has_device_target && let Some(sharding) = input_sharding {
                 let larger_axes = sharding
@@ -1377,8 +1453,11 @@ impl_differentiable_operation! {
             // state of the input (i.e., of a placement source, or of a placement target, which restates it too), and
             // a cotangent type cannot record reduction state over auto mesh axes, so the type rule of the transposed
             // placement would reject that state, and dropping it would return the whole output cotangent on each
-            // device where the cotangent of a reduced input holds contributions that sum to it.
-            if !has_device_target && !operation.transposes_in_place(&input_type) {
+            // device where the cotangent of a reduced input holds contributions that sum to it. After a device target,
+            // the transposed placement drops that state and the broadcast below cannot restore it over auto axes, so
+            // the input cotangent would lose it even over an axis of size one, where an explicit axis keeps it. Such
+            // transpositions are rejected rather than returning a cotangent without the dual state.
+            if !operation.transposes_in_place(&input_type) {
                 let auto_axes = [operation.source(), operation.target()]
                     .into_iter()
                     .flatten()
@@ -2504,6 +2583,33 @@ mod tests {
         let operation = PlaceOperation::new(PlacementRequest::from(Device::new(3, 0)), None);
         assert_eq!(operation.target(), Some(&PlacementRequest::from(Device::new(3, 0))));
         assert_eq!(operation.to_string(), "place [target=device(3)]");
+
+        // Requests for one device ID on two processes differ and render differently, as bare devices and as resolved
+        // placements, because a device of a process other than process 0 also renders its process.
+        let remote = PlaceOperation::new(Device::new(3, 1), None);
+        assert_ne!(remote, operation);
+        assert_eq!(remote.to_string(), "place [target=device(3@1)]");
+        let single_device = |device| {
+            let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+            PlaceOperation::new(placement(&mesh, Vec::new()), None)
+        };
+        assert_ne!(single_device(Device::new(3, 1)), single_device(Device::new(3, 0)));
+        assert_eq!(
+            single_device(Device::new(3, 0)).to_string(),
+            indoc! {"
+                place [
+                    target={mesh<['device'=1:auto]>, devices=[3], sharding={mesh<['device'=1:auto]>, []}},
+                ]"
+            },
+        );
+        assert_eq!(
+            single_device(Device::new(3, 1)).to_string(),
+            indoc! {"
+                place [
+                    target={mesh<['device'=1:auto]>, devices=[3@1], sharding={mesh<['device'=1:auto]>, []}},
+                ]"
+            },
+        );
 
         // A bare device converts into a device target or source without a memory and a layout, and a device source is
         // rendered like a device target.
@@ -3794,6 +3900,45 @@ mod tests {
             Ok(auto_type.clone())
         );
 
+        // A source placement describes a split along the auto axis that is only a hint, so a source layout addresses
+        // the shards of the concrete value whatever split the source claims, and the shards that the type of a staged
+        // value determines otherwise. The column shard strides overlap the rows of a replicated concrete value, and
+        // address the column shards of a split one, while the type of a staged value does not determine its shards.
+        let auto_device_mesh = DeviceMesh::new(concrete.mesh().clone(), vec![Device::new(0, 0), Device::new(1, 0)]);
+        let auto_device_mesh = auto_device_mesh.unwrap();
+        let auto_columns = Sharding::new(
+            concrete.mesh().clone(),
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let source = |sharding: &Sharding| {
+            let placement = Placement::new(auto_device_mesh.clone(), sharding.clone()).unwrap();
+            PlacementRequest::from(placement.with_layout(shard_strides.clone()))
+        };
+        let overlapping_rows = Err(TypeError::invalid(format!(
+            "`{PLACE_OPERATION_NAME}` source layout is invalid: strided layout stride 8 on axis 0 is smaller than the \
+             16-byte span occupied by more minor axes and may alias array elements",
+        )));
+        for (concrete_sharding, claimed_sharding, expected) in [
+            (Some(&concrete), &auto_columns, overlapping_rows.clone()),
+            (Some(&concrete), &concrete, overlapping_rows),
+            (Some(&auto_columns), &concrete, Ok(auto_type.clone())),
+            (Some(&auto_columns), &auto_columns, Ok(auto_type.clone())),
+            (None, &concrete, Ok(auto_type.clone())),
+            (None, &auto_columns, Ok(auto_type.clone())),
+        ] {
+            assert_eq!(
+                PlaceOperation::infer_output_type_allowing_uneven_splits(
+                    &auto_type,
+                    concrete_sharding,
+                    None,
+                    Some(&source(claimed_sharding)),
+                ),
+                expected,
+                "concrete sharding {concrete_sharding:?}, claimed source sharding {claimed_sharding}",
+            );
+        }
+
         // Without a target layout, whether an in-place output keeps the layout of its input depends on the type of the
         // input alone, so the output type is the same with and without the concrete sharding (which here describes
         // shards that the layout of the input would overlap, which no concrete value has).
@@ -3995,23 +4140,49 @@ mod tests {
             }],
         );
 
-        // A dynamic extent is only known when a backend places a concrete value, so type inference accepts any split
-        // of it, also one that its bounds do not admit evenly.
-        let dynamic_type = ArrayType::new(
-            DataType::I32,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
-                "n",
-                DimensionBounds::new(3, Some(5)).unwrap(),
-            ))]),
-        );
-        let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
-        check_operation_type_inference!(
-            operation = PlaceOperation::new(target.clone(), None),
-            cases = [{
-                input_types = [dynamic_type.clone()],
-                output_types = [dynamic_type.with_sharding(target.sharding().clone()).unwrap()],
-            }],
-        );
+        // A dynamic extent is only known when a backend places a concrete value, so type inference accepts a split of
+        // it when its bounds admit at least one extent that the split divides evenly (e.g., six of the extents five
+        // through seven into two shards), which backends then check, and it rejects a split for which the bounds
+        // prove that it cannot be even, as it rejects an uneven split of a static extent.
+        let dynamic_extent =
+            |lower, upper| Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(lower, upper).unwrap()));
+        for (extent, two_way_split_is_even, four_way_split_is_even, bounds) in [
+            (Dimension::Static(5), false, false, None),
+            (Dimension::Static(8), true, true, None),
+            (dynamic_extent(5, Some(6)), false, false, Some("[5, 6)")),
+            (dynamic_extent(5, Some(8)), true, false, Some("[5, 8)")),
+            (dynamic_extent(5, Some(9)), true, true, Some("[5, 9)")),
+            (dynamic_extent(5, None), true, true, Some("[5, ∞)")),
+        ] {
+            let input_type = ArrayType::new(DataType::I32, Shape::new(vec![extent.clone()]));
+            for (mesh, axis_name, shard_count, is_even) in
+                [(mesh_x(), "x", 2, two_way_split_is_even), (mesh_y(), "y", 4, four_way_split_is_even)]
+            {
+                let target = placement(&mesh, vec![ShardingDimension::sharded([axis_name])]);
+                let expected = if is_even {
+                    Ok(vec![input_type.clone().with_sharding(target.sharding().clone()).unwrap()])
+                } else {
+                    let extent = match bounds {
+                        Some(bounds) => format!("{extent} in {bounds}"),
+                        None => extent.to_string(),
+                    };
+                    let reason = match bounds {
+                        Some(_) => "which divide no extent in that range evenly",
+                        None => "which do not divide it evenly",
+                    };
+                    Err(TypeError::invalid(format!(
+                        "`{PLACE_OPERATION_NAME}` target sharding splits dimension #0 with extent {extent} into \
+                         {shard_count} shards, {reason}",
+                    )))
+                };
+                let operation = PlaceOperation::new(target, None);
+                assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), expected);
+                assert_eq!(
+                    operation.infer_output_type_requiring_even_splits(&input_type, None).map(|output| vec![output]),
+                    expected,
+                );
+            }
+        }
 
         // Backends can split a concrete value unevenly. The full type rule checks even splits after every other check.
         let input_type = ArrayType::new_static(DataType::I32, [5]);
@@ -7294,15 +7465,20 @@ mod tests {
 
     #[test]
     fn test_place_operation_transposition_reduction_state_of_concrete_inputs() {
-        // A concrete input that is reduced or unreduced over the mesh axis `x` of size two, explicit or auto, lives on
-        // the devices 0 and 1, and the forward placement records that placement as its source, which carries the
-        // reduction state over the auto axis that the type of the input omits. For every form of the target, the
-        // pullback either returns the cotangent with the cotangent dual of that state (i.e., contributions that sum to
-        // the seed for a reduced input, and the complete seed on each device for an unreduced one) or is rejected with
-        // an exact error. It never returns a cotangent without the dual state of an auto axis, which for a reduced
-        // input would hold the whole seed on each device rather than contributions that sum to it. A target that
-        // restates a state over an auto axis is already rejected when reverse mode stages the placement of the tangent, whose
-        // type cannot record that state (refer to the accepted limit on staged placements in the decisions register).
+        // A concrete input that is reduced, or unreduced as a sum, a maximum, or a minimum, over the mesh axis `x` of
+        // size one or two, explicit or auto, lives on the first devices of the mesh, and the forward placement records
+        // that placement as its source, which carries the reduction state over the auto axis that the type of the
+        // input omits, also when the caller states a device as the source. For every form of the target, the pullback
+        // either returns the cotangent with the cotangent dual of that state (i.e., contributions that sum to the seed
+        // for a reduced input, and the complete seed on each device for an unreduced one) or is rejected with an exact
+        // error, and an auto axis behaves as an explicit axis of the same size wherever a cotangent type can carry the
+        // state, and is rejected otherwise. It never returns a cotangent without the dual state of an auto axis, which
+        // for a reduced input would hold the whole seed on each device rather than contributions that sum to it, and
+        // which loses the state even over an axis of size one. A pending maximum or minimum has no cotangent, over
+        // either kind of axis. A target that restates a state over an auto axis is already rejected when reverse mode
+        // stages the placement of the tangent, whose type cannot record that state (refer to the accepted limit on
+        // staged placements in the decisions register). A device source is only accepted for an input that its type
+        // tracks over a mesh of one device, so it is only paired with the axis of size one.
         let device_error = format!(
             "cannot transpose `{PLACE_OPERATION_NAME}` onto a single device for a value that is reduced over mesh axes \
              larger than one (i.e., `x`), because its cotangent is unreduced over them",
@@ -7324,61 +7500,88 @@ mod tests {
         };
         let invalid =
             |message: &String| Err(DifferentiationError::Program(ProgramError::Type(TypeError::invalid(message))));
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
-            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
-            let other_mesh = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
+        let undefined = |primal_type: &ArrayType| {
+            Err(DifferentiationError::UndefinedCotangentType { primal_type: primal_type.to_string() })
+        };
+        for (axis_type, axis_size) in
+            [(MeshAxisType::Explicit, 1), (MeshAxisType::Explicit, 2), (MeshAxisType::Auto, 1), (MeshAxisType::Auto, 2)]
+        {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, axis_type).unwrap()]).unwrap();
+            let mesh =
+                DeviceMesh::new(logical_mesh.clone(), (0..axis_size).map(|id| Device::new(id, 0)).collect()).unwrap();
+            let other_mesh =
+                DeviceMesh::new(logical_mesh.clone(), (2..2 + axis_size).map(|id| Device::new(id, 0)).collect())
+                    .unwrap();
             let replicated = Sharding::replicated(logical_mesh, 1);
+            let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
             for (state, sharding) in [
                 ("reduced", replicated.clone().with_reduced_axes(["x"]).unwrap()),
-                ("unreduced", replicated.clone().with_unreduced_axes(["x"]).unwrap()),
+                ("unreduced", unreduced.clone()),
+                ("unreduced maximum", unreduced.clone().with_unreduced_kind(UnreducedKind::Max).unwrap()),
+                ("unreduced minimum", unreduced.clone().with_unreduced_kind(UnreducedKind::Min).unwrap()),
             ] {
                 let input_type =
                     ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.without_auto_axes()).unwrap();
+                let concrete_type = input_type.clone().with_sharding_unchecked(Some(sharding.clone()));
                 let context = RecordingContext::default();
                 let input = PlacedArray {
                     array: Array::from_elements(input_type.clone(), &[1.0f32, 2.0]).unwrap(),
                     placement: Some(Placement::new(mesh.clone(), sharding.clone()).unwrap()),
                     context: context.clone(),
                 };
-                let gradient = (
-                    Array::from_elements(input_type.cotangent().unwrap(), &[5.0f32, 6.0]).unwrap(),
-                    Some(sharding.cotangent().unwrap()),
-                );
+                let gradient = |sharding: Option<Sharding>| -> Result<(Array, Option<Sharding>), DifferentiationError> {
+                    Ok((Array::from_elements(input_type.cotangent()?, &[5.0f32, 6.0])?, sharding))
+                };
                 let is_auto = axis_type == MeshAxisType::Auto;
+                let is_larger = axis_size > 1;
                 let is_reduced = state == "reduced";
-                let targets = [
-                    (
-                        "resolved",
-                        Some(PlacementRequest::from(Placement::new(other_mesh.clone(), sharding.clone()).unwrap())),
-                        if is_auto { invalid(&changed_error) } else { Ok(gradient.clone()) },
-                    ),
-                    (
-                        "device",
-                        Some(PlacementRequest::from(Device::new(2, 0))),
-                        if is_reduced { unsupported(&device_error) } else { invalid(&forward_error) },
-                    ),
-                    (
-                        "in-place",
-                        Some(PlacementRequest::from(PINNED_HOST)),
-                        if is_auto { unsupported(&auto_error) } else { Ok(gradient.clone()) },
-                    ),
-                    ("none", None, if is_auto { unsupported(&auto_error) } else { Ok(gradient.clone()) }),
-                ];
-                for (target_name, target, expected) in targets {
-                    let place = differentiate_at(input.clone()).vjp(|x| {
-                        <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, target.as_ref(), None, true)
-                    });
-                    let result = place.and_then(|(output, pullback)| {
-                        let seed = PlacedArray {
-                            array: Array::from_elements(output.r#type().cotangent()?, &[5.0f32, 6.0])?,
-                            placement: output.placement.clone(),
-                            context: context.clone(),
+                let is_sum = sharding.unreduced_kind() == UnreducedKind::Sum;
+                let sources = [("none", None), ("device", Some(PlacementRequest::from(Device::new(0, 0))))];
+                for (source_name, source) in sources.into_iter().take(if is_larger { 1 } else { 2 }) {
+                    let targets = [
+                        (
+                            "resolved",
+                            Some(PlacementRequest::from(Placement::new(other_mesh.clone(), sharding.clone()).unwrap())),
+                        ),
+                        ("device", Some(PlacementRequest::from(Device::new(2, 0)))),
+                        ("in-place", Some(PlacementRequest::from(PINNED_HOST))),
+                        ("none", None),
+                    ];
+                    for (target_name, target) in targets {
+                        let expected = match target_name {
+                            _ if !is_sum && !is_auto => undefined(&concrete_type),
+                            "resolved" if is_auto => invalid(&changed_error),
+                            "device" if !is_reduced && is_larger => invalid(&forward_error),
+                            _ if !is_sum => undefined(&concrete_type),
+                            "device" if is_reduced && is_larger => unsupported(&device_error),
+                            "resolved" => gradient(Some(sharding.cotangent().unwrap())),
+                            _ if is_auto => unsupported(&auto_error),
+                            "device" => gradient(None),
+                            _ => gradient(Some(sharding.cotangent().unwrap())),
                         };
-                        let gradient = pullback.apply_materialized(seed)?;
-                        Ok((gradient.array, gradient.placement.map(|placement| placement.sharding().clone())))
-                    });
-                    assert_eq!(result, expected, "{axis_type} axis, {state} input, target {target_name}");
+                        let place = differentiate_at(input.clone()).vjp(|x| {
+                            <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(
+                                &x,
+                                target.as_ref(),
+                                source.clone(),
+                                true,
+                            )
+                        });
+                        let result = place.and_then(|(output, pullback)| {
+                            let seed = PlacedArray {
+                                array: Array::from_elements(output.r#type().cotangent()?, &[5.0f32, 6.0])?,
+                                placement: output.placement.clone(),
+                                context: context.clone(),
+                            };
+                            let gradient = pullback.apply_materialized(seed)?;
+                            Ok((gradient.array, gradient.placement.map(|placement| placement.sharding().clone())))
+                        });
+                        assert_eq!(
+                            result, expected,
+                            "{axis_type} axis of size {axis_size}, {state} input, source {source_name}, target \
+                             {target_name}",
+                        );
+                    }
                 }
             }
         }

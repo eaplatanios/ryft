@@ -1,11 +1,12 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Operation, ParallelReduceOperation, ProgramError, ReductionKind};
+use ryft_core::{ArrayType, Operation, ParallelReduceOperation, ProgramError, ReductionKind, UnreducedKind};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Value as MlirValue,
     ValueRef,
 };
 
+use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::collectives::{collective_replica_groups, mesh_axis_replica_groups};
@@ -27,15 +28,21 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 /// and it must stay a single operation because XLA backends implement all-reduce only for the combiners that they
 /// recognize. Floating-point extrema therefore follow the backend's native `maximum` and `minimum`, as
 /// `jax.lax.pmax` and `jax.lax.pmin` do, so their NaN and signed-zero behavior is backend-defined. The combiner also
-/// accumulates in the input element type, without the `f32` accumulation that [`ReductionKind::Sum`] documents for
-/// narrower floating-point `reduce` inputs, so that, e.g., `bf16` gradient all-reduces keep their communication
-/// volume. A `LogSumExp` has no single combiner and is rejected, because the
+/// takes the input element type, without the conversion to `f32` that [`ReductionKind::Sum`] documents for narrower
+/// floating-point `reduce` inputs, so that, e.g., `bf16` gradient all-reduces keep their communication volume. How
+/// precisely the backend then accumulates is its own choice: the CPU plugin accumulates `bf16` sums in `f32` and the
+/// sums of the narrower formats in `f16`, in ascending order of the participants (refer to the section on pending
+/// reductions of [`crate::arrays::host`]), so a sum of `f16` and narrower values can differ from a `reduce` of the
+/// same values. A `LogSumExp` has no single combiner and is rejected, because the
 /// [`ParallelReduce`](ryft_core::ParallelReduce) capability composes it from a mesh maximum and a mesh sum instead. A
-/// collective lowered outside any manual region, or naming an axis the innermost region does not bind as a manual mesh
-/// axis, is an error. A recorded mesh must have the topology of the binding region's mesh and make the same axes manual
-/// (i.e., satisfy [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that
-/// `auto_axes` and `explicit_axes` may retype the region's free axes, and the replica groups come from the region's
-/// mesh.
+/// sum, mean, maximum, or minimum of a data type for which the all-reduce of XLA does not compute what the data type
+/// means (e.g., one-bit integers, which XLA adds as predicates) is rejected as well, by the rule that every collective
+/// that reduces shares (refer to [`compiled_reduction_rejection`]), because the result would be another number or the
+/// compilation would fail or abort the process. A collective lowered outside any manual region, or naming an axis the
+/// innermost region does not bind as a manual mesh axis, is an error. A recorded mesh must have the topology of the
+/// binding region's mesh and make the same axes manual (i.e., satisfy
+/// [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that `auto_axes` and
+/// `explicit_axes` may retype the region's free axes, and the replica groups come from the region's mesh.
 pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     operation: &ParallelReduceOperation,
     collective_state: &CollectiveLoweringState,
@@ -72,6 +79,30 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         None => mesh_axis_replica_groups(collective_state, operation.axis_name())?,
     };
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+
+    // The all-reduce is the collective that completes a pending reduction of the same kind, so it is exact for the same
+    // data types (a mean divides a sum afterwards). The other kinds combine with operations that XLA computes as the
+    // data type means them.
+    let completed = match operation.kind() {
+        ReductionKind::Sum | ReductionKind::Mean => Some(UnreducedKind::Sum),
+        ReductionKind::Max => Some(UnreducedKind::Max),
+        ReductionKind::Min => Some(UnreducedKind::Min),
+        _ => None,
+    };
+    let data_type = output_array_type.data_type();
+    if let Some(reason) =
+        completed.and_then(|completed| compiled_reduction_rejection(data_type, ReductionChange::Complete(completed)))
+    {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{}` with kind `{}` cannot reduce `{data_type}` values over mesh axis `{}`, because {reason}",
+                operation.name(),
+                operation.kind(),
+                operation.axis_name(),
+            ),
+        }
+        .into());
+    }
 
     let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(output_array_type.data_type()), context, location)?;
     let mut computation = context.region();
@@ -888,6 +919,55 @@ pub(crate) mod tests {
             "`parallel_reduce` with kind `log_sum_exp` has no all-reduce combiner; stage it through the \
              `ParallelReduce` capability, which composes it from primitive mesh reductions",
         );
+    }
+
+    #[test]
+    fn test_parallel_reduce_operation_lower_rejects_data_types_that_the_all_reduce_does_not_reduce() {
+        // XLA adds one-bit integers as predicates, so their mesh sum would be a logical or (e.g., `1 + 1` would give
+        // `1`, where the sum wraps around to `0`), and it orders signed ones as predicates. Lowering alone is checked,
+        // because some of these collectives fail to compile or abort the process.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let lower = |kind: ReductionKind, data_type: DataType| {
+            let (mesh, sharding) = (mesh.clone(), sharding.clone());
+            let traced: TracedProgram<ArrayType, ArrayType> = trace(
+                move |x: ArrayTracer| {
+                    shard_map(
+                        |local_x: ArrayTracer| local_x.parallel_reduce(kind, "x"),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new().with_check_manual_variation(false),
+                    )
+                    .unwrap()
+                },
+                ArrayType::new_static(data_type, [8]),
+            )
+            .unwrap();
+            traced.to_mlir_module("main").map(|_| ()).map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            lower(ReductionKind::Sum, DataType::U1),
+            Err("`parallel_reduce` with kind `sum` cannot reduce `u1` values over mesh axis `x`, because XLA adds \
+                 one-bit integers as predicates (i.e., with a logical or), while their sum wraps around"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(ReductionKind::Max, DataType::I1),
+            Err("`parallel_reduce` with kind `max` cannot reduce `i1` values over mesh axis `x`, because XLA orders \
+                 one-bit integers as predicates, which puts `-1` above `0`"
+                .to_string()),
+        );
+        assert_eq!(
+            lower(ReductionKind::Sum, DataType::U2),
+            Err("`parallel_reduce` with kind `sum` cannot reduce `u2` values over mesh axis `x`, because XLA does \
+                 not compile reductions of two-bit integers"
+                .to_string()),
+        );
+        assert_eq!(lower(ReductionKind::Max, DataType::U1), Ok(()));
+        assert_eq!(lower(ReductionKind::Sum, DataType::I32), Ok(()));
+        assert_eq!(lower(ReductionKind::Max, DataType::F32), Ok(()));
     }
 
     #[test]

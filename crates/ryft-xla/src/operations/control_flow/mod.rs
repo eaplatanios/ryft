@@ -1144,7 +1144,7 @@ mod tests {
             primal.to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[], %2:f32[2] .
-                let %3:f32[], %4:f32[2], %5:bool[], %6:bool[2] = jit_call %0 %1 %2 [
+                let %3:f32[], %4:f32[2], %5:bool[], %6:bool[2] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee={
                         lambda %0:bool[], %1:f32[], %2:f32[2] .
                         let %3:f32[] = condition %0 %1 [
@@ -1269,7 +1269,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
-                let %4:f32[], %5:f32[2] = jit_call %0 %1 %2 %3 [
+                let %4:f32[], %5:f32[2] = jit_call [derived_input_shardings=[_, _, _, _]] %0 %1 %2 %3 [
                     callee={
                         lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
                         let %4:f32[] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %3 [
