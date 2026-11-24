@@ -1,8 +1,7 @@
-use std::rc::Rc;
-
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_macros::Parameter;
@@ -66,16 +65,17 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     /// the explicit layout of its primal).
     #[inline]
     pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, DifferentiationError> {
-        let tangent_type = primal.r#type().tangent()?;
+        let primal_type = primal.r#type();
+        let tangent_type = primal_type.tangent()?;
         let tangent = match tangent.into() {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
                 if !tangent_type.is_interchangeable_with(tangent.r#type().as_ref()) {
                     return Err(TypeError::invalid(format!(
                         "tangent type {} does not match type {} required by primal type {}",
-                        tangent.r#type().as_ref(),
+                        tangent.r#type(),
                         tangent_type,
-                        primal.r#type().as_ref(),
+                        primal_type,
                     ))
                     .into());
                 }
@@ -694,8 +694,8 @@ impl<
     /// therefore cannot recover the omitted values' positions or types, and the tangent-type mapping is not generally
     /// invertible. `primal_input_types` preserves the complete public input boundary so that [`apply`](Self::apply)
     /// can validate and filter its tangent arguments. `tangent_reconstruction` independently preserves the
-    /// reconstruction plan for omitted output values, while `primal_output_types` validates the compact
-    /// program boundary and remains available to reverse mode conversion.
+    /// reconstruction plan for omitted output values. The staged declarations in `primal_output_types` validate
+    /// the compact program boundary, and the concrete types remain available to reverse mode conversion.
     ///
     /// This function validates the relationship among all three boundaries. In particular, the program must consume
     /// one leading input for every non-zero tangent in `primal_input_types`, followed by one input for every residual,
@@ -714,8 +714,9 @@ impl<
     ///     [`apply`](Self::apply), or [`None`] for a pushforward that is only transposed and never applied.
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
-    ///   - `primal_output_types`: Complete flattened output-type boundary of the original primal function, including
-    ///     the leaves whose tangents are absent from `program`.
+    ///   - `primal_output_types`: Concrete type and optional staged declaration for each primal output leaf, including
+    ///     the leaves whose tangents are absent from `program`. A leaf without a declaration uses its concrete type
+    ///     to validate the tangent program.
     ///   - `tangent_output_slots`: One flag per entry of `primal_output_types`, set when `program` has an output for
     ///     that primal output's tangent.
     ///   - `primal_references`: Contains the canonical identities of every reference bound at the primal boundary,
@@ -729,7 +730,7 @@ impl<
         residuals: Vec<C::Value>,
         tangent_reconstruction: Option<ZeroBoundaryReconstruction<C::Value>>,
         primal_input_types: Vec<C::Type>,
-        primal_output_types: Vec<C::Type>,
+        primal_output_types: Vec<(C::Type, Option<C::Type>)>,
         tangent_output_slots: Vec<bool>,
         primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
         output_structure: Output::ParameterStructure,
@@ -741,8 +742,10 @@ impl<
                 residuals.len(),
             ))
         })?;
+
+        // A saved primal can refine the type with which the tangent program uses it.
         for (index, (input, residual)) in program.inputs().skip(tangent_input_count).zip(&residuals).enumerate() {
-            if input.r#type().as_ref() != residual.r#type().as_ref() {
+            if !input.r#type().is_refined_by(&residual.r#type()) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward residual {} has type {} in the pushforward program \
                      but carries a value of type {}",
@@ -752,6 +755,7 @@ impl<
                 )));
             }
         }
+
         let live_input_tangent_types = primal_input_types
             .iter()
             .map(DifferentiableType::tangent)
@@ -767,6 +771,7 @@ impl<
                 live_input_tangent_types.len(),
             )));
         }
+
         for (index, (input, tangent_type)) in program.inputs().zip(&live_input_tangent_types).enumerate() {
             if input.r#type().as_ref() != tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -777,6 +782,7 @@ impl<
                 )));
             }
         }
+
         if tangent_output_slots.len() != primal_output_types.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward has {} tangent output slot flags for {} primal outputs",
@@ -784,19 +790,34 @@ impl<
                 primal_output_types.len(),
             )));
         }
+
         let mut live_output_tangent_types = Vec::with_capacity(primal_output_types.len());
-        for (index, (primal_type, &has_slot)) in primal_output_types.iter().zip(&tangent_output_slots).enumerate() {
-            let tangent_type = primal_type.tangent()?;
+        for (index, ((primal_type, declaration), &has_slot)) in
+            primal_output_types.iter().zip(&tangent_output_slots).enumerate()
+        {
+            let declaration = declaration.as_ref();
+            if let Some(declaration) = declaration
+                && !declaration.is_refined_by(primal_type)
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward primal output {index} of type {primal_type} does not refine \
+                     its declaration {declaration}",
+                )));
+            }
+
+            let tangent_type = declaration.unwrap_or(primal_type).tangent()?;
             if has_slot && tangent_type.is_zero_space() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward gives primal output {index} a tangent output but its tangent type {tangent_type} is a \
                      zero differential space",
                 )));
             }
+
             if has_slot {
                 live_output_tangent_types.push(tangent_type);
             }
         }
+
         if let Some(reconstruction) = &tangent_reconstruction
             && !reconstruction.matches_tangent_output_slots(&tangent_output_slots)
         {
@@ -804,6 +825,7 @@ impl<
                 "pushforward output tangent reconstruction does not match its tangent output slots".to_string(),
             ));
         }
+
         if live_output_tangent_types.len() != program.output_ids().len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward program produces {} tangent outputs but its public boundary has {} outputs with tangent \
@@ -812,24 +834,26 @@ impl<
                 live_output_tangent_types.len(),
             )));
         }
+
         for (index, (output, tangent_type)) in program.outputs().zip(&live_output_tangent_types).enumerate() {
             if output.r#type().as_ref() != tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "pushforward program tangent output {} has type {} but its public boundary requires tangent \
-                     type {}",
+                    "pushforward program tangent output {} has type {} but its public boundary \
+                     requires tangent type {}",
                     index,
                     output.r#type().as_ref(),
                     tangent_type,
                 )));
             }
         }
+
         Ok(Self {
             context,
             program,
             residuals,
             tangent_reconstruction,
             primal_input_types,
-            primal_output_types,
+            primal_output_types: primal_output_types.into_iter().map(|(r#type, _)| r#type).collect(),
             tangent_output_slots,
             primal_references,
             output_structure,
@@ -3638,7 +3662,9 @@ where
     let mut output_types = Vec::with_capacity(output_duals.len());
     for (output_index, output_dual) in output_duals.into_iter().enumerate() {
         let (primal, tangent) = output_dual.into_dual().into_parts();
-        let primal = match primal.into_value()?.value() {
+        let primal = primal.into_value()?;
+        let declaration = if tangent.is_zero() { None } else { primal.declared_type().cloned() };
+        let primal = match primal.value() {
             PartialValue::Known(value) => value.clone(),
             PartialValue::Unknown(_) => {
                 return Err(ProgramError::MalformedProgram(
@@ -3650,7 +3676,7 @@ where
             }
         };
         let tangent_type = tangent.r#type().into_owned();
-        output_types.push(primal.r#type().into_owned());
+        output_types.push((primal.r#type().into_owned(), declaration));
         if tangent_type.is_zero_space() {
             tangent_output_slots.push(false);
             primal_outputs.push(primal);
@@ -3691,9 +3717,12 @@ where
     // Only an applied pushforward rebuilds the omitted output tangents. A pullback converts the pushforward and
     // returns input cotangents instead, so transposition captures no runtime dimensions for the output tangents.
     let tangent_reconstruction = match rule {
-        DifferentiationRule::Jvp => {
-            Some(ZeroBoundaryReconstruction::capture(context, &primal_outputs, &output_types, &tangent_output_slots)?)
-        }
+        DifferentiationRule::Jvp => Some(ZeroBoundaryReconstruction::capture(
+            context,
+            &primal_outputs,
+            output_types.iter().map(|(r#type, _)| r#type),
+            &tangent_output_slots,
+        )?),
         DifferentiationRule::JvpForTranspose => None,
     };
 
@@ -4139,7 +4168,7 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Layout, Shape, ShardingDimension, StridedLayout,
+        DimensionVariable, Layout, LogicalMesh, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
@@ -4372,15 +4401,19 @@ pub(crate) mod tests {
     ) -> Result<Pushforward<EagerContext<Array, ArrayOperation<Array>>, Vec<Array>, Vec<Array>>, ProgramError> {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
-        let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = outputs.iter().map(|value| (value.r#type().into_owned(), None)).collect::<Vec<_>>();
         let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
         let tangent_output_slots = output_types
             .iter()
-            .map(|r#type| Ok(!r#type.tangent()?.is_zero_space()))
+            .map(|(r#type, _)| Ok(!r#type.tangent()?.is_zero_space()))
             .collect::<Result<Vec<_>, DifferentiationError>>()
             .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
-        let reconstruction =
-            ZeroBoundaryReconstruction::capture(&context, outputs, &output_types, &tangent_output_slots)?;
+        let reconstruction = ZeroBoundaryReconstruction::capture(
+            &context,
+            outputs,
+            output_types.iter().map(|(r#type, _)| r#type),
+            &tangent_output_slots,
+        )?;
         Pushforward::new(
             context,
             program,
@@ -4474,6 +4507,42 @@ pub(crate) mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "tangent type f64[2] does not match type f32[2] required by primal type \
                                f32[2][layout=strided{8}]",
+        ));
+    }
+
+    #[test]
+    fn test_differentiation_dual_rejects_mismatched_tangent_sharding() {
+        let placed_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0))
+            .unwrap();
+        let placed = Array::from_elements(placed_type.clone(), &[1f32]).unwrap();
+        let plain = Array::scalar(2f32).unwrap();
+        let message =
+            format!("tangent type f32[] does not match type {placed_type} required by primal type {placed_type}");
+        assert!(matches!(
+            DifferentiationDual::new(placed.clone(), plain.clone()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message: actual })))
+                if actual == message,
+        ));
+        let message = format!("tangent type {placed_type} does not match type f32[] required by primal type f32[]");
+        assert!(matches!(
+            DifferentiationDual::new(plain.clone(), placed.clone()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message: actual })))
+                if actual == message,
+        ));
+        let message = format!(
+            "pushforward program tangent input 0 has type f32[] but its public boundary requires tangent type {placed_type}"
+        );
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[DataType::F32], &[]), Vec::new(), std::slice::from_ref(&placed), &[]),
+            Err(ProgramError::MalformedProgram(actual)) if actual == message,
+        ));
+        let message = format!(
+            "pushforward program tangent output 0 has type f32[] but its public boundary requires tangent type {placed_type}"
+        );
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[], &[plain]), Vec::new(), &[], &[placed]),
+            Err(ProgramError::MalformedProgram(actual)) if actual == message,
         ));
     }
 
@@ -4880,7 +4949,7 @@ pub(crate) mod tests {
             let reconstruction = ZeroBoundaryReconstruction::capture(
                 &context,
                 std::slice::from_ref(&output),
-                std::slice::from_ref(&output_type),
+                std::iter::once(&output_type),
                 reconstructed_slots,
             )?;
             let references = ReferenceBoundary::new_for_differentiation(&context, &[], &[], &[])?;
@@ -4890,7 +4959,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 Some(reconstruction),
                 Vec::new(),
-                vec![output_type],
+                vec![(output_type, None)],
                 tangent_output_slots,
                 references,
                 vec![Placeholder],

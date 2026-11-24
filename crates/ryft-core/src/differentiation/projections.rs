@@ -528,13 +528,7 @@ impl DifferentiationRule {
                     MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
                     MaybeZero::Value(value) => {
                         let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
-                        let declaration = input
-                            .declared_primal_type()
-                            .map(<&T>::try_from)
-                            .transpose()
-                            .map_err(Into::<TypeError>::into)?
-                            .cloned();
-                        DifferentiationDual::new_with_primal_declaration(primal, MaybeZero::Value(tangent), declaration)
+                        DifferentiationDual::new(primal, tangent)
                     }
                 }
             })
@@ -544,7 +538,6 @@ impl DifferentiationRule {
         outputs
             .into_iter()
             .map(|output| {
-                let declaration = output.declared_primal_type().cloned().map(Into::into);
                 let (primal, tangent) = output.into_parts();
                 let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
                 let tangent = match tangent {
@@ -553,7 +546,7 @@ impl DifferentiationRule {
                         MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
                     }
                 };
-                DifferentiationDual::new_with_primal_declaration(primal, tangent, declaration)
+                DifferentiationDual::new(primal, tangent)
             })
             .collect::<Result<Vec<_>, _>>()
     }
@@ -1884,24 +1877,21 @@ mod tests {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(ArrayIrContext::new()));
         let unplaced = ArrayType::scalar(DataType::F64);
         let placed = unplaced.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0)).unwrap();
-        let primal = context.primal().lift(Array::from_elements(placed.clone(), &[2.0f64]).unwrap().into()).unwrap();
         let declaration = ArrayIrType::from(unplaced);
+        let mut primal = context.primal().known_value(Array::from_elements(placed.clone(), &[2.0f64]).unwrap().into());
+        primal.set_declared_type(&declaration).unwrap();
+        let primal = PartialTracer::new(context.primal().clone(), primal);
         let tangent =
             PartialTracer::new(context.tangent().clone(), context.tangent().unknown_input(declaration.clone(), 0));
-        let input = DifferentiationDual::new_with_primal_declaration(
-            primal,
-            MaybeZero::Value(tangent),
-            Some(declaration.clone()),
-        )
-        .unwrap();
-
+        let input = DifferentiationDual::new(primal, tangent).unwrap();
         let output = context
             .jvp_projected_operation(&ArrayOperation::<Array>::Neg(NegOperation::new()), &[input])
             .unwrap()
             .remove(0);
-        assert_eq!(output.primal().r#type().into_owned(), ArrayIrType::from(placed));
+        let primal = output.primal().value().unwrap();
+        assert_eq!(primal.as_known().unwrap().r#type().into_owned(), ArrayIrType::from(placed));
+        assert_eq!(primal.r#type().as_ref(), &declaration);
         assert_eq!(output.tangent().as_value().unwrap().r#type().as_ref(), &declaration);
-        assert_eq!(output.declared_primal_type(), Some(&declaration));
     }
 
     #[test]

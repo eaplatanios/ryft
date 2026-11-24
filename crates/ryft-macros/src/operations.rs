@@ -831,7 +831,8 @@ impl OperationCodeGenerator {
                 variant.wildcard_arm(quote!(context.fold_or_residualize(
                     self.clone(),
                     driver.region_programs(),
-                    inputs
+                    inputs,
+                    ::std::option::Option::None,
                 )))
             }
         });
@@ -3807,13 +3808,28 @@ mod tests {
                                     partially_evaluate(operation, context, driver, inputs)
                             },
                             Self::Array(..) => {
-                                context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+                                context.fold_or_residualize(
+                                    self.clone(),
+                                    driver.region_programs(),
+                                    inputs,
+                                    ::std::option::Option::None,
+                                )
                             },
                             Self::Portable(..) => {
-                                context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+                                context.fold_or_residualize(
+                                    self.clone(),
+                                    driver.region_programs(),
+                                    inputs,
+                                    ::std::option::Option::None,
+                                )
                             },
                             Self::Extension(..) => {
-                                context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+                                context.fold_or_residualize(
+                                    self.clone(),
+                                    driver.region_programs(),
+                                    inputs,
+                                    ::std::option::Option::None,
+                                )
                             },
                         }
                     }

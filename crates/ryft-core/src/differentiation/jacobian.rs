@@ -528,6 +528,7 @@ where
     // structural zero tangent and seeds nothing, so its coordinates receive no contribution and its rows of the
     // Jacobian are zero.
     let tangent_output_slots = pullback.tangent_output_slots().to_vec();
+    let tangent_output_types = pullback.linear_program().output_types().into_owned();
     let (transposed, residuals) = pullback.into_transposed_parts()?;
     let program = transposed.program();
     let program_input_types = program.input_types();
@@ -540,6 +541,7 @@ where
     })?;
     check_count!("output", tangent_output_slots, output_types.parameter_count(), ProgramError);
     let seeded_output_count = tangent_output_slots.iter().filter(|&&has_slot| has_slot).count();
+    check_count!("output", tangent_output_types, seeded_output_count, ProgramError);
     if cotangent_input_count != seeded_output_count {
         return Err(ProgramError::MalformedProgram(format!(
             "pullback program consumes {} cotangent inputs but the differentiated output has {} leaves with tangent \
@@ -563,20 +565,24 @@ where
                 r#type: r#type.to_string(),
             });
         }
+
         if !has_slot {
             continue;
         }
-        let program_input_type = &program_input_types[packed_inputs.len()];
-        if program_input_type != &cotangent_type {
+
+        // Transposition derives each seed from the corresponding validated tangent output. The basis uses the
+        // concrete primal's cotangent type so its placement agrees with the public output.
+        let seed_index = packed_inputs.len();
+        let expected_cotangent_type = tangent_output_types[seed_index].cotangent()?;
+        let program_input_type = &program_input_types[seed_index];
+        if program_input_type != &expected_cotangent_type {
             return Err(ProgramError::MalformedProgram(format!(
-                "pullback cotangent input {} has type {} but output parameter {} has cotangent type {}",
-                packed_inputs.len(),
-                program_input_type,
-                path,
-                cotangent_type,
+                "pullback cotangent input {seed_index} has type {program_input_type} but output parameter {path} \
+                 requires staged cotangent type {expected_cotangent_type}",
             ))
             .into());
         }
+
         packed_inputs.push(C::Type::coordinate_basis(
             context,
             r#type,

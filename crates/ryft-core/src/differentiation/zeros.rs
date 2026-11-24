@@ -381,13 +381,18 @@ impl<V: Value<Type: DifferentiableType>> ZeroBoundaryReconstruction<V> {
     /// Returns [`ProgramError::MalformedProgram`] if the primal value, type, and slot counts differ or if an operation
     /// family captures residual values whose count or types disagree with its declaration.
     pub(crate) fn capture<
+        't,
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
+        T: ExactSizeIterator<Item = &'t V::Type>,
     >(
         context: &C,
         primal_values: &[C::Value],
-        primal_types: &[C::Type],
+        primal_types: T,
         tangent_output_slots: &[bool],
-    ) -> Result<Self, ProgramError> {
+    ) -> Result<Self, ProgramError>
+    where
+        V::Type: 't,
+    {
         if primal_values.len() != primal_types.len() || primal_values.len() != tangent_output_slots.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} has {} primal values, {} primal types, and {} tangent output slot flags",
@@ -397,6 +402,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroBoundaryReconstruction<V> {
                 tangent_output_slots.len(),
             )));
         }
+
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
         for (index, ((value, primal_type), &has_slot)) in
@@ -418,7 +424,8 @@ impl<V: Value<Type: DifferentiableType>> ZeroBoundaryReconstruction<V> {
                 });
             }
         }
-        Ok(Self { residuals, boundary_size: primal_types.len(), zero_leaves })
+
+        Ok(Self { residuals, boundary_size: primal_values.len(), zero_leaves })
     }
 
     /// Returns `true` when this reconstruction omits exactly the leaves that `tangent_output_slots` does not flag
@@ -704,7 +711,7 @@ mod tests {
         // Capture retains the key's dynamic extent and records that only the accumulator tangent remains live in the
         // compact output boundary. Rebuild must recover the omitted key tangent from that stored plan.
         let reconstruction =
-            ZeroBoundaryReconstruction::capture(&context, &primal_values, &primal_types, &[false, true]).unwrap();
+            ZeroBoundaryReconstruction::capture(&context, &primal_values, primal_types.iter(), &[false, true]).unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
         let key_tangent_type = ArrayIrType::Array(key_type.tangent().unwrap());
         assert_eq!(outputs.len(), 2);
@@ -731,9 +738,13 @@ mod tests {
             ArrayType::scalar(DataType::I32),
         ];
         let primal_values = primal_types.iter().map(|r#type| context.input(r#type.clone())).collect::<Vec<_>>();
-        let reconstruction =
-            ZeroBoundaryReconstruction::capture(&context, &primal_values, &primal_types, &[true, false, true, false])
-                .unwrap();
+        let reconstruction = ZeroBoundaryReconstruction::capture(
+            &context,
+            &primal_values,
+            primal_types.iter(),
+            &[true, false, true, false],
+        )
+        .unwrap();
 
         // Live values fill the nonzero-space leaves in order, and each zero-space leaf keeps its boundary index
         // with a freshly materialized zero of its tangent type.
@@ -767,7 +778,7 @@ mod tests {
         // A leaf without a tangent slot is omitted even though its tangent space is not a zero space (e.g., the output
         // of `stop_gradient`). Capture reads its extent from the primal value and rebuild materializes a sized zero.
         let reconstruction =
-            ZeroBoundaryReconstruction::capture(&context, &primal_values, &primal_types, &[false, true]).unwrap();
+            ZeroBoundaryReconstruction::capture(&context, &primal_values, primal_types.iter(), &[false, true]).unwrap();
         assert!(reconstruction.matches_tangent_output_slots(&[false, true]));
         assert!(!reconstruction.matches_tangent_output_slots(&[true, true]));
         assert!(!reconstruction.matches_tangent_output_slots(&[false]));
@@ -782,7 +793,7 @@ mod tests {
         // Mismatched boundary metadata is rejected before anything is captured.
         drop(builder);
         assert_eq!(
-            ZeroBoundaryReconstruction::capture(&context, &primal_values, &primal_types, &[true]).map(|_| ()),
+            ZeroBoundaryReconstruction::capture(&context, &primal_values, primal_types.iter(), &[true]).map(|_| ()),
             Err(ProgramError::MalformedProgram(
                 "output tangent boundary has 2 primal values, 2 primal types, and 1 tangent output slot flags"
                     .to_string(),
@@ -800,7 +811,7 @@ mod tests {
         let output_tangent = ZeroBoundaryReconstruction::capture(
             &context,
             std::slice::from_ref(&primal),
-            std::slice::from_ref(&primal_type),
+            std::iter::once(&primal_type),
             &[true],
         )
         .unwrap();
