@@ -1,6 +1,6 @@
 //! Moving values between concrete placements, which is the Ryft analogue of JAX's
-//! [`device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html). A [`Placement`] names where an
-//! array lives concretely (i.e., a [`Sharding`] over the devices of a [`DeviceMesh`], optionally with a [`Memory`]
+//! [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html). A [`Placement`] names where
+//! an array lives concretely (i.e., a [`Sharding`] over the devices of a [`DeviceMesh`], optionally with a [`Memory`]
 //! space and a storage [`Layout`]). Moving a value to another placement never changes its elements, shape, or data
 //! type, and unlike a [`Reshard`](crate::Reshard), which redistributes a value over the mesh that it already lives
 //! on, it can move the value onto the devices of another mesh.
@@ -90,9 +90,11 @@ use crate::tracing::Tracer;
 /// records, and the sharding of a source is what the input type must track. A bare device names no mesh, and the mesh
 /// of a value is not always known when its placement is staged (e.g., while a function is traced before it is compiled
 /// for a device mesh), so the device form keeps the intent "this device" until a backend knows where the value lives.
-/// The in-place form names no devices at all, so it changes only the storage of a value wherever the value lives,
-/// which is the analogue of a memory space destination of JAX's `device_put` (e.g.,
-/// `jax.device_put(x, jax.memory.Space.Host)`), which keeps the devices and the distribution of `x`.
+/// The in-place form names no devices at all, so it changes only the storage of a value wherever the value lives, and
+/// it keeps the devices and the distribution of the value on every path. It is the Ryft analogue of a memory space
+/// destination of JAX's [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html) (e.g.,
+/// `jax.device_put(x, jax.memory.Space.Host)`), which does not guarantee that it keeps the devices of an uncommitted
+/// `x`.
 ///
 /// # Staging and Resolution
 ///
@@ -256,11 +258,8 @@ impl PlacementRequest {
     /// Returns the [`Memory`] space that this request selects as the target of a placement, or [`None`] if the output
     /// keeps the memory of the value. A [`PlacementRequest::Device`] without a memory selects the default memory of its
     /// device (i.e., [`Memory::Device`]), so that it moves a value out of any other memory (e.g., pinned host memory).
-    /// JAX's eager `device_put` does the same for a bare device that is another device than the one of the value, or
-    /// with `may_alias=False`, whereas on CPU it rejects a move to the same device under the default aliasing policy
-    /// with a memory kind error. Every other form selects the memory that it names. This is
-    /// the one owner of that rule, which the type rule of [`PlaceOperation`] and the backends that execute a placement
-    /// share.
+    /// This is the one owner of that rule, which the type rule of [`PlaceOperation`] and the backends that execute a
+    /// placement share.
     #[inline]
     pub fn target_memory(&self) -> Option<Memory> {
         match self {
@@ -699,10 +698,11 @@ impl PlaceOperation {
     /// placement of the input along auto axes is never compared with a source, whose devices and auto axes are
     /// informative (e.g., a cotangent can be split along auto axes otherwise than the source of the transposed
     /// placement says). A source layout therefore addresses the shards that the concrete sharding determines, or,
-    /// without it, those that the type of the input determines, and the shards that a source placement describes only
-    /// for an input whose type tracks no sharding. Without a concrete sharding, a source restates the reduction state
-    /// of the input over the axes that its type records, and its reduction state over auto axes, which the type cannot
-    /// describe, is not checked.
+    /// without it, those that the type of the input determines, and the shards that a source placement or a device
+    /// source describes only for an input whose type tracks no sharding, while the shards of such an input are not
+    /// known without a source that names its devices, so the checks that depend on their extents are left to the
+    /// backend. Without a concrete sharding, a source restates the reduction state of the input over the axes that
+    /// its type records, and its reduction state over auto axes, which the type cannot describe, is not checked.
     ///
     /// # Errors
     ///
@@ -865,36 +865,50 @@ impl PlaceOperation {
         // into one whole shard), in which case backends store it in their default layout. The sharding of a placement
         // target describes every mesh axis, and the output of a device target lives on one device, while the output of
         // an in-place target is distributed like its input, which may also be split along the auto axes that its type
-        // omits. A target layout of an in-place target is therefore checked against the concrete sharding when it is
-        // known, whereas the decision to keep the layout of the input uses the type of the input alone, so that the
-        // output type never depends on the concrete sharding. Both agree for every concrete value, whose layout already
-        // addresses its own shards, which an in-place target keeps (e.g., backends validate the layout of an array
-        // against its shards when they construct it).
-        let (sharding, is_complete) = match destination {
-            PlacementRequest::Resolved(placement) => (Some(placement.sharding()), true),
-            PlacementRequest::Device { .. } => (output.sharding(), true),
-            PlacementRequest::InPlace { .. } => (known_sharding, is_known_complete),
+        // omits. The shards of an in-place output are therefore those of the input as far as they are known (refer
+        // to `Self::known_input_shards`, which owns the rule that a check depending on the shape of a shard is made
+        // exactly when the shards are known), and a target layout is checked against them, whereas the decision to
+        // keep the layout of the input uses the type of the input alone, so that the output type never depends on the
+        // concrete sharding. Both agree for every concrete value, whose layout already addresses its own shards, which
+        // an in-place target keeps (e.g., backends validate the layout of an array against its shards when they
+        // construct it).
+        let shards = match destination {
+            PlacementRequest::Resolved(placement) => Some((Some(placement.sharding()), true)),
+            PlacementRequest::Device { .. } => Some((output.sharding(), true)),
+            PlacementRequest::InPlace { .. } => Self::known_input_shards(input, concrete_sharding, source_request),
         };
 
-        // A placement target leaves the shards of the input unchanged when the input type records exactly its sharding
-        // and the mesh has no auto axis larger than one, along which the input may also be split without its type
-        // recording it. This uses the type of the input alone, like the rest of the decision below.
-        let keeps_shards = destination.placement().is_some_and(|placement| {
-            let sharding = placement.sharding();
-            input.sharding() == Some(sharding)
-                && sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1)
-        });
+        // A placement leaves the shards of the input unchanged when the type of the input determines them and the
+        // destination provably has the same ones. A placement target does when its sharding is exactly the one that
+        // the input type records and its mesh has no auto axis larger than one, along which the input may also be
+        // split without its type recording it. A value that its type records on a mesh of one device has one shard
+        // that holds the whole value, before and after a device target or a placement target over a mesh of one device.
+        // The shards of an input whose type tracks no sharding are not known, so it keeps no layout this way. This uses
+        // the type of the input alone, like the rest of the decision below.
+        let is_single_shard = |sharding: &Sharding| sharding.mesh().device_count() == 1;
+        let is_single_shard_input = input.sharding().is_some_and(is_single_shard);
+        let keeps_shards = match destination {
+            PlacementRequest::Resolved(placement) => {
+                let sharding = placement.sharding();
+                let has_no_auto_split =
+                    sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1);
+                (input.sharding() == Some(sharding) && has_no_auto_split)
+                    || (is_single_shard_input && is_single_shard(sharding))
+            }
+            PlacementRequest::Device { .. } => is_single_shard_input,
+            PlacementRequest::InPlace { .. } => false,
+        };
 
         match (destination.layout(), output.layout()) {
             (Some(layout), _) => {
-                output.validate_shard_layout(layout, sharding, is_complete).map_err(|error| {
+                Self::validate_layout_of_shards(&output, layout, shards).map_err(|error| {
                     TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
                 })?;
                 output = output.with_layout(layout.clone());
             }
             (None, Some(_)) if !destination.moves() || keeps_shards => {
-                // An in-place target without a layout keeps the sharding and the layout of the input, and so does
-                // a placement target whose sharding is provably the one that the input type records, so the output
+                // An in-place target without a layout keeps the sharding and the layout of the input, and so does a
+                // placement whose destination provably has the shards that the input type determines, so the output
                 // keeps the layout that the input type already promises for exactly the same shards at every extent.
             }
             (None, Some(layout)) => {
@@ -918,11 +932,8 @@ impl PlaceOperation {
                         .collect::<Option<Vec<_>>>(),
                 };
                 let holds = largest_dimensions.is_some_and(|dimensions| {
-                    output
-                        .clone()
-                        .with_shape(Shape::new(dimensions))
-                        .validate_shard_layout(layout, sharding, is_complete)
-                        .is_ok()
+                    let largest = output.clone().with_shape(Shape::new(dimensions));
+                    Self::validate_layout_of_shards(&largest, layout, shards).is_ok()
                 });
                 if !holds {
                     output = output.with_layout(None::<Layout>);
@@ -997,42 +1008,65 @@ impl PlaceOperation {
     }
 
     /// Validates that the `layout` of the input, which `source` asserts or the type of the input declares, addresses
-    /// the shards of a value of type `input`, which its concrete sharding (i.e., `concrete_sharding`) determines when
-    /// it is known, and the sharding that its type tracks otherwise (which omits the auto axes along which the input
-    /// may also be split, so it determines no shards over a mesh with an auto axis larger than one). The split that a
-    /// placement source describes along auto axes is a hint, like its devices, so it only describes the shards of an
-    /// input whose type tracks no sharding, and never makes a layout pass or fail for a split that the input does not
-    /// have. When no sharding of the input is known at all (i.e., neither a concrete sharding, nor one that its type
-    /// tracks, nor a source placement), a staged input of a type without a sharding may be split in any way, so the
-    /// shape of its shards is not known either. A strided layout is then only checked at the smallest shard (i.e., one
-    /// element along each dimension that is not empty), which keeps every check that does not depend on the extents of
-    /// the shards (e.g., the rank), and the backend that places a concrete value validates the rest against its shards.
+    /// the shards of a value of type `input` as far as they are known (refer to [`Self::known_input_shards`]).
     fn validate_source_shard_layout(
         input: &ArrayType,
         concrete_sharding: Option<&Sharding>,
         source: Option<&PlacementRequest>,
         layout: &Layout,
     ) -> Result<(), TypeError> {
-        let source = source.and_then(PlacementRequest::placement);
-        let (sharding, is_complete) = match (concrete_sharding, input.sharding(), source) {
-            (Some(sharding), _, _) => (Some(sharding), true),
-            (None, Some(sharding), _) => (Some(sharding), false),
-            (None, None, Some(placement)) => (Some(placement.sharding()), true),
-            (None, None, None) => (None, false),
-        };
-        let smallest_shard;
-        let input = match (layout, sharding) {
-            (Layout::Strided(_), None) => {
-                let dimensions = input.shape().dimensions().iter();
-                let dimensions = dimensions.map(|dimension| Dimension::Static(dimension.bounds().lower().min(1)));
-                smallest_shard = input.clone().with_shape(Shape::new(dimensions.collect()));
-                &smallest_shard
-            }
-            _ => input,
-        };
-        input
-            .validate_shard_layout(layout, sharding, is_complete)
+        let shards = Self::known_input_shards(input, concrete_sharding, source);
+        Self::validate_layout_of_shards(input, layout, shards)
             .map_err(|error| TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` source layout is invalid: {error}")))
+    }
+
+    /// Returns the shards of a value of type `input` as far as a placement knows them, as the sharding that determines
+    /// them and whether that sharding describes every mesh axis (refer to [`ArrayType::validate_shard_layout`], for
+    /// which no sharding means one shard that holds the whole value), or [`None`] when they are not known. This is the
+    /// one rule behind every check and every promise of a placement that depends on the shape of a shard (i.e., that a
+    /// layout addresses the shards of the input or of an in-place output, and that an output keeps the layout of its
+    /// input): each is made exactly when the shards are known. They are known when the concrete sharding of the value
+    /// is known (i.e., `concrete_sharding`), when the type of the input records a sharding (which omits the auto axes
+    /// along which the input may also be split, so it determines no shards over a mesh with an auto axis larger than
+    /// one), when a placement `source` resolves one (whose split along auto axes is a hint, like its devices, so it
+    /// only describes the shards of an input whose type tracks no sharding), and when a device `source` names the one
+    /// device that holds the whole value as one shard. A staged input whose type tracks no sharding may otherwise be
+    /// split in any way, so its shards are not known, and the checks that depend on their extents are left to the
+    /// backend that places a concrete value (refer to [`Self::validate_layout_of_shards`]).
+    fn known_input_shards<'s>(
+        input: &'s ArrayType,
+        concrete_sharding: Option<&'s Sharding>,
+        source: Option<&'s PlacementRequest>,
+    ) -> Option<(Option<&'s Sharding>, bool)> {
+        match (concrete_sharding, input.sharding(), source) {
+            (Some(sharding), _, _) => Some((Some(sharding), true)),
+            (None, Some(sharding), _) => Some((Some(sharding), false)),
+            (None, None, Some(PlacementRequest::Resolved(placement))) => Some((Some(placement.sharding()), true)),
+            (None, None, Some(PlacementRequest::Device { .. })) => Some((None, true)),
+            (None, None, Some(PlacementRequest::InPlace { .. }) | None) => None,
+        }
+    }
+
+    /// Validates `layout` against the shards of a value of type `r#type` that `shards` describes (refer to
+    /// [`Self::known_input_shards`]). When they are not known, a strided layout is only checked at the smallest shard
+    /// (i.e., one element along each dimension that is not empty), which keeps every check that does not depend on the
+    /// extents of the shards (e.g., the rank), and a tiled layout, which is valid for every shape of its rank, is
+    /// checked as usual.
+    fn validate_layout_of_shards(
+        r#type: &ArrayType,
+        layout: &Layout,
+        shards: Option<(Option<&Sharding>, bool)>,
+    ) -> Result<(), TypeError> {
+        match (layout, shards) {
+            (_, Some((sharding, is_complete))) => r#type.validate_shard_layout(layout, sharding, is_complete),
+            (Layout::Tiled(_), None) => r#type.validate_shard_layout(layout, None, true),
+            (Layout::Strided(_), None) => {
+                let dimensions = r#type.shape().dimensions().iter();
+                let dimensions = dimensions.map(|dimension| Dimension::Static(dimension.bounds().lower().min(1)));
+                let smallest_shard = r#type.clone().with_shape(Shape::new(dimensions.collect()));
+                smallest_shard.validate_shard_layout(layout, None, true)
+            }
+        }
     }
 
     /// Validates that a placement of a value of type `input` onto `target`, which states that the value lives
@@ -4157,27 +4191,60 @@ mod tests {
         // Without any known sharding of the input (i.e., a staged `f32[2, 2]` whose type tracks none, with an in-place
         // source), the shards of the input are not known either, so the source strides `[4, 4]`, which address the two
         // column shards of a concrete input that refines that type, are accepted. A source placement that is known to
-        // replicate the input describes one whole shard, which they overlap, so it still rejects them. Before, the
-        // untracked input was checked as one whole shard too.
+        // replicate the input describes one whole shard, which they overlap, so it still rejects them, and so does a
+        // device source, because one device holds the whole value as one shard (as eager placement rejects it). An
+        // in-place target leaves the shards of the input, so the same rule applies to its layout: the strides are
+        // accepted for the untracked input, and rejected with a device source or for an input whose type records one
+        // shard that holds the whole value. Before, the untracked input was checked as one whole shard for an in-place
+        // target, and at the smallest shard for a device source.
         let split_rows = placement(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
         let untracked_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let single_shard_type =
+            untracked_type.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 2)).unwrap();
         let column_shard_strides = Layout::Strided(StridedLayout::new(vec![4, 4]));
         let replicated_source = placement(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
-        for (source, expected) in [
+        let device = Device::new(0, 0);
+        let in_place = PlacementRequest::InPlace { memory: None, layout: Some(column_shard_strides.clone()) };
+        let overlapping_columns = |end: &str| {
+            Err(TypeError::invalid(format!(
+                "`{PLACE_OPERATION_NAME}` {end} layout is invalid: strided layout stride 4 on axis 1 is smaller than \
+                 the 8-byte span occupied by more minor axes and may alias array elements",
+            )))
+        };
+        for (target, source, input_type, expected) in [
             (
-                PlacementRequest::InPlace { memory: None, layout: Some(column_shard_strides.clone()) },
+                PlacementRequest::from(split_rows.clone()),
+                Some(in_place.clone()),
+                &untracked_type,
                 Ok(vec![untracked_type.clone().with_sharding(split_rows.sharding().clone()).unwrap()]),
             ),
             (
-                PlacementRequest::from(replicated_source.with_layout(column_shard_strides.clone())),
-                Err(TypeError::invalid(format!(
-                    "`{PLACE_OPERATION_NAME}` source layout is invalid: strided layout stride 4 on axis 1 is smaller \
-                     than the 8-byte span occupied by more minor axes and may alias array elements",
-                ))),
+                PlacementRequest::from(split_rows.clone()),
+                Some(PlacementRequest::from(replicated_source.with_layout(column_shard_strides.clone()))),
+                &untracked_type,
+                overlapping_columns("source"),
             ),
+            (
+                PlacementRequest::from(split_rows.clone()),
+                Some(PlacementRequest::Device { device, memory: None, layout: Some(column_shard_strides.clone()) }),
+                &untracked_type,
+                overlapping_columns("source"),
+            ),
+            (
+                in_place.clone(),
+                None,
+                &untracked_type,
+                Ok(vec![untracked_type.clone().with_layout(column_shard_strides.clone())]),
+            ),
+            (in_place.clone(), Some(PlacementRequest::from(device)), &untracked_type, overlapping_columns("target")),
+            (in_place.clone(), None, &single_shard_type, overlapping_columns("target")),
         ] {
-            let operation = PlaceOperation::new(split_rows.clone(), source.clone());
-            assert_eq!(operation.infer_output_types(std::slice::from_ref(&untracked_type), &[]), expected, "{source}");
+            let operation = PlaceOperation::new(target.clone(), source.clone());
+            assert_eq!(
+                operation.infer_output_types(std::slice::from_ref(input_type), &[]),
+                expected,
+                "{target} {source:?} {input_type}",
+            );
         }
 
         // Without a target layout, whether an in-place output keeps the layout of its input depends on the type of the
@@ -4644,9 +4711,17 @@ mod tests {
         // A placement target whose sharding is the one that the input type records also moves no shard of its own
         // shape, so it keeps the layout of a replicated `f32[n, 2]` with the strides `[8, 4]` for a variable without an
         // upper bound, whereas a target that splits the rows follows the largest-extent rule and drops it. Before, the
-        // same replicated target dropped it too.
+        // same replicated target dropped it too. A value on a mesh of one device has one shard that holds the whole
+        // value before and after a device target or a placement target over a mesh of one device, so both keep the
+        // layout too (before, both dropped it for a variable without an upper bound), whereas the shards of an input
+        // whose type tracks no sharding are not known, so a device target drops its layout.
         let row_major = Layout::Strided(StridedLayout::new(vec![8, 4]));
         let same_replicated = PlaceOperation::new(placement(&mesh, vec![ShardingDimension::Replicated; 2]), None);
+        let single_device = Sharding::replicated(LogicalMesh::single_device(), 2);
+        let on_device = PlaceOperation::new(Device::new(0, 0), None);
+        let other_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(1, 0)]).unwrap();
+        let on_other_device =
+            PlaceOperation::new(Placement::new(other_device_mesh, single_device.clone()).unwrap(), None);
         for (operation, input_type, expected) in [
             (&memory_only, input_type(&unbounded, None, &tiled), input_type(&unbounded, None, &tiled)),
             (&memory_only, input_type(&bounded, None, &strided), input_type(&bounded, None, &strided)),
@@ -4665,6 +4740,21 @@ mod tests {
                 &split_rows,
                 input_type(&unbounded, Some(&replicated), &row_major),
                 input_type(&unbounded, Some(&split), &row_major).with_layout(None::<Layout>),
+            ),
+            (
+                &on_device,
+                input_type(&unbounded, Some(&single_device), &row_major),
+                input_type(&unbounded, Some(&single_device), &row_major),
+            ),
+            (
+                &on_other_device,
+                input_type(&unbounded, Some(&single_device), &row_major),
+                input_type(&unbounded, Some(&single_device), &row_major),
+            ),
+            (
+                &on_device,
+                input_type(&unbounded, None, &row_major),
+                input_type(&unbounded, None, &row_major).with_layout(None::<Layout>),
             ),
         ] {
             let output = operation.infer_output_type_requiring_even_splits(&input_type, None);
