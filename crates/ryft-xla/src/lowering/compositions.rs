@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use ryft_core::{
-    ArrayType, AtomId, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef, RegionRole,
+    ArrayType, CompositeKey, Parameterized, ProgramError, RegionId, RegionRef, RegionRole,
     RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
@@ -13,7 +13,7 @@ use ryft_mlir::{
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{lower_array_ir_type, lower_tensor_type};
 use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
-use crate::operations::composites::NamedCompositeImplementation;
+use crate::operations::composites::omits_regions;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
@@ -167,7 +167,9 @@ impl NamedCompositionFunctionMap {
 }
 
 /// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
-/// Composite calls that a backend implementation replaces on `target_platform` contribute no compositions.
+/// Only the regions that lowering emits for `target_platform` contribute (refer to [`omits_regions`]), so neither a
+/// composite call that a backend implementation replaces on that target nor the body of a scan that admits no
+/// iteration contributes compositions.
 pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
     program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
@@ -189,20 +191,8 @@ where
         }
         for instruction in region.instructions() {
             let operation = instruction.operation();
-            if let Some(key) = operation.composite_key() {
-                let types = |atoms: &[AtomId]| {
-                    atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
-                };
-                if NamedCompositeImplementation::select(
-                    key,
-                    &types(instruction.inputs()),
-                    &types(instruction.outputs()),
-                    target_platform,
-                )
-                .is_some()
-                {
-                    continue;
-                }
+            if omits_regions(region, instruction, target_platform) {
+                continue;
             }
             for (index, nested) in instruction.regions().iter().enumerate() {
                 if operation.region_role(index) == Some(RegionRole::Computation) {
@@ -327,14 +317,15 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        CompositeAttribute, DataType, DomainTracingContext, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension,
+        CompositeAttribute, DataType, DomainTracingContext, DotDimensionNumbers, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, ScanOperation, Shape, Sharding, ShardingDimension,
     };
 
-    use crate::{Session, Tracer};
+    use crate::{ProgramBuilder, Session, Tracer};
 
     use super::*;
 
@@ -424,5 +415,40 @@ mod tests {
             vec!["downstream.example", "downstream.example_1"],
         );
         assert_eq!(registry.order()[1].input_types, vec![vector_type]);
+    }
+
+    #[test]
+    fn test_collect_named_composition_functions_skips_the_bodies_of_scans_without_iterations() {
+        // A scaled dot in the body of a scan needs its composition when the length of the scan admits an iteration,
+        // and not on any target when its length is zero, because lowering then emits nothing of its body (refer to
+        // `omits_regions`).
+        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![2.into(), 16.into()]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 1.into()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
+        let carry_types = [output_type, element_type.clone(), element_type, scale_type.clone(), scale_type];
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carries = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
+            let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+            let operation = ScaledDotOperation::new(dimensions, DataType::F32, true, true);
+            let output = builder.add_instruction(operation, Vec::new(), carries[1..].to_vec(), None).unwrap()[0];
+            let outputs = std::iter::once(output).chain(carries[1..].iter().copied()).collect();
+            Arc::new(builder.build(outputs, vec![Placeholder; 6], vec![Placeholder; 5]).unwrap())
+        };
+        let symbols = |length: usize| {
+            let mut builder = ProgramBuilder::new();
+            let inputs = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect();
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let scan = ScanOperation::<Type>::new(5, length);
+            let outputs = builder.add_instruction(scan, regions, inputs, None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
+                .unwrap();
+            let map = collect_named_composition_functions(&program, None).unwrap();
+            map.order().iter().map(|key| map.functions()[key].symbol().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(symbols(0), Vec::<String>::new());
+        assert_eq!(symbols(1), vec!["xla.scaled_dot".to_string()]);
     }
 }

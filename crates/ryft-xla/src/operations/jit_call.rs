@@ -10432,6 +10432,64 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_operation_eager_decision_gives_arguments_the_declared_logical_mesh() {
+        // A compiled identity declares its input replicated over the mesh `q`. An argument replicated over another
+        // logical mesh of the same devices (e.g., `p`, or the default mesh of an upload) only needs the logical mesh of
+        // the declared input, which a direct execution and a call both give it, on one device as on two. Before, a call
+        // kept the logical mesh of an argument on one device and rejected it with a mesh mismatch.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let values = [1f32, 2., 3., 4.];
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        for device_count in [1, 2] {
+            let mesh = |name: &str, axis_type| {
+                let axes = vec![MeshAxis::new(name, device_count, axis_type).unwrap()];
+                DeviceMesh::new(LogicalMesh::new(axes).unwrap(), devices[..device_count].to_vec()).unwrap()
+            };
+            for declared_axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
+                let target = mesh("q", declared_axis_type);
+                let replicated = Sharding::replicated(target.logical_mesh().clone(), 1);
+                let declared = vector_type.clone().with_sharding(replicated).unwrap();
+                let identity: CompiledFunction<ArrayType, ArrayType> =
+                    compile(|x: CompileTracer| x, declared.clone(), &session, target).unwrap();
+                let sources = [
+                    ("q", declared_axis_type),
+                    ("p", declared_axis_type),
+                    ("p", MeshAxisType::Explicit),
+                    ("device", MeshAxisType::Auto),
+                ];
+                for (name, axis_type) in sources {
+                    let input = Array::from_host_buffer(
+                        &session,
+                        vector_type.clone(),
+                        Some(mesh(name, axis_type)),
+                        None,
+                        values_to_bytes(&values),
+                    )
+                    .unwrap();
+                    let observe = |output: Array| {
+                        (output.r#type().into_owned(), values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap()))
+                    };
+                    let executed = identity.executable().execute(&session, input.clone()).map(observe);
+                    let called = identity.call(input).map(observe);
+                    let expected = Ok((declared.clone(), values.to_vec()));
+                    assert_eq!(
+                        (executed.map_err(|error| error.to_string()), called.map_err(|error| error.to_string())),
+                        (expected.clone(), expected),
+                        "{device_count} {declared_axis_type:?} {name} {axis_type:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_jit_call_operation_interpret_runs_the_callee_on_the_devices_of_the_call() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();

@@ -123,10 +123,10 @@ use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{declared_input_sharding, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::lowering::{
-    RequestedPlacement, merge_requested_placement, owned_session_constants, placement_requests, render_devices,
-    requested_placement_mesh,
+    RequestedPlacement, emitted_regions, merge_requested_placement, owned_session_constants, placement_requests,
+    render_devices, requested_placement_mesh,
 };
-use crate::operations::composites::NamedCompositeImplementation;
+use crate::operations::composites::{NamedCompositeImplementation, omits_operation_regions};
 use crate::operations::jit_call::EagerCallDecision;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
@@ -795,9 +795,13 @@ impl Session {
     /// for each operand, when an operand belongs to another PJRT client, when two committed operands live on different
     /// devices, when the session has no default mesh, and when an uncommitted input that would have to move cannot
     /// (i.e., when it is not replicated and is sharded over another logical mesh, or when it is not fully addressable,
-    /// or when the target mesh is not fully addressable from this process). [`Self::validate_input_placement`] then
-    /// reports operands on different devices. Distributed arrays are excluded because an uncommitted array lives on
-    /// devices that each process chooses for itself, so the processes would not agree on the transfers of a move.
+    /// or when the target mesh has devices of other processes, unless this process owns one of them and the input lives
+    /// on devices that this process chose on its own, refer to [`Array::is_locally_assigned`]).
+    /// [`Self::validate_input_placement`] then reports operands on different devices. Other moves onto devices of
+    /// other processes are excluded because an uncommitted array lives on devices that each process chooses for itself,
+    /// so the processes would not agree on the transfers of a move. An input that this process assigned locally moves
+    /// with local work only, each process placing its own value on its own devices of the target, which requires every
+    /// process to hold an equal value, as an explicit placement of that input onto the target does.
     ///
     /// Eager results and host uploads through [`Array::from_host_buffer`] on more than one device are committed, so an
     /// uncommitted input that is not replicated is usually an array on a single device whose sharding still names mesh
@@ -871,7 +875,21 @@ impl Session {
             .client()
             .process_index()
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-        if target.devices().iter().any(|device| device.process_index() != process_index) {
+
+        // The placement of an input whose devices this process chose on its own (refer to `Array::is_locally_assigned`)
+        // onto a target with devices of other processes sends nothing, because every process places its own value on
+        // its own devices of the target with local work only (refer to `DevicePlacementStrategy::ProcessLocalValue`),
+        // as an explicit placement of that input onto the target does, and it shares that placement's precondition that
+        // every process holds an equal value. Any other input that moves would need transfers that the processes do not
+        // agree on, because each one chooses the devices of its uncommitted arrays for itself, and a target without
+        // a device of this process leaves this process no part of the operation, so nothing moves in either case.
+        let is_local = |device: &Device| device.process_index() == process_index;
+        if !target.devices().iter().all(is_local)
+            && (!target.devices().iter().any(is_local)
+                || inputs
+                    .iter()
+                    .any(|input| !input.is_committed() && input.mesh() != target && !input.is_locally_assigned()))
+        {
             return Ok(None);
         }
 
@@ -1168,15 +1186,37 @@ impl Context for Session {
             });
         }
 
-        // Lowering and admission visit attached computation regions and their computation descendants. Dormant rule
-        // regions (e.g., derivative rules that no transform calls) are skipped at every level. Transforms that
-        // activate those regions handle their references themselves.
+        // Lowering and admission visit the attached computation regions and the regions below them that lowering emits
+        // for the platform of this session (refer to `emitted_regions`). Dormant rule regions (e.g., derivative rules
+        // that no transform calls) are skipped at every level, and so are the regions that lowering omits (refer to
+        // `omits_regions`), all of them if this application is such an operation. Transforms that activate dormant
+        // regions handle their references themselves. A call takes no platform (refer to its placement decision
+        // below), and an operation without regions never queries it.
+        let is_call = matches!(operation, Operation::JitCall(_));
+        let target_platform = if is_call || regions.regions().next().is_none() {
+            None
+        } else {
+            let target = self.target().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            Some(target.platform_name())
+        };
+
+        let omits_own_regions = !is_call
+            && regions.regions().next().is_some_and(|primal| {
+                let boundary_types = || {
+                    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
+                    (input_types, primal.interface().output_types().to_vec())
+                };
+                omits_operation_regions(&operation, operation.composite_key(), boundary_types, target_platform)
+            });
+
         let computation_regions = || {
             regions
                 .regions()
                 .enumerate()
-                .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
-                .flat_map(|(_, region)| region.computation_regions())
+                .filter(|(index, _)| {
+                    !omits_own_regions && operation.region_role(*index) == Some(RegionRole::Computation)
+                })
+                .flat_map(move |(_, region)| emitted_regions(region, target_platform))
         };
 
         // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone
@@ -1212,7 +1252,6 @@ impl Context for Session {
             _ => None,
         };
         let inputs = decision.as_ref().map_or(inputs, EagerCallDecision::inputs);
-        let is_call = decision.is_some();
         let has_regions = regions.region_count() > 0;
 
         let mut array_inputs = inputs
@@ -1303,25 +1342,13 @@ impl Context for Session {
         // `JitCallOperation::eager_decision`), and neither do the arrays that the callee of this application closes
         // over if it is a call, so execution places all of them on the devices of the application (refer to
         // `placed_constant`). Lowering never emits the regions that the implementation of a named composite replaces
-        // for the platform of this session (refer to `omits_regions`), so the arrays that only they hold take no
-        // part either, and neither do the arrays of this application if it is such a composite call. The constants
+        // for the platform of this session, nor the body of a scan that admits no iteration (refer to `omits_regions`),
+        // so the arrays that only they hold take no part either, and neither do the arrays of this application if it
+        // is such an operation, which the same decision recognizes (refer to `omits_operation_regions`, which reads
+        // the output types of the primal region of a composite call, as they are those of the call). The constants
         // that a region owns depend on that region and on the platform alone, so they are derived once for each region
-        // and retained with it.
-        let target_platform = if is_call || regions.regions().next().is_none() {
-            None
-        } else {
-            let target = self.target().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-            Some(target.platform_name())
-        };
-
-        let is_replaced = !is_call
-            && operation.composite_key().zip(regions.regions().next()).is_some_and(|(key, primal)| {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                let output_types = primal.interface().output_types();
-                NamedCompositeImplementation::select(key, &input_types, output_types, target_platform).is_some()
-            });
-
-        let captures = if is_call || is_replaced {
+        // and retained with it. The admission of reference state above already read the platform and that decision.
+        let captures = if is_call || omits_own_regions {
             Vec::new()
         } else {
             let mut owned = regions
@@ -1354,13 +1381,13 @@ impl Context for Session {
         // region that places a value onto other devices. An operation without regions, which is the common case, pays
         // for the first test alone, and one whose regions request no devices behaves as if they requested none. Only
         // the regions that lowering emits for the platform of this session request anything (refer to
-        // `placement_requests`), so a composite call that the platform replaces requests nothing. The devices that each
+        // `placement_requests`), so an operation whose regions lowering omits requests nothing. The devices that each
         // attached region requests depend on that region and on the platform alone, so they are derived once for each
         // region and retained with it (refer to `RequestedPlacementMesh`), and repeated applications only look them
         // up and merge them.
         let requested_mesh = if has_regions
             && !is_call
-            && !is_replaced
+            && !omits_own_regions
             && !array_inputs.iter().any(Array::is_committed)
             && !captures.iter().any(RetainedArray::is_committed)
         {
@@ -1397,7 +1424,7 @@ impl Context for Session {
         let named = requested_mesh.is_some()
             || (has_regions
                 && !is_call
-                && !is_replaced
+                && !omits_own_regions
                 && regions
                     .regions()
                     .enumerate()
@@ -4138,6 +4165,112 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_bind_ignores_the_bodies_of_scans_without_iterations() {
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so the
+        // placement requests of that body select no devices for an eager scan, which runs on the devices of its inputs
+        // and leaves its results uncommitted like them, as the compiled scan and eager and compiled JAX do, both when
+        // the requests do not form one mesh and when a request would move an unchanged carry. A scan that iterates
+        // still runs on the devices that its body requests and rejects requests that do not form one mesh.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
+        let carry_type = ArrayType::new_static(DataType::I32, [2]);
+        let carry = Array::from_host_buffer(&session, carry_type.clone(), None, None, values_to_bytes(&[-7i32, 21]));
+        let carry = carry.unwrap();
+        let facts = |array: &Array| (array.mesh().devices()[0].id(), array.is_committed());
+        let carry_facts = |array: &Array| (facts(array), array.copy_to_host().unwrap().elements::<i32>().unwrap());
+        let conflict = "cannot lower `place`: it requests a placement onto the devices [1], while another placement \
+                        request of the same program names the devices [0], and the two do not form one mesh";
+        let outside = "`place` cannot move a value to the device 1 inside a program compiled for the devices [0] of \
+                       mesh `['device'=1:auto]`";
+        for length in [0usize, 1] {
+            let slices_type = ArrayType::new_static(DataType::F32, [length, 4]);
+            let slices = Array::from_host_buffer(&session, slices_type.clone(), None, None, vec![0; length * 16]);
+            let slices = slices.unwrap();
+            assert!(!slices.is_committed() && !carry.is_committed());
+
+            // The body places each slice on both devices.
+            let eager = scan(
+                |_, (), slice| Ok(((), (slice.clone().place(&devices[0], None)?, slice.place(&devices[1], None)?))),
+                (),
+                slices.clone(),
+                ScanOptions::new(),
+            )
+            .map(|((), (first, second))| (facts(&first), facts(&second)))
+            .map_err(|error| error.to_string());
+            let compiled: Result<CompiledFunction<ArrayType, (ArrayType, ArrayType)>, _> = compile(
+                |slices: CompileTracer| {
+                    scan(
+                        |_, (), slice| {
+                            Ok(((), (slice.clone().place(&devices[0], None)?, slice.place(&devices[1], None)?)))
+                        },
+                        (),
+                        slices,
+                        ScanOptions::new(),
+                    )
+                    .unwrap()
+                    .1
+                },
+                slices_type.clone(),
+                &session,
+                mesh.clone(),
+            );
+            let compiled = compiled
+                .and_then(|function| function.executable().execute(&session, slices.clone()))
+                .map(|(first, second)| (facts(&first).0, facts(&second).0))
+                .map_err(|error| error.to_string());
+            if length == 0 {
+                assert_eq!(eager, Ok(((0, false), (0, false))));
+                assert_eq!(compiled, Ok((0, 0)));
+            } else {
+                assert_eq!(eager, Err(conflict.to_string()));
+                assert_eq!(compiled, Err(outside.to_string()));
+            }
+
+            // The body places each slice on the second device and returns the carry unchanged.
+            let eager = scan(
+                |_, carry, slice| Ok((carry, slice.place(&devices[1], None)?)),
+                carry.clone(),
+                slices.clone(),
+                ScanOptions::new(),
+            )
+            .map(|(carry, placed)| (carry_facts(&carry), facts(&placed)))
+            .map_err(|error| error.to_string());
+            let compiled: Result<CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)>, _> = compile(
+                |(carry, slices): (CompileTracer, CompileTracer)| {
+                    scan(
+                        |_, carry, slice| Ok((carry, slice.place(&devices[1], None)?)),
+                        carry,
+                        slices,
+                        ScanOptions::new(),
+                    )
+                    .unwrap()
+                },
+                (carry_type.clone(), slices_type),
+                &session,
+                mesh.clone(),
+            );
+            let compiled = compiled
+                .and_then(|function| function.executable().execute(&session, (carry.clone(), slices)))
+                .map(|(carry, placed)| (carry_facts(&carry).0.0, carry_facts(&carry).1, facts(&placed).0))
+                .map_err(|error| error.to_string());
+            if length == 0 {
+                assert_eq!(eager, Ok((((0, false), vec![-7, 21]), (0, false))));
+                assert_eq!(compiled, Ok((0, vec![-7, 21], 0)));
+            } else {
+                assert_eq!(eager, Ok((((1, true), vec![-7, 21]), (1, true))));
+                assert_eq!(compiled, Err(outside.to_string()));
+            }
+        }
+    }
+
+    #[test]
     fn test_session_bind_rejects_managed_callbacks() {
         let session = Session::builder().client(execution_client()).build().unwrap();
         let _guard = EffectCallbackGuard::enter();
@@ -4302,6 +4435,37 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(read_sharded_f32_array(program_array(&outputs[0])), vec![2.0]);
+
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so
+        // reference state there is admitted and the scan returns its initial carry, while the same body is rejected
+        // when the scan iterates.
+        let input = f32_scalar(&session, &mesh, 2.0);
+        let scalar_type = input.r#type().into_owned();
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let state = builder.add_input(scalar_type.into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let output =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let scan = |length: usize| {
+            let operation = Operation::Scan(ScanOperation::new(1, length));
+            session.bind(operation, vec![body.clone()], &[Value::Array(input.clone())])
+        };
+        assert_eq!(read_sharded_f32_array(program_array(&scan(0).unwrap()[0])), vec![2.0]);
+        assert_eq!(
+            scan(1),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`scan` carries reference state that XLA eager execution cannot lower; discharge references \
+                          before lowering"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -6213,6 +6377,38 @@ pub(crate) mod tests {
                 ),
             }),
         );
+    }
+
+    #[test]
+    fn test_session_place_uncommitted_inputs_onto_meshes_with_devices_of_other_processes() {
+        // An uncommitted input whose devices this process chose on its own follows a committed input whose mesh also
+        // has a device of another process with local work only, each process placing its own value on its own devices
+        // of that mesh, as an explicit placement of the input onto that mesh does. A mesh without a device of this
+        // process still moves nothing (refer to `test_session_bind_rejects_uncommitted_inputs_that_cannot_move`).
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local, remote]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh, 0);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let uncommitted = Array::from_host_buffer(&session, scalar_type.clone(), None, None, 2f32.to_ne_bytes());
+        let uncommitted = uncommitted.unwrap();
+        let committed =
+            Array::from_host_buffer(&session, scalar_type, mesh.clone(), Some(replicated.clone()), 3f32.to_ne_bytes());
+        let committed = committed.unwrap();
+        assert!(!uncommitted.is_committed() && uncommitted.is_locally_assigned() && committed.is_committed());
+        let moved = session.place_uncommitted_inputs(&[uncommitted, committed.clone()], &[], None).unwrap().unwrap();
+        let facts = |array: &Array| {
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            let placement = (array.mesh().clone(), array.sharding().clone());
+            (placement, array.is_committed(), array.is_locally_assigned(), array.addressable_shards().count(), values)
+        };
+        // An array with shards that this process cannot address is never locally assigned (refer to
+        // `Array::with_locally_assigned`).
+        assert_eq!(facts(&moved[0]), ((mesh, replicated), false, false, 1, vec![2.0]));
+        assert_eq!(facts(&moved[1]), facts(&committed));
     }
 
     #[test]

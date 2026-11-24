@@ -319,7 +319,7 @@ impl Session {
             }
             .into());
         }
-        validate_data_dependent_compilation(program)?;
+        validate_data_dependent_compilation(program, Some(self.target()?.platform_name()))?;
         if output_count > program.output_count() {
             return Err(ProgramError::MalformedProgram(format!(
                 "output count {output_count} exceeds the complete discharged output count {}",
@@ -727,7 +727,7 @@ impl Session {
             }
         }
         let expected_argument_shardings = signature.physical_input_shardings(logical_argument_shardings.as_slice());
-        let embeds_kernels = program.entry_region_ref().computation_regions().any(|region| {
+        let embeds_kernels = emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
             region.instructions().iter().any(|instruction| match instruction.operation() {
                 Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
                     operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
@@ -3723,16 +3723,16 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(foreign_mesh.logical_mesh().clone(), 0))
             .unwrap();
-        assert!(matches!(
-            session.lower_program(
-                &external_reference_read_program(scalar_type),
-                0,
-                &Options::new(foreign_mesh),
-            ),
-            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference state requires a mesh of devices that this client sees under the \
-                              processes that own them, at least one of which this process addresses",
-        ));
+        // A mesh that misattributes the devices of this process is rejected before the reference ABI is considered
+        // (refer to `test_session_lower_program_rejects_misattributed_mesh_devices`).
+        let (device_id, process_index) = (local_device.id(), local_device.process_index());
+        assert_eq!(
+            session
+                .lower_program(&external_reference_read_program(scalar_type), 0, &Options::new(foreign_mesh))
+                .unwrap_err()
+                .to_string(),
+            format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1),
+        );
 
         let non_addressable_mesh = DeviceMesh::new(
             mesh.logical_mesh().clone(),
@@ -3742,16 +3742,13 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::replicated(non_addressable_mesh.logical_mesh().clone(), 0))
             .unwrap();
-        assert!(matches!(
-            session.lower_program(
-                &external_reference_read_program(scalar_type),
-                0,
-                &Options::new(non_addressable_mesh),
-            ),
-            Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
-                if reason == "external reference state requires a mesh of devices that this client sees under the \
-                              processes that own them, at least one of which this process addresses",
-        ));
+        assert_eq!(
+            session
+                .lower_program(&external_reference_read_program(scalar_type), 0, &Options::new(non_addressable_mesh))
+                .unwrap_err()
+                .to_string(),
+            format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 1_000),
+        );
     }
 
     #[test]
@@ -5350,9 +5347,8 @@ mod tests {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
             DeviceMesh::new(logical_mesh, vec![device]).unwrap()
         };
-        let error = |device: Device| {
-            session.lower_program(&program, 0, &Options::new(mesh(device))).unwrap_err().to_string()
-        };
+        let error =
+            |device: Device| session.lower_program(&program, 0, &Options::new(mesh(device))).unwrap_err().to_string();
         assert_eq!(
             [error(Device::new(device_id, process_index + 1)), error(Device::new(device_id + 999, process_index))],
             [

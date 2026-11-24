@@ -580,9 +580,13 @@ pub(super) fn validate_addressable_buffer(
         return Err(Error::from(ArrayError::BufferTypeMismatch { expected: expected_array_type, actual: array_type }));
     }
 
+    // Only the logical elements of the carrier are read, so a buffer of a shard without elements is only awaited and
+    // never answered with its bound allocation (refer to `read_shard_to_host`).
     if validate_zero_carriers
         && r#type.data_type().is_zero()
-        && buffer.copy_to_host(None)?.r#await()?.iter().any(|value| *value != 0)
+        && read_shard_to_host(buffer, &descriptor.shape(), |event| event.r#await())?
+            .iter()
+            .any(|value| *value != 0)
     {
         return Err(Error::from(ArrayError::NonCanonicalZeroBuffer { device_id }));
     }
@@ -596,10 +600,12 @@ pub(super) fn validate_addressable_buffer(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::{
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape,
+    };
     use ryft_pjrt::{BufferSpecification, BufferType};
 
-    use crate::Session;
     use crate::arrays::Array;
     use crate::devices::PjrtDeviceExtension;
     use crate::sessions::tests::domain_mesh;
@@ -607,6 +613,7 @@ mod tests {
         cpu_client, device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array, values_from_bytes,
         values_to_bytes,
     };
+    use crate::{CompileTracer, CompiledFunction, Session, compile};
 
     use super::*;
 
@@ -1098,5 +1105,33 @@ mod tests {
             error.to_string(),
             format!("device {device_id} reports process index {process_index}, but expected {other_process_index}"),
         );
+    }
+
+    #[test]
+    fn test_validate_addressable_buffer_reads_only_logical_zero_carrier_elements() {
+        // A bounded function of a Boolean `[n, 3]` input at `n = 0` returns a buffer of logical shape `[0, 3]` whose
+        // raw host copy holds its bound allocation (29 bytes on the CPU plugin). Importing that buffer as an empty
+        // array of the zero data type reads only its logical elements, of which there are none, so the import succeeds.
+        // Before, the import copied and judged the whole bound allocation. The CPU plugin zeroes that padding, so this
+        // test pins the empty import, not a rejection that nonzero padding caused.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let extent = DimensionVariable::new("n", DimensionBounds::new(0, Some(7)).unwrap());
+        let bounded_type = ArrayType::new(DataType::Boolean, Shape::new(vec![extent.into(), Dimension::Static(3)]));
+        let negation: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x: CompileTracer| !x, bounded_type, &session, mesh.clone()).unwrap();
+        let empty_type = ArrayType::new_static(DataType::Boolean, [0, 3]);
+        let input = Array::from_host_buffer(&session, empty_type, Some(mesh.clone()), None, Vec::new()).unwrap();
+        let output = negation.executable().execute(&session, input).unwrap();
+        let buffer = Arc::clone(output.shards()[0].buffer().unwrap());
+        drop(output);
+        let buffer = Arc::try_unwrap(buffer).ok().unwrap();
+        assert!(!buffer.copy_to_host(None).unwrap().r#await().unwrap().is_empty());
+
+        let zero_type = ArrayType::new_static(DataType::Zero, [0, 3]);
+        let array = Array::from_addressable_buffers(&session, zero_type, mesh, None, vec![buffer]).unwrap();
+        assert_eq!((array.shape(), array.copy_to_host_bytes().unwrap()), (StaticShape::new(vec![0, 3]), Vec::new()));
     }
 }

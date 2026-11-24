@@ -25,8 +25,10 @@ use crate::types::DataTypeExtension;
 /// [`SessionBuilder::live_array_tracking`](crate::SessionBuilder::live_array_tracking) describes each
 /// of its live arrays as a [`LiveArray`] and totals their device bytes through
 /// [`Session::live_array_bytes_by_device`](crate::Session::live_array_bytes_by_device), and
-/// [`Session::device_memory_statistics`](crate::Session::device_memory_statistics) reports
-/// the allocator statistics for the PJRT plugins that support it.
+/// [`Session::device_memory_statistics`](crate::Session::device_memory_statistics) reports the allocator statistics
+/// for the PJRT plugins that support it. Neither the counts nor those totals include the buffers that only the placed
+/// copies of a captured array hold (refer to [`RetainedArray`](crate::RetainedArray)), which stay on their devices
+/// for as long as the captured array or a retention of it lives.
 ///
 /// Each count is read independently and without blocking writers. [`Self::live_arrays`] is a single counter rather than
 /// a difference of two, so every read returns a value that the count actually had. While arrays are being created and

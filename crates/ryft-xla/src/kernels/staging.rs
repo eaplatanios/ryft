@@ -33,6 +33,7 @@ use crate::kernels::{
     CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, placed_custom_call, unbound_kernel_axis_message,
     validate_kernel_sharding,
 };
+use crate::lowering::emitted_regions;
 use crate::{
     Constant, Error, FlatProgram, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation,
     Target, Type,
@@ -1351,7 +1352,9 @@ impl std::hash::Hash for KernelCompilerBinding {
 }
 
 /// Selects reachable kernel calls, discharges their state proven local, and extracts the remaining region closure.
-/// Dormant transform rule regions retain their unselected carriers until a transform makes them executable.
+/// Dormant transform rule regions retain their unselected carriers until a transform makes them executable. A kernel
+/// operation outside a selected call is rejected only in a region that lowering emits for the platform of the
+/// execution facts (refer to `emitted_regions`).
 pub(crate) fn select_kernels(
     program: &FlatProgram,
     binding: Option<&KernelCompilerBinding>,
@@ -1476,7 +1479,9 @@ pub(crate) fn select_kernels(
     let selected = RegionRef::new(&arena, program.entry())
         .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?
         .to_program();
-    for region in selected.entry_region_ref().computation_regions() {
+    // Only the regions that lowering emits for the platform of the execution facts must be free of kernel operations
+    // (refer to `emitted_regions`), as lowering never emits the others.
+    for region in emitted_regions(selected.entry_region_ref(), Some(facts.platform_name())) {
         if let Some(instruction) = region
             .instructions()
             .iter()
@@ -3415,6 +3420,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_execution_facts_ignore_the_bodies_of_scans_without_iterations() {
+        // A lowered program records the execution facts of its target when it embeds a compiled kernel (i.e., a custom
+        // call that carries `ryft.kernel.schema`), and not when that call is only in the body of a scan that admits no
+        // iteration, because lowering then emits nothing of its body (refer to `omits_regions`).
+        let client = crate::tests::cpu_client(1);
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
+        )
+        .unwrap();
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mut body = ProgramBuilder::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar.clone().into());
+        let kernel = CustomCallOperation::new("ryft.test.kernel", vec![scalar.clone()])
+            .with_attribute("ryft.kernel.schema", 1i64);
+        let output = body.add_instruction(kernel, Vec::new(), vec![carry], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let embeds_kernels = |length: usize| {
+            let mut builder = ProgramBuilder::new();
+            let carry = builder.add_input(scalar.clone().into());
+            let region = builder.import_region(body.entry_region_ref());
+            let outputs = builder
+                .add_instruction(Operation::Scan(ScanOperation::new(1, length)), vec![region], vec![carry], None)
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            session
+                .lower_program(&program, 0, &Options::new(mesh.clone()))
+                .unwrap()
+                .kernel_execution_facts()
+                .is_some()
+        };
+        assert!(!embeds_kernels(0));
+        assert!(embeds_kernels(1));
+    }
+
+    #[test]
     fn test_kernel_execution_facts_configuration_key() {
         let first = facts().unwrap();
         let key = first.configuration_key().unwrap();
@@ -4172,7 +4220,7 @@ pub(crate) mod tests {
         let body = kernel_primal(&differentiable_definition()).unwrap();
         let scalar = body.input_types()[0].clone();
         let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(scalar);
+        let input = builder.add_input(scalar.clone());
         let outputs = builder.splice_program(&body, &[input]).unwrap();
         let doubled = builder
             .add_instruction(
@@ -4189,6 +4237,34 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(
             select_kernels(&program, Some(&binding(1)), facts),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "kernel operation `add` remains outside a selected kernel call",
+        ));
+
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so the same
+        // operation there remains, while it is rejected in the body of a scan that iterates.
+        let mut body = ProgramBuilder::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar.clone());
+        let outputs = body.splice_program(&program, &[carry]).unwrap();
+        let body = body
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let scan = |length: usize| {
+            let mut builder = ProgramBuilder::new();
+            let carry = builder.add_input(scalar.clone());
+            let region = builder.import_region(body.entry_region_ref());
+            let outputs = builder
+                .add_instruction(Operation::Scan(ScanOperation::new(1, length)), vec![region], vec![carry], None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        assert!(select_kernels(&scan(0), Some(&binding(1)), facts).unwrap().is_some());
+        assert!(matches!(
+            select_kernels(&scan(1), Some(&binding(1)), facts),
             Err(KernelEmbeddingError::Invalid { message })
                 if message == "kernel operation `add` remains outside a selected kernel call",
         ));

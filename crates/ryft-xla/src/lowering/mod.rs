@@ -283,8 +283,9 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
 ///
 /// This scans those regions rather than consulting the effect summary of the program, because ordinary XLA cannot
 /// preserve state in any lowered region, including one whose effects the summary of its owner does not expose.
-/// Regions that lowering never reaches (e.g., the rule regions of composites or the transpose region of a
-/// `linear_call`) are not part of the lowered module, so state in them is never lowered and cannot reject the program.
+/// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
+/// or the body of a scan that admits no iteration, refer to [`emitted_regions`], here for no target platform) are not
+/// part of the lowered module, so state in them is never lowered and cannot reject the program.
 pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
@@ -292,7 +293,7 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    program.entry_region_ref().computation_regions().any(|region| {
+    emitted_regions(program.entry_region_ref(), None).any(|region| {
         region
             .instructions()
             .iter()
@@ -302,9 +303,10 @@ where
 
 /// Returns `true` if `program` contains a reference-typed atom or a [`CoreOperation`](ryft_core::Operation) whose
 /// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in a region that
-/// lowering emits (i.e., its entry region and the executed nested regions of that region). Regions that lowering never
-/// reaches (e.g., the rule regions of composites or the transpose region of a `linear_call`) are not part of the
-/// lowered module, so references in them neither need discharge nor reject the program.
+/// lowering emits (i.e., its entry region and the executed nested regions of that region, refer to [`emitted_regions`],
+/// here for no target platform). Regions that lowering never reaches (e.g., the rule regions of composites, the
+/// transpose region of a `linear_call`, or the body of a scan that admits no iteration) are not part of the lowered
+/// module, so references in them neither need discharge nor reject the program.
 ///
 /// This check is independent from [`contains_unresolved_state`], because a pure reference pass-through or a forwarded
 /// reference capture can carry reference values without executing a stateful instruction. Both predicates back the
@@ -320,7 +322,7 @@ where
     // The atom scan dominates for every well-formed program, because reference operations always touch an atom of a
     // reference type. The declaration scan is an independent check that still catches a core discharge bug which
     // retyped the boundary atoms but left a reference operation behind.
-    program.entry_region_ref().computation_regions().any(|region| {
+    emitted_regions(program.entry_region_ref(), None).any(|region| {
         region.atoms().iter().any(|atom| atom.r#type().is_reference())
             || region
                 .instructions()
@@ -5233,14 +5235,34 @@ pub(crate) mod tests {
             .unwrap()[0]
     }
 
+    /// Builds a program whose scan of `length` iterations carries a scalar through a body that extends it with
+    /// reference state (refer to [`add_reference_state`]).
+    fn stateful_scan_program(length: usize) -> FlatProgram {
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ArrayIrProgramBuilder::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(scalar_type.clone());
+        let output = add_reference_state(&mut builder, carry, carry);
+        let body = Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap());
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(scalar_type);
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let scan = ScanOperation::<Type>::new(1, length);
+        let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
     #[test]
     fn test_contains_unresolved_state_ignores_dormant_regions() {
         let stateful =
             |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
 
-        // State in the dormant transpose region of a `linear_call` is never lowered, unlike state in its forward region.
+        // State in the dormant transpose region of a `linear_call` is never lowered, unlike state in its forward region,
+        // and neither is state in the body of a scan that admits no iteration, unlike state in one that iterates.
         assert!(!contains_unresolved_state(&linear_call_program(&stateful(false), &stateful(true))));
         assert!(contains_unresolved_state(&linear_call_program(&stateful(true), &stateful(false))));
+        assert!(!contains_unresolved_state(&stateful_scan_program(0)));
+        assert!(contains_unresolved_state(&stateful_scan_program(1)));
     }
 
     #[test]
@@ -5249,9 +5271,11 @@ pub(crate) mod tests {
             |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
 
         // References in the dormant transpose region of a `linear_call` are never lowered, unlike references in its
-        // forward region.
+        // forward region, and neither are references in the body of a scan that admits no iteration.
         assert!(!contains_unresolved_references(&linear_call_program(&stateful(false), &stateful(true))));
         assert!(contains_unresolved_references(&linear_call_program(&stateful(true), &stateful(false))));
+        assert!(!contains_unresolved_references(&stateful_scan_program(0)));
+        assert!(contains_unresolved_references(&stateful_scan_program(1)));
     }
 
     #[test]
@@ -8548,7 +8572,9 @@ pub(crate) mod tests {
             let regions = vec![builder.intern_callee(&body, None).unwrap()];
             let scan = ScanOperation::<Type>::new(1, length);
             let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
-            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
         };
         let owned = |length, target_platform| {
             owned_session_constants(program(length).entry_region_ref(), target_platform).to_vec()
@@ -8614,11 +8640,12 @@ pub(crate) mod tests {
             let regions = vec![builder.intern_callee(&body, None).unwrap()];
             let scan = ScanOperation::<Type>::new(1, length);
             let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
-            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
         };
-        let requests = |length, target_platform| {
-            placement_requests(program(length).entry_region_ref(), target_platform).to_vec()
-        };
+        let requests =
+            |length, target_platform| placement_requests(program(length).entry_region_ref(), target_platform).to_vec();
         let device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![elsewhere]).unwrap();
         let placed = vec![(RequestedPlacement::Devices(device_mesh), PLACE_OPERATION_NAME)];
         assert_eq!(requests(0, None), vec![]);

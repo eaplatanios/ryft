@@ -1493,7 +1493,10 @@ impl Session {
         expected_sharding: &Sharding,
         input: Array,
     ) -> Result<Array, Error> {
-        Ok(self.reshard_inputs_if_needed(mesh, std::slice::from_ref(expected_sharding), vec![input])?.pop().unwrap())
+        Ok(self
+            .reshard_inputs_if_needed(mesh, std::slice::from_ref(expected_sharding), vec![input])?
+            .pop()
+            .unwrap())
     }
 
     /// Returns whether `array` lacks the buffer of a shard on a device of this process, whose process index is
@@ -1508,8 +1511,7 @@ impl Session {
     /// common case, costs one scan of its shards.
     fn serves_missing_local_replicas(array: &Array, process_index: usize) -> bool {
         let is_local = |shard: &&ArrayShard| shard.device().process_index() == process_index;
-        let mut missing =
-            array.shards().iter().filter(is_local).filter(|shard| shard.buffer().is_none()).peekable();
+        let mut missing = array.shards().iter().filter(is_local).filter(|shard| shard.buffer().is_none()).peekable();
         if missing.peek().is_none() || array.data_type().is_zero() {
             return false;
         }
@@ -4821,6 +4823,55 @@ mod tests {
                     "{device_count} {axis_type:?} {length}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_session_prepare_compiled_execution_serves_missing_local_replicas() {
+        // An `f32[4]` replicated over two devices is imported with the buffer of the first device only. An executable
+        // reads the buffer of every device of this process, so preparation copies the replica of the first device to
+        // the second, and both entry points return the four elements. Before, both rejected the absent buffer, because
+        // an argument whose mesh and sharding match skipped preparation. A split argument whose second half has no
+        // buffer on this process has no replica to serve it and keeps that error.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let devices = client.addressable_devices().unwrap();
+        let second_device_id = devices[1].id().unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let missing = format!("input array #0 has no addressable shard for device {second_device_id}");
+        for (sharding, values, expected) in
+            [(replicated, vec![1f32, 2., 3., 4.], Ok(vec![1f32, 2., 3., 4.])), (split, vec![1f32, 2.], Err(missing))]
+        {
+            let identity = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| x,
+                vector_type.clone(),
+                &session,
+                Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]),
+            )
+            .unwrap();
+            let bytes = values_to_bytes(&values);
+            let dimensions = [values.len() as u64];
+            let buffer = client
+                .buffer(bytes.as_slice(), BufferType::F32, dimensions, None, devices[0].clone(), None)
+                .unwrap();
+            let input = Array::from_addressable_buffers(
+                &session,
+                vector_type.clone(),
+                mesh.clone(),
+                Some(sharding),
+                vec![buffer],
+            )
+            .unwrap();
+            let read = |output: Array| values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap());
+            let executed = identity.executable().execute(&session, input.clone()).map(read);
+            let called = identity.call(input).map(read);
+            assert_eq!(
+                (executed.map_err(|error| error.to_string()), called.map_err(|error| error.to_string())),
+                (expected.clone(), expected),
+            );
         }
     }
 

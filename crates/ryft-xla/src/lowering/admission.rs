@@ -28,17 +28,20 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// nested regions, refer to [`emitted_regions`]) are validated. Regions that lowering never reaches (e.g., the rule
 /// regions of composites, the transpose region of a `linear_call`, or the body of a scan that admits no iteration) are
 /// not part of the compiled program, so they cannot keep it from compiling. The regions are those that lowering emits
-/// for no target platform, which omits only what lowering omits on every platform, so the body of a named composite
-/// call that only some platform replaces is still validated.
+/// for `target_platform`, so the body of a named composite call that the implementation for that platform replaces is
+/// not validated either, while [`None`] omits only what lowering omits on every platform.
 ///
 /// # Errors
 ///
 /// Returns an [`Error`] wrapping [`ProgramError::InvalidArgument`] when a data-derived dimension has no finite upper
 /// bound, or wrapping [`ProgramError::UnsupportedOperation`] when an operation without a supported padding discipline
 /// consumes a data-derived dimension.
-pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Result<(), Error> {
+pub(crate) fn validate_data_dependent_compilation(
+    program: &FlatProgram,
+    target_platform: Option<&str>,
+) -> Result<(), Error> {
     let mut variables = HashSet::new();
-    for region in emitted_regions(program.entry_region_ref(), None) {
+    for region in emitted_regions(program.entry_region_ref(), target_platform) {
         for instruction in region.instructions() {
             if let Operation::DimensionFromScalar(operation) = instruction.operation() {
                 // A static output defines no identity and is checked against its extent.
@@ -391,18 +394,21 @@ fn references_data_derived_dimension(r#type: &Type, variables: &HashSet<Dimensio
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayOperation, ArrayType,
         AttentionConfiguration, AttentionImplementation, AttentionInputs, CompareOperation, ComparisonDirection,
-        ConstantOperation, Context, ConvertElementTypeOperation, CumulativeKind, CumulativeOperation,
-        CustomCallOperation, DataType, Differentiate, Dimension, DimensionAddOperation, DimensionBounds,
-        DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionVariable,
-        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, Error as CoreError,
-        IotaOperation, LinearCallOperation, MulOperation, NegOperation, OneOperation, Placeholder, PrintOperation,
-        ProgramError, RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation,
-        ScaledDotOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection,
+        CompositeKey, CompositeOperation, ConstantOperation, Context, ConvertElementTypeOperation, CumulativeKind,
+        CumulativeOperation, CustomCallOperation, CustomRuleDefinition, CustomRuleRegistration, DataType,
+        Differentiate, Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
+        DimensionToScalarOperation, DimensionType, DimensionVariable, DomainTracingContext, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, Error as CoreError, IotaOperation, LinearCallOperation, MulOperation,
+        NamedComposite, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramError, RandomAlgorithm,
+        ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation, ScaledDotOperation,
+        ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection,
         SortOperation, StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
     };
     use ryft_pjrt::Client;
@@ -930,7 +936,7 @@ mod tests {
             program.regions()[0].atoms()[sum.index()].r#type().as_ref(),
             &Type::Dimension(DimensionType::from(Dimension::Static(8))),
         );
-        assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
+        assert_eq!(validate_data_dependent_compilation(&program, None).map_err(|error| error.to_string()), Ok(()));
     }
 
     #[test]
@@ -1001,7 +1007,7 @@ mod tests {
         // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so the mean there does
         // not keep the static primal from compiling.
         let program = build_program(&build_region(false), &build_region(true));
-        assert_eq!(validate_data_dependent_compilation(&program).map_err(|error| error.to_string()), Ok(()));
+        assert_eq!(validate_data_dependent_compilation(&program, None).map_err(|error| error.to_string()), Ok(()));
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         let outputs = session
@@ -1015,10 +1021,82 @@ mod tests {
         // The same mean in the forward region, which lowering emits, is rejected.
         let program = build_program(&build_region(true), &build_region(false));
         assert_eq!(
-            validate_data_dependent_compilation(&program).unwrap_err().to_string(),
+            validate_data_dependent_compilation(&program, None).unwrap_err().to_string(),
             "operation `reduce` cannot consume data-derived dimensions during XLA lowering because mean over a \
              dynamically sized reduction axis is not supported by the XLA lowering",
         );
+    }
+
+    #[test]
+    fn test_validate_data_dependent_compilation_ignores_the_bodies_of_scans_without_iterations() {
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so an
+        // unbounded data-derived dimension that only that body uses does not keep the program from compiling, while
+        // the same body is rejected when the scan iterates.
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(scalar_type.clone().into());
+            let carry = builder.add_input(scalar_type.clone().into());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![carry], None)
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
+        };
+        let program = |length: usize| {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let scan = ScanOperation::<Type>::new(1, length);
+            let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let lower = |program: &FlatProgram| {
+            let lowered = session.lower_program(program, 0, &Options::new(mesh.clone()));
+            lowered.map(|_| ()).map_err(|error| error.to_string())
+        };
+        let validate = |program: &FlatProgram, target_platform: Option<&str>| {
+            validate_data_dependent_compilation(program, target_platform).map_err(|error| error.to_string())
+        };
+        let unbounded =
+            "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound for XLA compilation";
+        assert_eq!(validate(&program(0), None), Ok(()));
+        assert_eq!(lower(&program(0)), Ok(()));
+        assert_eq!(validate(&program(1), None), Err(unbounded.to_string()));
+        assert_eq!(lower(&program(1)), Err(unbounded.to_string()));
+
+        // The same holds for the body of a named composite call on a target whose backend implementation replaces the
+        // whole call (`ryft.tests.xla_named_square` version 1 on CUDA), which never lowers the body.
+        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
+        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("unbounded").with_named_composite(named));
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar_type.into());
+        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
+        let program = program.unwrap();
+        assert_eq!(validate(&program, Some("cuda")), Ok(()));
+        assert_eq!(validate(&program, Some("cpu")), Err(unbounded.to_string()));
     }
 
     #[test]

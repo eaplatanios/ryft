@@ -18,7 +18,9 @@ use crate::lowering::types::{
     dimension_extent_i64, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
     physical_bound_type,
 };
-use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
+use crate::lowering::{
+    CollectiveLoweringState, EffectTokens, current_or_new_token, emitted_regions, token_threaded_effects,
+};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
@@ -82,7 +84,10 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// [`validates_output_extents`] detects. A region that contains such an assertion must thread its tokens out, in the
 /// order of [`token_threaded_effects`], even when its source program is pure, so that later assertions and I/O follow
 /// it. A region input guard joins its assertion token into the ordered I/O chain, and every assertion advances the
-/// ordered assertion chain.
+/// ordered assertion chain. Only the regions that lowering emits for no target platform are searched (refer to
+/// [`emitted_regions`]), which omits only what lowering omits on every platform, so an assertion in the body of a scan
+/// that admits no iteration adds no token, while one in a body that the implementation of a named composite replaces
+/// only on some platform still adds one.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> Result<EffectClasses, Error>
@@ -94,7 +99,7 @@ where
     if classes.contains(EffectClass::OrderedAssertion) {
         return Ok(classes);
     }
-    for region in program.entry_region_ref().computation_regions() {
+    for region in emitted_regions(program.entry_region_ref(), None) {
         for instruction in region.instructions() {
             let input_types = instruction
                 .inputs()
@@ -507,9 +512,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, CompositeJvpRule,
-        CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
-        DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis, Placeholder, PrintOperation, Sharding,
-        ZeroLikeOperation,
+        CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionType,
+        DimensionValue, DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis, Placeholder, PrintOperation,
+        Sharding, ZeroLikeOperation,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, Program as PjrtProgram};
@@ -719,6 +724,51 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lowered_effect_classes_ignores_the_bodies_of_scans_without_iterations() {
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so the
+        // validation of a refined extent in that body synthesizes no assertion, while the same body synthesizes one
+        // when the scan iterates. The symbolic extent is a dimension carry, because a `dimension_from_scalar` in the
+        // body would be an assertion of the source program, which every scan reports as its own effect.
+        let array_type = test_vector_type(4);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let mut builder = ArrayIrProgramBuilder::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(array_type.clone().into());
+        let symbolic = builder.add_input(DimensionType::from(extent.clone()).into());
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
+        builder
+            .add_instruction(
+                CustomCallOperation::new(
+                    "ryft.test.refined_extent",
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.clone().into()]))],
+                ),
+                Vec::new(),
+                vec![symbolic, exact],
+                None,
+            )
+            .unwrap();
+        let body = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![carry, symbolic], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let program = |length: usize| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let inputs = vec![
+                builder.add_input(array_type.clone().into()),
+                builder.add_input(DimensionType::from(extent.clone()).into()),
+            ];
+            let region = builder.import_region(body.entry_region_ref());
+            let scan = ScanOperation::<Type>::new(2, length);
+            let outputs = builder.add_instruction(scan, vec![region], inputs, None).unwrap().to_vec();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        assert!(program(0).effects().classes().is_empty());
+        assert!(lowered_effect_classes(&program(0)).unwrap().is_empty());
+        assert_eq!(lowered_effect_classes(&program(1)).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 
     #[test]

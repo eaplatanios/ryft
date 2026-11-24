@@ -175,6 +175,7 @@
 //!   - **A Failed Preparation Of A Sent Buffer:** A copy, a staging in device memory, or a conversion to the layout of
 //!     the receiver that fails to start stops this process before its transfers.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::ops::Range;
@@ -1243,15 +1244,12 @@ impl Array {
                 && self.shard_contribution(shard.descriptor()) == contribution
         });
         let first = || index.get(&contribution).and_then(|shards| shards.first()).map(|&shard| &self.shards()[shard]);
-        on_destination
-            .or_else(first)
-            .map(|shard| (shard, shard.buffer().unwrap()))
-            .ok_or_else(|| {
-                Error::from(ArrayError::MissingShardBuffer {
-                    shard_index: preferred,
-                    device_id: preferred_shard.device().id(),
-                })
+        on_destination.or_else(first).map(|shard| (shard, shard.buffer().unwrap())).ok_or_else(|| {
+            Error::from(ArrayError::MissingShardBuffer {
+                shard_index: preferred,
+                device_id: preferred_shard.device().id(),
             })
+        })
     }
 
     /// Returns the buffer that a cross-host transfer sends for the shard at `index`, which is a shard of this array on
@@ -1960,10 +1958,12 @@ impl Array {
                 // own shards to the requested storage, which needs no other process. A source in another declared
                 // layout, which only a placement that keeps its contributions plans regions for (refer to
                 // `Self::shard_region_plan`), first converts the shards that this process holds to the dense row-major
-                // layout on their own devices, which moves bytes within each shard and keeps every contribution.
+                // layout on their own devices, which moves bytes within each shard and keeps every contribution. The
+                // conversion lands in default device memory, where the regions are staged anyway and where every
+                // plugin can hold the dense layout (e.g., the CPU plugin cannot in pinned host memory).
                 let dense = dense_row_major_layout(self.shape().rank());
                 let source = if self.layout().is_some_and(|layout| *layout != dense) {
-                    self.clone().place_storage(self.r#type().memory(), Some(dense))
+                    self.clone().place_storage(Memory::Device, Some(dense))
                 } else {
                     Ok(self.clone())
                 };
@@ -3721,6 +3721,50 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
     Some(ContributionAxes { source: names(&source_varying), destination })
 }
 
+/// Returns whether a value placed as `input`, which has a pending reduction or manual variation within a tile (i.e.,
+/// does not hold one value per slice, refer to [`holds_one_value_per_slice`]), keeps its contributions as they are when
+/// placed with the sharding `output` (refer to [`moves_contributions`]). Such a placement only moves bytes, so no
+/// strategy of it may read back the combined value of its contributions and upload it again (i.e., neither the host
+/// round trip nor the host fallback of [`Array::to_placement`] nor the readback of a process-local value). The rule
+/// reads only the shardings, so every process decides alike.
+fn keeps_contributions(input: &Sharding, output: &Sharding) -> bool {
+    !holds_one_value_per_slice(input) && moves_contributions(input, output).is_some()
+}
+
+/// Returns the error of a placement that keeps the contributions of its source (refer to [`keeps_contributions`]) when
+/// only strategies that combine those contributions remain.
+fn combined_contributions_error() -> Error {
+    ProgramError::UnsupportedOperation {
+        message: "cannot place an array with a pending reduction or with manual variation within a tile when neither \
+                  whole shards nor regions of shards can move its contributions as they are (e.g., when the PJRT \
+                  plugin does not report the default layout that a cross-host receive allocates), because the \
+                  placement would have to combine the contributions of the pending reduction (complete the reduction \
+                  first)"
+            .to_string(),
+    }
+    .into()
+}
+
+/// Index of the shards of an array that hold a buffer on the process with index [`Self::process_index`] by the
+/// contribution that they hold (refer to [`ShardContribution`]), which a placement keeps for all of its lookups of
+/// [`Array::local_replica`], so that many destinations of one resident replica cost linear rather than quadratic work.
+/// The index is built on the first lookup that needs another replica, so a placement whose planned shards all have
+/// buffers never builds it.
+struct LocalReplicas {
+    /// Index of the process whose shards the index holds.
+    process_index: usize,
+
+    /// Shards with a buffer of each contribution, in the order of their device identifiers and then their indices.
+    shards: OnceCell<HashMap<ShardContribution, Vec<ShardIndex>>>,
+}
+
+impl LocalReplicas {
+    /// Creates an empty index of the local replicas of the process with index `process_index`.
+    fn new(process_index: usize) -> Self {
+        Self { process_index, shards: OnceCell::new() }
+    }
+}
+
 /// Returns the layout that an array placed as whole shards records, given the declared `layout` of its source and the
 /// layouts of the buffers that the cross-host moves of every process receive for it. Local copies keep the layout of
 /// their source shards, so the declared layout holds for them, and it is kept only when every received buffer has it
@@ -5336,8 +5380,8 @@ mod tests {
             }
         }
 
-        // On the same mesh, a source with a declared column-major layout, which regions do not move, falls back to the
-        // compiled reshard, which re-splits each contribution without completing anything.
+        // On the same mesh, a source with a declared column-major layout converts its shards to the dense row-major
+        // layout on their devices and moves regions of each contribution as well. Before, it took the compiled reshard.
         let matrix_sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]);
         let matrix_sum = matrix_sum.unwrap();
         let rows_y = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
@@ -5362,7 +5406,7 @@ mod tests {
         let strategy = source
             .device_placement_strategy(&cross_host_layout_resolver(client), &source_mesh, &rows_y, 0)
             .unwrap();
-        assert!(matches!(strategy, DevicePlacementStrategy::CompiledReshard { .. }));
+        assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }));
         let placed = source.to_placement(&session, Placement::new(source_mesh.clone(), rows_y).unwrap()).unwrap();
         let rows = [&a[..2], &a[2..], &b[..2], &b[2..]].map(values_to_bytes).to_vec();
         assert_eq!(device_bytes(&placed), rows);
@@ -5396,6 +5440,160 @@ mod tests {
                 "cannot place an array that varies along the manual mesh axes `m` onto this sharding, because the \
                  placement would discard values that differ along those axes",
             );
+        }
+    }
+
+    #[test]
+    fn test_array_to_placement_moves_pending_contributions_in_declared_layouts() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let devices = pjrt_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = |axes: &[(&str, usize)]| {
+            let axes = axes.iter().map(|(name, size)| MeshAxis::new(*name, *size, MeshAxisType::Explicit).unwrap());
+            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
+        };
+        let source_mesh = mesh(&[("x", 2), ("y", 2)]);
+        let sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let device_bytes = |array: &Array| {
+            devices
+                .iter()
+                .map(|device| array.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // A column-major `[rows, 2]` matrix with a pending sum along `x`, whose devices at `x = 0` hold the first
+        // contribution and those at `x = 1` the second one, keeps that sum and splits its rows along a second axis, on
+        // the same mesh, onto a mesh with an unused axis of size one, and onto a mesh with that axis renamed. Each
+        // process converts the shards that it holds to the dense row-major layout on their devices and moves the
+        // regions of each contribution, from a dense source and from a sparse one that holds only the replicas at
+        // `y = 1`, for an uneven split of three rows and an even one of four. Before, regions declined the declared
+        // layout, an uneven split or a missing replica ruled out the compiled reshard, and the host round trip read
+        // back the combined value, so the `u8` placement of three rows with contributions of `3` and `5` returned `8`
+        // at `x = 0` and `0` at `x = 1`, and `f8e8m0fnu` failed. The cross-mesh placements were rejected.
+        let destinations = [
+            (mesh(&[("x", 2), ("y", 2)]), "y"),
+            (mesh(&[("x", 2), ("y", 2), ("unit", 1)]), "y"),
+            (mesh(&[("x", 2), ("z", 2)]), "z"),
+        ];
+        // The element at `(row, column)` of the contribution at `x`, in row-major order.
+        let u8_contribution = |x: usize, rows: usize| {
+            (0..rows * 2)
+                .map(|index| [3u8, 5][x] + 10 * (index / 2) as u8 + (index % 2) as u8)
+                .collect::<Vec<_>>()
+        };
+        let f8_contribution = |_: usize, rows: usize| vec![0x7fu8; rows * 2];
+        let cases: [(DataType, &dyn Fn(usize, usize) -> Vec<u8>); 2] =
+            [(DataType::U8, &u8_contribution), (DataType::F8E8M0FNU, &f8_contribution)];
+        for rows in [3, 4] {
+            for &(data_type, contribution) in &cases {
+                let value = match data_type {
+                    DataType::U8 => {
+                        contribution(0, rows).iter().zip(contribution(1, rows)).map(|(a, b)| a + b).collect::<Vec<_>>()
+                    }
+                    _ => vec![0x80; rows * 2],
+                };
+                for sparse in [false, true] {
+                    let device_layout = column_major.to_pjrt().unwrap();
+                    let buffers = pjrt_devices
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !sparse || index % 2 == 1)
+                        .map(|(index, device)| {
+                            let bytes = contribution(index / 2, rows);
+                            let buffer_type = data_type.executable_buffer_type();
+                            let (device, layout) = (device.clone(), Some(device_layout.clone()));
+                            let dimensions = [rows as u64, 2];
+                            client.buffer(bytes.as_slice(), buffer_type, dimensions, None, device, layout).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let r#type = ArrayType::new_static(data_type, [rows, 2]).with_layout(Some(column_major.clone()));
+                    let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
+                    let source = Array::from_addressable_buffers(&session, r#type, mesh, sharding, buffers).unwrap();
+                    assert_eq!(source.copy_to_host_bytes().unwrap(), value, "{data_type} {rows} {sparse}");
+                    for (destination_mesh, axis) in &destinations {
+                        let split = vec![ShardingDimension::sharded([*axis]), ShardingDimension::replicated()];
+                        let split = Sharding::new(destination_mesh.logical_mesh().clone(), split).unwrap();
+                        let split = split.with_unreduced_axes(["x"]).unwrap();
+                        let context = format!("{data_type} with {rows} rows along {axis} (sparse: {sparse})");
+                        let strategy = source
+                            .device_placement_strategy(&cross_host_layout_resolver(client), destination_mesh, &split, 0)
+                            .unwrap();
+                        assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{context}");
+                        // The device at `(x, s)` holds the rows of part `s` of the contribution at `x`.
+                        let upper = rows.div_ceil(2);
+                        let expected = (0..4)
+                            .map(|index| {
+                                let range = if index % 2 == 0 { 0..upper * 2 } else { upper * 2..rows * 2 };
+                                contribution(index / 2, rows)[range].to_vec()
+                            })
+                            .collect::<Vec<_>>();
+                        let target = Placement::new(destination_mesh.clone(), split.clone()).unwrap();
+                        for placed in [
+                            source.to_placement(&session, target.clone()),
+                            source.clone().into_placement(&session, target.clone()),
+                            session.place(source.clone(), PlacementOptions::to(target.clone())),
+                        ] {
+                            let placed = placed.unwrap();
+                            assert_eq!(placed.layout(), Some(&column_major), "{context}");
+                            assert_eq!(device_bytes(&placed), expected, "{context}");
+                            assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // The same `u8` source in pinned host memory converts its shards into device memory, where the CPU plugin can
+        // hold the dense row-major layout, and the result takes the requested memory and the column-major layout.
+        // Before, the conversion stayed in pinned host memory, which the CPU plugin rejected for every row count.
+        let pinned = Memory::Host { pinned: true };
+        let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
+        let split = Sharding::new(source_mesh.logical_mesh().clone(), split).unwrap().with_unreduced_axes(["x"]);
+        let split = split.unwrap();
+        for rows in [3, 4] {
+            let (first, second) = (u8_contribution(0, rows), u8_contribution(1, rows));
+            let value = first.iter().zip(second).map(|(a, b)| a + b).collect::<Vec<_>>();
+            let source = Array::from_host_shards(
+                &session,
+                ArrayType::new_static(DataType::U8, [rows, 2]),
+                source_mesh.clone(),
+                Some(sum.clone()),
+                devices.iter().enumerate().map(|(index, device)| {
+                    (device.id(), Arc::<[u8]>::from(u8_contribution(index / 2, rows).as_slice()))
+                }),
+            )
+            .unwrap();
+            let target = Placement::new(source_mesh.clone(), sum.clone()).unwrap();
+            let target = target.with_memory(pinned).with_layout(column_major.clone());
+            let source = source.to_placement(&session, target).unwrap();
+            assert_eq!((source.r#type().memory(), source.layout()), (pinned, Some(&column_major)));
+            let strategy = source
+                .device_placement_strategy(&cross_host_layout_resolver(client), &source_mesh, &split, 0)
+                .unwrap();
+            assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{rows}");
+            let upper = rows.div_ceil(2);
+            let expected = (0..4)
+                .map(|index| {
+                    let range = if index % 2 == 0 { 0..upper * 2 } else { upper * 2..rows * 2 };
+                    u8_contribution(index / 2, rows)[range].to_vec()
+                })
+                .collect::<Vec<_>>();
+            for memory in [pinned, Memory::Device] {
+                let target = Placement::new(source_mesh.clone(), split.clone()).unwrap().with_memory(memory);
+                for placed in [
+                    source.to_placement(&session, target.clone()),
+                    source.clone().into_placement(&session, target.clone()),
+                    session.place(source.clone(), PlacementOptions::to(target.clone())),
+                ] {
+                    let placed = placed.unwrap();
+                    let context = format!("{rows} rows into {memory:?}");
+                    assert_eq!((placed.r#type().memory(), placed.layout()), (memory, Some(&column_major)), "{context}");
+                    assert_eq!(device_bytes(&placed), expected, "{context}");
+                    assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
+                }
+            }
         }
     }
 
@@ -6141,7 +6339,7 @@ mod tests {
         // pending reduction that a destination keeps moves as regions of the shards of each contribution, on the same
         // mesh too, so that sparse and dense sources behave alike, which slice or join the shards of every device
         // (`+4`) and complete nothing, whatever the type of the axes. On the same mesh, the compiled reshard is the
-        // fallback when regions do not apply (e.g., for a declared layout other than the dense row-major one).
+        // fallback when regions do not apply.
         // A compiled reshard makes every other change over auto axes (i.e., it completes a pending reduction and
         // introduces a pending sum or a completed reduction). XLA cannot introduce a pending maximum or minimum, so a
         // destination with one that the source does not keep compiles nothing and takes the host round trip (e.g., across meshes,
@@ -9741,7 +9939,8 @@ mod tests {
             let held = Arc::clone(source.shards()[1].buffer().unwrap());
 
             let mut completion = PlacementCompletion::default();
-            let sent = source.cross_host_source_buffer(0, &client_devices[0], process_index, &mut completion).unwrap();
+            let replicas = LocalReplicas::new(process_index);
+            let sent = source.cross_host_source_buffer(&replicas, 0, &client_devices[0], &mut completion).unwrap();
             completion.join(None).unwrap().block_until_ready().unwrap();
             assert!(!Arc::ptr_eq(&sent, &held));
             assert_eq!(sent.device().unwrap().id().unwrap(), devices[0].id());
@@ -9752,7 +9951,7 @@ mod tests {
             // The shard that holds a buffer sends it without a copy, and the result of the placement then waits for
             // and reports its readiness, which may be the only completion of the work that produced it.
             let mut completion = PlacementCompletion::default();
-            let sent = source.cross_host_source_buffer(1, &client_devices[1], process_index, &mut completion).unwrap();
+            let sent = source.cross_host_source_buffer(&replicas, 1, &client_devices[1], &mut completion).unwrap();
             assert!(Arc::ptr_eq(&sent, &held));
             let fence = completion.join(None).unwrap();
             fence.block_until_ready().unwrap();
@@ -9771,7 +9970,7 @@ mod tests {
         .unwrap();
         let mut completion = PlacementCompletion::default();
         let error = source
-            .cross_host_source_buffer(1, &client_devices[1], process_index, &mut completion)
+            .cross_host_source_buffer(&LocalReplicas::new(process_index), 1, &client_devices[1], &mut completion)
             .err()
             .unwrap();
         assert!(matches!(

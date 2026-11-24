@@ -164,8 +164,13 @@ fn test_array_rng_bit_generator_allocates_no_narrowing_buffer() {
 
 #[test]
 fn test_eager_context_fill_allocates_one_payload_buffer() {
+    // Filling broadcasts a scalar, and the first scalar shape of a process allocates the dimensions that every scalar
+    // shape then shares, so one is created before the first measurement to keep that allocation out of both counts.
     let small = measure_allocations(
-        || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])),
+        || {
+            black_box(ArrayType::scalar(DataType::F32));
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
+        },
         |r#type| EagerContext::<Array>::new().fill(&r#type, 2.5f32).unwrap(),
     );
     let large = measure_allocations(
