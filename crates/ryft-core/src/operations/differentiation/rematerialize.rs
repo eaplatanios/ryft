@@ -258,10 +258,16 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
         let body = &region_interfaces[0];
-        check_types!(@same, format!("`{REMATERIALIZE_OPERATION_NAME}` body input"), [
-            input_types,
-            body.input_types(),
-        ]);
+
+        // An input may refine the type that the body declares for it, because a body traced at the declaration
+        // of a value (refer to `Value::relocatable_type`) receives that value with its concrete type when it runs.
+        let declared_types = body.input_types();
+        if declared_types.len() != input_types.len()
+            || !declared_types.iter().zip(input_types).all(|(declared, input)| declared.is_refined_by(input))
+        {
+            check_types!(@same, format!("`{REMATERIALIZE_OPERATION_NAME}` body input"), [input_types, declared_types]);
+        }
+
         if let RematerializationOptimizationBarrier::Inputs(selected) = &self.optimization_barrier
             && selected.len() != input_types.len()
         {
@@ -272,6 +278,7 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
                 input_types.len(),
             )));
         }
+
         Ok(body.output_types().to_vec())
     }
 
@@ -1164,6 +1171,23 @@ mod tests {
             operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], std::slice::from_ref(&body)),
             Err(TypeError::invalid(
                 "`rematerialize` body input type signature mismatch: expected [f32[]] but got [f64[]]",
+            )),
+        );
+
+        // An input may refine the body input type (e.g., a placed value for a body traced at its declaration without
+        // a sharding), but a body input that the input does not refine is still rejected.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed = scalar.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&placed), std::slice::from_ref(&body)),
+            Ok(vec![scalar.clone(), scalar.clone()]),
+        );
+        let placed_body = RegionInterface::new(vec![placed.clone()], vec![placed.clone()], EffectClasses::NONE);
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&scalar), std::slice::from_ref(&placed_body)),
+            Err(TypeError::invalid(
+                "`rematerialize` body input type signature mismatch: expected [f64[]] but got \
+                 [f64[][sharding={mesh<['x'=1:auto]>, []}]]",
             )),
         );
         assert_eq!(
