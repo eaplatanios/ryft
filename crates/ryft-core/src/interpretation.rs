@@ -82,6 +82,7 @@
 //! [`InterpretationDriver`]. A new replay meaning normally requires no second interpreter: define a [`Context`]
 //! whose [`Context::bind`] implements that meaning and call [`Program::interpret_in_context`].
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::Debug;
 
@@ -994,20 +995,35 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
             }
         }
 
+        // A value that is free to be placed elsewhere enters with the declared type when it may be placed as that type
+        // states (refer to `is_relocatable_to`), and the operations of the region move it, as they would move it from
+        // wherever it lives. Every other value enters with its own type.
+        let input_types = input_ids
+            .iter()
+            .zip(&inputs)
+            .map(|(id, input)| {
+                let declared = region.atoms()[id.index()].r#type();
+                if !declared.is_refined_by(input.r#type().as_ref()) && is_relocatable_to(input, declared.as_ref()) {
+                    declared.into_owned()
+                } else {
+                    input.r#type().into_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+
         // Equal boundary types carry no additional refinement facts, so avoid constructing a refinement environment
         // in the common staging/replay case. More precise actual types (e.g., a static extent supplied for a dynamic
         // dimension) must be checked as one complete signature so repeated identities agree across inputs.
-        let refinements = if input_ids.len() == inputs.len()
-            && input_ids
-                .iter()
-                .zip(&inputs)
-                .all(|(id, actual)| region.atoms()[id.index()].r#type().as_ref() == actual.r#type().as_ref())
+        let refinements = if input_ids
+            .iter()
+            .zip(&input_types)
+            .all(|(id, actual)| region.atoms()[id.index()].r#type().as_ref() == actual)
         {
             <C::Type as Type>::Refinements::default()
         } else {
             <C::Type as Type>::Refinements::new(
                 input_ids.iter().map(|id| region.atoms()[id.index()].r#type()),
-                inputs.iter().map(Typed::r#type),
+                input_types.iter(),
             )
             .map_err(|error| Self::contextualize_refinement_error(region, error, input_ids, &inputs, "input"))?
         };
@@ -1027,7 +1043,6 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         // renaming applies to declared output types during validation; it does not equate unrelated dimensions
         // with equal names.
         let region_mappings = RegionReplayMappings::new();
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
 
         // A symbolic entry must be checked before strict structural renaming, and its prepared values must enter the
         // body. Reference handles retain their types; ordinary operands can adopt the checked representation. Exact
@@ -1220,8 +1235,24 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 .iter()
                 .map(|identity| renaming.rename(identity))
                 .collect::<Vec<_>>();
+
+            // A value that is free to be placed elsewhere satisfies the declared type when it may be placed as that
+            // type states (refer to `is_relocatable_to`), as it does at the input boundary in `Self::new`.
+            let actual = outputs
+                .iter()
+                .zip(declared.iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|(output, declared)| match declared {
+                    Some(declared)
+                        if !declared.is_refined_by(output.r#type().as_ref()) && is_relocatable_to(output, declared) =>
+                    {
+                        Cow::Borrowed(declared)
+                    }
+                    _ => output.r#type(),
+                })
+                .collect::<Vec<_>>();
+
             refinements
-                .validate_refinement(declared.iter(), outputs.iter().map(Typed::r#type), &closed_identities)
+                .validate_refinement(declared.iter(), actual, &closed_identities)
                 .map_err(|error| Self::contextualize_refinement_error(region, error, output_ids, &outputs, "output"))?;
         }
         Ok(outputs)
@@ -1437,6 +1468,16 @@ impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone> RegionInte
 
         Ok(outputs)
     }
+}
+
+/// Returns whether `value` is free to be placed elsewhere and may be placed as `declared` states (i.e., whether its
+/// [`relocatable_type`](Value::relocatable_type) is refined by `declared`), so that a boundary that declares `declared`
+/// admits it even when its own type does not satisfy that declaration (e.g., an uncommitted array that lives on another
+/// mesh than a declared sharding names). The input and output boundaries of an interpreted region, the seeds of a
+/// pullback, and the input cotangents of a pullback admit such values through this one function. A value without a
+/// relocatable type is never admitted by it.
+pub(crate) fn is_relocatable_to<V: Value>(value: &V, declared: &V::Type) -> bool {
+    value.relocatable_type().is_some_and(|declaration| declaration.is_refined_by(declared))
 }
 
 /// Interprets a [`Region`](crate::Region)-free member [`Operation`] through a heterogeneous [`Domain`]. Inputs are
