@@ -831,14 +831,15 @@ mod tests {
     #[test]
     fn test_dispatch_signature_relocates_uncommitted_arguments() {
         // A `jit` dispatcher and a function compiled ahead of time for the type that the dispatcher specializes for
-        // agree, at a direct execution and at an eager call, for every argument and every mesh of the function. An
-        // uncommitted argument that records nothing beyond replication follows the call (the function compiled ahead of
-        // time is compiled for its type without a sharding), whereas the mesh of the function still rejects a
-        // committed argument or a split over another logical mesh. Before, every dispatcher on a named mesh of one
-        // device rejected an uncommitted upload with "mesh mismatch". Each observation includes the runtime sharding of
-        // the result, because an eager call and an execution of one dispatcher must view an uncommitted argument alike
-        // (refer to `argument_type`): before, an eager call specialized for its type on the canonical mesh of its
-        // device, so it rejected a placement onto a bare device that every other entry point accepted.
+        // agree, at a direct execution and at an eager call, for every argument and every mesh of the function, which
+        // is named, so an eager call runs on it as an execution does. An uncommitted argument that records nothing
+        // beyond replication moves there (the function compiled ahead of time is compiled for its type without a
+        // sharding), whereas the mesh of the function rejects a committed argument or a split over another logical
+        // mesh. Before, every dispatcher on a named mesh of one device rejected an uncommitted upload with "mesh
+        // mismatch". Each observation includes the runtime sharding of the result, because an eager call and an
+        // execution of one dispatcher must view an uncommitted argument alike (refer to `argument_type`): before, an
+        // eager call specialized for its type on the canonical mesh of its device, so it rejected a placement onto a
+        // bare device that every other entry point accepted.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -891,6 +892,7 @@ mod tests {
         };
         let mut uncommitted_rows = Vec::new();
         let mut split_rows = Vec::new();
+        let mut rejected_rows = Vec::new();
         for (mesh_name, mesh) in &meshes {
             let dispatcher = jit::<_, (), ArrayType, ArrayType>(|(), x| Ok(x), &session, mesh.clone());
             for (argument_name, argument) in &arguments {
@@ -915,12 +917,13 @@ mod tests {
                         );
                     }
                     // The mesh of the function rejects the type of a committed argument or of a split over another
-                    // logical mesh, ahead of time and at a direct execution of the dispatcher alike, whereas an eager
-                    // call of the dispatcher keeps such an argument where it is (refer to the register entry "A call
-                    // of a `jit` dispatcher keeps its inputs where they are").
+                    // logical mesh, ahead of time and at a direct execution of the dispatcher alike, and an eager call
+                    // of the dispatcher rejects it too, because it runs on that mesh, with the error of its devices or
+                    // of its sharding, which the dispatcher keeps (refer to the register entry "A call of a `jit`
+                    // dispatcher keeps its inputs where they are").
                     Err(error) => {
                         assert_eq!(execution, Err(error.to_string()), "{mesh_name}, {argument_name}");
-                        assert!(call.is_ok(), "{mesh_name}, {argument_name}");
+                        rejected_rows.push((*mesh_name, *argument_name, call.clone()));
                     }
                 }
                 if !argument.is_committed() {
@@ -966,33 +969,67 @@ mod tests {
         let placed = |device: usize| Ok((vec![device], true, values.clone(), "{mesh<['q'=1:explicit]>, [{}]}".into()));
         assert_eq!(placement_rows, vec![("named here", placed(0)), ("named elsewhere", placed(1))]);
 
-        // An execution places an uncommitted argument on the mesh of the function, whereas an eager call keeps it where
-        // it is (refer to the register entry "A call of a `jit` dispatcher keeps its inputs where they are"). A split
-        // of an uncommitted argument along an auto axis is relocatable, so neither keeps it, whereas both keep the
-        // split of a committed one.
+        // An execution and an eager call place an uncommitted argument on the named mesh of the function and commit the
+        // result there, as JAX does under `set_mesh`. A split of an uncommitted argument along an auto axis is
+        // relocatable, so neither keeps it, whereas both keep the split of a committed one.
         let on = |devices: Vec<usize>, committed: bool, sharding: &str| {
             Ok::<_, String>((devices, committed, values.clone(), sharding.to_string()))
         };
-        let canonical = on(vec![0], false, "{mesh<['device'=1:auto]>, [{}]}");
-        let canonical_split = on(vec![0], false, "{mesh<['x'=1:auto]>, [{}]}");
-        let named = |device: usize| on(vec![device], false, "{mesh<['q'=1:explicit]>, [{}]}");
+        let canonical_split = on(vec![0], true, "{mesh<['x'=1:auto]>, [{}]}");
+        let named = |device: usize| on(vec![device], true, "{mesh<['q'=1:explicit]>, [{}]}");
         let one_device_split = "uncommitted split along an auto axis of one device";
         let both_devices = on(vec![0, 1], true, "{mesh<['x'=2:auto]>, [{}]}");
         assert_eq!(
             uncommitted_rows,
             vec![
-                ("named here", "uncommitted", named(0), canonical.clone()),
-                ("named here", one_device_split, named(0), canonical_split.clone()),
-                ("named elsewhere", "uncommitted", named(1), canonical.clone()),
-                ("named elsewhere", one_device_split, named(1), canonical_split.clone()),
-                ("two devices", "uncommitted", both_devices.clone(), canonical.clone()),
-                ("two devices", one_device_split, both_devices, canonical_split.clone()),
-                ("one device", "uncommitted", canonical_split.clone(), canonical),
+                ("named here", "uncommitted", named(0), named(0)),
+                ("named here", one_device_split, named(0), named(0)),
+                ("named elsewhere", "uncommitted", named(1), named(1)),
+                ("named elsewhere", one_device_split, named(1), named(1)),
+                ("two devices", "uncommitted", both_devices.clone(), both_devices.clone()),
+                ("two devices", one_device_split, both_devices.clone(), both_devices),
+                ("one device", "uncommitted", canonical_split.clone(), canonical_split.clone()),
                 ("one device", one_device_split, canonical_split.clone(), canonical_split),
             ],
         );
         let kept_split = on(vec![0], true, "{mesh<['x'=1:auto]>, [{'x'}]}");
         assert_eq!(split_rows.last(), Some(&("one device", kept_split.clone(), kept_split)));
+        let committed_to = |actual: &str, required: &str| {
+            Err::<(Vec<usize>, bool, Vec<f32>, String), _>(format!(
+                "public argument #0 is committed to devices {actual}, but the executable requires {required}"
+            ))
+        };
+        let sharded_as = |actual: &str, required: &str| {
+            Err::<(Vec<usize>, bool, Vec<f32>, String), _>(format!(
+                "array type sharding `{actual}` does not match the placement `{required}` over the non-auto mesh axes"
+            ))
+        };
+        let (device, q, x) =
+            ("{mesh<['device'=1:auto]>, [{}]}", "{mesh<['q'=1:explicit]>, [{}]}", "{mesh<['x'=1:auto]>, [{}]}");
+        let (auto_split, explicit_split, committed_split) =
+            ("split along an auto axis", "split along an explicit axis", "split along an auto axis of one device");
+        assert_eq!(
+            rejected_rows,
+            vec![
+                ("named here", "committed here", sharded_as(device, q)),
+                ("named here", "committed elsewhere", committed_to("[1]", "[0]")),
+                ("named here", auto_split, committed_to("[0, 1]", "[0]")),
+                ("named here", explicit_split, committed_to("[0, 1]", "[0]")),
+                ("named here", committed_split, sharded_as(x, q)),
+                ("named elsewhere", "committed here", committed_to("[0]", "[1]")),
+                ("named elsewhere", "committed elsewhere", sharded_as(device, q)),
+                ("named elsewhere", auto_split, committed_to("[0, 1]", "[1]")),
+                ("named elsewhere", explicit_split, committed_to("[0, 1]", "[1]")),
+                ("named elsewhere", committed_split, committed_to("[0]", "[1]")),
+                ("two devices", "committed here", committed_to("[0]", "[0, 1]")),
+                ("two devices", "committed elsewhere", committed_to("[1]", "[0, 1]")),
+                ("two devices", committed_split, committed_to("[0]", "[0, 1]")),
+                ("one device", "committed here", sharded_as(device, x)),
+                ("one device", "committed elsewhere", committed_to("[1]", "[0]")),
+                ("one device", auto_split, committed_to("[0, 1]", "[0]")),
+                ("one device", explicit_split, committed_to("[0, 1]", "[0]")),
+            ],
+        );
     }
 
     #[test]

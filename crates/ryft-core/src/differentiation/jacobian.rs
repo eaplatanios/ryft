@@ -292,7 +292,9 @@ where
     JacobianMode::Forward.validate_types(&output_types, holomorphic, DifferentiationParameterRole::Output)?;
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
-    // Verify that the derived program still satisfies this contract before constructing its packed inputs.
+    // Verify that the derived program still satisfies this contract before constructing its packed inputs. The tangent
+    // type of a relocatable input (refer to `Value::relocatable_type`) may be refined by that of its concrete value.
+    let relocatable_inputs = pushforward.relocatable_inputs().to_vec();
     let (_, program, residuals, _, _, tangent_output_slots, _) = pushforward.into_parts();
     let program_input_types = program.input_types();
     let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
@@ -310,8 +312,12 @@ where
         ))
         .into());
     }
-    for (index, (program_input_type, (path, input_type))) in
-        program_input_types[..tangent_input_count].iter().zip(input_types.named_parameters()).enumerate()
+
+    for (index, ((program_input_type, (path, input_type)), &relocatable)) in program_input_types[..tangent_input_count]
+        .iter()
+        .zip(input_types.named_parameters())
+        .zip(&relocatable_inputs)
+        .enumerate()
     {
         let tangent_type = input_type.tangent()?;
         if tangent_type.is_zero_space() {
@@ -322,7 +328,7 @@ where
                 r#type: input_type.to_string(),
             });
         }
-        if program_input_type != &tangent_type {
+        if program_input_type != &tangent_type && !(relocatable && program_input_type.is_refined_by(&tangent_type)) {
             return Err(ProgramError::MalformedProgram(format!(
                 "pushforward tangent input {index} has type {program_input_type} but the differentiated input \
                 parameter has tangent type {tangent_type}",

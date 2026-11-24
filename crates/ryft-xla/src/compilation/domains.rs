@@ -66,7 +66,10 @@ impl CompilationDomain for Session {
     // to another memory does not. Otherwise public arguments or the enclosing caller
     // select the devices, even for a function with committed captures. A dispatcher without input overrides also
     // keeps each argument's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
-    // (refer to `dispatch_signature`). Core constructs the call operation once for each staged function.
+    // (refer to `dispatch_signature`). Every call also records the mesh of its function, named or not, which only an
+    // application of the call by a session reads, to run there (refer to `JitCallOperation::with_function_mesh`), and
+    // which a call nested in a compiled caller never reads. Core constructs the call operation once for each staged
+    // function.
     fn call_operation(operation: Operation, callee: &FlatProgram, options: &Options, dispatched: bool) -> Operation {
         match operation {
             Operation::JitCall(call) => {
@@ -79,7 +82,8 @@ impl CompilationDomain for Session {
                 // that lowering emits for its target drops the mesh of a call whose callee names devices only inside a
                 // body that the target replaces (refer to `pruned_program`).
                 let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
-                let call = call.with_boundary(mesh, input_shardings, output_shardings);
+                let call =
+                    call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
                 let call = if dispatched && options.input_shardings().is_none() {
                     call.with_kept_input_placements()
                 } else {
@@ -162,7 +166,9 @@ impl Session {
         // The captures that survive pruning are placed as `capture_sharding` resolves them, which is as they are at
         // runtime, including over the auto mesh axes that their types do not record, so that executions need not
         // reshard them. A capture whose placement the function cannot keep fails here, and only if the function uses
-        // it.
+        // it. So does a capture of another client than that of this session, with the error with which a session
+        // constant of another client fails (refer to `placed_constant`), because every execution would reject it.
+        // Staging already pruned the captures that the function does not use, which are therefore never checked.
         let capture_placements = staged
             .source_program()
             .captures()
@@ -170,6 +176,9 @@ impl Session {
             .enumerate()
             .map(|(index, capture)| match capture {
                 Value::Array(array) => {
+                    if !std::ptr::eq(array.client(), self.client()) {
+                        RetainedArray::new(array).validate_client(self.client())?;
+                    }
                     admit_capture(array.sharding(), index, capture_count)?;
                     let sharding = capture_sharding(
                         &format!("capture #{index}"),
@@ -189,7 +198,7 @@ impl Session {
         } else {
             options
         };
-        let lowered_program = self.lower_program(program, capture_count, options)?;
+        let lowered_program = self.lower_function_program(program, capture_count, options, true)?;
         // A compiled function accepts exactly the arguments that its declared input types describe, so the public input
         // types of its executable are those types, which lowering never changes.
         let lowered_input_types = lowered_program.input_types();
@@ -221,26 +230,42 @@ impl Session {
     /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
     /// reject it (refer to `validate_mesh_device_processes`), before anything is lowered, compiled, or looked up in a
     /// compilation cache, so that every process rejects it alike. A device that the client does not know (e.g., of a
-    /// remote process) is accepted.
+    /// remote process) is accepted. The program is lowered as the program of an eager application, whose mesh is
+    /// where its operands are, so the mesh does not commit its outputs for being named (refer to
+    /// [`commits_public_outputs`] and `lower_function_program`).
     pub(crate) fn lower_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
         options: &Options,
     ) -> Result<LoweredProgram, Error> {
+        self.lower_function_program(program, capture_count, options, false)
+    }
+
+    /// Lowers `program` as [`Self::lower_program`] does, where `function` says whether it is the program of a function
+    /// compiled for the mesh of `options`, which commits its public outputs when that mesh is named (refer to
+    /// [`commits_public_outputs`]).
+    fn lower_function_program(
+        &self,
+        program: &FlatProgram,
+        capture_count: usize,
+        options: &Options,
+        function: bool,
+    ) -> Result<LoweredProgram, Error> {
         validate_mesh_device_processes(self.client(), options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
         // `pruned_program`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
-        self.lower_pruned_program(&pruned_program(program, target_platform)?, capture_count, options)
+        self.lower_pruned_program(&pruned_program(program, target_platform)?, capture_count, options, function)
     }
 
-    /// Lowers `program` after dead instruction pruning.
+    /// Lowers `program` after dead instruction pruning (refer to `lower_function_program` for `function`).
     fn lower_pruned_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
         options: &Options,
+        function: bool,
     ) -> Result<LoweredProgram, Error> {
         // Kernel selection validates the actual attached body and discharges only its owned local state before the
         // ordinary reference discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
@@ -269,20 +294,23 @@ impl Session {
                 program.output_count(),
                 &[],
                 options,
+                function,
             );
         }
         // Discharge the exact lifted program so capture references of attached regions resolve against the same lexical
         // capture prefixes used during staging. Programs that actually contain references are cloned because
         // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
         let discharged = program.clone().discharge_references_in_capture_lifted_program(capture_count)?;
-        self.lower_discharged_program(&discharged, options)
+        self.lower_discharged_program(&discharged, options, function)
     }
 
-    /// Lowers one validated reference discharge artifact through the ordinary array-only XLA path.
+    /// Lowers one validated reference discharge artifact through the ordinary array-only XLA path (refer to
+    /// `lower_function_program` for `function`).
     fn lower_discharged_program(
         &self,
         discharged: &ReferenceDischargeResult<Constant, Operation>,
         options: &Options,
+        function: bool,
     ) -> Result<LoweredProgram, Error> {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
         // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
@@ -300,10 +328,12 @@ impl Session {
             discharged.output_count(),
             discharged.external_reference_bindings(),
             options,
+            function,
         )
     }
 
-    /// Lowers one program after an independent verifier has established that it contains no references.
+    /// Lowers one program after an independent verifier has established that it contains no references (refer to
+    /// `lower_function_program` for `function`).
     fn lower_verified_reference_free_program(
         &self,
         program: &FlatProgram,
@@ -311,6 +341,7 @@ impl Session {
         output_count: usize,
         reference_states: &[ExternalReferenceBinding],
         options: &Options,
+        function: bool,
     ) -> Result<LoweredProgram, Error> {
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
@@ -609,13 +640,18 @@ impl Session {
         // function that is compiled for more than one device is committed as well, including its hidden reference
         // states, as JAX commits every result of a computation on more than one device (refer to
         // `lower_sharding_computation` in `jax._src.interpreters.pxla`), whereas a function that is compiled for a
-        // single device leaves its outputs to the other rules. Other outputs are committed when a public argument of
-        // an execution is. The arrays that a function captures never commit its outputs, committed or not, as JAX
-        // returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
+        // single device leaves its outputs to the other rules. Every public output of a function compiled for a named
+        // mesh (`function`) is committed too, as JAX commits every result of a `jit` function under `set_mesh` (refer
+        // to `commits_public_outputs`). Other outputs are committed when a public argument of an execution is. The
+        // arrays that a function captures never commit its outputs, committed or not, as JAX returns
+        // `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
         // operations and compiled reshards set the commitment of their results themselves, so these flags do not
         // reach them.
-        let commits_public_outputs =
-            commits_public_outputs(options.mesh(), requests_placement(program, options, target_platform, true));
+        let commits_public_outputs = commits_public_outputs(
+            options.mesh(),
+            function,
+            requests_placement(program, options, target_platform, true),
+        );
         let runs_on_multiple_devices = options.mesh().devices().len() > 1;
         let committed_outputs = (0..output_types.len())
             .map(|index| runs_on_multiple_devices || index < output_count && commits_public_outputs)
@@ -1048,7 +1084,18 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// keeps nothing alive beyond the capture itself. Every process therefore holds the same facts for the capture of a
 /// function (i.e., committed to its devices and not locally assigned), whether a process placed it or found it there
 /// (e.g., a capture without a target on a function on the first device of the first process, which the first process
-/// finds on that device and every other process places there).
+/// finds on that device and every other process places there). The exception is such a capture that lacks the buffer
+/// of a shard of this process that another local replica of the same contribution holds (e.g., a partial import,
+/// refer to [`RetainedArray::fills_missing_local_replicas`]), which is placed onto its own mesh and sharding once, as
+/// any other destination is, so that the copy of that replica is made once rather than by every execution. Each
+/// process decides this from its own buffers, but that placement moves every shard to its own device and copies only
+/// between devices of one process, so a process that places it submits no transfer that another process pairs with,
+/// whichever replicas each process holds, and a contribution without any local replica is left as it is.
+///
+/// Only session constants take this route, which are the captures whose types record nothing beyond replication. A
+/// capture whose type records more (e.g., a split over explicit mesh axes) stays an ordinary capture of the
+/// executable, which receives it as it is, so an execution on other devices than those of that capture moves it again
+/// every time, and one on its devices moves nothing.
 ///
 /// # Errors
 ///
@@ -1074,7 +1121,9 @@ pub(crate) fn placed_constant(
         return Ok(None);
     }
     let (target, sharding) = if constant.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
-        if constant.mesh().devices() == mesh.devices() {
+        // A capture on the devices of `mesh` is placed onto its own mesh and sharding only to fill its missing local
+        // replicas.
+        if constant.mesh().devices() == mesh.devices() && !constant.fills_missing_local_replicas()? {
             return Ok(Some(constant.on_named_devices()));
         }
         (DeviceMesh::new(constant.sharding().mesh().clone(), mesh.devices().to_vec())?, constant.sharding().clone())
@@ -1266,13 +1315,32 @@ pub(crate) fn jit_compilation_options(
 
 /// Returns whether every execution of a program on `mesh` commits its public outputs whatever the commitment of its
 /// arguments, where `requests_placement` says whether the program requests a placement explicitly anywhere, including
-/// one that only moves a value to another memory (refer to `requests_placement`). This is the case when it does, as JAX
-/// commits every result of a `jit` function with any explicit sharding, and when the program runs on more than one
-/// device, as JAX commits every result of a computation on more than one device. Compiled programs record it (refer to
-/// [`CompiledProgram::committed_outputs`]), and region replay of a call commits the results of its callee by it, so
-/// that the two agree.
-pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, requests_placement: bool) -> bool {
-    requests_placement || mesh.devices().len() > 1
+/// one that only moves a value to another memory (refer to `requests_placement`), and `function_mesh` says whether
+/// `mesh` is the mesh that the function of the program was compiled for and runs on, rather than the devices of the
+/// arguments of an eager application or of an eager operation. This is the case when the program requests a placement,
+/// as JAX commits every result of a `jit` function with any explicit sharding, when it runs on more than one device, as
+/// JAX commits every result of a computation on more than one device, and when it runs on the named mesh of its
+/// function (refer to [`is_named_mesh`]), as JAX commits every result of a `jit` function under `set_mesh`, on one
+/// device too. A result of a function on a named mesh of one device is therefore committed to that mesh, so combining
+/// it with a value committed to other devices is an error, as under `set_mesh`. On an anonymous mesh, results are
+/// committed only by the other rules or by a committed public argument.
+///
+/// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
+/// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
+/// for the mesh on which the application runs (refer to `JitCallOperation::eager_decision`), so that `.call`, the
+/// replay of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an execution
+/// does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
+pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, requests_placement: bool) -> bool {
+    requests_placement || mesh.devices().len() > 1 || function_mesh && is_named_mesh(mesh.logical_mesh())
+}
+
+/// Returns whether `mesh` is named, the analogue of a mesh that JAX's `set_mesh` makes current, which is any mesh other
+/// than [`LogicalMesh::single_device`] and the mesh without axes. Those two are anonymous, the analogue of one device
+/// without a mesh (e.g., under JAX's `default_device`). A function compiled for a named mesh runs there wherever a
+/// session applies it and commits its results (refer to `JitCallOperation::eager_decision` and
+/// [`commits_public_outputs`]).
+pub(crate) fn is_named_mesh(mesh: &LogicalMesh) -> bool {
+    !mesh.axes().is_empty() && *mesh != LogicalMesh::single_device()
 }
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a
@@ -5226,6 +5294,90 @@ mod tests {
         let placed = placed_constant(&session, &retained, &mesh).unwrap().unwrap().to_array(&session).unwrap();
         let values = placed.copy_to_host().unwrap().elements::<f32>().unwrap();
         assert_eq!((placed.mesh().devices().to_vec(), placed.is_committed(), values), (vec![device], true, vec![3.0]));
+    }
+
+    #[test]
+    fn test_session_lower_staged_program_rejects_used_captures_of_another_client() {
+        // A capture of another client that the function uses is rejected at compilation with the error with which a
+        // session constant of another client is rejected (refer to
+        // `test_placed_constant_rejects_another_client_before_the_placement_attempt`), whereas staging prunes one that
+        // the function does not use, which therefore compiles. Before, a split capture of another client, which stays
+        // an ordinary capture, compiled into an executable whose every execution failed with `CaptureClientMismatch`.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let foreign_session = Session::builder().client(other_cpu_client(2)).build().unwrap();
+        let foreign_mesh = two_device_mesh(foreign_session.client(), MeshAxisType::Explicit);
+        let dimensions = vec![ShardingDimension::sharded(["x"])];
+        let sharding = Sharding::new(foreign_mesh.logical_mesh().clone(), dimensions).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2f32]);
+        let capture = Array::from_host_buffer(&foreign_session, r#type, foreign_mesh, Some(sharding), bytes).unwrap();
+        let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
+        let input_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let used = compile_statefully_with_captures::<_, Type, Type>(
+            |captures, _| Ok(captures[0].clone()),
+            vec![Value::Array(capture.clone())],
+            input_type.clone(),
+            &session,
+            Options::new(mesh.clone()),
+        );
+        let message = format!(
+            "session constant `{}` retains an array of a different PJRT client than the client of this session",
+            RetainedArray::new(&capture),
+        );
+        assert_eq!(used.err().map(|error| error.to_string()), Some(message));
+        let unused = compile_statefully_with_captures::<_, Type, Type>(
+            |_, input| Ok(input),
+            vec![Value::Array(capture)],
+            input_type,
+            &session,
+            Options::new(mesh),
+        );
+        assert!(unused.is_ok());
+    }
+
+    #[test]
+    fn test_placed_constant_fills_missing_local_replicas_once() {
+        // A replicated capture on the devices of a function that holds the buffer of only one of its two local replicas
+        // (e.g., a partial import) is placed onto its own mesh and sharding once, which copies that replica, so that the
+        // executable holds a fully populated capture and every execution creates only its output. Before, it was passed
+        // as it was, and every execution copied the same replica again.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let bytes = values_to_bytes(&values);
+        let buffer = client.buffer(bytes.as_slice(), BufferType::F32, [8u64], None, device, None).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [8]);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let capture =
+            Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding), vec![buffer]).unwrap();
+        let input_placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0));
+        let input = session.place(0f32, PlacementOptions::to(input_placement.unwrap())).unwrap();
+        let function = compile_statefully_with_captures::<_, Type, Type>(
+            |captures, _| Ok(captures[0].clone()),
+            vec![Value::Array(capture.clone())],
+            Type::Array(ArrayType::scalar(DataType::F32)),
+            &session,
+            Options::new(mesh),
+        )
+        .unwrap();
+        let [Value::Array(placed)] = function.executable().captures() else {
+            panic!("expected one captured array");
+        };
+        let held = placed.shards().iter().map(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
+        assert_eq!(held, [true, true]);
+        assert!(Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), capture.shards()[0].buffer().unwrap()));
+        let executions = (0..3)
+            .map(|_| {
+                let statistics = session.array_statistics();
+                let output = function.execute_statefully_and_wait(&session, Value::Array(input.clone())).unwrap();
+                let created = session.array_statistics().created_arrays - statistics.created_arrays;
+                let Value::Array(output) = output else { panic!("expected an array output") };
+                (created, output.copy_to_host().unwrap().elements::<f32>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(executions, vec![(1, values); 3]);
     }
 
     #[test]

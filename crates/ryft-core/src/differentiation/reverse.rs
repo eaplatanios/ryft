@@ -1673,9 +1673,13 @@ impl<
                         ),
                     });
                 }
-            } else if !expected_type.is_interchangeable_with(cotangent.r#type().as_ref()) {
+            } else if !expected_type.is_interchangeable_with(cotangent.r#type().as_ref())
+                && !expected_type.is_refined_by(cotangent.r#type().as_ref())
+            {
                 // A live cotangent may be stored differently than its type describes (e.g., with the explicit layout
-                // that a seed or a primal value contributed), because that type has no explicit layout.
+                // that a seed or a primal value contributed), because that type has no explicit layout. An input that
+                // entered linearization with a declaration (refer to `Value::relocatable_type`) accepts a cotangent
+                // that refines it.
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
                         "pullback cotangent {} has type {} but its primal input requires cotangent type {}",
@@ -2022,8 +2026,14 @@ impl<
                     }
 
                     // A seed may be stored differently than the cotangent type describes (e.g., with the explicit
-                    // layout of the primal output), because that type has no explicit layout.
-                    if !cotangent_type.is_interchangeable_with(value.r#type().as_ref()) {
+                    // layout of the primal output), because that type has no explicit layout. A seed that is free to
+                    // be placed elsewhere is compared by its declaration (refer to `Value::relocatable_type`), which
+                    // the cotangent type must refine, so that the pullback places it as that type states.
+                    if !cotangent_type.is_interchangeable_with(value.r#type().as_ref())
+                        && !value
+                            .relocatable_type()
+                            .is_some_and(|declaration| declaration.is_refined_by(&cotangent_type))
+                    {
                         return Err(ProgramError::MalformedProgram(format!(
                             "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
                             index,

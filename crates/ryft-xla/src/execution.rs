@@ -1458,8 +1458,12 @@ impl Session {
     /// Places `inputs` on `mesh` according to `expected_shardings` at the call boundary. Inputs that already match skip
     /// the placement entirely, and the implicit placement is the cold path. An input matches only if it is also on
     /// `mesh`, because the same sharding assigns its shards to other devices on another device mesh (e.g., one that
-    /// lists the same devices in another order), and only if it has the buffer of every shard on a device of this
-    /// process that it can have (refer to [`Self::serves_missing_local_replicas`]).
+    /// lists the same devices in another order). An executable reads the buffer of every device of this process, so a
+    /// matching input that lacks some of them receives a copy of a local replica of the same contribution for each
+    /// (refer to [`Array::serves_missing_local_buffers`] and [`Array::with_local_replicas`]), also with a pending
+    /// reduction or with manual variation, and a placement serves the missing buffers of the other inputs. A matching
+    /// input with a missing contribution that no local replica holds is passed as it is and keeps the error of the
+    /// executable.
     fn reshard_inputs_if_needed(
         &self,
         mesh: &DeviceMesh,
@@ -1467,20 +1471,24 @@ impl Session {
         inputs: Vec<Array>,
     ) -> Result<Vec<Array>, Error> {
         let process_index = self.client().process_index()?;
-        let matches = |array: &Array, expected: &Sharding| {
-            array.sharding() == expected
-                && array.mesh() == mesh
-                && !Self::serves_missing_local_replicas(array, process_index)
+        let matches = |array: &Array, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
+        let ready = |array: &Array, expected: &Sharding| {
+            matches(array, expected) && !array.serves_missing_local_buffers(process_index)
         };
-        if inputs.iter().zip(expected_shardings).all(|(array, expected)| matches(array, expected)) {
+        if inputs.iter().zip(expected_shardings).all(|(array, expected)| ready(array, expected)) {
             return Ok(inputs);
         }
         inputs
             .into_iter()
             .zip(expected_shardings)
-            .map(|(array, expected)| match matches(&array, expected) {
-                true => Ok(array),
-                false => array.reshard_on_devices(self, mesh, expected, false),
+            .map(|(array, expected)| {
+                if !matches(&array, expected) {
+                    return array.reshard_on_devices(self, mesh, expected, false);
+                }
+                if !array.serves_missing_local_buffers(process_index) {
+                    return Ok(array);
+                }
+                Ok(array.with_local_replicas()?.unwrap_or(array))
             })
             .collect()
     }
@@ -1497,36 +1505,6 @@ impl Session {
             .reshard_inputs_if_needed(mesh, std::slice::from_ref(expected_sharding), vec![input])?
             .pop()
             .unwrap())
-    }
-
-    /// Returns whether `array` lacks the buffer of a shard on a device of this process, whose process index is
-    /// `process_index`, and another shard of this process with a buffer holds the same elements for every such shard
-    /// (e.g., for an array imported with a buffer for only one of its local replicas, refer to
-    /// [`Array::from_addressable_buffers`]). A placement of `array` onto its own mesh and sharding then serves each
-    /// missing shard from such a replica (refer to `Array::local_replica`), which an executable needs, because it
-    /// reads the buffer of every device of this process. A missing shard without elements needs no replica. The
-    /// replicas of an array with a pending reduction or with manual variation are only the shards with the same
-    /// contribution, so such an array is not served here and keeps the error of the missing shard, as does an array
-    /// with a missing shard that no local shard can serve. An array with every buffer of this process, which is the
-    /// common case, costs one scan of its shards.
-    fn serves_missing_local_replicas(array: &Array, process_index: usize) -> bool {
-        let is_local = |shard: &&ArrayShard| shard.device().process_index() == process_index;
-        let mut missing = array.shards().iter().filter(is_local).filter(|shard| shard.buffer().is_none()).peekable();
-        if missing.peek().is_none() || array.data_type().is_zero() {
-            return false;
-        }
-        let sharding = array.sharding();
-        if !sharding.unreduced_axes().is_empty() || !sharding.varying_manual_axes().is_empty() {
-            return false;
-        }
-        missing.all(|shard| {
-            shard.slice().iter().any(|range| range.is_empty())
-                || array
-                    .shards()
-                    .iter()
-                    .filter(is_local)
-                    .any(|other| other.buffer().is_some() && other.slice() == shard.slice())
-        })
     }
 
     /// Pads bounded-dynamic inputs to static executable storage and appends their logical extents. An executable
@@ -1720,8 +1698,9 @@ impl Session {
     /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any public
     /// array input of the execution is committed. The arrays that the program captures never commit them. The outputs
     /// that [`CompiledProgram::committed_outputs`] flags (e.g., the public outputs of a program that requests a
-    /// placement explicitly, or all of them when the program runs on more than one device) are committed in either
-    /// case, which both the plain and the stateful execution paths rely on. Eager operations and compiled reshards
+    /// placement explicitly or of a function compiled for a named mesh, or all of them when the program runs on more
+    /// than one device, refer to `commits_public_outputs`) are committed in either case, which both the plain and the
+    /// stateful execution paths rely on. Eager operations and compiled reshards
     /// replace the commitment of the arrays that this function returns with their own.
     fn reconstruct_compiled_outputs(
         &self,
@@ -2959,8 +2938,9 @@ mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let second_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[1]]).unwrap();
+        // Every result of a function compiled for a named mesh is committed, so the function is compiled for the
+        // anonymous mesh of one device, where the commitment of its inputs decides.
+        let second_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![wide_mesh.devices()[1]]).unwrap();
         let scalar_type = replicated_scalar_type(&second_mesh, DataType::F32);
         let staged = crate::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
             |(left, right)| (right, left),
@@ -2997,12 +2977,13 @@ mod tests {
 
     #[test]
     fn test_session_execute_compiled_async_commits_outputs_of_explicit_placements() {
-        // Every output of a function compiled for more than one device is committed, so the function runs on a single
-        // device here, where only the rules below commit its outputs.
+        // Every output of a function compiled for more than one device or for a named mesh is committed, so the
+        // function runs on the anonymous mesh of one device here, where only the rules below commit its outputs.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 1);
-        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["device"])]).unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [2]);
         let uncommitted =
             Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32, 2.])).unwrap();
@@ -3090,10 +3071,12 @@ mod tests {
 
     #[test]
     fn test_session_execute_compiled_async_commits_outputs_of_nested_boundary_shardings() {
-        // The function runs on a single device, where only explicit placement requests commit its outputs.
+        // The function runs on the anonymous mesh of one device, where only explicit placement requests commit its
+        // outputs (every result of a function compiled for a named mesh is committed).
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 1);
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let vector_type = ArrayType::new_static(DataType::I32, [2]);
         let uncommitted =
@@ -3148,7 +3131,8 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let narrow_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[0]]).unwrap();
+        let named_narrow_mesh = DeviceMesh::new(logical_mesh, vec![wide_mesh.devices()[0]]).unwrap();
+        let narrow_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![wide_mesh.devices()[0]]).unwrap();
         let uncommitted = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [2]),
@@ -3179,9 +3163,11 @@ mod tests {
 
         // A function on uncommitted inputs that requests no placement commits every output when it is compiled for
         // more than one device, as JAX commits every result of a computation over more than one device, and it keeps
-        // the rule for the commitment of its inputs when it is compiled for a single device.
+        // the rule for the commitment of its inputs when it is compiled for the anonymous mesh of a single device. On a
+        // named mesh of a single device, it commits every public output, as JAX does under `set_mesh`.
         assert_eq!(execute(&wide_mesh), (true, true));
         assert_eq!(execute(&narrow_mesh), (false, false));
+        assert_eq!(execute(&named_narrow_mesh), (true, true));
     }
 
     #[test]
@@ -4871,6 +4857,58 @@ mod tests {
             assert_eq!(
                 (executed.map_err(|error| error.to_string()), called.map_err(|error| error.to_string())),
                 (expected.clone(), expected),
+            );
+        }
+
+        // On a 2x2 mesh, an `f32[4]` imported with the buffers of the devices at `y = 1` only holds one local replica
+        // of every tile, and of every contribution of a pending sum along `x`. An identity that takes it replicated
+        // from split, split from replicated, or with the same pending sum serves the missing buffers from those
+        // replicas, through a compiled reshard for the first two and directly for the third. Before, the compiled
+        // reshard rejected the absent buffers, and the matching argument with a pending sum kept them absent.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let axes = vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ];
+        let logical_mesh = LogicalMesh::new(axes).unwrap();
+        let mesh_devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), mesh_devices).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let split = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sum = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let cases = [
+            (&replicated, &split, [[1f32, 2., 3., 4.], [1., 2., 3., 4.]], vec![1f32, 2., 3., 4.]),
+            (&split, &replicated, [[1., 2., 0., 0.], [3., 4., 0., 0.]], vec![1., 2., 3., 4.]),
+            (&sum, &sum, [[1., 2., 3., 4.], [5., 6., 7., 8.]], vec![6., 8., 10., 12.]),
+        ];
+        for (source, expected_sharding, tiles, expected) in cases {
+            let identity = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| x,
+                vector_type.clone(),
+                &session,
+                Options::new(mesh.clone()).with_input_shardings(vec![expected_sharding.clone()]),
+            )
+            .unwrap();
+            let length = if source == &split { 2 } else { 4 };
+            let buffers = [1, 3]
+                .into_iter()
+                .map(|index| {
+                    let bytes = values_to_bytes(&tiles[index / 2][..length]);
+                    let (device, dimensions) = (devices[index].clone(), [length as u64]);
+                    client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, device, None).unwrap()
+                })
+                .collect();
+            let (r#type, sharding) = (vector_type.clone(), Some(source.clone()));
+            let input = Array::from_addressable_buffers(&session, r#type, mesh.clone(), sharding, buffers).unwrap();
+            let read = |output: Array| values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap());
+            let executed = identity.executable().execute(&session, input.clone()).map(read);
+            let called = identity.call(input).map(read);
+            assert_eq!(
+                (executed.map_err(|error| error.to_string()), called.map_err(|error| error.to_string())),
+                (Ok(expected.clone()), Ok(expected)),
+                "{source:?} -> {expected_sharding:?}",
             );
         }
     }

@@ -22,6 +22,35 @@
 //! returning public outputs. [`StatefulCompiledFunction`] supplies the corresponding entry points with a fixed
 //! signature.
 //!
+//! # Where Compiled Functions Run
+//!
+//! Every function is compiled for a [`DeviceMesh`]. A *named* mesh is any mesh other than
+//! [`LogicalMesh::single_device`](ryft_core::LogicalMesh::single_device) and the mesh without axes, the analogue of a
+//! mesh that JAX's `set_mesh` makes current. The *anonymous* mesh of one device is the analogue of JAX's
+//! `default_device`. This section is the one statement of where a call of a compiled function runs, which depends on
+//! what applies the call:
+//!
+//!   - **Applied by a session.** This covers `call` and `call_in_context` in a session, `execute`, and the calls that
+//!     eager JVP, `vmap`, and eager VJP derive from a call. On a named mesh the function runs on that mesh. Uncommitted
+//!     public arguments move there, a public argument committed to other devices is rejected, and the results are
+//!     committed to that mesh, on one device too, and are not locally assigned. Combining such a result with a value
+//!     committed to other devices is therefore an error, as under `jax.set_mesh`. On the anonymous mesh, uncommitted
+//!     public arguments move to its device, and a committed public argument selects the devices of a `call` (`execute`
+//!     rejects one on another device, because it runs one executable). The results are committed only when a public
+//!     argument is or when the function requests a placement.
+//!   - **Nested.** A call inside another compiled function, inside a region of an eager operation (e.g.,
+//!     `condition`), or replayed inside the eager replay of another call follows its caller. It runs where that
+//!     function, operation, or call runs, and its results are committed as theirs are.
+//!   - **Pullbacks.** The pullback of an eager VJP runs as one computation where its seed and its residuals are. The
+//!     primal output, and the cotangent of an uncommitted argument of a pullback that keeps residuals which the call
+//!     committed to the mesh of its function (e.g., of `x * x`), are on that mesh, committed, even for a seed that is
+//!     uncommitted on other devices. A pullback without residuals (e.g., of `x + x`) runs where its seed is, so an
+//!     uncommitted seed on other devices gives an uncommitted cotangent there. A seed over another logical mesh than
+//!     the output that the pullback recorded is rejected. The pullback for an argument committed to the device of a
+//!     named mesh of one device, but typed over the anonymous mesh of that device (e.g., by
+//!     [`Array::to_placement`] with a bare device), currently fails, because it cannot cast the cotangent back onto
+//!     that mesh inside a computation lowered for the mesh of the function.
+//!
 //! # Calling Compiled Functions
 //!
 //! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `jit_call`
@@ -33,8 +62,9 @@
 //! context is supported:
 //!
 //!   - An eager parent lowers the retained source on first use. When the callee requests placement, the call honors
-//!     its mesh and sharding overrides. Otherwise the public arguments select the devices, and captured arrays follow
-//!     them. [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
+//!     its mesh and sharding overrides. Otherwise it runs and commits its results as stated in
+//!     [Where Compiled Functions Run](#where-compiled-functions-run). Captured arrays follow the call.
+//!     [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
 //!     on the devices it was compiled for. Both fixed execution and a device-pinned call require committed public
 //!     arguments on the same ordered physical devices. Captures and uncommitted arguments can move to those devices.
 //!     See [`JitCallOperation`](crate::JitCallOperation).
@@ -59,9 +89,13 @@
 //! structurally zero tangent under differentiation, and as known under partial evaluation).
 //!
 //! Lowering places captured arrays on the devices of the program, so it can communicate before the first execution.
-//! Each captured array is placed once for each destination, and every program, signature, and retention that captures
-//! it shares that copy until the array and every retention of it are gone (refer to the ownership of
-//! [`RetainedArray`](crate::RetainedArray)). A capture is placed with device work only, without the host round trip to
+//! Each captured array whose type records nothing beyond replication (i.e., a session constant) is placed once for
+//! each destination, also when it lives on the devices of the program but lacks a local replica that another local
+//! replica can supply, and every program, signature, and retention that captures it shares that copy until the array
+//! and every retention of it are gone (refer to the ownership of [`RetainedArray`](crate::RetainedArray)). A capture
+//! whose type records more (e.g., a split over explicit mesh axes) stays an ordinary capture of the executable, which
+//! receives it as it is, so an execution on other devices than those of that capture moves it again every time, and
+//! one on its devices moves nothing. A capture is placed with device work only, without the host round trip to
 //! which [`Array::to_placement`] can fall back, so a placement that only that round trip can make (e.g., of uneven
 //! column shards that a compiled reshard cannot produce) is an error for a capture. The CUDA plugin pairs the transfers
 //! between two devices by the order in which they are issued (refer to
@@ -455,7 +489,9 @@ where
 }
 
 /// Constructs a retained dispatcher for `function` on `mesh` with otherwise default options. Refer to
-/// [`jit_with_options`] for more information.
+/// [`jit_with_options`] for more information. Every entry point of the dispatcher runs, and commits its results, as
+/// the same entry point of a function compiled for `mesh` does (refer to
+/// [Where Compiled Functions Run](self#where-compiled-functions-run)).
 ///
 /// `function` is fallible so that it can reject its inputs while it is traced, and an infallible function returns its
 /// outputs wrapped in [`Ok`].
@@ -1721,7 +1757,9 @@ where
 /// specialization on subsequent calls. Use [`jit`] when runtime calls should select and retain specializations in
 /// the style of `jax.jit`.
 ///
-/// Equivalent to [`compile_with_options`] called with [`Options::new(mesh)`](Options::new).
+/// Equivalent to [`compile_with_options`] called with [`Options::new(mesh)`](Options::new). Where each entry point of
+/// the result runs, and whether it commits its results, is stated in
+/// [Where Compiled Functions Run](self#where-compiled-functions-run).
 ///
 /// The function is traced into a fresh XLA program, in which compiled functions that it calls register their runtime
 /// captures as captures of the new program (refer to [`StagedFunction::call`]). The resulting program is then
@@ -2263,7 +2301,7 @@ mod tests {
         ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, Device, DifferentiableType,
         Differentiate, DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation,
         DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable, EagerInterpretationDriver,
-        ErasedOperation, Error as CoreError, ForwardModeDifferentiate, Hessian, ImportingContext,
+        ErasedOperation, Error as CoreError, EverythingSavable, ForwardModeDifferentiate, Hessian, ImportingContext,
         InterpretableOperation, Jacobian, LogicalMesh, MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, Neg,
         NothingSavable, Parameter, PartialEvaluationOutput, PartitionedProgram, Place, Placeholder, Placement, Program,
         ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate,
@@ -4434,35 +4472,34 @@ mod tests {
         let driver = EagerInterpretationDriver::new(&regions);
         for placement in [None, Some(&first), Some(&second)] {
             let input = upload(placement, [1.0, 3.0]);
-            let called = function.call(input.clone()).unwrap();
             // The capture is replicated, so the function holds it as a session constant of a type that names no mesh,
-            // which region replay places on the devices of the call.
-            assert_eq!(captured_arrays(&function), (0, 1));
+            // which region replay places on the devices of the call. A call that does not record the mesh of its
+            // function (e.g., one built without `call_operation`) runs where its argument runs.
             let mut interpreted =
                 JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
             let interpreted = ValueProjection::<ArrayType>::into_projected(interpreted.remove(0)).unwrap();
-            assert_eq!(interpreted.mesh(), called.mesh());
-            assert_eq!(interpreted.sharding(), called.sharding());
-            for output in [&called, &interpreted] {
-                assert_eq!(output.mesh().devices(), input.mesh().devices());
-                assert_eq!(output.is_committed(), input.is_committed());
-                assert_eq!(output.is_locally_assigned(), input.is_locally_assigned());
-                assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
-            }
+            assert_eq!(captured_arrays(&function), (0, 1));
+            assert_eq!(interpreted.mesh().devices(), input.mesh().devices());
+            assert_eq!(interpreted.is_committed(), input.is_committed());
+            assert_eq!(interpreted.is_locally_assigned(), input.is_locally_assigned());
+            assert_eq!(interpreted.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
+
+            // The function was compiled for a named mesh, so an eager call of it runs there and commits its result, as
+            // its execution does, and both reject an argument committed to other devices.
+            let called = function.call(input.clone());
             let executed = function.executable().execute(&session, input.clone());
             if placement == Some(&first) {
-                assert!(matches!(
-                    executed,
-                    Err(Error::Execution(ExecutionError::CommittedInputDeviceMismatch { index: 0, actual, expected }))
-                        if actual == [first.devices()[0].id()] && expected == [second.devices()[0].id()]
-                ));
+                let message = "public argument #0 is committed to devices [0], but the executable requires [1]";
+                assert_eq!(called.unwrap_err().to_string(), message);
+                assert_eq!(executed.unwrap_err().to_string(), message);
                 continue;
             }
-            let executed = executed.unwrap();
-            assert_eq!(executed.mesh(), &second);
-            assert_eq!(executed.is_committed(), input.is_committed());
-            assert!(!executed.is_locally_assigned());
-            assert_eq!(executed.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
+            for output in [called.unwrap(), executed.unwrap()] {
+                assert_eq!(output.mesh(), &second);
+                assert!(output.is_committed());
+                assert!(!output.is_locally_assigned());
+                assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), [3.0, 7.0]);
+            }
         }
         assert_eq!(capture.mesh(), &second);
         assert!(capture.is_committed());
@@ -5240,10 +5277,10 @@ mod tests {
         // `g(x) = (sin(x), place(x, CPU 1))`, compiled for CPU 1, names that device, but `h(x) = g(x).0` drops the only
         // output that the placement computes, so its call of `g`, pruned to the first output, names no devices, as JAX
         // 0.12.0.1 lowers `jit(lambda x: g(x)[0])` without the dropped placement (`{CpuDevice(id=0)} False` for an
-        // uncommitted `x`). `h` therefore compiles for CPU 0 and runs where its argument runs, and a direct execution
-        // of `h` compiled for CPU 1 runs there without committing its result. An eager call of `g` itself runs all of
-        // `g`, which names CPU 1, and commits its results there (refer to the departure on devices inside a compiled
-        // function), whichever result its caller then uses.
+        // uncommitted `x`). `h` therefore runs on the device of the anonymous mesh that it was compiled for, eagerly
+        // and when executed directly, as JAX runs it under `default_device`, without committing its result. An eager
+        // call of `g` itself runs all of `g`, which names CPU 1, and commits its results there (refer to the departure
+        // on devices inside a compiled function), whichever result its caller then uses.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -5275,7 +5312,7 @@ mod tests {
             observed.push(observe(h.call(input.clone()).unwrap()));
         }
         observed.push(observe(g.call(input.clone()).unwrap().0));
-        assert_eq!(observed, [(vec![0], false), (vec![0], false), (vec![1], false), (vec![0], false), (vec![1], true)],);
+        assert_eq!(observed, [(vec![0], false), (vec![0], false), (vec![1], false), (vec![1], false), (vec![1], true)],);
     }
 
     #[test]
@@ -5309,6 +5346,341 @@ mod tests {
             ),
             (true, true, false, false),
         );
+    }
+
+    #[test]
+    fn test_compiled_function_call_runs_on_the_mesh_of_its_function_at_every_entry_point() {
+        // An eager call of a function compiled for a named mesh runs on that mesh, as its execution does and as JAX
+        // runs a `jit` function under `set_mesh`: an uncommitted argument moves there, an argument committed to other
+        // devices is rejected, the results are committed, as under `set_mesh` (on one device too), and their devices
+        // are not locally assigned. On the anonymous mesh of one device, an uncommitted argument moves to its device,
+        // as JAX moves it under `default_device`, with an uncommitted result, while a committed argument selects the
+        // devices of a call and is rejected by an execution, which runs one executable. The calls that eager JVP and
+        // `vmap` derive from the call (with an unbatched and a batched argument) carry the mesh of its function, and so
+        // do those of an eager VJP, so they run and commit as the call does, and the cotangent of the argument comes
+        // back where the call puts the argument (except for one limit, below). An eager `condition` compiles the call
+        // into its own computation, and a compiled caller into its program, so the call runs where they run and
+        // commits for a committed argument or on two devices, and so does the eager pullback of `x + x`, which keeps no
+        // residual and so runs where its seed is (a pullback that keeps residuals runs where they are, refer to
+        // `test_compiled_function_call_pullback_runs_on_the_mesh_of_its_residuals`).
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |mesh: Option<DeviceMesh>| {
+            Array::from_host_buffer(&session, vector_type.clone(), mesh, None, values_to_bytes(&[1f32, 2.0])).unwrap()
+        };
+        let named_logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]);
+        let two_devices = two_device_mesh(client, MeshAxisType::Auto);
+        let anonymous = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let uncommitted = upload(None);
+        let on_device = |device: Device| uncommitted.to_placement(&session, device).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let predicate = Array::from_host_buffer(&session, predicate_type, None, None, [1u8]).unwrap();
+        let observe = |result: Result<Array, String>| {
+            result.map(|array| {
+                let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+                let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+                (devices, array.is_committed(), array.is_locally_assigned(), values)
+            })
+        };
+        let mut outcomes = Vec::new();
+        for (mesh_name, mesh, own) in [
+            (
+                "named mesh of one device",
+                DeviceMesh::new(named_logical_mesh.unwrap(), vec![devices[1]]).unwrap(),
+                on_device(devices[1]),
+            ),
+            ("named mesh of two devices", two_devices.clone(), upload(Some(two_devices.clone()))),
+            ("anonymous mesh", anonymous(devices[1]), on_device(devices[1])),
+        ] {
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x: CompileTracer| x.clone() + x, vector_type.clone(), &session, mesh.clone()).unwrap();
+            let scalar_function: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x: CompileTracer| x.clone() + x, ArrayType::scalar(DataType::F32), &session, mesh).unwrap();
+            let caller: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x| function.call(x).unwrap(), vector_type.clone(), &session, anonymous(devices[0])).unwrap();
+            for (argument_name, argument) in [
+                ("uncommitted", uncommitted.clone()),
+                ("committed to its devices", own),
+                ("committed elsewhere", on_device(devices[0])),
+            ] {
+                let conditional = Value::Array(predicate.clone())
+                    .condition(
+                        |value| Ok(function.call(ValueProjection::<ArrayType>::into_projected(value)?)?.into_value()),
+                        |value| Ok(function.call(ValueProjection::<ArrayType>::into_projected(value)?)?.into_value()),
+                        Value::Array(argument.clone()),
+                    )
+                    .and_then(|value| Ok(ValueProjection::<ArrayType>::into_projected(value)?));
+                let project = |value: Value| {
+                    ValueProjection::<ArrayType>::into_projected(value).map_err(|error| error.to_string())
+                };
+                let jvp = session
+                    .differentiate_at(Value::Array(argument.clone()))
+                    .jvp(Value::Array(argument.clone()), |x| {
+                        Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value())
+                    })
+                    .map_err(|error| error.to_string());
+                let (jvp_primal, jvp_tangent) = match jvp {
+                    Ok((primal, tangent)) => (project(primal), project(tangent)),
+                    Err(error) => (Err(error.clone()), Err(error)),
+                };
+                // The cotangent is seeded with the output, so it holds twice the values of the other results, and the
+                // seeded cotangent with the uncommitted argument, so it holds the values of the other results.
+                let vjp = session
+                    .differentiate_at(Value::Array(argument.clone()))
+                    .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+                    .map_err(|error| error.to_string());
+                let (vjp_output, vjp_cotangent, vjp_seeded_cotangent) = match vjp {
+                    Ok((output, pullback)) => {
+                        let cotangent = pullback.apply_materialized(output.clone()).map_err(|error| error.to_string());
+                        let seeded = pullback
+                            .apply_materialized(Value::Array(uncommitted.clone()))
+                            .map_err(|error| error.to_string());
+                        (project(output), cotangent.and_then(project), seeded.and_then(project))
+                    }
+                    Err(error) => (Err(error.clone()), Err(error.clone()), Err(error)),
+                };
+                // The unbatched argument is batched beside an unused batched value, so that the call receives only
+                // unbatched inputs, and the batched argument is mapped along its only dimension.
+                let unbatched = batch(
+                    |(_, x)| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()),
+                    (Value::Array(uncommitted.clone()), Value::Array(argument.clone())),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::default(),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(project);
+                let batched = batch(
+                    |x| Ok(scalar_function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()),
+                    Value::Array(argument.clone()),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default(),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(project);
+                let observations = vec![
+                    observe(function.call(argument.clone()).map_err(|error| error.to_string())),
+                    observe(function.call_in_context(&session, argument.clone()).map_err(|error| error.to_string())),
+                    observe(
+                        function.executable().execute(&session, argument.clone()).map_err(|error| error.to_string()),
+                    ),
+                    observe(conditional.map_err(|error| error.to_string())),
+                    observe(caller.executable().execute(&session, argument.clone()).map_err(|error| error.to_string())),
+                    observe(jvp_primal),
+                    observe(jvp_tangent),
+                    observe(unbatched),
+                    observe(batched),
+                    observe(vjp_output),
+                    observe(vjp_cotangent).map(|(devices, committed, locally_assigned, values)| {
+                        (devices, committed, locally_assigned, values.into_iter().map(|value| value / 2.0).collect())
+                    }),
+                    observe(vjp_seeded_cotangent),
+                ];
+                outcomes.push((mesh_name, argument_name, observations));
+            }
+        }
+
+        // The entry points are, in order, `call`, `call_in_context`, `execute`, a call in both branches of an eager
+        // `condition`, an execution of a caller compiled for the anonymous mesh of the first device, the primal and the
+        // tangent of an eager JVP, an eager `vmap` of the call with an unbatched and with a batched argument, and the
+        // output, the cotangent (halved), and the cotangent for an uncommitted seed on the first device of an eager
+        // VJP.
+        let on = |devices: &[usize], committed: bool, locally_assigned: bool| {
+            Ok::<_, String>((devices.to_vec(), committed, locally_assigned, vec![2f32, 4.0]))
+        };
+        let rejected = |actual: &str, required: &str| {
+            Err(format!("public argument #0 is committed to devices {actual}, but the executable requires {required}"))
+        };
+        let (first, second, both) = (&[0][..], &[1][..], &[0, 1][..]);
+        // The derived calls of eager JVP, `vmap`, and eager VJP observe what `derived` states, which is what `call`
+        // observes, in each of their six columns. An eager pullback runs as one computation where its seed and its
+        // residuals are, and the pullback of `x + x` keeps no residual, so a seed that is uncommitted on the first
+        // device brings the cotangent there, uncommitted, and its devices were chosen by this process alone, while a
+        // seed over another logical mesh than the output that the pullback recorded is rejected (limits).
+        let row = |mesh_name,
+                   argument_name,
+                   entry_points: [Result<_, String>; 5],
+                   derived: Result<_, String>,
+                   seeded: Result<_, String>| {
+            let observations = entry_points
+                .into_iter()
+                .chain(std::iter::repeat_n(derived, 6))
+                .chain(std::iter::once(seeded))
+                .collect::<Vec<_>>();
+            (mesh_name, argument_name, observations)
+        };
+        let incompatible = |mesh: &str| {
+            Err::<(Vec<usize>, bool, bool, Vec<f32>), _>(format!(
+                "encountered input type f32[2][sharding={{mesh<['device'=1:auto]>, [{{}}]}}] which is incompatible \
+                 with the region's declared type f32[2][sharding={{mesh<[{mesh}]>, [{{}}]}}]",
+            ))
+        };
+        let (q, x) = ("'q'=1:explicit", "'x'=2:auto");
+        let mut expected = vec![
+            row(
+                "named mesh of one device",
+                "uncommitted",
+                [
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(first, false, true),
+                    on(first, false, false),
+                ],
+                on(second, true, false),
+                on(first, false, true),
+            ),
+            row(
+                "named mesh of one device",
+                "committed to its devices",
+                [
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(second, true, false),
+                    rejected("[1]", "[0]"),
+                ],
+                on(second, true, false),
+                incompatible(q),
+            ),
+            row(
+                "named mesh of one device",
+                "committed elsewhere",
+                [
+                    rejected("[0]", "[1]"),
+                    rejected("[0]", "[1]"),
+                    rejected("[0]", "[1]"),
+                    on(first, true, false),
+                    on(first, true, false),
+                ],
+                rejected("[0]", "[1]"),
+                rejected("[0]", "[1]"),
+            ),
+            row(
+                "named mesh of two devices",
+                "uncommitted",
+                [
+                    on(both, true, false),
+                    on(both, true, false),
+                    on(both, true, false),
+                    on(first, false, true),
+                    on(first, false, false),
+                ],
+                on(both, true, false),
+                on(first, false, true),
+            ),
+            row(
+                "named mesh of two devices",
+                "committed to its devices",
+                [
+                    on(both, true, false),
+                    on(both, true, false),
+                    on(both, true, false),
+                    on(both, true, false),
+                    rejected("[0, 1]", "[0]"),
+                ],
+                on(both, true, false),
+                incompatible(x),
+            ),
+            row(
+                "named mesh of two devices",
+                "committed elsewhere",
+                [
+                    rejected("[0]", "[0, 1]"),
+                    rejected("[0]", "[0, 1]"),
+                    rejected("[0]", "[0, 1]"),
+                    on(first, true, false),
+                    on(first, true, false),
+                ],
+                rejected("[0]", "[0, 1]"),
+                rejected("[0]", "[0, 1]"),
+            ),
+            row(
+                "anonymous mesh",
+                "uncommitted",
+                [
+                    on(second, false, false),
+                    on(second, false, false),
+                    on(second, false, false),
+                    on(first, false, true),
+                    on(first, false, false),
+                ],
+                on(second, false, false),
+                on(first, false, true),
+            ),
+            row(
+                "anonymous mesh",
+                "committed to its devices",
+                [
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(second, true, false),
+                    on(second, true, false),
+                    rejected("[1]", "[0]"),
+                ],
+                on(second, true, false),
+                on(first, false, true),
+            ),
+            row(
+                "anonymous mesh",
+                "committed elsewhere",
+                [
+                    on(first, true, false),
+                    on(first, true, false),
+                    rejected("[0]", "[1]"),
+                    on(first, true, false),
+                    on(first, true, false),
+                ],
+                on(first, true, false),
+                on(first, false, true),
+            ),
+        ];
+        // The cotangent of an argument committed to the device of a named mesh of one device, over the canonical mesh
+        // of that device, is cast back onto that logical mesh inside the eager pullback, whose computation runs on the
+        // mesh of the function, which no lowered module can hold together (limit).
+        expected[1].2[10] = Err(
+            "mesh `['device'=1:auto]` does not have the topology of the module mesh `['q'=1:explicit]`".to_string(),
+        );
+        assert_eq!(outcomes, expected);
+    }
+
+    #[test]
+    fn test_compiled_function_call_pullback_runs_on_the_mesh_of_its_residuals() {
+        // The pullback of a call of `x * x` on a named mesh of the second device at an uncommitted argument keeps the
+        // residual that the call committed to that mesh, so a seed uncommitted on the first device moves there and
+        // the cotangent comes back on the mesh of the function, committed, as it does for the output as the seed.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |values: &[f32]| {
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(values)).unwrap()
+        };
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![second_device]).unwrap();
+        let function: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x: CompileTracer| x.clone() * x, vector_type.clone(), &session, mesh).unwrap();
+        let (output, pullback) = session
+            .differentiate_at(Value::Array(upload(&[1.0, 2.0])))
+            .vjp(|x| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value()))
+            .unwrap();
+        let observe = |seed: Value| {
+            let cotangent = ValueProjection::<ArrayType>::into_projected(pullback.apply_materialized(seed).unwrap());
+            let cotangent = cotangent.unwrap();
+            let devices = cotangent.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+            let values = cotangent.copy_to_host().unwrap().elements::<f32>().unwrap();
+            (devices, cotangent.is_committed(), values)
+        };
+        assert_eq!(observe(output), (vec![1], true, vec![2.0, 16.0]));
+        assert_eq!(observe(Value::Array(upload(&[1.0, 1.0]))), (vec![1], true, vec![2.0, 4.0]));
     }
 
     #[test]
@@ -5908,15 +6280,7 @@ mod tests {
             "caller with a while loop",
         ];
         let derivative_columns = ["eager JVP tangent", "eager VJP cotangent", "compiled gradient"];
-        let eager_columns = [
-            "eager call",
-            "interpretation of the staged caller",
-            "nested interpretation",
-            "partial evaluation with a known input",
-            "partial evaluation with an unknown input",
-            "eager JVP",
-            "eager VJP",
-        ];
+        let follows_its_caller = ["partial evaluation with a known input", "partial evaluation with an unknown input"];
         let runs_where_its_arguments_are = [
             "committed capture of an uncommitted input",
             "closed-over committed constant",
@@ -6094,13 +6458,13 @@ mod tests {
                 .map_err(|error| error.to_string()),
             ];
             for (column, observation) in columns.iter().zip(observations) {
-                // A call of a callee that names no devices runs where its arguments are (registered as "A call of a
-                // compiled function runs where its caller runs unless the function names devices"), so where an entry
-                // point runs it eagerly on an uncommitted argument, this process alone chose its devices, while an
-                // execution and every compiled caller run on devices that a mesh named.
+                // The calls that eager JVP and eager VJP derive from the call carry the mesh of its function, so they
+                // run and commit as an execution does. The calls that partial evaluation places into a known or a
+                // residual program do not (refer to `JitCallOperation::function_mesh`), so they run where the
+                // uncommitted argument is, whose devices this process alone chose, for a callee that names no devices.
                 let expected = Observation {
                     locally_assigned: expected.locally_assigned
-                        || (runs_where_its_arguments_are.contains(&row.name) && eager_columns.contains(column)),
+                        || (runs_where_its_arguments_are.contains(&row.name) && follows_its_caller.contains(column)),
                     ..expected.clone()
                 };
                 let outcome = match observation {
@@ -6233,8 +6597,22 @@ mod tests {
         let split_arguments_of_replicas = "fails with `invalid compilation options: bounded-dynamic multi-device \
                                            programs currently require fully replicated shardings because Shardy \
                                            rejects dynamic tensors`";
-        let rematerialized_replay = "fails with ``rematerialize` body input type signature mismatch: expected \
-                                     [f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]] but got [f32[4]]`";
+        // A nested interpretation of a callee that closes over a constant committed to the second device runs where
+        // that capture is, while an execution moves the capture to its argument (refer to `captured_type`), so on an
+        // uncommitted argument it returns the result on the second device, and on an argument committed to the first
+        // device it rejects the application (limit). Its `rematerialize` body, traced at the declaration of the capture
+        // without a sharding, accepts the placed capture, which refines that declaration.
+        let observation = |device: usize| {
+            format!(
+                "Observation {{ devices: [Device {{ id: {device}, process_index: 0 }}], shapes: [\"[4]\"], sharding: \
+                 \"{{mesh<['device'=1:auto]>, [{{}}]}}\", type: \"f32[4][sharding={{mesh<['device'=1:auto]>, \
+                 [{{}}]}}]\", memory: [\"device\"], values: [[1.0, 2.0, 3.0, 4.0]], committed: false, \
+                 locally_assigned: false, owned_by_session: true }}",
+            )
+        };
+        let replayed_capture = format!("disagrees with {} as {}", observation(0), observation(1));
+        let replayed_committed_capture = "fails with `received incompatible devices for eager XLA execution: captured \
+                                          array #0 is placed on devices [1] but input #0 is placed on devices [0]`";
         let exceptions = [
             ("split output override", "caller with a bounded dynamic argument", split_replicas),
             ("other single device", "nested call", other_devices),
@@ -6260,8 +6638,12 @@ mod tests {
             ("dispatcher over auto axes", "caller with a scan", replicated),
             ("dispatcher over auto axes", "caller with a condition", replicated),
             ("dispatcher over auto axes", "caller with a while loop", replicated),
-            ("closed-over committed constant", "nested interpretation", rematerialized_replay),
-            ("closed-over committed constant of a committed input", "nested interpretation", rematerialized_replay),
+            ("closed-over committed constant", "nested interpretation", replayed_capture.as_str()),
+            (
+                "closed-over committed constant of a committed input",
+                "nested interpretation",
+                replayed_committed_capture,
+            ),
             (
                 "declared unsharded input over explicit axes of a split argument",
                 "caller with a bounded dynamic argument",
@@ -6286,7 +6668,8 @@ mod tests {
         // they are placed as executions of the derived calls place them, which follows the boundary of the callee as
         // JAX places the tangents and cotangents of a `jit` call: a tangent takes the output override and the devices
         // of the callee, and so does a cotangent that the call moves onto those devices, committed there. An eager
-        // input on the canonical mesh of one device gets its cotangent back on that mesh, over the device of the call.
+        // uncommitted input enters the VJP without a sharding (refer to `Value::relocatable_type`), so it gets its
+        // cotangent back on the mesh of the call, as JAX returns the cotangent of a `jit` call under `set_mesh`.
         // A placement in the body sends the cotangent to the devices of the call, which moved the input there, as JAX
         // returns the cotangent of a `jit` call to the devices of the call, whereas the function that the callee was
         // compiled from, an uncompiled `place`, transposes it back to the device of the input. Likewise, a placement
@@ -6328,6 +6711,13 @@ mod tests {
                 ("sharding", sharding, canonical),
                 ("type", &r#type, &canonical_type),
                 ("committed", "true", "false"),
+            ])
+        };
+        let moved_without_commitment = |sharding: &str| {
+            differences(&[
+                ("devices", "[1]", "[0]"),
+                ("sharding", sharding, canonical),
+                ("type", &typed(sharding), &typed(canonical)),
             ])
         };
         let unconstrained = "{mesh<['x'=2:auto]>, [{?}]}";
@@ -6415,11 +6805,7 @@ mod tests {
             (maximum, "eager VJP cotangent", no_maximum_cotangent.to_string()),
             (maximum, "compiled gradient", no_maximum_cotangent.to_string()),
             ("other single device", "eager JVP tangent", moved(second)),
-            (
-                "other single device",
-                "eager VJP cotangent",
-                differences(&[("devices", "[1]", "[0]"), ("committed", "true", "false")]),
-            ),
+            ("other single device", "eager VJP cotangent", moved(second)),
             ("other single device", "compiled gradient", other_devices.to_string()),
             (
                 "single device replicated output override",
@@ -6433,37 +6819,31 @@ mod tests {
             (
                 "single device replicated output override",
                 "eager VJP cotangent",
-                differences(&[("committed", "true", "false")]),
-            ),
-            (
-                "single device replicated output override",
-                "compiled gradient",
-                differences(&[("committed", "true", "false")]),
+                differences(&[
+                    ("sharding", local, canonical),
+                    ("type", &typed(local), &typed(canonical)),
+                    ("committed", "true", "false"),
+                ]),
             ),
             (
                 "bufferless result",
                 "compiled gradient",
                 "fails with `cannot lower element type `zero` for sum reduction identity`".to_string(),
             ),
-            ("placement in the body", "eager VJP cotangent", differences(&[("devices", "[1]", "[0]")])),
+            ("placement in the body", "eager VJP cotangent", moved_without_commitment(second)),
             (
                 "device in the body",
                 "eager JVP tangent",
                 differences(&[("sharding", second, canonical), ("type", &typed(second), &typed(canonical))]),
             ),
-            ("device in the body", "eager VJP cotangent", differences(&[("devices", "[1]", "[0]")])),
+            ("device in the body", "eager VJP cotangent", moved_without_commitment(second)),
             (
                 "unconstrained placement in the body",
                 "eager VJP cotangent",
                 differences(&[("sharding", replicated, split)]),
             ),
             ("three levels of nesting", "eager JVP tangent", moved(second)),
-            (
-                "three levels of nesting",
-                "eager VJP cotangent",
-                differences(&[("devices", "[1]", "[0]"), ("committed", "true", "false")]),
-            ),
-            ("three levels of nesting", "compiled gradient", differences(&[("committed", "true", "false")])),
+            ("three levels of nesting", "eager VJP cotangent", moved(second)),
         ];
         let expected_outcomes = rows
             .iter()
@@ -7210,8 +7590,8 @@ mod tests {
     #[test]
     fn test_compiled_function_call_vjp_returns_cotangents_of_moved_inputs() {
         // A call that moves an uncommitted input onto the devices of its callee returns the cotangent of that input on
-        // the canonical mesh of the device of a callee mesh of one device, where JAX returns it, while a callee mesh of
-        // several devices has no such placement.
+        // the mesh of the callee, where JAX returns it, on one device and on several, because the input enters the VJP
+        // without the placement that it happens to have (refer to `Value::relocatable_type`).
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
@@ -7257,15 +7637,13 @@ mod tests {
             cotangent(&second_mesh),
             Ok((
                 vec![devices[1]],
-                "f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]".to_string(),
+                "f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}]".to_string(),
                 vec![4., 8., 12., 16.],
             )),
         );
         assert_eq!(
             cotangent(&wide_mesh),
-            Err("cotangent contribution has type f32[4] but its accumulator expects \
-                 f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]"
-                .to_string()),
+            Ok((devices.clone(), "f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]".to_string(), vec![4., 8., 12., 16.])),
         );
     }
 
@@ -7770,6 +8148,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(batched), vec![2.0, -2.0, 1.5, 8.0, -5.0, 3.0]);
+    }
+
+    #[test]
+    fn test_compiled_function_call_inside_rematerialize_follows_the_body_under_eager_vjp() {
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        // A call in a `rematerialize` body is nested in the body, so it runs where the body runs, eagerly and under an
+        // eager VJP alike, whatever mesh its function was compiled for (a named mesh of another device, or the
+        // anonymous mesh of the device of the argument), and the calls that partial evaluation places into the known
+        // and residual programs of the body follow the body too, under every residual policy, so the output and the
+        // cotangent of the VJP are on the device of the argument and uncommitted. The uncommitted argument enters the
+        // VJP without a sharding (refer to `Value::relocatable_type`), so the tangent of the call, which has the type
+        // that the callee declares, matches the declaration of its primal.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input =
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(&[1f32, 2.0])).unwrap();
+        let facts = |value: Result<Value, String>| {
+            value.map(|value| {
+                let array = ValueProjection::<ArrayType>::into_projected(value).unwrap();
+                let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+                (array.mesh().devices().to_vec(), array.is_committed(), values)
+            })
+        };
+        let mut outcomes = Vec::new();
+        for mesh in [
+            DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap(),
+            DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap(),
+        ] {
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x: CompileTracer| x.clone() * x, vector_type.clone(), &session, mesh).unwrap();
+            let body = |x: Body| Ok(function.call(ValueProjection::<ArrayType>::into_projected(x)?)?.into_value());
+            for everything in [false, true] {
+                let nothing = rematerialize(body);
+                let all = rematerialize(body).with_policy(EverythingSavable);
+                let argument = Value::Array(input.clone());
+                let primal = if everything { all.call(argument) } else { nothing.call(argument) };
+                let vjp = session
+                    .differentiate_at(Value::Array(input.clone()))
+                    .vjp(|x| if everything { all.call(x) } else { nothing.call(x) })
+                    .map_err(|error| error.to_string());
+                let (output, cotangent) = match vjp {
+                    Ok((output, pullback)) => {
+                        let cotangent = pullback.apply_materialized(output.clone()).map_err(|error| error.to_string());
+                        (Ok(output), cotangent)
+                    }
+                    Err(error) => (Err(error.clone()), Err(error)),
+                };
+                outcomes.push((facts(primal.map_err(|error| error.to_string())), facts(output), facts(cotangent)));
+            }
+        }
+        // The cotangent is seeded with the output `x * x`, so it is `2 * x * x * x`.
+        let expected = (
+            Ok((vec![devices[0]], false, vec![1.0, 4.0])),
+            Ok((vec![devices[0]], false, vec![1.0, 4.0])),
+            Ok((vec![devices[0]], false, vec![2.0, 16.0])),
+        );
+        assert_eq!(outcomes, vec![expected.clone(), expected.clone(), expected.clone(), expected]);
     }
 
     #[test]

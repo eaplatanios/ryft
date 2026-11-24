@@ -186,7 +186,8 @@ pub struct Options {
 
 impl Options {
     /// Constructs options for `mesh` with no sharding overrides or donation and with the portable decomposition of
-    /// grouped dots.
+    /// grouped dots. Where a function compiled with these options runs, and whether it commits its results, is stated
+    /// in [Where Compiled Functions Run](crate::compilation::functions#where-compiled-functions-run).
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
         Self {

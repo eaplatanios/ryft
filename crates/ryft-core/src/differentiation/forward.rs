@@ -657,6 +657,11 @@ pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
     /// is a zero differential space.
     primal_input_types: Vec<C::Type>,
 
+    /// One flag per public primal input that is set when that input was declared with its
+    /// [`relocatable_type`](Value::relocatable_type). Such an input may be placed anywhere,
+    /// so [`apply`](Self::apply) accepts for it a tangent whose type refines its declared tangent type.
+    relocatable_inputs: Vec<bool>,
+
     /// Complete public primal output boundary. The executable pushforward omits the outputs that
     /// [`tangent_output_slots`](Self::tangent_output_slots) does not flag.
     primal_output_types: Vec<C::Type>,
@@ -714,6 +719,8 @@ impl<
     ///     [`apply`](Self::apply), or [`None`] for a pushforward that is only transposed and never applied.
     ///   - `primal_input_types`: Complete flattened input-type boundary of the original primal function, including
     ///     leaves whose tangent spaces contain only zero and which are consequently absent from `program`.
+    ///   - `relocatable_inputs`: One flag per entry of `primal_input_types`, set when that type is the input's
+    ///     [`relocatable_type`](Value::relocatable_type).
     ///   - `primal_output_types`: Concrete type and optional staged declaration for each primal output leaf, including
     ///     the leaves whose tangents are absent from `program`. A leaf without a declaration uses its concrete type
     ///     to validate the tangent program.
@@ -730,11 +737,20 @@ impl<
         residuals: Vec<C::Value>,
         tangent_reconstruction: Option<ZeroBoundaryReconstruction<C::Value>>,
         primal_input_types: Vec<C::Type>,
+        relocatable_inputs: Vec<bool>,
         primal_output_types: Vec<(C::Type, Option<C::Type>)>,
         tangent_output_slots: Vec<bool>,
         primal_references: ReferenceBoundary<DifferentiationBoundaryPosition>,
         output_structure: Output::ParameterStructure,
     ) -> Result<Self, ProgramError> {
+        if relocatable_inputs.len() != primal_input_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "pushforward has {} relocatable input flags for {} primal inputs",
+                relocatable_inputs.len(),
+                primal_input_types.len(),
+            )));
+        }
+
         let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "pushforward program consumes {} inputs which is fewer than its {} residuals",
@@ -853,6 +869,7 @@ impl<
             residuals,
             tangent_reconstruction,
             primal_input_types,
+            relocatable_inputs,
             primal_output_types: primal_output_types.into_iter().map(|(r#type, _)| r#type).collect(),
             tangent_output_slots,
             primal_references,
@@ -873,6 +890,13 @@ impl<
     #[inline]
     pub fn residuals(&self) -> &[C::Value] {
         &self.residuals
+    }
+
+    /// Returns one flag per public primal input that is set when that input was declared with its
+    /// [`relocatable_type`](Value::relocatable_type), for which a tangent may refine the declared tangent type.
+    #[inline]
+    pub(crate) fn relocatable_inputs(&self) -> &[bool] {
+        &self.relocatable_inputs
     }
 
     /// Returns one flag per public primal output that is set when [`program`](Self::program) has an output for that
@@ -983,12 +1007,17 @@ impl<
         )?;
 
         // Validate every public tangent against the tangent type derived from its primal leaf, which a tangent that
-        // is stored differently (e.g., with the explicit layout of its primal) still satisfies. Forward only the
-        // information-carrying values because the compact program has no SSA input for a zero differential space.
+        // is stored differently (e.g., with the explicit layout of its primal) still satisfies, and which a tangent
+        // of a relocatable input may refine (e.g., with any placement). Forward only the information-carrying values
+        // because the compact program has no SSA input for a zero differential space.
         let mut program_inputs = Vec::new();
-        for (index, (value, primal_type)) in public_tangents.into_iter().zip(&self.primal_input_types).enumerate() {
+        for (index, ((value, primal_type), &relocatable)) in
+            public_tangents.into_iter().zip(&self.primal_input_types).zip(&self.relocatable_inputs).enumerate()
+        {
             let tangent_type = primal_type.tangent()?;
-            if !tangent_type.is_interchangeable_with(value.r#type().as_ref()) {
+            if !tangent_type.is_interchangeable_with(value.r#type().as_ref())
+                && !(relocatable && tangent_type.is_refined_by(value.r#type().as_ref()))
+            {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
                     index,
@@ -1040,6 +1069,7 @@ impl<C: Context> Pushforward<C, Vec<C::Value>, Vec<C::Value>> {
             residuals: self.residuals,
             tangent_reconstruction: self.tangent_reconstruction,
             primal_input_types: self.primal_input_types,
+            relocatable_inputs: self.relocatable_inputs,
             primal_output_types: self.primal_output_types,
             tangent_output_slots: self.tangent_output_slots,
             primal_references: self.primal_references,
@@ -3607,7 +3637,15 @@ where
         capture_values.iter(),
     )?;
 
-    let input_types = primal_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    // A value that is free to be placed elsewhere enters with its relocatable type (refer to
+    // `Value::relocatable_type`), which its known input declares and from which its tangent and cotangent types derive.
+    let declarations = primal_values.iter().map(Value::relocatable_type).collect::<Vec<_>>();
+    let input_types = primal_values
+        .iter()
+        .zip(&declarations)
+        .map(|(value, declaration)| declaration.clone().unwrap_or_else(|| value.r#type().into_owned()))
+        .collect::<Vec<_>>();
+    let relocatable_inputs = declarations.iter().map(Option::is_some).collect::<Vec<_>>();
 
     // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
     // so they can be residualized when needed without increasing the pushforward's tangent arity.
@@ -3621,9 +3659,13 @@ where
     let input_duals = primal_values
         .iter()
         .cloned()
-        .map(|value| {
-            let primal_type = value.r#type().into_owned();
-            let tangent_type = primal_type.tangent()?;
+        .zip(declarations)
+        .map(|(value, declaration)| {
+            let mut primal = PartialEvaluationValue::known_input(value);
+            if let Some(declaration) = &declaration {
+                primal.set_declared_type(declaration)?;
+            }
+            let tangent_type = primal.r#type().tangent()?;
             let tangent = if !tangent_type.is_zero_space() {
                 let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
                 tangent_index += 1;
@@ -3631,10 +3673,8 @@ where
             } else {
                 MaybeZero::Zero(tangent_type)
             };
-            let dual = DifferentiationDual::new(
-                PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value)),
-                tangent,
-            )?;
+            let primal = PartialTracer::new(primal_evaluation_context.clone(), primal);
+            let dual = DifferentiationDual::new(primal, tangent)?;
             Ok::<_, ProgramError>(DifferentiationTracer::new(dual, differentiation_context.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3808,6 +3848,7 @@ where
         residuals,
         tangent_reconstruction,
         input_types,
+        relocatable_inputs,
         output_types,
         tangent_output_slots,
         primal_references,
@@ -4401,6 +4442,7 @@ pub(crate) mod tests {
     ) -> Result<Pushforward<EagerContext<Array, ArrayOperation<Array>>, Vec<Array>, Vec<Array>>, ProgramError> {
         let context = EagerContext::new();
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
+        let relocatable_inputs = vec![false; inputs.len()];
         let output_types = outputs.iter().map(|value| (value.r#type().into_owned(), None)).collect::<Vec<_>>();
         let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
         let tangent_output_slots = output_types
@@ -4420,6 +4462,7 @@ pub(crate) mod tests {
             residuals,
             Some(reconstruction),
             input_types,
+            relocatable_inputs,
             output_types,
             tangent_output_slots,
             references,
@@ -4560,6 +4603,46 @@ pub(crate) mod tests {
             assert!(plain.is_interchangeable_with(output.r#type().as_ref()));
             assert_eq!(output.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
         }
+    }
+
+    #[test]
+    fn test_pushforward_apply_relocatable_input_tangents() {
+        // Only an input declared with its relocatable type accepts a tangent that refines its declared tangent type
+        // (e.g., with any placement). Another data type is still rejected.
+        let placed_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0))
+            .unwrap();
+        let placed = Array::from_elements(placed_type.clone(), &[1f32]).unwrap();
+        let new = |relocatable: bool| {
+            let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+            let reconstruction = ZeroBoundaryReconstruction::capture(&context, &[], std::iter::empty(), &[]).unwrap();
+            let references = ReferenceBoundary::new_for_differentiation(&context, &[], &[], &[]).unwrap();
+            Pushforward::<_, Vec<Array>, Vec<Array>>::new(
+                context,
+                boundary_program(&[DataType::F32], &[]),
+                Vec::new(),
+                Some(reconstruction),
+                vec![ArrayType::scalar(DataType::F32)],
+                vec![relocatable],
+                Vec::new(),
+                Vec::new(),
+                references,
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(new(true).apply(vec![placed.clone()]).unwrap(), Vec::<Array>::new());
+        let message = "pushforward tangent 0 has type f64[] but its primal boundary requires tangent type f32[]";
+        assert!(matches!(
+            new(true).apply(vec![Array::scalar(1f64).unwrap()]),
+            Err(ProgramError::MalformedProgram(actual)) if actual == message,
+        ));
+        let message =
+            format!("pushforward tangent 0 has type {placed_type} but its primal boundary requires tangent type f32[]");
+        assert!(matches!(
+            new(false).apply(vec![placed]),
+            Err(ProgramError::MalformedProgram(actual)) if actual == message,
+        ));
     }
 
     #[test]
@@ -4958,6 +5041,7 @@ pub(crate) mod tests {
                 boundary_program(&[], &[]),
                 Vec::new(),
                 Some(reconstruction),
+                Vec::new(),
                 Vec::new(),
                 vec![(output_type, None)],
                 tangent_output_slots,

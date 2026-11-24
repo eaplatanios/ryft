@@ -37,6 +37,7 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 
+use crate::compilation::domains::argument_type;
 use crate::{Array, RetainedArray, Session};
 
 /// Type of an XLA [`Value`], which is the [`ArrayIrType`] of `ryft-core` used as it is. XLA defines its own values,
@@ -370,6 +371,16 @@ impl CoreValue for Value {
                 value.handle().rename_type_identities(renaming)?,
                 value.session().clone(),
             ))),
+        }
+    }
+
+    fn relocatable_type(&self) -> Option<Self::Type> {
+        // An uncommitted array whose type records nothing beyond replication enters a transform without a sharding,
+        // which is the type for which a `jit` dispatcher specializes such an argument, so that a call moves it onto
+        // the devices where it runs under a transform as it does outside of one.
+        match self {
+            Self::Array(array) => argument_type(array, &array.r#type()).map(Type::Array),
+            Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
 

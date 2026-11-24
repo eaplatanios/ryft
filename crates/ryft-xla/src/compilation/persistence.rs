@@ -1732,7 +1732,7 @@ mod tests {
         let input = Array::from_host_buffer(&session, input_type.clone(), None, None, values_to_bytes(&[1f32, 2., 3.]))
             .unwrap();
         assert!(!input.is_committed());
-        let restore = |options: Options| {
+        let restore = |options: Options, input_type: &ArrayType| {
             let staged = StagedFunction::<Session, Type, Type>::stage(
                 |_, _, input| Ok(input),
                 vec![],
@@ -1747,7 +1747,8 @@ mod tests {
 
         // A program that is deserialized on its own commits the outputs that the program that was serialized commits
         // (i.e., every output of a function with an explicit output sharding), even for an uncommitted input.
-        let (compiled, restored) = restore(Options::new(mesh.clone()).with_output_shardings(vec![sharding]));
+        let (compiled, restored) =
+            restore(Options::new(mesh.clone()).with_output_shardings(vec![sharding]), &input_type);
         assert_eq!(compiled.compiled_program().committed_outputs(), &[true]);
         assert_eq!(restored.committed_outputs(), &[true]);
         let output = session.execute(&restored, vec![Value::Array(input.clone())]).unwrap().pop().unwrap();
@@ -1756,10 +1757,22 @@ mod tests {
         assert!(output.is_committed());
         assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3.]);
 
-        // Without an explicit placement on a single device, the outputs follow the commitment of the inputs.
-        let (compiled, restored) = restore(Options::new(mesh));
+        // Without an explicit placement, a function compiled for a named mesh of one device commits its outputs too, as
+        // JAX does under `set_mesh`, and so does the program that is deserialized.
+        let (compiled, restored) = restore(Options::new(mesh.clone()), &input_type);
+        assert_eq!(compiled.compiled_program().committed_outputs(), &[true]);
+        assert_eq!(restored.committed_outputs(), &[true]);
+        let output = session.execute(&restored, vec![Value::Array(input)]).unwrap().pop().unwrap();
+        assert!(program_array(&output).is_committed());
+
+        // On the anonymous mesh of one device, the outputs follow the commitment of the inputs.
+        let anonymous = DeviceMesh::new(LogicalMesh::single_device(), mesh.devices().to_vec()).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [3]);
+        let (compiled, restored) = restore(Options::new(anonymous), &input_type);
         assert_eq!(compiled.compiled_program().committed_outputs(), &[false]);
         assert_eq!(restored.committed_outputs(), &[false]);
+        let input =
+            Array::from_host_buffer(&session, input_type, None, None, values_to_bytes(&[1f32, 2., 3.])).unwrap();
         let output = session.execute(&restored, vec![Value::Array(input)]).unwrap().pop().unwrap();
         assert!(!program_array(&output).is_committed());
     }

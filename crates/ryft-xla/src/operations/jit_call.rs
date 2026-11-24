@@ -36,7 +36,7 @@ use ryft_mlir::{
 
 use crate::compilation::domains::{
     argument_type, boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
-    states_boundary_placement,
+    is_named_mesh, states_boundary_placement,
 };
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
@@ -50,7 +50,7 @@ use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};
 use crate::{
-    Array, CompileTracer, CompiledFunction, Constant, Error, ExecutionError, LowerableOperation,
+    Array, CompileTracer, CompiledFunction, Constant, Dimension, Error, ExecutionError, LowerableOperation,
     LowerableOperationFamily, Lowerer, LoweringError, Options, Session, Type, Value,
 };
 
@@ -416,10 +416,11 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///
 /// A call stages the callee's source in its caller. When an input or output has a sharding override, or the body
 /// requests placement through a `place` whose target names devices, a `constrain_sharding`, or a nested call that names
-/// devices, the call uses the callee's mesh. Otherwise it runs on the devices of its caller or public arguments, also
-/// when its body only moves a value to another memory, as JAX runs such a `jit` function where its arguments are.
-/// Lifted captures follow those devices, even when the original array is committed. Executing the retained executable
-/// directly always uses the mesh it was compiled for.
+/// devices, the call uses the callee's mesh. Otherwise, including when its body only moves a value to another memory,
+/// where it runs is stated in
+/// [Where Compiled Functions Run](crate::compilation::functions#where-compiled-functions-run): an application by a
+/// session reads the mesh of its function (refer to `function_mesh`), and a nested call follows its caller.
+/// Lifted captures follow those devices, even when the original array is committed.
 ///
 /// A call therefore carries the boundary of its callee as that function was compiled (refer to `with_boundary`), which
 /// is the sharding override of each of its inputs and outputs, if any, together with the device mesh that the function
@@ -449,7 +450,8 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 ///     An input of a `shard_map` body may vary along manual mesh axes that the callee input type does not declare,
 ///     and every output of the call then varies along them too.
 ///   - A call commits its results when it names devices, when its callee requests any placement (including one that
-///     only moves a value to another memory), runs on multiple devices, or has a committed public input.
+///     only moves a value to another memory), runs on multiple devices, has a committed public input, or is applied
+///     by a session on the named mesh of its function (refer to `commits_public_outputs`).
 ///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with the
 ///     device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
 ///     evaluation split, or a batched call). A call that a transform creates (e.g., the primal and tangent calls of a
@@ -493,6 +495,19 @@ pub struct JitCallOperation<T: CoreType> {
     /// program transform derives from another call (refer to `with_derived_boundary_shardings`), or [`None`] for a
     /// call of a compiled function, whose declared input types define it (refer to [`Self::boundary_input_sharding`]).
     derived_input_shardings: Option<Arc<[Option<Sharding>]>>,
+
+    /// Device mesh that the called function was compiled for (refer to [`Self::with_function_mesh`]), or [`None`] for
+    /// a call that a program transform creates. Only the placement decision of an application by a session reads it
+    /// (refer to [`Self::eager_decision`]), so it takes part in equality but is neither hashed nor rendered, and
+    /// staged programs, their keys, lowering, and transforms are the same with and without it. It is separate from
+    /// [`Self::mesh`], which type inference and transforms read as the devices that the call names. A transform keeps
+    /// it on a call that replaces the whole call in the same context (i.e., the fused JVP call and a batched call), on
+    /// the calls of a linearization (i.e., the primal call, the tangent call, and the transposed call that a pullback
+    /// derives from them), which an eager VJP applies on the session, and on a call that partial evaluation folds into
+    /// an eager known side. It drops it on every call that partial evaluation places into a known or a residual program
+    /// (e.g., the known and residual calls of a split, or a call folded into a staged known program, such as that of a
+    /// `rematerialize` body), because such a call is nested in a program and follows its caller.
+    function_mesh: Option<DeviceMesh>,
 }
 
 impl<T: CoreType + Hash> Hash for JitCallOperation<T> {
@@ -534,6 +549,7 @@ impl<T: CoreType> JitCallOperation<T> {
             mesh: None,
             keeps_input_placements: false,
             derived_input_shardings: None,
+            function_mesh: None,
         }
     }
 
@@ -568,6 +584,14 @@ impl<T: CoreType> JitCallOperation<T> {
     /// type records, and an eager call places it the same way.
     pub(crate) fn with_kept_input_placements(mut self) -> Self {
         self.keeps_input_placements = true;
+        self
+    }
+
+    /// Returns this call with `mesh`, the device mesh that the called function was compiled for, which decides where
+    /// an application of the call by a session runs (refer to [`Self::eager_decision`]). A call nested in another
+    /// compiled function runs where its caller runs whatever this mesh is.
+    pub(crate) fn with_function_mesh(mut self, mesh: &DeviceMesh) -> Self {
+        self.function_mesh = Some(mesh.clone());
         self
     }
 
@@ -673,6 +697,12 @@ impl<T: CoreType> JitCallOperation<T> {
         Self { mesh: None, ..self.clone() }
     }
 
+    /// Returns this call without the mesh of its function (refer to [`Self::function_mesh`]), for a call that a
+    /// transform places into a program, where it follows its caller.
+    fn without_function_mesh(&self) -> Self {
+        Self { function_mesh: None, ..self.clone() }
+    }
+
     /// Returns whether this call leaves each input without a sharding override placed as it is (refer to
     /// [`Self::with_kept_input_placements`]).
     #[inline]
@@ -702,7 +732,9 @@ impl<T: CoreType> JitCallOperation<T> {
     /// Returns `derived` with the boundary shardings of this call at the positions that `input_indices` and
     /// `output_indices` select (refer to `derived_boundary_shardings`), with the mesh of this call, if any, because
     /// the derived call runs a part of the callee of this call, which an execution runs on the devices that it names,
-    /// and with the placement of its inputs that this call keeps (refer to [`Self::with_kept_input_placements`]).
+    /// and with the placement of its inputs that this call keeps (refer to [`Self::with_kept_input_placements`]). The
+    /// derived call keeps the mesh of the function of `derived` (refer to [`Self::function_mesh`]), which a call that a
+    /// transform creates does not have, so a caller that wants it copies it.
     ///
     /// `boundary` is the effective boundary sharding of each input of this call without an override (refer to
     /// `effective_input_boundary`), which the derived call receives as its own at the selected positions, so that a
@@ -945,8 +977,9 @@ pub(crate) struct EagerCallDecision<'o> {
     mesh: Cow<'o, DeviceMesh>,
 
     /// Whether every result of the application is committed, which is when a public argument is committed or when the
-    /// callee commits its public outputs on [`Self::mesh`] (i.e., when the call requests a placement or runs on more
-    /// than one device, refer to [`commits_public_outputs`]), as the executable of the callee commits them.
+    /// callee commits its public outputs on [`Self::mesh`] (i.e., when the call requests a placement, runs on more
+    /// than one device, or runs on the named mesh of its function, refer to [`commits_public_outputs`]), as the
+    /// executable of the callee commits them.
     committed: bool,
 
     /// Whether this process alone chose [`Self::mesh`] (refer to `Session::assigns_placement_locally`), which every
@@ -992,6 +1025,14 @@ impl JitCallOperation<Type> {
     ///     every input is placed there as its effective boundary sharding requests (refer to
     ///     [`Self::boundary_input_sharding`]), or keeps its sharding when the mesh topologies agree and is replicated
     ///     otherwise. Its devices are named for every process, so they are not locally assigned.
+    ///   - A call that the session applies itself, rather than the replay of another call (refer to
+    ///     [`Session::replays_call`]), runs on the mesh of its function (refer to [`Self::with_function_mesh`]) in the
+    ///     same way when that mesh is named (refer to [`is_named_mesh`]), as JAX runs a `jit` function under
+    ///     `set_mesh`, and commits its results. On the anonymous mesh of one device, it does so only when no public
+    ///     argument is committed, as JAX runs a `jit` function under `default_device`, with uncommitted results, and a
+    ///     committed public argument decides as below. A call replayed inside the replay of another call runs where
+    ///     that call runs, as a nested call runs where its compiled caller runs, and so does a call in a region of an
+    ///     eager operation (e.g., `condition`), which `Session::bind` compiles into the computation of that operation.
     ///   - Any other call runs where its public arguments are, as JAX runs a `jit` function without shardings.
     ///     Committed public arguments must agree on their devices, as JAX rejects a `jit` call whose committed
     ///     arguments are on different devices ("Received incompatible devices for jitted computation"), and they
@@ -1011,7 +1052,9 @@ impl JitCallOperation<Type> {
     /// `validate_input_reduction`), because a reshard never completes a pending reduction, so the replay of the
     /// callee, which runs no executable, rejects what an eager call and an execution reject. The results are
     /// committed when a public argument is committed or when the callee commits its public outputs on the selected
-    /// devices (refer to [`Self::requests_placement`] and [`commits_public_outputs`]).
+    /// devices (refer to [`Self::requests_placement`] and [`commits_public_outputs`]), which includes every
+    /// application that runs on the named mesh of its function, as JAX commits every result of a `jit` function under
+    /// `set_mesh`, and excludes an application that runs where its arguments are, whatever logical mesh they record.
     ///
     /// # Errors
     ///
@@ -1048,14 +1091,21 @@ impl JitCallOperation<Type> {
         }
         let public_arrays = inputs.iter().skip(self.capture_count).filter_map(array);
         let target_platform = session.target()?.platform_name();
-        let committed = |mesh: &DeviceMesh| {
+        // The mesh commits the results for being named only when the application runs on it because the function was
+        // compiled for it, and not when it is where the arguments of the application are (refer to
+        // `commits_public_outputs`).
+        let committed = |mesh: &DeviceMesh, function_mesh: bool| {
             public_arrays.clone().any(Array::is_committed)
-                || commits_public_outputs(mesh, self.requests_placement(callee, Some(target_platform)))
+                || commits_public_outputs(mesh, function_mesh, self.requests_placement(callee, Some(target_platform)))
         };
         // The call records its mesh when it is staged, for no target, so whether it still names devices is read for the
         // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
         let names_devices = || has_placement_requests_in_region(callee, Some(target_platform), false);
-        if let Some(mesh) = self.names_devices(names_devices) {
+        let function_mesh = || {
+            let mesh = self.function_mesh.as_ref().filter(|_| !session.replays_call())?;
+            (is_named_mesh(mesh.logical_mesh()) || !public_arrays.clone().any(Array::is_committed)).then_some(mesh)
+        };
+        if let Some(mesh) = self.names_devices(names_devices).or_else(function_mesh) {
             for (index, input) in inputs.iter().skip(self.capture_count).enumerate() {
                 if let Value::Array(array) = input {
                     validate_committed_input_devices(array, index, mesh)?;
@@ -1077,7 +1127,7 @@ impl JitCallOperation<Type> {
             return Ok(EagerCallDecision {
                 inputs: Cow::Owned(placed),
                 mesh: Cow::Owned(mesh.clone()),
-                committed: committed(mesh),
+                committed: committed(mesh, true),
                 locally_assigned: false,
             });
         }
@@ -1170,7 +1220,7 @@ impl JitCallOperation<Type> {
                 prepared.to_mut()[index] = Value::Array(placed);
             }
         }
-        let committed = committed(&mesh);
+        let committed = committed(&mesh, false);
         Ok(EagerCallDecision { inputs: prepared, mesh, committed, locally_assigned })
     }
 
@@ -1960,8 +2010,12 @@ where
                 }))
                 .collect::<Result<_, _>>()?,
         );
-        let operation =
-            Self { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..operation };
+        let operation = Self {
+            keeps_input_placements: self.keeps_input_placements,
+            derived_input_shardings,
+            function_mesh: self.function_mesh.clone(),
+            ..operation
+        };
         let operation = if let Some(mesh) = self.mesh() {
             let input_shardings = std::iter::once(Ok(None))
                 .chain(inputs.iter().enumerate().map(|(index, input)| {
@@ -2062,8 +2116,12 @@ where
                 })
                 .collect::<Result<_, _>>()?,
         );
-        let operation =
-            Self { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..operation };
+        let operation = Self {
+            keeps_input_placements: self.keeps_input_placements,
+            derived_input_shardings,
+            function_mesh: self.function_mesh.clone(),
+            ..operation
+        };
         let operation = if let Some(mesh) = self.mesh() {
             let input_shardings = inputs
                 .iter()
@@ -2220,12 +2278,17 @@ where
             let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
             let boundary =
                 self.effective_input_boundary(&input_types, inputs.iter().map(|input| input.primal().r#type()));
-            let operation = Operation::JitCall(self.with_derived_boundary_shardings(
-                JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
-                Some(&boundary),
-                (0..input_types.len()).chain(activity.input_indices().iter().copied()).map(Some),
-                (0..output_count).chain(live_outputs).map(Some),
-            ));
+            // The fused call replaces the whole call in the same context, so it keeps the mesh of the function and an
+            // eager JVP runs where the call runs.
+            let operation = Operation::JitCall(JitCallOperation {
+                function_mesh: self.function_mesh.clone(),
+                ..self.with_derived_boundary_shardings(
+                    JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
+                    Some(&boundary),
+                    (0..input_types.len()).chain(activity.input_indices().iter().copied()).map(Some),
+                    (0..output_count).chain(live_outputs).map(Some),
+                )
+            });
             let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
             check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
             let mut tangents = outputs.split_off(output_count).into_iter();
@@ -2292,14 +2355,24 @@ where
         // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
         // survives verbatim and its length carries over.
         // The primal call has the boundary shardings of this call, and its trailing residuals have none.
+        //
+        // The primal and the tangent call carry the mesh of the function, and so does the transposed call that a
+        // pullback derives from them, so an eager linearization (e.g., of an eager VJP) runs each of them where the
+        // call runs, as JAX runs the linearized calls of a `jit` function under `set_mesh` (refer to
+        // `JitCallOperation::function_mesh`). An uncommitted argument enters an eager linearization without the
+        // placement that it happens to have (refer to `Value::relocatable_type`), so the tangent and the cotangent of
+        // such an argument may live on the devices of the function.
         let boundary =
             self.effective_input_boundary(&input_types, primal_operands.iter().map(|operand| operand.r#type()));
-        let primal_call = Operation::JitCall(self.with_derived_boundary_shardings(
-            JitCallOperation::new(self.capture_count()).with_callee_region(primal_program.entry_region_ref())?,
-            Some(&boundary),
-            (0..input_types.len()).map(Some),
-            (0..output_count).map(Some),
-        ));
+        let primal_call = Operation::JitCall(JitCallOperation {
+            function_mesh: self.function_mesh.clone(),
+            ..self.with_derived_boundary_shardings(
+                JitCallOperation::new(self.capture_count()).with_callee_region(primal_program.entry_region_ref())?,
+                Some(&boundary),
+                (0..input_types.len()).map(Some),
+                (0..output_count).map(Some),
+            )
+        });
         let mut primal_call_outputs =
             context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
@@ -2336,12 +2409,15 @@ where
         let active_inputs = activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
         let live_outputs =
             output_activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
-        let tangent_call = Operation::JitCall(self.with_derived_boundary_shardings(
-            JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?,
-            Some(&boundary),
-            active_inputs,
-            live_outputs,
-        ));
+        let tangent_call = Operation::JitCall(JitCallOperation {
+            function_mesh: self.function_mesh.clone(),
+            ..self.with_derived_boundary_shardings(
+                JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?,
+                Some(&boundary),
+                active_inputs,
+                live_outputs,
+            )
+        });
         let tangent_outputs =
             context
                 .tangent()
@@ -2479,6 +2555,7 @@ pub fn transpose_primal_jit_call<
     let mut transposed_call =
         JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
     transposed_call.keeps_input_placements = operation.keeps_input_placements();
+    transposed_call.function_mesh = operation.function_mesh.clone();
     // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
     // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
     // leaves its residuals where they are.
@@ -2636,8 +2713,10 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         let locally_assigned = decision.locally_assigned();
         // The callee runs on the devices on which an eager execution of the call runs, so the operations of the callee
         // that take no array input (e.g., a `fill`) are replayed there rather than on the default mesh of the session,
-        // as an execution of the callee places them.
-        let session = context.with_device_mesh(decision.mesh().clone());
+        // as an execution of the callee places them. The calls in the callee then run where this call runs (refer to
+        // `Session::replays_call`).
+        // The guard of the replay lives until the replay returns, so that no handle of it replays a call afterwards.
+        let (session, _replay) = context.replaying_call(decision.mesh().clone());
         // The replayed callee receives every argument as an executable of the callee holds it once it has entered
         // (refer to `entered_argument`), as do the results that return it.
         let mut inputs = decision.inputs.into_owned();
@@ -2651,9 +2730,15 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
             .iter()
             .enumerate()
             .map(|(index, value)| match value.rename_type_identities(&renaming)? {
+                // The results belong to `context`, which applied the call, and not to the handle of the replay, so that
+                // a later application of a call on them is not taken for a replay.
                 Value::Array(array) => {
                     let array = self.boundary_output(context, index, array).map_err(invalid_argument)?;
+                    let array = array.with_session(context).map_err(invalid_argument)?;
                     Ok(Value::Array(array.with_committed(committed).with_locally_assigned(locally_assigned)))
+                }
+                Value::Dimension(dimension) => {
+                    Ok(Value::Dimension(Dimension::new(dimension.into_value(), context.clone())))
                 }
                 value => Ok(value),
             })
@@ -3783,9 +3868,16 @@ where
     C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
     D: PartialEvaluationDriver<C>,
 {
+    // A call that folds into an eager known side (e.g., the primal call of an eager linearization) is applied by the
+    // session and keeps the mesh of its function. A call placed into a known or a residual program follows its caller.
     let callee = shared_jit_call_callee(driver.region(0)?)?;
+    let operation = if context.parent().is_eager() && inputs.iter().all(PartialEvaluationValue::is_known) {
+        operation.clone()
+    } else {
+        operation.without_function_mesh()
+    };
     context.fold_or_residualize(
-        Operation::JitCall(operation.clone()),
+        Operation::JitCall(operation),
         AttachedRegions::Callees(std::slice::from_ref(&callee)),
         inputs,
         None,
@@ -4605,7 +4697,8 @@ mod tests {
 
         // Two structurally identical callees whose calls differ in any field of the call that lowering uses share no
         // function, so that each call lowers its own boundary. Only the shared innermost callee gets a function. The
-        // destructuring names every field of the call, so that a field added later must be classified here.
+        // destructuring names every field of the call, so that a field added later must be classified here. Lowering
+        // never reads the mesh of the called function, which only an application by a session reads.
         let JitCallOperation {
             capture_count: _,
             marker: _,
@@ -4615,6 +4708,7 @@ mod tests {
             mesh: _,
             keeps_input_placements: _,
             derived_input_shardings: _,
+            function_mesh: _,
         } = &base;
         let derived = |shardings: Vec<Option<Sharding>>| JitCallOperation::<Type> {
             derived_input_shardings: Some(Arc::from(shardings)),
