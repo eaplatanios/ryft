@@ -996,14 +996,14 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
         }
 
         // A value that is free to be placed elsewhere enters with the declared type when it may be placed as that type
-        // states (refer to `is_relocatable_to`), and the operations of the region move it, as they would move it from
-        // wherever it lives. Every other value enters with its own type.
+        // states (refer to `Value::is_relocatable_to`), and the operations of the region move it, as they would move
+        // it from wherever it lives. Every other value enters with its own type.
         let input_types = input_ids
             .iter()
             .zip(&inputs)
             .map(|(id, input)| {
                 let declared = region.atoms()[id.index()].r#type();
-                if !declared.is_refined_by(input.r#type().as_ref()) && is_relocatable_to(input, declared.as_ref()) {
+                if !declared.is_refined_by(input.r#type().as_ref()) && input.is_relocatable_to(declared.as_ref()) {
                     declared.into_owned()
                 } else {
                     input.r#type().into_owned()
@@ -1237,13 +1237,13 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 .collect::<Vec<_>>();
 
             // A value that is free to be placed elsewhere satisfies the declared type when it may be placed as that
-            // type states (refer to `is_relocatable_to`), as it does at the input boundary in `Self::new`.
+            // type states (refer to `Value::is_relocatable_to`), as it does at the input boundary in `Self::new`.
             let actual = outputs
                 .iter()
                 .zip(declared.iter().map(Some).chain(std::iter::repeat(None)))
                 .map(|(output, declared)| match declared {
                     Some(declared)
-                        if !declared.is_refined_by(output.r#type().as_ref()) && is_relocatable_to(output, declared) =>
+                        if !declared.is_refined_by(output.r#type().as_ref()) && output.is_relocatable_to(declared) =>
                     {
                         Cow::Borrowed(declared)
                     }
@@ -1468,16 +1468,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone> RegionInte
 
         Ok(outputs)
     }
-}
-
-/// Returns whether `value` is free to be placed elsewhere and may be placed as `declared` states (i.e., whether its
-/// [`relocatable_type`](Value::relocatable_type) is refined by `declared`), so that a boundary that declares `declared`
-/// admits it even when its own type does not satisfy that declaration (e.g., an uncommitted array that lives on another
-/// mesh than a declared sharding names). The input and output boundaries of an interpreted region, the seeds of a
-/// pullback, and the input cotangents of a pullback admit such values through this one function. A value without a
-/// relocatable type is never admitted by it.
-pub(crate) fn is_relocatable_to<V: Value>(value: &V, declared: &V::Type) -> bool {
-    value.relocatable_type().is_some_and(|declaration| declaration.is_refined_by(declared))
 }
 
 /// Interprets a [`Region`](crate::Region)-free member [`Operation`] through a heterogeneous [`Domain`]. Inputs are

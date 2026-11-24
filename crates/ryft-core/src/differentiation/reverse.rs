@@ -1673,13 +1673,16 @@ impl<
                         ),
                     });
                 }
-            } else if !expected_type.is_interchangeable_with(cotangent.r#type().as_ref())
-                && !expected_type.is_refined_by(cotangent.r#type().as_ref())
+            } else if let MaybeZero::Value(value) = cotangent
+                && !expected_type.is_interchangeable_with(value.r#type().as_ref())
+                && !expected_type.is_refined_by(value.r#type().as_ref())
+                && !value.is_relocatable_to(&expected_type)
             {
                 // A live cotangent may be stored differently than its type describes (e.g., with the explicit layout
                 // that a seed or a primal value contributed), because that type has no explicit layout. An input that
                 // entered linearization with a declaration (refer to `Value::relocatable_type`) accepts a cotangent
-                // that refines it.
+                // that refines it, and a cotangent that is free to be placed elsewhere is admitted when it may be
+                // placed as that type states (refer to `Value::is_relocatable_to`).
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
                         "pullback cotangent {} has type {} but its primal input requires cotangent type {}",
@@ -2027,12 +2030,11 @@ impl<
 
                     // A seed may be stored differently than the cotangent type describes (e.g., with the explicit
                     // layout of the primal output), because that type has no explicit layout. A seed that is free to
-                    // be placed elsewhere is compared by its declaration (refer to `Value::relocatable_type`), which
-                    // the cotangent type must refine, so that the pullback places it as that type states.
+                    // be placed elsewhere is admitted when it may be placed as the cotangent type states (refer to
+                    // `Value::is_relocatable_to`), which the boundary of the transposed program admits as well,
+                    // and the operations of that program move it from where it lives.
                     if !cotangent_type.is_interchangeable_with(value.r#type().as_ref())
-                        && !value
-                            .relocatable_type()
-                            .is_some_and(|declaration| declaration.is_refined_by(&cotangent_type))
+                        && !value.is_relocatable_to(&cotangent_type)
                     {
                         return Err(ProgramError::MalformedProgram(format!(
                             "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
@@ -4467,8 +4469,10 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Placement, Shape, Sharding,
+        StridedLayout,
     };
+    use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::forward::{
@@ -4479,20 +4483,21 @@ pub(crate) mod tests {
     use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
         AddOperation, BroadcastOperation, CastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
-        Constant, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, MulOperation,
-        NegOperation, OneLikeOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation,
-        ReshardOperation, SelectOperation, Sin, SliceOperation, StopGradient, SubOperation, TransposeOperation,
-        UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
+        Constant, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, Fill, Iota, MulOperation,
+        NegOperation, One, OneLikeOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Placed,
+        PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
+        ReshapeOperation, ReshardOperation, SelectOperation, Sin, SliceOperation, StopGradient, SubOperation,
+        TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
         Operation, Program, ProgramBuilder, ProgramError, ProvenanceScope, ReferenceAccessDescriptor, ReferenceError,
-        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value, ValueProjection,
+        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value, ValueDomainDispatch,
+        ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::TestArrayContext;
@@ -5856,6 +5861,174 @@ pub(crate) mod tests {
             let gradient: Array = pullback.apply_materialized(seed).unwrap();
             assert!(plain.is_interchangeable_with(gradient.r#type().as_ref()));
             assert_eq!(gradient.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
+        }
+    }
+
+    #[test]
+    fn test_pullback_apply_relocatable_cotangent_seeds() {
+        /// Reference array that, when `relocatable` is set, is free to be placed elsewhere like an uncommitted array
+        /// of a backend (i.e., enters a transform with its type without a sharding).
+        #[derive(Clone, Debug)]
+        struct RelocatableArray {
+            array: Array,
+            relocatable: bool,
+        }
+
+        impl std::fmt::Display for RelocatableArray {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.array)
+            }
+        }
+
+        impl Parameter for RelocatableArray {}
+
+        impl Typed for RelocatableArray {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                self.array.r#type()
+            }
+        }
+
+        impl Value for RelocatableArray {
+            type Dispatch = ValueDomainDispatch;
+            type Domain = RelocatingContext;
+
+            fn domain(&self) -> Self::Domain {
+                RelocatingContext
+            }
+
+            fn relocatable_type(&self) -> Option<ArrayType> {
+                self.relocatable.then(|| self.array.r#type().into_owned().with_sharding(None).unwrap())
+            }
+        }
+
+        impl Placed for RelocatableArray {
+            fn placement(&self) -> Option<Placement> {
+                self.array.placement()
+            }
+        }
+
+        impl Concretizable<bool> for RelocatableArray {
+            fn concretize(&self) -> Result<bool, ProgramError> {
+                self.array.concretize()
+            }
+        }
+
+        /// Eager context that interprets operations over reference arrays and returns arrays that are not relocatable.
+        #[derive(Clone, Debug)]
+        struct RelocatingContext;
+
+        impl Domain for RelocatingContext {
+            type Type = ArrayType;
+            type Value = RelocatableArray;
+            type Constant = Array;
+            type Operation = ArrayOperation<Array>;
+        }
+
+        impl Context for RelocatingContext {
+            fn lift(&self, array: Array) -> Result<RelocatableArray, ProgramError> {
+                Ok(RelocatableArray { array, relocatable: false })
+            }
+
+            fn bind<'r, O: Into<Self::Operation>, R: Into<AttachedRegions<'r, Self::Constant, Self::Operation>>>(
+                &self,
+                operation: O,
+                regions: R,
+                inputs: &[RelocatableArray],
+            ) -> Result<Vec<RelocatableArray>, ProgramError>
+            where
+                Self::Constant: 'r,
+                Self::Operation: 'r,
+            {
+                let inputs = inputs.iter().map(|input| input.array.clone()).collect::<Vec<_>>();
+                let outputs = EagerContext::<Array, ArrayOperation<Array>>::new().bind(operation, regions, &inputs)?;
+                Ok(outputs.into_iter().map(|array| RelocatableArray { array, relocatable: false }).collect())
+            }
+
+            fn is_eager(&self) -> bool {
+                true
+            }
+
+            fn provenance(&self) -> Provenance {
+                Provenance::unknown()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+                function()
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+                function()
+            }
+        }
+
+        impl NamedAxes for RelocatingContext {
+            fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
+                None
+            }
+
+            fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+                Vec::new()
+            }
+        }
+
+        impl Zero<RelocatableArray> for RelocatingContext {
+            fn zero(&self, r#type: &ArrayType) -> Result<RelocatableArray, ProgramError> {
+                self.lift(EagerContext::<Array>::new().zero(r#type)?)
+            }
+        }
+
+        impl One<RelocatableArray> for RelocatingContext {
+            fn one(&self, r#type: &ArrayType) -> Result<RelocatableArray, ProgramError> {
+                self.lift(EagerContext::<Array>::new().one(r#type)?)
+            }
+        }
+
+        impl Iota<RelocatableArray> for RelocatingContext {
+            fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<RelocatableArray, ProgramError> {
+                self.lift(EagerContext::<Array>::new().iota(r#type, dimension)?)
+            }
+        }
+
+        impl Fill<u64, RelocatableArray> for RelocatingContext {
+            fn fill(&self, r#type: &ArrayType, value: u64) -> Result<RelocatableArray, ProgramError> {
+                self.lift(EagerContext::<Array>::new().fill(r#type, value)?)
+            }
+        }
+
+        impl Fill<f64, RelocatableArray> for RelocatingContext {
+            fn fill(&self, r#type: &ArrayType, value: f64) -> Result<RelocatableArray, ProgramError> {
+                self.lift(EagerContext::<Array>::new().fill(r#type, value)?)
+            }
+        }
+
+        // A relocatable seed may be placed as the cotangent type states, so the pullback accepts it and replays the
+        // transposed program on it, whether the cotangent type leaves its sharding open or tracks another mesh than
+        // the one that the seed lives on. A seed of the same type that is not relocatable is rejected before replay.
+        let sharded = |axis: &str| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new(axis, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap()
+        };
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let seed_type = sharded("device");
+        let array = |r#type: &ArrayType, elements: &[f32]| Array::from_elements(r#type.clone(), elements).unwrap();
+        let seed = |relocatable: bool| RelocatableArray { array: array(&seed_type, &[5.0, 6.0]), relocatable };
+        for primal_type in [plain, sharded("q")] {
+            let primal = RelocatableArray { array: array(&primal_type, &[1.0, 2.0]), relocatable: false };
+            let (output, pullback) = differentiate_at(primal).vjp(|x| Ok(x)).unwrap();
+            assert_eq!(output.array, array(&primal_type, &[1.0, 2.0]));
+            assert_eq!(
+                pullback.apply_materialized(seed(true)).map(|gradient| gradient.array),
+                Ok(array(&seed_type, &[5.0, 6.0])),
+            );
+            assert_eq!(
+                pullback.apply_materialized(seed(false)).map(|gradient| gradient.array),
+                Err(ProgramError::MalformedProgram(format!(
+                    "pullback cotangent 0 has type {seed_type} but its primal boundary requires cotangent type \
+                     {primal_type}",
+                ))),
+            );
         }
     }
 

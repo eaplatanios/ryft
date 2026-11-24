@@ -149,6 +149,14 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         None
     }
 
+    /// Returns whether this value can be admitted at a boundary with `declared_type` by allowing it to relocate.
+    /// This holds when the value has a [`relocatable_type`](Self::relocatable_type) that `declared_type`
+    /// [refines](Type::is_refined_by).
+    #[inline]
+    fn is_relocatable_to(&self, r#type: &Self::Type) -> bool {
+        self.relocatable_type().is_some_and(|declaration| declaration.is_refined_by(r#type))
+    }
+
     /// Returns an equivalent value whose type-identity metadata has been simultaneously renamed according to
     /// `renaming`. [`Value`] represents every kind of leaf that can participate in a [`Program`](crate::Program), not
     /// only concrete runtime payloads. Some values, such as metadata-only values and captured-value references, store
