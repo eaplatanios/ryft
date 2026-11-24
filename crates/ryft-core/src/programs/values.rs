@@ -136,6 +136,19 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// Returns the [`Domain`](Self::Domain) in which operations involving this [`Value`] bind and execute.
     fn domain(&self) -> Self::Domain;
 
+    /// Returns the type under which this value enters a transform, or [`None`] when it enters with its own type.
+    /// A value that is free to be placed elsewhere (e.g., an uncommitted array, which a call moves onto the devices
+    /// where it runs) declares no placement that it only happens to have, so this type is one that its own type refines
+    /// (refer to [`Type::is_refined_by`]) and that omits that placement. An eager linearization (e.g., of an eager
+    /// Vector-Jacobian Product) declares each known input that it creates from a concrete value with this type and
+    /// derives the tangent and cotangent types of that input from it, so the derivatives of the value are not pinned
+    /// to its placement either, and a pullback compares a seed by this type (i.e., accepts a seed whose declaration
+    /// the cotangent type refines). The default returns [`None`].
+    #[inline]
+    fn relocatable_type(&self) -> Option<Self::Type> {
+        None
+    }
+
     /// Returns an equivalent value whose type-identity metadata has been simultaneously renamed according to
     /// `renaming`. [`Value`] represents every kind of leaf that can participate in a [`Program`](crate::Program), not
     /// only concrete runtime payloads. Some values, such as metadata-only values and captured-value references, store
@@ -607,6 +620,7 @@ mod tests {
             TestValue { r#type: ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])) };
         assert_eq!(value.validate_as_constant(), Ok(()));
         assert!(!value.is_zero());
+        assert_eq!(value.relocatable_type(), None);
         assert_eq!(value.rename_type_identities(&TypeIdentityRenaming::new()), Ok(value.clone()));
 
         let mut renaming = TypeIdentityRenaming::new();

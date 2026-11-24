@@ -553,15 +553,17 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// stays unmapped. Differentiation places the tangent with the same target, source, and copy policy as the primal but
 /// without the layouts of the target and source, which need not be valid for the element type of the tangent, so an
 /// in-place target that names only a layout leaves the tangent where it is without a target. When the operation has no
-/// source, both use the concrete placement of the primal as their source, if it has one, and an in-place source is
-/// completed with that placement (refer to [`PlacementRequest::resolve_source`]) after the request is validated as it
-/// is given, as interpretation and batching also do. Transposition moves the cotangent back to where the input lived
-/// whenever the source says where that is, for every form of the target, and rejects a cotangent that it cannot return
-/// to the mesh of the input (refer to [`PlacementRequest`]), and it always forces a copy, as JAX's `device_put`
-/// transpose does. Like that transpose, which swaps the devices and the sources of `device_put`, it swaps the two ends
-/// of the placement, so that transposing twice moves the value to the forward target again, except that an in-place
-/// target names no devices and so becomes no source. A device source of an input that its type tracks over a mesh of
-/// one device becomes a placement over the logical mesh of the input on that device.
+/// source, the primal uses its concrete placement as its source, if it has one, and an in-place source is completed
+/// with that placement (refer to [`PlacementRequest::resolve_source`]) after the request is validated as it is given,
+/// as interpretation and batching also do. A tangent is free to live elsewhere than its primal, so a concrete tangent
+/// uses its own placement instead, and a staged tangent records that of the primal as an inferred source, which only
+/// transposition reads and which is never validated against the tangent. Transposition moves the cotangent back to
+/// where the input lived whenever the source says where that is, for every form of the target, and rejects a cotangent
+/// that it cannot return to the mesh of the input (refer to [`PlacementRequest`]), and it always forces a copy, as
+/// JAX's `device_put` transpose does. Like that transpose, which swaps the devices and the sources of `device_put`,
+/// it swaps the two ends of the placement, so that transposing twice moves the value to the forward target again,
+/// except that an in-place target names no devices and so becomes no source. A device source of an input that its
+/// type tracks over a mesh of one device becomes a placement over the logical mesh of the input on that device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaceOperation {
     /// Optional source [`PlacementRequest`] where the input is expected to live, which is informative only.
@@ -573,6 +575,13 @@ pub struct PlaceOperation {
     /// Boolean indicating whether the output may share storage with the input. When it is `false`, the output must
     /// have storage of its own.
     may_alias: bool,
+
+    /// Boolean indicating whether `source` was inferred (e.g., by differentiation from where a concrete primal lives),
+    /// rather than being provided by the caller. Such a source is the source of the placement of a tangent, which is
+    /// free to live elsewhere than its primal, so it only tells transposition where to return the cotangent and is
+    /// never validated against the input or recorded by the rules that place a value of their own (i.e., interpretation
+    /// and batching).
+    is_source_inferred: bool,
 }
 
 impl PlaceOperation {
@@ -584,7 +593,7 @@ impl PlaceOperation {
     /// with its input (refer to [`Self::with_may_alias`]).
     #[inline]
     pub fn new(target: impl Into<Option<PlacementRequest>>, source: impl Into<Option<PlacementRequest>>) -> Self {
-        Self { source: source.into(), target: target.into(), may_alias: true }
+        Self { source: source.into(), target: target.into(), may_alias: true, is_source_inferred: false }
     }
 
     /// Returns this [`PlaceOperation`] with its copy policy replaced by `may_alias`. With `true`, which is the default,
@@ -610,6 +619,13 @@ impl PlaceOperation {
     #[inline]
     pub fn source(&self) -> Option<&PlacementRequest> {
         self.source.as_ref()
+    }
+
+    /// Returns the source that the input is validated against, which is the source unless differentiation inferred it
+    /// for a tangent. Refer to [`Self::is_source_inferred`] for more information.
+    #[inline]
+    fn validated_source(&self) -> Option<&PlacementRequest> {
+        self.source.as_ref().filter(|_| !self.is_source_inferred)
     }
 
     /// Returns the [`PlacementRequest`] that the input is moved to, or [`None`] if the input stays where it is.
@@ -968,9 +984,8 @@ impl PlaceOperation {
         input: &ArrayType,
         concrete_sharding: Option<&Sharding>,
     ) -> Result<ArrayType, TypeError> {
-        let output =
-            Self::infer_output_type_allowing_uneven_splits(input, concrete_sharding, self.target(), self.source())?;
-
+        let source = self.validated_source();
+        let output = Self::infer_output_type_allowing_uneven_splits(input, concrete_sharding, self.target(), source)?;
         let extents = Self::validate_even_splits(input, self.target())?;
         if extents.is_empty() {
             return Ok(output);
@@ -990,8 +1005,8 @@ impl PlaceOperation {
         // The layout of the input (i.e., the one that its source asserts, or otherwise the one that its type declares,
         // which a source layout must match) must address the shards of the input at the same extents, so that the
         // input and the target have a common legal shape.
-        if let Some(layout) = self.source().and_then(PlacementRequest::layout).or(input.layout()) {
-            Self::validate_source_shard_layout(&at_extents(input), concrete_sharding, self.source(), layout)?;
+        if let Some(layout) = source.and_then(PlacementRequest::layout).or(input.layout()) {
+            Self::validate_source_shard_layout(&at_extents(input), concrete_sharding, source, layout)?;
         }
 
         if let Some(target) = self.target()
@@ -1320,6 +1335,9 @@ impl Hash for PlaceOperation {
         hash(&self.source, state);
         hash(&self.target, state);
         self.may_alias.hash(state);
+        if self.is_source_inferred {
+            true.hash(state);
+        }
     }
 }
 
@@ -1349,14 +1367,15 @@ impl Operation for PlaceOperation {
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         // An omitted source or target is not rendered, and neither is the default copy policy, so that the rendering
-        // of a placement stays compact. An identity placement therefore renders as its name alone.
+        // of a placement stays compact. An identity placement therefore renders as its name alone. A source that
+        // differentiation inferred for a tangent renders under its own name, because it is not validated.
         let formatter = OperationFormatter::new(formatter, indentation, self.name())?;
         if self.source.is_none() && self.target.is_none() && self.may_alias {
             return Ok(());
         }
         formatter.bracketed(|operation| {
             if let Some(source) = &self.source {
-                operation.field("source", source)?;
+                operation.field(if self.is_source_inferred { "inferred_source" } else { "source" }, source)?;
             }
             if let Some(target) = &self.target {
                 operation.field("target", target)?;
@@ -1382,7 +1401,9 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         // The placement flows through the dispatch primitive of `Place`, which also carries the optional target and the
         // copy policy, so that interpretation over staging values (e.g., program batching, re-tracing, etc.) preserves
-        // them, while concrete values move to the target or stay where they are without one.
+        // them, while concrete values move to the target or stay where they are without one. A source that
+        // differentiation inferred describes the primal of the linearization that recorded it, not the value
+        // placed here (e.g., a tangent that lives elsewhere), so it is dropped like an absent source.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
 
@@ -1393,11 +1414,11 @@ where
                 &input.r#type(),
                 Some(placement.sharding()),
                 self.target(),
-                self.source(),
+                self.validated_source(),
             )?;
         }
 
-        let source = PlacementRequest::resolve_source(self.source.clone(), placement);
+        let source = PlacementRequest::resolve_source(self.validated_source().cloned(), placement);
         Ok(vec![<C::Value as Value>::Dispatch::place(input, self.target.as_ref(), source, self.may_alias)?])
     }
 }
@@ -1468,7 +1489,7 @@ where
         )?;
 
         let mut target = self.target.clone();
-        let mut source = self.source.clone();
+        let mut source = self.validated_source().cloned();
         let pop_batch_sharding = |end: &mut Option<PlacementRequest>| match end {
             Some(PlacementRequest::Resolved(placement)) => placement.pop_batch_sharding(),
             Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => None,
@@ -1553,18 +1574,25 @@ impl_differentiable_operation! {
         C::Value: Placed + Value<Dispatch: PlaceDispatch<ArrayType, C::Value>>,
         C::Operation: From<PlaceOperation>,
     {
-        |operation, _context, _driver, inputs| {
-            // A placement is linear, so the tangent is placed on the same devices, with the same sharding, in the same
-            // memory, and with the same copy policy as the primal, and symbolic zero tangents stay symbolic without
-            // allocation. The tangent can have another element type than the primal (e.g., an `f8e8m0fnu` primal has
-            // an `f32` tangent), for which the layouts of the target and source can be invalid, so it is placed without
-            // them. Derivative types carry no layout either. Without a source, the primal records where it concretely
-            // lives as its source, if anywhere, and so does the tangent, because the tangent is placed by the same
-            // linear map, whose transpose must move the cotangent back to where the primal lived. An in-place target
-            // that names only a layout names nothing without it, so the tangent is placed without a target, which
-            // leaves it where it is, as the primal is, and such an in-place source is replaced like an absent one.
+        |operation, context, _driver, inputs| {
+            // A placement is linear, so the tangent is placed with the same target and copy policy as the primal, and
+            // symbolic zero tangents stay symbolic without allocation. The tangent can have another element type than
+            // the primal (e.g., an `f8e8m0fnu` primal has an `f32` tangent), for which the layouts of the target and
+            // source can be invalid, so it is placed without them. Derivative types carry no layout either. An in-place
+            // target that names only a layout names nothing without it, so the tangent is placed without a target,
+            // which leaves it where it is, as the primal is, and such an in-place source is replaced like an absent
+            // one.
+            //
+            // Without a source, the primal records where it concretely lives as its source, if anywhere. That source
+            // also tells the transpose of the linear map that places the tangent where to move the cotangent back to,
+            // but it does not constrain the tangent, which is free to live elsewhere (e.g., the tangent of an
+            // uncommitted primal on another mesh, which JAX accepts as well). So a concrete tangent is validated
+            // against the source that the caller gave and records where it lives itself, and a staged tangent records
+            // the source of the primal as inferred (refer to `PlaceOperation::is_source_inferred`), which transposition
+            // reads and which nothing validates against the tangent that the linear map is later applied to.
             check_count!("input", inputs, 1, ProgramError);
             let may_alias = operation.may_alias();
+            let given = operation.validated_source();
             let input = inputs[0].primal();
             let placement = input.placement();
             if let Some(placement) = &placement {
@@ -1573,33 +1601,42 @@ impl_differentiable_operation! {
                     &input.r#type(),
                     sharding,
                     operation.target(),
-                    operation.source(),
+                    given,
                 )?;
             }
-            let source = PlacementRequest::resolve_source(operation.source().cloned(), placement);
+            let source = PlacementRequest::resolve_source(given.cloned(), placement);
             let primal = <C::Value as Value>::Dispatch::place(input, operation.target(), source.clone(), may_alias)?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
-                    let names_nothing = |end: &PlacementRequest| {
-                        matches!(end, PlacementRequest::InPlace { memory: None, layout: None })
+                    let without_layout = |end: Option<PlacementRequest>| {
+                        end.map(PlacementRequest::without_layout)
+                            .filter(|end| !matches!(end, PlacementRequest::InPlace { memory: None, layout: None }))
                     };
-                    let target = operation.target().cloned().map(PlacementRequest::without_layout);
-                    let target = target.filter(|target| !names_nothing(target));
-                    let source = source.map(PlacementRequest::without_layout).filter(|source| !names_nothing(source));
-                    let placement = tangent.placement();
-                    if let Some(placement) = &placement {
-                        let r#type = tangent.r#type();
-                        let sharding = Some(placement.sharding());
-                        PlaceOperation::infer_output_type_allowing_uneven_splits(
-                            &r#type,
-                            sharding,
-                            target.as_ref(),
-                            source.as_ref(),
-                        )?;
-                    }
-                    let source = PlacementRequest::resolve_source(source, placement);
-                    MaybeZero::Value(<C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?)
+                    let target = without_layout(operation.target().cloned());
+                    let given = without_layout(given.cloned());
+                    MaybeZero::Value(match (tangent.placement(), without_layout(source)) {
+                        (Some(placement), _) => {
+                            let r#type = tangent.r#type();
+                            let sharding = Some(placement.sharding());
+                            PlaceOperation::infer_output_type_allowing_uneven_splits(
+                                &r#type,
+                                sharding,
+                                target.as_ref(),
+                                given.as_ref(),
+                            )?;
+                            let source = PlacementRequest::resolve_source(given, Some(placement));
+                            <C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?
+                        }
+                        (None, Some(source)) if given.is_none() => {
+                            let operation =
+                                PlaceOperation { source: Some(source), target, may_alias, is_source_inferred: true };
+                            context.tangent().bind(operation, Vec::new(), std::slice::from_ref(tangent))?.remove(0)
+                        }
+                        (None, source) => {
+                            <C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?
+                        }
+                    })
                 }
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -2456,6 +2493,13 @@ mod tests {
 
         fn domain(&self) -> Self::Domain {
             self.context.clone()
+        }
+
+        fn relocatable_type(&self) -> Option<ArrayType> {
+            // An array that lives somewhere but whose type tracks no sharding is free to be placed elsewhere,
+            // like an uncommitted array of a backend, so its tangents and cotangents may live elsewhere too.
+            let r#type = self.array.r#type();
+            (self.placement.is_some() && r#type.sharding().is_none()).then(|| r#type.into_owned())
         }
     }
 
@@ -6865,6 +6909,81 @@ mod tests {
                 ArrayOperation::Place(PlaceOperation::new(None, source)),
             ],
         );
+    }
+
+    #[test]
+    fn test_place_operation_differentiation_inferred_source() {
+        // The primal lives on the devices of `mesh_x` with a type that tracks no sharding, so it is free to be placed
+        // elsewhere, and so is its tangent, which lives on `mesh_y`. A placement without a target and a source records
+        // where the primal lives as the inferred source of the placement of the tangent, which the pushforward does not
+        // validate against the tangent that it is applied to, as JAX accepts it. A source that the caller gives is
+        // validated against that tangent.
+        let primal_placement = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
+        let tangent_placement = placement(&mesh_y(), vec![ShardingDimension::Replicated]);
+        let tangent_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(tangent_placement.sharding().clone())
+            .unwrap();
+        let context = RecordingContext::default();
+        let primal = PlacedArray {
+            array: Array::vector(vec![1.0f32, 2.0]).unwrap(),
+            placement: Some(primal_placement.clone()),
+            context: context.clone(),
+        };
+        let tangent = PlacedArray {
+            array: Array::from_elements(tangent_type.clone(), &[3.0f32, 4.0]).unwrap(),
+            placement: Some(tangent_placement.clone()),
+            context: context.clone(),
+        };
+        let given = Some(PlacementRequest::from(primal_placement.clone()));
+        let pushforward = |source: Option<PlacementRequest>| {
+            let (_, pushforward) = differentiate_at(primal.clone())
+                .linearize(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, source, true))
+                .unwrap();
+            pushforward.apply(tangent.clone())
+        };
+
+        let output = pushforward(None).unwrap();
+        assert_eq!(output.array, Array::from_elements(tangent_type.clone(), &[3.0f32, 4.0]).unwrap());
+        assert_eq!(output.placement, Some(tangent_placement));
+        let inferred = PlaceOperation {
+            source: Some(PlacementRequest::from(primal_placement.clone())),
+            target: None,
+            may_alias: true,
+            is_source_inferred: true,
+        };
+        assert_eq!(
+            context.0.take(),
+            vec![
+                ArrayOperation::Place(PlaceOperation::new(None, primal_placement.clone())),
+                ArrayOperation::Place(inferred),
+            ],
+        );
+        assert_eq!(
+            pushforward(given.clone()).map(|output| output.array),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input type `{tangent_type}`",
+                primal_placement.sharding(),
+            )))),
+        );
+
+        // Both transpositions move the cotangent back to where the primal lives.
+        let transposed = |source: Option<PlacementRequest>| {
+            let (_, pullback) = differentiate_at(primal.clone())
+                .vjp(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, source, true))
+                .unwrap();
+            pullback.into_transposed_parts().unwrap().0.into_program().to_string()
+        };
+        let expected = indoc! {"
+            lambda %0:f32[2] .
+            let %1:f32[2][sharding={mesh<['x'=2:explicit]>, [{}]}] = place [
+                target={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Device},
+                may_alias=false,
+            ] %0
+                %2:f32[2] = broadcast [output_type=f32[2], output_axes=[0]] %1
+            in (%2)"
+        };
+        assert_eq!(transposed(None), expected);
+        assert_eq!(transposed(given), expected);
     }
 
     #[test]
