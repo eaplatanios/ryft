@@ -355,6 +355,28 @@ impl Sharding {
             .collect()
     }
 
+    /// Returns whether this [`Sharding`] describes one logical value per slice. Any unreduced axis retains pending
+    /// reduction state, even if it has size one. A varying manual axis can give a slice multiple values only if it has
+    /// more than one coordinate and does not split a dimension.
+    #[inline]
+    pub fn holds_one_value_per_slice(&self) -> bool {
+        self.unreduced_axes.is_empty()
+            && self
+                .varying_manual_axes
+                .iter()
+                .all(|axis| self.mesh.axis_size(axis).unwrap_or(1) == 1 || self.dimensions_use_axis(axis))
+    }
+
+    /// Returns whether this [`Sharding`] distinguishes shards along the mesh axis named `axis_name`. A dimension split,
+    /// an unreduced axis, or manual variation declares a distinction, including along a size-one axis. An axis marked
+    /// only as reduced holds replicas of the completed contribution with the other coordinates fixed.
+    #[inline]
+    pub fn distinguishes_shards_along(&self, axis_name: &str) -> bool {
+        self.dimensions_use_axis(axis_name)
+            || self.unreduced_axes.contains(axis_name)
+            || self.varying_manual_axes.contains(axis_name)
+    }
+
     /// Returns the partition index for the provided array dimension that is owned by the device at the provided
     /// mesh coordinates. Each dimension of a sharded array is partitioned independently; a device's full shard is the
     /// intersection of its per-dimension partitions. For example, with sharding `[Sharded(["x"]), Sharded(["y"])]` on
@@ -1046,6 +1068,49 @@ mod tests {
             Sharding::along(mesh, "model", Some(0), 1),
             Err(ShardingError::UnknownMeshAxisName { name: "model".to_string() }),
         );
+    }
+
+    #[test]
+    fn test_sharding_holds_one_value_per_slice() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("unit", 1, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("tiles", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        assert!(replicated.holds_one_value_per_slice());
+        assert!(replicated.clone().with_varying_manual_axes(["unit"]).unwrap().holds_one_value_per_slice());
+        assert!(!replicated.clone().with_unreduced_axes(["unit"]).unwrap().holds_one_value_per_slice());
+        assert!(!replicated.with_varying_manual_axes(["tiles"]).unwrap().holds_one_value_per_slice());
+
+        let tiled = Sharding::along(mesh, "tiles", Some(0), 1).unwrap();
+        assert!(tiled.with_varying_manual_axes(["unit", "tiles"]).unwrap().holds_one_value_per_slice());
+    }
+
+    #[test]
+    fn test_sharding_distinguishes_shards_along() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("split", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("pending", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("completed", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("replica", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 1, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::along(mesh, "split", Some(0), 1)
+            .unwrap()
+            .with_unreduced_axes(["pending"])
+            .unwrap()
+            .with_reduced_axes(["completed"])
+            .unwrap()
+            .with_varying_manual_axes(["manual"])
+            .unwrap();
+        assert!(sharding.distinguishes_shards_along("split"));
+        assert!(sharding.distinguishes_shards_along("pending"));
+        assert!(sharding.distinguishes_shards_along("manual"));
+        assert!(!sharding.distinguishes_shards_along("completed"));
+        assert!(!sharding.distinguishes_shards_along("replica"));
+        assert!(!sharding.distinguishes_shards_along("missing"));
     }
 
     #[test]
