@@ -2722,9 +2722,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
 
             // Resharding the source onto both devices (i.e., `reshard_on_devices`) copies the column-major replica of
-            // rank 0 to its own device and sends it to rank 1, which receives it in the default row-major layout. Both
-            // ranks record the layout that the moves of both ranks imply (i.e., none), rather than rank 0 keeping the
-            // declared layout of its copy, so both prepare the result for the compiled function below in the same way.
+            // rank 0 to its own device and sends it to rank 1, which receives it in the default row-major layout. The
+            // result has the declared layout of its input on both ranks, as a placement that changes only the devices
+            // promises, so rank 1 converts the buffer that it received, and both ranks hold column-major buffers and
+            // prepare the result for the compiled function below in the same way.
             let moved = source.clone().reshard_on_devices(&session, &mesh, &replicated, false).unwrap();
             moved.block_until_ready().unwrap();
             let shards = moved
@@ -2777,10 +2778,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         assert_eq!(
             probes,
             indoc! {"
-                rank 0 moved: None [(true, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+                rank 0 moved: Some(Tiled(TiledLayout { minor_to_major: [0, 1], tiles: [] })) [(true, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
                 rank 0 source: public argument #0 is committed to devices [0], but the executable requires [0, 1]
                 rank 0 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]
-                rank 1 moved: None [(false, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+                rank 1 moved: Some(Tiled(TiledLayout { minor_to_major: [0, 1], tiles: [] })) [(true, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
                 rank 1 source: public argument #0 is committed to devices [0], but the executable requires [0, 1]
                 rank 1 doubled moved: [[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]"},
         );
