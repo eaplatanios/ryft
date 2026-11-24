@@ -53,6 +53,7 @@ use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
+use crate::captures::{CapturePlacement, CapturePlacementContext};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
@@ -3128,7 +3129,7 @@ pub trait Scan: Context {
         Carry::ParameterStructure: PartialEq;
 }
 
-impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>> Scan for C
+impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>> + CapturePlacementContext> Scan for C
 where
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
@@ -3157,7 +3158,18 @@ where
         let carry_count = carry_values.len();
         let mut operation_inputs = carry_values.clone();
         operation_inputs.extend(inputs.into_parameters());
-        let mut input_types = operation_inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+
+        // A context whose values follow the computation (refer to `CapturePlacementContext::capture_placement`) moves
+        // an operand that is free to move onto the devices where the operation runs, so the body is traced at the type
+        // that the operand declares without the placement that it only happens to have.
+        let follows_computation = self.capture_placement() == CapturePlacement::FollowCall;
+        let mut input_types = operation_inputs
+            .iter()
+            .map(|value| match follows_computation.then(|| value.relocatable_type()).flatten() {
+                Some(r#type) => r#type,
+                None => value.r#type().into_owned(),
+            })
+            .collect::<Vec<_>>();
         let operation = options.operation(carry_count, &input_types[carry_count..])?;
         if let ScanIterationCount::Value(value) = options.iteration_count {
             input_types.push(value.r#type().into_owned());
@@ -25224,7 +25236,9 @@ mod tests {
             }
         }
 
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        impl CapturePlacementContext for RecordingContext {}
+
+        let mesh =LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type =
             ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let varying_type = ArrayType::scalar(DataType::F32)

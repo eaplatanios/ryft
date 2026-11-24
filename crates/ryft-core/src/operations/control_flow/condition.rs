@@ -42,6 +42,7 @@ use crate::batching::{
     BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
 };
+use crate::captures::{CapturePlacement, CapturePlacementContext};
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
@@ -1694,8 +1695,10 @@ pub trait Condition<T = <Self as Capability>::Universe>: Capability + Value<Doma
 
 impl<
     T,
-    V: Value<Type: ConditionType, Domain: Context<Operation: From<ConditionOperation<V::Type>>>>
-        + Capability<Universe = T>
+    V: Value<
+            Type: ConditionType,
+            Domain: Context<Operation: From<ConditionOperation<V::Type>>> + CapturePlacementContext,
+        > + Capability<Universe = T>
         + ManualVariationAlignment,
 > Condition<T> for V
 where
@@ -1731,7 +1734,18 @@ where
             Some(sharding) => Self::align_manual_variation_to(&inputs, sharding)?,
             None => inputs.clone(),
         };
-        let input_types = aligned_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+
+        // A context whose values follow the computation (refer to `CapturePlacementContext::capture_placement`) moves
+        // an input that is free to move onto the devices where the condition runs, so the branches are traced at the
+        // type that the input declares without the placement that it only happens to have.
+        let follows_computation = context.capture_placement() == CapturePlacement::FollowCall;
+        let input_types = aligned_inputs
+            .iter()
+            .map(|input| match follows_computation.then(|| input.relocatable_type()).flatten() {
+                Some(r#type) => r#type,
+                None => input.r#type().into_owned(),
+            })
+            .collect::<Vec<_>>();
 
         // Align branch outputs before they leave the nested trace: even an invariant branch result may be selected
         // differently across devices. Preserve the output structure and static fields around its aligned leaves.

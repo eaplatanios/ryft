@@ -50,7 +50,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
-use crate::captures::CaptureReference;
+use crate::captures::{CapturePlacement, CapturePlacementContext, CaptureReference};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
@@ -1982,7 +1982,7 @@ pub trait While: Context {
     ) -> Result<State, ProgramError>;
 }
 
-impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> While for C
+impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>> + CapturePlacementContext> While for C
 where
     Tracer<NestedTracingContext<C>>: ManualVariationAlignment,
 {
@@ -2010,7 +2010,18 @@ where
         let state_structure = state.parameter_structure();
         let state_values = state.into_parameters().collect::<Vec<_>>();
         let state_count = state_values.len();
-        let initial_state_types = state_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+
+        // A context whose values follow the computation (refer to `CapturePlacementContext::capture_placement`) moves
+        // a state element that is free to move onto the devices where the loop runs, so both functions are traced at
+        // the type that the element declares without the placement that it only happens to have.
+        let follows_computation = self.capture_placement() == CapturePlacement::FollowCall;
+        let initial_state_types = state_values
+            .iter()
+            .map(|value| match follows_computation.then(|| value.relocatable_type()).flatten() {
+                Some(r#type) => r#type,
+                None => value.r#type().into_owned(),
+            })
+            .collect::<Vec<_>>();
 
         // Trace both functions over the current state types until those types reach a fixed point of their manual
         // variation and of their joins with the returned types. Both are traced on every pass so that their input
@@ -16929,6 +16940,8 @@ mod tests {
                 self.named_axis("m").and_then(|axis| axis.mesh().cloned())
             }
         }
+
+        impl CapturePlacementContext for RecordingContext {}
 
         // The varying counter makes the predicate vary, so the invariant value is widened once, before the loop,
         // through the explicit context rather than through the domain of the values.

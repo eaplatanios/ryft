@@ -2000,7 +2000,8 @@ impl<
         // the transposed program can be inspected. If preparation fails, report the first deferred seed's error
         // when one precedes that failure, as if the seed had been rejected immediately.
         let mut deferred_seeds = Vec::new();
-        // TODO(eaplatanios): Why the closure here?
+
+        // Use a closure to catch preparation errors here so an earlier deferred seed error can take precedence.
         let prepared = (|| {
             // Validate the seeds against the complete primal output boundary, including leaves whose differential
             // spaces contain only zero. Each public output leaf has a seed. The linear program's outputs are the leaves
