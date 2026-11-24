@@ -51,12 +51,21 @@
 //! narrower formats, and the data type itself otherwise), so a readback and a placement of the same array agree there,
 //! while a compiled `reduce` of the same values, which accumulates every format narrower than `f32` in `f32`, can
 //! differ for `f16` and the narrower formats. A compiled program that completes the same reduction (e.g., a sum of an
-//! unreduced argument) computes what the device placement computes. (iv) A pending maximum or minimum of floating point
-//! values that a compiled program completes (e.g., an argument whose input sharding states one over auto mesh axes)
-//! follows the treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN values),
-//! because no compiled program has an exact alternative, whereas a device placement takes a host round trip for it.
-//! Every other change gives this meaning bit for bit, where all NaN encodings of a format count as one value, because
-//! the arithmetic of [`ryft_core::Array`] does not keep NaN payloads in narrow formats either. That includes every
+//! unreduced argument) computes what the device placement computes. A device placement that completes a pending sum
+//! along some of its axes and keeps it along the others (a partial completion) fixes the association of the sum: the
+//! contributions along the completed axes are summed first, into partial sums in the data type, and a readback of the
+//! result then sums those partial sums in ascending order of their coordinates along the kept axes (e.g., the `f32`
+//! contributions `2^24`, `1`, `-2^24`, and `1` at the coordinates `(0, 0)`, `(0, 1)`, `(1, 0)`, and `(1, 1)` read back
+//! as `1`, and as `2` after completing the first axis). That is an order of accumulation that this clause allows only
+//! for the data types that accumulate their sums in themselves, so a device placement declines a partial completion of
+//! `bf16` values and of the narrower formats, whose partial sums would round to the data type (and can overflow), and
+//! takes a host round trip for it where one process can read the value back, which gives this meaning bit for bit, or
+//! returns the same error on every process otherwise. (iv) A pending maximum or minimum of floating point values that a
+//! compiled program completes (e.g., an argument whose input sharding states one over auto mesh axes) follows the
+//! treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN values), because no
+//! compiled program has an exact alternative, whereas a device placement takes a host round trip for it. Every other
+//! change gives this meaning bit for bit, where all NaN encodings of a format count as one value, because the
+//! arithmetic of [`ryft_core::Array`] does not keep NaN payloads in narrow formats either. That includes every
 //! introduction of a pending sum by a device placement, which writes the identities of this module.
 //!
 //! # Completion
@@ -96,7 +105,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ryft_core::{
     Add, Array as CoreArray, ArrayAddressing, ArrayType, ConvertElementType, DataType, DeviceMesh, Max, Min, Or,
-    ProgramError, Sharding, Typed, UnreducedKind,
+    ProgramError, Sharding, ShardingDimension, Typed, UnreducedKind,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
@@ -135,9 +144,11 @@ impl Array {
     /// [`crate::arrays::resharding`]).
     ///
     /// When the destination mesh spans several processes, each process uploads only the shards of its own devices,
-    /// so every process must call this function with the same host value. Nothing compares the values across processes,
-    /// so differing values leave the shards and the replicas of the array inconsistent. Use [`Self::from_host_shards`]
-    /// for values that are meant to differ between processes.
+    /// so every process must call this function with the same host value, which is a precondition of every whole-host
+    /// upload (e.g., also of a host value that [`Session::place`] uploads). Nothing compares the values across
+    /// processes, so differing values leave the shards and the replicas of the array inconsistent. Use
+    /// [`Self::from_host_shards`] for values that are meant to differ between processes (e.g., process-local
+    /// data, or values that vary along a manual mesh axis), which takes the bytes of each local shard.
     ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`.
     /// [`Memory::Device`](ryft_core::Memory::Device) uses the device's default memory. Host placements select
@@ -180,6 +191,7 @@ impl Array {
     /// sharding sums along unreduced axes a data type without an additive identity and some device would have to hold
     /// that identity, and [`ArrayError::DeviceProcessIndexMismatch`] if the PJRT client reports another process for a
     /// device than the one that the mesh assigns to it.
+    #[inline]
     pub fn from_host_buffer<M: Into<Option<DeviceMesh>>, B: AsRef<[u8]>>(
         session: &Session,
         r#type: ArrayType,
@@ -187,11 +199,24 @@ impl Array {
         sharding: Option<Sharding>,
         buffer: B,
     ) -> Result<Self, Error> {
-        let (mesh, buffer) = (mesh.into(), buffer.as_ref());
+        let addressable_devices = session.client().addressable_devices()?;
+        Self::from_host_buffer_on(session, r#type, mesh.into(), sharding, buffer.as_ref(), addressable_devices)
+    }
 
+    /// Implements [`Self::from_host_buffer`] given the addressable devices of the client of `session`, which a caller
+    /// that has already enumerated them (e.g., to choose a default device) passes along, so that an upload enumerates
+    /// the devices of its client once.
+    pub(super) fn from_host_buffer_on(
+        session: &Session,
+        r#type: ArrayType,
+        mesh: Option<DeviceMesh>,
+        sharding: Option<Sharding>,
+        buffer: &[u8],
+        addressable_devices: Vec<PjrtDevice<'static>>,
+    ) -> Result<Self, Error> {
         // Without a mesh of the caller or of `session`, this process chooses the devices on its own.
         let committed = mesh.is_some() || session.commits_placement(&[], &[]);
-        let uploads = HostBufferUploads::new(session, r#type, mesh, sharding, Some(buffer.len()))?;
+        let uploads = HostBufferUploads::new(session, r#type, mesh, sharding, Some(buffer.len()), addressable_devices)?;
         let HostBufferUploads { r#type, sharding, mesh, device_layout, shards, .. } = uploads;
         validate_host_element_encodings(r#type.data_type(), buffer)?;
         if r#type.data_type().is_zero() {
@@ -297,7 +322,8 @@ impl Array {
         R: 'static + Send + FnOnce() -> Result<Vec<u8>, Error>,
         P: 'static + Send + FnOnce(Error) -> PjrtError,
     {
-        let uploads = HostBufferUploads::new(session, r#type, Some(mesh), Some(sharding), None)?;
+        let addressable_devices = session.client().addressable_devices()?;
+        let uploads = HostBufferUploads::new(session, r#type, Some(mesh), Some(sharding), None, addressable_devices)?;
         if uploads.r#type.data_type().is_zero() {
             return Ok(None);
         }
@@ -392,12 +418,15 @@ impl Array {
     /// describes the global array. Every process supplies bytes only for its own devices and uses the same global
     /// type, mesh, and placement. Each replica needs its own entry, and along unreduced axes the bytes represent
     /// the partial value of that device. The replicas of one contribution (i.e., the devices that hold the same slice
-    /// and, along unreduced axes, the same coordinates) must receive equal bytes, on this process and across processes,
-    /// as for [`Self::from_addressable_buffers`]. Nothing compares them, and a readback reads only one of them, so
-    /// differing bytes make the value that the array reads back depend on which replica a readback or a later
-    /// placement selects. Shards of [`DataType::Zero`] take empty buffers and require no upload. The bytes of every
-    /// shard must encode valid elements of the data type, as for [`Self::from_host_buffer`], and are validated before
-    /// anything is uploaded.
+    /// and the same coordinates along unreduced axes and along varying manual axes, refer to `ShardContribution`)
+    /// must receive equal bytes, on this process and across processes, as for [`Self::from_addressable_buffers`]. The
+    /// devices at different coordinates along a varying manual axis may receive different bytes for one slice, which
+    /// every placement keeps apart (e.g., a placement that serves a missing replica reads only a replica of the same
+    /// contribution), while a readback rejects such variation within a tile. Nothing compares the replicas of one
+    /// contribution, and a readback reads only one of them, so differing bytes make the value that the array reads back
+    /// depend on which replica a readback or a later placement selects. Shards of [`DataType::Zero`] take empty buffers
+    /// and require no upload. The bytes of every shard must encode valid elements of the data type, as for
+    /// [`Self::from_host_buffer`], and are validated before anything is uploaded.
     ///
     /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and replicates the
     /// array across `mesh` otherwise. A supplied sharding can place the array over auto mesh axes. After
@@ -768,7 +797,7 @@ impl Array {
         if self.data_type().is_zero() || global_shape.as_slice().contains(&0) {
             return Ok(());
         }
-        self.readback_shards(self.unreduced_axis_indices().as_slice())?;
+        self.readback_shards()?;
         Ok(())
     }
 
@@ -814,7 +843,7 @@ impl Array {
     /// occupies one contiguous byte range of the dense representation (e.g., when only the leading dimension is
     /// sharded, or for a replicated array). Otherwise, it assembles their copies on the host.
     fn host_readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<(Vec<&ArrayShard>, bool), Error> {
-        let shards = self.readback_shards(unreduced_axis_indices)?;
+        let shards = self.readback_shards()?;
         let global_shape = self.shape();
 
         // A tile occupies one contiguous span if every dimension after the first non-unit slice is whole.
@@ -832,66 +861,35 @@ impl Array {
     }
 
     /// Selects one local replica of each distinct contribution to the value of this array, which is what
-    /// [`Self::copy_to_host_bytes`] reads, given the indices of the unreduced axes of the sharding within its mesh.
-    /// A contribution is identified by the tile of a shard and its coordinates along the unreduced axes (refer to
-    /// [`Self::unreduced_coordinates`]), and its selected replica is the first addressable one in shard order, so the
-    /// selection is deterministic. The other replicas are not read, as in JAX. The tiles of a sharding are either
-    /// disjoint or identical, so the selection holds the whole value exactly when the current process can assemble
-    /// it (e.g., for a replicated array, or for an unreduced array whose summands each have a local replica). A tile
-    /// without elements (e.g., the last tile of an uneven split) contributes nothing, so it needs no local replica and
-    /// is never selected, even when this process holds one. The readback and its fence therefore never wait for the
-    /// buffer of such a tile, which the separate execution fence of the producer still covers. Returns
-    /// [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution has no local replica.
+    /// [`Self::copy_to_host_bytes`] reads. A contribution is the one of [`Self::shard_contribution`] (i.e., the tile
+    /// of a shard and its coordinates along unreduced and varying manual axes), and its selected replica is the first
+    /// addressable one in shard order, so the selection is deterministic. The other replicas are not read. The tiles
+    /// of a sharding are either disjoint or identical, so the selection holds the whole value exactly when the current
+    /// process can assemble it (e.g., for a replicated array, or for an unreduced array whose summands each have a
+    /// local replica). A tile without elements (e.g., the last tile of an uneven split) contributes nothing, so it
+    /// needs no local replica and is never selected, even when this process holds one. The readback and its fence
+    /// therefore never wait for the buffer of such a tile, which the separate execution fence of the producer still
+    /// covers. Returns [`ArrayError::MissingShardBuffer`] for the first shard with elements whose contribution has
+    /// no local replica.
     ///
     /// Devices whose coordinates differ along a varying manual mesh axis (refer to [`Sharding::varying_manual_axes`])
-    /// can hold different values for one contribution, which one host value cannot represent. The selection rejects
-    /// such an array with [`ProgramError::InvalidArgument`] when two shards with elements share a contribution but
-    /// not their coordinates along those axes, which is the case for a varying axis that does not split the array.
-    /// The check reads only the metadata of every shard, so it rejects the same arrays in every process.
-    fn readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<Vec<&ArrayShard>, Error> {
+    /// can hold different values of one tile, which one host value cannot represent. The selection rejects such an
+    /// array with [`ProgramError::InvalidArgument`] when two shards with elements hold different contributions (refer
+    /// to [`ShardContribution`]) that differ only in their coordinates along those axes (i.e., variation within a
+    /// tile), which is the case for a varying axis that does not split the array, and accepts variation between tiles.
+    /// The check reads only the metadata of every shard, so it rejects the same arrays in every process (refer to
+    /// [`Self::validate_one_value_per_contribution`]).
+    fn readback_shards(&self) -> Result<Vec<&ArrayShard>, Error> {
+        self.validate_one_value_per_contribution()?;
         let all_shards = self.shards();
-        let contribution =
-            |shard: &ArrayShard| (shard.slice().to_vec(), self.unreduced_coordinates(shard, unreduced_axis_indices));
+        let contribution = |shard: &ArrayShard| self.shard_contribution(shard.descriptor());
         let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
-
-        let varying_manual_axes = self.sharding().varying_manual_axes();
-        if !varying_manual_axes.is_empty() {
-            let varying_axis_indices = self
-                .mesh()
-                .logical_mesh()
-                .axes()
-                .iter()
-                .enumerate()
-                .filter(|(_, axis)| varying_manual_axes.contains(axis.name()))
-                .map(|(axis_index, _)| axis_index)
-                .collect::<Vec<_>>();
-            let mut first_shards = HashMap::new();
-            for shard in all_shards.iter().filter(required) {
-                let coordinates = self.unreduced_coordinates(shard, varying_axis_indices.as_slice());
-                let (first_index, first_coordinates) =
-                    first_shards.entry(contribution(shard)).or_insert((shard.index(), coordinates.clone()));
-                if *first_coordinates != coordinates {
-                    let axes = varying_manual_axes.iter().map(|axis| format!("`{axis}`")).collect::<Vec<_>>();
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "cannot read back an array that varies along the manual mesh axes {} as one host value, \
-                             because shards #{first_index} and #{} can hold different values of the same slice",
-                            axes.join(", "),
-                            shard.index(),
-                        ),
-                    }
-                    .into());
-                }
-            }
-        }
-
         let mut covered = HashSet::new();
         let selected = all_shards
             .iter()
             .filter(required)
             .filter(|shard| shard.buffer().is_some() && covered.insert(contribution(shard)))
             .collect::<Vec<_>>();
-
         let missing = all_shards.iter().filter(required).find(|shard| !covered.contains(&contribution(shard)));
         if let Some(missing) = missing {
             return Err(Error::from(ArrayError::MissingShardBuffer {
@@ -899,8 +897,43 @@ impl Array {
                 device_id: missing.device().id(),
             }));
         }
-
         Ok(selected)
+    }
+
+    /// Checks that a readback of this array can produce one host value, as far as the metadata of its shards tells,
+    /// which every process shares: devices whose coordinates differ along a varying manual mesh axis within one tile
+    /// can hold different values of it (refer to [`Self::readback_shards`]), which are rejected with
+    /// [`ProgramError::InvalidArgument`]. The host round trip of a placement reads this check to name its owner (refer
+    /// to `Array::host_round_trip` in [`crate::arrays::resharding`]), so that no process plans a round trip that its
+    /// readback would reject.
+    pub(super) fn validate_one_value_per_contribution(&self) -> Result<(), Error> {
+        let all_shards = self.shards();
+        let contribution = |shard: &ArrayShard| self.shard_contribution(shard.descriptor());
+        let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
+        let varying_manual_axes = self.sharding().varying_manual_axes();
+        if !varying_manual_axes.is_empty() {
+            let mut first_shards = HashMap::new();
+            for shard in all_shards.iter().filter(required) {
+                let ShardContribution { slice, unreduced_ordinal, varying_manual_coordinates: coordinates } =
+                    contribution(shard);
+                let (first_index, first_coordinates) =
+                    first_shards.entry((slice, unreduced_ordinal)).or_insert((shard.index(), coordinates.clone()));
+                if *first_coordinates != coordinates {
+                    let axes = varying_manual_axes.iter().map(|axis| format!("`{axis}`")).collect::<Vec<_>>();
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "cannot read back an array that varies along the manual mesh axes {} as one host value, \
+                             because shards #{} and #{} can hold different values of the same slice",
+                            axes.join(", "),
+                            first_index,
+                            shard.index(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the indices of the unreduced axes of the sharding of this array within its mesh, in mesh order.
@@ -916,14 +949,141 @@ impl Array {
     }
 
     /// Returns the coordinates of the device of `shard` along the mesh axes at `axis_indices` (e.g., the unreduced
-    /// axes of [`Self::unreduced_axis_indices`]). Shards with the same tile and the same coordinates along unreduced
-    /// axes hold replicas of one contribution to the value (e.g., one summand), which a readback needs only once.
+    /// axes of [`Self::unreduced_axis_indices`]), which order the contributions of one tile along unreduced axes.
+    /// Which shards hold replicas of one contribution is [`Self::shard_contribution`].
     fn unreduced_coordinates(&self, shard: &ArrayShard, axis_indices: &[usize]) -> Vec<usize> {
         match self.mesh().device_coordinates(shard.index()) {
             Some(coordinates) => axis_indices.iter().map(|&axis| coordinates[axis]).collect(),
             None => Vec::new(),
         }
     }
+
+    /// Returns the contribution that `shard`, a shard of this array, holds, which another shard of this array holds as
+    /// well exactly when the two hold the same bytes (refer to [`ShardContribution`]).
+    pub(super) fn shard_contribution(&self, shard: &ShardDescriptor) -> ShardContribution {
+        ShardContribution::new(self.mesh(), self.sharding(), shard)
+    }
+}
+
+/// What one shard of an array holds, which two shards of one array share exactly when their devices hold the same
+/// bytes. This is the one definition of the replicas of a contribution, which every function that substitutes one
+/// shard of an array for another or decides that an array holds the same bytes along a mesh axis reads: the host
+/// readback, which reads one replica of each contribution (refer to [`Array::copy_to_host_bytes`]), the placements
+/// of [`crate::arrays::resharding`] that serve a missing buffer from another local replica, that plan moves of whole
+/// shards or of shard regions from any replica of a slice (refer to [`holds_one_value_per_slice`]) or that move
+/// each contribution of a pending reduction to the destination shard with the same contribution, that restrict
+/// a value to the devices at coordinate zero along the axes of an introduced sum (refer to
+/// [`distinguishes_shards_along`]), or that choose the process of a host round trip, and the partial imports (i.e.,
+/// [`Array::from_addressable_buffers`] and [`Array::from_host_shards`]), whose replicas of one contribution must hold
+/// equal bytes. A sharding makes the shards of one array differ in exactly these ways:
+///
+///   - **Slice:** A dimension that is split along some mesh axes gives the devices at different coordinates along those
+///     axes different slices.
+///   - **Pending Reduction:** The devices at different coordinates along an unreduced axis hold different contributions
+///     to the pending reduction of one slice, such as different summands.
+///   - **Manual Variation:** The devices at different coordinates along a varying manual axis (refer to
+///     [`Sharding::varying_manual_axes`]) can hold different values of one slice. Along a varying axis that also splits
+///     a dimension, the slices already tell those devices apart, so the variation is only between tiles, while along
+///     any other varying axis it is within a tile.
+///
+/// Nothing else that a sharding records makes the shards differ: the devices along a reduced axis all hold the result
+/// of the completed reduction, the devices along an axis that neither splits a dimension nor carries reduction state or
+/// variation hold replicas, an unconstrained dimension is stored replicated, and the memory, the layout, and the data
+/// type are those of the whole array.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ShardContribution {
+    /// Slice of the shard in global array coordinates.
+    slice: Vec<Range<usize>>,
+
+    /// Ordinal of the contribution of the shard to the pending reduction of its slice, which is the row-major index of
+    /// the coordinates of its device along the unreduced axes of the sharding in mesh order (i.e., a mixed-radix number
+    /// whose digits are those coordinates), and zero without unreduced axes. The host readback combines the
+    /// contributions of one tile in ascending lexicographic order of those coordinates, which is the order of these
+    /// ordinals, so two placements with the same unreduced kind and the same number of contributions correspond by
+    /// ordinal, whatever the names, sizes, and order of their unreduced axes.
+    unreduced_ordinal: usize,
+
+    /// Coordinates of the device of the shard along the varying manual axes of the sharding, in mesh order unless
+    /// [`ShardContribution::ordered`] supplies other axes or another order.
+    varying_manual_coordinates: Vec<usize>,
+}
+
+impl ShardContribution {
+    /// Returns the contribution that `shard`, a shard of a placement on `mesh` with `sharding`, holds.
+    pub(super) fn new(mesh: &DeviceMesh, sharding: &Sharding, shard: &ShardDescriptor) -> Self {
+        let axes = mesh.logical_mesh().axes();
+        let along = |selected: &BTreeSet<String>| {
+            axes.iter().map(|axis| axis.name()).filter(|name| selected.contains(*name)).collect::<Vec<_>>()
+        };
+        Self::ordered(mesh, sharding, shard, &along(sharding.varying_manual_axes()))
+    }
+
+    /// Returns the contribution that `shard`, a shard of a placement on `mesh` with `sharding`, holds, with its
+    /// coordinates along the mesh axes named `varying_manual_axes` in the order of that list rather than in mesh order.
+    /// This lets the contributions of placements on two meshes whose varying manual axes correspond in another order
+    /// be compared.
+    pub(super) fn ordered<S: AsRef<str>>(
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        shard: &ShardDescriptor,
+        varying_manual_axes: &[S],
+    ) -> Self {
+        let coordinates = mesh.device_coordinates(shard.index()).unwrap_or_default();
+        let axes = mesh.logical_mesh().axes();
+        let unreduced_ordinal = axes
+            .iter()
+            .zip(&coordinates)
+            .filter(|(axis, _)| sharding.unreduced_axes().contains(axis.name()))
+            .fold(0, |ordinal, (axis, coordinate)| ordinal * axis.size() + coordinate);
+        let varying_manual_coordinates = varying_manual_axes
+            .iter()
+            .filter_map(|name| axes.iter().position(|axis| axis.name() == name.as_ref()))
+            .filter_map(|index| coordinates.get(index).copied())
+            .collect();
+        Self { slice: shard.slice().to_vec(), unreduced_ordinal, varying_manual_coordinates }
+    }
+
+    /// Returns which array of the sequence of arrays that the contributions of a placement form the shard belongs to
+    /// (i.e., its unreduced ordinal and its coordinates along the varying manual axes), which the shards with other
+    /// slices of the same array share.
+    pub(super) fn member(&self) -> (usize, &[usize]) {
+        (self.unreduced_ordinal, self.varying_manual_coordinates.as_slice())
+    }
+}
+
+// TODO(eaplatanios): Should this be a function on `Sharding`?
+/// Returns whether every array placed with `sharding` holds one value per slice, which is the value of that slice
+/// (i.e., whether its shards with the same slice hold the same contribution, refer to [`ShardContribution`], and it has
+/// no pending reduction, whose contributions are not the value). That is the case when it has no unreduced axes and
+/// every varying manual axis of size greater than one splits a dimension, so that its variation is only between tiles.
+/// The placements that move whole shards or regions of shards from any replica of a slice (refer to
+/// [`crate::arrays::resharding`]) require it of both ends. The rule reads only the sharding, so every process decides
+/// alike.
+pub(super) fn holds_one_value_per_slice(sharding: &Sharding) -> bool {
+    let size =
+        |name: &str| sharding.mesh().axes().iter().find(|axis| axis.name() == name).map_or(1, |axis| axis.size());
+    sharding.unreduced_axes().is_empty()
+        && sharding.varying_manual_axes().iter().all(|axis| size(axis) == 1 || splits_along(sharding, axis))
+}
+
+// TODO(eaplatanios): Should this be a function on `Sharding`?
+/// Returns whether the devices at different coordinates along the mesh axis named `axis` can hold different
+/// contributions of an array placed with `sharding` (refer to [`ShardContribution`]), which is the case when a
+/// dimension is split along it, or when it is an unreduced axis or a varying manual axis of the sharding. Otherwise,
+/// the array is replicated along it, so the devices at any one coordinate along it hold its whole value.
+pub(super) fn distinguishes_shards_along(sharding: &Sharding, axis: &str) -> bool {
+    splits_along(sharding, axis)
+        || sharding.unreduced_axes().contains(axis)
+        || sharding.varying_manual_axes().contains(axis)
+}
+
+// TODO(eaplatanios): Should this be a function on `Sharding`?
+/// Returns whether `sharding` splits a dimension along the mesh axis named `axis`.
+fn splits_along(sharding: &Sharding, axis: &str) -> bool {
+    sharding.dimensions().iter().any(|dimension| match dimension {
+        ShardingDimension::Sharded(axes) => axes.iter().any(|name| name == axis),
+        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+    })
 }
 
 /// Uploads of a dense row-major host buffer to the addressable shards of an [`Array`]. [`Array::from_host_buffer`]
@@ -951,13 +1111,15 @@ struct HostBufferUploads {
 impl HostBufferUploads {
     /// Resolves the placement of a dense row-major host buffer and derives the bytes that each addressable shard
     /// receives. Refer to [`Array::from_host_buffer`] for the meaning of the parameters. `byte_count` is the size
-    /// of the host buffer, which is validated against the type when it is already known.
+    /// of the host buffer, which is validated against the type when it is already known. `addressable_devices` are
+    /// the addressable devices of the client of `session`.
     fn new(
         session: &Session,
         r#type: ArrayType,
         mesh: Option<DeviceMesh>,
         sharding: Option<Sharding>,
         byte_count: Option<usize>,
+        addressable_devices: Vec<PjrtDevice<'static>>,
     ) -> Result<Self, Error> {
         let logical_mesh = sharding.as_ref().or(r#type.sharding()).map(Sharding::mesh);
         let mesh = match mesh {
@@ -986,7 +1148,6 @@ impl HostBufferUploads {
         // the devices of its client once.
         let client = session.client();
         let client_process_index = client.process_index()?;
-        let addressable_devices = client.addressable_devices()?;
         let mut addressable_device_by_id = HashMap::with_capacity(addressable_devices.len());
         for device in addressable_devices {
             addressable_device_by_id.insert(device.id()?, device);
@@ -1168,7 +1329,7 @@ struct HostShardUpload {
 /// accumulation). [`DataType::F8E8M0FNU`], whose sums the collective does not compute as the format does (its values
 /// are below the range of [`DataType::F16`]), keeps its own arithmetic. Every other data type and kind, including
 /// [`DataType::F16`], [`DataType::F32`], [`DataType::F64`], and the complex types, combines in its own type.
-fn unreduced_accumulation_type(kind: UnreducedKind, data_type: DataType) -> DataType {
+pub(super) fn unreduced_accumulation_type(kind: UnreducedKind, data_type: DataType) -> DataType {
     match (kind, data_type) {
         (UnreducedKind::Sum, DataType::BF16) => DataType::F32,
         (
@@ -1359,6 +1520,47 @@ pub(crate) fn compiled_reduction_rejection(data_type: DataType, change: Reductio
         CollectiveReduction::Exact | CollectiveReduction::DropsNan => None,
         classification => classification.reason(),
     }
+}
+
+/// Returns why completing a pending reduction of `kind` to a value of `data_type` along the mesh axes `completed`
+/// while keeping it along the mesh axes `pending` (each given with its size) does not give the value that the
+/// reduction means, or [`None`] when it does. This is the one owner of the rule for the whole transition, which
+/// [`collective_reduction`] cannot state because it classifies each completed axis in isolation. Such a partial
+/// completion leaves partial results in `data_type`, which the remaining reduction combines again. Where the reduction
+/// accumulates in a wider type (refer to [`unreduced_accumulation_type`]), rounding those partial sums changes the
+/// value and can overflow (e.g., the `f8e4m3fn` contributions `448`, `448`, `-448`, and `-448` sum to zero, while their
+/// partial sums `896` and `-896` are NaN in `f8e4m3fn`), so the transition is rejected whenever an axis of size greater
+/// than one is completed and another stays pending. Every other data type and kind accumulates in itself, where a
+/// partial completion only fixes the order of accumulation, which the contract of floating point sums allows. An axis
+/// of size one holds a single contribution and changes nothing. The rule reads only shared metadata, so every process
+/// decides alike. Its readers are the device placements of [`crate::arrays::resharding`], which take a host round trip
+/// instead, and the lowering of compiled programs, which rejects such a program before compilation because a compiled
+/// program has no exact alternative.
+pub(crate) fn partial_completion_rejection<
+    'a,
+    C: IntoIterator<Item = (&'a str, usize)>,
+    P: IntoIterator<Item = (&'a str, usize)>,
+>(
+    data_type: DataType,
+    kind: UnreducedKind,
+    completed: C,
+    pending: P,
+) -> Option<String> {
+    fn first_wide<'a, A: IntoIterator<Item = (&'a str, usize)>>(axes: A) -> Option<&'a str> {
+        axes.into_iter().find(|(_, size)| *size > 1).map(|(name, _)| name)
+    }
+
+    let accumulation_type = unreduced_accumulation_type(kind, data_type);
+    if accumulation_type == data_type {
+        return None;
+    }
+
+    let (completed, pending) = (first_wide(completed)?, first_wide(pending)?);
+    Some(format!(
+        "cannot complete a pending `{kind}` of `{data_type}` values along mesh axis `{completed}` and keep it along \
+         mesh axis `{pending}` on the devices, because the partial sums would be rounded to `{data_type}`, while the \
+         sum accumulates in `{accumulation_type}`",
+    ))
 }
 
 /// Returns the encoding of one element of the additive identity of `data_type`, which a split of a host
@@ -1915,7 +2117,7 @@ where
 /// `client` cannot address, [`ArrayError::DeviceProcessIndexMismatch`] for the first device that the mesh assigns to
 /// another process and whose process index differs from the one that `client` reports, and the PJRT errors of
 /// querying the devices of `client`.
-pub(super) fn validate_mesh_device_processes(client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+pub(crate) fn validate_mesh_device_processes(client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
     let process_index = client.process_index()?;
     if mesh.devices().iter().any(|device| device.process_index() == process_index) {
         let addressable_device_ids =
@@ -4169,7 +4371,10 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
         let host_bytes = Arc::new(values_to_bytes(&[0f32, 1., 2., 3., 4., 5., 6., 7.]));
         let prepare = |r#type: ArrayType, sharding: Sharding| {
-            let uploads = HostBufferUploads::new(&session, r#type, Some(mesh.clone()), Some(sharding), None).unwrap();
+            let addressable_devices = client.addressable_devices().unwrap();
+            let uploads =
+                HostBufferUploads::new(&session, r#type, Some(mesh.clone()), Some(sharding), None, addressable_devices)
+                    .unwrap();
             let shards = uploads.shards.into_iter().map(|shard| (shard.dimensions, shard.source)).collect();
             let mut prepared = PreparedHostShards::new(shards, 4);
             (0..4).map(|index| prepared.bytes(&host_bytes, index)).collect::<Vec<_>>()
