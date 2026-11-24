@@ -842,6 +842,7 @@ mod tests {
             TestIrReferenceWriteOperation::new(),
             Vec::new(),
             &[reference.clone(), replacement.clone()],
+            None,
         );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
@@ -849,8 +850,12 @@ mod tests {
         // Under the default `Execute` placement an all-known write folds: it runs against the live state in program
         // order at partial evaluation time.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let outputs =
-            executing.fold_or_residualize(TestIrReferenceWriteOperation::new(), Vec::new(), &[reference, replacement]);
+        let outputs = executing.fold_or_residualize(
+            TestIrReferenceWriteOperation::new(),
+            Vec::new(),
+            &[reference, replacement],
+            None,
+        );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(4.0_f32).unwrap()));
     }
@@ -895,11 +900,11 @@ mod tests {
         ];
         let staging =
             PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
-        let outputs = staging.fold_or_residualize(operation.clone(), Vec::new(), &inputs);
+        let outputs = staging.fold_or_residualize(operation.clone(), Vec::new(), &inputs, None);
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 2.]).unwrap()));
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let outputs = executing.fold_or_residualize(operation, Vec::new(), &inputs);
+        let outputs = executing.fold_or_residualize(operation, Vec::new(), &inputs, None);
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 7., 5., 2.]).unwrap()));
     }

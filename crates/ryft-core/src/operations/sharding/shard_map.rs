@@ -2239,7 +2239,7 @@ impl ShardMapOperation {
                     || operation.projected_payload::<DimensionFromScalarOperation>().is_some()
             })
         {
-            return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+            return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs, None);
         }
 
         // Feed the residual side directly from the known boundary inputs and known boundary outputs that residual edges
@@ -2275,7 +2275,7 @@ impl ShardMapOperation {
             .collect::<Result<Vec<_>, _>>()
         {
             Err(ShardMapError::DynamicResidualNotSupported { .. }) => {
-                return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+                return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs, None);
             }
             residual_edges => residual_edges?,
         };
@@ -3497,7 +3497,7 @@ where
         // then the body are validated first, so that an invalid application or a malformed body is reported as such
         // rather than forwarded, split, or residualized silently, and before the known side executes anything.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(&input_types, &driver.region_interfaces())?;
+        let output_types = self.infer_output_types(&input_types, &driver.region_interfaces())?;
         let body_program = driver.region(0)?;
         self.validate_body(body_program)?;
 
@@ -3505,7 +3505,7 @@ where
         // keep the default fold or residualize behavior and therefore the original boundary.
         if inputs.iter().all(PartialEvaluationValue::is_known) || inputs.iter().all(PartialEvaluationValue::is_unknown)
         {
-            return context.fold_or_residualize(self.clone(), driver.region_programs(), inputs);
+            return context.fold_or_residualize(self.clone(), driver.region_programs(), inputs, Some(&output_types));
         }
 
         // Split the local body through the shared online boundary machinery. The body's inputs are aligned by index
@@ -3518,8 +3518,22 @@ where
             || body_program.output_types().iter().any(Type::is_reference)
             || body_program.contains_reference_accesses_in_closure()
         {
-            return context.fold_or_residualize(self.clone(), vec![body_program.to_program()], inputs);
+            return context.fold_or_residualize(
+                self.clone(),
+                vec![body_program.to_program()],
+                inputs,
+                Some(&output_types),
+            );
         }
+
+        let preserve_output_types = inputs.iter().any(|input| input.declared_type().is_some());
+        let declare_outputs = |outputs| {
+            if preserve_output_types {
+                PartialEvaluationValue::with_declared_output_types(outputs, &output_types)
+            } else {
+                Ok(outputs)
+            }
+        };
 
         // Outputs that merely forward a known input are that input itself. When the output sharding equals the input
         // sharding and the input already has the declared output type, the global output is the global input, so it
@@ -3537,7 +3551,7 @@ where
             })
             .collect::<Vec<_>>();
         if forwarded_inputs.iter().all(Option::is_none) {
-            return self.partially_evaluate_split(context, driver, body_program, inputs);
+            return self.partially_evaluate_split(context, driver, body_program, inputs).and_then(declare_outputs);
         }
         let kept_outputs =
             (0..self.output_types.len()).filter(|&index| forwarded_inputs[index].is_none()).collect::<Vec<_>>();
@@ -3567,13 +3581,15 @@ where
             operation.partially_evaluate_split(context, driver, body.entry_region_ref(), inputs)?
         };
         let mut outputs = outputs.into_iter();
-        Ok(forwarded_inputs
-            .into_iter()
-            .map(|forwarded| match forwarded {
-                Some(input_index) => inputs[input_index].clone(),
-                None => outputs.next().unwrap(),
-            })
-            .collect())
+        declare_outputs(
+            forwarded_inputs
+                .into_iter()
+                .map(|forwarded| match forwarded {
+                    Some(input_index) => inputs[input_index].clone(),
+                    None => outputs.next().unwrap(),
+                })
+                .collect(),
+        )
     }
 }
 

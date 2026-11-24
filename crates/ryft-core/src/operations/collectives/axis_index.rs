@@ -195,7 +195,7 @@ impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> Partiall
         // differentiated function that reads an enclosing batch axis needs. A device mesh coordinate has no eager
         // value, so an eager known side reports it as unsupported and the operation stays residual, while a staged
         // known side (e.g., a `shard_map` body) stages it like any other known work.
-        context.fold_or_residualize(self.clone(), Vec::new(), inputs)
+        context.fold_or_residualize(self.clone(), Vec::new(), inputs, None)
     }
 }
 

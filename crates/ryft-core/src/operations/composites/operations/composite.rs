@@ -1076,8 +1076,9 @@ where
                 self.clone(),
                 AttachedRegions::Callees(std::slice::from_ref(&callee)),
                 inputs,
+                None,
             ),
-            None => context.fold_or_residualize(self.clone(), driver.region_programs(), inputs),
+            None => context.fold_or_residualize(self.clone(), driver.region_programs(), inputs, None),
         }
     }
 }

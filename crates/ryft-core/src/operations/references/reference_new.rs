@@ -632,6 +632,7 @@ mod tests {
                 TestIrReferenceNewOperation::new(),
                 Vec::new(),
                 &[PartialEvaluationValue::known(initial.clone())],
+                None,
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -643,8 +644,9 @@ mod tests {
         // only when the residual program replays against the runtime initial value.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let unknown = executing.unknown_input(scalar_type.clone(), 0);
-        let outputs =
-            executing.fold_or_residualize(TestIrReferenceNewOperation::new(), Vec::new(), &[unknown]).unwrap();
+        let outputs = executing
+            .fold_or_residualize(TestIrReferenceNewOperation::new(), Vec::new(), &[unknown], None)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
         let evaluation = executing.into_evaluation(outputs).unwrap();
@@ -670,6 +672,7 @@ mod tests {
                 TestIrReferenceNewOperation::new(),
                 Vec::new(),
                 &[PartialEvaluationValue::known(initial.clone())],
+                None,
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);

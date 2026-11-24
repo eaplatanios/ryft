@@ -888,7 +888,12 @@ mod tests {
         // leaves untouched.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let outputs = executing
-            .fold_or_residualize(TestIrReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(&reference))
+            .fold_or_residualize(
+                TestIrReferenceReadOperation::new(),
+                Vec::new(),
+                std::slice::from_ref(&reference),
+                None,
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&value));
@@ -898,8 +903,9 @@ mod tests {
         // never observes live reference state.
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
-        let outputs =
-            staging.fold_or_residualize(TestIrReferenceReadOperation::new(), Vec::new(), &[reference]).unwrap();
+        let outputs = staging
+            .fold_or_residualize(TestIrReferenceReadOperation::new(), Vec::new(), &[reference], None)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
 
@@ -963,12 +969,12 @@ mod tests {
             PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(0i32).unwrap())),
         ];
         let executing = PartialEvaluationContext::new(EagerContext::<TestIrValue, TestIrOperation>::new());
-        let outputs = executing.fold_or_residualize(operation.clone(), Vec::new(), &inputs).unwrap();
+        let outputs = executing.fold_or_residualize(operation.clone(), Vec::new(), &inputs, None).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&TestIrValue::Array(Array::scalar(4f32).unwrap())));
         let staging = PartialEvaluationContext::new(EagerContext::<TestIrValue, TestIrOperation>::new())
             .with_reference_placement(ReferencePlacement::Stage);
-        let outputs = staging.fold_or_residualize(operation, Vec::new(), &inputs).unwrap();
+        let outputs = staging.fold_or_residualize(operation, Vec::new(), &inputs, None).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
         assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()));

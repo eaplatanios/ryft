@@ -359,7 +359,7 @@ mod tests {
         let unknown = context.unknown_input(left.clone(), 0);
         let zero = PartialEvaluationValue::known(DimensionValue::constant(0).unwrap());
         assert_eq!(
-            context.fold_or_residualize(operation.clone(), Vec::new(), &[unknown, zero]).unwrap_err(),
+            context.fold_or_residualize(operation.clone(), Vec::new(), &[unknown, zero], None).unwrap_err(),
             ProgramError::Type(TypeError::invalid(format!(
                 "`dimension_add` input 1 has type `dimension<0>` but the operation was constructed for type `{right}`",
             )))
@@ -372,6 +372,7 @@ mod tests {
                     PartialEvaluationValue::known(DimensionValue::new(left, 1).unwrap()),
                     PartialEvaluationValue::known(DimensionValue::new(right, 1).unwrap()),
                 ],
+                None,
             )
             .unwrap();
         assert!(outputs[0].is_unknown());

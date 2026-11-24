@@ -1417,7 +1417,7 @@ impl<C: Context<Type = ArrayType, Operation: From<DropoutOperation> + From<RngBi
         // The advanced state depends only on the state and on the number of words drawn at the mask type, so when only
         // the input is unknown, it is computed on the known side by the same `rng_bit_generator` draw, which keeps
         // later draws from that state known. The residual dropout recomputes the same state, which is then unused.
-        let mut outputs = context.fold_or_residualize(self.clone(), Vec::new(), inputs)?;
+        let mut outputs = context.fold_or_residualize(self.clone(), Vec::new(), inputs, None)?;
         if let [input, state] = inputs
             && !input.is_known()
             && state.is_known()
@@ -1425,7 +1425,8 @@ impl<C: Context<Type = ArrayType, Operation: From<DropoutOperation> + From<RngBi
             check_count!("output", outputs, 2, ProgramError);
             let algorithm = RandomAlgorithm::from_state_type(&state.r#type())?;
             let generator = RngBitGeneratorOperation::<ArrayType>::new(algorithm, self.mask_type(&input.r#type())?);
-            let mut generated = context.fold_or_residualize(generator, Vec::new(), std::slice::from_ref(state))?;
+            let mut generated =
+                context.fold_or_residualize(generator, Vec::new(), std::slice::from_ref(state), None)?;
             check_count!("output", generated, 2, ProgramError);
             outputs[1] = generated.remove(0);
         }

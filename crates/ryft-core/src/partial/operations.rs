@@ -186,7 +186,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RecursivePartialEvaluationDriver<'_
     ///   - `reference_analysis`: Canonical source-reference analysis for repeated residual calls. Omitting it retains
     ///     the active context's ordering rules without performing source-reference analysis.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn partially_evaluate_instruction<C: Context<Constant = V, Operation = O>>(
+    pub(super) fn partially_evaluate_instruction<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         &self,
         context: &PartialEvaluationContext<C>,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -249,7 +249,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RecursivePartialEvaluationDriver<'_
             if must_defer {
                 context.residualize(operation.clone(), programs, inputs)
             } else {
-                context.fold_or_residualize(operation.clone(), programs, inputs)
+                context.fold_or_residualize(operation.clone(), programs, inputs, None)
             }
         } else {
             operation.partially_evaluate(context, self, inputs)
@@ -462,15 +462,15 @@ where
 /// # Deriving Partially Evaluatable Operation Enums
 ///
 /// The `#[derive(Operation)]` macro generates a [`PartiallyEvaluatableOperation`] implementation for operation enums
-/// that select `#[ryft(dispatch(partial_evaluation))]`. Native variants forward to their payload's own rule, and the
-/// generated per-payload predicates transport that rule's value and context requirements to the enum's use site.
-/// Mixed and structural member variants instead use the enclosing enum's canonical fold-or-residualize path because
-/// member-side partial values cannot represent values belonging to other members of the heterogeneous universe. This
-/// preserves correct folding and residualization without a second projected partial-value protocol, including for
-/// payloads that require fresh storage (refer to [`Operation::requires_fresh_storage`]), which that path keeps residual
-/// under a context that does not allow copies to fold. Variants that declare `#[ryft(family)]` use the default path,
-/// because the rule of a nested family belongs to programs over that family. Refer to the documentation of
-/// [`Operation`] for the full derive contract.
+/// that select `#[ryft(dispatch(partial_evaluation))]`. Native variants forward to their payload's rule. The generated
+/// per-payload predicates transport that rule's value and context requirements to the enum's use site. Mixed and
+/// structural member variants instead use the enclosing enum's canonical fold-or-residualize path because member-side
+/// partial values cannot represent values belonging to other members of the heterogeneous universe. This preserves
+/// correct folding and residualization without a second projected partial-value protocol, including for payloads that
+/// require fresh storage (refer to [`Operation::requires_fresh_storage`]), which that path keeps residual under a
+/// context that does not allow copies to fold. Variants that declare `#[ryft(family)]` use the default path, because
+/// the rule of a nested family belongs to programs over that family. Refer to the documentation of [`Operation`] for
+/// the full derive contract.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
@@ -503,7 +503,8 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     /// staging known-side context may be a [`Tracer`](crate::Tracer) into the outer program rather than a program
     /// constant, and partial evaluation should fall back to a conservative rewrite otherwise. Resolving to a constant
     /// alone does not guarantee that the payload is host-inspectable; rules that inspect it require the corresponding
-    /// capability separately.
+    /// capability separately. Rules that assemble known outputs directly must retain the staged declarations that their
+    /// rewrite establishes.
     ///
     /// # Parameters
     ///
@@ -518,7 +519,7 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+        context.fold_or_residualize(self.clone(), driver.region_programs(), inputs, None)
     }
 
     /// Splits this [`PartiallyEvaluatableOperation`]'s application, whose inputs are all known, on residual demand for

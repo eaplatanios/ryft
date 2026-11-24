@@ -864,6 +864,7 @@ mod tests {
                     TestIrReferenceAtomicAddUpdateOperation::new(),
                     Vec::new(),
                     &[reference.clone(), update.clone()],
+                    None,
                 )
                 .map(|outputs| outputs.len()),
             Ok(0),
@@ -872,7 +873,12 @@ mod tests {
         let executing = PartialEvaluationContext::new(TestIrContext::new());
         assert_eq!(
             executing
-                .fold_or_residualize(TestIrReferenceAtomicAddUpdateOperation::new(), Vec::new(), &[reference, update])
+                .fold_or_residualize(
+                    TestIrReferenceAtomicAddUpdateOperation::new(),
+                    Vec::new(),
+                    &[reference, update],
+                    None
+                )
                 .map(|outputs| outputs.len()),
             Ok(0),
         );

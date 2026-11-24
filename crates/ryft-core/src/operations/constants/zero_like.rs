@@ -116,13 +116,13 @@ where
             || r#type.validate_zero().is_err()
             || (inputs[0].is_known() && context.parent().is_eager())
         {
-            return context.fold_or_residualize(*self, driver.region_programs(), inputs);
+            return context.fold_or_residualize(*self, driver.region_programs(), inputs, None);
         }
-        let operation = C::Operation::provide(ZeroOperation::new(r#type.into_owned()), &[])?;
+        let operation = C::Operation::provide(ZeroOperation::new(r#type.as_ref().clone()), &[])?;
         if inputs[0].is_unknown() {
             context.residualize(operation, Vec::new(), &[])
         } else {
-            context.fold_or_residualize(operation, Vec::new(), &[])
+            context.fold_or_residualize(operation, Vec::new(), &[], Some(std::slice::from_ref(r#type.as_ref())))
         }
     }
 }

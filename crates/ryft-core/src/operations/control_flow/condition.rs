@@ -68,6 +68,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
+use crate::operations::manipulation::conversions::CastOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::references::ReferenceNewOperation;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
@@ -758,7 +759,7 @@ impl<
         // that a concrete predicate cannot skip the contracts of the branch that it does not select.
         let branches = driver.condition_branches(inputs.len())?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, branches)?;
+        let mut output_types = self.validate_application(&input_types, branches)?;
 
         // A known predicate selects a branch only when it resolves to a program constant: under a staging known-side
         // context "known" means known to the outer program, and a genuine tracer carries no boolean to branch on. A
@@ -772,6 +773,7 @@ impl<
             .and_then(|predicate| predicate.concretize().ok())
             .map(|predicate| if predicate { 0 } else { 1 });
         if let Some(index) = selected_branch {
+            // Inlining eliminates the join. Primal and residual work can both use the selected branch's types.
             return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
         }
 
@@ -789,6 +791,11 @@ impl<
             let branch_input_types = true_branch.input_types();
             let mut guarded_inputs = vec![inputs[0].clone()];
             guarded_inputs.extend(context.guard_inputs(&branch_input_types, inputs[1..].to_vec(), false)?);
+            let guarded_types = guarded_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            if guarded_types != input_types {
+                output_types =
+                    self.infer_output_types(&guarded_types, &branches.map(|branch| branch.interface().clone()))?;
+            }
             let input_known = guarded_inputs[1..].iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
 
             // Partition each branch in its own fresh known-side context, whose inputs stand in for the known inputs,
@@ -806,17 +813,17 @@ impl<
             if let Ok(outputs) = reconstruct_partitioned_condition(
                 guarded_inputs[0].r#type().as_ref(),
                 &branch_input_types,
-                true_branch.output_types().len(),
+                output_types.len(),
                 &guarded_inputs,
                 &input_known,
                 [true_partition, false_partition],
                 |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
                     zero_placeholder(builder, edge_type)
                 },
-                |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
+                |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs, None),
                 |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
             )? {
-                return Ok(outputs);
+                return PartialEvaluationValue::with_declared_output_types(outputs, &output_types);
             }
 
             // Reconstruction rejects unsupported splits before binding either half. Preserve the entry guards when
@@ -827,7 +834,7 @@ impl<
         // A condition whose inputs are all known but whose predicate selects no branch here folds whole, unless one
         // of its branches holds work that must not fold under this context (e.g., a copy that every execution of a
         // specialized program must make), in which case the default rule keeps the whole condition residual.
-        context.fold_or_residualize(O::from(*self), driver.region_programs(), &inputs)
+        context.fold_or_residualize(O::from(*self), driver.region_programs(), &inputs, Some(&output_types))
     }
 
     fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
@@ -875,7 +882,7 @@ impl<
             |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
                 zero_placeholder(builder, edge_type)
             },
-            |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
+            |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs, None),
             |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
         )?
         else {
@@ -1332,7 +1339,7 @@ where
         check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
         let mut primal_outputs = outputs;
         let tangent_outputs = primal_outputs.split_off(output_count);
-        context.control_flow_dual_outputs(primal_outputs, tangent_outputs, &output_activity, output_types)
+        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, &output_activity)
     }
 }
 
@@ -1343,6 +1350,7 @@ impl<
         + ResidualZeroProvider<T, Operation = O>
         + OperationProvider<T, AddOperation<T>, Operation = O>
         + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = O>
+        + From<CastOperation<T>>
         + From<ConditionOperation<T>>,
 > TransposableOperation<V, O> for ConditionOperation<T>
 where
@@ -1566,9 +1574,25 @@ where
                 .iter()
                 .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            for (&index, cotangent) in branch_input_indices.iter().zip(branch_cotangents) {
+            for ((&index, cotangent), expected_type) in
+                branch_input_indices.iter().zip(branch_cotangents).zip(branch_cotangent_types)
+            {
                 if cotangents.kind(index + 1) == CotangentDestinationKind::Return {
-                    input_cotangents[index + 1] = cotangent.unwrap();
+                    let mut cotangent = cotangent.unwrap();
+                    if let MaybeZero::Value(value) = &mut cotangent {
+                        let actual_type = value.r#type().into_owned();
+
+                        // Retracing a branch at the joined seed type can drop placement from a forwarded cotangent.
+                        // Restore the input's placement after branch selection, before accumulating its cotangent.
+                        if !expected_type.is_interchangeable_with(&actual_type)
+                            && actual_type.join_for_control_flow(&expected_type).as_ref() == Some(&actual_type)
+                        {
+                            let cast = CastOperation::checked(expected_type, vec![actual_type])?;
+                            *value = context.bind(O::from(cast), Vec::new(), std::slice::from_ref(value))?.remove(0);
+                        }
+                    }
+
+                    input_cotangents[index + 1] = cotangent;
                 }
             }
 
@@ -7402,7 +7426,10 @@ mod tests {
         // condition whose output has the joined type, in either branch order.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let placed_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let sharding = Sharding::replicated(mesh, 0);
+        let placed_type = scalar_type.clone().with_sharding(sharding.clone()).unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let placed_predicate_type = predicate_type.clone().with_sharding(sharding).unwrap();
         let placed_output = Array::from_elements::<f64>(placed_type.clone(), &[2.0]).unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         builder.add_input(scalar_type.clone());
@@ -7420,7 +7447,12 @@ mod tests {
         ] {
             for predicate in [true, false] {
                 let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-                let predicate_tracer = context.lift(Array::scalar(predicate).unwrap()).unwrap();
+
+                // A staged input declaration must still allow a concrete predicate to specialize the result type.
+                let mut predicate_value =
+                    context.known_value(Array::from_elements(placed_predicate_type.clone(), &[predicate]).unwrap());
+                predicate_value.set_declared_type(&predicate_type).unwrap();
+                let predicate_tracer = PartialTracer::new(context.clone(), predicate_value);
                 let input_tracer = context.lift(input.clone()).unwrap();
                 let outputs = context
                     .bind(ConditionOperation::new(), branches.clone(), &[predicate_tracer, input_tracer])
@@ -7428,6 +7460,8 @@ mod tests {
                 let PartialValue::Known(output) = outputs[0].value().unwrap().value() else {
                     panic!("expected a known output")
                 };
+
+                assert_eq!(outputs[0].r#type(), output.r#type());
                 assert_eq!(output, if predicate == placed_first { &placed_output } else { &input });
             }
 
@@ -15762,6 +15796,48 @@ mod tests {
                         .interpret(vec![Array::scalar(5.0f64).unwrap(), Array::scalar(predicate).unwrap()])
                         .map(|outputs| outputs[0].elements::<f64>().unwrap()),
                     Ok(vec![expected]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_condition_transposition_restores_input_sharding_after_retracing_a_forwarded_seed() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed_type = scalar_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let branch = |keep_placement| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(placed_type.clone());
+            let output = if keep_placement {
+                input
+            } else {
+                let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+                let cast = CastOperation::unchecked(scalar_type.clone(), vec![placed_type.clone()]).unwrap();
+                builder.add_instruction(cast, Vec::new(), vec![negative], None).unwrap()[0]
+            };
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        for placed_first in [false, true] {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let branches = [branch(placed_first), branch(!placed_first)].map(|branch| builder.import_program(branch));
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+            let input = builder.add_input(placed_type.clone());
+            let output = builder
+                .add_instruction(ConditionOperation::new(), branches.to_vec(), vec![predicate, input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            assert_eq!(program.output_types(), vec![scalar_type.clone()]);
+            // The identity branch now receives an unplaced seed but contributes to the placed input's accumulator.
+            let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+            assert_eq!(transposed.output_types(), vec![placed_type.clone()]);
+            for predicate in [false, true] {
+                let expected = if predicate == placed_first { 7.0 } else { -7.0 };
+                assert_eq!(
+                    transposed.interpret(vec![Array::scalar(7.0f64).unwrap(), Array::scalar(predicate).unwrap()]),
+                    Ok(vec![Array::from_elements(placed_type.clone(), &[expected]).unwrap()]),
                 );
             }
         }

@@ -465,7 +465,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             PartialValueMaterialization::Variable { .. } => unreachable!("known values never name residual variables"),
         };
         if let Some(declaration) = partial.declared_type() {
-            imported = imported.with_declared_type(declaration.clone())?;
+            imported.set_declared_type(declaration)?;
         }
         self.state
             .imported_known_values
@@ -577,38 +577,46 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     when eager execution must be retried with owned programs.
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Their
     ///     known-ness determines whether the operation is folded or residualized.
+    ///   - `validated_output_types`: Output types already validated for this operation's staged inputs and regions.
+    ///     Folded outputs retain these declarations. With `None`, the context infers output types as needed and
+    ///     retains them on folded outputs when an input carries a staged declaration.
     ///
     /// # Errors
     ///
     /// Returns the context's retained binding error, if any, or an error when the inputs or regions cannot be prepared
-    /// or the operation cannot be bound. Unsupported pure eager work follows the residual fallback described above.
+    /// or the operation cannot be bound, including when a folded output does not refine its declaration.
+    /// Unsupported pure eager work follows the residual fallback described above.
     #[inline]
     pub fn fold_or_residualize<'r, P: Into<C::Operation>, R: Into<AttachedRegions<'r, C::Constant, C::Operation>>>(
         &self,
         operation: P,
         regions: R,
         inputs: &[PartialEvaluationValue<C::Value>],
+        validated_output_types: Option<&[C::Type]>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
     where
         C::Constant: 'r,
         C::Operation: 'r,
     {
-        if let Some(error) = self.error() {
-            return Err(error);
-        }
-        self.fold_or_residualize_operation(operation.into(), regions.into(), inputs)
+        self.fold_or_residualize_operation(operation.into(), regions.into(), inputs, validated_output_types)
     }
 
-    /// Internal helper that folds or residualizes an already converted [`Operation`]. This is the body of
-    /// [`fold_or_residualize`](Self::fold_or_residualize), which only converts its operation and regions, so this body
-    /// is compiled once per context rather than once per input operation or region representation. Keep those type
-    /// parameters out of this body, because every closure and iterator adapter is instantiated per distinct signature.
+    // Keep the operation and region conversions outside this body, so it is compiled once per context.
     fn fold_or_residualize_operation(
         &self,
         operation: C::Operation,
         regions: AttachedRegions<'_, C::Constant, C::Operation>,
         inputs: &[PartialEvaluationValue<C::Value>],
+        validated_output_types: Option<&[C::Type]>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if let Some(error) = self.error() {
+            return Err(error);
+        }
+
+        let preserve_output_types =
+            validated_output_types.is_some() || inputs.iter().any(|input| input.declared_type().is_some());
+        let mut output_types = validated_output_types.map(Cow::Borrowed);
+
         // Specifies whether this operation may stay in the residual program when an eager parent reports that it cannot
         // execute it (i.e., returns `ProgramError::UnsupportedOperation`), rather than failing partial evaluation. This
         // is how work that has no eager value on this backend, such as a reduction over a manual mesh axis, survives
@@ -627,10 +635,13 @@ impl<C: Context> PartialEvaluationContext<C> {
             if !input_types.iter().any(Type::is_reference) {
                 let replacements = (|| -> Result<_, ProgramError> {
                     operation.validate_region_interfaces(&[])?;
-                    let output_types = operation.infer_output_types(&input_types, &[])?;
-                    operation.effects().validate_application(operation.name(), &input_types, &output_types)?;
+                    if output_types.is_none() {
+                        output_types = Some(Cow::Owned(operation.infer_output_types(&input_types, &[])?));
+                    }
+                    let output_types = output_types.as_deref().unwrap();
+                    operation.effects().validate_application(operation.name(), &input_types, output_types)?;
                     can_defer_unsupported = !output_types.iter().any(Type::is_reference);
-                    Ok(operation.resolve_fold::<C::Constant>(&input_types, &[], &output_types)?)
+                    Ok(operation.resolve_fold::<C::Constant>(&input_types, &[], output_types)?)
                 })()
                 .inspect_err(|_| {
                     // A failed ordered application must not let later known effects run ahead of the failed work.
@@ -638,8 +649,9 @@ impl<C: Context> PartialEvaluationContext<C> {
                         self.state.defer_ordered_effects.set(true);
                     }
                 })?;
+
                 if let Some(replacements) = replacements {
-                    return replacements
+                    let outputs = replacements
                         .into_iter()
                         .map(|replacement| match replacement {
                             OperationFoldReplacement::Input(index) => Ok(inputs[index].clone()),
@@ -647,7 +659,12 @@ impl<C: Context> PartialEvaluationContext<C> {
                                 Ok(PartialEvaluationValue::known_constant(self.state.parent.lift(constant)?))
                             }
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+                    return if preserve_output_types {
+                        PartialEvaluationValue::with_declared_output_types(outputs, output_types.as_deref().unwrap())
+                    } else {
+                        Ok(outputs)
+                    };
                 }
             }
         }
@@ -709,19 +726,30 @@ impl<C: Context> PartialEvaluationContext<C> {
             return self.residualize_with_effects(operation, regions, inputs, effects);
         }
 
+        // Infer staged types before binding known values if the rule has not supplied them and folding must carry
+        // declarations forward. The residual builder checks and types any operation left in the residual program.
+        if preserve_output_types && output_types.is_none() {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            output_types = Some(Cow::Owned(operation.infer_output_types(&input_types, &regions.region_interfaces())?));
+        }
+
         // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
         // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
         // involves references. Its effect summary above already includes those regions. Note that only pure eager
         // execution can use this fallback. Residual, staged, and effectful applications perform their ordinary
         // validation when they are bound, without the discarded output inference and closure scan of this probe.
         if self.state.parent.is_eager() && effects.is_empty() && regions.region_count() > 0 {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let region_interfaces = regions.region_interfaces();
-            can_defer_unsupported = !input_types.iter().any(Type::is_reference)
+            can_defer_unsupported = !inputs.iter().any(|input| input.r#type().is_reference())
                 && !operation.effects().has_reference_effects()
-                && operation
-                    .infer_output_types(&input_types, &region_interfaces)
-                    .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
+                && match output_types.as_deref() {
+                    Some(output_types) => !output_types.iter().any(Type::is_reference),
+                    None => {
+                        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                        operation
+                            .infer_output_types(&input_types, &regions.region_interfaces())
+                            .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
+                    }
+                }
                 && !regions.regions().enumerate().any(|(index, region)| {
                     operation.region_role(index) == Some(RegionRole::Computation)
                         && region
@@ -744,7 +772,12 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.state.parent.bind(operation, regions, &known)?
         };
 
-        Ok(outputs.into_iter().map(|value| self.known_value(value)).collect())
+        let outputs = outputs.into_iter().map(|value| self.known_value(value)).collect();
+        if preserve_output_types {
+            PartialEvaluationValue::with_declared_output_types(outputs, output_types.as_deref().unwrap())
+        } else {
+            Ok(outputs)
+        }
     }
 
     /// _Residualizes_ the provided [`Operation`] into the residual [`Program`], materializing each known input into
@@ -1112,6 +1145,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                             )?,
                             Vec::new(),
                             &guarded,
+                            None,
                         )
                     })?;
                     check_count!(
@@ -1252,7 +1286,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let known_inputs = known_input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
         let (known_program_operation, known_regions) = build_known_operation(known_program);
         let known_outputs =
-            self.fold_or_residualize(known_program_operation, known_regions, known_inputs.as_slice())?;
+            self.fold_or_residualize(known_program_operation, known_regions, known_inputs.as_slice(), None)?;
 
         // Emit the residual operation over its sources (i.e., original boundary inputs, fully known outputs, and the
         // residual edges, which trail the fully known outputs among the known-side operation's outputs). The emission
@@ -1581,7 +1615,7 @@ impl<C: Context> PartialEvaluationContext<C> {
 
             // Apply the known guard, replacing only the known members whose types it changes.
             let guarded = members.iter().map(|&index| inputs[index].clone().unwrap()).collect::<Vec<_>>();
-            let narrowed = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
+            let narrowed = self.fold_or_residualize(guard, Vec::new(), &guarded, None)?;
             check_count!("output", narrowed, outputs.len(), ProgramError);
             for ((index, _), output) in outputs.into_iter().zip(narrowed) {
                 if inputs[index].as_ref().unwrap().r#type() != output.r#type() {
@@ -1606,7 +1640,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
         let output_members =
             members.iter().copied().filter(|&index| !declared_types[index].is_reference()).collect::<Vec<_>>();
-        let outputs = self.fold_or_residualize(guard, Vec::new(), &guarded)?;
+        let outputs = self.fold_or_residualize(guard, Vec::new(), &guarded, None)?;
         check_count!("output", outputs, output_members.len(), ProgramError);
         for (index, output) in output_members.into_iter().zip(outputs) {
             if inputs[index].is_unknown() || inputs[index].r#type() != output.r#type() {
@@ -1844,30 +1878,7 @@ where
             Ok(input_values) => {
                 let input_values = input_values.into_iter().cloned().collect::<Vec<_>>();
                 let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
-                let outputs = (|| {
-                    // Known-side execution can refine an input's type. Keep computing the staged signature from
-                    // its declaration so that, for example, an eager negation of a joined result retains the join.
-                    let declarations = if input_values.iter().any(|input| input.declared_type().is_some()) {
-                        let input_types =
-                            input_values.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                        Some(operation.infer_output_types(&input_types, &regions.region_interfaces())?)
-                    } else {
-                        None
-                    };
-                    let outputs = operation.partially_evaluate(self, &driver, &input_values)?;
-                    match declarations {
-                        Some(declarations) => {
-                            check_count!("output", outputs, declarations.len(), ProgramError);
-                            outputs
-                                .into_iter()
-                                .zip(declarations)
-                                .map(|(output, declaration)| output.with_declared_type(declaration).map_err(Into::into))
-                                .collect()
-                        }
-                        None => Ok(outputs),
-                    }
-                })();
-                match outputs {
+                match operation.partially_evaluate(self, &driver, &input_values) {
                     Ok(outputs) => {
                         return Ok(outputs.into_iter().map(|value| PartialTracer::new(self.clone(), value)).collect());
                     }
@@ -2176,18 +2187,6 @@ impl<C: Context> PartialTracer<C> {
         Self { context, state: PartialTracerState::Live(value) }
     }
 
-    /// Retains a staged result declaration through eager evaluation of this value.
-    ///
-    /// # Errors
-    /// Returns a [`TypeError`] when a known result does not refine its declaration.
-    pub(crate) fn with_declared_type(self, declaration: C::Type) -> Result<Self, TypeError> {
-        let state = match self.state {
-            PartialTracerState::Live(value) => PartialTracerState::Live(value.with_declared_type(declaration)?),
-            state @ PartialTracerState::Poison { .. } => state,
-        };
-        Ok(Self { state, ..self })
-    }
-
     /// Creates a poisoned [`PartialTracer`] deferring the provided error. Refer to the documentation of
     /// [`PartialTracerState`] for more information.
     #[inline]
@@ -2468,12 +2467,13 @@ mod tests {
         // Enabling folding again must restore behavior, while preserving the previously created residual input.
         let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         let allocated = restored
-            .fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(&initial))
+            .fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(&initial), None)
             .unwrap();
         assert!(
             matches!(allocated[0].as_known(), Some(TestValue::Reference(reference)) if reference.read() == Ok(Array::scalar(2.0_f32).unwrap())),
         );
-        let deferred = configured.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial]).unwrap();
+        let deferred =
+            configured.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial], None).unwrap();
         assert!(deferred[0].is_unknown());
         drop((configured, restored));
         let evaluation = context.into_evaluation(vec![input, deferred[0].clone()]).unwrap();
@@ -2827,7 +2827,7 @@ mod tests {
             PartialEvaluationValue::known(Array::scalar(2.0).unwrap()),
             PartialEvaluationValue::known(Array::scalar(3.0).unwrap()),
         ];
-        let folded = context.fold_or_residualize(MulOperation::new(), Vec::new(), &inputs).unwrap();
+        let folded = context.fold_or_residualize(MulOperation::new(), Vec::new(), &inputs, None).unwrap();
         assert_eq!(folded.len(), 1);
         assert!(folded[0].is_known());
         assert!(!folded[0].is_unknown());
@@ -2837,12 +2837,26 @@ mod tests {
         assert!(matches!(folded[0].value(), PartialValue::Known(value) if *value == Array::scalar(6.0).unwrap()));
 
         let unknown = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
-        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[unknown]).unwrap();
+        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[unknown], None).unwrap();
         let evaluation = context.into_evaluation(mixed).unwrap();
         assert_eq!(
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0).unwrap()]),
             Ok(vec![Array::scalar(-7.0).unwrap()])
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_preserves_declared_output_type() {
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let declaration = ArrayType::scalar(DataType::F32);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let placed_type = declaration.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let mut input = PartialEvaluationValue::known(Array::from_elements(placed_type.clone(), &[2.0f32]).unwrap());
+        input.set_declared_type(&declaration).unwrap();
+
+        let outputs = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[input], None).unwrap();
+        assert_eq!(outputs[0].declared_type(), Some(&declaration));
+        assert_eq!(outputs[0].as_known(), Some(&Array::from_elements(placed_type, &[-2.0f32]).unwrap()));
     }
 
     #[test]
@@ -2855,13 +2869,14 @@ mod tests {
         let copy = TestOperation::Array(ArrayOperation::Place(PlaceOperation::new(None, None).with_may_alias(false)));
         let alias = TestOperation::Array(ArrayOperation::Place(PlaceOperation::new(None, None)));
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
-        let outputs = context.fold_or_residualize(copy.clone(), Vec::new(), std::slice::from_ref(&known)).unwrap();
+        let outputs =
+            context.fold_or_residualize(copy.clone(), Vec::new(), std::slice::from_ref(&known), None).unwrap();
         assert_eq!(outputs[0].as_known(), Some(&TestValue::Array(input.clone())));
         assert!(context.state.builder.borrow().instructions().is_empty());
         let context = context.with_allow_copy_folding(false);
-        let outputs = context.fold_or_residualize(alias, Vec::new(), std::slice::from_ref(&known)).unwrap();
+        let outputs = context.fold_or_residualize(alias, Vec::new(), std::slice::from_ref(&known), None).unwrap();
         assert_eq!(outputs[0].as_known(), Some(&TestValue::Array(input.clone())));
-        let outputs = context.fold_or_residualize(copy, Vec::new(), std::slice::from_ref(&known)).unwrap();
+        let outputs = context.fold_or_residualize(copy, Vec::new(), std::slice::from_ref(&known), None).unwrap();
         assert!(outputs[0].is_unknown());
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert_eq!(
@@ -2892,6 +2907,7 @@ mod tests {
                 LinearCallOperation::new(0),
                 vec![region(true), region(false)],
                 std::slice::from_ref(&known),
+                None,
             )
             .unwrap();
         assert_eq!(outputs[0].as_known(), Some(&input));
@@ -2900,6 +2916,7 @@ mod tests {
                 LinearCallOperation::new(0),
                 vec![region(false), region(true)],
                 std::slice::from_ref(&known),
+                None,
             )
             .unwrap();
         assert!(outputs[0].is_unknown());
@@ -2933,6 +2950,7 @@ mod tests {
                 LinearCallOperation::new(0),
                 vec![region(false), region(true)],
                 std::slice::from_ref(&known),
+                None,
             )
             .unwrap();
         assert_eq!(outputs[0].as_known(), Some(&input));
@@ -2982,7 +3000,12 @@ mod tests {
         let input = PartialEvaluationValue::known(parent.input(scalar_type));
         let context = PartialEvaluationContext::new(parent);
         let outputs = context
-            .fold_or_residualize(CountedRegionOperation { queries: Rc::clone(&queries) }, vec![body.clone()], &[input])
+            .fold_or_residualize(
+                CountedRegionOperation { queries: Rc::clone(&queries) },
+                vec![body.clone()],
+                &[input],
+                None,
+            )
             .unwrap();
         assert_eq!(queries.get(), 1);
         let output = outputs[0].as_known().unwrap().atom_id().unwrap();
@@ -3012,7 +3035,7 @@ mod tests {
         queries.set(0);
         assert_eq!(
             context
-                .fold_or_residualize(CountedRegionOperation { queries: Rc::clone(&queries) }, vec![body], &[])
+                .fold_or_residualize(CountedRegionOperation { queries: Rc::clone(&queries) }, vec![body], &[], None)
                 .unwrap_err(),
             ProgramError::Type(TypeError::invalid("expected 1 input but got 0")),
         );
@@ -3026,7 +3049,7 @@ mod tests {
             TestOrderedStateOperation::Unavailable { error: unsupported.clone(), effects: Effects::empty().clone() };
         let inputs = [PartialEvaluationValue::known(Array::scalar(2.0_f32).unwrap())];
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
-        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &inputs).unwrap();
+        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &inputs, None).unwrap();
         assert!(outputs[0].is_unknown());
         assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
         let evaluation = context.into_evaluation(outputs).unwrap();
@@ -3037,7 +3060,7 @@ mod tests {
         let parent = TracingContext::<Array, TestOrderedStateOperation>::new();
         let input = PartialEvaluationValue::known(parent.input(ArrayType::scalar(DataType::F32)));
         let context = PartialEvaluationContext::new(parent);
-        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &[input]).unwrap();
+        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &[input], None).unwrap();
         assert!(outputs[0].is_known());
         assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
 
@@ -3047,18 +3070,18 @@ mod tests {
             effects: Effects::new(EffectClasses::single(EffectClass::OrderedIo), Vec::new()).unwrap(),
         };
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
-        assert_eq!(context.fold_or_residualize(effectful, Vec::new(), &inputs).unwrap_err(), unsupported);
+        assert_eq!(context.fold_or_residualize(effectful, Vec::new(), &inputs, None).unwrap_err(), unsupported);
 
         // Unsupported execution does not conceal malformed boundaries or other runtime errors.
         assert_eq!(
-            context.fold_or_residualize(operation.clone(), Vec::new(), &[]).unwrap_err(),
+            context.fold_or_residualize(operation.clone(), Vec::new(), &[], None).unwrap_err(),
             ProgramError::Type(TypeError::invalid("expected 1 input but got 0")),
         );
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         let invalid = ProgramError::Type(TypeError::invalid("invalid kernel input"));
         let operation =
             TestOrderedStateOperation::Unavailable { error: invalid.clone(), effects: Effects::empty().clone() };
-        assert_eq!(context.fold_or_residualize(operation, Vec::new(), &inputs).unwrap_err(), invalid);
+        assert_eq!(context.fold_or_residualize(operation, Vec::new(), &inputs, None).unwrap_err(), invalid);
     }
 
     #[test]
@@ -3084,7 +3107,7 @@ mod tests {
         ];
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let outputs = context
-            .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)
+            .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs, None)
             .unwrap();
         assert!(outputs[0].is_unknown());
         assert_eq!(
@@ -3119,7 +3142,7 @@ mod tests {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         assert_eq!(
             context
-                .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)
+                .fold_or_residualize(ConditionOperation::new(), vec![branch.clone(), branch], &inputs, None)
                 .unwrap_err(),
             ProgramError::UnsupportedOperation {
                 message: "the reference array backend cannot execute the foreign kernel `kernel`".to_string(),
@@ -3135,16 +3158,19 @@ mod tests {
         let unknown = [context.unknown_input(scalar_type, 0)];
 
         // Ordered state folds like any other all-known operation before any ordered effect has been deferred.
-        let folded = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
+        let folded =
+            context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known, None).unwrap();
         assert_eq!(folded[0].as_known(), Some(&Array::scalar(1.0).unwrap()));
 
         // A state access with an unknown input stages. All later ordered operations must then stage too, even with
         // known inputs and no shared reference allocation. Pure work keeps folding.
-        let staged = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &unknown).unwrap();
+        let staged = context
+            .fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &unknown, None)
+            .unwrap();
         assert!(staged[0].is_unknown());
-        let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
+        let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known, None).unwrap();
         assert!(later[0].is_unknown());
-        let pure = context.fold_or_residualize(TestOrderedStateOperation::Pure, Vec::new(), &known).unwrap();
+        let pure = context.fold_or_residualize(TestOrderedStateOperation::Pure, Vec::new(), &known, None).unwrap();
         assert_eq!(pure[0].as_known(), Some(&Array::scalar(1.0).unwrap()));
         let evaluation = context.into_evaluation(vec![later[0].clone()]).unwrap();
         assert_eq!(
@@ -3167,7 +3193,7 @@ mod tests {
         let context = PartialEvaluationContext::new(EagerContext::<Array, TestOrderedStateOperation>::new());
         let known = [PartialEvaluationValue::known(Array::scalar(1.0).unwrap())];
         context.residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
-        let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
+        let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known, None).unwrap();
         assert!(later[0].is_unknown());
     }
 
@@ -3191,16 +3217,18 @@ mod tests {
         let add_update = TestOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new());
         assert!(
             context
-                .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update])
+                .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update], None)
                 .unwrap()
                 .is_empty(),
         );
         assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
         let allocation = TestOperation::ReferenceNew(ReferenceNewOperation::new());
-        let allocated = context.fold_or_residualize(allocation, Vec::new(), std::slice::from_ref(&initial)).unwrap();
+        let allocated =
+            context.fold_or_residualize(allocation, Vec::new(), std::slice::from_ref(&initial), None).unwrap();
         assert!(allocated[0].is_unknown());
         let product = TestOperation::from(ArrayOperation::from(MulOperation::new()));
-        let folded = context.fold_or_residualize(product, Vec::new(), &[initial.clone(), initial.clone()]).unwrap();
+        let folded =
+            context.fold_or_residualize(product, Vec::new(), &[initial.clone(), initial.clone()], None).unwrap();
         assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(9.0_f32).unwrap())));
 
         // The live handle crosses into the residual program by identity as a residual reference, so replaying the
@@ -3234,11 +3262,11 @@ mod tests {
             .with_reference_placement(ReferencePlacement::Stage);
         let reference = PartialEvaluationValue::known(TestValue::Reference(frozen));
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
-        let output = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
+        let output = context.fold_or_residualize(read, Vec::new(), &[reference], None).unwrap();
         assert!(output[0].is_unknown());
         let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(42.0_f32).unwrap()));
         let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("after_read")));
-        let printed = context.fold_or_residualize(print, Vec::new(), &[value]).unwrap();
+        let printed = context.fold_or_residualize(print, Vec::new(), &[value], None).unwrap();
         assert!(printed[0].is_unknown());
         let evaluation = context.into_evaluation(printed).unwrap();
         assert_eq!(
@@ -3264,11 +3292,11 @@ mod tests {
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let reference = context.unknown_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into(), 0);
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
-        let output = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
+        let output = context.fold_or_residualize(read, Vec::new(), &[reference], None).unwrap();
         let target = PartialEvaluationValue::known(TestValue::Reference(other.clone()));
         let value = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7.0_f32).unwrap()));
         let write = TestOperation::ReferenceWrite(ReferenceWriteOperation::new());
-        assert!(context.fold_or_residualize(write, Vec::new(), &[target, value]).unwrap().is_empty());
+        assert!(context.fold_or_residualize(write, Vec::new(), &[target, value], None).unwrap().is_empty());
         assert_eq!(other.read(), Ok(Array::scalar(2.0_f32).unwrap()));
         let evaluation = context.into_evaluation(output).unwrap();
         let error = evaluation
@@ -3291,9 +3319,9 @@ mod tests {
         let known = PartialEvaluationValue::known(outer.input(ArrayType::scalar(DataType::F32)));
         let unknown = context.unknown_input(ArrayType::scalar(DataType::F32), 0);
         let operation = TestRegionOperation::WithRegions(const { &[RegionSlot::rule("derivative")] });
-        context.fold_or_residualize(operation, vec![rule], &[unknown]).unwrap();
+        context.fold_or_residualize(operation, vec![rule], &[unknown], None).unwrap();
         let retained = context
-            .fold_or_residualize(TestRegionOperation::Effectful(EffectClass::OrderedIo), Vec::new(), &[known])
+            .fold_or_residualize(TestRegionOperation::Effectful(EffectClass::OrderedIo), Vec::new(), &[known], None)
             .unwrap();
         assert!(retained[0].is_known());
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
@@ -3312,12 +3340,13 @@ mod tests {
         // Deferred work stays residual even when all inputs are known, whether the operation declares it directly
         // or carries it in an executable computation region, because folding it would discharge its obligation.
         let direct = context
-            .fold_or_residualize(TestRegionOperation::Deferred, Vec::new(), std::slice::from_ref(&known))
+            .fold_or_residualize(TestRegionOperation::Deferred, Vec::new(), std::slice::from_ref(&known), None)
             .unwrap();
         assert!(direct[0].is_unknown());
         let computation = TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] });
-        let computation =
-            context.fold_or_residualize(computation, vec![body.clone()], std::slice::from_ref(&known)).unwrap();
+        let computation = context
+            .fold_or_residualize(computation, vec![body.clone()], std::slice::from_ref(&known), None)
+            .unwrap();
         assert!(computation[0].is_unknown());
         assert_eq!(context.state.builder.borrow().instructions().len(), 2);
         assert!(outer.builder().borrow().instructions().is_empty());
@@ -3325,7 +3354,7 @@ mod tests {
         // A dormant rule region (i.e., a registered but unselected derivative) creates no obligation,
         // so its application folds into the known-side context.
         let rule = TestRegionOperation::WithRegions(const { &[RegionSlot::rule("derivative")] });
-        let rule = context.fold_or_residualize(rule, vec![body], &[known]).unwrap();
+        let rule = context.fold_or_residualize(rule, vec![body], &[known], None).unwrap();
         assert!(rule[0].is_known());
         assert_eq!(context.state.builder.borrow().instructions().len(), 2);
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
@@ -3348,7 +3377,7 @@ mod tests {
         let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         assert!(
             context
-                .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update])
+                .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update], None)
                 .unwrap()
                 .is_empty(),
         );
@@ -3357,11 +3386,11 @@ mod tests {
 
         // A write of the unknown value stages and prevents later ordered effects from folding: later known reads stage
         // even on a different allocation, preserving failure and synchronization order.
-        assert!(context.fold_or_residualize(write, Vec::new(), &[reference.clone(), u]).unwrap().is_empty());
+        assert!(context.fold_or_residualize(write, Vec::new(), &[reference.clone(), u], None).unwrap().is_empty());
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
-        let staged = context.fold_or_residualize(read.clone(), Vec::new(), &[reference]).unwrap();
+        let staged = context.fold_or_residualize(read.clone(), Vec::new(), &[reference], None).unwrap();
         assert!(staged[0].is_unknown());
-        let other_read = context.fold_or_residualize(read, Vec::new(), &[other_reference]).unwrap();
+        let other_read = context.fold_or_residualize(read, Vec::new(), &[other_reference], None).unwrap();
         assert!(other_read[0].is_unknown());
     }
 
@@ -3376,13 +3405,13 @@ mod tests {
         let mismatched = context.unknown_input(ArrayType::scalar(DataType::F64).into(), 0);
         let write = TestOperation::ReferenceWrite(ReferenceWriteOperation::new());
         assert!(matches!(
-            context.fold_or_residualize(write, Vec::new(), &[reference.clone(), mismatched]),
+            context.fold_or_residualize(write, Vec::new(), &[reference.clone(), mismatched], None),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`reference_write` replacement type `f64[]` must exactly \
                                match reference referent type `f32[]`",
         ),);
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
-        let staged = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
+        let staged = context.fold_or_residualize(read, Vec::new(), &[reference], None).unwrap();
         assert!(staged[0].is_unknown());
         assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
     }
@@ -3405,6 +3434,7 @@ mod tests {
                 RematerializeOperation::new(save_nothing()),
                 AttachedRegions::Callees(std::slice::from_ref(&body)),
                 &[known],
+                None,
             )
             .unwrap();
         assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(-2f32).unwrap())));
@@ -3417,6 +3447,7 @@ mod tests {
                 RematerializeOperation::new(save_nothing()),
                 AttachedRegions::Callees(std::slice::from_ref(&body)),
                 &[input],
+                None,
             )
             .unwrap();
         let second = context
@@ -3424,6 +3455,7 @@ mod tests {
                 RematerializeOperation::new(save_nothing()),
                 AttachedRegions::Callees(std::slice::from_ref(&body)),
                 &first,
+                None,
             )
             .unwrap();
         let evaluation = context.into_evaluation(second).unwrap();
@@ -3471,7 +3503,7 @@ mod tests {
 
         // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
         // over the residual variable, producing the next residual atom.
-        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[residual[0].clone()]).unwrap();
+        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[residual[0].clone()], None).unwrap();
         assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
 
         // Materializing the same known value twice reuses the residual atom assigned on first materialization through
@@ -3680,7 +3712,7 @@ mod tests {
         let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7f32).unwrap()));
         assert!(
             context
-                .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[target, replacement])
+                .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[target, replacement], None)
                 .unwrap()
                 .is_empty()
         );
@@ -4902,6 +4934,7 @@ mod tests {
                     .with_retained_identities(vec![a.to_variable()]),
                 Vec::new(),
                 &[unknown, second.clone()],
+                None,
             )
             .unwrap();
         let outputs = context.guard_inputs(&program.input_types(), vec![first.clone(), second], false).unwrap();
@@ -5189,7 +5222,7 @@ mod tests {
         let later_reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32).unwrap()));
         let error = context
-            .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[later_reference, update])
+            .fold_or_residualize(ReferenceWriteOperation::new(), Vec::new(), &[later_reference, update], None)
             .unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));

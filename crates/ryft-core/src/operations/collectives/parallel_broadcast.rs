@@ -470,7 +470,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelBroadcastOperation>>> 
             &driver.region_interfaces(),
         )?;
         let regions = driver.region_programs();
-        match context.fold_or_residualize(self.clone(), regions.clone(), inputs) {
+        match context.fold_or_residualize(self.clone(), regions.clone(), inputs, None) {
             Err(error)
                 if self.source == ParallelBroadcastSource::Dynamic(())
                     && self.axis_size > 1

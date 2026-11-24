@@ -419,12 +419,20 @@ where
             || effects.is_retained_when_unused()
             || has_references
         {
-            return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+            return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs, None);
         }
         if let Some(error) = context.error() {
             return Err(error);
         }
 
+        // The known program is replayed over concrete payloads, so retain the original boundary's staged result types
+        // when a caller supplied staged declarations.
+        let output_types = if inputs.iter().any(|input| input.declared_type().is_some()) {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            Some(self.infer_output_types(&input_types, std::slice::from_ref(body.interface()))?)
+        } else {
+            None
+        };
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
 
         // Round each saved value right after its producer and before the storage of the policy, if any, stores it
@@ -452,7 +460,7 @@ where
         let known_inputs = known_input_indices.iter().map(|&index| inputs[index].as_known().cloned().unwrap());
         let known_outputs = match known_program.interpret_in_context(context.parent(), known_inputs.collect()) {
             Err(ProgramError::UnsupportedOperation { .. }) => {
-                return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+                return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs, None);
             }
             known_outputs => known_outputs?,
         };
@@ -478,13 +486,18 @@ where
             .collect::<Vec<_>>();
         let residual_outputs =
             context.residualize(residual_operation, vec![residual_program], residual_inputs.as_slice())?;
-        Ok(outputs
+        let outputs = outputs
             .iter()
             .map(|output| match output {
                 PartialEvaluationOutput::Known(index) => known_outputs[*index].clone(),
                 PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].clone(),
             })
-            .collect())
+            .collect();
+        if let Some(output_types) = output_types {
+            PartialEvaluationValue::with_declared_output_types(outputs, &output_types)
+        } else {
+            Ok(outputs)
+        }
     }
 }
 

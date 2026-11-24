@@ -2084,13 +2084,18 @@ impl<
         let carry_count = self.carry_count;
         let body_input_types = body.input_types();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, body)?;
+        let output_types = self.validate_application(&input_types, body)?;
 
-        // When every input is known the whole scan folds by binding it in the known-side context so we
-        // defer to that default behavior, which keeps the whole scan residual when its body holds work that must not
-        // fold under this context (e.g., a copy that every execution of a specialized program must make).
+        // When every input is known the whole scan folds by binding it in the known-side context so we defer to that
+        // default behavior, which keeps the whole scan residual when its body holds work that must not fold under this
+        // context (e.g., a copy that every execution of a specialized program must make).
         if inputs.iter().all(PartialEvaluationValue::is_known) {
-            return context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], inputs);
+            return context.fold_or_residualize(
+                O::from(self.clone()),
+                vec![body.to_program()],
+                inputs,
+                Some(&output_types),
+            );
         }
 
         // Splitting the scan replaces its boundary with the boundaries of the rebuilt scans, and forwarding a carry can
@@ -2098,6 +2103,14 @@ impl<
         // guard first. The rebuilt scans and the forwarded carries use the guarded inputs, whose types prove them.
         let inputs =
             context.guard_inputs(&self.entry_input_types(&body_input_types, &input_types)?, inputs.to_vec(), false)?;
+
+        // The guard may retain a shared symbolic identity in the inputs that both rebuilt scans consume.
+        let guarded_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = if guarded_types == input_types {
+            output_types
+        } else {
+            self.infer_output_types(&guarded_types, std::slice::from_ref(body.interface()))?
+        };
 
         // The trailing iteration count input of a scan with a dynamic iteration count is neither a carry nor a stacked
         // input, so it does not make any per-iteration work known. A split forwards the carries that the body passes
@@ -2143,21 +2156,27 @@ impl<
                     &[],
                     |constant| Ok(context.known_value(context.parent().lift(constant)?)),
                     |value| value.as_known().and_then(|value| context.parent().resolve(value).into_constant()),
-                    |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
+                    |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs, None),
                     |operation, programs, inputs| context.residualize(operation, programs, inputs),
                 )?
             {
                 // The split forwards the known passed-through carries itself; the unknown ones are forwarded here,
                 // exactly as for a scan that stays whole.
                 self.forward_carries(body, &inputs, &mut outputs);
-                return Ok(outputs);
+                return PartialEvaluationValue::with_declared_output_types(outputs, &output_types);
             }
         }
-        let mut outputs = context.fold_or_residualize(O::from(self.clone()), vec![body.to_program()], &inputs)?;
+
+        let mut outputs = context.fold_or_residualize(
+            O::from(self.clone()),
+            vec![body.to_program()],
+            &inputs,
+            Some(&output_types),
+        )?;
 
         // Forwarding keeps a known initial value of a passed-through carry known.
         self.forward_carries(body, &inputs, &mut outputs);
-        Ok(outputs)
+        PartialEvaluationValue::with_declared_output_types(outputs, &output_types)
     }
 
     fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
@@ -2220,7 +2239,7 @@ impl<
             demanded_carries,
             |constant| Ok(context.known_value(context.parent().lift(constant)?)),
             |value| value.as_known().and_then(|value| context.parent().resolve(value).into_constant()),
-            |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
+            |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs, None),
             |operation, programs, inputs| context.residualize(operation, programs, inputs),
         )?
         else {
@@ -2299,7 +2318,7 @@ where
         // so the complete primal application is validated before any tangent work.
         let body = driver.region(0)?;
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = self.validate_application(&input_types, body)?;
+        self.validate_application(&input_types, body)?;
 
         // Separate-context linearization splits the scan boundary into a primal scan and a tangent scan, and forwarding
         // a carry can leave a staged scan dead, so the relationships that the primal input types leave unproven are
@@ -2330,21 +2349,21 @@ where
         // forwarding unchanged carries from their guarded inputs.
         let output_live = jvp.activity.output_tangent_liveness();
         let tangent_outputs = primal_outputs.split_off(output_live.len());
-        let mut outputs =
-            context.control_flow_dual_outputs(primal_outputs, tangent_outputs, output_live, output_types)?;
+        let mut outputs = DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, output_live)?;
         self.forward_carries(body, &inputs, &mut outputs);
         Ok(outputs)
     }
 }
 
 impl<
-    T: ScanType + DifferentiableType,
+    T: ScanType + DifferentiableType + CastType,
     V: Value<Type = T>,
     O: Operation<Type = T>
         + ResidualZeroProvider<T, Operation = O>
         + OperationProvider<T, AddOperation<T>, Operation = O>
         + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = O>
-        + From<ScanOperation<T>>,
+        + From<ScanOperation<T>>
+        + From<CastOperation<T>>,
 > TransposableOperation<V, O> for ScanOperation<T>
 where
     TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
@@ -2809,10 +2828,21 @@ where
                     } else {
                         None
                     };
-                    Ok(match returned {
-                        Some(cotangent) => MaybeZero::Value(cotangent),
-                        None => MaybeZero::Zero(input.r#type().cotangent()?),
-                    })
+
+                    let expected_type = input.r#type().cotangent()?;
+                    let Some(mut cotangent) = returned else { return Ok(MaybeZero::Zero(expected_type)) };
+                    let actual_type = cotangent.r#type().into_owned();
+
+                    // The reversed scan returns cotangents at its body boundary. Restore sharding omitted by that
+                    // boundary before accumulating against the original input.
+                    if !expected_type.is_interchangeable_with(&actual_type)
+                        && actual_type.join_for_control_flow(&expected_type).as_ref() == Some(&actual_type)
+                    {
+                        let cast = CastOperation::checked(expected_type, vec![actual_type])?;
+                        cotangent = context.bind(O::from(cast), Vec::new(), &[cotangent])?.remove(0);
+                    }
+
+                    Ok(MaybeZero::Value(cotangent))
                 })
                 .collect::<Result<Vec<_>, DifferentiationError>>()?
         };
@@ -4980,8 +5010,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
+        DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError, TiledLayout,
     };
     use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -12586,8 +12616,8 @@ mod tests {
         // no guard, and the scan rule guards the relationship between the two carries before it splits the scan: the
         // residual guard precedes the residual scan, which then receives the unknown carry at the checked type.
         let n_type = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let vector_type: ArrayIrType =
-            ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()])).into();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![n_type.dimension().clone()]));
+        let vector_type = ArrayIrType::from(array_type.clone());
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
         let known = builder.add_input(vector_type.clone());
@@ -12643,12 +12673,13 @@ mod tests {
         // retains the known identity, so the unknown carry enters the residual scan as an `f32[n]`, which the known
         // stack of the residual edge shares.
         let three_type: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
-        let program = scan_program(ScanOperation::new(2, 2), body, vec![vector_type.clone(), three_type.clone()]);
+        let program =
+            scan_program(ScanOperation::new(2, 2), body.clone(), vec![vector_type.clone(), three_type.clone()]);
         let outer = TestIrTracingContext::new();
         let evaluation = program
             .partially_evaluate_in_context(
                 &outer,
-                &[PartialValue::Known(outer.input(vector_type)), PartialValue::Unknown(three_type)],
+                &[PartialValue::Known(outer.input(vector_type.clone())), PartialValue::Unknown(three_type.clone())],
             )
             .unwrap();
         assert_eq!(
@@ -12669,6 +12700,19 @@ mod tests {
                     ]
                 in (%5)"#},
         );
+
+        // The known carry also admits a staged declaration without its storage layout. With this declaration, the
+        // driver must accept the split's guarded `n` instead of applying the static type inferred before the guard.
+        let outer = TestIrTracingContext::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
+        let mut known = context.known_value(outer.input(array_type.with_layout(layout).into()));
+        known.set_declared_type(&vector_type).unwrap();
+        let known = PartialTracer::new(context.clone(), known);
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(three_type, 0));
+        let outputs = context.bind(ScanOperation::new(2, 2), vec![body], &[known, unknown]).unwrap();
+        assert_eq!(outputs[0].r#type().as_ref(), &vector_type);
+        assert_eq!(outputs[1].r#type().as_ref(), &vector_type);
     }
 
     #[test]

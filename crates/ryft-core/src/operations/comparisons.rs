@@ -278,7 +278,7 @@ impl<
         // Validate inputs and regions before attempting to eliminate the comparison.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let regions = driver.region_programs();
-        self.infer_output_types(
+        let output_types = self.infer_output_types(
             &input_types,
             &regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>(),
         )?;
@@ -297,10 +297,11 @@ impl<
 
         // A proven predicate is a Boolean constant. Unresolved predicates follow ordinary partial evaluation.
         if let Some(output) = self.direction.prove_for_dimensions(left, right, exact)? {
-            return Ok(vec![PartialEvaluationValue::known(context.parent().lift(C::Constant::try_from(output)?)?)]);
+            let output = PartialEvaluationValue::known(context.parent().lift(C::Constant::try_from(output)?)?);
+            return PartialEvaluationValue::with_declared_output_types(vec![output], &output_types);
         }
 
-        context.fold_or_residualize(*self, regions, inputs)
+        context.fold_or_residualize(*self, regions, inputs, Some(&output_types))
     }
 }
 

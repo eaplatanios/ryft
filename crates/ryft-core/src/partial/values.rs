@@ -3,7 +3,8 @@ use std::cell::Cell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::programs::{AtomId, Type, TypeError, Typed, Value};
+use crate::macros::check_count;
+use crate::programs::{AtomId, ProgramError, Type, TypeError, Typed, Value};
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial context
 /// interprets a [`Program`](crate::Program) over. Every [`Atom`](crate::Atom) and every intermediate result is either
@@ -164,9 +165,9 @@ impl<V: Value> PartialEvaluationValue<V> {
     /// # Errors
     ///
     /// Returns a [`TypeError`] when the known value does not refine the declaration.
-    pub(super) fn with_declared_type(mut self, declaration: V::Type) -> Result<Self, TypeError> {
-        if self.is_unknown() || self.r#type().as_ref() == &declaration {
-            return Ok(self);
+    pub(crate) fn set_declared_type(&mut self, declaration: &V::Type) -> Result<(), TypeError> {
+        if self.is_unknown() || self.r#type().as_ref() == declaration {
+            return Ok(());
         }
 
         let actual = self.value.r#type();
@@ -176,10 +177,26 @@ impl<V: Value> PartialEvaluationValue<V> {
             )));
         }
 
-        self.declared_type = (actual.as_ref() != &declaration).then(|| Rc::new(declaration));
+        self.declared_type = (actual.as_ref() != declaration).then(|| Rc::new(declaration.clone()));
         self.materialization = Rc::new(Cell::new(PartialValueMaterialization::Input { residual_atom: None }));
 
-        Ok(self)
+        Ok(())
+    }
+
+    /// Retains the staged declarations of known outputs in output order. Residual outputs already carry their types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output counts differ or a known output does not refine its declaration.
+    pub fn with_declared_output_types(
+        mut outputs: Vec<Self>,
+        declarations: &[V::Type],
+    ) -> Result<Vec<Self>, ProgramError> {
+        check_count!("output", outputs, declarations.len(), ProgramError);
+        for (output, declaration) in outputs.iter_mut().zip(declarations) {
+            output.set_declared_type(declaration)?;
+        }
+        Ok(outputs)
     }
 
     /// Returns the underlying [`PartialValue`].

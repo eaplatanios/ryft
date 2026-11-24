@@ -854,6 +854,7 @@ impl<T: WhileType> WhileOperation<T> {
             O::from(known_while),
             vec![known_condition, known_body],
             known_inputs.as_slice(),
+            None,
         )?;
         check_count!("output", known_outputs, known_count, ProgramError);
         let residual_outputs =
@@ -1448,9 +1449,9 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         let condition = driver.region(0)?;
         let body = driver.region(1)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, condition, body)?;
+        let output_types = self.validate_application(&input_types, condition, body)?;
         if inputs.iter().all(PartialEvaluationValue::is_known) {
-            return context.fold_or_residualize(*self, driver.region_programs(), inputs);
+            return context.fold_or_residualize(*self, driver.region_programs(), inputs, Some(&output_types));
         }
 
         let state_types = body.input_types();
@@ -1472,7 +1473,7 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
             || condition.effects().has_deferred_work()
             || body.effects().has_deferred_work()
         {
-            return context.fold_or_residualize(*self, driver.region_programs(), inputs);
+            return context.fold_or_residualize(*self, driver.region_programs(), inputs, Some(&output_types));
         }
 
         // The rewrites below replace the loop's boundary. The closed-knownness split binds a known loop over the known
@@ -1482,6 +1483,12 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
         // the input types leave unproven are checked by an entry guard first, which survives simplification. The fold,
         // the split, and every residualized loop use the guarded inputs, whose types prove them.
         let inputs = context.guard_inputs(&state_types, inputs.to_vec(), false)?;
+        let guarded_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let output_types = if guarded_types == input_types {
+            output_types
+        } else {
+            self.infer_output_types(&guarded_types, &[condition.interface().clone(), body.interface().clone()])?
+        };
         let inputs = inputs.as_slice();
 
         // Every pure fallback below first attempts the closed-knownness split (a known state subset whose next values
@@ -1491,9 +1498,9 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
             if inputs.iter().any(PartialEvaluationValue::is_known)
                 && let Some(outputs) = self.split_by_closed_knownness(context, condition, body, inputs, driver)?
             {
-                return Ok(outputs);
+                return PartialEvaluationValue::with_declared_output_types(outputs, &output_types);
             }
-            context.fold_or_residualize(*self, driver.region_programs(), inputs)
+            context.fold_or_residualize(*self, driver.region_programs(), inputs, Some(&output_types))
         };
 
         // A state element can only fold if its type is not a reference and mentions no type identity (see the overview
@@ -1597,10 +1604,12 @@ impl<C: Context<Type: WhileType, Operation: From<WhileOperation<C::Type>>>> Part
             inputs,
             driver,
         )? {
-            return Ok(outputs);
+            return PartialEvaluationValue::with_declared_output_types(outputs, &output_types);
         }
 
-        context.fold_or_residualize(while_operation, vec![residual_condition, residual_body], inputs)
+        let outputs =
+            context.fold_or_residualize(while_operation, vec![residual_condition, residual_body], inputs, None)?;
+        PartialEvaluationValue::with_declared_output_types(outputs, &output_types)
     }
 }
 
@@ -1680,7 +1689,9 @@ where
         // The rule requests all nested-computation work through its driver (region `0` is the condition and region `1`
         // the body), which keeps its bounds free of the operation family's own semantic traits.
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        let output_types = self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
+
+        self.validate_application(&input_types, driver.region(0)?, driver.region(1)?)?;
+
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
         if context.primal().is_eager() {
@@ -1738,7 +1749,7 @@ where
                         }
                         let remaining = WhileOperation::new()
                             .with_iteration_bound(self.iteration_bound().map(|bound| bound - completed_iterations))?;
-                        return WhileJvp::new(driver, &remaining, &carries, output_types)?
+                        return WhileJvp::new(driver, &remaining, &carries)?
                             .bind(condition, body, context, driver, &carries);
                     }
                 };
@@ -1777,7 +1788,7 @@ where
             return Ok(carries);
         }
 
-        WhileJvp::new(driver, self, inputs, output_types)?.bind(&condition, &body, context, driver, inputs)
+        WhileJvp::new(driver, self, inputs)?.bind(&condition, &body, context, driver, inputs)
     }
 }
 
@@ -2366,9 +2377,6 @@ struct WhileJvp<C: Context> {
     /// and output tangent slots. Every state element is a carry, so its output tangent liveness is also the converged
     /// tangent liveness of the state.
     activity: TangentActivity<C>,
-
-    /// Validated primal result declarations shared by the primal and tangent loop boundaries.
-    output_types: Vec<C::Type>,
 }
 
 impl<C: Context<Type: DifferentiableType + WhileType> + Zero<C::Value>> WhileJvp<C>
@@ -2398,8 +2406,7 @@ where
     for<'t> <&'t ArrayType as TryFrom<&'t C::Type>>::Error: Into<TypeError>,
 {
     /// Creates a new [`WhileJvp`] by analyzing the forward mode activity of an application of `operation` to the input
-    /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body. The original
-    /// application supplies its validated `output_types`.
+    /// duals `inputs` and deriving its fused body through `driver`, whose region `1` is the body.
     ///
     /// # Errors
     ///
@@ -2409,7 +2416,6 @@ where
         driver: &D,
         operation: &WhileOperation<C::Type>,
         inputs: &[DifferentiationDual<C::Value>],
-        output_types: Vec<C::Type>,
     ) -> Result<Self, DifferentiationError> {
         let body = driver.region(1)?;
         let state_count = body.input_ids().len();
@@ -2417,7 +2423,7 @@ where
         let input_tangent_liveness = inputs.iter().map(|input| !input.tangent().is_zero()).collect();
         let (_, activity) =
             TangentActivity::from_loop_body(driver, body, input_tangent_liveness, 0..state_count, 0..state_count)?;
-        Ok(Self { operation: *operation, activity, output_types })
+        Ok(Self { operation: *operation, activity })
     }
 
     /// Stages the forward mode application of this loop with the condition and body programs `condition` and `body` to
@@ -3166,12 +3172,7 @@ where
         let tangent_outputs = context.tangent().bind(tangent_scan, vec![scan_body], tangent_scan_inputs.as_slice())?;
         check_count!("output", tangent_outputs, invariant_carry_count + tangent_state_count, ProgramError);
         let tangent_outputs = tangent_outputs.into_iter().skip(invariant_carry_count).collect();
-        context.control_flow_dual_outputs(
-            primal_outputs,
-            tangent_outputs,
-            activity.output_tangent_liveness(),
-            self.output_types.clone(),
-        )
+        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 
     /// Stages one fused doubled-state forward mode `while` for the condition program
@@ -3252,6 +3253,7 @@ where
         for &index in activity.input_indices() {
             fused_inputs.push(context.materialize_dual_tangent(&inputs[index])?);
         }
+
         let fused_regions = [Arc::new(fused_condition), fused_body];
         let (primal_outputs, tangent_outputs) = if std::ptr::eq(context.primal(), context.tangent()) {
             let mut outputs =
@@ -3287,12 +3289,8 @@ where
                 outputs.into_iter().map(|output| context.tangent_to_primal(output)).collect::<Result<Vec<_>, _>>()?;
             (primal_outputs, tangent_outputs)
         };
-        context.control_flow_dual_outputs(
-            primal_outputs,
-            tangent_outputs,
-            activity.output_tangent_liveness(),
-            self.output_types.clone(),
-        )
+
+        DifferentiationDual::from_live_tangents(primal_outputs, tangent_outputs, activity.output_tangent_liveness())
     }
 }
 

@@ -466,7 +466,7 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
         // Elementwise assertions need the ordinary execution path to collect failing indices and observations.
         // The default policy decides whether to bind them in the parent or retain them in the residual program.
         if self.failure_limit.is_some() {
-            return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
+            return context.fold_or_residualize(self.clone(), Vec::new(), inputs, None);
         }
 
         // A known input can still be symbolic in the parent context. Inspect it only if it resolves to a constant.
@@ -482,12 +482,12 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
                     // Raise immediately only under eager execution when effect folding is allowed and no earlier
                     // deferred ordered effect must run first. Otherwise, let the default policy place the assertion.
                     if !context.parent().is_eager() || !context.can_fold_effects(self.effects().classes()) {
-                        return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
+                        return context.fold_or_residualize(self.clone(), Vec::new(), inputs, None);
                     }
                 }
                 Err(ProgramError::Concretization { .. }) => {
                     // An unavailable concrete Boolean is not an assertion failure; defer to ordinary binding.
-                    return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
+                    return context.fold_or_residualize(self.clone(), Vec::new(), inputs, None);
                 }
                 Err(error) => return Err(error),
             }
@@ -508,7 +508,7 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
         }
 
         // Without a concrete condition, preserve the assertion through the default partial evaluation policy.
-        context.fold_or_residualize(self.clone(), Vec::new(), inputs)
+        context.fold_or_residualize(self.clone(), Vec::new(), inputs, None)
     }
 }
 
@@ -1955,7 +1955,7 @@ impl<C: Context<Operation: From<GuardOperation<C::Type>>>> PartiallyEvaluatableO
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
             &driver.region_interfaces(),
         )?;
-        context.fold_or_residualize(self.clone(), Vec::new(), inputs)
+        context.fold_or_residualize(self.clone(), Vec::new(), inputs, None)
     }
 }
 

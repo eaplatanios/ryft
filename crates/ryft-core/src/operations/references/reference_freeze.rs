@@ -559,7 +559,12 @@ mod tests {
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
         let outputs = staging
-            .fold_or_residualize(TestIrReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&reference))
+            .fold_or_residualize(
+                TestIrReferenceFreezeOperation::new(),
+                Vec::new(),
+                std::slice::from_ref(&reference),
+                None,
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].is_unknown());
@@ -569,7 +574,7 @@ mod tests {
         // freeze consumes.
         let executing = PartialEvaluationContext::new(TestContext::new());
         let outputs = executing
-            .fold_or_residualize(TestIrReferenceFreezeOperation::new(), Vec::new(), &[reference])
+            .fold_or_residualize(TestIrReferenceFreezeOperation::new(), Vec::new(), &[reference], None)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].as_known(), Some(&value));

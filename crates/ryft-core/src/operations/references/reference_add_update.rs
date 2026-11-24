@@ -943,6 +943,7 @@ mod tests {
             TestIrReferenceAddUpdateOperation::new(),
             Vec::new(),
             &[reference.clone(), update.clone()],
+            None,
         );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(6.0_f32).unwrap()));
@@ -950,8 +951,12 @@ mod tests {
         // Under the default `Execute` placement an all-known accumulation folds: it runs against the live state in
         // program order at partial evaluation time.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
-        let outputs =
-            executing.fold_or_residualize(TestIrReferenceAddUpdateOperation::new(), Vec::new(), &[reference, update]);
+        let outputs = executing.fold_or_residualize(
+            TestIrReferenceAddUpdateOperation::new(),
+            Vec::new(),
+            &[reference, update],
+            None,
+        );
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(10.0_f32).unwrap()));
     }

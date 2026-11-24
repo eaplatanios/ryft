@@ -917,6 +917,7 @@ mod tests {
                 TestIrReferenceSwapOperation::new(),
                 Vec::new(),
                 &[reference.clone(), replacement.clone()],
+                None,
             )
             .unwrap();
         assert_eq!(swapped.len(), 1);
@@ -927,7 +928,7 @@ mod tests {
         // order at partial evaluation time and its previous value is known.
         let executing = PartialEvaluationContext::new(TestIrContext::new());
         let swapped = executing
-            .fold_or_residualize(TestIrReferenceSwapOperation::new(), Vec::new(), &[reference, replacement])
+            .fold_or_residualize(TestIrReferenceSwapOperation::new(), Vec::new(), &[reference, replacement], None)
             .unwrap();
         assert_eq!(swapped.len(), 1);
         assert_eq!(swapped[0].as_known(), Some(&TestIrValue::Array(Array::scalar(3.0_f32).unwrap())));
