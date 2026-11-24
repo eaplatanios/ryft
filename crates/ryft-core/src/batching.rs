@@ -752,6 +752,14 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Returns the per-item type exposed by `batch` after removing its mapped batch axis, if any.
     fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type>;
 
+    /// Returns the per-item relocatable type of `batch` (refer to [`Value::relocatable_type`]), which is the
+    /// relocatable type of its packed value with the mapped batch axis removed, or [`None`] when the packed
+    /// value has none or this policy cannot remove the axis from it. The default returns [`None`].
+    #[inline]
+    fn unbatched_relocatable_type(_batch: &Self::Batch) -> Option<C::Type> {
+        None
+    }
+
     /// Returns the parent-owned bookkeeping values that this policy's structurally batched programs require
     /// prepended to the instruction inputs that feed their source region inputs when they are rebound as ordinary
     /// [`Region`](crate::Region)s of an operation that does not thread this policy's batching state itself.
@@ -1917,6 +1925,13 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
     #[inline]
     fn domain(&self) -> BatchingContext<C, P> {
         self.context().clone()
+    }
+
+    #[inline]
+    fn relocatable_type(&self) -> Option<C::Type> {
+        // A batch item of a packed value that is free to be placed elsewhere is free to be placed elsewhere too,
+        // so that nested transforms admit it as the outermost one does.
+        P::unbatched_relocatable_type(&self.batch)
     }
 }
 

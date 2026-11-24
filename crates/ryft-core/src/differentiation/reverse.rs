@@ -1996,179 +1996,242 @@ impl<
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        // Validate the seeds against the complete primal output boundary, including the leaves whose differential
-        // spaces contain only zero. Three index spaces meet here: the public output leaves (one seed each), the linear
-        // program's outputs (the public leaves that `tangent_output_slots` flags, including reference outputs), and
-        // the transposed program's seed inputs (the linear outputs that are neither references nor structural zeros).
-        // The structural zero mask follows the linear program's outputs. Only values that carry information become
-        // program inputs because the compact program has no Single Static Assignment (SSA) input for an output without
-        // a tangent slot (e.g., a zero differential space), none for a structural zero seed, and none for a reference
-        // output, whose state cotangent is owned by the destination of the input root it forwards.
-        if seeds.len() != self.primal_output_types.len() {
-            return Err(ProgramError::InvalidInputCount {
-                expected: self.primal_output_types.len(),
-                actual: seeds.len(),
-            });
-        }
-        let mut program_inputs = Vec::new();
-        let mut zero_output_cotangents = Vec::with_capacity(seeds.len());
-        for (index, ((seed, primal_type), &has_slot)) in
-            seeds.into_iter().zip(&self.primal_output_types).zip(&self.tangent_output_slots).enumerate()
-        {
-            let cotangent_type = primal_type.cotangent()?;
-            let is_zero = matches!(seed, CotangentSeed::Zero);
-            match seed {
-                CotangentSeed::Value(value) => {
-                    if primal_type.is_reference() {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "pullback cotangent seed {index} supplies a value for a primal output of reference \
-                                 type {primal_type}; use `CotangentSeed::NoCotangent` for reference outputs"
-                            ),
-                        });
-                    }
-
-                    // A seed may be stored differently than the cotangent type describes (e.g., with the explicit
-                    // layout of the primal output), because that type has no explicit layout. A seed that is free to
-                    // be placed elsewhere is admitted when it may be placed as the cotangent type states (refer to
-                    // `Value::is_relocatable_to`), which the boundary of the transposed program admits as well,
-                    // and the operations of that program move it from where it lives.
-                    if !cotangent_type.is_interchangeable_with(value.r#type().as_ref())
-                        && !value.is_relocatable_to(&cotangent_type)
-                    {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
-                            index,
-                            value.r#type().as_ref(),
-                            cotangent_type,
-                        )));
-                    }
-
-                    if has_slot {
-                        program_inputs.push(value);
-                    }
-                }
-                CotangentSeed::Zero => {
-                    if primal_type.is_reference() {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "pullback cotangent seed {index} is a structural zero for a primal output of reference \
-                                 type {primal_type}; use `CotangentSeed::NoCotangent` for reference outputs"
-                            ),
-                        });
-                    }
-                }
-                CotangentSeed::NoCotangent => {
-                    if !primal_type.is_reference() {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "pullback cotangent seed {index} omits the cotangent of a primal output of type \
-                                 {primal_type}; use `CotangentSeed::Value` or `CotangentSeed::Zero` for non-reference \
-                                 outputs"
-                            ),
-                        });
-                    }
-                }
+        // Defer seeds that are neither interchangeable with their cotangent types nor relocatable to them until
+        // the transposed program can be inspected. If preparation fails, report the first deferred seed's error
+        // when one precedes that failure, as if the seed had been rejected immediately.
+        let mut deferred_seeds = Vec::new();
+        // TODO(eaplatanios): Why the closure here?
+        let prepared = (|| {
+            // Validate the seeds against the complete primal output boundary, including leaves whose differential
+            // spaces contain only zero. Each public output leaf has a seed. The linear program's outputs are the leaves
+            // that `tangent_output_slots` flags, including reference outputs. The structural zero mask follows those
+            // outputs. The transposed program has Single Static Assignment (SSA) inputs only for linear outputs that
+            // carry a live seed. Each reference output forwards an input root whose destination owns its state
+            // cotangent.
+            if seeds.len() != self.primal_output_types.len() {
+                return Err(ProgramError::InvalidInputCount {
+                    expected: self.primal_output_types.len(),
+                    actual: seeds.len(),
+                });
             }
-            if has_slot {
-                zero_output_cotangents.push(is_zero);
-            }
-        }
 
-        // Validate the destinations against the complete primal input boundary and derive the structural destination
-        // mask. Each destination kind selects its own retained program; runtime buffer identities are never keys.
-        if destinations.len() != self.primal_input_types.len() {
-            return Err(ProgramError::InvalidArgument {
-                message: format!(
-                    "pullback received {} cotangent destinations for a primal input boundary with {} leaves",
-                    destinations.len(),
-                    self.primal_input_types.len(),
-                ),
-            });
-        }
-        let mut destination_references = Vec::new();
-        for (index, (destination, primal_type)) in destinations.iter().zip(&self.primal_input_types).enumerate() {
-            let is_reference = primal_type.is_reference();
-            match destination {
-                CotangentDestination::Return if is_reference => {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "pullback destination {index} returns the cotangent of a primal input of reference type \
-                             {primal_type} as a value; use `CotangentDestination::Reference` or \
-                             `CotangentDestination::Ignore` for reference inputs"
-                        ),
-                    });
-                }
-                CotangentDestination::Return | CotangentDestination::Ignore => {}
-                CotangentDestination::Reference(reference) => {
-                    let cotangent_type = primal_type.cotangent()?;
-                    let valid_type = if is_reference {
-                        reference.r#type().as_ref() == &cotangent_type
-                    } else {
-                        cotangent_type
-                            .as_referent()
-                            .is_some_and(|referent| reference.r#type().referent() == Some(referent))
-                    };
-                    if !valid_type {
-                        let requirement = if is_reference {
-                            format!("the cotangent reference type {cotangent_type}")
-                        } else {
-                            format!("a reference storing the cotangent type {cotangent_type}")
-                        };
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "pullback destination {} has type {} but its primal input of type {} requires {}",
+            let mut program_inputs = Vec::new();
+            let mut zero_output_cotangents = Vec::with_capacity(seeds.len());
+            for (index, ((seed, primal_type), &has_slot)) in
+                seeds.into_iter().zip(&self.primal_output_types).zip(&self.tangent_output_slots).enumerate()
+            {
+                let cotangent_type = primal_type.cotangent()?;
+                let is_zero = matches!(seed, CotangentSeed::Zero);
+                match seed {
+                    CotangentSeed::Value(value) => {
+                        if primal_type.is_reference() {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "pullback cotangent seed {index} supplies a value for a primal output of reference \
+                                     type {primal_type}; use `CotangentSeed::NoCotangent` for reference outputs"
+                                ),
+                            });
+                        }
+
+                        // A seed may carry the primal's explicit layout when the cotangent type leaves it open.
+                        // A seed that can relocate to the cotangent type also passes the transposed program's boundary
+                        // check, and that program's operations move it from wherever it lives. Defer any other seed
+                        // until the transposed program can show whether its consumer accepts it.
+                        if !cotangent_type.is_interchangeable_with(value.r#type().as_ref())
+                            && !value.is_relocatable_to(&cotangent_type)
+                        {
+                            let error = ProgramError::MalformedProgram(format!(
+                                "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
                                 index,
-                                reference.r#type().as_ref(),
-                                primal_type,
-                                requirement,
+                                value.r#type().as_ref(),
+                                cotangent_type,
+                            ));
+                            deferred_seeds.push((has_slot.then_some(program_inputs.len()), error));
+                        }
+
+                        if has_slot {
+                            program_inputs.push(value);
+                        }
+                    }
+                    CotangentSeed::Zero => {
+                        if primal_type.is_reference() {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "pullback cotangent seed {index} is a structural zero for a primal output of \
+                                     reference type {primal_type}; use `CotangentSeed::NoCotangent` for reference \
+                                     outputs",
+                                ),
+                            });
+                        }
+                    }
+                    CotangentSeed::NoCotangent => {
+                        if !primal_type.is_reference() {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "pullback cotangent seed {index} omits the cotangent of a primal output of type \
+                                     {primal_type}; use `CotangentSeed::Value` or `CotangentSeed::Zero` for \
+                                     non-reference outputs",
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                if has_slot {
+                    zero_output_cotangents.push(is_zero);
+                }
+            }
+
+            // Validate the destinations against the complete primal input boundary and derive the structural
+            // destination mask. The retained program is keyed by destination kind, independent of buffer identity.
+            if destinations.len() != self.primal_input_types.len() {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "pullback received {} cotangent destinations for a primal input boundary with {} leaves",
+                        destinations.len(),
+                        self.primal_input_types.len(),
+                    ),
+                });
+            }
+
+            let mut destination_references = Vec::new();
+            for (index, (destination, primal_type)) in destinations.iter().zip(&self.primal_input_types).enumerate() {
+                let is_reference = primal_type.is_reference();
+                match destination {
+                    CotangentDestination::Return if is_reference => {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "pullback destination {index} returns the cotangent of a primal input of reference \
+                                 type {primal_type} as a value; use `CotangentDestination::Reference` or \
+                                 `CotangentDestination::Ignore` for reference inputs",
                             ),
                         });
                     }
-                    destination_references.push((index, reference));
+                    CotangentDestination::Return | CotangentDestination::Ignore => {}
+                    CotangentDestination::Reference(reference) => {
+                        let cotangent_type = primal_type.cotangent()?;
+                        let valid_type = if is_reference {
+                            reference.r#type().as_ref() == &cotangent_type
+                        } else {
+                            cotangent_type
+                                .as_referent()
+                                .is_some_and(|referent| reference.r#type().referent() == Some(referent))
+                        };
+
+                        if !valid_type {
+                            let requirement = if is_reference {
+                                format!("the cotangent reference type {cotangent_type}")
+                            } else {
+                                format!("a reference storing the cotangent type {cotangent_type}")
+                            };
+
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "pullback destination {} has type {} but its primal input of type {} requires {}",
+                                    index,
+                                    reference.r#type().as_ref(),
+                                    primal_type,
+                                    requirement,
+                                ),
+                            });
+                        }
+                        destination_references.push((index, reference));
+                    }
                 }
             }
-        }
 
-        // Every destination reference must denote an allocation distinct from every primal reference and from every
-        // other destination. Identity, not generation, is compared: a primal reference that advanced generations after
-        // the differentiated closure ran is still the same allocation and still rejected.
-        self.primal_references.validate_differentiation_arguments(
-            context,
-            destination_references
+            // Every destination reference must denote an allocation distinct from every primal reference and every
+            // other destination. A primal reference retains its identity across generations, so it is rejected even
+            // if it advanced after the differentiated closure ran.
+            self.primal_references.validate_differentiation_arguments(
+                context,
+                destination_references
+                    .iter()
+                    .map(|&(index, reference)| (DifferentiationBoundaryPosition::Cotangent(index), reference)),
+            )?;
+
+            // Transpose under the derived destination and seed masks, reusing the retained transform cache on later
+            // applications. The compact boundary takes the live seeds, destination references, and primal residuals.
+            // The destination mask covers the linear program's tangent inputs and the seed mask covers its outputs.
+            // Both omit leaves whose tangent spaces contain only zero.
+            let mut transposition_kinds = Vec::with_capacity(destinations.len());
+            for (destination, primal_type) in destinations.iter().zip(&self.primal_input_types) {
+                if !primal_type.cotangent()?.is_zero_space() {
+                    transposition_kinds.push(destination.kind());
+                }
+            }
+
+            let program = self.linear_program.transpose_with_trailing_residuals_shared(
+                self.residuals.len(),
+                &zero_output_cotangents,
+                &transposition_kinds,
+            )?;
+
+            for (index, reference) in destination_references {
+                if !self.primal_input_types[index].cotangent()?.is_zero_space() {
+                    program_inputs.push(reference.clone());
+                }
+            }
+
+            for residual in &self.residuals {
+                program_inputs.push(context.import(residual.clone())?);
+            }
+
+            Ok((program, program_inputs))
+        })();
+        let (program, program_inputs) =
+            prepared.map_err(|error| deferred_seeds.drain(..).next().map_or(error, |(_, deferred)| deferred))?;
+        let entry = program.program().entry_region_ref();
+        let mut admitted = vec![false; program_inputs.len()];
+
+        // A deferred seed must have exactly one use, as an input of a regionless instruction. That instruction
+        // must infer the same output types when the seed replaces the declared input type, as a transposed
+        // placement can do by moving the seed from wherever it lives.
+        for (position, error) in deferred_seeds {
+            let Some(position) = position else { return Err(error) };
+            let seed_type = program_inputs[position].r#type();
+            let Some(&input_id) = entry.input_ids().get(position) else { return Err(error) };
+            if entry.output_ids().contains(&input_id) {
+                return Err(error);
+            }
+
+            let mut uses = entry.instructions().iter().flat_map(|instruction| {
+                let inputs = instruction.inputs().iter().enumerate().filter(|(_, id)| **id == input_id);
+                inputs.map(move |(input_position, _)| (instruction, input_position))
+            });
+
+            let (Some((instruction, input_position)), None) = (uses.next(), uses.next()) else { return Err(error) };
+            if !instruction.regions().is_empty() {
+                return Err(error);
+            }
+
+            let declared_input_types = instruction
+                .inputs()
                 .iter()
-                .map(|&(index, reference)| (DifferentiationBoundaryPosition::Cotangent(index), reference)),
-        )?;
+                .map(|id| entry.atoms()[id.index()].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let mut input_types_with_seed = declared_input_types.clone();
+            input_types_with_seed[input_position] = seed_type.as_ref().clone();
 
-        // Transpose under the derived destination and seed masks (served from the retained transform cache after the
-        // first application), close the compact cotangent boundary over the live seeds, the destination references and
-        // the primal residuals, and replay it in the originating context. The destination mask covers the linear
-        // program's tangent inputs and the seed mask its outputs, so the leaves whose tangent spaces contain only zero
-        // (and which the compact program omits) drop out of both.
-        let mut transposition_kinds = Vec::with_capacity(destinations.len());
-        for (destination, primal_type) in destinations.iter().zip(&self.primal_input_types) {
-            if !primal_type.cotangent()?.is_zero_space() {
-                transposition_kinds.push(destination.kind());
+            let operation = instruction.operation();
+            if !matches!(
+                (
+                    operation.infer_output_types(&declared_input_types, &[]),
+                    operation.infer_output_types(&input_types_with_seed, &[]),
+                ),
+                (Ok(declared_outputs), Ok(seed_outputs)) if declared_outputs == seed_outputs,
+            ) {
+                return Err(error);
             }
+
+            admitted[position] = true;
         }
-        let program = self.linear_program.transpose_with_trailing_residuals_shared(
-            self.residuals.len(),
-            &zero_output_cotangents,
-            &transposition_kinds,
-        )?;
-        for (index, reference) in destination_references {
-            if !self.primal_input_types[index].cotangent()?.is_zero_space() {
-                program_inputs.push(reference.clone());
-            }
-        }
-        for residual in &self.residuals {
-            program_inputs.push(context.import(residual.clone())?);
-        }
+
         let cotangent_types =
             self.primal_input_types.iter().map(|r#type| r#type.cotangent()).collect::<Result<Vec<_>, _>>()?;
         let live_cotangent_types =
             cotangent_types.iter().filter(|r#type| !r#type.is_zero_space()).cloned().collect::<Vec<_>>();
-        let outputs = program.program().interpret_in_context(context, program_inputs)?;
+        let outputs = entry.interpret_in_context_admitting(context, program_inputs, &admitted)?;
         let mut program_input_cotangents = program.assemble_cotangents(&live_cotangent_types, outputs)?.into_iter();
 
         // Restore type-omitted leaves without constructing values. Reference identity outputs are consumed by

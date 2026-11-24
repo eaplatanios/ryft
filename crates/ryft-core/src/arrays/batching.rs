@@ -1084,6 +1084,11 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 
     #[inline]
+    fn unbatched_relocatable_type(batch: &Self::Batch) -> Option<ArrayType> {
+        batch.value().relocatable_type()?.unbatched(batch.batch_axis()).ok()
+    }
+
+    #[inline]
     fn boundary_inputs(axis_extent: &Self::Extent) -> Vec<C::Value> {
         P::boundary_inputs(axis_extent)
     }

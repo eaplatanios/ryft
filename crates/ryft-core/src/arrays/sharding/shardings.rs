@@ -333,7 +333,10 @@ impl Sharding {
             && self.varying_manual_axes.is_empty()
     }
 
-    /// Returns the names of the mesh axes that are implicitly or explicitly replicated by this [`Sharding`].
+    /// Returns the names of explicit and manual mesh axes that count as replicated for placement, in mesh order.
+    /// This list excludes axes assigned to a dimension and axes marked as reduced or unreduced. Manual variation is
+    /// a typing fact, so a varying manual axis remains in the list when it has no dimension assignment or reduction
+    /// marker. See [`Self::distinguishes_shards_along`] for the roles that distinguish shard contributions.
     pub fn replicated_axes(&self) -> Vec<&str> {
         let mut used_axes = HashSet::new();
         for dimension in &self.dimensions {
@@ -1068,6 +1071,21 @@ mod tests {
             Sharding::along(mesh, "model", Some(0), 1),
             Err(ShardingError::UnknownMeshAxisName { name: "model".to_string() }),
         );
+    }
+
+    #[test]
+    fn test_sharding_replicated_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("reduced", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(mesh, 1)
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+        assert_eq!(sharding.replicated_axes(), vec!["varying"]);
     }
 
     #[test]

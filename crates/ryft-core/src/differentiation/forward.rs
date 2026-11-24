@@ -1897,6 +1897,12 @@ impl<C: Context, P: DifferentiationPolicy<C>> Value for DifferentiationTracer<C,
     fn domain(&self) -> DifferentiationContext<C, P> {
         self.context().clone()
     }
+
+    #[inline]
+    fn relocatable_type(&self) -> Option<C::Type> {
+        // A differentiation tracer is free to be placed elsewhere exactly when its primal is.
+        self.primal().relocatable_type()
+    }
 }
 
 /// [`DifferentiationContext`] used to linearize a function in `C`. Its [`PartialEvaluationContext`]s execute primal

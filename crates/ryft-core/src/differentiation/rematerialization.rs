@@ -276,7 +276,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::arrays::{ArrayIrType, ArrayType, Memory};
 use crate::axes::{MeshContext, NamedAxes};
-use crate::captures::CapturePlacementContext;
+use crate::captures::{CapturePlacement, CapturePlacementContext};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationRule;
 use crate::differentiation::forward::DifferentiableOperation;
@@ -398,10 +398,19 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        // The first input's domain determines whether inputs follow the call. In that case, trace relocatable inputs
+        // at their declared types so they can follow the call's placement.
         let mut input_values = Vec::new();
+        let mut follows_computation = None;
         let input_types = input
             .map_parameters(|value| {
-                let r#type = value.r#type().into_owned();
+                let follows_computation = *follows_computation
+                    .get_or_insert_with(|| value.domain().capture_placement() == CapturePlacement::FollowCall);
+                let r#type = if follows_computation && let Some(r#type) = value.relocatable_type() {
+                    r#type
+                } else {
+                    value.r#type().into_owned()
+                };
                 input_values.push(value);
                 r#type
             })
@@ -449,9 +458,15 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let mut input_values = Vec::new();
+        // When the context places inputs where the call runs, trace relocatable inputs at their declared types.
+        let follows_computation = context.capture_placement() == CapturePlacement::FollowCall;
         let input_types = input
             .map_parameters(|value| {
-                let r#type = value.r#type().into_owned();
+                let r#type = if follows_computation && let Some(r#type) = value.relocatable_type() {
+                    r#type
+                } else {
+                    value.r#type().into_owned()
+                };
                 input_values.push(value);
                 r#type
             })
