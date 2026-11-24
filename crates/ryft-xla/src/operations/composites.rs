@@ -5,7 +5,8 @@ use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Operation, Parameter, Placeholder, ProgramError, RematerializationOptimizationBarrier, Typed,
+    DifferentiableType, Instruction, Operation, Parameter, Placeholder, ProgramError, RegionRef,
+    RematerializationOptimizationBarrier, ScanOperation, Typed, Value,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
+use crate::operations::control_flow::scan::admits_iterations;
 use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
@@ -34,6 +36,37 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     };
     NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
         || nested_functions.is_some_and(|functions| functions.named(key, input_types, output_types).is_some())
+}
+
+/// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
+/// for a named composite call whose backend implementation replaces the whole call for that target (refer to
+/// [`NamedCompositeImplementation::select`]) and, on every target, for a scan whose length admits no iteration (refer
+/// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
+/// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
+/// functions that calls share (refer to `collect_jit_call_functions`), the traversal of the regions that lowering emits
+/// (refer to `emitted_regions`), the summaries of the placement requests and of the session constants of a region, and
+/// the validation of the placements of a compiled program (refer to `validate_placements`), so that a placement request
+/// or a captured array inside a region that lowering omits is never validated, placed, or passed.
+pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
+    region: RegionRef<'_, V, O>,
+    instruction: &Instruction<O>,
+    target_platform: Option<&str>,
+) -> bool {
+    if instruction
+        .operation()
+        .projected_payload::<ScanOperation<Type>>()
+        .is_some_and(|scan| !admits_iterations(scan))
+    {
+        return true;
+    }
+    let Some(key) = instruction.operation().composite_key() else {
+        return false;
+    };
+    let types = |atoms: &[ryft_core::AtomId]| {
+        atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
+    };
+    let (input_types, output_types) = (types(instruction.inputs()), types(instruction.outputs()));
+    NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
 }
 
 /// Backend implementation that replaces the calls of a named composite when the XLA lowering targets a

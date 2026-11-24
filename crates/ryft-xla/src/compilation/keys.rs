@@ -19,7 +19,7 @@ use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey, CompilationOpti
 use serde::Serialize;
 
 use crate::compilation::CompilationError;
-use crate::compilation::domains::apply_input_shardings;
+use crate::compilation::domains::{apply_input_shardings, argument_type};
 use crate::compilation::options::{InputBoundBucketing, Options};
 use crate::compilation::persistence::{
     PersistentArraySignature, PersistentBoundaryDimension, PersistentCanonicalArraySignature, PersistentDeviceMesh,
@@ -363,43 +363,53 @@ impl EagerDispatchKeyView for EagerDispatchQuery<'_> {
 
 /// Derives the retained dispatch key, the effective staged input types, and any options specialized on input
 /// placements for one dispatch request. This function implements
-/// [`CompilationSession::dispatch_signature`](ryft_core::CompilationSession::dispatch_signature) for
+/// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature) for
 /// [`Session`](crate::Session).
 pub(super) fn dispatch_signature(
-    inputs: DispatchInputs<'_, '_, Value>,
+    inputs: DispatchInputs<'_, Value>,
     options: &Options,
 ) -> Result<(DispatchKey, Arc<[Type]>, Option<Options>), Error> {
-    let (input_types, values) = match inputs {
-        DispatchInputs::Types(input_types) => (input_types, None),
-        DispatchInputs::Values { values, types } => (types, Some(values)),
-    };
-    let input_count = input_types.len();
-    // Only independent executable requests apply bucketing. Staged calls retain their caller's signature.
-    let bucketing = values.as_ref().and(options.input_bound_bucketing());
-    let (key, input_types) = normalize_dispatch_signature(input_types, options, bucketing)?;
-    let Some(inputs) = values.filter(|_| options.input_shardings().is_none()) else {
-        return Ok((key, input_types, None));
-    };
-
-    // Only placements that name auto mesh axes are missing from the input types, and the placement vector is only
-    // allocated once such an input appears, so that ordinary calls pay for no allocation.
-    let mut placements = None::<Vec<Option<Sharding>>>;
-    for (index, input) in inputs.enumerate() {
-        match input {
-            Value::Array(array) if array.sharding().references_auto_axis() => {
-                placements.get_or_insert_with(|| vec![None; index]).push(Some(array.sharding().clone()))
-            }
-            _ => {
-                if let Some(placements) = &mut placements {
-                    placements.push(None);
+    let mut inputs = match inputs {
+        DispatchInputs::Call(mut inputs) => {
+            // Available runtime values inform the staged types. The enclosing call determines actual placement.
+            for (input_type, input) in &mut inputs {
+                if let (Type::Array(array_type), Some(Value::Array(array))) = (&*input_type, *input)
+                    && let Some(relocated_type) = argument_type(array, array_type)
+                {
+                    *input_type = Type::Array(relocated_type);
                 }
             }
+            let (key, input_types) = normalize_dispatch_signature(inputs, options, None)?;
+            return Ok((key, input_types, None));
+        }
+        DispatchInputs::Values(inputs) => inputs,
+    };
+
+    // A relocatable argument is specialized for the same type as in a staged call. The executable signature for
+    // other arguments records runtime placements that name auto mesh axes, which the input types omit.
+    let mut placements = None::<Vec<Option<Sharding>>>;
+    for (index, (input_type, input)) in inputs.iter_mut().enumerate() {
+        let placement = match (*input, &*input_type) {
+            (Value::Array(array), Type::Array(array_type)) => match argument_type(array, array_type) {
+                Some(relocated_type) => {
+                    *input_type = Type::Array(relocated_type);
+                    None
+                }
+                None => array.sharding().references_auto_axis().then(|| array.sharding().clone()),
+            },
+            (Value::Array(array), _) => array.sharding().references_auto_axis().then(|| array.sharding().clone()),
+            _ => None,
+        };
+        match (placement, &mut placements) {
+            (Some(placement), placements) => placements.get_or_insert_with(|| vec![None; index]).push(Some(placement)),
+            (None, Some(placements)) => placements.push(None),
+            (None, None) => {}
         }
     }
-    let Some(mut placements) = placements else {
+    let (key, input_types) = normalize_dispatch_signature(inputs, options, options.input_bound_bucketing())?;
+    let Some(placements) = placements.filter(|_| options.input_shardings().is_none()) else {
         return Ok((key, input_types, None));
     };
-    placements.resize(input_count, None);
     let placements: Arc<[_]> = placements.into();
     let options = options.clone().with_input_placements(Arc::clone(&placements));
     Ok((DispatchKey { placements: Some(placements), ..key }, input_types, Some(options)))
@@ -439,39 +449,6 @@ struct BucketedDispatchSignature {
 
     /// Bucketed input array types with their shapes rewritten into patterns of variable indices.
     input_types: Vec<BucketedArrayTypeKey>,
-}
-
-impl BucketedDispatchSignature {
-    /// Builds a dispatch key from the already bucketed `input_types`, numbering dimension variables by first
-    /// occurrence.
-    fn new(input_types: &[ArrayType]) -> Self {
-        let mut variables = Vec::<DimensionVariable>::new();
-        let input_types = input_types
-            .iter()
-            .map(|array_type| BucketedArrayTypeKey {
-                carrier: array_type.clone().with_shape(Shape::new(Vec::new())),
-                dimensions: array_type
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .map(|dimension| match dimension {
-                        Dimension::Static(extent) => BucketedDimensionKey::Static(*extent),
-                        Dimension::Dynamic(variable) => {
-                            let index =
-                                variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
-                                    variables.push(variable.clone());
-                                    variables.len() - 1
-                                });
-                            BucketedDimensionKey::Variable(index)
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-        let variables =
-            variables.iter().map(|variable| (variable.bounds().lower(), variable.bounds().upper())).collect();
-        Self { variables, input_types }
-    }
 }
 
 /// One bucketed input array type split into a carrier without a shape and a shape pattern of canonical variable
@@ -703,16 +680,27 @@ pub(crate) fn canonical_compilation_options_bytes(options: &CompilationOptions) 
 }
 
 /// Applies input sharding declarations and optional executable bucketing, without inspecting runtime values.
-fn normalize_dispatch_signature(
-    input_types: Vec<Type>,
+fn normalize_dispatch_signature<T>(
+    mut inputs: Vec<(Type, T)>,
     options: &Options,
     bucketing: Option<InputBoundBucketing>,
 ) -> Result<(DispatchKey, Arc<[Type]>), Error> {
-    let input_types = apply_input_shardings(input_types, options)?;
-    let Some(bucketing) = bucketing else {
-        let input_types: Arc<[Type]> = input_types.into();
-        return Ok((DispatchKey::new(DispatchKeyKind::Exact(input_types.clone())), input_types));
-    };
+    apply_input_shardings(&mut inputs, options, |(r#type, _)| r#type)?;
+    let bucketed = bucketing
+        .map(|bucketing| bucket_dispatch_signature(inputs.iter_mut().map(|(r#type, _)| r#type), options, bucketing))
+        .transpose()?;
+    // The projection retains the exact length, so collecting allocates the shared type slice directly.
+    let input_types: Arc<[_]> = inputs.into_iter().map(|(r#type, _)| r#type).collect();
+    let kind = bucketed.map_or_else(|| DispatchKeyKind::Exact(input_types.clone()), DispatchKeyKind::Bucketed);
+    Ok((DispatchKey::new(kind), input_types))
+}
+
+/// Buckets the effective input types in place and numbers dimension variables by first occurrence across the inputs.
+fn bucket_dispatch_signature<'t>(
+    input_types: impl ExactSizeIterator<Item = &'t mut Type>,
+    options: &Options,
+    bucketing: InputBoundBucketing,
+) -> Result<BucketedDispatchSignature, Error> {
     if options.mesh().devices().len() > 1 {
         return Err(Error::Compilation(CompilationError::InvalidOptions {
             reason: "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
@@ -720,8 +708,9 @@ fn normalize_dispatch_signature(
                 .to_string(),
         }));
     }
-    let mut bucketed_array_types = Vec::with_capacity(input_types.len());
-    for (input_index, r#type) in input_types.iter().enumerate() {
+    let mut variables = Vec::<DimensionVariable>::new();
+    let mut bucketed_input_types = Vec::with_capacity(input_types.len());
+    for (input_index, r#type) in input_types.enumerate() {
         let array_type = match r#type {
             Type::Array(array_type) => array_type,
             Type::Dimension(_) => {
@@ -761,11 +750,28 @@ fn normalize_dispatch_signature(
                 Dimension::Dynamic(variable) => Ok(Dimension::Dynamic(variable.clone())),
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
+        *array_type = array_type.clone().with_shape(Shape::new(dimensions));
+        bucketed_input_types.push(BucketedArrayTypeKey {
+            carrier: array_type.clone().with_shape(Shape::new(Vec::new())),
+            dimensions: array_type
+                .shape()
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    Dimension::Static(extent) => BucketedDimensionKey::Static(*extent),
+                    Dimension::Dynamic(variable) => {
+                        let index = variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
+                            variables.push(variable.clone());
+                            variables.len() - 1
+                        });
+                        BucketedDimensionKey::Variable(index)
+                    }
+                })
+                .collect(),
+        });
     }
-    let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
-    let input_types = bucketed_array_types.into_iter().map(Type::Array).collect::<Vec<_>>();
-    Ok((DispatchKey::new(DispatchKeyKind::Bucketed(key)), input_types.into()))
+    let variables = variables.iter().map(|variable| (variable.bounds().lower(), variable.bounds().upper())).collect();
+    Ok(BucketedDispatchSignature { variables, input_types: bucketed_input_types })
 }
 
 #[cfg(test)]
@@ -774,11 +780,13 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, CompilationCacheDomain, CompilationDomain, CompilationTracer, Compile,
-        CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation, DataType, Device,
-        Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, LogicalMesh, Memory, Place, Placeholder, ReduceOperation,
-        ReductionKind, ReferenceType, Shape, Sharding, ShardingDimension, Sin, StaticShape,
+        AddOperation, ArrayType, BatchAxis, BatchAxisSpecification, CompilationCacheDomain, CompilationDomain,
+        CompilationTracer, Compile, CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation,
+        DataType, Device, Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionType,
+        DimensionValue, DimensionVariable, DynamicBroadcastOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        PartialEvaluationContext, PartialEvaluationValue, PartialTracer, Place, Placeholder, ReduceOperation,
+        ReductionKind, ReferenceType, Shape, Sharding, ShardingDimension, Sin, StaticShape, ValueProjection,
+        batch_in_parent, differentiate_in_parent_at,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionOverride};
     #[cfg(feature = "cuda-13")]
@@ -795,7 +803,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
         Array, CompileTracer, Constant, CustomCallOperationExtension, Dimension, Error, FromPjrt, Operation,
-        ProgramBuilder, RuntimeRequirement, Session, Type, Value,
+        ProgramBuilder, RuntimeRequirement, Session, Type, Value, compile, jit,
     };
 
     use super::*;
@@ -818,6 +826,316 @@ mod tests {
             .context()
             .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
             .remove(0))
+    }
+
+    #[test]
+    fn test_dispatch_signature_relocates_uncommitted_arguments() {
+        // A `jit` dispatcher and a function compiled ahead of time for the type that the dispatcher specializes for
+        // agree, at a direct execution and at an eager call, for every argument and every mesh of the function. An
+        // uncommitted argument that records nothing beyond replication follows the call (the function compiled ahead of
+        // time is compiled for its type without a sharding), whereas the mesh of the function still rejects a
+        // committed argument or a split over another logical mesh. Before, every dispatcher on a named mesh of one
+        // device rejected an uncommitted upload with "mesh mismatch". Each observation includes the runtime sharding of
+        // the result, because an eager call and an execution of one dispatcher must view an uncommitted argument alike
+        // (refer to `argument_type`): before, an eager call specialized for its type on the canonical mesh of its
+        // device, so it rejected a placement onto a bare device that every other entry point accepted.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2f32]);
+        let mesh = |name: &str, axis_type: MeshAxisType, devices: Vec<Device>| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(name, devices.len(), axis_type).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, devices).unwrap()
+        };
+        let split = |axis_type: MeshAxisType| {
+            let mesh = mesh("x", axis_type, devices.clone());
+            let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(sharding), bytes.clone()).unwrap()
+        };
+        let uncommitted = Array::from_host_buffer(&session, vector_type.clone(), None, None, bytes.clone()).unwrap();
+        let one_device_split = |committed: bool| {
+            let mesh = mesh("x", MeshAxisType::Auto, vec![devices[0]]);
+            let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let array = Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(sharding), bytes.clone());
+            array.unwrap().with_committed(committed)
+        };
+        let arguments = [
+            ("uncommitted", uncommitted.clone()),
+            ("committed here", uncommitted.to_placement(&session, devices[0]).unwrap()),
+            ("committed elsewhere", uncommitted.to_placement(&session, devices[1]).unwrap()),
+            ("split along an auto axis", split(MeshAxisType::Auto)),
+            ("split along an explicit axis", split(MeshAxisType::Explicit)),
+            ("split along an auto axis of one device", one_device_split(true)),
+            ("uncommitted split along an auto axis of one device", one_device_split(false)),
+        ];
+        let meshes = [
+            ("named here", mesh("q", MeshAxisType::Explicit, vec![devices[0]])),
+            ("named elsewhere", mesh("q", MeshAxisType::Explicit, vec![devices[1]])),
+            ("two devices", mesh("x", MeshAxisType::Auto, devices.clone())),
+            ("one device", mesh("x", MeshAxisType::Auto, vec![devices[0]])),
+        ];
+        let observe = |result: Result<Array, Error>| {
+            result
+                .map(|array| {
+                    let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+                    let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+                    (devices, array.is_committed(), values, array.sharding().to_string())
+                })
+                .map_err(|error| error.to_string())
+        };
+        let mut uncommitted_rows = Vec::new();
+        let mut split_rows = Vec::new();
+        for (mesh_name, mesh) in &meshes {
+            let dispatcher = jit::<_, (), ArrayType, ArrayType>(|(), x| Ok(x), &session, mesh.clone());
+            for (argument_name, argument) in &arguments {
+                let aot_type =
+                    if argument.is_committed() { argument.r#type().into_owned() } else { vector_type.clone() };
+                let execution = observe(dispatcher.execute((), argument.clone()));
+                let call = observe(dispatcher.call((), argument.clone()).map_err(Error::from));
+                match compile::<_, ArrayType, ArrayType>(|x| x, aot_type, &session, mesh.clone()) {
+                    Ok(compiled) => {
+                        let aot_execution = observe(compiled.executable().execute(&session, argument.clone()));
+                        let aot_call = observe(compiled.call(argument.clone()).map_err(Error::from));
+                        // A dispatcher keeps the placement of a committed split along an auto axis, which a function
+                        // compiled for its type replicates (refer to the register entry "A call of a `jit` dispatcher
+                        // keeps its inputs where they are"), so the runtime shardings are compared below instead.
+                        let placed = |observation: &Result<_, String>| {
+                            observation.clone().map(|(devices, committed, values, _)| (devices, committed, values))
+                        };
+                        assert_eq!(
+                            (placed(&execution), placed(&call)),
+                            (placed(&aot_execution), placed(&aot_call)),
+                            "{mesh_name}, {argument_name}",
+                        );
+                    }
+                    // The mesh of the function rejects the type of a committed argument or of a split over another
+                    // logical mesh, ahead of time and at a direct execution of the dispatcher alike, whereas an eager
+                    // call of the dispatcher keeps such an argument where it is (refer to the register entry "A call
+                    // of a `jit` dispatcher keeps its inputs where they are").
+                    Err(error) => {
+                        assert_eq!(execution, Err(error.to_string()), "{mesh_name}, {argument_name}");
+                        assert!(call.is_ok(), "{mesh_name}, {argument_name}");
+                    }
+                }
+                if !argument.is_committed() {
+                    uncommitted_rows.push((*mesh_name, *argument_name, execution, call));
+                } else if *argument_name == "split along an auto axis of one device" {
+                    split_rows.push((*mesh_name, execution, call));
+                }
+            }
+        }
+
+        // A placement of an uncommitted argument onto the bare device of a mesh of one device commits the result there,
+        // at every entry point alike.
+        let mut placement_rows = Vec::new();
+        for (mesh_name, mesh) in &meshes[..2] {
+            let device = mesh.devices()[0];
+            let context = session.with_device_mesh(mesh.clone());
+            let dispatcher = jit::<_, (), ArrayType, ArrayType>(
+                move |(), x: CompileTracer| Ok(x.place(&device, None)?),
+                &session,
+                mesh.clone(),
+            );
+            let compiled = compile::<_, ArrayType, ArrayType>(
+                move |x: CompileTracer| x.place(&device, None).unwrap(),
+                vector_type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            let observations = [
+                observe(dispatcher.execute((), uncommitted.clone())),
+                observe(dispatcher.call((), uncommitted.clone()).map_err(Error::from)),
+                observe(dispatcher.call_in_context(&context, (), uncommitted.clone()).map_err(Error::from)),
+                observe(compiled.executable().execute(&session, uncommitted.clone())),
+                observe(compiled.call(uncommitted.clone()).map_err(Error::from)),
+            ];
+            assert!(
+                observations.iter().all(|observation| *observation == observations[0]),
+                "{mesh_name}: {observations:#?}",
+            );
+            placement_rows.push((*mesh_name, observations[0].clone()));
+        }
+        let values = vec![1f32, 2f32];
+        let placed = |device: usize| Ok((vec![device], true, values.clone(), "{mesh<['q'=1:explicit]>, [{}]}".into()));
+        assert_eq!(placement_rows, vec![("named here", placed(0)), ("named elsewhere", placed(1))]);
+
+        // An execution places an uncommitted argument on the mesh of the function, whereas an eager call keeps it where
+        // it is (refer to the register entry "A call of a `jit` dispatcher keeps its inputs where they are"). A split
+        // of an uncommitted argument along an auto axis is relocatable, so neither keeps it, whereas both keep the
+        // split of a committed one.
+        let on = |devices: Vec<usize>, committed: bool, sharding: &str| {
+            Ok::<_, String>((devices, committed, values.clone(), sharding.to_string()))
+        };
+        let canonical = on(vec![0], false, "{mesh<['device'=1:auto]>, [{}]}");
+        let canonical_split = on(vec![0], false, "{mesh<['x'=1:auto]>, [{}]}");
+        let named = |device: usize| on(vec![device], false, "{mesh<['q'=1:explicit]>, [{}]}");
+        let one_device_split = "uncommitted split along an auto axis of one device";
+        let both_devices = on(vec![0, 1], true, "{mesh<['x'=2:auto]>, [{}]}");
+        assert_eq!(
+            uncommitted_rows,
+            vec![
+                ("named here", "uncommitted", named(0), canonical.clone()),
+                ("named here", one_device_split, named(0), canonical_split.clone()),
+                ("named elsewhere", "uncommitted", named(1), canonical.clone()),
+                ("named elsewhere", one_device_split, named(1), canonical_split.clone()),
+                ("two devices", "uncommitted", both_devices.clone(), canonical.clone()),
+                ("two devices", one_device_split, both_devices, canonical_split.clone()),
+                ("one device", "uncommitted", canonical_split.clone(), canonical),
+                ("one device", one_device_split, canonical_split.clone(), canonical_split),
+            ],
+        );
+        let kept_split = on(vec![0], true, "{mesh<['x'=1:auto]>, [{'x'}]}");
+        assert_eq!(split_rows.last(), Some(&("one device", kept_split.clone(), kept_split)));
+    }
+
+    #[test]
+    fn test_dispatch_signature_relocates_uncommitted_arguments_under_transforms() {
+        // A call of a `jit` dispatcher under JVP, batching, or partial evaluation with a known input sees the runtime
+        // value that the transform wraps (i.e., the primal of a dual, the packed value of a batch, or a known value,
+        // refer to `ImportingContext::as_source_value`), so it specializes an uncommitted argument for its type without
+        // a sharding and places it on the named mesh of one device, as `.call` does. Before, each of these specialized
+        // for the canonical upload mesh and rejected the argument with a mesh mismatch, both on the device where the
+        // argument lives and on another one.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let values = vec![1f32, 2f32];
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let uncommitted = Array::from_host_buffer(&session, vector_type, None, None, values_to_bytes(&values)).unwrap();
+        let observe = |result: Result<Array, String>| {
+            result.map(|array| {
+                let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+                let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+                (devices, array.is_committed(), values, array.sharding().to_string())
+            })
+        };
+        let program_error = |error: Error| ProgramError::InvalidArgument { message: error.to_string() };
+        for index in [0, 1] {
+            let device = Device::from_pjrt(&client.addressable_devices().unwrap()[index]).unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+            let place = move |(), x: CompileTracer| -> Result<CompileTracer, Error> { Ok(x.place(&device, None)?) };
+            let dispatcher = jit::<_, (), ArrayType, ArrayType>(place, &session, mesh);
+            let call = dispatcher.call((), uncommitted.clone()).map_err(|error| error.to_string());
+            let (primal, tangent) = match differentiate_in_parent_at(uncommitted.clone())
+                .jvp(uncommitted.clone(), |x| dispatcher.call((), x).map_err(program_error))
+            {
+                Ok((primal, tangent)) => (Ok(primal), Ok(tangent)),
+                Err(error) => (Err(error.to_string()), Err(error.to_string())),
+            };
+            let batched = batch_in_parent(
+                |x| dispatcher.call((), x).map_err(program_error),
+                uncommitted.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::default(),
+            )
+            .map_err(|error| error.to_string());
+            let context = PartialEvaluationContext::new(session.clone());
+            let known = PartialEvaluationValue::known(Value::Array(uncommitted.clone()));
+            let known = ValueProjection::<ArrayType>::into_projected(PartialTracer::new(context.clone(), known));
+            let partial = dispatcher
+                .call_in_context(&context, (), known.unwrap())
+                .map_err(|error| error.to_string())
+                .and_then(|output| output.into_value().into_value().map_err(|error| error.to_string()))
+                .and_then(|output| match output.as_known() {
+                    Some(Value::Array(array)) => Ok(array.clone()),
+                    _ => Err("expected a known array".to_string()),
+                });
+            let expected = Ok((vec![index], true, values.clone(), "{mesh<['q'=1:explicit]>, [{}]}".to_string()));
+            assert_eq!(observe(call), expected.clone());
+            assert_eq!(
+                [primal, tangent, batched, partial].map(observe),
+                [expected.clone(), expected.clone(), expected.clone(), expected],
+                "device {index}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_signature_keeps_mixed_call_inputs_aligned() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let uncommitted = f32_vector(&session, &mesh, &[1.0, 2.0]).with_committed(false);
+        let declared = uncommitted.r#type().into_owned();
+        let normalized = declared.clone().with_sharding(None).unwrap();
+        assert_ne!(declared, normalized);
+
+        // Only the inputs with concrete values lose their incidental placement.
+        let expected = [declared.clone(), normalized.clone(), declared.clone(), normalized, declared.clone()];
+        let dispatcher = jit::<_, (), Vec<ArrayType>, ArrayType>(
+            move |(), inputs: Vec<CompileTracer>| {
+                assert_eq!(inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), expected);
+                Ok(inputs[1].clone())
+            },
+            &session,
+            mesh,
+        );
+        let context = PartialEvaluationContext::new(session.clone());
+        let unknown = |index| context.unknown_input(Type::Array(declared.clone()), index);
+        let known = || PartialEvaluationValue::known(Value::Array(uncommitted.clone()));
+        let inputs = [unknown(0), known(), unknown(1), known(), unknown(2)]
+            .into_iter()
+            .map(|value| {
+                ValueProjection::<ArrayType>::into_projected(PartialTracer::new(context.clone(), value)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        dispatcher.call_in_context(&context, (), inputs).unwrap();
+    }
+
+    #[test]
+    fn test_dispatch_signature_validates_declared_sharding_before_call_normalization() {
+        let client = cpu_client(1);
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let session = Session::builder().client(client).build().unwrap();
+        let values = [1.0f32, 2.0];
+        // The declaration names a sharding that the concrete input satisfies. A relocatable argument loses that
+        // sharding when staged, so validating the normalized type would reject this valid input.
+        let array = f32_vector(&session, &mesh, &values).with_committed(false);
+        let declared = array.r#type().into_owned();
+        assert_eq!(declared.sharding(), Some(array.sharding()));
+        let normalized = Type::Array(declared.clone().with_sharding(None).unwrap());
+        let dispatcher: CompiledFunctionDispatcher<Session, (), Type, Type, _> = session.jit_with_options(
+            move |(), input: CompilationTracer<Session>| {
+                assert_eq!(input.r#type().as_ref(), &normalized);
+                Ok(input)
+            },
+            Options::new(mesh.clone()),
+        );
+        let declared_type = declared.clone();
+        let dispatcher = dispatcher.with_staged_input_types(Some(Type::Array(declared))).unwrap();
+        let input = Value::Array(array);
+        let called = dispatcher.call((), input.clone()).unwrap();
+        let executed = dispatcher.execute((), input).unwrap();
+        let called = program_array(&called);
+        let executed = program_array(&executed);
+        assert_eq!(called.mesh(), executed.mesh());
+        assert_eq!(called.sharding(), executed.sharding());
+        assert_eq!(called.is_committed(), executed.is_committed());
+        assert_eq!(called.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+        assert_eq!(executed.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        let other_mesh = domain_mesh(client, "other", 1);
+        let incompatible = f32_vector(&session, &other_mesh, &values).with_committed(false);
+        let message = format!(
+            "compilation input `$` has type `{}`, which does not refine its declared staged type `{}`",
+            Type::Array(incompatible.r#type().into_owned()),
+            Type::Array(declared_type),
+        );
+        let incompatible = Value::Array(incompatible);
+        let call_error = dispatcher.call((), incompatible.clone()).unwrap_err();
+        let execute_error = dispatcher.execute((), incompatible).unwrap_err();
+        assert_eq!(call_error.to_string(), message);
+        assert_eq!(execute_error.to_string(), message);
     }
 
     #[test]
@@ -984,19 +1302,40 @@ mod tests {
         let options = Options::new(mesh).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
 
         let (key, staged_types, specialized_options) =
-            Session::dispatch_signature(DispatchInputs::Types(input_types.clone()), &options).unwrap();
+            Session::dispatch_signature(DispatchInputs::Call(vec![(input_types[0].clone(), None)]), &options).unwrap();
         assert_eq!(key, DispatchKey::new(DispatchKeyKind::Exact(input_types.clone().into())));
         assert_eq!(staged_types.as_ref(), input_types.as_slice());
         assert_eq!(specialized_options, None);
 
-        let (key, executable_types, specialized_options) = Session::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&input), types: input_types.clone() },
+        let call_signature =
+            Session::dispatch_signature(DispatchInputs::Call(vec![(input_types[0].clone(), Some(&input))]), &options)
+                .unwrap();
+        assert_eq!(call_signature, (key, staged_types, specialized_options));
+
+        // A missing value leaves the first input's declaration in place. Only the second input is relocatable.
+        let array = program_array(&input);
+        let declared = array.r#type().into_owned();
+        let normalized = declared.clone().with_sharding(None).unwrap();
+        assert_ne!(normalized, declared);
+        let relocated = Value::Array(array.clone().with_committed(false));
+        let (_, staged_types, _) = Session::dispatch_signature(
+            DispatchInputs::Call(vec![
+                (Type::Array(declared.clone()), None),
+                (Type::Array(declared.clone()), Some(&relocated)),
+            ]),
             &options,
         )
         .unwrap();
+        assert_eq!(staged_types.as_ref(), &[Type::Array(declared), Type::Array(normalized)]);
+
+        let (key, executable_types, specialized_options) =
+            Session::dispatch_signature(DispatchInputs::Values(vec![(input_types[0].clone(), &input)]), &options)
+                .unwrap();
         assert_eq!(
             key,
-            normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing()).unwrap().0
+            normalize_dispatch_signature(vec![(input_types[0].clone(), ())], &options, options.input_bound_bucketing())
+                .unwrap()
+                .0,
         );
         let [Type::Array(array_type)] = executable_types.as_ref() else {
             panic!("the executable signature must contain one array");
@@ -1037,38 +1376,57 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(replicated_input.r#type(), tiled_input.r#type());
-        let input_types = vec![replicated_input.r#type().into_owned()];
+        let input_type = replicated_input.r#type().into_owned();
         let options = Options::new(mesh);
         let (replicated_key, replicated_types, replicated_options) = Session::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
+            DispatchInputs::Values(vec![(input_type.clone(), &replicated_input)]),
             &options,
         )
         .unwrap();
-        let (tiled_key, tiled_types, tiled_options) = Session::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types.clone() },
-            &options,
-        )
-        .unwrap();
+        let (tiled_key, tiled_types, tiled_options) =
+            Session::dispatch_signature(DispatchInputs::Values(vec![(input_type.clone(), &tiled_input)]), &options)
+                .unwrap();
         assert_ne!(replicated_key, tiled_key);
         assert_eq!(replicated_types, tiled_types);
         assert_eq!(replicated_options, None);
-        assert_eq!(tiled_options, Some(options.clone().with_input_placements(vec![Some(tiled)].into())),);
+        assert_eq!(tiled_options, Some(options.clone().with_input_placements(vec![Some(tiled.clone())].into())),);
+
+        let (_, _, mixed_options) = Session::dispatch_signature(
+            DispatchInputs::Values(vec![
+                (input_type.clone(), &replicated_input),
+                (input_type.clone(), &tiled_input),
+                (input_type.clone(), &replicated_input),
+            ]),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(mixed_options, Some(options.clone().with_input_placements(vec![None, Some(tiled), None].into())));
+
+        let call_signature =
+            Session::dispatch_signature(DispatchInputs::Call(vec![(input_type.clone(), Some(&tiled_input))]), &options)
+                .unwrap();
+        assert_eq!(call_signature, (replicated_key.clone(), replicated_types, None));
 
         // A declared sharding determines placement instead of the actual placement of either input.
         let options = options.with_input_shardings(vec![replicated]);
         let replicated_signature = Session::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&replicated_input), types: input_types.clone() },
+            DispatchInputs::Values(vec![(input_type.clone(), &replicated_input)]),
             &options,
         )
         .unwrap();
-        let tiled_signature = Session::dispatch_signature(
-            DispatchInputs::Values { values: &mut std::iter::once(&tiled_input), types: input_types },
-            &options,
-        )
-        .unwrap();
+        let tiled_signature =
+            Session::dispatch_signature(DispatchInputs::Values(vec![(input_type, &tiled_input)]), &options).unwrap();
         assert_eq!(replicated_signature, tiled_signature);
         assert_eq!(replicated_signature.0, replicated_key);
         assert_eq!(replicated_signature.2, None);
+
+        let unsharded = program_array(&tiled_input).r#type().into_owned().with_sharding(None).unwrap();
+        let call_signature = Session::dispatch_signature(
+            DispatchInputs::Call(vec![(Type::Array(unsharded), Some(&tiled_input))]),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(call_signature, tiled_signature);
     }
 
     #[test]
@@ -1323,7 +1681,7 @@ mod tests {
             Options::new(single_device_mesh.clone()).with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
         let dimension_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         assert!(matches!(
-            normalize_dispatch_signature(vec![dimension_type.clone().into()], &bucketed_options, bucketing),
+            normalize_dispatch_signature(vec![(dimension_type.clone().into(), ())], &bucketed_options, bucketing),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == format!(
                     "input-bound bucketing only supports array inputs, but input 0 has first-class dimension type \
@@ -1336,7 +1694,7 @@ mod tests {
         let reference_input_types: Arc<[Type]> = vec![Type::Reference(reference_type.clone())].into();
         assert_eq!(
             normalize_dispatch_signature(
-                reference_input_types.to_vec(),
+                vec![(Type::Reference(reference_type.clone()), ())],
                 &Options::new(single_device_mesh.clone()),
                 None
             )
@@ -1345,7 +1703,7 @@ mod tests {
         );
         assert!(matches!(
             normalize_dispatch_signature(
-                vec![Type::Reference(reference_type.clone())],
+                vec![(Type::Reference(reference_type.clone()), ())],
                 &bucketed_options,
                 bucketing,
             ),
@@ -1368,7 +1726,7 @@ mod tests {
             .with_input_bound_bucketing(InputBoundBucketing::PowerOfTwo);
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]));
         assert!(matches!(
-            normalize_dispatch_signature(vec![vector_type.into()], &multi_device_options, bucketing),
+            normalize_dispatch_signature(vec![(vector_type.into(), ())], &multi_device_options, bucketing),
             Err(Error::Compilation(CompilationError::InvalidOptions { reason }))
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                               signatures require disabling the Shardy partitioner",
@@ -1377,7 +1735,7 @@ mod tests {
         // Multi-device bucketing is rejected before inspecting individual input kinds.
         assert!(matches!(
             normalize_dispatch_signature(
-                vec![Type::Reference(reference_type.clone())],
+                vec![(Type::Reference(reference_type.clone()), ())],
                 &multi_device_options,
                 bucketing,
             ),
@@ -1396,13 +1754,14 @@ mod tests {
         let vector_type =
             |dimension: CoreDimension| Type::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
         let key = |input_types: Vec<Type>| {
-            normalize_dispatch_signature(input_types, &options, options.input_bound_bucketing()).unwrap().0
+            let inputs = input_types.into_iter().map(|r#type| (r#type, ())).collect();
+            normalize_dispatch_signature(inputs, &options, options.input_bound_bucketing()).unwrap().0
         };
 
         // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
         // types carry the generated variable name of each axis, which the key itself excludes.
         let (three_key, three_types) = normalize_dispatch_signature(
-            vec![vector_type(CoreDimension::Static(3))],
+            vec![(vector_type(CoreDimension::Static(3)), ())],
             &options,
             options.input_bound_bucketing(),
         )
@@ -1419,9 +1778,11 @@ mod tests {
         assert_eq!(variable.bounds(), bounds);
 
         // Signatures requested for staging preserve the caller's types without executable dispatch bucketing.
-        let (_, staged_types, _) =
-            Session::dispatch_signature(DispatchInputs::Types(vec![vector_type(CoreDimension::Static(3))]), &options)
-                .unwrap();
+        let (_, staged_types, _) = Session::dispatch_signature(
+            DispatchInputs::Call(vec![(vector_type(CoreDimension::Static(3)), None)]),
+            &options,
+        )
+        .unwrap();
         assert_eq!(staged_types.as_ref(), &[vector_type(CoreDimension::Static(3))]);
 
         // Dimension variables are keyed by their bounds and by the pattern in which inputs share them, numbered by

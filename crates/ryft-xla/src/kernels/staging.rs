@@ -547,7 +547,7 @@ where
             }
             context.residualize(self.clone(), regions, inputs)
         } else {
-            context.fold_or_residualize(self.clone(), regions, inputs)
+            context.fold_or_residualize(self.clone(), regions, inputs, None)
         }
     }
 }

@@ -35,7 +35,8 @@ use ryft_mlir::{
 };
 
 use crate::compilation::domains::{
-    boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
+    argument_type, boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
+    states_boundary_placement,
 };
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
@@ -44,7 +45,7 @@ use crate::lowering::{
     CollectiveLoweringState, EffectTokens, collect_session_constants, entry_boundary_sharding,
     has_placement_requests_in_region, has_untracked_auto_axes, validate_declared_pending_reduction,
 };
-use crate::operations::composites::NamedCompositeImplementation;
+use crate::operations::composites::omits_regions;
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};
@@ -243,7 +244,9 @@ where
         // caller's effect token in program order, which a shared token-free function could not preserve. That
         // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
         // reference session constants also inline, because only the entry function receives their hidden arguments.
-        if count < 2 || !lowered_effect_classes(&program)?.is_empty() || !collect_session_constants(&program).is_empty()
+        if count < 2
+            || !lowered_effect_classes(&program)?.is_empty()
+            || !collect_session_constants(&program, target_platform).is_empty()
         {
             continue;
         }
@@ -640,23 +643,28 @@ impl<T: CoreType> JitCallOperation<T> {
         self.mesh.as_ref()
     }
 
-    /// Returns the device mesh that this call of `callee` names (refer to [`Self::mesh`]), which is the mesh that it
-    /// records when it has a sharding override or when `callee` requests a placement that names devices (refer to
-    /// `has_placement_requests_in_region`), and [`None`] otherwise. The mesh is recorded when the function is staged,
-    /// from its whole program, so a call whose outputs pruning dropped (refer to `pruned_program`) can record a mesh
-    /// that only a request of a dropped output named, which this function no longer reports, as JAX lowers a nested
-    /// `jit` function pruned to the outputs that its caller uses and so without the shardings of the dropped ones.
-    pub(crate) fn names_devices<V, O>(&self, callee: RegionRef<'_, V, O>) -> Option<&DeviceMesh>
-    where
-        V: CoreValue<Type = Type>,
-        O: CoreOperation<Type = Type> + OperationPayloadProjection,
-    {
+    /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when it
+    /// states a placement at its boundary (refer to [`Self::states_boundary_placement`]) or when its callee requests a
+    /// placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
+    /// `has_placement_requests_in_region`), which `callee_names_devices` says and which is asked only when the call
+    /// records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when the
+    /// function is staged, from its whole program, so a call whose outputs pruning dropped (refer to `pruned_program`)
+    /// can record a mesh that only a request of a dropped output named, which this function no longer reports, as JAX
+    /// lowers a nested `jit` function pruned to the outputs that its caller uses and so without the shardings of the
+    /// dropped ones. The analysis of a program (refer to `placement_requests` and `pruned_program`) answers
+    /// `callee_names_devices` with the facts of the callee that it derives in the same pass over the program, so that it
+    /// never analyses a callee again for each call that encloses it.
+    pub(crate) fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
-        let overrides = [&self.input_shardings, &self.output_shardings]
-            .into_iter()
-            .flatten()
-            .any(|shardings| shardings.iter().any(Option::is_some));
-        (overrides || has_placement_requests_in_region(callee, false)).then_some(mesh)
+        (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
+    }
+
+    /// Returns whether this call states a placement at the boundary of its callee, which is when an input or an output
+    /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
+    /// [`states_boundary_placement`]).
+    #[inline]
+    pub(crate) fn states_boundary_placement(&self) -> bool {
+        states_boundary_placement(self.boundary_shardings())
     }
 
     /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
@@ -1024,11 +1032,15 @@ impl JitCallOperation<Type> {
             }
         }
         let public_arrays = inputs.iter().skip(self.capture_count).filter_map(array);
+        let target_platform = session.target()?.platform_name();
         let committed = |mesh: &DeviceMesh| {
             public_arrays.clone().any(Array::is_committed)
-                || commits_public_outputs(mesh, self.requests_placement(callee))
+                || commits_public_outputs(mesh, self.requests_placement(callee, Some(target_platform)))
         };
-        if let Some(mesh) = &self.mesh {
+        // The call records its mesh when it is staged, for no target, so whether it still names devices is read for the
+        // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
+        let names_devices = || has_placement_requests_in_region(callee, Some(target_platform), false);
+        if let Some(mesh) = self.names_devices(names_devices) {
             for (index, input) in inputs.iter().skip(self.capture_count).enumerate() {
                 if let Value::Array(array) = input {
                     validate_committed_input_devices(array, index, mesh)?;
@@ -1171,12 +1183,15 @@ impl JitCallOperation<Type> {
     /// created (refer to `with_derived_boundary_shardings`) or that keeps its input placements (refer to
     /// [`Self::with_kept_input_placements`]), it is the runtime sharding of `array`, because such a call leaves that
     /// input where it is and its executable must not move it to the placement that its traced input type would
-    /// give it. It is [`None`] for any other input, whose placement the executable chooses by its own rule.
+    /// give it. A call of a `jit` dispatcher keeps no relocatable argument where it is (refer to `argument_type`),
+    /// because the executions of the dispatcher do not specialize on its placement either. It is [`None`] for any
+    /// other input, whose placement the executable chooses by its own rule.
     pub(crate) fn eager_input_placement(&self, index: usize, array: &Array, declared: &Type) -> Option<Sharding> {
         if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared) {
             return Some(sharding.into_owned());
         }
-        (self.derived_input_shardings.is_some() || self.keeps_input_placements).then(|| array.sharding().clone())
+        let keeps_placement = self.keeps_input_placements && argument_type(array, &array.r#type()).is_none();
+        (self.derived_input_shardings.is_some() || keeps_placement).then(|| array.sharding().clone())
     }
 
     /// Validates that `array`, the argument at `index` of an eager application of this call for a callee input of type
@@ -1207,20 +1222,23 @@ impl JitCallOperation<Type> {
         validate_input_reduction(array, &expected, index, self.capture_count)
     }
 
-    /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the callee
-    /// names devices (refer to [`Self::with_boundary`]) or requests a placement anywhere in the regions that lowering
-    /// emits for it, including one that only moves a value to another memory (refer to
+    /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the call
+    /// names devices (refer to [`Self::names_devices`]) or the callee requests a placement anywhere in the regions that
+    /// lowering emits for it, including one that only moves a value to another memory (refer to
     /// `has_placement_requests_in_region`). Every such request commits every result of the call (refer to
     /// [`commits_public_outputs`]), which the placement decision of an eager application (refer to
     /// [`Self::eager_decision`]) and the forwarding of partial evaluation (refer to [`Self::returns_input_unchanged`])
-    /// read from here. The requests of a callee depend on the callee alone, so they are derived once for each callee
-    /// and retained with it (refer to `placement_requests`), and repeated applications only look them up.
-    pub(crate) fn requests_placement<V, O>(&self, callee: RegionRef<'_, V, O>) -> bool
+    /// read from here, for the platform `target_platform` that the call is lowered for ([`None`] for no target). The
+    /// requests of a callee depend on the callee and the platform alone, so they are derived once for each callee and
+    /// platform and retained with the callee (refer to `placement_requests`), and repeated applications only look them
+    /// up.
+    pub(crate) fn requests_placement<V, O>(&self, callee: RegionRef<'_, V, O>, target_platform: Option<&str>) -> bool
     where
-        V: CoreValue<Type = Type>,
-        O: CoreOperation<Type = Type> + OperationPayloadProjection,
+        V: CoreValue<Type = Type> + 'static,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
     {
-        self.mesh.is_some() || has_placement_requests_in_region(callee, true)
+        self.names_devices(|| has_placement_requests_in_region(callee, target_platform, false)).is_some()
+            || has_placement_requests_in_region(callee, target_platform, true)
     }
 
     /// Returns, for each input of an application of this call to arguments of types `input_types`, whether the call
@@ -1264,15 +1282,15 @@ impl JitCallOperation<Type> {
         input_types: &[Cow<'_, Type>],
     ) -> Vec<bool>
     where
-        V: CoreValue<Type = Type>,
-        O: CoreOperation<Type = Type> + OperationPayloadProjection,
+        V: CoreValue<Type = Type> + 'static,
+        O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
     {
         let public_array_count = input_types
             .iter()
             .skip(self.capture_count)
             .filter(|r#type| matches!(r#type.as_ref(), Type::Array(_)))
             .count();
-        if public_array_count != 1 || self.requests_placement(callee) {
+        if public_array_count != 1 || self.requests_placement(callee, None) {
             return vec![false; input_types.len()];
         }
         let declared = callee.input_types();
@@ -1681,7 +1699,8 @@ where
         + CoreValue<Type = Type>
         + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
         + CaptureConstant
-        + Concretizable<bool>,
+        + Concretizable<bool>
+        + 'static,
     C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -1702,6 +1721,22 @@ where
             }
             return Ok(outputs);
         }
+        // The split calls have separate boundaries. Preserve the original call's staged result types when its caller
+        // supplied staged declarations.
+        let output_types = if inputs.iter().any(|input| input.declared_type().is_some()) {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            Some(self.infer_output_types(&input_types, std::slice::from_ref(callee.interface()))?)
+        } else {
+            None
+        };
+        let declare_outputs = |outputs| {
+            if let Some(output_types) = &output_types {
+                PartialEvaluationValue::with_declared_output_types(outputs, output_types)
+            } else {
+                Ok(outputs)
+            }
+        };
+
         // Retain mixed splits without references, captures, or nominal identities. Unlike all-known replay,
         // partitioning a mixed effectful call preserves its effects and shares only the structural split.
         if can_cache_jit_call_split(callee, inputs) {
@@ -1709,7 +1744,7 @@ where
             let partition =
                 |callee: RegionRef<'_, V, Operation<V>>| driver.partition_program(context, callee, &input_known);
             let kind = JitCallSplitKind::Knownness(input_known.clone());
-            return split_jit_call(self, context, driver, inputs, kind, &partition);
+            return split_jit_call(self, context, driver, inputs, kind, &partition).and_then(declare_outputs);
         }
 
         // Split the callee of any other mixed call per call through the shared online boundary machinery, bind the
@@ -1779,13 +1814,14 @@ where
             partition.known_program().output_count(),
             partition.residual_program().output_count(),
         );
-        context.inline_partitioned_program(
+        let outputs = context.inline_partitioned_program(
             partition,
             Some(callee),
             inputs,
             |known_program| (Operation::JitCall(known_call), vec![known_program]),
             |residual_program| (Operation::JitCall(residual_call), vec![residual_program]),
-        )
+        )?;
+        declare_outputs(outputs)
     }
 
     fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
@@ -3181,20 +3217,8 @@ where
             if instruction.operation().projected_payload::<ShardMapOperation>().is_some() {
                 continue;
             }
-            if let Some(key) = instruction.operation().composite_key() {
-                let types = |atoms: &[AtomId]| {
-                    atoms.iter().map(|atom| region_ref.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
-                };
-                if NamedCompositeImplementation::select(
-                    key,
-                    &types(instruction.inputs()),
-                    &types(instruction.outputs()),
-                    target_platform,
-                )
-                .is_some()
-                {
-                    continue;
-                }
+            if omits_regions(region_ref, instruction, target_platform) {
+                continue;
             }
             for (index, &nested) in instruction.regions().iter().enumerate() {
                 if instruction.operation().region_role(index) == Some(RegionRole::Computation) {
@@ -3725,6 +3749,7 @@ where
         Operation::JitCall(operation.clone()),
         AttachedRegions::Callees(std::slice::from_ref(&callee)),
         inputs,
+        None,
     )
 }
 
@@ -3776,8 +3801,8 @@ fn forward_jit_call_inputs<V, O, W>(
     outputs: Vec<PartialEvaluationValue<W>>,
 ) -> Vec<PartialEvaluationValue<W>>
 where
-    V: CoreValue<Type = Type>,
-    O: CoreOperation<Type = Type> + OperationPayloadProjection,
+    V: CoreValue<Type = Type> + 'static,
+    O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
     W: CoreValue<Type = Type>,
 {
     let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
@@ -3834,7 +3859,10 @@ fn split_jit_call<V, C, D>(
     partition: &dyn Fn(RegionRef<'_, V, Operation<V>>) -> Result<PartitionedProgram<V, Operation<V>>, ProgramError>,
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
 where
-    V: CoreValue<Type = Type> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>> + CaptureConstant,
+    V: CoreValue<Type = Type>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
+        + CaptureConstant
+        + 'static,
     C: Context<Type = Type, Constant = V, Operation = Operation<V>>,
     D: PartialEvaluationDriver<C>,
 {
@@ -3897,6 +3925,7 @@ where
         Operation::JitCall(known_call.clone()),
         AttachedRegions::Callees(std::slice::from_ref(known_callee)),
         &known_inputs,
+        None,
     )?;
     let known_outputs = match context.residual_policy() {
         Some(_) if known_callee.effects().classes().is_empty() => {
@@ -5088,6 +5117,46 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_jit_call_operation_names_devices() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0)]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+
+        // Lists of overrides that are empty or hold none state no placement at the boundary, whether they belong to the
+        // inputs or to the outputs, so such a call names its devices only when its callee does. One override at either
+        // boundary states a placement, and the call names its devices whatever its callee requests.
+        let call = |inputs: Vec<Option<Sharding>>, outputs: Vec<Option<Sharding>>| {
+            JitCallOperation::<Type>::new(0).with_boundary(Some(&device_mesh), inputs, outputs)
+        };
+        let rows = [
+            ("empty lists", call(vec![], vec![])),
+            ("no input override", call(vec![None], vec![])),
+            ("no output override", call(vec![], vec![None])),
+            ("one input override", call(vec![Some(replicated.clone())], vec![None])),
+            ("one output override", call(vec![None], vec![Some(replicated.clone())])),
+        ];
+        let observed = rows
+            .iter()
+            .map(|(name, call)| {
+                (*name, call.states_boundary_placement(), call.names_devices(|| false), call.names_devices(|| true))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![
+                ("empty lists", false, None, Some(&device_mesh)),
+                ("no input override", false, None, Some(&device_mesh)),
+                ("no output override", false, None, Some(&device_mesh)),
+                ("one input override", true, Some(&device_mesh), Some(&device_mesh)),
+                ("one output override", true, Some(&device_mesh), Some(&device_mesh)),
+            ],
+        );
+
+        // A call that records no mesh names no devices and never asks about its callee.
+        assert_eq!(JitCallOperation::<Type>::new(0).names_devices(|| unreachable!()), None);
     }
 
     #[test]
@@ -10062,7 +10131,7 @@ mod tests {
                 options,
             )
             .unwrap();
-            outer.into_inner().lower(&session).map(|lowered| lowered.stable_hlo().to_string())
+            outer.into_inner().lower(&session).map(|lowered| lowered.lowered_program().stable_hlo().to_string())
         };
 
         // A type never records reduction state over an auto mesh axis, so no value carries one there.
@@ -10089,7 +10158,19 @@ mod tests {
                              `{kind}` reduction over them is never carried)",
                         )),
                     ),
-                    false => assert_eq!(lowered.as_deref(), Ok(ENTERED_OPERAND_MODULE)),
+                    false => assert_eq!(
+                        lowered.as_deref(),
+                        Ok(indoc! {r#"
+                            module {
+                              sdy.mesh @mesh = <["x"=2]>
+                              func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                                %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                                %1 = stablehlo.add %0, %0 : tensor<4xf32>
+                                return %1 : tensor<4xf32>
+                              }
+                            }
+                        "#}),
+                    ),
                 }
             }
         }
@@ -10104,10 +10185,6 @@ mod tests {
         let options = Options::new(mesh.clone()).with_input_shardings(vec![maximum]);
         assert!(lower(inner, options, false).is_ok());
     }
-
-    /// Module of a caller with a replicated input override over the auto mesh axis `x` that adds two results of a call
-    /// whose input override states a pending maximum or minimum over `x`, whose operand the call constrains replicated.
-    const ENTERED_OPERAND_MODULE: &str = "PLACEHOLDER";
 
     #[test]
     fn test_jit_call_operation_interpret() {

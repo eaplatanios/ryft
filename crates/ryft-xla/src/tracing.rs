@@ -237,14 +237,15 @@ where
         argument_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
-        let simplified_program = pruned_program(&self.program)?;
+        let simplified_program = pruned_program(&self.program, None)?;
         let argument_shardings: Vec<_> = match argument_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => self.global_input_types.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
         // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
-        // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
-        let session_constants = collect_session_constants(&simplified_program);
+        // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The export
+        // lowers for no target platform, so it collects them for none either.
+        let session_constants = collect_session_constants(&simplified_program, None);
 
         // A plain trace preserves the types of the arrays that enter it (`CapturePlacement::Preserve`), so an array
         // that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of another

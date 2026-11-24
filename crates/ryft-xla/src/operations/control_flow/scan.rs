@@ -47,6 +47,15 @@ use crate::operations::control_flow::{
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
+/// Returns `true` if the length of `scan` admits an iteration, which is false for a static length of zero and for a
+/// dynamic length whose bounds admit only zero. The lowering of a scan that admits no iteration emits nothing of its
+/// body, and this is the one decision of that, which the walks that follow the regions that lowering emits read
+/// (refer to `omits_regions`).
+pub(crate) fn admits_iterations(scan: &ScanOperation<Type>) -> bool {
+    let length = scan.iteration_count();
+    length.value() != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0)
+}
+
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -115,7 +124,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // and which this lowering does not adapt per iteration. A scan whose length admits no iteration never slices,
         // so it is lowered without its body.
         let static_length = length.value();
-        let admits_iterations = static_length != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0);
+        let admits_iterations = admits_iterations(self);
         if admits_iterations {
             let slice_types = body_input_types[1 + carry_count..]
                 .iter()
@@ -661,14 +670,14 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation, BatchAxis,
-        BatchedProgram, CompositeTransposeOperation, ConditionOperation, ConvertElementType, Device, DeviceMesh,
-        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass,
-        Error as CoreError, LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, NegOperation,
-        OneLikeOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, RandomAlgorithm,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation, ScanOptions,
-        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TracingContext, TransposedProgramCotangent,
-        TypeError, TypedProgram, WhileOperation, ZeroOperation, batch, scan,
+        Add, AddOperation, Array as CoreArray, ArrayReferenceTransform, ArrayReferenceTransformIndex, AssertOperation,
+        BatchAxis, BatchedProgram, CompositeTransposeOperation, ConditionOperation, ConstantOperation,
+        ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
+        DimensionVariable, EffectClass, Error as CoreError, LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul,
+        MulOperation, NegOperation, OneLikeOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy,
+        RandomAlgorithm, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation,
+        ScanOptions, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TracingContext,
+        TransposedProgramCotangent, TypeError, TypedProgram, WhileOperation, ZeroOperation, batch, scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
@@ -689,6 +698,62 @@ mod tests {
     };
 
     use super::*;
+
+    /// Returns a scan whose body negates each slice at an unsharded declaration of its type.
+    fn unsharded_negation_scan_program(stack_type: ArrayType) -> FlatProgram {
+        let (slice_type, iteration_count) = stack_type.without_dimension(0).unwrap();
+        let mut body = ArrayIrProgramBuilder::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let slice = body.add_input(slice_type.with_sharding(None).unwrap().into());
+        let negated = body.add_instruction(NegOperation::new(), Vec::new(), vec![slice], None).unwrap()[0];
+        let body: FlatProgram = body.build(vec![negated], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let body = builder.import_program(body);
+        let stack = builder.add_input(stack_type.into());
+        let output = builder
+            .add_instruction(ScanOperation::<Type>::new(0, iteration_count), vec![body], vec![stack], None)
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Transposes a linear scan with an unsharded result declaration and checks the input cotangent on both devices.
+    fn assert_transposed_scan_cotangent(
+        session: &Session,
+        mesh: &DeviceMesh,
+        program: &FlatProgram,
+        seed_values: &[f32],
+        expected_shards: [&[f32]; 2],
+    ) {
+        let input_types = program.input_types();
+        let output_types = program.output_types();
+        let [Type::Array(input_type)] = input_types.as_ref() else { panic!("expected one array input") };
+        let [Type::Array(output_type)] = output_types.as_ref() else { panic!("expected one array result") };
+        assert_eq!(output_type.sharding(), None);
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(transposed.input_types(), output_types);
+        assert_eq!(transposed.output_types(), input_types);
+
+        let seed = replicated_array(
+            session,
+            mesh,
+            DataType::F32,
+            output_type.static_shape().unwrap().as_slice(),
+            &values_to_bytes(seed_values),
+        );
+        let lowered = session.lower_program(&transposed, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let cotangents = session.execute_program(&compiled, vec![seed]).unwrap();
+        let [cotangent] = cotangents.as_slice() else { panic!("expected one cotangent") };
+        assert_eq!(cotangent.mesh(), mesh);
+        assert_eq!(cotangent.sharding(), input_type.sharding().unwrap());
+        assert_eq!(cotangent.addressable_shards().count(), expected_shards.len());
+        for (device, expected) in mesh.devices().iter().zip(expected_shards) {
+            let shard = cotangent.device_shard(device.id()).unwrap();
+            let values = values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap());
+            assert_eq!(values.as_slice(), expected, "CPU device {}", device.id());
+        }
+    }
 
     /// Returns the scan body `(i, c, x) -> (c + x)` over `f64` scalars, which prints each item `x` with the label
     /// `item` before adding it to the sum `c`.
@@ -3986,6 +4051,76 @@ mod tests {
         let (outputs, lines) = with_captured_prints(|| execute_mixed_program(client, &pullback, &[], &[]));
         assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 0.0", "backward: 0.0", "backward: 0.0"]);
+    }
+
+    #[test]
+    fn test_scan_operation_lower_transposed_replicated_carry_on_cpu() {
+        let (client, mesh) = two_device_mesh(MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let replicated_type =
+            scalar_type.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0)).unwrap();
+
+        // The outer carry is replicated. The body accepts an unsharded carry and returns it scaled by a replicated
+        // constant, so the forward scan joins its carry output at the unsharded body input declaration.
+        let mut body = ArrayIrProgramBuilder::new();
+        body.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = body.add_input(scalar_type.into());
+        let factor = CoreArray::from_elements(replicated_type.clone(), &[2f32]).unwrap();
+        let factor = body.add_instruction(ConstantOperation::new(factor), Vec::new(), Vec::new(), None).unwrap()[0];
+        let output = body
+            .add_instruction(MulOperation::<ArrayType>::new(), Vec::new(), vec![carry, factor], None)
+            .unwrap()[0];
+        let body: FlatProgram = body.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let replicated_type = Type::from(replicated_type);
+        assert_eq!(body.output_types().as_ref(), std::slice::from_ref(&replicated_type));
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let body = builder.import_program(body);
+        let carry = builder.add_input(replicated_type.clone());
+        let outputs = builder
+            .add_instruction(ScanOperation::<Type>::new(1, 2), vec![body], vec![carry], None)
+            .unwrap()
+            .to_vec();
+        let program: FlatProgram = builder.build(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_transposed_scan_cotangent(&session, &mesh, &program, &[1.0], [&[4.0], &[4.0]]);
+    }
+
+    #[test]
+    fn test_scan_operation_lower_transposed_replicated_stack_on_cpu() {
+        let (client, mesh) = two_device_mesh(MeshAxisType::Auto);
+        let session = Session::builder().client(client).build().unwrap();
+        let stack_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let program = unsharded_negation_scan_program(stack_type);
+        let expected = [-1.0, -2.0, -3.0, -4.0];
+        assert_transposed_scan_cotangent(&session, &mesh, &program, &[1.0, 2.0, 3.0, 4.0], [&expected, &expected]);
+    }
+
+    #[test]
+    fn test_scan_operation_lower_transposed_sharded_stack_on_cpu() {
+        let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);
+        let session = Session::builder().client(client).build().unwrap();
+        // The scan axis is replicated and each slice is split along its only axis.
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let stack_type = ArrayType::new_static(DataType::F32, [4, 4]).with_sharding(sharding).unwrap();
+        let program = unsharded_negation_scan_program(stack_type);
+        let seed = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+        assert_transposed_scan_cotangent(
+            &session,
+            &mesh,
+            &program,
+            &seed,
+            [
+                &[-1.0, -2.0, -5.0, -6.0, -9.0, -10.0, -13.0, -14.0],
+                &[-3.0, -4.0, -7.0, -8.0, -11.0, -12.0, -15.0, -16.0],
+            ],
+        );
     }
 
     #[test]

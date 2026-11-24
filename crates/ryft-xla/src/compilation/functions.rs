@@ -58,6 +58,15 @@
 //! import them through their parent and then treat them like constants (i.e., as replicated under batching, with a
 //! structurally zero tangent under differentiation, and as known under partial evaluation).
 //!
+//! Lowering places captured arrays on the devices of the program, so it can communicate before the first execution.
+//! Each captured array is placed once for each destination, and every program, signature, and retention that captures
+//! it shares that copy until the array and every retention of it are gone (refer to the ownership of
+//! [`RetainedArray`](crate::RetainedArray)). The CUDA plugin pairs the transfers between two devices by the order in
+//! which they are issued (refer to
+//! [`CrossHostTransferKey`](ryft_pjrt::extensions::cross_host_transfers::CrossHostTransferKey)), so processes must
+//! lower functions that capture arrays on other hosts in the same order, as they must issue direct placements of
+//! arrays across hosts in the same order (refer to [`Array::to_placement`]).
+//!
 //! Some bodies are traced over constants alone (i.e., in a `TracingContext<Constant, Operation>`), such as the bodies
 //! of [`rematerialize`](ryft_core::rematerialize) and [`composite`](ryft_core::composite), the custom rules of
 //! composites, and the regions nested in them. Their capture tables cannot hold runtime arrays, so calls in them
@@ -189,7 +198,7 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{
     ArrayIrBatchingPolicy, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError, BatchingTracer,
-    ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
+    CapturePlacementContext, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, ConstrainSharding, Context, ContextProjection,
     DeviceMesh, DifferentiableType, Dimension, DimensionValue, DispatcherStatistics, DomainTracingContext,
     ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext, MeshAxisType,
@@ -332,7 +341,8 @@ where
             + ContextProjection<ArrayType>
             + ImportingContext<Session, Path>
             + NamedAxes
-            + MeshContext,
+            + MeshContext
+            + CapturePlacementContext,
         C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
         In::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
         Out::Family: ParameterizedFamily<C::Value> + ParameterizedFamily<L>,
@@ -368,7 +378,8 @@ where
         C: Context<Type = Type, Constant = Constant, Operation = Operation>
             + ImportingContext<Session, Path>
             + NamedAxes
-            + MeshContext,
+            + MeshContext
+            + CapturePlacementContext,
         C::Value: ValueProjection<ArrayType, Projected: Parameter> + Reshard + ConstrainSharding,
         In::Family:
             ParameterizedFamily<C::Value> + ParameterizedFamily<<C::Value as ValueProjection<ArrayType>>::Projected>,
@@ -2246,16 +2257,16 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, Array as CoreArray, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast,
-        CaptureReference, Compare, ComparisonDirection, CompositeKey, Condition, Context, ConvertElementType, Cos,
-        CotangentAccumulator, CotangentDestinationKind, DataType, Device, DifferentiableType, Differentiate,
-        DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable,
-        DomainTracer, Dot, DotDimensionNumbers, DotsSavable, EagerInterpretationDriver, ErasedOperation,
-        Error as CoreError, ForwardModeDifferentiate, Hessian, ImportingContext, InterpretableOperation, Jacobian,
-        LogicalMesh, MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, Neg, NothingSavable, Parameter,
-        PartialEvaluationOutput, PartitionedProgram, Place, Placeholder, Placement, Program, ProgramBuilder,
-        ProgramError, ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceType, ReshapeOperation, ResidualCandidate, ResidualDecision,
+        CaptureReference, Compare, ComparisonDirection, CompilationDomain, CompositeKey, Condition, Context,
+        ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, Device, DifferentiableType,
+        Differentiate, DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation,
+        DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable, EagerInterpretationDriver,
+        ErasedOperation, Error as CoreError, ForwardModeDifferentiate, Hessian, ImportingContext,
+        InterpretableOperation, Jacobian, LogicalMesh, MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, Neg,
+        NothingSavable, Parameter, PartialEvaluationOutput, PartitionedProgram, Place, Placeholder, Placement, Program,
+        ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation, ResidualCandidate, ResidualDecision,
         ResidualInputSource, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection,
         ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, ShardMapOptions, Sharding,
         ShardingDimension, Sin, Slice, Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation,
@@ -2294,7 +2305,7 @@ mod tests {
         Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     {
         let program = function.source_program().to_program_with_lifted_captures().unwrap();
-        (function.source_program().captures().len(), collect_session_constants(&program).len())
+        (function.source_program().captures().len(), collect_session_constants(&program, None).len())
     }
 
     /// Traces `f(reference, update) = { reference += update; read(reference) }` over a `ref<f32[]>` and an `f32[]` into
@@ -3325,6 +3336,75 @@ mod tests {
         let Value::Array(output) = output else { panic!("stateful public output must be an array") };
         assert_eq!(read_first_shard::<f32>(client, &output), vec![3.0]);
         assert_eq!(read_first_shard::<f32>(client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_compile_statefully_with_captures_shares_one_placement_of_each_capture() {
+        // Every compiled signature that captures one array and every retention of that array share one placed copy of
+        // it for each destination (refer to `placed_constant`), so the number of copies does not grow with the number
+        // of signatures, stagings, or differently named meshes that capture the array.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let singleton = |name: &str| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(name, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, vec![device]).unwrap()
+        };
+        let r#type = ArrayType::scalar(DataType::F32);
+        let capture = Array::from_host_buffer(&session, r#type, None, None, 2.5f32.to_ne_bytes()).unwrap();
+        let buffer = |array: &Array| Arc::clone(array.shards()[0].buffer().unwrap());
+        let functions = (1..=8)
+            .map(|size| {
+                compile_statefully_with_captures::<_, Type, Type>(
+                    |captures, _| Ok(captures[0].clone()),
+                    vec![Value::Array(capture.clone())],
+                    Type::Array(ArrayType::new_static(DataType::F32, [size])),
+                    &session,
+                    Options::new(singleton("q")),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let compiled = functions
+            .iter()
+            .map(|function| {
+                let [Value::Array(placed)] = function.executable().captures() else {
+                    panic!("expected one captured array");
+                };
+                buffer(placed)
+            })
+            .collect::<Vec<_>>();
+        assert!(compiled.iter().all(|placed| Arc::ptr_eq(placed, &compiled[0])));
+        assert!(!Arc::ptr_eq(&compiled[0], &buffer(&capture)));
+
+        // Lifts of independent retentions of the array onto the same mesh receive that same copy.
+        let target = session.with_device_mesh(singleton("q"));
+        let lifted = (0..16)
+            .map(|_| {
+                let constant = Session::capture_constant(&Value::Array(capture.clone())).unwrap().unwrap();
+                let Value::Array(array) = target.lift(constant).unwrap() else { panic!("expected an array") };
+                buffer(&array)
+            })
+            .collect::<Vec<_>>();
+        assert!(lifted.iter().all(|placed| Arc::ptr_eq(placed, &compiled[0])));
+
+        // On one process, a placement onto the same devices starts from that copy, whose buffers a placement onto a
+        // mesh that differs only in its axis names shares, so sixteen such meshes share it as well.
+        let constant = Session::capture_constant(&Value::Array(capture.clone())).unwrap().unwrap();
+        let lift = |name: &str| {
+            let Value::Array(array) = session.with_device_mesh(singleton(name)).lift(constant.clone()).unwrap() else {
+                panic!("expected an array");
+            };
+            array
+        };
+        // A copy is the source of another placement only once its work has completed, which is never waited for.
+        lift("q").block_until_ready().unwrap();
+        let renamed = (0..16).map(|index| buffer(&lift(&format!("q{index}")))).collect::<Vec<_>>();
+        assert!(renamed.iter().all(|placed| Arc::ptr_eq(placed, &compiled[0])));
+        let mesh = singleton("r");
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let relabelled = lift("q0").reshard_on_devices(&session, &mesh, &sharding, false).unwrap();
+        assert!(Arc::ptr_eq(&buffer(&relabelled), &compiled[0]));
     }
 
     #[test]
@@ -4610,7 +4690,7 @@ mod tests {
         // A capture lives as long as a function or a program that holds it. The eager dispatch cache keeps the program
         // of every eager call, but its keys and entries hold captures without their storage, so it never keeps a
         // capture alive, whether the call runs on the device of the capture or on other devices, where the capture
-        // is placed once for its retention and released with it.
+        // is placed once for the array and released with the array and its retentions, which the function owns here.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -4647,7 +4727,7 @@ mod tests {
 
     #[test]
     fn test_compiled_function_places_captures_once_for_each_mesh() {
-        // A capture that is not on the devices where a function receives it is placed there once for its retention
+        // A capture that is not on the devices where a function receives it is placed there once for the array
         // and mesh (refer to `placed_constant`), whether it is on the same devices, on other devices of the same mesh
         // topology, or on a mesh of another topology, so that repeated executions, eager calls, and replays of the
         // callee, after the first application of each path, create the same arrays wherever the capture lives.
@@ -4946,7 +5026,7 @@ mod tests {
     #[test]
     fn test_compile_types_imported_arrays_that_follow_the_call_at_every_entry_point() {
         // An array that a body nested in a compiled function imports from a mesh of another topology is typed as the
-        // function receives it under `CapturePlacement::FollowCall` (refer to `NamedAxes::capture_placement`)
+        // function receives it under `CapturePlacement::FollowCall` (refer to `CapturePlacementContext::capture_placement`)
         // wherever the body is traced: in a `rematerialize` body, in a composite, in a `scan` body nested in such a
         // body, under forward mode differentiation, and under batching. Each combines it with the input of the function
         // on its single device.
@@ -5273,7 +5353,8 @@ mod tests {
                     + ContextProjection<ArrayType>
                     + ImportingContext<Session, Path>
                     + NamedAxes
-                    + MeshContext,
+                    + MeshContext
+                    + CapturePlacementContext,
                 C::Value: ValueProjection<ArrayType, Projected = L> + Reshard + ConstrainSharding,
             {
                 match self {
@@ -6125,17 +6206,21 @@ mod tests {
         // rejects an argument whose type records a split. The replay of a callee operation by operation gives a
         // `rematerialize` in the callee an eager input, whose type records its placement, while the body of the
         // `rematerialize` was traced for the input type of the callee, which records none. An argument with a pending
-        // sum over an auto mesh axis, which the input override of the callee states, is admitted by every entry point
-        // that applies the call itself, and the result that returns it is the completed value, as the callee completes
-        // the sum where the argument enters. A compiled caller receives its own argument without such a reduction,
+        // sum or maximum over an auto mesh axis, which the input override of the callee states, is admitted by every
+        // entry point that applies the call itself, and the result that returns it is the completed value, as the
+        // entry of the callee completes it with a collective (which drops the NaN of one contribution of the maximum).
+        // A compiled caller, including one that runs as replicas, receives its own argument without such a reduction,
         // because it has no override that states one, so it rejects the argument where it enters, as an execution of
-        // the caller does, and a caller that runs as replicas rejects the boundary of the callee.
+        // the caller does.
         let unreduced_argument = "fails with `public argument #0 is unreduced along the mesh axes [\"x\"], which the \
                                   executable cannot receive because a staged type does not record a pending reduction \
                                   over auto mesh axes; reduce the argument (e.g., with `Array::to_placement` onto a \
                                   sharding without unreduced axes), or place it over explicit mesh axes, before passing \
                                   it to a compiled function or an eager operation`";
+        let no_maximum_cotangent = "fails with `a value that is unreduced with kind `max` has no cotangent, because \
+                                    reverse mode supports only `sum` unreduced axes`";
         let pending = "input override that states the pending reduction of an argument";
+        let maximum = "input override that states the pending maximum of an argument";
         let other_devices = "fails with `\
             `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
@@ -6182,10 +6267,17 @@ mod tests {
             ),
             (pending, "nested call", unreduced_argument),
             (pending, "nested call consumed by arithmetic", unreduced_argument),
-            (pending, "caller with a bounded dynamic argument", split_replicas),
+            (pending, "caller with a bounded dynamic argument", unreduced_argument),
             (pending, "caller with a scan", unreduced_argument),
             (pending, "caller with a condition", unreduced_argument),
             (pending, "caller with a while loop", unreduced_argument),
+            (maximum, "nested call", unreduced_argument),
+            (maximum, "nested call consumed by arithmetic", unreduced_argument),
+            (maximum, "caller with a bounded dynamic argument", unreduced_argument),
+            (maximum, "eager VJP", no_maximum_cotangent),
+            (maximum, "caller with a scan", unreduced_argument),
+            (maximum, "caller with a condition", unreduced_argument),
+            (maximum, "caller with a while loop", unreduced_argument),
         ];
 
         // The derivatives of a call agree in values with those of the function that the callee was compiled from, and
@@ -6208,11 +6300,12 @@ mod tests {
         // tangent and the cotangent of a split argument, as an input override does, except that the cotangent of an
         // argument whose type records its split is resharded back to that split. A compiled gradient follows the eager
         // cotangent, except where a caller compiled for other devices calls the callee and where the sum of a
-        // bufferless value does not lower. The tangent of an argument with a pending sum over an auto mesh axis that
-        // the input override of the callee states is completed at the boundary like the argument, and the cotangent
-        // takes the dual state of the override (refer to `Sharding::cotangent`), whereas the function that the callee
-        // was compiled from returns both with the pending sum of the argument, and a compiled gradient rejects such an
-        // argument where its caller receives it.
+        // bufferless value does not lower. The tangent of an argument with a pending sum or maximum over an auto mesh
+        // axis that the input override of the callee states is completed at the boundary like the argument (the
+        // maximum by the collective, which drops a NaN), and so is the cotangent of a pending sum, which carries no
+        // reduction state over the auto axis either (refer to `entered_argument_sharding`), whereas the function that
+        // the callee was compiled from returns both with the pending reduction of the argument. A pending maximum has
+        // no cotangent, and a compiled gradient rejects such an argument where its caller receives it.
         let differences = |fields: &[(&str, &str, &str)]| {
             let fields = fields
                 .iter()
@@ -6222,8 +6315,8 @@ mod tests {
         let typed = |sharding: &str| format!("f32[4][sharding={sharding}]");
         let (replicated, split) = ("{mesh<['x'=2:auto]>, [{}]}", "{mesh<['x'=2:auto]>, [{'x'}]}");
         let canonical = "{mesh<['device'=1:auto]>, [{}]}";
-        let (unreduced, reduced) =
-            ("{mesh<['x'=2:auto]>, [{}], unreduced={'x'}}", "{mesh<['x'=2:auto]>, [{}], reduced={'x'}}");
+        let unreduced = "{mesh<['x'=2:auto]>, [{}], unreduced={'x'}}";
+        let unreduced_maximum = "{mesh<['x'=2:auto]>, [{}], unreduced={'x'}, unreduced_kind=max}";
         let (second, local) = ("{mesh<['x'=1:explicit]>, [{}]}", "{mesh<['x'=1:auto]>, [{}]}");
         let moved = |sharding: &str| {
             let r#type = typed(sharding);
@@ -6307,8 +6400,18 @@ mod tests {
             ),
             ("input override", "eager VJP cotangent", differences(&[("sharding", replicated, split)])),
             (pending, "eager JVP tangent", differences(&[("sharding", replicated, unreduced)])),
-            (pending, "eager VJP cotangent", differences(&[("sharding", reduced, unreduced)])),
+            (pending, "eager VJP cotangent", differences(&[("sharding", replicated, unreduced)])),
             (pending, "compiled gradient", unreduced_argument.to_string()),
+            (
+                maximum,
+                "eager JVP tangent",
+                differences(&[
+                    ("values", "[2.0, 3.0, 4.0, 5.0]", "[NaN, 3.0, 4.0, 5.0]"),
+                    ("sharding", replicated, unreduced_maximum),
+                ]),
+            ),
+            (maximum, "eager VJP cotangent", no_maximum_cotangent.to_string()),
+            (maximum, "compiled gradient", no_maximum_cotangent.to_string()),
             ("other single device", "eager JVP tangent", moved(second)),
             (
                 "other single device",
