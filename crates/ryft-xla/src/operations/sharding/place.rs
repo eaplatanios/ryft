@@ -25,7 +25,9 @@ impl LowerableOperation for PlaceOperation {
         // that of `reshard`), a target states the placement along every mesh axis, including auto axes, so the
         // constraint is closed over the dimensions that the target specifies, like that of `constrain_sharding`.
         // The layout is constrained first, so that the conversion runs before the value leaves device memory. JAX
-        // instead lowers `device_put` inside `jit` to nothing, unless its target names a memory kind.
+        // instead lowers `device_put` inside `jit` to nothing, unless its target names a memory kind or changes the
+        // reduction state of the value, which it lowers to a sharding constraint that completes the reduction and
+        // which Ryft rejects before lowering (refer to `Session::place`).
         // The copy policy of the operation (i.e., `PlaceOperation::may_alias`) is ignored, because a compiled program
         // has no observable buffer identity. Its outputs are buffers that its execution allocates (or donated inputs,
         // which no other handle can observe), so a value inside it never shares storage with any array that the caller

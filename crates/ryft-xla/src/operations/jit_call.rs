@@ -851,12 +851,26 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
     /// input type without a sharding when the mesh of the call is unknown (i.e., `actual` has no sharding), and for a
     /// placement over a single device, which places nothing that the devices of the call do not. Eager calls, region
     /// replay, call lowering, the result placements of compiled programs, and the admission of bounded dynamic callers
-    /// all consult this function, so that they agree on where a call places its inputs.
+    /// all consult this function, so that they agree on where a call places its inputs. Only an eager application also
+    /// gives an argument on one device the logical mesh of a declared placement over a single device (refer to
+    /// `JitCallOperation::eager_boundary_input_sharding`).
     pub(crate) fn boundary_input_sharding<'s>(
         &'s self,
         index: usize,
         actual: &ArrayType,
         declared: &'s T,
+    ) -> Option<Cow<'s, Sharding>> {
+        self.boundary_input_sharding_over(index, actual, declared, false)
+    }
+
+    /// Returns the effective boundary sharding of callee input `index` (refer to [`Self::boundary_input_sharding`]),
+    /// which, with `single_device`, includes a placement over a single device.
+    fn boundary_input_sharding_over<'s>(
+        &'s self,
+        index: usize,
+        actual: &ArrayType,
+        declared: &'s T,
+        single_device: bool,
     ) -> Option<Cow<'s, Sharding>> {
         if index < self.capture_count {
             return None;
@@ -884,7 +898,7 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
                 Cow::Owned(declared_input_sharding(declared, mesh))
             }
         };
-        (sharding.mesh().device_count() > 1).then_some(sharding)
+        (single_device || sharding.mesh().device_count() > 1).then_some(sharding)
     }
 
     /// Returns the effective boundary sharding of each callee input without a sharding override (refer to
@@ -989,7 +1003,8 @@ impl JitCallOperation<Type> {
     ///     move there, as closed-over constants do in JAX (refer to `capture_inputs`), and so do the uncommitted public
     ///     arguments that live elsewhere, through the one rule by which uncommitted operands follow committed ones
     ///     (refer to `Session::place_uncommitted_inputs`). Each input with an effective boundary sharding is then
-    ///     placed as it requests.
+    ///     placed as it requests, as is an argument on one device whose callee input declares another logical mesh of
+    ///     one device (refer to [`Self::eager_boundary_input_sharding`]).
     ///
     /// The arguments are admitted before anything moves, and whether or not anything moves: an argument that carries a
     /// pending reduction that the executable of the callee cannot receive is rejected wherever it is (refer to
@@ -1147,7 +1162,7 @@ impl JitCallOperation<Type> {
 
         for (index, declared) in declared.iter().enumerate().skip(self.capture_count) {
             let Some(Value::Array(array)) = prepared.get(index) else { continue };
-            if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared)
+            if let Some(sharding) = self.eager_boundary_input_sharding(index, &array.r#type(), declared)
                 && array.sharding() != sharding.as_ref()
             {
                 let mesh = DeviceMesh::new(sharding.mesh().clone(), array.mesh().devices().to_vec())?;
@@ -1157,6 +1172,25 @@ impl JitCallOperation<Type> {
         }
         let committed = committed(&mesh);
         Ok(EagerCallDecision { inputs: prepared, mesh, committed, locally_assigned })
+    }
+
+    /// Returns the sharding to which an eager application of this call places callee input `index`, which receives an
+    /// argument of type `actual`, on the devices of that argument before the callee runs. This is the effective
+    /// boundary sharding of the input (refer to [`Self::boundary_input_sharding`]), and, for an argument on one device,
+    /// also a placement over a single device, which moves no data but may name another logical mesh than `actual` does
+    /// (e.g., `q` for an argument over `p`). A direct execution of the callee gives every argument the mesh and the
+    /// sharding with which its executable receives it (refer to `Session::prepare_compiled_execution`), so the
+    /// application gives the argument that logical mesh too, and both entry points accept the same arguments and return
+    /// the same results. Partial evaluation forwards no input that this sharding changes (refer to
+    /// [`Self::returns_input_unchanged`]).
+    fn eager_boundary_input_sharding<'s>(
+        &'s self,
+        index: usize,
+        actual: &ArrayType,
+        declared: &'s Type,
+    ) -> Option<Cow<'s, Sharding>> {
+        let single_device = actual.sharding().is_some_and(|sharding| sharding.mesh().device_count() == 1);
+        self.boundary_input_sharding_over(index, actual, declared, single_device)
     }
 
     /// Returns the effective boundary sharding of callee input `index` (refer to [`Self::boundary_input_sharding`])
@@ -1262,7 +1296,9 @@ impl JitCallOperation<Type> {
     ///     the call checks it when the call is staged, but never over auto mesh axes, including those of a type without
     ///     a sharding, whose value may live on any mesh, so that only such a type proves that the call admits every
     ///     argument of it, and
-    ///   - the boundary does not place the input (refer to [`Self::boundary_input_placement`]).
+    ///   - the boundary does not place the input (refer to [`Self::boundary_input_placement`]), and an eager application
+    ///     does not give it the logical mesh of another placement over its single device either (refer to
+    ///     [`Self::eager_boundary_input_sharding`]).
     ///
     /// An argument of another client is rejected by the call and returned by the forwarded value, as by any program
     /// that returns its argument, and every consumer of that value that executes rejects it.
@@ -1304,6 +1340,9 @@ impl JitCallOperation<Type> {
                     });
                     records_reduction_state
                         && self.boundary_input_placement(position, actual, &declared[position]).is_none()
+                        && self
+                            .eager_boundary_input_sharding(position, actual, &declared[position])
+                            .is_none_or(|sharding| actual.sharding() == Some(sharding.as_ref()))
                 }
                 _ => false,
             })

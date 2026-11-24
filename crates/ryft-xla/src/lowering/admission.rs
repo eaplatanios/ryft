@@ -13,6 +13,7 @@ use ryft_core::{
     ScatterReductionKind, SortDirection, Type as CoreType, Typed,
 };
 
+use crate::lowering::emitted_regions;
 use crate::{Error, FlatProgram, Operation, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -24,8 +25,11 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// logical extents in the lowering of Ryft.
 /// Only configurations with execution evidence are admitted, and unbounded gateways and unsupported consumers are
 /// rejected before MLIR construction. Only the regions that lowering emits (i.e., the entry region and its executed
-/// nested regions) are validated. Regions that lowering never reaches (e.g., the rule regions of composites or the
-/// transpose region of a `linear_call`) are not part of the compiled program, so they cannot keep it from compiling.
+/// nested regions, refer to [`emitted_regions`]) are validated. Regions that lowering never reaches (e.g., the rule
+/// regions of composites, the transpose region of a `linear_call`, or the body of a scan that admits no iteration) are
+/// not part of the compiled program, so they cannot keep it from compiling. The regions are those that lowering emits
+/// for no target platform, which omits only what lowering omits on every platform, so the body of a named composite
+/// call that only some platform replaces is still validated.
 ///
 /// # Errors
 ///
@@ -34,7 +38,7 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// consumes a data-derived dimension.
 pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Result<(), Error> {
     let mut variables = HashSet::new();
-    for region in program.entry_region_ref().computation_regions() {
+    for region in emitted_regions(program.entry_region_ref(), None) {
         for instruction in region.instructions() {
             if let Operation::DimensionFromScalar(operation) = instruction.operation() {
                 // A static output defines no identity and is checked against its extent.
@@ -63,7 +67,7 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
     // instruction outputs before classifying the array operations that consume those identities.
     loop {
         let count = variables.len();
-        for region in program.entry_region_ref().computation_regions() {
+        for region in emitted_regions(program.entry_region_ref(), None) {
             for instruction in region.instructions() {
                 if !instruction.inputs().iter().any(|input| {
                     references_data_derived_dimension(region.atoms()[input.index()].r#type().as_ref(), &variables)
@@ -85,7 +89,7 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
         }
     }
 
-    for region in program.entry_region_ref().computation_regions() {
+    for region in emitted_regions(program.entry_region_ref(), None) {
         for instruction in region.instructions() {
             let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
                 references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)

@@ -61,8 +61,10 @@
 //! Lowering places captured arrays on the devices of the program, so it can communicate before the first execution.
 //! Each captured array is placed once for each destination, and every program, signature, and retention that captures
 //! it shares that copy until the array and every retention of it are gone (refer to the ownership of
-//! [`RetainedArray`](crate::RetainedArray)). The CUDA plugin pairs the transfers between two devices by the order in
-//! which they are issued (refer to
+//! [`RetainedArray`](crate::RetainedArray)). A capture is placed with device work only, without the host round trip to
+//! which [`Array::to_placement`] can fall back, so a placement that only that round trip can make (e.g., of uneven
+//! column shards that a compiled reshard cannot produce) is an error for a capture. The CUDA plugin pairs the transfers
+//! between two devices by the order in which they are issued (refer to
 //! [`CrossHostTransferKey`](ryft_pjrt::extensions::cross_host_transfers::CrossHostTransferKey)), so processes must
 //! lower functions that capture arrays on other hosts in the same order, as they must issue direct placements of
 //! arrays across hosts in the same order (refer to [`Array::to_placement`]).

@@ -39,7 +39,7 @@ use ryft_core::{
     IotaOperation, LogicalMesh, Memory, MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation,
     OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
     Provenance, Region as CoreRegion, RegionId, RegionRef, RegionRole, RematerializationOptimizationBarrier,
-    ReshapeOperation, ReshardOperation, SCAN_OPERATION_NAME, ScanOperation, ScatterOperation, Shape, ShardMapBoundary,
+    ReshapeOperation, ReshardOperation, SCAN_OPERATION_NAME, ScatterOperation, Shape, ShardMapBoundary,
     ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
     Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value,
     WHILE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
@@ -66,8 +66,7 @@ use crate::lowering::types::{
     lower_tensor_type, lower_unplaced_constant_output,
 };
 use crate::operations::collectives::collective_replica_groups;
-use crate::operations::composites::{NamedCompositeImplementation, omits_regions};
-use crate::operations::control_flow::scan::admits_iterations;
+use crate::operations::composites::{omits_operation_regions, omits_regions};
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
@@ -1839,10 +1838,10 @@ where
 }
 
 /// Returns whether lowering `instruction` of `region` for `target_platform` omits its regions (refer to
-/// [`omits_regions`]), for the operations of any family. A scan whose length admits no iteration omits its body on
-/// every target, which this recognizes through its payload, and only the named composite calls of [`Operation`] are
-/// replaced, which this recognizes through [`LowerableOperation::composite_key`], so that the families that only
-/// partial evaluation analyses, for no target, need not lower.
+/// [`omits_regions`]), for the operations of any family, through the same decision (refer to
+/// [`omits_operation_regions`]). Only the named composite calls of [`Operation`] are replaced, which this recognizes
+/// through [`LowerableOperation::composite_key`] when there is a target, so that the families that only partial
+/// evaluation analyses, for no target, need not lower.
 fn omits_placement_regions<V, O>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
@@ -1852,20 +1851,18 @@ where
     V: Value<Type = Type>,
     O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
 {
-    if instruction.operation().projected_payload::<ScanOperation<Type>>().is_some_and(|scan| !admits_iterations(scan)) {
-        return true;
-    }
-    let Some(key) = target_platform
+    let composite_key = target_platform
         .and_then(|_| (instruction.operation() as &dyn Any).downcast_ref::<Operation>())
-        .and_then(LowerableOperation::composite_key)
-    else {
-        return false;
-    };
+        .and_then(LowerableOperation::composite_key);
     let types = |atoms: &[AtomId]| {
         atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
     };
-    let (input_types, output_types) = (types(instruction.inputs()), types(instruction.outputs()));
-    NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
+    omits_operation_regions(
+        instruction.operation(),
+        composite_key,
+        || (types(instruction.inputs()), types(instruction.outputs())),
+        target_platform,
+    )
 }
 
 /// Returns the session constants that the program whose entry region is `entry`, which is already pruned, holds in
@@ -4505,8 +4502,8 @@ pub(crate) mod tests {
         ParameterizedFamily, Place, Placeholder, Placement, PrintOperation, Program,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, Reduce, ReduceOperation,
         ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceType, ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOptions,
-        ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout, Tag, TiledLayout,
+        ReferenceType, ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOperation,
+        ScanOptions, ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout, Tag, TiledLayout,
         TransferToMemory, Transpose, TypedProgram, UnreducedKind, ValueProjection, WhileOptions, ZeroLike, i1, i2, i4,
         scan, shard_map, u1, u2, u4, r#while,
     };

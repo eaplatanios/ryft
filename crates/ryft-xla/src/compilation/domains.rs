@@ -217,13 +217,18 @@ impl Session {
     }
 
     /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
-    /// session.
+    /// session. A mesh that assigns a device to another process than the one that owns it, or that assigns to this
+    /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
+    /// reject it (refer to `validate_mesh_device_processes`), before anything is lowered, compiled, or looked up in a
+    /// compilation cache, so that every process rejects it alike. A device that the client does not know (e.g., of a
+    /// remote process) is accepted.
     pub(crate) fn lower_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
         options: &Options,
     ) -> Result<LoweredProgram, Error> {
+        validate_mesh_device_processes(self.client(), options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
         // `pruned_program`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
@@ -1032,7 +1037,12 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// eager call, replay, or other program that captures the array moves the capture again. A placement that cannot
 /// communicate (refer to [`RetainedArray::can_communicate`]) starts from a copy on the same devices whose work has
 /// already completed when there is one (e.g., for meshes that differ only in their axis names), so that such
-/// destinations share its buffers. A capture that already
+/// destinations share its buffers, but only from a copy with the memory and the declared layout of the capture, so
+/// that the result is what a placement of the capture itself gives, whatever placements were made before (refer to
+/// [`RetainedArray::completed_placement_on`]). The placement uses device work only, without the host round trip to
+/// which [`Session::place`] can fall back, because only a process that owns every destination device can take that
+/// round trip, so a placement that only it can make (e.g., of uneven column shards that a compiled reshard cannot
+/// produce) is an error for a capture. A capture that already
 /// lives on the devices of `mesh` with that placement is not copied, but it is still handed out as its placement onto
 /// the devices that the function names (refer to [`RetainedArray::on_named_devices`]), which shares its buffers and
 /// keeps nothing alive beyond the capture itself. Every process therefore holds the same facts for the capture of a
@@ -1087,8 +1097,11 @@ pub(crate) fn placed_constant(
     // When the placement cannot communicate, a copy on the same devices (e.g., for a mesh that differs only in its axis
     // names) whose work has already completed without an error is placed instead of the capture, which shares its
     // buffers rather than copying the capture again. It is chosen only once the exact key missed (i.e., inside the
-    // attempt), and never waited for, so a request that finds its own placement never waits for other work. A placement
-    // that cannot communicate either has every device on one process, or a capture with locally assigned devices, which
+    // attempt), and never waited for, so a request that finds its own placement never waits for other work. A copy is a
+    // source only when it keeps the memory and the declared layout of the capture (refer to
+    // `RetainedArray::completed_placement_on`), so that the result has the type that a placement of the capture gives,
+    // whichever placements the index already holds. A placement that cannot communicate either has every device on one
+    // process, or a capture with locally assigned devices, which
     // every process places with local work only. In the second case the copy may span processes, so it is reused only
     // when it and the destination are both replicated: every destination shard then comes from the shard of the copy
     // on the same device, and no process communicates. A process whose copy is missing, pending, or failed places from
@@ -1833,14 +1846,14 @@ mod tests {
         CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomRuleDefinition, CustomRuleRegistration,
         DataType, Device, DeviceMesh, Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
         DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, LinearCallOperation, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Layout, LinearCallOperation,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneOperation,
         Operation as CoreOperation, Place, Placeholder, Placement, ProgramError, Provenance, ProvenanceScope,
         ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshard, ScanOperation, Shape,
         ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation, StagedFunction,
-        WhileOperation,
+        StridedLayout, WhileOperation,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{BufferSpecification, BufferType};
@@ -5316,6 +5329,73 @@ mod tests {
         let message =
             format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 999);
         assert_eq!(error(&missing), message);
+    }
+
+    #[test]
+    fn test_session_lower_program_rejects_misattributed_mesh_devices() {
+        // A function compiled for a mesh that assigns the device of this process to another process, or a device that
+        // this process cannot address to this process, is rejected before anything is lowered or compiled, as a
+        // placement of a capture rejects it (refer to
+        // `test_placed_constant_rejects_misattributed_devices_before_the_placement_attempt`), so every process rejects
+        // it alike, also for a function without captures. Before, it compiled, and an execution either failed for a
+        // missing shard or returned a result on the misattributed mesh.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let (device_id, process_index) = (local.id(), local.process_index());
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mesh = |device: Device| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, vec![device]).unwrap()
+        };
+        let error = |device: Device| {
+            session.lower_program(&program, 0, &Options::new(mesh(device))).unwrap_err().to_string()
+        };
+        assert_eq!(
+            [error(Device::new(device_id, process_index + 1)), error(Device::new(device_id + 999, process_index))],
+            [
+                format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1),
+                format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 999),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_placed_constant_takes_the_layout_of_the_capture_whatever_the_index_holds() {
+        // A capture of two column shards with byte strides `[8, 4]` lives on two devices of another process, which a
+        // metadata-only import describes, because the CPU plugin cannot allocate strided buffers. A replicated copy on
+        // another device pair drops the layout, which no longer describes its shards. A later placement as the
+        // original split on that pair keeps the layout as a placement of the capture itself does, rather than dropping
+        // it because it started from that copy. Before, it dropped it.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = |name: &str, devices: [usize; 2]| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(name, 2, MeshAxisType::Auto).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, devices.map(|device| Device::new(2048 + device, 1)).to_vec()).unwrap()
+        };
+        let source_mesh = mesh("a", [0, 1]);
+        let dimensions = vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"])];
+        let sharding = Sharding::new(source_mesh.logical_mesh().clone(), dimensions).unwrap();
+        let layout = Layout::Strided(StridedLayout::new(vec![8, 4]));
+        let r#type = ArrayType::new_static(DataType::F32, [4, 4]).with_layout(layout.clone());
+        let placed_layout = |after_replicated_copy: bool| {
+            let (r#type, source_mesh, sharding) = (r#type.clone(), source_mesh.clone(), Some(sharding.clone()));
+            let capture = Array::from_addressable_buffers(&session, r#type, source_mesh, sharding, Vec::new()).unwrap();
+            let retained = RetainedArray::new(&capture);
+            let retained = match captured_type(&capture.r#type()) {
+                Some(captured_type) => retained.with_declared_type(captured_type),
+                None => retained,
+            };
+            if after_replicated_copy {
+                let copy = placed_constant(&session, &retained, &mesh("b", [2, 3])).unwrap().unwrap();
+                assert_eq!(copy.r#type().layout(), None);
+            }
+            let placed = placed_constant(&session, &retained, &mesh("a", [2, 3])).unwrap().unwrap();
+            placed.r#type().layout().cloned()
+        };
+        assert_eq!([placed_layout(false), placed_layout(true)], [Some(layout.clone()), Some(layout)]);
     }
 
     #[test]

@@ -1458,21 +1458,30 @@ impl Session {
     /// Places `inputs` on `mesh` according to `expected_shardings` at the call boundary. Inputs that already match skip
     /// the placement entirely, and the implicit placement is the cold path. An input matches only if it is also on
     /// `mesh`, because the same sharding assigns its shards to other devices on another device mesh (e.g., one that
-    /// lists the same devices in another order).
+    /// lists the same devices in another order), and only if it has the buffer of every shard on a device of this
+    /// process that it can have (refer to [`Self::serves_missing_local_replicas`]).
     fn reshard_inputs_if_needed(
         &self,
         mesh: &DeviceMesh,
         expected_shardings: &[Sharding],
         inputs: Vec<Array>,
     ) -> Result<Vec<Array>, Error> {
-        let matches = |array: &Array, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
+        let process_index = self.client().process_index()?;
+        let matches = |array: &Array, expected: &Sharding| {
+            array.sharding() == expected
+                && array.mesh() == mesh
+                && !Self::serves_missing_local_replicas(array, process_index)
+        };
         if inputs.iter().zip(expected_shardings).all(|(array, expected)| matches(array, expected)) {
             return Ok(inputs);
         }
         inputs
             .into_iter()
             .zip(expected_shardings)
-            .map(|(array, expected)| self.reshard_input_if_needed(mesh, expected, array))
+            .map(|(array, expected)| match matches(&array, expected) {
+                true => Ok(array),
+                false => array.reshard_on_devices(self, mesh, expected, false),
+            })
             .collect()
     }
 
@@ -1484,11 +1493,38 @@ impl Session {
         expected_sharding: &Sharding,
         input: Array,
     ) -> Result<Array, Error> {
-        if input.sharding() == expected_sharding && input.mesh() == mesh {
-            Ok(input)
-        } else {
-            input.reshard_on_devices(self, mesh, expected_sharding, false)
+        Ok(self.reshard_inputs_if_needed(mesh, std::slice::from_ref(expected_sharding), vec![input])?.pop().unwrap())
+    }
+
+    /// Returns whether `array` lacks the buffer of a shard on a device of this process, whose process index is
+    /// `process_index`, and another shard of this process with a buffer holds the same elements for every such shard
+    /// (e.g., for an array imported with a buffer for only one of its local replicas, refer to
+    /// [`Array::from_addressable_buffers`]). A placement of `array` onto its own mesh and sharding then serves each
+    /// missing shard from such a replica (refer to `Array::local_replica`), which an executable needs, because it
+    /// reads the buffer of every device of this process. A missing shard without elements needs no replica. The
+    /// replicas of an array with a pending reduction or with manual variation are only the shards with the same
+    /// contribution, so such an array is not served here and keeps the error of the missing shard, as does an array
+    /// with a missing shard that no local shard can serve. An array with every buffer of this process, which is the
+    /// common case, costs one scan of its shards.
+    fn serves_missing_local_replicas(array: &Array, process_index: usize) -> bool {
+        let is_local = |shard: &&ArrayShard| shard.device().process_index() == process_index;
+        let mut missing =
+            array.shards().iter().filter(is_local).filter(|shard| shard.buffer().is_none()).peekable();
+        if missing.peek().is_none() || array.data_type().is_zero() {
+            return false;
         }
+        let sharding = array.sharding();
+        if !sharding.unreduced_axes().is_empty() || !sharding.varying_manual_axes().is_empty() {
+            return false;
+        }
+        missing.all(|shard| {
+            shard.slice().iter().any(|range| range.is_empty())
+                || array
+                    .shards()
+                    .iter()
+                    .filter(is_local)
+                    .any(|other| other.buffer().is_some() && other.slice() == shard.slice())
+        })
     }
 
     /// Pads bounded-dynamic inputs to static executable storage and appends their logical extents. An executable

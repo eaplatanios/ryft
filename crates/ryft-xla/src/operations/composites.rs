@@ -5,8 +5,8 @@ use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Instruction, Operation, Parameter, Placeholder, ProgramError, RegionRef,
-    RematerializationOptimizationBarrier, ScanOperation, Typed, Value,
+    DifferentiableType, Instruction, Operation, OperationPayloadProjection, Parameter, Placeholder, ProgramError,
+    RegionRef, RematerializationOptimizationBarrier, ScanOperation, Typed, Value,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -44,28 +44,46 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
 /// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
 /// functions that calls share (refer to `collect_jit_call_functions`), the traversal of the regions that lowering emits
-/// (refer to `emitted_regions`), the summaries of the placement requests and of the session constants of a region, and
-/// the validation of the placements of a compiled program (refer to `validate_placements`), so that a placement request
-/// or a captured array inside a region that lowering omits is never validated, placed, or passed.
+/// (refer to `emitted_regions`, which compilation admission also reads), the summaries of the placement requests and of
+/// the session constants of a region, and the validation of the placements of a compiled program (refer to
+/// `validate_placements`), so that a placement request or a captured array inside a region that lowering omits is never
+/// validated, placed, or passed. The eager application of an operation asks the same question of that operation (refer
+/// to [`omits_operation_regions`]).
 pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
     target_platform: Option<&str>,
 ) -> bool {
-    if instruction
-        .operation()
-        .projected_payload::<ScanOperation<Type>>()
-        .is_some_and(|scan| !admits_iterations(scan))
-    {
-        return true;
-    }
-    let Some(key) = instruction.operation().composite_key() else {
-        return false;
-    };
     let types = |atoms: &[ryft_core::AtomId]| {
         atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
     };
-    let (input_types, output_types) = (types(instruction.inputs()), types(instruction.outputs()));
+    omits_operation_regions(
+        instruction.operation(),
+        instruction.operation().composite_key(),
+        || (types(instruction.inputs()), types(instruction.outputs())),
+        target_platform,
+    )
+}
+
+/// Returns `true` if lowering `operation`, which calls the named composite `composite_key` if it is one, for
+/// `target_platform` emits none of its regions. This is the part of [`omits_regions`] that reads only the operation,
+/// its input and output types, which `boundary_types` returns when a named composite call needs them, and the
+/// platform, so that the eager application of an operation (refer to `Session::bind`) asks the same question of the
+/// operation that it binds as the walks of the regions that lowering emits ask of each instruction. The caller passes
+/// the key, because the families that only partial evaluation analyses recognize no named composite call.
+pub(crate) fn omits_operation_regions<O: OperationPayloadProjection>(
+    operation: &O,
+    composite_key: Option<&CompositeKey>,
+    boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
+    target_platform: Option<&str>,
+) -> bool {
+    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(|scan| !admits_iterations(scan)) {
+        return true;
+    }
+    let Some(key) = composite_key else {
+        return false;
+    };
+    let (input_types, output_types) = boundary_types();
     NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
 }
 

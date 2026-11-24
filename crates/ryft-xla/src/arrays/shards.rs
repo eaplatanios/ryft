@@ -30,9 +30,13 @@ pub struct ArrayShard {
 
 impl ArrayShard {
     /// Creates a new [`ArrayShard`] described by `descriptor`. `buffer` holds the shard's storage when the shard is
-    /// addressable from the current process, and [`None`] creates a metadata-only remote shard.
+    /// addressable from the current process, and [`None`] creates a metadata-only remote shard. Nothing checks that
+    /// `buffer` lives on the device of `descriptor` and holds its shape and data type, so only the constructors of
+    /// [`Array`](crate::Array), which validate every buffer against the descriptor of its shard first (refer to
+    /// [`Array::from_addressable_buffers`](crate::Array::from_addressable_buffers)), create shards. A public caller
+    /// imports buffers through those constructors and reads the shards of the resulting array.
     #[inline]
-    pub fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'static>>>) -> Self {
+    pub(crate) fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'static>>>) -> Self {
         let storage = buffer.map_or(ArrayShardStorage::Remote, ArrayShardStorage::Buffer);
         Self { descriptor, storage }
     }

@@ -27,12 +27,16 @@
 //!
 //! Every session counts the arrays that are created through it, which [`ArrayStatistics`] reports, and can describe
 //! the ones that are still alive as [`LiveArray`]s. The unit that it counts is the storage that an array shares with
-//! its clones, so cloning and dropping array handles involves no bookkeeping.
+//! its clones, so cloning and dropping array handles involves no bookkeeping. Only the buffers of live arrays are
+//! counted, so a buffer that only the placement index of a captured array holds (i.e., a copy of the array that a
+//! function which captures it received on other devices, refer to `RetainedArray::placed`) is not, and the statistics
+//! can then understate the memory that is resident on a device (e.g., zero bytes on the device of a dropped result of
+//! a lift whose copy the index of the captured array still holds).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ryft_core::{
     Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
@@ -47,6 +51,7 @@ use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
 use crate::arrays::host::validate_mesh_device_processes;
 use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
+use crate::arrays::retained::PlacementIndex;
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
 use crate::types::ArrayTypeExtension;
@@ -60,7 +65,7 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{HostOrArray, Placeable, PlacementOptions};
+pub use placement::{PlaceInput, Placeable, PlacementOptions, validate_parameter_options};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
@@ -84,6 +89,24 @@ pub enum ArrayError {
 
     #[error("array `{path}` cannot be donated while `may_alias` is `Some(true)`")]
     DonatedArrayMayAlias { path: ParameterPath },
+
+    #[error("failed to place the parameter at `{path}`: {source}")]
+    FailedParameterPlacement {
+        path: ParameterPath,
+        #[source]
+        source: Arc<Error>,
+    },
+
+    #[error(
+        "the placement of this captured array as `{sharding}` failed with: {source}; a failed placement of a capture \
+         is not retried, because a retry by one process alone would unpair its cross-host transfers, so create the \
+         capture again on every process to retry it"
+    )]
+    FailedCapturePlacement {
+        sharding: Sharding,
+        #[source]
+        source: Arc<Error>,
+    },
 
     #[error("compiled reshard does not support `Manual` mesh axis {axis_name}")]
     ManualReshardingAxis { axis_name: String },
@@ -220,7 +243,11 @@ impl Array {
     ///
     /// With [`None`] for `sharding`, the function uses the sharding of `r#type` if present and defaults to replication
     /// over `mesh` otherwise. Each buffer in a replicated placement must have the full logical shape, and callers are
-    /// responsible for supplying the same value in each replica.
+    /// responsible for supplying the same value in the replicas of each contribution, which are the shards with the
+    /// same slice and the same coordinates along unreduced axes and along varying manual axes. Devices at different
+    /// coordinates along a varying manual axis may hold different values of one slice, and a placement that serves a
+    /// missing buffer (e.g., of an import that supplies only some local replicas) reads only another replica of the
+    /// same contribution.
     ///
     /// A supplied sharding can place the array over auto mesh axes. After removing its auto axes with
     /// [`Sharding::without_auto_axes`], it must match any sharding in the type, or the function returns
@@ -535,12 +562,7 @@ impl Array {
     /// `session` belongs to a different PJRT client. The array's addressable shard buffers belong to its original
     /// client.
     pub(crate) fn with_session(mut self, session: &Session) -> Result<Self, Error> {
-        if !std::ptr::eq(self.client(), session.client()) {
-            return Err(PjrtError::invalid_argument(
-                "cannot associate an array with a session of a different PJRT client",
-            )
-            .into());
-        }
+        self.validate_session_client(session)?;
         self.session = session.clone();
         Ok(self)
     }
@@ -551,12 +573,16 @@ impl Array {
     /// this function wherever it would otherwise return the storage of its input on this process (e.g., a forced copy
     /// on a process that holds no buffer to copy), and no other function creates such storage. Storage that no other
     /// handle refers to (i.e., that has no clone and no [`RetainedArray`]) is kept, because nothing can tell it apart
-    /// from new storage, so whether this function allocates depends on the handles of this process, while its result
-    /// is a new array on every process.
+    /// from new storage once its placements (refer to [`RetainedArray::placed`]) are cleared, so whether this function
+    /// allocates depends on the handles of this process, while its result is a new array on every process, which
+    /// starts without placements on every process alike.
     pub(crate) fn with_new_identity(mut self) -> Self {
-        if Arc::strong_count(&self.parts) != 1 || Arc::weak_count(&self.parts) != 0 {
-            let metadata = Arc::clone(&self.parts.metadata);
-            self.parts = Arc::new(ArrayParts::new(self.session(), metadata, self.parts.shards.clone()));
+        match Arc::get_mut(&mut self.parts) {
+            Some(parts) => parts.placements = OnceLock::new(),
+            None => {
+                let metadata = Arc::clone(&self.parts.metadata);
+                self.parts = Arc::new(ArrayParts::new(self.session(), metadata, self.parts.shards.clone()));
+            }
         }
         self
     }
@@ -863,6 +889,17 @@ impl Array {
             fence.block_until_ready()?;
         }
 
+        Ok(())
+    }
+
+    /// Validates that this [`Array`] and `session` use the same PJRT client.
+    fn validate_session_client(&self, session: &Session) -> Result<(), Error> {
+        if !std::ptr::eq(self.client(), session.client()) {
+            return Err(PjrtError::invalid_argument(
+                "cannot associate an array with a session of a different PJRT client",
+            )
+            .into());
+        }
         Ok(())
     }
 }
@@ -1295,6 +1332,11 @@ struct ArrayParts {
     /// [`ArrayShard`]s that make up the [`Array`], in the order of the shard indices of [`Self::metadata`].
     shards: Vec<ArrayShard>,
 
+    /// Placements of the [`Array`] on other devices that functions which capture it receive, which every retention of
+    /// the array shares (refer to [`RetainedArray::placed`]). It is created by the first retention, so an array that
+    /// is never captured allocates nothing, and it lives as long as the array or any retention of it.
+    placements: OnceLock<Arc<PlacementIndex>>,
+
     /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
     /// as live in [`Session::array_statistics`] until the storage is dropped. It is the last field so that the shards
     /// and caches are released before the array stops counting as live.
@@ -1306,7 +1348,7 @@ impl ArrayParts {
     /// Storage can only be created through this function, so every logical array is counted exactly once.
     fn new(session: &Session, metadata: Arc<ArrayMetadata>, shards: Vec<ArrayShard>) -> Self {
         let registration = session.array_tracker().register(&metadata, &shards);
-        Self { metadata, shards, _registration: registration }
+        Self { metadata, shards, placements: OnceLock::new(), _registration: registration }
     }
 }
 
