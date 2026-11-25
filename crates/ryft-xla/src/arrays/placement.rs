@@ -1483,8 +1483,6 @@ impl Session {
         self.place_with_comparison(x, options, ValueComparison::of_session(self)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Implements [`Self::place`] with `comparison`, the comparison of the values of the processes that the call makes
     /// for the leaves that every process places on its own (refer to [`PlaceableParameter::process_value`]), if any.
     pub(crate) fn place_with_comparison<
@@ -1513,7 +1511,6 @@ impl Session {
     {
         let structure = x.parameter_structure();
         let (target, source, donate, may_alias) = options.into_parts();
-
         let target_values =
             broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(target, &structure, Ok, |prefix, _| Ok(prefix))?;
         let source_values =
@@ -1543,16 +1540,19 @@ impl Session {
                         None
                     }
                 };
+
                 let target =
                     resolve(target_values.get(index).cloned().map_or(Ok(None), |request| request.resolve(self)));
                 let source =
                     resolve(source_values.get(index).cloned().map_or(Ok(None), |request| request.resolve(self)));
                 let donate = donate_values.get(index).copied().unwrap_or_default();
                 let may_alias = may_alias_values.get(index).copied().flatten();
+
                 if checked.is_ok() {
                     checked =
                         validate_parameter_options(|| path(index), target.as_ref(), source.as_ref(), donate, may_alias);
                 }
+
                 (target, source, donate, may_alias)
             })
             .collect::<Vec<_>>();
@@ -1586,6 +1586,7 @@ impl Session {
                 may_alias,
             })
             .collect();
+
         let output_parameters = place_leaves(
             self,
             comparison,
@@ -1594,9 +1595,12 @@ impl Session {
             |_, leaf| leaf.parameter.place_parameter(self, leaf.target, leaf.source, leaf.donate, leaf.may_alias),
             |index, error| with_parameter_path(error, || path(index)),
         )?;
+
         Input::To::<P::Output>::from_parameters(structure, output_parameters).map_err(Into::into)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Leaf and its expanded placement options, shared by the two eager placement frontends.
 struct PlacementLeaf<P> {
