@@ -368,6 +368,33 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Returns the `f32` values that the devices of `array` hold, in the device order of its mesh.
+    pub(crate) fn shard_values(array: &Array) -> Vec<Vec<f32>> {
+        array
+            .shards()
+            .iter()
+            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
+            .collect()
+    }
+
+    /// Returns the native addresses of the buffers that the devices of `array` hold, in the device order of its mesh,
+    /// once they are ready. Two arrays that are both alive share storage exactly when they share such an address, which
+    /// the identity of the handles of their buffers does not show.
+    pub(crate) fn native_buffer_addresses(array: &Array) -> Vec<usize> {
+        array
+            .shards()
+            .iter()
+            .map(|shard| {
+                let buffer = shard.buffer().unwrap();
+                buffer.ready().unwrap().r#await().unwrap();
+
+                // The buffer is ready and stays alive while `array` does, and its address is only compared and never
+                // dereferenced.
+                unsafe { buffer.unsafe_pointer().unwrap() }
+            })
+            .collect()
+    }
+
     /// Compiles only when `T` is both [`Send`] and [`Sync`], so that tests can pin these auto traits of a type.
     pub(crate) fn assert_send_sync<T: Send + Sync>() {}
 

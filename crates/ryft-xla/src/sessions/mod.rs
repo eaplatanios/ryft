@@ -3197,8 +3197,8 @@ pub(crate) mod tests {
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::sessions::effects::EffectCallbackGuard;
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, loopback_address, other_cpu_client, peer_devices,
-        replicated_array, session_with_remote_devices, values_from_bytes, values_to_bytes,
+        assert_send_sync, cpu_client, device_mesh_2x2, execution_client, loopback_address, other_cpu_client,
+        peer_devices, replicated_array, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
         CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
@@ -3996,6 +3996,31 @@ pub(crate) mod tests {
         let session = Session::builder().client(client).build().unwrap();
         assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
         assert_eq!(session.with_device_mesh(mesh.clone()).device_mesh().unwrap(), &mesh);
+    }
+
+    #[test]
+    fn test_session_placement() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let mesh = device_mesh_2x2();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert!(matches!(session.placement(sharding.clone()), Err(Error::Session(SessionError::MissingMesh))));
+        let configured = session.with_device_mesh(mesh.clone());
+        assert_eq!(configured.placement(sharding.clone()).unwrap(), Placement::new(mesh.clone(), sharding).unwrap());
+
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Auto).unwrap()]).unwrap();
+        let error = configured.placement(Sharding::replicated(other_mesh.clone(), 1)).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Core(error) if matches!(
+                error.as_ref(),
+                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
+                    if expected == mesh.logical_mesh() && actual == &other_mesh,
+            ),
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!("mesh mismatch; expected `{:?}` but got `{other_mesh:?}`", mesh.logical_mesh()),
+        );
     }
 
     #[test]

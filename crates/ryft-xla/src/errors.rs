@@ -469,6 +469,7 @@ mod tests {
         assert_eq!(error.downcast_custom::<ExecutionError>(), Some(&backend));
         assert_eq!(error, ProgramError::from(Error::from(backend.clone())));
         assert_eq!(error.to_string(), backend.to_string());
+        assert!(error.source().is_none());
 
         let backend = Error::from(io::Error::other("I/O failure"));
         let error = ProgramError::from(backend.clone());

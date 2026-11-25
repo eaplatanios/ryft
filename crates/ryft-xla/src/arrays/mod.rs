@@ -1403,11 +1403,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Error as CoreError,
-        Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, Placed, Placement, ProgramError, Reference, Shape,
-        Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed, UnreducedKind, Value,
-        WhilePredicate,
+        Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayType, AssertionValue, Concretizable, DataType, Device,
+        DeviceMesh, Differentiate, DifferentiationDual, DifferentiationError, Dimension, DimensionBounds,
+        DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Error as CoreError, Layout, LogicalMesh,
+        MaybeZero, Memory, MeshAxis, MeshAxisType, Neg, Place, Placed, Placement, ProgramError, Reference, Shape,
+        Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed, UnreducedKind,
+        Value as CoreValue, ValueProjection, WhilePredicate, differentiate_at,
     };
     use ryft_pjrt::{BufferType, Client, Error as PjrtError, ExecutionFence};
 
@@ -1420,7 +1421,7 @@ mod tests {
         session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
+    use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt, Value};
 
     use super::{Array, ArrayError, block_until_ready, ready};
 
@@ -2607,6 +2608,101 @@ mod tests {
         let recovered = array.domain();
         assert!(std::ptr::eq(recovered.parent().client(), client));
         assert!(recovered.parent().is_same_session(&session));
+    }
+
+    #[test]
+    fn test_array_relocatable_type() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |values: &[f32; 2]| {
+            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(values)).unwrap()
+        };
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
+        let placement = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
+        let primal = upload(&[1., 2.]);
+        let committed = primal.place(&devices[1], None).unwrap();
+        let movable = upload(&[3., 4.]);
+        let named_tangent = movable.place(&placement, None).unwrap();
+
+        // The saved identity keeps whichever tangent its declaration admits. A movable primal leaves its
+        // declaration open, while a committed anonymous primal requires an anonymous or relocatable tangent. An
+        // `Array` and its `Value::Array` representation accept the same tangents.
+        for (primal, tangent, expected) in [
+            (primal, named_tangent.clone(), Ok((devices[1], true, vec![3., 4.]))),
+            (committed.clone(), movable, Ok((devices[0], false, vec![3., 4.]))),
+            (
+                committed,
+                named_tangent,
+                Err(ProgramError::MalformedProgram(
+                    "pushforward tangent 0 has type f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}] \
+                     but its primal boundary requires tangent type f32[2]"
+                        .into(),
+                )),
+            ),
+        ] {
+            let (_, pushforward) = differentiate_at(primal.clone()).linearize(Ok).unwrap();
+            let through_array = pushforward.apply(tangent.clone());
+            let (_, pushforward) = session.differentiate_at(Value::Array(primal)).linearize(Ok).unwrap();
+            let through_value = pushforward
+                .apply(Value::Array(tangent))
+                .and_then(|output| Ok(ValueProjection::<ArrayType>::into_projected(output)?));
+            for output in [through_array, through_value] {
+                let observed = output.map(|array| {
+                    let [device] = array.mesh().devices() else { panic!("expected one device") };
+                    (*device, array.is_committed(), array.copy_to_host().unwrap().elements::<f32>().unwrap())
+                });
+                assert_eq!(observed, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_relocatable_type_survives_generic_array_ir_wrapping() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1);
+        let mesh = DeviceMesh::new(mesh, vec![second]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |mesh, sharding| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh, sharding, values_to_bytes(&[1f32, 2.])).unwrap()
+        };
+        let named = upload(Some(mesh), Some(sharding));
+        let anonymous = upload(None, None);
+        for movable in [anonymous.clone(), named.clone().with_committed(false)] {
+            let declaration = CoreValue::relocatable_type(&movable).unwrap();
+            let movable = ArrayIrValue::Array(movable);
+            assert_eq!(CoreValue::relocatable_type(&movable), Some(ArrayIrType::Array(declaration)));
+            let primal = ArrayIrValue::Array(named.clone());
+            let dual = DifferentiationDual::new(primal, movable.clone()).unwrap();
+            assert_eq!(dual.tangent(), &MaybeZero::Value(movable));
+        }
+
+        let committed = ArrayIrValue::Array(anonymous.place(&second, None).unwrap());
+        let named = ArrayIrValue::Array(named);
+        for (primal, tangent, message) in [
+            (
+                named.clone(),
+                committed.clone(),
+                "tangent type f32[2] does not match type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] \
+                 required by primal type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}]",
+            ),
+            (
+                committed,
+                named,
+                "tangent type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] does not match type f32[2] \
+                 required by primal type f32[2]",
+            ),
+        ] {
+            assert!(matches!(
+                DifferentiationDual::new(primal, tangent),
+                Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message: actual })))
+                    if actual == message,
+            ));
+        }
     }
 
     #[test]
