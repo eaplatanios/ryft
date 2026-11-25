@@ -47,6 +47,9 @@ use crate::kernels::aot::{KernelAotError, LoadedKernel};
 use crate::kernels::staging::KernelExecutionFacts;
 use crate::{Array, DistributedRuntime, Error, FromPjrt};
 
+/// Coordination protocol of [`DistributedKernel`], which starts the key of every record that a coordinator stores.
+const COORDINATION_PROTOCOL: &str = "ryft/kernel-host/v1/";
+
 // TODO(eaplatanios): Promote distributed kernel errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
 /// Represents errors produced while configuring or executing a [`DistributedKernel`]. The host drains submitted
@@ -290,20 +293,18 @@ impl<'o> DistributedKernel<'o> {
         if chunks > 4096 {
             return Err(DistributedKernelError::invalid("input chunk count exceeds the host transport budget"));
         }
-        let (launch, coordinator, process, processes) = runtime.reserve_kernel_coordinator()?;
+        let process = runtime.process_index();
+        let processes = runtime.process_count();
         if processes == 0 || processes > 256 || process >= processes {
             return Err(DistributedKernelError::invalid("invalid distributed runtime participant coordinates"));
         }
-        let mut prefix = b"ryft/kernel-host/v1/".to_vec();
-        prefix.extend_from_slice(&launch);
-        prefix.extend_from_slice(&coordinator.to_le_bytes());
         Ok(Self {
             kernel,
             coordination: Arc::new(KernelCoordination {
                 runtime: runtime.clone(),
-                prefix,
-                process: process as usize,
-                processes: processes as usize,
+                prefix: runtime.reserve_key_prefix(COORDINATION_PROTOCOL),
+                process,
+                processes,
                 options,
             }),
             round: 0,
@@ -508,7 +509,7 @@ struct KernelCoordination {
     /// Existing runtime owner retained through pending completion.
     runtime: DistributedRuntime,
 
-    /// Launch identity and unique ordered coordinator reservation.
+    /// Key prefix that [`DistributedRuntime::reserve_key_prefix`] reserved for this coordinator.
     prefix: Vec<u8>,
 
     /// Local participant index owned by runtime initialization.
@@ -1097,7 +1098,7 @@ mod tests {
             }
             "order" => {
                 if process == 0 {
-                    runtime.reserve_kernel_coordinator().unwrap();
+                    runtime.reserve_key_prefix(COORDINATION_PROTOCOL);
                 }
                 let mut next = DistributedKernel::new(&runtime, &kernel, options).unwrap();
                 assert!(matches!(

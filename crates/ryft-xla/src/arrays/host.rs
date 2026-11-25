@@ -2307,7 +2307,7 @@ impl Array {
     fn digest_verdict(session: &Session, device: Device, maximum: Self) -> Result<ExecutionFence, Error> {
         let verdict = |maximum: &Self| -> Result<Vec<u8>, Error> {
             let bytes = maximum.copy_to_host_bytes()?;
-            let words = bytes.as_chunks::<4>().0.iter().map(|word| u32::from_ne_bytes(word.try_into().unwrap()));
+            let words = bytes.as_chunks::<4>().0.iter().copied().map(u32::from_ne_bytes);
             let words = words.collect::<Vec<_>>();
             let agree = words.len() == 2 * DIGEST_WORDS
                 && (0..DIGEST_WORDS).all(|index| words[index] == !words[index + DIGEST_WORDS]);

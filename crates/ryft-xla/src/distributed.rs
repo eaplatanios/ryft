@@ -39,9 +39,9 @@
 //! # }
 //! ```
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -210,7 +210,7 @@ impl DistributedRuntime {
             state: Arc::new(DistributedRuntimeState {
                 key_value_store,
                 launch_id,
-                kernel_sequence: AtomicU64::new(0),
+                key_prefix_counts: Mutex::new(HashMap::new()),
                 process_index: process_index as ProcessIndex,
                 process_count: process_count as usize,
                 request_timeout,
@@ -270,17 +270,20 @@ impl DistributedRuntime {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Reserves one ordered kernel coordinator namespace within the existing distributed launch, returning the launch
-    /// identity, the reserved sequence number, the index of this process, and the number of processes.
-    pub(crate) fn reserve_kernel_coordinator(&self) -> Result<([u8; 32], u64, u32, u32), Error> {
-        let sequence = self
-            .state
-            .kernel_sequence
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
-            .map_err(|_| ryft_pjrt::Error::invalid_argument("kernel coordinator sequence overflow"))?;
-
-        // The coordinates were converted from `u32` values when the runtime was initialized.
-        Ok((self.state.launch_id, sequence, self.state.process_index as u32, self.state.process_count as u32))
+    /// Reserves a key prefix in the key-value store of this runtime for one instance of the coordination protocol
+    /// `protocol` (e.g., one coordinator of a protocol that keeps a round counter per coordinator). The prefix consists
+    /// of `protocol`, the launch identity, and the number of prefixes that any handle of this runtime reserved for
+    /// `protocol` before in this process, and so it differs from every prefix reserved before. The processes of a job
+    /// agree on the prefix of an instance without communicating when each of them reserves the prefixes of `protocol`
+    /// in the same order. Prefixes of other protocols do not affect that order.
+    pub(crate) fn reserve_key_prefix(&self, protocol: &'static str) -> Vec<u8> {
+        let mut counts = self.state.key_prefix_counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = counts.entry(protocol).or_insert(0u64);
+        let mut prefix = protocol.as_bytes().to_vec();
+        prefix.extend_from_slice(&self.state.launch_id);
+        prefix.extend_from_slice(&count.to_le_bytes());
+        *count += 1;
+        prefix
     }
 
     /// Creates a chunked, checksummed compilation artifact exchange over the key-value store of this runtime, for
@@ -451,8 +454,8 @@ struct DistributedRuntimeState {
     /// Launch identity that the coordinator generated and published during initialization.
     launch_id: [u8; 32],
 
-    /// Next sequence number that [`DistributedRuntime::reserve_kernel_coordinator`] reserves.
-    kernel_sequence: AtomicU64,
+    /// Number of key prefixes that [`DistributedRuntime::reserve_key_prefix`] reserved so far for each protocol.
+    key_prefix_counts: Mutex<HashMap<&'static str, u64>>,
 
     /// Index of this process among the processes of the job.
     process_index: ProcessIndex,
@@ -1196,12 +1199,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_distributed_runtime_reserve_kernel_coordinator() {
+    fn test_distributed_runtime_reserve_key_prefix() {
         let runtime = single_process_runtime();
-        let (launch_id, sequence, process_index, process_count) = runtime.reserve_kernel_coordinator().unwrap();
-        assert_eq!((sequence, process_index, process_count), (0, 0, 1));
-        assert_eq!(runtime.clone().reserve_kernel_coordinator().unwrap(), (launch_id, 1, 0, 1));
-        assert_ne!(single_process_runtime().reserve_kernel_coordinator().unwrap().0, launch_id);
+        let launch_id = runtime.state.launch_id;
+        let prefix = |protocol: &str, count: u64| [protocol.as_bytes(), &launch_id, &count.to_le_bytes()].concat();
+        assert_eq!(runtime.reserve_key_prefix("first/"), prefix("first/", 0));
+
+        // Every handle of the runtime counts the prefixes of a protocol together, and each protocol is counted apart.
+        assert_eq!(runtime.clone().reserve_key_prefix("first/"), prefix("first/", 1));
+        assert_eq!(runtime.reserve_key_prefix("second/"), prefix("second/", 0));
+        assert_eq!(runtime.reserve_key_prefix("first/"), prefix("first/", 2));
+
+        // Another launch has another identity, and so its prefixes differ.
+        assert_ne!(single_process_runtime().reserve_key_prefix("first/"), prefix("first/", 0));
     }
 
     #[test]
