@@ -1575,6 +1575,7 @@ impl Session {
             .zip(leaf_options)
             .map(|(parameter, (target, source, donate, may_alias))| PlacementArgument {
                 parameter,
+                context: (),
                 target,
                 source,
                 donate,
@@ -1701,17 +1702,31 @@ impl<Value> PlacementOptionValues<Value> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One input parameter and its expanded placement options, shared by [`Session::place`] and
-/// [`place_operation_bindings`].
-struct PlacementArgument<P> {
+/// One input parameter and its expanded placement options. [`place_operation_bindings`] keeps the binding's session
+/// in `context`, while [`Session::place`] shares its session across the arguments and uses `()` here.
+struct PlacementArgument<P, C = ()> {
+    /// Input parameter to place.
     parameter: P,
+
+    /// Session that places `parameter` when the arguments of a call do not share one (i.e., the session of the binding
+    /// of a core placement operation), and `()` otherwise.
+    context: C,
+
+    /// Destination placement of `parameter`, if one was specified.
     target: Option<PlacementRequest>,
+
+    /// Expected source placement of `parameter`, if one was specified.
     source: Option<PlacementRequest>,
+
+    /// Whether a compiled reshard may reuse the buffers of `parameter` for the result.
     donate: bool,
+
+    /// Whether the result may share buffers with other arrays. `Some(false)` forbids it, unless `donate` is `true`,
+    /// which gives `parameter` up.
     may_alias: Option<bool>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Places the array inputs bound to the given core placement operations as a group. The core operation requires even
 /// splits and keeps the input client, while the session frontend also admits uneven splits and explicit cross-client
@@ -1746,37 +1761,37 @@ pub(crate) fn place_operation_bindings(
         None
     };
 
-    let mut contexts = Vec::with_capacity(bindings.len());
-    let mut arguments = Vec::with_capacity(bindings.len());
-    for (context, parameter, operation) in bindings {
-        contexts.push(context);
-        arguments.push(PlacementArgument {
+    let arguments = bindings
+        .into_iter()
+        .map(|(context, parameter, operation)| PlacementArgument {
             parameter,
+            context,
             target: operation.target().cloned(),
             source: operation.source().cloned(),
             donate: false,
             may_alias: Some(operation.may_alias()),
-        });
-    }
-    let checked = arguments.iter().enumerate().try_for_each(|(index, argument)| {
+        })
+        .collect::<Vec<_>>();
+    let checked = arguments.iter().try_for_each(|argument| {
         let array = &argument.parameter;
+        let context = &argument.context;
         let rank = array.r#type().rank();
         let target = argument.target.clone().map(|target| target.padded(rank)).transpose()?;
         let source = argument.source.clone().map(|source| source.padded(rank)).transpose()?;
         PlaceOperation::new(target.clone(), source).infer_output_type_of_value(array, Some(array.sharding()), true)?;
-        contexts[index].validate_input_placement(std::slice::from_ref(array), &[])?;
-        array.validate_placement_client(&contexts[index], target.as_ref())?;
-        array.validate_array_destination(&contexts[index], target)
+        context.validate_input_placement(std::slice::from_ref(array), &[])?;
+        array.validate_placement_client(context, target.as_ref())?;
+        array.validate_array_destination(context, target)
     });
     admit_and_place_arguments(
         &session,
         comparison,
         arguments,
         checked,
-        |index, argument| {
+        |_, argument| {
             let rank = argument.parameter.r#type().rank();
             let target = argument.target.map(|target| target.padded(rank)).transpose()?;
-            argument.parameter.place_validated(&contexts[index], target, false, argument.may_alias)
+            argument.parameter.place_validated(&argument.context, target, false, argument.may_alias)
         },
         |_, error| error,
     )
@@ -1784,12 +1799,12 @@ pub(crate) fn place_operation_bindings(
 }
 
 /// Coordinates any required distributed admission, then places the arguments on every participating process.
-fn admit_and_place_arguments<P: Placeable>(
+fn admit_and_place_arguments<P: Placeable, C>(
     session: &Session,
     comparison: Option<&ValueComparison>,
-    arguments: Vec<PlacementArgument<P>>,
+    arguments: Vec<PlacementArgument<P, C>>,
     checked: Result<(), Error>,
-    place: impl Fn(usize, PlacementArgument<P>) -> Result<P::Output, Error>,
+    place: impl Fn(usize, PlacementArgument<P, C>) -> Result<P::Output, Error>,
     map_error: impl Fn(usize, Error) -> Error,
 ) -> Result<Vec<P::Output>, Error> {
     let Some(comparison) = comparison else {
@@ -4794,9 +4809,10 @@ mod tests {
 
         let run = |parameter: PlaceInput<Array>, target, may_alias| {
             let arguments = vec![
-                PlacementArgument { parameter, target, source: None, donate: false, may_alias },
+                PlacementArgument { parameter, context: (), target, source: None, donate: false, may_alias },
                 PlacementArgument {
                     parameter: PlaceInput::from(committed.clone()),
+                    context: (),
                     target: Some(PlacementRequest::from(remote)),
                     source: None,
                     donate: false,
