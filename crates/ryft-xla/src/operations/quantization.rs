@@ -13,13 +13,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::CollectiveLoweringState;
-use crate::operations::composites::{NamedCompositionKey, lower_decomposition_call, named_composition_input_types};
 use crate::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,
 };
 use crate::operations::FlatProgram;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer};
+use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
+use crate::operations::jit_call::lower_shared_function_call;
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
@@ -160,7 +161,15 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     };
     if let Some(function) = decomposition {
         if collective_state.target_platform() == Some("cuda") && !uses_physical_boundary {
-            return lower_decomposition_call(function, input_values, output_types, block, context, location);
+            let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
+            return lower_shared_function_call(
+                function.symbol(),
+                &output_types,
+                input_values,
+                block,
+                context,
+                location,
+            );
         }
         let composition_input_values = if uses_physical_boundary {
             input_values

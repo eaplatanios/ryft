@@ -8,14 +8,16 @@ use ryft_core::{
     DifferentiableType, Operation, Parameter, Parameterized, Placeholder, ProgramError, RegionId, RegionRef,
     RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
+#[cfg(test)]
+use ryft_mlir::Operation as _;
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility,
-    Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Region, SymbolVisibility, Type as MlirType,
+    TypeAndAttributes, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::regions::lower_nested_program_inline;
-use crate::lowering::types::{lower_array_ir_type, lower_tensor_type};
+use crate::lowering::types::lower_array_ir_type;
 use crate::lowering::{CollectiveLoweringState, EffectTokens, omits_regions};
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
@@ -314,37 +316,6 @@ pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result
             Ok(Type::from(input.clone().with_sharding(sharding)?))
         })
         .collect()
-}
-
-/// Calls one emitted typed decomposition function at its registered array boundary.
-pub(crate) fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
-    function: &NamedCompositionFunction,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let result_types = output_types
-        .iter()
-        .map(|r#type| lower_tensor_type(r#type, context, location).map(|r#type| r#type.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let call = block.append_operation(func::call(
-        function.symbol.as_str(),
-        func::CallProperties {
-            arguments: input_values
-                .iter()
-                .map(|value| ValueAndAttributes { value: *value, attributes: None })
-                .collect(),
-            results: result_types
-                .iter()
-                .map(|r#type| TypeAndAttributes { r#type: *r#type, attributes: None })
-                .collect(),
-            no_inline: false,
-        },
-        location,
-    )?)?;
-    Ok((0..output_types.len()).map(|index| call.result(index).unwrap().as_ref()).collect())
 }
 
 /// Identity of one generated decomposition of a named composition at a concrete typed boundary.

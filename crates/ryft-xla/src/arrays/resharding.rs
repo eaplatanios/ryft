@@ -208,7 +208,7 @@ use crate::arrays::host::{
     validate_mesh_devices, validate_one_value_per_contribution,
 };
 use crate::arrays::metadata::ArrayMetadata;
-use crate::arrays::placement::{resolve_array_placement, single_device_placement};
+use crate::arrays::placement::single_device_placement;
 use crate::arrays::shards::{
     ArrayShard, ShardContribution, ShardDescriptor, ShardIndex, ShardLayout, read_shard_to_host,
 };
@@ -389,7 +389,7 @@ impl Array {
     }
 
     /// Places this array as `request` asks. The request is resolved against this array (refer to
-    /// [`resolve_array_placement`]) and placed with [`Self::place_on_same_client`], or with
+    /// [`Self::resolve_placement_request`]) and placed with [`Self::place_on_same_client`], or with
     /// [`Self::place_from_other_client`] for an array of another PJRT client than that of `session`. Only a request
     /// that names neither devices nor a sharding (i.e., an [`PlacementRequest::InPlace`] request, which names only a
     /// memory or a layout) leaves the result on the devices that this process chose on its own when this array has such
@@ -424,7 +424,7 @@ impl Array {
         let same_client = std::ptr::eq(self.client(), session.client());
         let destination = (|| {
             self.validate_placement_client(session, Some(&request))?;
-            let target = resolve_array_placement(request, &self)?;
+            let target = self.resolve_placement_request(request)?;
             if same_client {
                 if collective.is_some() {
                     validate_mesh_devices(session, target.mesh())?;
@@ -786,7 +786,7 @@ impl Array {
     /// # Parameters
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `target`: Resolved destination [`Placement`] (refer to [`resolve_array_placement`]).
+    ///   - `target`: Resolved destination [`Placement`] (refer to [`Self::resolve_placement_request`]).
     ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
     ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     pub(crate) fn run_placement_dispatch(
@@ -869,7 +869,7 @@ impl Array {
         target: Option<PlacementRequest>,
     ) -> Result<(), Error> {
         let Some(target) = target else { return Ok(()) };
-        let placement = resolve_array_placement(target, self)?;
+        let placement = self.resolve_placement_request(target)?;
         if !std::ptr::eq(self.client(), session.client()) {
             return self.validate_placement_from_other_client(session, &placement);
         }
