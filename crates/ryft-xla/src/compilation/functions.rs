@@ -5172,7 +5172,7 @@ mod tests {
 
         // A plain trace preserves the types of the arrays that enter it, so an import there keeps the type of its
         // array.
-        let traced = crate::trace_with_context::<_, ArrayType, ArrayType>(
+        let traced = crate::trace_with_context::<_, ArrayType, crate::ArrayTracer>(
             |context, _| {
                 let imported =
                     ImportingContext::<Session, ThroughSession>::import(context, Value::Array(capture.clone()))?;
@@ -5181,7 +5181,7 @@ mod tests {
             input_type.clone(),
         )
         .unwrap();
-        assert_eq!(traced.output_type(), &capture_type);
+        assert_eq!(traced.output_type().unwrap(), Type::Array(capture_type));
     }
 
     #[test]

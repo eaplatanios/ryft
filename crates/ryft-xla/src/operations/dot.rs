@@ -616,7 +616,7 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, Options, Session, ToPjrt, TracedProgram, Type,
+        Array, ArrayConstant, ArrayTracer, Constant, Options, ProgramExtension, Session, ToPjrt, TracedProgram, Type,
         to_mlir_module_for_program, trace,
     };
 

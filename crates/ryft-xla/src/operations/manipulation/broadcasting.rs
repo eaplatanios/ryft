@@ -1048,7 +1048,7 @@ mod tests {
                 trace_with_context(|_, (x, u): (ArrayTracer, ArrayTracer)| batched_combine!(state, x, u), input_types);
             let staged = traced.map_err(diagnostic).and_then(|traced| {
                 let inputs = (Value::Array(x.clone()), Value::Array(u.clone()));
-                match traced.program().interpret_in_context(&session, inputs) {
+                match traced.interpret_in_context(&session, inputs) {
                     Ok(Value::Array(output)) => Ok(observe(&output)),
                     Ok(_) => Err("a batched function of arrays must produce an array".to_string()),
                     Err(error) => Err(diagnostic(error)),

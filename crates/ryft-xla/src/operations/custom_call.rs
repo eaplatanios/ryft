@@ -592,8 +592,9 @@ mod tests {
         test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError, RuntimeError,
-        RuntimeRequirement, Session, TracedProgram, Type, Value, to_mlir_module_for_program, trace,
+        Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError,
+        ProgramExtension, RuntimeError, RuntimeRequirement, Session, TracedProgram, Type, Value,
+        to_mlir_module_for_program, trace,
     };
 
     use super::*;

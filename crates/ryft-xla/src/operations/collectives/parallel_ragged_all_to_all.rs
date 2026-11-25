@@ -1409,16 +1409,17 @@ mod tests {
                     .unwrap()
                 }
             },
-            input_types,
+            input_types.clone(),
         )
         .unwrap();
+        let output_type = traced.output_type().unwrap();
 
         assert!(matches!(
             crate::lowering::modules::lower_mlir_module_for_program(
-                traced.program(),
+                &traced,
                 &[],
-                traced.input_type(),
-                traced.output_type(),
+                &input_types,
+                <&ArrayType>::try_from(&output_type).unwrap(),
                 "main",
                 None,
                 None,

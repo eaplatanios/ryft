@@ -2107,7 +2107,7 @@ mod tests {
         match (error.take(), traced) {
             (Some(message), _) => Err(message),
             (None, Err(error)) => Err(error.to_string()),
-            (None, Ok(traced)) => match traced.program().interpret_in_context(session, Value::Array(input.clone())) {
+            (None, Ok(traced)) => match traced.interpret_in_context(session, Value::Array(input.clone())) {
                 Ok(Value::Array(output)) => Ok(output),
                 Ok(_) => Err("placing an array must produce an array".to_string()),
                 Err(error) => Err(error.to_string()),
@@ -3236,7 +3236,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %1:f32[4] .
                 let %2:f32[4] = place [target=device(0)] %0
@@ -3246,7 +3246,7 @@ mod tests {
             },
         );
         let inputs = (Value::Array(split), Value::Array(upload));
-        let Value::Array(sum) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+        let Value::Array(sum) = traced.interpret_in_context(&session, inputs).unwrap() else {
             panic!("adding two arrays must produce an array");
         };
         assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
@@ -3430,13 +3430,11 @@ mod tests {
             let staged = match (error.take(), traced) {
                 (Some(message), _) => Err(message),
                 (None, Err(error)) => Err(error.to_string()),
-                (None, Ok(traced)) => {
-                    match traced.program().interpret_in_context(&session, Value::Array(array.clone())) {
-                        Ok(Value::Array(output)) => Ok(output),
-                        Ok(_) => Err("placing an array must produce an array".to_string()),
-                        Err(error) => Err(error.to_string()),
-                    }
-                }
+                (None, Ok(traced)) => match traced.interpret_in_context(&session, Value::Array(array.clone())) {
+                    Ok(Value::Array(output)) => Ok(output),
+                    Ok(_) => Err("placing an array must produce an array".to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
             };
             let compiled: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
                 |x: CompileTracer| {
@@ -3638,15 +3636,13 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(|x: ArrayTracer| session.place(x, options()).unwrap(), input.r#type().into_owned()).unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[4] .
                 let %1:f32[4] = place [source=device(2), target=device(1)] %0
                 in (%1)"},
         );
-        let Value::Array(staged) =
-            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
-        else {
+        let Value::Array(staged) = traced.interpret_in_context(&session, Value::Array(input.clone())).unwrap() else {
             panic!("placing an array must produce an array");
         };
         assert_eq!(observe(&staged), expected);
@@ -4023,7 +4019,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
                 let %1:f32[2] = place %0
@@ -4633,7 +4629,7 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(|input: ArrayTracer| session.place(input, options()).unwrap(), r#type.clone()).unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
@@ -4645,7 +4641,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&session, r#type.clone(), first_mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
                 .unwrap();
-        let Value::Array(output) = traced.program().interpret_in_context(&session, Value::Array(input)).unwrap() else {
+        let Value::Array(output) = traced.interpret_in_context(&session, Value::Array(input)).unwrap() else {
             panic!("placing an array must produce an array");
         };
         assert_eq!(output.mesh(), &first_mesh);
@@ -4662,7 +4658,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
                     %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
@@ -4704,7 +4700,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
                     %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
@@ -4718,7 +4714,7 @@ mod tests {
             },
         );
         let inputs = (upload(&[1., 2.], &first_mesh), upload(&[3., 4.], &second_mesh));
-        let Value::Array(gradient) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+        let Value::Array(gradient) = traced.interpret_in_context(&session, inputs).unwrap() else {
             panic!("placing an array must produce an array");
         };
         assert_eq!(gradient.mesh(), &first_mesh);
@@ -4741,7 +4737,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
                     %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
@@ -4756,7 +4752,7 @@ mod tests {
             },
         );
         let inputs = (upload(&[1., 2.], &first_mesh), upload(&[5., 6.], &first_mesh));
-        let Value::Array(cotangent) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+        let Value::Array(cotangent) = traced.interpret_in_context(&session, inputs).unwrap() else {
             panic!("placing an array must produce an array");
         };
         assert_eq!(cotangent.mesh(), &second_mesh);
@@ -4890,16 +4886,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[2, 2] .
                 let %1:f32[2, 2] = place [may_alias=false] %0
                 in (%1)"
             },
         );
-        let Value::Array(output) =
-            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
-        else {
+        let Value::Array(output) = traced.interpret_in_context(&session, Value::Array(input.clone())).unwrap() else {
             panic!("placing an array must produce an array");
         };
         assert!(!shares_input_buffer(&output));
@@ -5766,7 +5760,7 @@ mod tests {
                 |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x),
                 ArrayType::new_static(DataType::F32, [2]),
             );
-            let traced = traced.map(|traced| traced.program().to_string()).map_err(|error| error.to_string());
+            let traced = traced.map(|traced| traced.to_string()).map_err(|error| error.to_string());
             assert_eq!(traced, Err(expected_error.clone()));
             let recorded = error.take().unwrap();
             assert_eq!((host, array, recorded), (expected_error.clone(), expected_error.clone(), expected_error));

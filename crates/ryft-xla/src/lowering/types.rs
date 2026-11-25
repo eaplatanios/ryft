@@ -39,7 +39,7 @@ impl ToMlir for ComparisonDirection {
 /// bodies. Both operands must already share one tensor type, because this function neither promotes nor broadcasts
 /// them, and the result has their shape with a Boolean element type. The comparison type (i.e., `FLOAT`, `SIGNED`, or
 /// `UNSIGNED`) follows the element type of the left-hand side input, as [`comparison_type_for_mlir_type`] describes.
-pub(crate) fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
+pub fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
     direction: ComparisonDirection,
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
@@ -74,7 +74,7 @@ pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&
 }
 
 /// Applies the non-default memory placement declared by `output_type` to `value`.
-pub(crate) fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut B,
@@ -101,7 +101,7 @@ pub(crate) fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L
 /// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
 /// transfers (i.e., transfers whose destination equals the operand's current space) still lower to the annotation,
 /// because placement round trips are meaningful to `HostOffloader` and must not be optimized away here.
-pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     destination: Memory,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut B,
@@ -135,7 +135,7 @@ pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>,
 }
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
-pub(crate) fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
+pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
     block: &mut B,
     context: &'c MlirContext<'t>,
@@ -155,7 +155,7 @@ where
 }
 
 /// Reads one runtime tensor dimension and widens StableHLO's `i32` size result to Ryft's `i64` dimension ABI.
-pub(crate) fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
+pub fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     axis: usize,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -175,7 +175,7 @@ pub(crate) fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
 /// # Errors
 ///
 /// Returns [`LoweringError::UnsupportedOperation`] when a dynamic dimension has no finite positive upper bound.
-pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
+pub fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
     let dimensions = r#type
         .shape()
         .dimensions()
@@ -200,7 +200,7 @@ pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error
 /// Materializes the full physical buffer of one bounded dynamic value. The original runtime sizes are retained before
 /// each dynamic axis is widened to its physical bound, and every newly exposed position is replaced with
 /// `padding_value`.
-pub(crate) fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
+pub fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     padding_value: f64,
@@ -313,7 +313,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
 
 /// Restores the dynamic dimensions of `output_type` on a value of its [`physical_bound_type`]. Each entry in `sources`
 /// identifies the value and axis that define the corresponding output dimension.
-pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
+pub fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     mut value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     sources: &[(ValueRef<'b, 'c, 't>, usize)],
@@ -351,7 +351,7 @@ pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
 /// [`lower_physical_bound_value`], this does not mask the positions beyond the runtime sizes, so it is only suitable
 /// for callers that discard those positions again (e.g., by slicing to a static extent or by restoring the runtime
 /// sizes).
-pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
+pub fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -389,13 +389,13 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Converts one dimension extent to StableHLO's signed 64-bit shape representation.
-pub(crate) fn dimension_extent_i64(value: usize) -> Result<i64, Error> {
+pub fn dimension_extent_i64(value: usize) -> Result<i64, Error> {
     i64::try_from(value)
         .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value, maximum: i64::MAX as usize }.into())
 }
 
 /// Converts one dimension extent to the signed 32-bit representation required by dynamic StableHLO shape operations.
-pub(crate) fn dimension_extent_i32(value: usize) -> Result<i32, Error> {
+pub fn dimension_extent_i32(value: usize) -> Result<i32, Error> {
     i32::try_from(value)
         .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value, maximum: i32::MAX as usize }.into())
 }
@@ -403,7 +403,7 @@ pub(crate) fn dimension_extent_i32(value: usize) -> Result<i32, Error> {
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
 /// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation, because StableHLO
 /// has no statically indexed update operation.
-pub(crate) fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     start_indices: &[usize],
     block: &mut B,
     context: &'c MlirContext<'t>,
@@ -429,7 +429,7 @@ pub(crate) fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 
 ///
 /// Returns an [`Error`] when `output_types` does not contain exactly one type, or when the type cannot be lowered or
 /// represent `integer_value`.
-pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
     block: &mut B,
@@ -484,7 +484,7 @@ pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c
 
 /// Lowers one constant with an integer value like [`lower_unplaced_constant_output`] and applies the declared memory
 /// placement of its output type to the final value when that placement is not the device memory.
-pub(crate) fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+pub fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
     block: &mut B,
@@ -497,7 +497,7 @@ pub(crate) fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L:
 }
 
 /// Returns the static dimensions for one tensor type.
-pub(crate) fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
+pub fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
     array_type
         .shape()
         .dimensions()
@@ -588,7 +588,7 @@ where
 /// Lowers a scalar `u64` constant. It is shared by the group interval arithmetic of ragged dots, the device shard and
 /// batch item arithmetic of `parallel_ragged_all_to_all`, and the coordinate arithmetic of
 /// [`AxisIndexOperation`](ryft_core::AxisIndexOperation).
-pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
+pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     value: u64,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -641,7 +641,7 @@ pub(crate) fn lower_boundary_layout<'c, 't>(
 }
 
 /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
-pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
+pub fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
     array_type: &ArrayType,
     context: &'c MlirContext<'t>,
     location: L,
@@ -667,7 +667,7 @@ pub(crate) fn lower_tensor_type<'c, 't, L: Location<'c, 't>>(
 }
 
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
-pub(crate) fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
+pub fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
     match size {
         Dimension::Static(_) => None,
         Dimension::Dynamic(variable) => variable.bounds().upper().and_then(|upper| upper.checked_sub(1)),
@@ -675,10 +675,7 @@ pub(crate) fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usi
 }
 
 /// Lowers one [`DataType`] to the corresponding MLIR element type.
-pub(crate) fn lower_element_type<'c, 't>(
-    data_type: DataType,
-    context: &'c MlirContext<'t>,
-) -> Result<TypeRef<'c, 't>, Error> {
+pub fn lower_element_type<'c, 't>(data_type: DataType, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error> {
     Ok(match data_type {
         DataType::Token => {
             return Err(Error::Lowering(LoweringError::UnsupportedElementType {
@@ -730,7 +727,7 @@ pub(crate) fn lower_element_type<'c, 't>(
 /// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type matches
 /// `output_type`, then broadcasts that scalar to the full output shape. It is used when synthesizing zeros, ones, and
 /// padding values and when lowering literal constants.
-pub(crate) fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
+pub fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     factor: f64,
     output_type: &ArrayType,
     output_tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -835,7 +832,7 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
 /// splats hold the exact `i64` value, and every other data type routes through
 /// [`lower_f64_scalar_elements_attribute`] after a widening of `integer_value` to `f64`. Integer attributes
 /// use the physical element type from [`lower_element_type`], including signless `i1` for `U1`.
-pub(crate) fn lower_constant_elements_attribute<'c, 't>(
+pub fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
     integer_value: i64,
@@ -907,7 +904,7 @@ pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Error
 }
 
 /// Lowers an array IR type to its physical StableHLO tensor type.
-pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
+pub fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     r#type: &Type,
     context: &'c MlirContext<'t>,
     location: L,
@@ -923,7 +920,7 @@ pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
 
 /// Packs scalar first-class dimension operands into the rank-1 `i64` shape tensor consumed by dynamic StableHLO
 /// shape operations.
-pub(crate) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
+pub fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
     block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,

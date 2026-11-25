@@ -1735,7 +1735,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
 /// a body that a backend implementation replaces, or the body of a scan whose length admits no iteration) are not
 /// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
-/// for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices
+/// for a device mesh (e.g., [`ProgramExtension::to_mlir_module`](crate::ProgramExtension::to_mlir_module)) know no devices
 /// and do not run it.
 ///
 /// # Errors

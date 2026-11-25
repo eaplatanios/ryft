@@ -144,8 +144,9 @@ mod tests {
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions, Session,
-        StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully, compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
+        ProgramExtension, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
+        compile_with_options, trace,
     };
 
     use super::*;
@@ -311,7 +312,7 @@ mod tests {
         // module as a placement that may alias its input.
         let copying = place(false);
         assert_eq!(
-            copying.program().to_string(),
+            copying.to_string(),
             indoc! {r#"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
@@ -368,7 +369,7 @@ mod tests {
         // copy policy are.
         let traced = place(Some(source.clone()), false);
         assert_eq!(
-            traced.program().to_string(),
+            traced.to_string(),
             indoc! {r#"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
@@ -1152,8 +1153,7 @@ mod tests {
             trace(move |input: ArrayTracer| place_on(&input, &target).unwrap(), input.r#type().into_owned()).unwrap()
         };
         let interpret = |traced: TracedProgram<ArrayType, ArrayType>, input: &Array| {
-            let Value::Array(output) =
-                traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
+            let Value::Array(output) = traced.interpret_in_context(&session, Value::Array(input.clone())).unwrap()
             else {
                 panic!("placing an array must produce an array");
             };
@@ -1165,7 +1165,7 @@ mod tests {
         let target = PlacementRequest::Device { device: first_device, memory: Some(Memory::Device), layout: None };
         let traced_program = traced(target, &input);
         assert_eq!(
-            traced_program.program().to_string(),
+            traced_program.to_string(),
             indoc! {"
                 lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [target=device(0, memory=Device)] %0
@@ -1244,7 +1244,7 @@ mod tests {
         .unwrap();
         let traced_program = traced(PlacementRequest::from(second_device), &sharded);
         assert_eq!(
-            traced_program.program().to_string(),
+            traced_program.to_string(),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4] = place [target=device(1)] %0

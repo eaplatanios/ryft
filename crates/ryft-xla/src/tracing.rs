@@ -1,7 +1,7 @@
 //! General XLA program tracing. The [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
-//! root tracing context of [`Session`], and its [`TracedProgram`] result reports the statistics of the staged program
-//! and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering) module. [`Error`] reports
-//! the failures of both tracing and lowering.
+//! root tracing context of [`Session`]. Its result is a staged [`Program`] of `ryft-core` (refer to [`TracedProgram`]),
+//! which [`ProgramExtension`] lowers to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering)
+//! module. [`Error`] reports the failures of both tracing and lowering.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
 //! semantics of `shard_map` (i.e., boundary metadata, validation, closure tracing, and transform rules) are owned by
@@ -9,9 +9,9 @@
 //! `sdy.manual_computation` operations in the [`lowering`](crate::lowering) module. A `shard_map` traced on its own is
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
 //! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
-//! global input and output type that has one (refer to [`TracedProgram::to_mlir_module`]). Tracing such a function over
-//! input types that carry the input shardings of its `shard_map` therefore yields function arguments and results that
-//! are placed as the `shard_map` boundary specifies.
+//! global input and output type that has one (refer to [`ProgramExtension::to_mlir_module`]). Tracing such a function
+//! over input types that carry the input shardings of its `shard_map` therefore yields function arguments and results
+//! that are placed as the `shard_map` boundary specifies.
 //!
 //! Core failures use [`Error::Core`], and concrete lowering failures have their own [`Error`] variants. Logical
 //! `shard_map` errors raised while tracing or lowering remain [`ProgramError::Custom`] payloads, recoverable through
@@ -20,8 +20,8 @@
 use std::cell::RefCell;
 
 use ryft_core::{
-    ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, Program, ProgramError, ProgramStatistics,
-    ProjectedValue, Sharding, Typed, ValueProjection,
+    ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, Program, ProgramError, ProjectedValue,
+    Sharding, Tracer as CoreTracer, TracingContext, Typed, ValueProjection,
 };
 
 use crate::compilation::placements::{
@@ -36,76 +36,44 @@ use crate::{Constant, Error, Operation, Session, Tracer, Type};
 /// same values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 
-/// Traced XLA program backed by a staged [`Program`], as returned by [`trace`]. The global input and output types
+/// [`ArrayTracer`] spelled without the type aliases over [`Session`] that it goes through, which contain projections.
+/// The compiler does not match a bound whose trait argument is spelled through them, so the bounds of [`trace`] and
+/// [`trace_with_context`] on the structure of the traced outputs name this type instead.
+type NormalizedArrayTracer = ProjectedValue<ArrayType, CoreTracer<TracingContext<Constant, Operation>>>;
+
+/// Traced XLA program over global array types structured as `Input` and `Output`, as returned by [`trace`]. It is
+/// the staged [`Program`] of `ryft-core` itself, whose entry region carries the global input and output types, which
 /// describe the whole logical arrays at the function boundary. For example, a global array of shape `[8]` split evenly
-/// across two devices has shape `[4]` on each device.
-pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
-where
-    Input::Family: ParameterizedFamily<Constant>,
-    Output::Family: ParameterizedFamily<Constant>,
-{
-    /// Global input types used to trace the function.
-    input_type: Input,
+/// across two devices has shape `[4]` on each device. [`ProgramExtension`] adds what the XLA backend offers for such a
+/// program.
+pub type TracedProgram<Input, Output> = Program<
+    Constant,
+    Operation,
+    <Input as Parameterized<ArrayType>>::To<Constant>,
+    <Output as Parameterized<ArrayType>>::To<Constant>,
+>;
 
-    /// Global output types inferred by tracing the function.
-    output_type: Output,
-
-    /// Staged traced XLA program specialized to abstract array leaves.
-    program: Program<Constant, Operation, Input::To<Constant>, Output::To<Constant>>,
-}
-
-impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedProgram<Input, Output>
-where
-    Input::Family: ParameterizedFamily<Constant>,
-    Output::Family: ParameterizedFamily<Constant>,
-{
-    /// Returns the global input types used to trace the function.
-    #[inline]
-    pub fn input_type(&self) -> &Input {
-        &self.input_type
-    }
-
-    /// Returns the global output types inferred by tracing the function.
-    #[inline]
-    pub fn output_type(&self) -> &Output {
-        &self.output_type
-    }
-
-    /// Returns the staged program that backs this [`TracedProgram`].
-    #[inline]
-    pub fn program(&self) -> &Program<Constant, Operation, Input::To<Constant>, Output::To<Constant>> {
-        &self.program
-    }
-
-    /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle.
-    /// The statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
-    /// [`Program::into_simplified`](ryft_core::Program::into_simplified)). Instructions that reach no program output
-    /// are not counted unless they have observable effects, while the boundary pruning of operations with attached
-    /// regions (refer to [`Program::into_pruned`](ryft_core::Program::into_pruned)), which lowering applies, is not
-    /// reflected in the counts. Refer to the documentation of [`Program::statistics`](ryft_core::Program::statistics)
-    /// for the precise semantics of the reported statistics.
-    #[inline]
-    pub fn statistics(&self) -> ProgramStatistics {
-        self.program.statistics()
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature carries the
-    /// shardings of the global input and output types that have one (refer to
-    /// [`Self::to_mlir_module_with_signature_shardings`]).
+/// Extends the staged [`Program`]s of the XLA backend whose inputs and outputs are arrays (e.g., a [`TracedProgram`])
+/// with their export as StableHLO/Shardy MLIR modules. The global input and output types that the export reads are
+/// those of the program (refer to [`Program::input_type`] and [`Program::output_type`]).
+pub trait ProgramExtension {
+    /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature
+    /// carries the shardings of the global input and output types that have one. Refer to
+    /// [`Self::to_mlir_module_with_signature_shardings`] for more information.
     ///
     /// # Parameters
     ///
-    ///   - `function_name`: Symbol name to use for the outer `func.func`.
+    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::to_mlir_module_with_signature_shardings`].
     #[inline]
-    pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
+    fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
         self.to_mlir_module_with_signature_shardings(function_name, None, None)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Same as [`Self::to_mlir_module`] but with explicitly provided `sdy.sharding` attributes for the function's
     /// arguments and/or results. This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device
@@ -142,22 +110,59 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Core`] when pruning or simplifying the traced program fails, or when the program imports an
+    /// Returns [`Error::Core`] when an input or output of the program is not an array, when pruning or simplifying
+    /// the traced program fails, or when the program imports an
     /// array whose type names a mesh of another topology than the meshes of the signature, because a plain trace keeps
     /// the type of an array that it imports (a function compiled through a [`Session`], whose captures follow its call,
     /// receives it where it runs instead). Lowering failures use the corresponding [`Error`] variants (e.g., for an
     /// invalid function name, mismatched signature shardings, unresolved references or state, or operations that the
     /// backend cannot lower).
-    pub fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
+    fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
+        &self,
+        function_name: S,
+        argument_shardings: Option<&[Sharding]>,
+        result_shardings: Option<&[Sharding]>,
+    ) -> Result<String, Error>;
+}
+
+impl<Input: Parameterized<Constant>, Output: Parameterized<Constant>> ProgramExtension
+    for Program<Constant, Operation, Input, Output>
+where
+    Input::Family: ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<ArrayType>,
+{
+    fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
         argument_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
-        let simplified_program = pruned_program(&self.program, None)?;
+        // Project the entry signature to array types and reconstruct the program's input and output structures.
+        let signature = self.interface();
+        let input_type = Input::To::<ArrayType>::from_parameters(
+            self.input_structure().clone(),
+            signature
+                .input_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)?,
+        )
+        .map_err(ProgramError::from)?;
+        let output_type = Output::To::<ArrayType>::from_parameters(
+            self.output_structure().clone(),
+            signature
+                .output_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)?,
+        )
+        .map_err(ProgramError::from)?;
+        let simplified_program = pruned_program(self, None)?;
         let argument_shardings: Vec<_> = match argument_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
-            None => self.input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
+            None => input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
         // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
         // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The export
@@ -172,7 +177,7 @@ where
             .iter()
             .flatten()
             .chain(result_shardings.into_iter().flatten())
-            .chain(self.output_type.parameters().filter_map(ArrayType::sharding))
+            .chain(output_type.parameters().filter_map(ArrayType::sharding))
             .map(Sharding::mesh)
             .next();
         if let Some(signature_mesh) = signature_mesh {
@@ -201,7 +206,7 @@ where
             .chain(argument_shardings.iter().map(Option::as_ref))
             .map(|sharding| sharding.map(entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
-        let output_types = self.output_type.parameters().cloned().collect::<Vec<_>>();
+        let output_types = output_type.parameters().cloned().collect::<Vec<_>>();
         let placements =
             entry_result_placements(&simplified_program, output_types.len(), |constant| constant.sharding().clone());
         let result_annotations =
@@ -210,8 +215,8 @@ where
         Ok(super::lowering::modules::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &capture_types,
-            &self.input_type,
-            &self.output_type,
+            &input_type,
+            &output_type,
             function_name,
             &argument_annotations,
             &result_annotations,
@@ -238,13 +243,19 @@ where
 ///
 /// Returns the errors of [`trace_with_context`].
 #[inline]
-pub fn trace<F, Input, Output>(function: F, input_type: Input) -> Result<TracedProgram<Input, Output>, Error>
+pub fn trace<F, Input, Output>(
+    function: F,
+    input_type: Input,
+) -> Result<
+    Program<Constant, Operation, Input::To<Constant>, <Output as Parameterized<NormalizedArrayTracer>>::To<Constant>>,
+    Error,
+>
 where
     Input: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    F: FnOnce(Input::To<ArrayTracer>) -> Output::To<ArrayTracer>,
+    Output: Parameterized<NormalizedArrayTracer>,
+    <Output as Parameterized<NormalizedArrayTracer>>::Family: ParameterizedFamily<Constant>,
+    F: FnOnce(Input::To<ArrayTracer>) -> Output,
 {
     trace_with_context(|_, inputs| Ok(function(inputs)), input_type)
 }
@@ -269,17 +280,20 @@ where
 pub fn trace_with_context<F, Input, Output>(
     function: F,
     input_type: Input,
-) -> Result<TracedProgram<Input, Output>, Error>
+) -> Result<
+    Program<Constant, Operation, Input::To<Constant>, <Output as Parameterized<NormalizedArrayTracer>>::To<Constant>>,
+    Error,
+>
 where
     Input: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output::To<ArrayTracer>, ProgramError>,
+    Output: Parameterized<NormalizedArrayTracer>,
+    <Output as Parameterized<NormalizedArrayTracer>>::Family: ParameterizedFamily<Constant>,
+    F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output, ProgramError>,
 {
     let input_structure = input_type.parameter_structure();
     let output_structure = RefCell::new(None);
-    let (output_types, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
+    let (_, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
         |context, inputs: Vec<Tracer>| {
             let inputs = inputs
                 .into_iter()
@@ -296,18 +310,12 @@ where
     let output_structure = output_structure.into_inner().ok_or_else(|| {
         ProgramError::MalformedProgram("XLA tracing completed without recording its output structure".to_string())
     })?;
-    let output_type = Output::from_parameters(
-        output_structure.clone(),
-        output_types
-            .iter()
-            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?,
-    )?;
-    let program = program
+    Ok(program
         .into_simplified()?
-        .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
-    Ok(TracedProgram { input_type, output_type, program })
+        .restructured::<Input::To<Constant>, <Output as Parameterized<NormalizedArrayTracer>>::To<Constant>>(
+            input_structure,
+            output_structure,
+        )?)
 }
 
 #[cfg(test)]
@@ -366,12 +374,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.input_type(),
-            &(ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
-        );
-        assert_eq!(traced.output_type(), &ArrayType::new_static(DataType::F32, [4]));
-        assert_eq!(
-            traced.program.to_string(),
+            traced.to_string(),
             indoc! {"
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:f32[4] = sin %0
@@ -386,7 +389,7 @@ mod tests {
     fn test_trace_with_context() {
         // Failures of the traced function propagate unchanged as core program errors.
         assert!(matches!(
-            trace_with_context::<_, ArrayType, ArrayType>(
+            trace_with_context::<_, ArrayType, ArrayTracer>(
                 |_, _| Err(ProgramError::MalformedProgram("traced function failure".to_string())),
                 ArrayType::new_static(DataType::F32, [4]),
             ),
@@ -399,9 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_statistics() {
-        // `TracedProgram::statistics` delegates to the stored simplified staged program. The asserted numbers are
-        // cross-checked against `traced.program.to_string()`, which renders the entry region as one `shard_map`
+    fn test_trace_statistics() {
+        // A traced program is the simplified staged program, whose statistics these are. The asserted numbers are
+        // cross-checked against `traced.to_string()`, which renders the entry region as one `shard_map`
         // instruction that attaches a body region with a single `sin` instruction.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -453,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module() {
+    fn test_program_extension_to_mlir_module() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
@@ -483,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_reshard_then_reshape() {
+    fn test_program_extension_to_mlir_module_reshard_then_reshape() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -518,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
+    fn test_program_extension_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
         // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
         // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
         // the tracked type by marking the explicit axis replicated. The result is not the result of a `place`, so its
@@ -558,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_annotates_placed_results() {
+    fn test_program_extension_to_mlir_module_annotates_placed_results() {
         // A result that a `place` produces, also through an operation that returns its input unchanged, is annotated
         // with the target of that `place`, including its split along the auto axis that the result type drops, as
         // compilation places it.
@@ -589,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_passes_imported_arrays_as_arguments() {
+    fn test_program_extension_to_mlir_module_passes_imported_arrays_as_arguments() {
         // An array that the traced function imports becomes a session constant, which enters the module as a hidden
         // argument that precedes the inputs and is annotated as the array is placed, as compilation passes it.
         let client = cpu_client(1);
@@ -597,7 +600,7 @@ mod tests {
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 4f32.to_ne_bytes())
             .unwrap();
         let device = array.mesh().devices()[0];
-        let traced = trace_with_context::<_, (), ArrayType>(
+        let traced = trace_with_context::<_, (), ArrayTracer>(
             |context, ()| {
                 let imported =
                     ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
@@ -620,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_with_signature_shardings_rejects_imports_over_other_topologies() {
+    fn test_program_extension_to_mlir_module_with_signature_shardings_rejects_imports_over_other_topologies() {
         // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
         // cannot hold an array over two devices, and the error names the cause and the way forward.
         let client = cpu_client(2);
@@ -636,7 +639,7 @@ mod tests {
             values_to_bytes(&[0f32, 1., 2., 3.]),
         )
         .unwrap();
-        let traced = trace_with_context::<_, ArrayType, ArrayType>(
+        let traced = trace_with_context::<_, ArrayType, ArrayTracer>(
             |context, _| {
                 let imported =
                     ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
@@ -661,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_closes_unconstrained_result_placements() {
+    fn test_program_extension_to_mlir_module_closes_unconstrained_result_placements() {
         // The runtime placement of a result reads an unconstrained dimension of the target of the `place` that produces
         // it, or of a result sharding override, as replicated, so the result is annotated with that dimension closed,
         // as compilation annotates it, while the constraint inside the function keeps it open.
@@ -716,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_closes_unconstrained_result_types() {
+    fn test_program_extension_to_mlir_module_closes_unconstrained_result_types() {
         // A result that is computed from the result of a `place` inherits the unconstrained dimension of its target in
         // its type, which its runtime placement reads as replicated as well, so it is annotated with that dimension
         // closed, as compilation annotates it.
@@ -766,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_leaves_results_open_over_auto_axes() {
+    fn test_program_extension_to_mlir_module_leaves_results_open_over_auto_axes() {
         // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
         // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
         // result is annotated open over it, as compilation annotates it.
@@ -804,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_with_signature_shardings_keeps_effectful_dead_shard_maps() {
+    fn test_program_extension_to_mlir_module_with_signature_shardings_keeps_effectful_dead_shard_maps() {
         // Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
         // ordinary results, so the lowered manual computation only threads the effect token of its body.
         let (traced, sharding) = traced_effectful_dead_shard_map();
@@ -839,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn test_traced_program_to_mlir_module_with_signature_shardings_executes_effectful_dead_shard_maps_on_cpu() {
+    fn test_program_extension_to_mlir_module_with_signature_shardings_executes_effectful_dead_shard_maps_on_cpu() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
             .to_mlir_module_with_signature_shardings(

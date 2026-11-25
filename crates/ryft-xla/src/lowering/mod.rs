@@ -49,7 +49,7 @@ use crate::lowering::reductions::{
 };
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::{lower_captured_constant, lower_literal_value, lower_tensor_type};
+use crate::lowering::types::{lower_captured_constant, lower_literal_value};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{ArrayConstant, Constant, Error, JIT_CALL_OPERATION_NAME, Operation, RuntimeRequirement, Type};
 
@@ -179,6 +179,14 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub use modules::to_mlir_module_for_program;
+pub use types::{
+    annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_array_ir_type, lower_compare_to_mlir,
+    lower_constant_elements_attribute, lower_constant_output, lower_element_type, lower_explicit_shape,
+    lower_f64_constant_splat, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
+    lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir, lower_static_index_constants, lower_tensor_type,
+    lower_transfer_to_memory, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
+};
 
 /// Per-class StableHLO tokens owned by one lowering scope.
 ///
@@ -1103,7 +1111,7 @@ pub(crate) mod tests {
 
     use crate::{
         ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, JitCallOperation,
-        Operation, Options, Session, ToMlir, TracedProgram, Type, compile, trace_with_context,
+        Operation, Options, ProgramExtension, Session, ToMlir, Type, compile, trace_with_context,
     };
 
     use crate::devices::MemoryExtension;
@@ -1337,7 +1345,7 @@ pub(crate) mod tests {
                 .map(|(r#type, sharding)| r#type.with_sharding(sharding.without_auto_axes()))
                 .collect::<Result<Vec<_>, _>>()?,
         )?;
-        let traced: TracedProgram<Input, Output> = trace_with_context(
+        let traced = trace_with_context::<_, Input, Output::To<ArrayTracer>>(
             |context, inputs| {
                 let outputs = context.shard_map(
                     |body_context, local_inputs: Vec<ArrayTracer>| {

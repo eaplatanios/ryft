@@ -167,7 +167,7 @@ mod tests {
     use crate::tests::{cpu_client, test_compilation_options};
     #[cfg(feature = "cuda-13")]
     use crate::{Array, FromPjrt, Options, Value};
-    use crate::{ArrayTracer, TracedProgram, to_mlir_module_for_program, trace_with_context};
+    use crate::{ArrayTracer, ProgramExtension, TracedProgram, to_mlir_module_for_program, trace_with_context};
 
     use super::*;
 

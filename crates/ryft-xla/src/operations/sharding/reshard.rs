@@ -42,8 +42,8 @@ mod tests {
     use crate::sessions::tests::{read_first_shard, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, Session, TracedProgram, compile,
-        compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, ProgramExtension, Session,
+        TracedProgram, compile, compile_with_options, trace,
     };
 
     /// Returns `logical_mesh` over the addressable devices of `client`.

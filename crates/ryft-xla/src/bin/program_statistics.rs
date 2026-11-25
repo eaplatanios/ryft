@@ -569,7 +569,7 @@ mod tests {
 
     // Verifies the exact expected statistics for every `shard_map` case, including the region edges of the nested
     // case's shared arena. The `shard_map_basic` expectation is anchored against a program rendering by the
-    // `test_traced_program_statistics` test of the owning `ryft_xla::tracing` module. The other two fixtures were
+    // `test_trace_statistics` test of the owning `ryft_xla::tracing` module. The other two fixtures were
     // pinned from the binary's emitted values after checking them for internal consistency, so they serve as change
     // detectors rather than independently derived ground truth.
     #[test]

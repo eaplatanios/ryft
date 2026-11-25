@@ -251,7 +251,10 @@ pub(crate) mod tests {
     use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, Session, TracedProgram, Type, trace};
+    use crate::{
+        Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, ProgramExtension, Session, TracedProgram, Type,
+        trace,
+    };
 
     use super::*;
 

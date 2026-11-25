@@ -426,8 +426,8 @@ pub(crate) mod tests {
     use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt, Options,
-        PlacementOptions, Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully,
-        to_mlir_module_for_program, trace, trace_with_context,
+        PlacementOptions, Platform, ProgramExtension, Reference, Session, TracedProgram, Tracer, Value,
+        compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;
@@ -4842,7 +4842,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .into_iter()
                     .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
-                    .collect()
+                    .collect::<Vec<_>>()
             },
             input_types,
         )

@@ -251,6 +251,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Input::To::<Atom<V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
     }
 
+    /// Returns the structured `Input` of this [`Program`] parameterized by the types of its inputs.
+    #[inline]
+    pub fn input_type(&self) -> Result<Input::To<V::Type>, ParameterError>
+    where
+        V::Type: Parameter,
+        Input::Family: ParameterizedFamily<V::Type>,
+    {
+        Input::To::<V::Type>::from_parameters(self.input_structure.clone(), self.entry_region().input_types())
+    }
+
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
     /// of this [`Program`].
     #[inline]
@@ -272,6 +282,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Output::Family: ParameterizedFamily<Atom<V>>,
     {
         Output::To::<Atom<V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
+    }
+
+    /// Returns the structured `Output` of this [`Program`] parameterized by the types of its outputs.
+    #[inline]
+    pub fn output_type(&self) -> Result<Output::To<V::Type>, ParameterError>
+    where
+        V::Type: Parameter,
+        Output::Family: ParameterizedFamily<V::Type>,
+    {
+        Output::To::<V::Type>::from_parameters(self.output_structure.clone(), self.entry_region().output_types())
     }
 
     /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`]'s
@@ -3006,6 +3026,34 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "region ^0 is not reachable from the program entry region",
         ));
+    }
+
+    #[test]
+    fn test_program_input_type() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::F32));
+        let program =
+            builder.build::<(Array, Vec<Array>), Array>(vec![i0], (Placeholder, vec![Placeholder]), Placeholder);
+        let program = program.unwrap();
+        assert_eq!(
+            program.input_type(),
+            Ok((ArrayType::scalar(DataType::F64), vec![ArrayType::scalar(DataType::F32)])),
+        );
+    }
+
+    #[test]
+    fn test_program_output_type() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c0 = builder.add_constant(Array::scalar(3.0f32).unwrap());
+        let program =
+            builder.build::<Array, (Array, Vec<Array>)>(vec![i0, c0], Placeholder, (Placeholder, vec![Placeholder]));
+        let program = program.unwrap();
+        assert_eq!(
+            program.output_type(),
+            Ok((ArrayType::scalar(DataType::F64), vec![ArrayType::scalar(DataType::F32)])),
+        );
     }
 
     #[test]
