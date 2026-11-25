@@ -284,7 +284,7 @@ pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output>
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<T: IntoHostArray + Parameter> PlaceableParameter<Array> for T {
+impl<T: HostValue + Parameter> PlaceableParameter<Array> for T {
     fn validate_placement(
         &self,
         session: &Session,
@@ -316,7 +316,7 @@ impl<T: IntoHostArray + Parameter> PlaceableParameter<Array> for T {
     }
 }
 
-impl<T: IntoHostArray + Parameter> Placeable for T {
+impl<T: HostValue + Parameter> Placeable for T {
     type Output = Array;
 
     fn place_parameter(
@@ -889,7 +889,7 @@ pub enum PlaceInput<V = Array> {
     Concrete(Array),
 }
 
-impl<T: IntoHostArray> From<T> for PlaceInput {
+impl<T: HostValue> From<T> for PlaceInput {
     #[inline]
     fn from(value: T) -> Self {
         Self::Host(value.into_host_array())
@@ -1709,10 +1709,10 @@ fn place_leaves<P: Placeable>(
 }
 
 /// Host value that [`Session::place`] uploads as one dense array (i.e., a host array of the reference backend, or a
-/// scalar of any [`ArrayElement`] type, which is uploaded as a rank-0 array). This trait is
-/// the single list of uploadable host values. Every host value that implements it converts into [`PlaceInput`], and
-/// every one that is also a [`Parameter`] is a [`Placeable`] leaf on its own.
-trait IntoHostArray {
+/// scalar of any [`ArrayElement`] type, which is uploaded as a rank-0 array). This trait is the single list of
+/// uploadable host values. Every host value that implements it converts into [`PlaceInput`], and every one that is
+/// also a [`Parameter`] is a [`Placeable`] leaf on its own.
+trait HostValue {
     /// Returns the element type and the static shape of the dense upload of this value as an [`ArrayType`] without a
     /// sharding, a memory, or a layout, which is what the placement of this value checks before it is uploaded.
     fn host_type(&self) -> ArrayType;
@@ -1731,7 +1731,7 @@ trait IntoHostArray {
     }
 }
 
-impl IntoHostArray for CoreArray {
+impl HostValue for CoreArray {
     #[inline]
     fn host_type(&self) -> ArrayType {
         // A host array holds materialized storage, which only a type with static extents can describe.
@@ -1755,10 +1755,10 @@ impl IntoHostArray for CoreArray {
     }
 }
 
-macro_rules! impl_into_host_array {
-    // Implements `IntoHostArray` for the scalar `ArrayElement` type `$ty` as a rank-0 host array.
+macro_rules! impl_host_value {
+    // Implements `HostValue` for the scalar `ArrayElement` type `$ty` as a rank-0 host array.
     ($ty:ty) => {
-        impl IntoHostArray for $ty {
+        impl HostValue for $ty {
             #[inline]
             fn host_type(&self) -> ArrayType {
                 ArrayType::scalar(<$ty as ArrayElement>::data_type())
@@ -1778,38 +1778,38 @@ macro_rules! impl_into_host_array {
     };
 }
 
-impl_into_host_array!(bool);
-impl_into_host_array!(i1);
-impl_into_host_array!(i2);
-impl_into_host_array!(i4);
-impl_into_host_array!(i8);
-impl_into_host_array!(i16);
-impl_into_host_array!(i32);
-impl_into_host_array!(i64);
-impl_into_host_array!(u1);
-impl_into_host_array!(u2);
-impl_into_host_array!(u4);
-impl_into_host_array!(u8);
-impl_into_host_array!(u16);
-impl_into_host_array!(u32);
-impl_into_host_array!(u64);
-impl_into_host_array!(f4e2m1fn);
-impl_into_host_array!(f6e2m3fn);
-impl_into_host_array!(f6e3m2fn);
-impl_into_host_array!(f8e3m4);
-impl_into_host_array!(f8e4m3);
-impl_into_host_array!(f8e4m3fn);
-impl_into_host_array!(f8e4m3fnuz);
-impl_into_host_array!(f8e4m3b11fnuz);
-impl_into_host_array!(f8e5m2);
-impl_into_host_array!(f8e5m2fnuz);
-impl_into_host_array!(f8e8m0fnu);
-impl_into_host_array!(bf16);
-impl_into_host_array!(f16);
-impl_into_host_array!(f32);
-impl_into_host_array!(f64);
-impl_into_host_array!(Complex<f32>);
-impl_into_host_array!(Complex<f64>);
+impl_host_value!(bool);
+impl_host_value!(i1);
+impl_host_value!(i2);
+impl_host_value!(i4);
+impl_host_value!(i8);
+impl_host_value!(i16);
+impl_host_value!(i32);
+impl_host_value!(i64);
+impl_host_value!(u1);
+impl_host_value!(u2);
+impl_host_value!(u4);
+impl_host_value!(u8);
+impl_host_value!(u16);
+impl_host_value!(u32);
+impl_host_value!(u64);
+impl_host_value!(f4e2m1fn);
+impl_host_value!(f6e2m3fn);
+impl_host_value!(f6e3m2fn);
+impl_host_value!(f8e3m4);
+impl_host_value!(f8e4m3);
+impl_host_value!(f8e4m3fn);
+impl_host_value!(f8e4m3fnuz);
+impl_host_value!(f8e4m3b11fnuz);
+impl_host_value!(f8e5m2);
+impl_host_value!(f8e5m2fnuz);
+impl_host_value!(f8e8m0fnu);
+impl_host_value!(bf16);
+impl_host_value!(f16);
+impl_host_value!(f32);
+impl_host_value!(f64);
+impl_host_value!(Complex<f32>);
+impl_host_value!(Complex<f64>);
 
 /// Returns the common compilation trace that the host and concrete leaves join.
 fn placement_trace(parameters: &[PlaceInput<CompileTracer>]) -> Result<Option<&CompileTracer>, Error> {
