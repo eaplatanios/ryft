@@ -2320,16 +2320,13 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Comparison of the values that the processes of a run place onto a destination that all of them share, which the
-/// placements of a session make when it enables it (refer to [`SessionBuilder::value_comparison`]) and its run has
-/// more than one process. JAX compares the whole values of the processes with `process_allgather` when a host value or
-/// an uncommitted array is placed onto a destination that every process takes part in. Ryft compares their digests
-/// (refer to [`value_digest`] and [`combined_digest`]) bit for bit using a compiled maximum all-reduce of 64 bytes
+/// Comparison of the values that the processes of a run place onto a destination
+/// that all of them share, which the placements of a session make when it enables it (refer to
+/// [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)) and its run has more than one
+/// process. JAX compares the whole values of the processes with `process_allgather` when a host value or an uncommitted
+/// array is placed onto a destination that every process takes part in. Ryft compares their digests (i.e.,
+/// [`value_digest`] and [`combined_digest`]) bit for bit using a compiled maximum all-reduce of 64 bytes
 /// over the same ordered PJRT devices (refer to [`ComparisonCollective::submit`]).
-///
-/// [`SessionBuilder::value_comparison`]: crate::SessionBuilder::value_comparison
 pub(crate) struct ValueComparison {
     /// Processes that a destination must hold exactly for its placement to compare values.
     processes: BTreeSet<usize>,
@@ -2339,6 +2336,13 @@ pub(crate) struct ValueComparison {
 }
 
 impl ValueComparison {
+    /// Returns the comparison over `participants` to which this process contributes through `contributors`.
+    pub(crate) fn new(participants: DeviceMesh, contributors: Vec<Device>) -> Self {
+        let processes = participants.devices().iter().map(Device::process_index).collect();
+        let collective = (!contributors.is_empty()).then_some(ComparisonCollective { participants, contributors });
+        Self { processes, collective }
+    }
+
     /// Returns the comparison of the placements of `session`, or [`None`] when the session disables it or its run has
     /// one process, in which case nothing is ever compared and nothing is computed for it.
     pub(crate) fn of_session(session: &Session) -> Result<Option<&Self>, Error> {
@@ -2360,27 +2364,24 @@ impl ValueComparison {
                 *first = device;
             }
         }
+
         let processes = first_devices
             .keys()
             .copied()
             .chain(session.remote_devices().iter().map(Device::process_index))
             .collect::<BTreeSet<_>>();
+
         if processes.len() < 2 {
             return Ok(None);
         }
+
         if processes.len() != first_devices.len() {
             return Ok(Some(Self { processes, collective: None }));
         }
+
         let contributors = first_devices.get(&client.process_index()?).copied().into_iter().collect();
         let participants = participant_mesh_of(first_devices.into_values().collect())?;
         Ok(Some(Self::new(participants, contributors)))
-    }
-
-    /// Returns the comparison over `participants` to which this process contributes through `contributors`.
-    pub(crate) fn new(participants: DeviceMesh, contributors: Vec<Device>) -> Self {
-        let processes = participants.devices().iter().map(Device::process_index).collect();
-        let collective = (!contributors.is_empty()).then_some(ComparisonCollective { participants, contributors });
-        Self { processes, collective }
     }
 
     /// Returns whether the placement of a value that every process places on its own (i.e., a host value or a locally
@@ -2407,6 +2408,8 @@ impl ValueComparison {
         self.collective.as_ref().ok_or(SessionError::PlacementComparisonUnavailable)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Native PJRT collective with at least one contributor owned by this process.
 pub(crate) struct ComparisonCollective {
