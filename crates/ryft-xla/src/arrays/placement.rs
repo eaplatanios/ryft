@@ -1905,8 +1905,6 @@ fn admit_and_place_arguments<P: Placeable, C>(
         .collect()
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Checks the precondition of [`Placeable::place_parameter`], which rejects the per-leaf options that no leaf accepts
 /// and does not depend on the leaf. [`Session::place`] calls this function for every leaf before it places any leaf,
 /// and every implementation of [`Placeable::place_parameter`] calls it first, with [`ParameterPath::root`] as `path`,
@@ -1920,13 +1918,12 @@ fn admit_and_place_arguments<P: Placeable, C>(
 /// # Errors
 ///
 /// Returns [`ArrayError::DonatedArrayMayAlias`] at the path that `path` returns for a `donate` of `true` with a
-/// `may_alias` of `Some(true)`, and then a [`TypeError`] with the diagnostic of the type rule of [`PlaceOperation`] for
-/// an in-place source and then an in-place target that name neither a memory nor a layout. That [`TypeError`] is
-/// wrapped in [`ArrayError::FailedParameterPlacement`] when `path` returns a path other than the root.
-///
-/// [`TypeError`]: ryft_core::TypeError
-fn validate_parameter_options(
-    path: impl FnOnce() -> ParameterPath,
+/// `may_alias` of `Some(true)`, and then a [`TypeError`](ryft_core::TypeError) with the diagnostic of the type rule of
+/// [`PlaceOperation`] for an in-place source and then an in-place target that name neither a memory nor a layout. That
+/// [`TypeError`](ryft_core::TypeError) is wrapped in [`ArrayError::FailedParameterPlacement`] when `path` returns a
+/// path other than the root.
+fn validate_parameter_options<P: FnOnce() -> ParameterPath>(
+    path: P,
     target: Option<&PlacementRequest>,
     source: Option<&PlacementRequest>,
     donate: bool,
@@ -1935,10 +1932,14 @@ fn validate_parameter_options(
     if donate && may_alias == Some(true) {
         return Err(ArrayError::DonatedArrayMayAlias { path: path() }.into());
     }
+
     // The type rule of `PlaceOperation` owns the checks of the requests that need no type of the leaf.
     PlaceOperation::validate_requests(target, source).map_err(|error| with_parameter_path(error.into(), path))?;
+
     Ok(())
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns whether the placement of a leaf with the leafwise options `donate` and `may_alias` (refer to
 /// [`Placeable::place_parameter`]) forces a copy, so that its result shares no buffer with any other array. That is
