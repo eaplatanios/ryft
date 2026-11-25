@@ -1,27 +1,24 @@
-//! Session-carrying array IR values of the [`Session`].
+//! [`Session`]-carrying values used by the Ryft XLA backend. [`Value`] is the XLA counterpart of [`ArrayIrValue`].
+//! It holds an [`Array`], a first-class runtime dimension (i.e., a [`Dimension`]), or an array reference (i.e., a
+//! [`Reference`]). Unlike [`ArrayIrValue`], whose dimension and reference members are session-free host values, every
+//! member of a [`Value`], and every projected representation of a member, owns the [`Session`] session that it belongs
+//! to. This has three consequences:
 //!
-//! [`Value`] is the [`Session`] counterpart of [`ArrayIrValue`]. It holds an [`Array`], a first-class runtime
-//! dimension (i.e., a [`Dimension`]), or an array reference (i.e., a [`Reference`]). Unlike [`ArrayIrValue`], whose
-//! dimension and reference members are session-free host values, every member of a [`Value`], and every projected
-//! representation of a member, owns the [`Session`] session that it belongs to. This has three consequences:
-//!
-//!   - **Eager functions from dimensions to arrays.** Functions that turn first-class dimensions into arrays (e.g.,
+//!   - **Eager Functions from Dimensions to Arrays:** Functions that turn first-class dimensions into arrays (e.g.,
 //!     comparing two dimensions or [`DimensionToScalar`](ryft_core::DimensionToScalar)) materialize their results in
 //!     the session of their inputs, so they execute eagerly outside any explicit context.
-//!   - **Rich dispatch.** [`Value`] dispatches and executes through its [`Session`], so its capabilities come from
+//!   - **Rich Dispatch:** [`Value`] dispatches and executes through its [`Session`], so its capabilities come from
 //!     the blanket implementations in `ryft-core` that bind operations, exactly like those of the staged values of a
 //!     [`Session`], and free transform entry points (e.g., [`batch`](ryft_core::batch) or
 //!     [`differentiate_at`](ryft_core::differentiate_at)) recover the [`Session`] from the values themselves.
-//!   - **No construction without a session.** Because [`ValueProjection::from_projected`] is infallible and receives no
-//!     session, projected dimensions and references are the session-carrying [`Dimension`] and [`Reference`]
-//!     rather than [`DimensionValue`] and [`ArrayReference`]. Host-side dimension values enter a [`Session`] through
-//!     its constants (i.e., [`Context::lift`]) instead.
+//!   - **No Construction Without a Session:** Because [`ValueProjection::from_projected`] is infallible and receives
+//!     no session, projected dimensions and references are the session-carrying [`Dimension`] and [`Reference`] rather
+//!     than [`DimensionValue`] and [`ArrayReference`]. Host-side dimension values enter a [`Session`] through its
+//!     constants (i.e., [`Context::lift`]) instead.
 //!
 //! Host-side semantics that do not depend on the session (e.g., which members can act as `while` predicates, assertion
 //! observations, and the reference handle lifecycle) delegate to the generic [`ArrayIrValue`] implementations in
 //! `ryft-core` through a lossless conversion, so that both array IR value types share one source of truth.
-
-// TODO(eaplatanios): Review this module.
 
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
@@ -43,20 +40,18 @@ use crate::{Array, RetainedArray, Session};
 /// Type of an XLA [`Value`], which is the [`ArrayIrType`] of `ryft-core` used as it is. XLA defines its own values,
 /// constants, and operations, but it adds no types of its own, so this alias only gives the type universe of
 /// [`Session`] the name that this crate uses for its other members. Being an alias, it is interchangeable with
-/// [`ArrayIrType`] everywhere, including in patterns and in the paths of its variants (e.g., `Type::Array`).
+/// [`ArrayIrType`] everywhere, including in patterns and in the paths of its variants (e.g., [`Type::Array`]).
 pub type Type = ArrayIrType;
 
 /// First-class runtime dimension bound to the [`Session`] session in which array results derived from it are
-/// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`].
-///
-/// A [`Dimension`] is a runtime *value* that holds a checked [`DimensionValue`]. It is not a
-/// [`ryft_core::Dimension`], which is a static or symbolic extent inside an [`ArrayType`]. Dimension
-/// arithmetic remains host integer work. It dispatches through this dimension's [`Session`], whose eager binding
-/// evaluates dimension operations on the host without compiling programs. Only functions that produce arrays (e.g.,
-/// comparisons and [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their results, which are placed
-/// according to the mesh of the session. [`Value`] documents this placement policy.
-///
-/// Two dimensions are equal when their [`DimensionValue`]s are equal, regardless of their sessions.
+/// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`]. A [`Dimension`]
+/// is a runtime _value_ that holds a checked [`DimensionValue`]. It is not a [`ryft_core::Dimension`], which is a
+/// static or symbolic extent inside an [`ArrayType`]. Dimension arithmetic remains host integer work. It dispatches
+/// through this dimension's [`Session`], whose eager binding evaluates dimension operations on the host without
+/// compiling programs. Only functions that produce arrays (e.g., comparisons and
+/// [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their results, which are placed according to the mesh
+/// of the session. [`Value`] documents this placement policy. Two dimensions are equal when their [`DimensionValue`]s
+/// are equal, regardless of their sessions.
 #[derive(Clone, Parameter)]
 pub struct Dimension {
     /// Checked host-side dimension.
@@ -68,46 +63,54 @@ pub struct Dimension {
 
 impl Dimension {
     /// Creates a new [`Dimension`] that materializes array results derived from `value` in `session`.
+    #[inline]
     pub fn new(value: DimensionValue, session: Session) -> Self {
         Self { value, session }
     }
 
     /// Returns the checked host-side [`DimensionValue`] of this dimension.
+    #[inline]
     pub fn value(&self) -> &DimensionValue {
         &self.value
     }
 
     /// Returns the [`Session`] in which array results computed from this dimension are materialized.
+    #[inline]
     pub fn session(&self) -> &Session {
         &self.session
     }
 
     /// Consumes this dimension and returns its checked host-side [`DimensionValue`].
+    #[inline]
     pub fn into_value(self) -> DimensionValue {
         self.value
     }
 }
 
 impl Debug for Dimension {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_tuple("Dimension").field(&self.value).finish()
     }
 }
 
 impl Display for Dimension {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.value, formatter)
     }
 }
 
-// Dimensions compare by value, because the session only selects where derived arrays are materialized.
 impl PartialEq for Dimension {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
+        // Dimensions compare by value, because the session only selects where derived arrays are materialized.
         self.value == other.value
     }
 }
 
 impl Borrow<DimensionValue> for Dimension {
+    #[inline]
     fn borrow(&self) -> &DimensionValue {
         &self.value
     }
@@ -116,17 +119,9 @@ impl Borrow<DimensionValue> for Dimension {
 impl Typed for Dimension {
     type Type = DimensionType;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, DimensionType> {
         self.value.r#type()
-    }
-}
-
-// Comparing two dimensions yields a Boolean array, which is materialized in this dimension's session by binding the
-// array IR comparison there. The session decides the predicate on the host from the two extents.
-impl Compare<Value, DimensionType> for Dimension {
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value, ProgramError> {
-        let inputs = [Value::Dimension(self.clone()), Value::Dimension(other.clone())];
-        Ok(self.session.bind(CompareOperation::<Type>::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
@@ -134,13 +129,16 @@ impl CoreValue for Dimension {
     // Like `Array`, a dimension dispatches and executes through the rich `Session` that it carries, projected onto
     // the dimension member family. That session evaluates dimension operations on the host and materializes array
     // results (e.g., `dimension_to_scalar`) in its session.
+
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<Session, DimensionType>;
 
+    #[inline]
     fn domain(&self) -> Self::Domain {
         ProjectedContext::new(self.session.clone())
     }
 
+    #[inline]
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as CoreType>::Identity>,
@@ -149,13 +147,22 @@ impl CoreValue for Dimension {
     }
 }
 
-/// Handle to an XLA array reference, bound to the [`Session`] session that owns its referent. This is the reference
-/// member of [`Value`] and its projection onto [`ReferenceType<ArrayType>`](ReferenceType).
-///
-/// The session is retained next to the handle rather than recovered from the referent, because reading the referent
-/// locks its allocation and fails once the allocation is frozen, whereas the session of a value must be available
-/// infallibly. Two references are equal when their handles are equal (i.e., when they name the same allocation and
-/// view), regardless of their sessions.
+impl Compare<Value, DimensionType> for Dimension {
+    #[inline]
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Value, ProgramError> {
+        // Comparing two dimensions yields a Boolean array, which is materialized in this dimension's session by binding
+        // the array IR comparison there. The session decides the predicate on the host from the two extents.
+        let inputs = [Value::Dimension(self.clone()), Value::Dimension(other.clone())];
+        Ok(self.session.bind(CompareOperation::<Type>::new(direction), Vec::new(), &inputs)?.remove(0))
+    }
+}
+
+/// Handle to an XLA [`Array`] reference, bound to the [`Session`] session that owns its referent. This is the reference
+/// member of [`Value`] and its projection onto [`ReferenceType<ArrayType>`](ReferenceType). The session is retained
+/// next to the handle rather than recovered from the referent, because reading the referent locks its allocation and
+/// fails once the allocation is frozen, whereas the session of a value must be available infallibly. Two references
+/// are equal when their handles are equal (i.e., when they name the same allocation and view), regardless of their
+/// sessions.
 #[derive(Clone)]
 pub struct Reference {
     /// Shared reference handle (i.e., the allocation, the view path, and the cached reference type).
@@ -167,41 +174,48 @@ pub struct Reference {
 
 impl Reference {
     /// Creates a new [`Reference`] that binds `reference` to `session`.
+    #[inline]
     pub fn new(reference: ArrayReference<Array>, session: Session) -> Self {
         Self { reference, session }
     }
 
     /// Returns the shared [`ArrayReference`] handle of this reference.
+    #[inline]
     pub fn handle(&self) -> &ArrayReference<Array> {
         &self.reference
     }
 
     /// Returns the [`Session`] that owns the referent of this reference.
+    #[inline]
     pub fn session(&self) -> &Session {
         &self.session
     }
 
     /// Consumes this reference and returns its shared [`ArrayReference`] handle.
+    #[inline]
     pub fn into_handle(self) -> ArrayReference<Array> {
         self.reference
     }
 }
 
 impl Debug for Reference {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_tuple("Reference").field(&self.reference).finish()
     }
 }
 
 impl Display for Reference {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.reference, formatter)
     }
 }
 
-// References compare by handle identity, like `ArrayReference`.
 impl PartialEq for Reference {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
+        // References compare by handle identity, like `ArrayReference`.
         self.reference == other.reference
     }
 }
@@ -209,30 +223,31 @@ impl PartialEq for Reference {
 impl Typed for Reference {
     type Type = ReferenceType<ArrayType>;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, ReferenceType<ArrayType>> {
         self.reference.r#type()
     }
 }
 
-/// Array IR runtime value of the [`Session`] (i.e., its [`Session::Value`](ryft_core::Domain::Value)), and the
-/// [`Session`] counterpart of [`ArrayIrValue`] in which every member carries the [`Session`] session that it
-/// belongs to. Refer to the [module documentation](self) for why the session is part of every member.
+/// Array IR runtime value associated with a [`Session`] (i.e., its [`Session::Value`](ryft_core::Domain::Value)),
+/// and the [`Session`] counterpart of [`ArrayIrValue`] in which every member carries the [`Session`] session that
+/// it belongs to. Refer to the [module documentation](self) for why the session is part of every member.
 ///
 /// # Dispatch and Transforms
 ///
 /// A [`Value`] dispatches and executes through the [`Session`] of its member, so every capability binds an
 /// [`Operation`](crate::Operation) that the session executes eagerly, one operation at a time through its eager
-/// dispatch cache, and free transform entry points recover that session from the values. When several inputs
-/// carry different sessions, the receiver's session executes, and it validates that its array inputs belong to its
-/// client and placement. Dimension inputs are host data and need no such validation.
+/// dispatch cache, and free transform entry points recover that session from the values. When several inputs carry
+/// different sessions, the receiver's session executes, and it validates that its array inputs belong to its client
+/// and placement. Dimension inputs are host data and need no such validation.
 ///
 /// # Placement
 ///
-/// Arrays that a [`Value`] creates without array inputs (e.g., the scalar that converts a first-class dimension
-/// into array data) are placed on the mesh of the executing session. When the session of an array member has no mesh of
-/// its own, the session recovered from that member adopts the array's mesh, so a statically known extent read from an
-/// array on some devices, and every scalar later derived from it, stays on those devices instead of moving to the
-/// client's default devices. Dimensions read from or decoded from an array bind the array's mesh in the same way.
+/// Arrays that a [`Value`] creates without array inputs (e.g., the scalar that converts a first-class dimension into
+/// array data) are placed on the mesh of the executing session. When the session of an array member has no mesh of its
+/// own, the session recovered from that member adopts the array's mesh, so a statically known extent read from an array
+/// on some devices, and every scalar later derived from it, stays on those devices instead of moving to the client's
+/// default devices. Dimensions read from or decoded from an array bind the array's mesh in the same way.
 ///
 /// # Identity
 ///
@@ -250,9 +265,12 @@ pub enum Value {
     Reference(Reference),
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl Value {
     /// Converts a session-free [`ArrayIrValue`] over XLA arrays into a [`Value`], binding dimension and reference
     /// members to `session`. Array members keep their own session.
+    #[inline]
     pub(crate) fn from_array_ir_value(value: ArrayIrValue<Array>, session: &Session) -> Result<Self, TypeError> {
         match value {
             ArrayIrValue::Array(value) => Ok(Self::Array(value)),
@@ -262,6 +280,7 @@ impl Value {
     }
 
     /// Returns the [`Session`] of this value's member.
+    #[inline]
     pub fn session(&self) -> &Session {
         match self {
             Self::Array(value) => value.session(),
@@ -273,7 +292,8 @@ impl Value {
     /// Converts this value into the session-free [`ArrayIrValue`] representation over XLA arrays, which drops the
     /// sessions of dimension and reference members. Used to delegate host-side semantics (e.g., reference handles and
     /// predicates) to the generic [`ArrayIrValue`] implementations in `ryft-core`.
-    pub(crate) fn into_array_ir_value(self) -> ArrayIrValue<Array> {
+    #[inline]
+    pub fn into_array_ir_value(self) -> ArrayIrValue<Array> {
         match self {
             Self::Array(value) => ArrayIrValue::Array(value),
             Self::Dimension(value) => ArrayIrValue::Dimension(value.into_value()),
@@ -281,15 +301,16 @@ impl Value {
         }
     }
 
-    /// Converts this value into the immediate [`Constant`] that a trace whose capture table holds constants stages
-    /// for it. An array is retained and becomes a [`Constant::Session`] handle to its storage, and a dimension
-    /// becomes a [`Constant::Dimension`].
+    /// Converts this value into the immediate [`Constant`] that a trace whose capture table holds constants stages for
+    /// it. An array is retained and becomes a [`Constant::Session`] handle to its storage, and a dimension becomes a
+    /// [`Constant::Dimension`].
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError::Type`] error for a reference, because its state cannot be shared with a trace that
     /// outlives the current transform.
-    pub(crate) fn constant(self) -> Result<Constant, ProgramError> {
+    #[inline]
+    pub fn into_constant(self) -> Result<Constant, ProgramError> {
         match self {
             Self::Array(value) => Ok(Constant::Session(RetainedArray::new(&value))),
             Self::Dimension(value) => Ok(Constant::Dimension(value.into_value())),
@@ -301,7 +322,8 @@ impl Value {
     }
 
     /// Returns this member's diagnostic kind name.
-    fn kind_name(&self) -> &'static str {
+    #[inline]
+    fn kind(&self) -> &'static str {
         match self {
             Self::Array(_) => "array",
             Self::Dimension(_) => "dimension",
@@ -455,14 +477,14 @@ impl ValueProjection<ArrayType> for Value {
     {
         match self {
             Self::Array(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind()))),
         }
     }
 
     fn into_projected(self) -> Result<Array, TypeError> {
         match self {
             Self::Array(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind()))),
         }
     }
 }
@@ -484,14 +506,14 @@ impl ValueProjection<DimensionType> for Value {
     {
         match self {
             Self::Dimension(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind()))),
         }
     }
 
     fn into_projected(self) -> Result<Dimension, TypeError> {
         match self {
             Self::Dimension(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind()))),
         }
     }
 }
@@ -513,14 +535,14 @@ impl ValueProjection<ReferenceType<ArrayType>> for Value {
     {
         match self {
             Self::Reference(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind()))),
         }
     }
 
     fn into_projected(self) -> Result<Reference, TypeError> {
         match self {
             Self::Reference(value) => Ok(value),
-            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
+            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind()))),
         }
     }
 }
@@ -1229,7 +1251,7 @@ mod tests {
             .unwrap();
 
         // Arrays are retained by their session and become handles to their retained storage.
-        let Ok(Constant::Session(handle)) = Value::Array(array.clone()).constant() else {
+        let Ok(Constant::Session(handle)) = Value::Array(array.clone()).into_constant() else {
             panic!("an array was not converted into a session constant");
         };
         assert_eq!(handle.to_array(&session).unwrap(), array);
@@ -1237,11 +1259,11 @@ mod tests {
         // Dimensions become immediate constants, and references are rejected.
         let extent = DimensionValue::constant(2).unwrap();
         assert_eq!(
-            Value::Dimension(Dimension::new(extent.clone(), session.clone())).constant(),
+            Value::Dimension(Dimension::new(extent.clone(), session.clone())).into_constant(),
             Ok(Constant::Dimension(extent)),
         );
         assert_eq!(
-            Value::Reference(Reference::new(ArrayReference::new(array), session)).constant(),
+            Value::Reference(Reference::new(ArrayReference::new(array), session)).into_constant(),
             Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
                 .into()),
         );
