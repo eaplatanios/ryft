@@ -712,11 +712,13 @@ impl Array {
 }
 
 macro_rules! impl_placeable {
-    // Implements `Placeable` for a traced value type, whose context records or executes its placement.
-    ([$($generics:tt)*] $value:ty where $($bounds:tt)*) => {
-        impl<$($generics)*> PlaceableParameter<$value> for $value
+    // Implements `Placeable` for one generic tracer type. The optional `where` clause supplies
+    // its type-specific bounds.
+    (<$($generic:ident),+> $value:ty $(where $($bounds:tt)+)?) => {
+        impl<$($generic),+> PlaceableParameter<$value> for $value
         where
-            $($bounds)*
+            Self: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
+            $($($bounds)+)?
         {
             #[inline]
             fn validate_placement(
@@ -752,9 +754,10 @@ macro_rules! impl_placeable {
             }
         }
 
-        impl<$($generics)*> Placeable for $value
+        impl<$($generic),+> Placeable for $value
         where
-            $($bounds)*
+            Self: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
+            $($($bounds)+)?
         {
             type Output = Self;
 
@@ -786,41 +789,13 @@ macro_rules! impl_placeable {
     };
 }
 
+impl_placeable!(<C> Tracer<C> where C: Context<Type = ArrayType>);
+impl_placeable!(<C> PartialTracer<C> where C: Context<Type = ArrayType>);
+impl_placeable!(<C, P> DifferentiationTracer<C, P> where C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>);
+impl_placeable!(<C, P> BatchingTracer<C, P> where C: Context<Type = ArrayType>, P: BatchingPolicy<C>);
+impl_placeable!(<V> ProjectedValue<ArrayType, V>);
+
 // TODO(eaplatanios): Review from here onwards.
-
-impl_placeable!(
-    [C: Context<Type = ArrayType>] Tracer<C>
-    where
-        Tracer<C>: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
-);
-
-impl_placeable!(
-    [C: Context<Type = ArrayType>] PartialTracer<C>
-    where
-        PartialTracer<C>:
-            ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
-);
-
-impl_placeable!(
-    [C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>] DifferentiationTracer<C, P>
-    where
-        DifferentiationTracer<C, P>: ConcreteArrays
-            + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
-);
-
-impl_placeable!(
-    [C: Context<Type = ArrayType>, P: BatchingPolicy<C>] BatchingTracer<C, P>
-    where
-        BatchingTracer<C, P>:
-            ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
-);
-
-impl_placeable!(
-    [V] ProjectedValue<ArrayType, V>
-    where
-        ProjectedValue<ArrayType, V>: ConcreteArrays
-            + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
-);
 
 /// Validates the destination `target` of the upload of a host value whose element type and static shape `r#type`
 /// describes, and returns it with a sharding that is padded to the rank of the value. The upload of a host value onto
