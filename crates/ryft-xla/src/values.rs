@@ -265,17 +265,15 @@ pub enum Value {
     Reference(Reference),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Value {
-    /// Converts a session-free [`ArrayIrValue`] over XLA arrays into a [`Value`], binding dimension and reference
-    /// members to `session`. Array members keep their own session.
+    /// Converts an [`ArrayIrValue`] over XLA arrays into a [`Value`]. Array members keep their original [`Session`].
+    /// Dimension and reference members bind to `session`.
     #[inline]
-    pub(crate) fn from_array_ir_value(value: ArrayIrValue<Array>, session: &Session) -> Result<Self, TypeError> {
+    pub fn from_array_ir_value(value: ArrayIrValue<Array>, session: &Session) -> Self {
         match value {
-            ArrayIrValue::Array(value) => Ok(Self::Array(value)),
-            ArrayIrValue::Dimension(value) => Ok(Self::Dimension(Dimension::new(value, session.clone()))),
-            ArrayIrValue::Reference(value) => Ok(Self::Reference(Reference::new(value, session.clone()))),
+            ArrayIrValue::Array(value) => Self::Array(value),
+            ArrayIrValue::Dimension(value) => Self::Dimension(Dimension::new(value, session.clone())),
+            ArrayIrValue::Reference(value) => Self::Reference(Reference::new(value, session.clone())),
         }
     }
 
@@ -333,6 +331,7 @@ impl Value {
 }
 
 impl Display for Value {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Array(value) => Display::fmt(value, formatter),
@@ -345,6 +344,7 @@ impl Display for Value {
 impl Typed for Value {
     type Type = Type;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, Type> {
         Cow::Owned(match self {
             Self::Array(value) => Type::Array(value.r#type().into_owned()),
@@ -355,6 +355,7 @@ impl Typed for Value {
 }
 
 impl Placed for Value {
+    #[inline]
     fn placement(&self) -> Option<Placement> {
         // Only the array members of an XLA value live on devices.
         match self {
@@ -367,12 +368,14 @@ impl Placed for Value {
 impl CoreValue for Value {
     // Every member carries its `Session`, so array IR values dispatch and execute through it directly. Capability
     // blankets in `ryft-core` bind `Operation`s into this session, and free transform entry points recover it here.
+
     type Dispatch = ValueDomainDispatch;
     type Domain = Session;
 
+    #[inline]
     fn domain(&self) -> Self::Domain {
-        // A mesh-less session recovered from an array places the values that it creates without array inputs (e.g., a
-        // folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
+        // A mesh-less session recovered from an array places the values that it creates without array inputs (e.g.,
+        // a folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
         // client's default devices.
         match self {
             Self::Array(value) if value.session().device_mesh().is_err() => value.session().with_derived_mesh(value),
@@ -380,6 +383,7 @@ impl CoreValue for Value {
         }
     }
 
+    #[inline]
     fn relocatable_type(&self) -> Option<Self::Type> {
         // An uncommitted array whose type records nothing beyond replication enters a transform without a sharding,
         // which is the type for which a `jit` dispatcher specializes such an argument, so that a call moves it onto
@@ -390,6 +394,7 @@ impl CoreValue for Value {
         }
     }
 
+    #[inline]
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as CoreType>::Identity>,
@@ -404,10 +409,12 @@ impl CoreValue for Value {
         }
     }
 
+    #[inline]
     fn validate_as_constant(&self) -> Result<(), TypeError> {
         self.clone().into_array_ir_value().validate_as_constant()
     }
 
+    #[inline]
     fn is_zero(&self) -> bool {
         match self {
             Self::Array(value) => value.is_zero(),
@@ -415,10 +422,10 @@ impl CoreValue for Value {
         }
     }
 
-    // `singleton` keeps the default `None`, because it is a static function that cannot attach a session to a
-    // singleton dimension, and `None` is the conservative answer.
-
+    #[inline]
     fn reference_id(&self) -> Option<ReferenceId> {
+        // `singleton` keeps the default `None`, because it is a static function that cannot attach a session
+        // to a singleton dimension, and `None` is the conservative answer.
         match self {
             Self::Array(_) | Self::Dimension(_) => None,
             Self::Reference(value) => Some(value.handle().id()),
@@ -431,30 +438,35 @@ impl CoreValue for Value {
 // a batched selection) have a single source of truth.
 
 impl Concretizable<bool> for Value {
+    #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().concretize()
     }
 }
 
 impl WhilePredicate for Value {
+    #[inline]
     fn any_true(&self) -> Result<bool, ProgramError> {
         self.clone().into_array_ir_value().any_true()
     }
 
+    #[inline]
     fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         let output = self
             .clone()
             .into_array_ir_value()
             .select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
-        Ok(Self::from_array_ir_value(output, on_true.session())?)
+        Ok(Self::from_array_ir_value(output, on_true.session()))
     }
 }
 
 impl AssertionValue for Value {
+    #[inline]
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         self.clone().into_array_ir_value().assertion_observation()
     }
 
+    #[inline]
     fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         self.clone().into_array_ir_value().assertion_array()
     }
@@ -467,10 +479,12 @@ impl ValueProjection<ArrayType> for Value {
     where
         Self: 'v;
 
+    #[inline]
     fn from_projected(value: Array) -> Self {
         Self::Array(value)
     }
 
+    #[inline]
     fn projected<'v>(&'v self) -> Result<&'v Array, TypeError>
     where
         ArrayType: 'v,
@@ -481,6 +495,7 @@ impl ValueProjection<ArrayType> for Value {
         }
     }
 
+    #[inline]
     fn into_projected(self) -> Result<Array, TypeError> {
         match self {
             Self::Array(value) => Ok(value),
@@ -496,10 +511,12 @@ impl ValueProjection<DimensionType> for Value {
     where
         Self: 'v;
 
+    #[inline]
     fn from_projected(value: Dimension) -> Self {
         Self::Dimension(value)
     }
 
+    #[inline]
     fn projected<'v>(&'v self) -> Result<&'v Dimension, TypeError>
     where
         DimensionType: 'v,
@@ -510,6 +527,7 @@ impl ValueProjection<DimensionType> for Value {
         }
     }
 
+    #[inline]
     fn into_projected(self) -> Result<Dimension, TypeError> {
         match self {
             Self::Dimension(value) => Ok(value),
@@ -525,10 +543,12 @@ impl ValueProjection<ReferenceType<ArrayType>> for Value {
     where
         Self: 'v;
 
+    #[inline]
     fn from_projected(value: Reference) -> Self {
         Self::Reference(value)
     }
 
+    #[inline]
     fn projected<'v>(&'v self) -> Result<&'v Reference, TypeError>
     where
         ReferenceType<ArrayType>: 'v,
@@ -539,6 +559,7 @@ impl ValueProjection<ReferenceType<ArrayType>> for Value {
         }
     }
 
+    #[inline]
     fn into_projected(self) -> Result<Reference, TypeError> {
         match self {
             Self::Reference(value) => Ok(value),
@@ -548,22 +569,27 @@ impl ValueProjection<ReferenceType<ArrayType>> for Value {
 }
 
 impl From<Array> for Value {
+    #[inline]
     fn from(value: Array) -> Self {
         Self::Array(value)
     }
 }
 
 impl From<Dimension> for Value {
+    #[inline]
     fn from(value: Dimension) -> Self {
         Self::Dimension(value)
     }
 }
 
 impl From<Reference> for Value {
+    #[inline]
     fn from(value: Reference) -> Self {
         Self::Reference(value)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values. These implementations provide the panicking operator sugar that the array operation
@@ -1218,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_value_into_array_ir_value() {
-        // The conversion is lossless up to the sessions, which the inverse conversion binds to the provided session.
+        // A round trip preserves the members and only rebinds the dimension and reference sessions.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
@@ -1236,7 +1262,7 @@ mod tests {
             [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
         );
         let other_session = Session::builder().client(client).build().unwrap();
-        let restored = converted.map(|value| Value::from_array_ir_value(value, &other_session).unwrap());
+        let restored = converted.map(|value| Value::from_array_ir_value(value, &other_session));
         assert_eq!(restored, values);
         assert!(same_session(restored[0].session(), &session));
         assert!(same_session(restored[1].session(), &other_session));
