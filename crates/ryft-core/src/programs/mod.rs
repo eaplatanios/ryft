@@ -90,6 +90,7 @@
 //! New operations define their type inference, effects, rendering, and transform rules alongside the operation type.
 //! The program representation supplies their common structure without needing cases for individual operation variants.
 
+use std::convert::Infallible;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -244,6 +245,14 @@ impl ProgramError {
             ProgramError::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
             _ => None,
         }
+    }
+}
+
+// This lets fallible program code use the blanket `TryFrom` implementation of an infallible conversion.
+impl From<Infallible> for ProgramError {
+    #[inline]
+    fn from(error: Infallible) -> Self {
+        match error {}
     }
 }
 

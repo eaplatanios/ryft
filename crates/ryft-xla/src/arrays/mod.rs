@@ -38,12 +38,13 @@ use std::fmt::{Debug, Display};
 use std::sync::{Arc, OnceLock};
 
 use ryft_core::{
-    Add, And, Array as CoreArray, ArrayElement, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType,
-    DeviceId, DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
+    Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
+    DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
     DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul,
-    Neg, Not, Operation, Or, Parameter, ParameterPath, Parameterized, Placed, Placement, ProgramError,
-    ProjectedContext, Rem, Select, Shape, ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed,
-    UnreducedKind, Value, ValueDomainDispatch, WhilePredicate, Xor, dispatch_on_array_element_type, encode_elements,
+    Neg, Not, NumericArrayElement, Operation, Or, Parameter, ParameterPath, Parameterized, Placed, Placement,
+    ProgramError, ProjectedContext, Rem, Select, Shape, ShapeChangingCollectiveValue, Sharding, StaticShape, Sub,
+    Typed, UnreducedKind, Value, ValueDomainDispatch, WhilePredicate, Xor, dispatch_on_array_element_type,
+    encode_elements,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -1301,15 +1302,15 @@ impl std::ops::Mul for Array {
     }
 }
 
-impl std::ops::Mul<f64> for Array {
+impl<S: NumericArrayElement> std::ops::Mul<S> for Array {
     type Output = Self;
 
-    fn mul(self, right: f64) -> Self {
+    fn mul(self, right: S) -> Self {
         // Convert before multiplying so the scalar follows the input dtype's rounding and saturation rules.
         let data_type = self.data_type();
         let factor_type = ArrayType::scalar(data_type).with_memory(self.r#type().memory());
         let bytes = dispatch_on_array_element_type!(data_type, |Element| {
-            Element::from_real(right).and_then(|element| encode_elements(&factor_type, &[element]))
+            right.convert_to::<Element>().and_then(|element| encode_elements(&factor_type, &[element]))
         })
         .expect("`mul` operation failed");
 
@@ -3057,6 +3058,16 @@ mod tests {
         assert!(!scaled.is_committed());
         assert!(scaled.is_locally_assigned());
         assert_eq!(scaled.copy_to_host().unwrap().elements::<i32>().unwrap(), [-6, 8]);
+    }
+
+    #[test]
+    fn test_array_mul_scalar_preserves_large_integer() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let coefficient = (1u64 << 53) + 1;
+        let r#type = ArrayType::new_static(DataType::U64, [2]);
+        let input = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1u64, 2])).unwrap();
+        let output = input * coefficient;
+        assert_eq!(output.copy_to_host().unwrap().elements::<u64>().unwrap(), [coefficient, 2 * coefficient]);
     }
 
     #[test]

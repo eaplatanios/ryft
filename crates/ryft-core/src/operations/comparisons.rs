@@ -264,10 +264,12 @@ impl<C: Context<Type = ArrayType, Operation: From<CompareOperation<ArrayType>>>>
 impl<
     C: Context<
             Type = ArrayIrType,
-            Constant: TryFrom<bool, Error = ProgramError> + ValueProjection<DimensionType, Projected = DimensionValue>,
+            Constant: TryFrom<bool> + ValueProjection<DimensionType, Projected = DimensionValue>,
             Operation: From<Self>,
         >,
 > PartiallyEvaluatableOperation<C> for CompareOperation<ArrayIrType>
+where
+    ProgramError: From<<C::Constant as TryFrom<bool>>::Error>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -601,7 +603,10 @@ impl Compare<Array> for DimensionValue {
     }
 }
 
-impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<ArrayIrValue<A>> for DimensionValue {
+impl<A: Value<Type = ArrayType> + TryFrom<bool>> Compare<ArrayIrValue<A>> for DimensionValue
+where
+    ProgramError: From<<A as TryFrom<bool>>::Error>,
+{
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<ArrayIrValue<A>, ProgramError> {
         let output = direction.prove_for_dimensions(
             self.r#type().as_ref(),
@@ -644,12 +649,13 @@ impl<
             Type = ArrayIrType,
             Domain: Context<
                 Type = ArrayIrType,
-                Constant: TryFrom<bool, Error = ProgramError>
-                              + ValueProjection<DimensionType, Projected = DimensionValue>,
+                Constant: TryFrom<bool> + ValueProjection<DimensionType, Projected = DimensionValue>,
                 Operation: From<CompareOperation<V::Type>>,
             >,
         >,
 > Compare<V> for ProjectedValue<DimensionType, V>
+where
+    ProgramError: From<<<V::Domain as Domain>::Constant as TryFrom<bool>>::Error>,
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
         // Immediate extents override nominal identity, just as in partial evaluation. Captures remain runtime data.

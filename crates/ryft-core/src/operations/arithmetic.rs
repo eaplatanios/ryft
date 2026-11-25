@@ -1123,10 +1123,10 @@ impl std::ops::Mul for Array {
     }
 }
 
-impl std::ops::Mul<f64> for Array {
+impl<S: NumericArrayElement> std::ops::Mul<S> for Array {
     type Output = Self;
 
-    fn mul(self, right: f64) -> Self::Output {
+    fn mul(self, right: S) -> Self::Output {
         // Scales every element by `right`, converting `right` into this array's element data type first so that scaling
         // preserves its data type. The literal coefficient matches the array's memory and manual variation and is
         // reduced over all of its reduction axes, so multiplying preserves pending and completed reductions.
@@ -1149,7 +1149,7 @@ impl std::ops::Mul<f64> for Array {
             .with_sharding(sharding)
             .unwrap_or_else(|error| panic!("{error}"));
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::from_elements(factor_type, &[Element::from_real(right).unwrap_or_else(|error| panic!("{error}"))])
+            Self::from_elements(factor_type, &[right.convert_to::<Element>().unwrap_or_else(|error| panic!("{error}"))])
                 .unwrap()
         });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
@@ -4373,6 +4373,13 @@ mod tests {
         // Scaling by an `f64` preserves the array's element data type.
         let scaled = Array::vector(vec![1.0f32, 2.0]).unwrap() * 2.0;
         assert_eq!(scaled, Array::vector(vec![2.0f32, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_array_mul_scalar_preserves_large_integer() {
+        let coefficient = (1u64 << 53) + 1;
+        let input = Array::vector(vec![1u64, 2]).unwrap();
+        assert_eq!(input * coefficient, Array::vector(vec![coefficient, 2 * coefficient]).unwrap());
     }
 
     #[test]

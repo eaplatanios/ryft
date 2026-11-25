@@ -941,12 +941,10 @@ impl From<DimensionValue> for Constant {
     }
 }
 
-impl TryFrom<bool> for Constant {
-    type Error = ProgramError;
-
+impl From<bool> for Constant {
     #[inline]
-    fn try_from(value: bool) -> Result<Self, ProgramError> {
-        Ok(Self::Boolean(value))
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
     }
 }
 
@@ -1098,12 +1096,10 @@ impl From<CaptureReference<ArrayType>> for ArrayConstant {
     }
 }
 
-impl TryFrom<bool> for ArrayConstant {
-    type Error = ProgramError;
-
+impl From<bool> for ArrayConstant {
     #[inline]
-    fn try_from(value: bool) -> Result<Self, ProgramError> {
-        Ok(Self::Boolean(value))
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
     }
 }
 
@@ -1112,6 +1108,7 @@ impl TryFrom<bool> for ArrayConstant {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AxisError, BatchAxis,
         CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, ConvertElementType,
@@ -1965,11 +1962,11 @@ mod tests {
     fn test_array_constant_from() {
         let capture = CaptureReference::new(2, vector_type());
         assert_eq!(ArrayConstant::from(capture.clone()), ArrayConstant::Captured(capture));
-    }
-
-    #[test]
-    fn test_array_constant_try_from() {
-        assert_eq!(ArrayConstant::try_from(true), Ok(ArrayConstant::Boolean(true)));
+        assert_eq!(ArrayConstant::from(true), ArrayConstant::Boolean(true));
+        assert_eq!(
+            ArrayIrValue::<ArrayConstant>::try_from(false),
+            Ok(ArrayIrValue::Array(ArrayConstant::Boolean(false))),
+        );
     }
 
     #[test]
@@ -2073,7 +2070,7 @@ mod tests {
         assert_eq!(captured.to_string(), "capture#2:f64[4]");
         assert_eq!(immediate.to_string(), extent.to_string());
 
-        let predicate = Constant::try_from(true).unwrap();
+        let predicate = Constant::from(true);
         assert_eq!(predicate, Constant::Boolean(true));
         assert_eq!(predicate.r#type().into_owned(), Type::Array(ArrayType::scalar(DataType::Boolean)));
         assert_eq!(predicate.to_string(), "true");

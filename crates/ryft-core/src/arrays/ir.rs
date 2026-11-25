@@ -297,7 +297,10 @@ impl<A: Concretizable<bool> + Value<Type = ArrayType>> Concretizable<bool> for A
     }
 }
 
-impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> TryFrom<bool> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + TryFrom<bool>> TryFrom<bool> for ArrayIrValue<A>
+where
+    ProgramError: From<<A as TryFrom<bool>>::Error>,
+{
     type Error = ProgramError;
 
     fn try_from(value: bool) -> Result<Self, Self::Error> {
