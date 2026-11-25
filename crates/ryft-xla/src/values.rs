@@ -968,21 +968,8 @@ pub enum ArrayConstant {
     Boolean(bool),
 }
 
-impl From<CaptureReference<ArrayType>> for ArrayConstant {
-    fn from(value: CaptureReference<ArrayType>) -> Self {
-        Self::Captured(value)
-    }
-}
-
-impl TryFrom<bool> for ArrayConstant {
-    type Error = ProgramError;
-
-    fn try_from(value: bool) -> Result<Self, ProgramError> {
-        Ok(Self::Boolean(value))
-    }
-}
-
 impl Display for ArrayConstant {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Captured(value) => Display::fmt(value, formatter),
@@ -995,6 +982,7 @@ impl Display for ArrayConstant {
 impl Typed for ArrayConstant {
     type Type = ArrayType;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         match self {
             Self::Captured(value) => value.r#type(),
@@ -1008,10 +996,12 @@ impl CoreValue for ArrayConstant {
     type Dispatch = ValueDirectDispatch;
     type Domain = EagerContext<Self>;
 
+    #[inline]
     fn domain(&self) -> Self::Domain {
         EagerContext::new()
     }
 
+    #[inline]
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<ArrayType as CoreType>::Identity>,
@@ -1023,6 +1013,7 @@ impl CoreValue for ArrayConstant {
         }
     }
 
+    #[inline]
     fn capture_index(&self) -> Option<usize> {
         match self {
             Self::Captured(value) => Some(value.index()),
@@ -1032,6 +1023,7 @@ impl CoreValue for ArrayConstant {
 }
 
 impl CaptureConstant for ArrayConstant {
+    #[inline]
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
             Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
@@ -1042,6 +1034,7 @@ impl CaptureConstant for ArrayConstant {
 }
 
 impl Concretizable<bool> for ArrayConstant {
+    #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
         match self {
             Self::Captured(value) => value.concretize(),
@@ -1054,6 +1047,7 @@ impl Concretizable<bool> for ArrayConstant {
 }
 
 impl AssertionValue for ArrayConstant {
+    #[inline]
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_observation(),
@@ -1064,6 +1058,7 @@ impl AssertionValue for ArrayConstant {
         }
     }
 
+    #[inline]
     fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_array(),
@@ -1095,6 +1090,22 @@ impl ValueProjection<ArrayType> for ArrayConstant {
     #[inline]
     fn into_projected(self) -> Result<Self::Projected, TypeError> {
         Ok(self)
+    }
+}
+
+impl From<CaptureReference<ArrayType>> for ArrayConstant {
+    #[inline]
+    fn from(value: CaptureReference<ArrayType>) -> Self {
+        Self::Captured(value)
+    }
+}
+
+impl TryFrom<bool> for ArrayConstant {
+    type Error = ProgramError;
+
+    #[inline]
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
     }
 }
 
