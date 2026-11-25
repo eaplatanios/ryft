@@ -885,17 +885,12 @@ pub(crate) mod tests {
     }
 
     /// Runs the worker test `helper`, given as its path within this test binary, in `process_count` processes that
-    /// stand for the ranks of one job, with `environment` added to their environment, and returns their standard
-    /// outputs in rank order. Each process finds its rank and a coordinator address on a free loopback port with
-    /// [`test_process`]. Panics with the outputs of every process if a process fails, if a process did not run and
-    /// pass exactly its worker test, or if the processes do not finish within `timeout`. A failed process ends the
-    /// launch, because its peers would wait for it, and no process outlives this function.
-    fn run_test_processes(
-        helper: &str,
-        process_count: usize,
-        environment: &[(&str, String)],
-        timeout: Duration,
-    ) -> Vec<String> {
+    /// stand for the ranks of one job, with `environment` added to their environment. Each process finds its rank and
+    /// a coordinator address on a free loopback port with [`test_process`], and asserts its own outcome. Panics with
+    /// the outputs of every process if a process fails, if a process did not run and pass exactly its worker test, or
+    /// if the processes do not finish within `timeout`. A failed process ends the launch, because its peers would wait
+    /// for it, and no process outlives this function.
+    fn run_test_processes(helper: &str, process_count: usize, environment: &[(&str, String)], timeout: Duration) {
         /// Processes of one launch, which are killed when dropped.
         struct Processes(Vec<Child>);
 
@@ -972,13 +967,12 @@ pub(crate) mod tests {
                 .join("\n");
             panic!("distributed test `{helper}` failed:\n{report}");
         }
-        outputs.into_iter().map(|(stdout, _)| stdout).collect()
     }
 
-    /// Runs the worker test `helper` in `process_count` CPU processes of one job and returns their standard outputs in
-    /// rank order (refer to [`run_test_processes`]).
-    pub(crate) fn run_cpu_processes(helper: &str, process_count: usize) -> Vec<String> {
-        run_test_processes(helper, process_count, &[], Duration::from_secs(30))
+    /// Runs the worker test `helper` in `process_count` CPU processes of one job and asserts that every process
+    /// passes (refer to [`run_test_processes`]).
+    pub(crate) fn run_cpu_processes(helper: &str, process_count: usize) {
+        run_test_processes(helper, process_count, &[], Duration::from_secs(30));
     }
 
     /// Joins the two-process CUDA job that [`run_cuda_rank_pair`] launched this process into, runs `check` with a
@@ -1054,14 +1048,14 @@ pub(crate) mod tests {
     }
 
     /// Runs the test `helper`, given as a path within this test binary, as the two ranks of a CUDA job that share CUDA
-    /// device 0, asserts that both ranks pass, and returns their standard outputs (refer to [`run_test_processes`]).
+    /// device 0, and asserts that both ranks pass (refer to [`run_test_processes`]).
     ///
     /// The CPU plugin cannot host such jobs, because a CPU client that joins a distributed runtime sees only its own
     /// devices (e.g., process 1 sees just device 2048), so it has no cross-process topology for collectives. Instead,
     /// both ranks share CUDA device 0 through NCCL's multiple ranks per GPU, with CUDA MPS for concurrent progress,
     /// which mirrors the `cuda-distributed-collectives` differential suite that `python/README.md` describes.
     #[cfg(feature = "cuda-13")]
-    pub(crate) fn run_cuda_rank_pair(helper: &str) -> [String; 2] {
+    pub(crate) fn run_cuda_rank_pair(helper: &str) {
         /// Private MPS control daemon, which is shut down on drop.
         struct MpsDaemon {
             environment: Vec<(&'static str, String)>,
@@ -1115,19 +1109,7 @@ pub(crate) mod tests {
             Some(MpsDaemon { environment: daemon_environment })
         };
 
-        run_test_processes(helper, 2, &environment, Duration::from_secs(300)).try_into().unwrap()
-    }
-
-    /// Runs the worker test `helper` as the two ranks of a CUDA job (refer to [`run_cuda_rank_pair`]) and returns the
-    /// lines that its ranks printed after `probe: `, those of rank 0 first.
-    #[cfg(feature = "cuda-13")]
-    pub(crate) fn run_cuda_rank_pair_probes(helper: &str) -> String {
-        let outputs = run_cuda_rank_pair(helper);
-        let probes = outputs
-            .iter()
-            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
-            .collect::<Vec<_>>();
-        probes.join("\n")
+        run_test_processes(helper, 2, &environment, Duration::from_secs(300));
     }
 
     /// Returns the elements of the buffer of every shard of `array` that the current process addresses, in mesh order.
