@@ -242,6 +242,11 @@ where
         let r#type = <&T>::try_from(self.r#type().as_ref())?.clone();
         Ok(ProjectedValue::new(self, r#type))
     }
+
+    #[inline]
+    fn projected_relocatable_type(&self) -> Option<T> {
+        <&T>::try_from(&self.relocatable_type()?).ok().cloned()
+    }
 }
 
 impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
@@ -522,33 +527,15 @@ impl DifferentiationRule {
         }
         let projected_inputs = inputs
             .iter()
-            .map(|input| {
-                let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
-                match input.tangent() {
-                    MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
-                    MaybeZero::Value(value) => {
-                        let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
-                        DifferentiationDual::new(primal, tangent)
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+            .cloned()
+            .map(|input| input.map_projected_values(<C::Value as ValueProjection<T>>::into_projected))
+            .collect::<Result<Vec<_>, _>>()?;
         let projected_context = context.project::<T>();
         let outputs = self.apply(operation, &projected_context, &EmptyRegionDriver, &projected_inputs)?;
         outputs
             .into_iter()
-            .map(|output| {
-                let (primal, tangent) = output.into_parts();
-                let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
-                let tangent = match tangent {
-                    MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.into()),
-                    MaybeZero::Value(value) => {
-                        MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
-                    }
-                };
-                DifferentiationDual::new(primal, tangent)
-            })
-            .collect::<Result<Vec<_>, _>>()
+            .map(|output| output.map_projected_values(|value| Ok(C::Value::from_projected(value))))
+            .collect()
     }
 }
 
@@ -1602,7 +1589,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionOperation,
-        DimensionValue, LogicalMesh, Sharding,
+        DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, batch_in_parent};
     use crate::contexts::EagerContext;
@@ -1876,7 +1863,8 @@ mod tests {
     fn test_differentiation_context_jvp_projected_operation_preserves_primal_declaration() {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(ArrayIrContext::new()));
         let unplaced = ArrayType::scalar(DataType::F64);
-        let placed = unplaced.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0)).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let placed = unplaced.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let declaration = ArrayIrType::from(unplaced);
         let mut primal = context.primal().known_value(Array::from_elements(placed.clone(), &[2.0f64]).unwrap().into());
         primal.set_declared_type(&declaration).unwrap();

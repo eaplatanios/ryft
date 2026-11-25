@@ -1,6 +1,6 @@
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
-    DimensionType, DimensionValue, Shape, Sharding, ShardingDimension,
+    DimensionType, DimensionValue, MeshAxisType, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchableOperation, BatchingContext, BatchingPolicy, RecursiveBatchingPolicy};
 use crate::contexts::{Context, ContextProjection, ProjectedContext, StagingContext};
@@ -59,6 +59,17 @@ pub trait DifferentiableType: Type {
     /// boundaries. Types that cannot participate in reverse differentiation return an error instead of fabricating a
     /// zero-space representation.
     fn cotangent(&self) -> Result<Self, DifferentiationError>;
+
+    /// Returns whether `actual` can seed a pullback expecting this cotangent type. The seed keeps its own placement
+    /// and the pullback's operations consume it on those devices. The default checks [`Type::is_interchangeable_with`].
+    /// Array types require the same element type, shape, memory, manual variation, and reduction state. If either
+    /// sharding is unspecified or both meshes are automatic, the shardings may differ as long as neither carries
+    /// manual variation or reduction state. When both types name a mesh and either mesh has an explicit axis, their
+    /// abstract shardings must agree. Physical device assignments and layouts do not affect seed compatibility.
+    #[inline]
+    fn accepts_cotangent_seed(&self, actual: &Self) -> bool {
+        self.is_interchangeable_with(actual)
+    }
 }
 
 impl DifferentiableType for DataType {
@@ -162,6 +173,35 @@ impl DifferentiableType for ArrayType {
             .map_err(|_| DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() })?;
         Ok(self.clone().with_data_type(data_type).with_layout(None).with_sharding_unchecked(sharding))
     }
+
+    fn accepts_cotangent_seed(&self, actual: &Self) -> bool {
+        let declared_sharding = self.sharding();
+        let actual_sharding = actual.sharding();
+        if declared_sharding == actual_sharding {
+            return self.is_interchangeable_with(actual);
+        }
+
+        let has_only_placement = |sharding: &Sharding| {
+            sharding.varying_manual_axes().is_empty()
+                && sharding.unreduced_axes().is_empty()
+                && sharding.reduced_axes().is_empty()
+        };
+
+        let is_automatic =
+            |sharding: &Sharding| sharding.mesh().axes().iter().all(|axis| axis.r#type() == MeshAxisType::Auto);
+
+        // An unspecified sharding or two automatic meshes leave placement open. An explicit sharding is compared
+        // when both types name a mesh. Manual variation and reduction state affect the meaning of a seed.
+        (declared_sharding.is_none()
+            || actual_sharding.is_none()
+            || (declared_sharding.is_some_and(is_automatic) && actual_sharding.is_some_and(is_automatic)))
+            && declared_sharding.is_none_or(has_only_placement)
+            && actual_sharding.is_none_or(has_only_placement)
+            && self
+                .clone()
+                .with_sharding_unchecked(None)
+                .is_interchangeable_with(&actual.clone().with_sharding_unchecked(None))
+    }
 }
 
 impl DifferentiableType for ArrayIrType {
@@ -198,6 +238,14 @@ impl DifferentiableType for ArrayIrType {
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
             Self::Reference(r#type) => Ok(Self::Reference(r#type.cotangent()?)),
+        }
+    }
+
+    #[inline]
+    fn accepts_cotangent_seed(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (Self::Array(declared), Self::Array(actual)) => declared.accepts_cotangent_seed(actual),
+            _ => self.is_interchangeable_with(actual),
         }
     }
 }
@@ -1327,6 +1375,41 @@ mod tests {
             maximum_type.cotangent(),
             Err(DifferentiationError::UndefinedCotangentType { primal_type: maximum_type.to_string() }),
         );
+    }
+
+    #[test]
+    fn test_array_type_accepts_cotangent_seed() {
+        let plain = ArrayType::new_static(F32, [4]);
+        let sharding = |name, axis_type| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new(name, 2, axis_type).unwrap()]).unwrap();
+            Sharding::replicated(mesh, 1)
+        };
+        let explicit = sharding("q", MeshAxisType::Explicit);
+        let named = plain.clone().with_sharding(explicit.clone()).unwrap();
+        let different = plain.clone().with_sharding(sharding("r", MeshAxisType::Explicit)).unwrap();
+        let automatic = |name| plain.clone().with_sharding(sharding(name, MeshAxisType::Auto)).unwrap();
+        assert!(named.accepts_cotangent_seed(&plain));
+        assert!(plain.accepts_cotangent_seed(&named));
+        assert!(!named.is_interchangeable_with(&plain));
+        assert!(!named.accepts_cotangent_seed(&different));
+        assert!(automatic("q").accepts_cotangent_seed(&automatic("r")));
+        assert!(!named.accepts_cotangent_seed(&automatic("q")));
+
+        for incompatible in [
+            plain.clone().with_data_type(F64),
+            plain.clone().with_shape(Shape::from([3])),
+            plain.clone().with_memory(Memory::Host { pinned: true }),
+        ] {
+            assert!(!named.accepts_cotangent_seed(&incompatible));
+        }
+        let unreduced = explicit.clone().with_unreduced_axes(["q"]).unwrap();
+        let reduced = explicit.with_reduced_axes(["q"]).unwrap();
+        let varying = sharding("manual", MeshAxisType::Manual).with_varying_manual_axes(["manual"]).unwrap();
+        for sharding in [unreduced, reduced, varying] {
+            let semantic = plain.clone().with_sharding(sharding).unwrap();
+            assert!(!plain.accepts_cotangent_seed(&semantic));
+            assert!(!semantic.accepts_cotangent_seed(&plain));
+        }
     }
 
     #[test]

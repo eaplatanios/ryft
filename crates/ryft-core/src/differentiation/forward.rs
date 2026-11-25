@@ -59,10 +59,12 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     ///
     /// # Errors
     ///
-    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation or if the type of a live `tangent`
-    /// is not interchangeable with the tangent type required by `primal` (refer to
-    /// [`Type::is_interchangeable_with`]), so a tangent may be stored differently than that type describes (e.g., with
-    /// the explicit layout of its primal).
+    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation or if the
+    /// type of a live `tangent` is not interchangeable with the tangent type required by `primal` (refer to
+    /// [`Type::is_interchangeable_with`]), so a tangent may be stored differently than that type describes (e.g.,
+    /// with the explicit layout of its primal), and if `tangent` cannot relocate to that type either (refer to
+    /// [`Value::is_relocatable_to`]). A tangent that is free to be placed elsewhere (e.g., an uncommitted array)
+    /// is admitted wherever it lives, and the operations that consume it determine where to use it.
     #[inline]
     pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, DifferentiationError> {
         let primal_type = primal.r#type();
@@ -70,7 +72,9 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
         let tangent = match tangent.into() {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
-                if !tangent_type.is_interchangeable_with(tangent.r#type().as_ref()) {
+                if !tangent_type.is_interchangeable_with(tangent.r#type().as_ref())
+                    && !tangent.is_relocatable_to(&tangent_type)
+                {
                     return Err(TypeError::invalid(format!(
                         "tangent type {} does not match type {} required by primal type {}",
                         tangent.r#type(),
@@ -140,6 +144,20 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
                 can_materialize_zero_tangent_from_type(self.primal.r#type().as_ref(), tangent_type)
                     && !tangent_type.is_zero_space()
             }
+        }
+    }
+
+    /// Converts a validated dual through a value projection that preserves its representation and device assignment.
+    pub(super) fn map_projected_values<W: Value<Type: DifferentiableType>, F: Fn(V) -> Result<W, TypeError>>(
+        self,
+        map_fn: F,
+    ) -> Result<DifferentiationDual<W>, DifferentiationError> {
+        let primal = map_fn(self.primal)?;
+        match self.tangent {
+            MaybeZero::Value(tangent) => {
+                Ok(DifferentiationDual { primal, tangent: MaybeZero::Value(map_fn(tangent)?) })
+            }
+            MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
         }
     }
 }
@@ -1007,16 +1025,18 @@ impl<
         )?;
 
         // Validate every public tangent against the tangent type derived from its primal leaf, which a tangent that
-        // is stored differently (e.g., with the explicit layout of its primal) still satisfies, and which a tangent
-        // of a relocatable input may refine (e.g., with any placement). Forward only the information-carrying values
-        // because the compact program has no SSA input for a zero differential space.
+        // is stored differently (e.g., with the explicit layout of its primal) still satisfies. Forward only live
+        // differential spaces, which are the compact program's inputs.
         let mut program_inputs = Vec::new();
         for (index, ((value, primal_type), &relocatable)) in
             public_tangents.into_iter().zip(&self.primal_input_types).zip(&self.relocatable_inputs).enumerate()
         {
             let tangent_type = primal_type.tangent()?;
-            if !tangent_type.is_interchangeable_with(value.r#type().as_ref())
-                && !(relocatable && tangent_type.is_refined_by(value.r#type().as_ref()))
+            let actual_type = value.r#type();
+            let interchangeable = tangent_type.is_interchangeable_with(&actual_type);
+            if !interchangeable
+                && !(relocatable && tangent_type.is_refined_by(&actual_type))
+                && !value.is_relocatable_to(&tangent_type)
             {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
@@ -1034,7 +1054,8 @@ impl<
         for residual in &self.residuals {
             program_inputs.push(context.import(residual.clone())?);
         }
-        let tangent_outputs = self.program.interpret_in_context(context, program_inputs)?.into_iter();
+        let tangent_outputs =
+            self.program.entry_region_ref().interpret_in_context(context, program_inputs)?.into_iter();
 
         // Reconstruct the complete flattened public output boundary. Consume one program result for each tangent output
         // slot and materialize a typed zero, sized from the imported retained extents, for every omitted leaf.
@@ -4215,7 +4236,8 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Shape, Sharding, ShardingDimension, StridedLayout,
+        DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
@@ -4561,9 +4583,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_dual_rejects_mismatched_tangent_sharding() {
-        let placed_type = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0))
-            .unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let placed_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let placed = Array::from_elements(placed_type.clone(), &[1f32]).unwrap();
         let plain = Array::scalar(2f32).unwrap();
         let message =
@@ -4615,9 +4636,8 @@ pub(crate) mod tests {
     fn test_pushforward_apply_relocatable_input_tangents() {
         // Only an input declared with its relocatable type accepts a tangent that refines its declared tangent type
         // (e.g., with any placement). Another data type is still rejected.
-        let placed_type = ArrayType::scalar(DataType::F32)
-            .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0))
-            .unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let placed_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let placed = Array::from_elements(placed_type.clone(), &[1f32]).unwrap();
         let new = |relocatable: bool| {
             let context = EagerContext::<Array, ArrayOperation<Array>>::new();
