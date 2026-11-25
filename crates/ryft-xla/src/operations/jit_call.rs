@@ -899,10 +899,10 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
     /// placed as it is (refer to [`Self::with_kept_input_placements`]), for an input that varies along manual mesh
     /// axes that the declared type does not declare, which the declared sharding does not describe, for a declared
     /// input type without a sharding when the mesh of the call is unknown (i.e., `actual` has no sharding), and for a
-    /// placement over a single device, which places nothing that the devices of the call do not. Eager calls, region
-    /// replay, call lowering, the result placements of compiled programs, and the admission of bounded dynamic callers
-    /// all consult this function, so that they agree on where a call places its inputs. Only an eager application also
-    /// gives an argument on one device the logical mesh of a declared placement over a single device (refer to
+    /// placement over a single device, which places nothing that the devices of the call do not. Eager calls, call
+    /// lowering, the result placements of compiled programs, and the admission of bounded dynamic callers all consult
+    /// this function, so that they agree on where a call places its inputs. Only an eager application also gives an
+    /// argument on one device the logical mesh of a declared placement over a single device (refer to
     /// `JitCallOperation::eager_boundary_input_sharding`).
     pub(crate) fn boundary_input_sharding<'s>(
         &'s self,
@@ -980,8 +980,9 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
 /// Placement decision of one eager application of a call (i.e., an eager call of a compiled function, which
 /// `Session::bind` applies), which [`JitCallOperation::eager_decision`] makes once from the call, its callee, and the
 /// actual arguments. It states the facts that the types of the arguments omit, and the application consumes it instead
-/// of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which sees types only, forwards an input through a call only where this decision
-/// returns it unchanged whatever the arguments are (refer to [`JitCallOperation::returns_input_unchanged`]).
+/// of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which sees
+/// types only, forwards an input through a call only where this decision returns it unchanged whatever the arguments
+/// are (refer to [`JitCallOperation::returns_input_unchanged`]).
 pub(crate) struct EagerCallDecision<'o> {
     /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
     /// their committed public arguments agree on their devices, and none carries a pending reduction that its boundary
@@ -1088,11 +1089,11 @@ impl JitCallOperation<Type> {
     /// The arguments are admitted before anything moves, and whether or not anything moves: an argument that carries a
     /// pending reduction that the executable of the callee cannot receive is rejected wherever it is (refer to
     /// `validate_input_reduction`), because a reshard never completes a pending reduction, so an eager call rejects
-    /// what an execution rejects, whatever placement the decision chooses. The results are
-    /// committed when a public argument is committed or when the callee commits its public outputs on the selected
-    /// devices (refer to [`Self::requests_placement`] and [`commits_public_outputs`]), which includes every
-    /// application that runs on the named mesh of its function, as JAX commits every result of a `jit` function under
-    /// `set_mesh`, and excludes an application that runs where its arguments are, whatever logical mesh they record.
+    /// what an execution rejects, whatever placement the decision chooses. The results are committed when a public
+    /// argument is committed or when the callee commits its public outputs on the selected devices (refer to
+    /// [`Self::requests_placement`] and [`commits_public_outputs`]), which includes every application that runs on the
+    /// named mesh of its function, as JAX commits every result of a `jit` function under `set_mesh`, and excludes an
+    /// application that runs where its arguments are, whatever logical mesh they record.
     ///
     /// # Errors
     ///
@@ -1123,10 +1124,10 @@ impl JitCallOperation<Type> {
         let interface = callee.interface();
         let declared = interface.input_types();
         // Admission is decided here, once, from the arguments as they arrive and before any of them moves, whether or
-        // not the application moves it, so that every application that does not run the executable of the callee
-        // (e.g., the replay of the callee) still rejects what that executable rejects. A pending reduction that a type
-        // records is judged by the type rule of the call first, as when the call is staged, and the common case of
-        // arguments without one costs one branch for each argument.
+        // not the application moves it, so that an eager call, which runs a program of its own rather than the
+        // executable of the callee, still rejects what that executable rejects. A pending reduction that a type records
+        // is judged by the type rule of the call first, as when the call is staged, and the common case of arguments
+        // without one costs one branch for each argument.
         let pending = |(index, input): (usize, &Value)| {
             read_array(unread, index, input).is_some_and(|array| !array.sharding().unreduced_axes().is_empty())
         };
@@ -1151,7 +1152,7 @@ impl JitCallOperation<Type> {
         // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
         let names_devices = || has_placement_requests_in_region(callee, Some(target_platform), false);
         let function_assignment = || {
-            let mesh = self.function_mesh.as_ref().filter(|_| !session.replays_call())?;
+            let mesh = self.function_mesh.as_ref()?;
             if is_named_mesh(mesh.logical_mesh()) {
                 Some((mesh, false))
             } else if !public_arrays.clone().any(Array::is_committed) {
@@ -1416,13 +1417,13 @@ impl JitCallOperation<Type> {
     ///
     /// These conditions hold whatever the known side of the partial evaluation is. An eager known side folds the call,
     /// which takes its placement decision on the concrete arguments, before any output is forwarded, so forwarding
-    /// loses no admission check there. A staged known side compiles nothing by
-    /// itself, and the program that it stages may be compiled, where the boundary of the outer executable admits every
-    /// argument, or interpreted eagerly (e.g., by [`Program::interpret_in_context`](ryft_core::Program) or by the
-    /// replay of a region), where each call takes its own placement decision on the concrete arguments, so that a
-    /// sibling argument, or a pending reduction that no type records, changes what the call returns there or whether
-    /// it returns at all, which types alone cannot show at partition time. A call that is not forwarded stays in the
-    /// known program and takes its placement decision, admission included, whenever that program is interpreted.
+    /// loses no admission check there. A staged known side compiles nothing by itself, and the program that it stages
+    /// may be compiled, where the boundary of the outer executable admits every argument, or interpreted eagerly (e.g.,
+    /// by [`Program::interpret_in_context`](ryft_core::Program)), where each call takes its own placement decision on
+    /// the concrete arguments, so that a sibling argument, or a pending reduction that no type records, changes what
+    /// the call returns there or whether it returns at all, which types alone cannot show at partition time. A call
+    /// that is not forwarded stays in the known program and takes its placement decision, admission included, whenever
+    /// that program is interpreted.
     pub(crate) fn returns_input_unchanged<V, O>(
         &self,
         callee: RegionRef<'_, V, O>,
@@ -4312,11 +4313,11 @@ mod tests {
         }
     }
 
-    /// Test-only interpretation driver that rejects every region that it is asked to interpret and binds operations as
-    /// the eager driver that it wraps binds them.
-    struct RejectingRegionDriver<'r>(EagerInterpretationDriver<'r, Constant, Operation>);
+    /// Test-only interpretation driver that rejects every operation that it is asked to bind, naming the operation and
+    /// the number of its regions, and interprets regions as the eager driver that it wraps interprets them.
+    struct RejectingBindDriver<'r>(EagerInterpretationDriver<'r, Constant, Operation>);
 
-    impl RegionDriver<Constant, Operation> for RejectingRegionDriver<'_> {
+    impl RegionDriver<Constant, Operation> for RejectingBindDriver<'_> {
         fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Constant, Operation>>
         where
             Constant: 'r,
@@ -4326,9 +4327,14 @@ mod tests {
         }
     }
 
-    impl InterpretationDriver<Session> for RejectingRegionDriver<'_> {
-        fn interpret_region(&self, _: &Session, index: usize, _: Vec<Value>) -> Result<Vec<Value>, ProgramError> {
-            Err(ProgramError::InvalidArgument { message: format!("the driver rejects region #{index}") })
+    impl InterpretationDriver<Session> for RejectingBindDriver<'_> {
+        fn interpret_region(
+            &self,
+            context: &Session,
+            index: usize,
+            inputs: Vec<Value>,
+        ) -> Result<Vec<Value>, ProgramError> {
+            self.0.interpret_region(context, index, inputs)
         }
 
         fn bind(
@@ -4338,7 +4344,9 @@ mod tests {
             regions: AttachedRegions<'_, Constant, Operation>,
             inputs: &[Value],
         ) -> Result<Vec<Value>, ProgramError> {
-            InterpretationDriver::<Session>::bind(&self.0, context, operation, regions, inputs)
+            let _ = (context, inputs);
+            let message = format!("the driver rejects `{}` with region count {}", operation.name(), regions.region_count());
+            Err(ProgramError::InvalidArgument { message })
         }
     }
 
@@ -10552,9 +10560,9 @@ mod tests {
         };
 
         // An identity whose input override is the sharding of its argument is applied directly, through a call, and
-        // through the replay of its call in a caller, to an argument that holds the buffers of only some of its local
-        // devices. The replay supplies a missing buffer from a local replica of the same contribution, rejects an
-        // argument with a contribution that no local replica holds at the call with the error of the execution, and
+        // through the interpretation rule of its call in a caller, to an argument that holds the buffers of only some
+        // of its local devices. The rule supplies a missing buffer from a local replica of the same contribution,
+        // rejects an argument with a contribution that no local replica holds with the error of the execution, and
         // returns a result without the layout of its argument, which the declaration of the result omits, as an
         // execution of the callee does.
         for sharding in [&replicated, &split] {
@@ -10781,11 +10789,10 @@ mod tests {
     #[test]
     fn test_jit_call_operation_interpret_binds_the_captures_that_nested_regions_read() {
         // The body of a scan in the callee of a call reads a capture of the callee through a capture constant (refer to
-        // `emitted_capture_reads`). A replay of the call binds the scan on its own, so it binds that constant to the
-        // argument that the call receives for the capture, and the replay returns what `.call` and an execution of the
-        // callee return, on the same devices and with the same commitment, also for a capture that lives on another
-        // mesh of the same devices in the opposite order. Before, the replay failed with `missing captured constant #0
-        // during XLA lowering`.
+        // `emitted_capture_reads`), which the lowering of the whole callee binds to the argument that the call receives
+        // for the capture. The interpretation rule of the call returns what `.call` and an execution of the callee
+        // return, on the same devices and with the same commitment, also for a capture that lives on another mesh of
+        // the same devices in the opposite order.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
         let reversed_mesh =
@@ -10842,7 +10849,7 @@ mod tests {
             let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
             let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
             let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
-            let replayed =
+            let interpreted =
                 operation
                     .interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs)
                     .map(|mut outputs| match outputs.remove(0) {
@@ -10854,7 +10861,7 @@ mod tests {
             let values = [1f32, 2.0, 3.0, 4.0].repeat(length);
             assert_eq!(observed, Ok((&mesh.devices().to_vec(), true, &values)), "{length}");
             assert_eq!(
-                (called.map_err(|error| error.to_string()), replayed.map_err(|error| error.to_string())),
+                (called.map_err(|error| error.to_string()), interpreted.map_err(|error| error.to_string())),
                 (executed.clone(), executed),
                 "{length} {:?}",
                 capture_mesh.devices(),
@@ -10863,10 +10870,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_operation_interpret_interprets_the_callee_through_the_supplied_driver() {
-        // A replay of a call interprets its callee through the driver that it receives, which here rejects the region,
-        // whether or not the body of a scan in the callee reads a capture of the callee. Before, a callee whose scan
-        // body read a capture was interpreted without the driver, and its replay succeeded.
+    fn test_jit_call_operation_interpret_binds_the_call_through_the_supplied_driver() {
+        // The interpretation rule of a call binds the call, with its whole callee as its one region, through the driver
+        // that it receives, which here rejects it, whether or not the body of a scan in the callee reads a capture of
+        // the callee.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -10916,23 +10923,53 @@ mod tests {
             let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, bytes).unwrap();
             let mut inputs = caller.source_program().captures().to_vec();
             inputs.push(Value::Array(input));
-            let driver = RejectingRegionDriver(EagerInterpretationDriver::new(&regions));
-            let replayed = operation.interpret(&session, &driver, &inputs).map(|outputs| outputs.len());
+            let driver = RejectingBindDriver(EagerInterpretationDriver::new(&regions));
+            let bound = operation.interpret(&session, &driver, &inputs).map(|outputs| outputs.len());
             assert_eq!(
-                (inputs.len(), replayed.map_err(|error| error.to_string())),
-                (if reads_capture { 2 } else { 1 }, Err("the driver rejects region #0".to_string())),
+                (inputs.len(), bound.map_err(|error| error.to_string())),
+                (if reads_capture { 2 } else { 1 }, Err("the driver rejects `jit_call` with region count 1".to_string())),
             );
         }
+    }
+
+    #[test]
+    fn test_jit_call_operation_interpret_rejects_callees_with_reference_state() {
+        // A callee that allocates a reference and reads it carries reference state that the program of an eager call
+        // cannot lower, so the interpretation rule of the call rejects it with the error of an eager call.
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(Type::Array(scalar_type.clone()));
+            let operation = Operation::ReferenceNew(ReferenceNewOperation::new());
+            let reference = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            let operation = Operation::ReferenceRead(ReferenceReadOperation::new());
+            let value = builder.add_instruction(operation, Vec::new(), vec![reference], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+        let input = Array::from_host_buffer(&session, scalar_type, None, None, 2f32.to_ne_bytes()).unwrap();
+        let inputs = [Value::Array(input)];
+        let call = JitCallOperation::new(0);
+        let expected = "`jit_call` carries reference state that XLA eager execution cannot lower; discharge references \
+                        before lowering";
+        let bound = session.bind(Operation::JitCall(call.clone()), AttachedRegions::Callees(&[callee.clone()]), &inputs);
+        assert!(matches!(bound, Err(ProgramError::UnsupportedOperation { message }) if message == expected));
+        let interpreted = call.interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs);
+        assert!(matches!(interpreted, Err(ProgramError::UnsupportedOperation { message }) if message == expected));
     }
 
     #[test]
     fn test_jit_call_operation_interpret_fails_every_result_of_a_call_with_a_failed_argument() {
         // A compiled identity of two arguments receives a failed first argument and a healthy second one. Every result
         // of an execution carries the completion of the whole execution, so reading the healthy second result fails
-        // with the failure of the first argument on direct execution and on `.call`, and so does reading it from the
-        // replay of a call of the function. The first argument is either of the zero data type, without buffers, with
-        // a failed producer, or an ordinary `f32` produced by an execution whose input upload failed. Before, the
-        // replay of the second case returned the healthy value.
+        // with the failure of the first argument on direct execution, on `.call`, and through the interpretation rule
+        // of a call of the function. The first argument is either of the zero data type, without buffers, with a failed
+        // producer, or an ordinary `f32` produced by an execution whose input upload failed.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -10987,14 +11024,14 @@ mod tests {
             let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
             let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
             let inputs = [Value::Array(failed), Value::Array(scalar.clone())];
-            let replayed = operation
+            let interpreted = operation
                 .interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs)
                 .map_err(|error| error.to_string())
                 .map(|mut outputs| match outputs.remove(1) {
                     Value::Array(result) => result,
                     _ => panic!("expected an array"),
                 });
-            observations.push((executed, called, observe(replayed)));
+            observations.push((executed, called, observe(interpreted)));
         }
         let (zero_failure, upload_failure) = (Err("producer failed".to_string()), Err("upload failed".to_string()));
         assert_eq!(
@@ -11085,8 +11122,8 @@ mod tests {
         };
 
         // A callee compiled for the second device that places its input there and fills a value that depends on no
-        // input returns both on that device, committed, when the call is replayed operation by operation, as an
-        // execution of the callee returns them, rather than filling the value on the default device of the session.
+        // input returns both on that device, committed, when the call is interpreted, as an execution of the callee
+        // returns them, rather than filling the value on the default device of the session.
         let function: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
             |x: CompileTracer| (x.place(&second_device, None).unwrap(), x.domain().fill(&vector_type, 17f32).unwrap()),
             vector_type.clone(),
@@ -11111,9 +11148,9 @@ mod tests {
         );
 
         // A callee that only moves its input to another memory names no devices, so its call runs where its public
-        // argument is and commits both results, because the callee requests a placement. Replay fills the value there
-        // too, rather than on the default device of the session, and commits both results whatever the commitment of
-        // the argument, as an execution of the callee on those devices does.
+        // argument is and commits both results, because the callee requests a placement. The interpreted call fills the
+        // value there too, rather than on the default device of the session, and commits both results whatever the
+        // commitment of the argument, as an execution of the callee on those devices does.
         let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let first_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
         let memory: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
@@ -11212,8 +11249,8 @@ mod tests {
         // A call of a callee without inputs that names no devices runs where the session places a value without array
         // inputs over the logical mesh of its outputs (refer to `Session::device_mesh_for`), which is the first device
         // of the client for a named mesh of one device and the first two devices for a mesh of two devices, and the
-        // results are committed exactly when they live on more than one device. An eager call and the replay of its
-        // callee by a region interpreter run it on the same devices and give its results the same facts.
+        // results are committed exactly when they live on more than one device. An eager call and the interpretation
+        // rule of the call run it on the same devices and give its results the same facts.
         for (axis, size) in [("a", 1), ("x", 2)] {
             let logical_mesh =
                 LogicalMesh::new(vec![MeshAxis::new(axis, size, MeshAxisType::Explicit).unwrap()]).unwrap();

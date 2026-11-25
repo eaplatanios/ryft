@@ -805,7 +805,7 @@ impl Array {
         let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
         let memory = target.memory().unwrap_or_else(|| self.r#type().memory());
         let placed = |array: Self| array.with_committed(true).with_locally_assigned(false);
-        if self.parts.metadata.matches_placement(&mesh, &sharding) {
+        if self.mesh() == &mesh && self.sharding() == &sharding {
             // A placement that only changes the storage of this array, or nothing, does not inherit the sends of the
             // placement that produced it (refer to `Self::without_previous_sends`).
             return Ok(placed(self.without_previous_sends().place_storage(memory, layout)?));
@@ -880,7 +880,7 @@ impl Array {
         self.checked_placement_layout(session, &placement)?;
         if self.is_locally_assigned()
             || self.data_type().is_zero()
-            || self.parts.metadata.matches_placement(mesh, sharding)
+            || (self.mesh() == mesh && self.sharding() == sharding)
         {
             return Ok(());
         }
@@ -3241,7 +3241,7 @@ pub(super) fn placement_communicates<'a>(
 ) -> bool {
     if locally_assigned
         || metadata.r#type().data_type().is_zero()
-        || metadata.matches_placement(mesh, sharding)
+        || (metadata.mesh() == mesh && metadata.sharding() == sharding)
         || !devices_span_processes(metadata.mesh().devices().iter().chain(mesh.devices()))
     {
         return false;

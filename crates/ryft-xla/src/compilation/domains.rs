@@ -2878,11 +2878,12 @@ mod tests {
             assert!(Arc::ptr_eq(capture.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
         }
 
-        // Region replay uses the same placed buffers and interprets each capture with its original commitment.
-        let replay = session.with_device_mesh(array.mesh().clone());
+        // Lifting the captures on a session with the mesh of the array, as the interpretation of a program that holds
+        // them does, uses the same placed buffers and gives each capture its original commitment.
+        let meshed = session.with_device_mesh(array.mesh().clone());
         for (source, committed) in [(uncommitted, false), (committed, true)] {
-            let Value::Array(capture) = replay.lift(Constant::Session(source)).unwrap() else {
-                panic!("expected a replayed array")
+            let Value::Array(capture) = meshed.lift(Constant::Session(source)).unwrap() else {
+                panic!("expected a lifted array")
             };
             assert_eq!(capture.is_committed(), committed);
             assert!(!capture.is_locally_assigned());
@@ -5653,9 +5654,9 @@ mod tests {
         // whose admission rejects it, and for a capture of this client without buffers, which only an execution
         // rejects. At length zero both compile and run through the executable. It holds alike for a capture of another
         // client of the zero data type, which has no buffer either, and for a capture of this client that is split
-        // unevenly, which the executable could not receive. Every entry point agrees: an execution, a call, the replay
-        // of a call, an execution of a persisted copy, and an execution of a caller that is compiled around a call,
-        // which passes the capture on to the callee and so reads it only where the callee reads it.
+        // unevenly, which the executable could not receive. Every entry point agrees: an execution, a call, the
+        // interpretation rule of a call, an execution of a persisted copy, and an execution of a caller that is compiled
+        // around a call, which passes the capture on to the callee and so reads it only where the callee reads it.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let foreign_session = Session::builder().client(other_cpu_client(2)).build().unwrap();
         let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
@@ -5749,8 +5750,8 @@ mod tests {
             let (function, input) = compiled(capture, length)?;
             function.call(input).map(read).map_err(|error| error.to_string())
         };
-        // The replay of the call, which a region interpreter runs for the call that a caller stages.
-        let replayed = |capture: &Array, length: usize| {
+        // The interpretation rule of the call that a caller stages.
+        let interpreted = |capture: &Array, length: usize| {
             let (function, input) = compiled(capture, length)?;
             let caller: crate::StagedFunction<ArrayType, ArrayType> =
                 crate::stage(|x| function.call(x).unwrap(), input.r#type().into_owned(), Options::new(mesh.clone()))
@@ -5809,10 +5810,10 @@ mod tests {
         // so the two agree for every capture and length.
         let results = [executed(&foreign, 0), called(&foreign, 0), executed(&empty, 0), called(&empty, 0)];
         assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone(), nothing.clone()]);
-        assert_eq!([replayed(&foreign, 0), replayed(&empty, 0)], [nothing.clone(), nothing.clone()]);
+        assert_eq!([interpreted(&foreign, 0), interpreted(&empty, 0)], [nothing.clone(), nothing.clone()]);
         assert_eq!(called(&foreign, 1), executed(&foreign, 1));
         assert_eq!(called(&empty, 1), executed(&empty, 1));
-        let results = [executed(&reversed, 0), called(&reversed, 0), replayed(&reversed, 0)];
+        let results = [executed(&reversed, 0), called(&reversed, 0), interpreted(&reversed, 0)];
         assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone()]);
         let read = Ok((Shape::new(vec![Dimension::Static(1), Dimension::Static(4)]), vec![1.0, 2.0, 3.0, 4.0]));
         assert_eq!([executed(&reversed, 1), called(&reversed, 1)], [read.clone(), read.clone()]);
@@ -5832,7 +5833,7 @@ mod tests {
         }
         let nothing_of_three = Ok((Shape::new(vec![Dimension::Static(0), Dimension::Static(3)]), Vec::new()));
         for (capture, nothing) in [(&zero, &nothing), (&uneven, &nothing_of_three)] {
-            let results = [executed(capture, 0), called(capture, 0), replayed(capture, 0)];
+            let results = [executed(capture, 0), called(capture, 0), interpreted(capture, 0)];
             assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone()]);
         }
         // A persisted copy keeps the record of the captures that its executable never reads.
@@ -5908,7 +5909,8 @@ mod tests {
             };
             Ok::<_, String>((function, types, (input(outer_length), input(inner_length))))
         };
-        // An execution, a call, the replay of a call, an execution of a persisted copy, and an execution of a caller.
+        // An execution, a call, the interpretation rule of a call, an execution of a persisted copy, and an execution of
+        // a caller.
         let nested_results = |outer: &Array, outer_length: usize, inner: &Array, inner_length: usize| {
             let compiled = || nested(outer, outer_length, inner, inner_length);
             let executed = compiled().and_then(|(function, _, inputs)| {
@@ -5917,7 +5919,7 @@ mod tests {
             let called = compiled().and_then(|(function, _, inputs)| {
                 function.call(inputs).map(read_pair).map_err(|error| error.to_string())
             });
-            let replayed = compiled().and_then(|(function, types, (first, second))| {
+            let interpreted = compiled().and_then(|(function, types, (first, second))| {
                 let caller: crate::StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
                     crate::stage(|inputs| function.call(inputs).unwrap(), types, Options::new(mesh.clone())).unwrap();
                 let program = caller.source_program().to_program_with_lifted_captures().unwrap();
@@ -5955,7 +5957,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
                 caller.executable().execute(&session, inputs).map(read_pair).map_err(|error| error.to_string())
             });
-            [executed, called, replayed, persisted, caller]
+            [executed, called, interpreted, persisted, caller]
         };
         let nothing = (Shape::new(vec![Dimension::Static(0), Dimension::Static(4)]), Vec::new());
         let read = (Shape::new(vec![Dimension::Static(1), Dimension::Static(4)]), vec![1.0, 2.0, 3.0, 4.0]);
@@ -6092,49 +6094,33 @@ mod tests {
     }
 
     #[test]
-    fn test_placed_constant_preserves_replayed_capture_completion_with_shared_buffers() {
+    fn test_placed_constant_preserves_capture_completion_with_shared_buffers() {
+        // Two captures share the buffer of one array but complete with different fences (e.g., a result that aliases an
+        // existing array, refer to `Array::with_execution_fence`). Placing either one reuses the placed buffer of the
+        // other while each placement observes the fence of its own capture.
         let client = cpu_client(3);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
         let device = |index: usize| Device::from_pjrt(&devices[index]).unwrap();
         let mesh = |index| DeviceMesh::new(LogicalMesh::single_device(), vec![device(index)]).unwrap();
-        let (zero_type, scalar_type) = (ArrayType::scalar(DataType::Zero), ArrayType::scalar(DataType::F32));
+        let scalar_type = ArrayType::scalar(DataType::F32);
         let healthy =
             Array::from_host_buffer(&session, scalar_type.clone(), mesh(0), None, 4f32.to_ne_bytes()).unwrap();
         let (event, promise) = client.event(()).unwrap();
         promise.set(Some(PjrtError::aborted("capture producer failed"))).unwrap();
-        let failed = Array::from_host_buffer(&session, zero_type.clone(), mesh(0), None, [])
-            .unwrap()
-            .with_execution_fence(ExecutionFence::new(vec![event]));
-        let types = (zero_type, scalar_type.clone());
-        let identity: crate::CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
-            compile(|inputs: (CompileTracer, CompileTracer)| inputs, types.clone(), &session, mesh(0)).unwrap();
-        let caller: crate::StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
-            stage(|inputs| identity.call(inputs).unwrap(), types, Options::new(mesh(0))).unwrap();
-        let program = caller.source_program().to_program_with_lifted_captures().unwrap();
-        let call = program
-            .instructions()
-            .iter()
-            .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-            .unwrap();
-        let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
-        let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
-        let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
-        let inputs = [Value::Array(failed), Value::Array(healthy.clone())];
-        let outputs = operation.interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs).unwrap();
-        let Value::Array(dependent) = &outputs[1] else { panic!("expected a replayed array") };
+        let dependent = healthy.clone().with_execution_fence(ExecutionFence::new(vec![event]));
         let buffer = |array: &Array| Arc::clone(array.shards()[0].buffer().unwrap());
-        assert!(Arc::ptr_eq(&buffer(dependent), &buffer(&healthy)));
+        assert!(Arc::ptr_eq(&buffer(&dependent), &buffer(&healthy)));
 
         let healthy = RetainedArray::new(&healthy).with_declared_type(scalar_type.clone());
-        let dependent = RetainedArray::new(dependent).with_declared_type(scalar_type);
+        let dependent = RetainedArray::new(&dependent).with_declared_type(scalar_type);
         assert_ne!(healthy, dependent);
         let is_failed = |result: Result<(), Error>| {
             assert!(matches!(result, Err(Error::Pjrt(PjrtError::Aborted { message, .. }))
                 if message == "capture producer failed"));
         };
 
-        // Region replay uses the physical placement in either request order while each lift observes its own fence.
+        // Lifts share the physical placement in either request order while each lift observes its own fence.
         let lift = |capture: &RetainedArray, target: &DeviceMesh| {
             let Value::Array(array) =
                 session.with_device_mesh(target.clone()).lift(Constant::Session(capture.clone())).unwrap()

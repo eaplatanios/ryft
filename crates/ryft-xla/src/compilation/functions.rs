@@ -4492,7 +4492,7 @@ mod tests {
         for placement in [None, Some(&first), Some(&second)] {
             let input = upload(placement, [1.0, 3.0]);
             // The capture is replicated, so the function holds it as a session constant of a type that names no mesh,
-            // which region replay places on the devices of the call. A call that does not record the mesh of its
+            // which an eager call places on the devices of the call. A call that does not record the mesh of its
             // function (e.g., one built without `call_operation`) runs where its argument runs.
             let mut interpreted =
                 JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
@@ -4568,12 +4568,12 @@ mod tests {
                 actual: vec![first.devices()[0].id()],
                 expected: vec![second.devices()[0].id()],
             };
-            let replay = |argument: &Array| {
+            let interpret = |argument: &Array| {
                 let mut inputs = caller.source_program().captures().to_vec();
                 inputs.extend([Value::Array(uncommitted.clone()), Value::Array(argument.clone())]);
                 program.interpret_in_context(&session, inputs)
             };
-            assert_eq!(replay(&wrong).unwrap_err(), ProgramError::InvalidArgument { message: error.to_string() });
+            assert_eq!(interpret(&wrong).unwrap_err(), ProgramError::InvalidArgument { message: error.to_string() });
             let called = function.call(invalid.clone()).unwrap_err();
             assert_eq!(called, ProgramError::InvalidArgument { message: error.to_string() });
             assert_eq!(
@@ -4586,10 +4586,10 @@ mod tests {
             );
 
             let valid = (uncommitted.clone(), compatible.clone());
-            let replayed =
-                ValueProjection::<ArrayType>::into_projected(replay(&compatible).unwrap().remove(0)).unwrap();
+            let interpreted =
+                ValueProjection::<ArrayType>::into_projected(interpret(&compatible).unwrap().remove(0)).unwrap();
             for output in [
-                replayed,
+                interpreted,
                 function.call(valid.clone()).unwrap(),
                 function.executable().execute(&session, valid).unwrap(),
             ] {
@@ -4787,8 +4787,8 @@ mod tests {
     fn test_compiled_function_places_captures_once_for_each_mesh() {
         // A capture that is not on the devices where a function receives it is placed there once for the array
         // and mesh (refer to `placed_constant`), whether it is on the same devices, on other devices of the same mesh
-        // topology, or on a mesh of another topology, so that repeated executions, eager calls, and replays of the
-        // callee, after the first application of each path, create the same arrays wherever the capture lives.
+        // topology, or on a mesh of another topology, so that repeated executions, eager calls, and interpretations of
+        // a call, after the first application of each path, create the same arrays wherever the capture lives.
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -4819,13 +4819,13 @@ mod tests {
             let callee = Arc::new(function.source_program().to_program_with_lifted_captures().unwrap());
             let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
             let driver = EagerInterpretationDriver::new(&regions);
-            let replay = || {
+            let interpret = || {
                 JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
             };
             let paths: [&dyn Fn(); 3] = [
                 &|| drop(function.executable().execute(&session, input.clone()).unwrap()),
                 &|| drop(function.call(input.clone()).unwrap()),
-                &replay,
+                &interpret,
             ];
             for path in paths {
                 path();
@@ -4836,8 +4836,9 @@ mod tests {
                 created.push(session.array_statistics().created_arrays - before);
             }
         }
-        // An execution creates its result, and an eager call and a replay also create a handle of the placed capture
-        // that refers to its buffers, the same count wherever the capture lives, so none of them moves it again.
+        // An execution creates its result, and an eager call and an interpreted call also create a handle of the placed
+        // capture that refers to its buffers, the same count wherever the capture lives, so none of them moves it
+        // again.
         assert_eq!(created, [3, 6, 6, 3, 6, 6, 3, 6, 6]);
     }
 
@@ -6668,9 +6669,7 @@ mod tests {
         // Control flow uses the declared result sharding for bufferless results, so a split over auto mesh axes
         // selected inside its regions requires an enclosing output override. A caller compiled ahead of time places
         // its argument as its type records, which replicates the split input of the dispatcher before the call. A
-        // caller that runs as replicas rejects an argument whose type records a split. The replay of a callee operation
-        // by operation gives a `rematerialize` in the callee an eager input whose type records its placement.
-        // The body of the `rematerialize` was traced for the callee's input type, which records no placement.
+        // caller that runs as replicas rejects an argument whose type records a split.
         // Every entry point that applies the call itself admits an argument with a pending sum or maximum over an
         // auto mesh axis when the callee's input override states it. The callee completes the reduction at entry
         // with a collective, which drops the NaN of one contribution of the maximum.
@@ -7062,10 +7061,10 @@ mod tests {
         // boundary of the callee cannot receive, which is a pending sum over an auto mesh axis, which no type records,
         // or one over an explicit mesh axis that the callee input type does not declare. Every entry point that applies
         // the call to that argument rejects it too, including those that never run the executable of the callee (i.e.,
-        // the replay of the callee, partial evaluation, which may forward the argument through the call, a `jit` caller,
-        // which is specialized for the argument, and the interpretation of a caller that drops the result of the call),
-        // because a call admits its arguments before, and independently of, any decision to move one of them (refer to
-        // `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
+        // the interpretation rule of the call, partial evaluation, which may forward the argument through the call, a
+        // `jit` caller, which is specialized for the argument, and the interpretation of a caller that drops the result
+        // of the call), because a call admits its arguments before, and independently of, any decision to move one of
+        // them (refer to `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
         let pending_sum = |mesh: &DeviceMesh| {
             let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
             let r#type = vector_type.clone().with_sharding(sharding.without_auto_axes()).unwrap();
@@ -7177,7 +7176,7 @@ mod tests {
                     .map_err(|error| error.to_string())
                     .and_then(|mut outputs| observe_value(outputs.remove(0)))
             };
-            let replayed = || {
+            let applied = || {
                 let (program, inputs) = lifted(false).map_err(|error| error.to_string())?;
                 let call = program
                     .instructions()
@@ -7204,7 +7203,7 @@ mod tests {
                     .map(|output| observe(&output, false))
                     .map_err(|error| error.to_string()),
                 interpreted(false),
-                replayed(),
+                applied(),
                 partially_evaluated(true),
                 partially_evaluated(false),
                 session

@@ -1191,6 +1191,81 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_contribution_new() {
+        let axis = |name: &str, size: usize, r#type: MeshAxisType| MeshAxis::new(name, size, r#type).unwrap();
+        let devices = |count: usize| (0..count).map(|id| Device::new(id, 0)).collect::<Vec<_>>();
+
+        // The unreduced ordinal is the row-major index of the coordinates along the unreduced axes in mesh order,
+        // whatever the coordinate along the axis that splits the dimension, and the slice is that of the shard.
+        let logical_mesh = LogicalMesh::new(vec![
+            axis("x", 2, MeshAxisType::Auto),
+            axis("y", 3, MeshAxisType::Auto),
+            axis("z", 2, MeshAxisType::Auto),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices(12)).unwrap();
+        let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])])
+            .unwrap()
+            .with_unreduced_axes(["x", "z"])
+            .unwrap();
+        assert_eq!(
+            ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(6, Device::new(6, 0), vec![0..2])),
+            ShardContribution { slice: vec![0..2], unreduced_ordinal: 2, varying_manual_coordinates: vec![] },
+        );
+        assert_eq!(
+            ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(11, Device::new(11, 0), vec![4..6])),
+            ShardContribution { slice: vec![4..6], unreduced_ordinal: 3, varying_manual_coordinates: vec![] },
+        );
+
+        // The coordinates along the varying manual axes are in mesh order, whatever order the sharding was given.
+        let logical_mesh =
+            LogicalMesh::new(vec![axis("m", 2, MeshAxisType::Manual), axis("n", 3, MeshAxisType::Manual)]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices(6)).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["n", "m"]).unwrap();
+        assert_eq!(
+            ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(5, Device::new(5, 0), vec![0..4])),
+            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![1, 2] },
+        );
+    }
+
+    #[test]
+    fn test_shard_contribution_ordered() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("n", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let devices = (0..6).map(|id| Device::new(id, 0)).collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["m", "n"]).unwrap();
+        let shard = ShardDescriptor::new(5, Device::new(5, 0), vec![0..4]);
+
+        // The coordinates follow the order of the named axes, and a name that is not a mesh axis adds none.
+        assert_eq!(
+            ShardContribution::ordered(&mesh, &sharding, &shard, &["n", "m"]),
+            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![2, 1] },
+        );
+        assert_eq!(
+            ShardContribution::ordered(&mesh, &sharding, &shard, &["n", "q"]),
+            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![2] },
+        );
+    }
+
+    #[test]
+    fn test_shard_contribution_member() {
+        let contribution =
+            ShardContribution { slice: vec![2..4], unreduced_ordinal: 3, varying_manual_coordinates: vec![1, 0] };
+        assert_eq!(contribution.member(), (3, [1, 0].as_slice()));
+    }
+
+    #[test]
+    fn test_shard_contribution_into_parts() {
+        let contribution =
+            ShardContribution { slice: vec![2..4], unreduced_ordinal: 3, varying_manual_coordinates: vec![1, 0] };
+        assert_eq!(contribution.into_parts(), (vec![2..4], 3, vec![1, 0]));
+    }
+
+    #[test]
     fn test_array_shard_contribution() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
