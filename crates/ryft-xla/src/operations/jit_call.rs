@@ -41,7 +41,11 @@ use crate::compilation::domains::{
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output};
-use crate::lowering::{CollectiveLoweringState, EffectTokens, entry_boundary_sharding, has_placement_requests_in_region, has_untracked_auto_axes, partition_session_constants, unread_call_captures, unread_lifted_captures, validate_declared_pending_reduction, omits_regions};
+use crate::lowering::{
+    CollectiveLoweringState, EffectTokens, entry_boundary_sharding, has_placement_requests_in_region,
+    has_untracked_auto_axes, omits_regions, partition_session_constants, unread_call_captures, unread_lifted_captures,
+    validate_declared_pending_reduction,
+};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};

@@ -120,7 +120,7 @@ use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
 
 use crate::arrays::host::{HostUploadWorkers, ValueComparison, validate_mesh_devices};
-use crate::arrays::placement::place_core_operations;
+use crate::arrays::placement::place_operation_bindings;
 use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{captured_type, declared_input_sharding, is_named_mesh, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
@@ -2000,7 +2000,7 @@ impl Context for Session {
                 // same admission and completion rules as the member placement capability.
                 check_count!("input", inputs, 1, ProgramError);
                 let array = <Value as ValueProjection<ArrayType>>::into_projected(inputs[0].clone())?;
-                return place_core_operations(vec![(self.clone(), array, operation.clone())])
+                return place_operation_bindings(vec![(self.clone(), array, operation.clone())])
                     .map(|outputs| outputs.into_iter().map(Value::Array).collect());
             }
             Operation::Cast(operation) if matches!(operation.output_type(), Type::Dimension(_)) => {

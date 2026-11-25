@@ -39,10 +39,10 @@ use ryft_core::{
     MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection,
     PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, Provenance,
     Region as CoreRegion, RegionId, RegionRef, RegionRole, RematerializationOptimizationBarrier, ReshapeOperation,
-    ReshardOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, ScanOperation, ScatterOperation, Shape, ShardMapBoundary,
-    ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
-    Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value,
-    WHILE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
+    ReshardOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, ScanOperation, ScatterOperation, Shape,
+    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
+    TransferToMemoryOperation, Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram,
+    UnreducedKind, Value, WHILE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{

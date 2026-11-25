@@ -1570,10 +1570,10 @@ impl Session {
                 P::prepare_parameters(&mut parameters, self, &requests, &path)
             });
 
-        let leaves = parameters
+        let arguments = parameters
             .into_iter()
             .zip(leaf_options)
-            .map(|(parameter, (target, source, donate, may_alias))| PlacementLeaf {
+            .map(|(parameter, (target, source, donate, may_alias))| PlacementArgument {
                 parameter,
                 target,
                 source,
@@ -1582,12 +1582,20 @@ impl Session {
             })
             .collect();
 
-        let output_parameters = place_leaves(
+        let output_parameters = admit_and_place_arguments(
             self,
             comparison,
-            leaves,
+            arguments,
             checked,
-            |_, leaf| leaf.parameter.place_parameter(self, leaf.target, leaf.source, leaf.donate, leaf.may_alias),
+            |_, argument| {
+                argument.parameter.place_parameter(
+                    self,
+                    argument.target,
+                    argument.source,
+                    argument.donate,
+                    argument.may_alias,
+                )
+            },
             |index, error| with_parameter_path(error, || path(index)),
         )?;
 
@@ -1595,184 +1603,13 @@ impl Session {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Leaf and its expanded placement options, shared by the two eager placement frontends.
-struct PlacementLeaf<P> {
-    parameter: P,
-    target: Option<PlacementRequest>,
-    source: Option<PlacementRequest>,
-    donate: bool,
-    may_alias: Option<bool>,
-}
-
-/// Places the concrete inputs of core placement operations as a group. The core operation requires even splits and
-/// keeps the input client, while the session frontend also admits uneven splits and explicit cross-client transfers.
-/// A failed local check of a concrete leaf participates in admission before its error is returned.
-pub(crate) fn place_core_operations(
-    bindings: Vec<(Session, Array, PlaceOperation)>,
-) -> Result<Vec<Array>, ProgramError> {
-    ensure_effect_dispatch_is_allowed()?;
-    let Some((session, _, _)) = bindings.first() else { return Ok(Vec::new()) };
-    let session = session.clone();
-    let comparison = if bindings.iter().all(|(_, _, operation)| operation.target().is_none()) {
-        None
-    } else if bindings.iter().all(|(context, _, _)| context.is_same_session(&session)) {
-        ValueComparison::of_session(&session)?
-    } else {
-        // A placement keeps the context of each leaf. Independent placements can use different contexts. A tree
-        // which needs agreement requires one comparison sequence shared by all its leaves.
-        let communicates =
-            bindings.iter().any(|(context, array, operation)| array.communicates(context, operation.target()));
-        for (context, array, operation) in &bindings {
-            let target = operation.target();
-            if ValueComparison::of_session(context)?
-                .is_some_and(|comparison| communicates || (array.is_locally_assigned() && comparison.applies(target)))
-            {
-                return Err(ProgramError::InvalidArgument {
-                    message: "distributed core placement requires the leaves of a tree to share one session"
-                        .to_string(),
-                });
-            }
-        }
-        None
-    };
-
-    let mut contexts = Vec::with_capacity(bindings.len());
-    let mut leaves = Vec::with_capacity(bindings.len());
-    for (context, parameter, operation) in bindings {
-        contexts.push(context);
-        leaves.push(PlacementLeaf {
-            parameter,
-            target: operation.target().cloned(),
-            source: operation.source().cloned(),
-            donate: false,
-            may_alias: Some(operation.may_alias()),
-        });
-    }
-    let checked = leaves.iter().enumerate().try_for_each(|(index, leaf)| {
-        let array = &leaf.parameter;
-        let rank = array.r#type().rank();
-        let target = leaf.target.clone().map(|target| target.padded(rank)).transpose()?;
-        let source = leaf.source.clone().map(|source| source.padded(rank)).transpose()?;
-        PlaceOperation::new(target.clone(), source).infer_output_type_of_value(array, Some(array.sharding()), true)?;
-        contexts[index].validate_input_placement(std::slice::from_ref(array), &[])?;
-        array.validate_placement_client(&contexts[index], target.as_ref())?;
-        array.validate_array_destination(&contexts[index], target)
-    });
-    place_leaves(
-        &session,
-        comparison,
-        leaves,
-        checked,
-        |index, leaf| {
-            let rank = leaf.parameter.r#type().rank();
-            let target = leaf.target.map(|target| target.padded(rank)).transpose()?;
-            leaf.parameter.place_validated(&contexts[index], target, false, leaf.may_alias)
-        },
-        |_, error| error,
-    )
-    .map_err(Into::into)
-}
-
-/// Performs the admission and submits the leaves of one eager placement call on every participating process.
-fn place_leaves<P: Placeable>(
-    session: &Session,
-    comparison: Option<&ValueComparison>,
-    leaves: Vec<PlacementLeaf<P>>,
-    checked: Result<(), Error>,
-    place: impl Fn(usize, PlacementLeaf<P>) -> Result<P::Output, Error>,
-    map_error: impl Fn(usize, Error) -> Error,
-) -> Result<Vec<P::Output>, Error> {
-    let Some(comparison) = comparison else {
-        checked?;
-        return leaves
-            .into_iter()
-            .enumerate()
-            .map(|(index, leaf)| place(index, leaf).map_err(|error| map_error(index, error)))
-            .collect();
-    };
-
-    // Ranks decide whether work communicates from shared placement metadata before a local validation can fail.
-    let process_values = leaves.iter().map(|leaf| leaf.parameter.process_value()).collect::<Vec<_>>();
-    let admits =
-        leaves.len() > 1 && leaves.iter().any(|leaf| leaf.parameter.communicates(session, leaf.target.as_ref()));
-    let compared = leaves
-        .iter()
-        .zip(&process_values)
-        .map(|(leaf, value)| value.is_some() && comparison.applies(leaf.target.as_ref()))
-        .collect::<Vec<_>>();
-    let mut joins = vec![None; leaves.len()];
-    let verdict = if admits || compared.iter().any(|compared| *compared) {
-        let collective = match comparison.collective(session) {
-            Ok(collective) => collective,
-            Err(error) => {
-                checked?;
-                return Err(error.into());
-            }
-        };
-        let mut checked = checked;
-        let mut digests = Vec::new();
-        for (index, value) in process_values.into_iter().enumerate() {
-            let Some(value) = value else { continue };
-            if compared[index] {
-                joins[index] = Some(value.join());
-                digests.push(if checked.is_ok() { value.digest() } else { None });
-            } else if admits && checked.is_ok() {
-                let leaf = &leaves[index];
-                let readiness = if leaf.target.is_some() || forces_copy(leaf.donate, leaf.may_alias) {
-                    sealed::ArrayReadiness::Required
-                } else {
-                    sealed::ArrayReadiness::Unneeded
-                };
-                checked = value.validate(readiness).map_err(|error| map_error(index, error));
-            }
-        }
-
-        let digest = checked.as_ref().ok().and_then(|_| combined_digest(digests));
-        let verdict = collective.submit(session, digest);
-        checked?;
-        let verdict = verdict?;
-        if admits {
-            verdict.block_until_ready()?;
-            None
-        } else {
-            Some(verdict)
-        }
-    } else {
-        drop(process_values);
-        checked?;
-        None
-    };
-
-    leaves
-        .into_iter()
-        .enumerate()
-        .map(|(index, leaf)| {
-            let output = place(index, leaf).map_err(|error| map_error(index, error))?;
-            Ok(match (&verdict, joins[index]) {
-                (Some(verdict), Some(join)) => join(output, verdict.clone()),
-                _ => output,
-            })
-        })
-        .collect()
-}
-
-/// Exposes the borrowed [`ryft_xla::Array`](crate::Array) handles carried by a value. Traced placement runs in the
-/// tracer's existing contexts, so [`Session::place`] checks that those handles belong to the receiving session
-/// and its PJRT client.
+/// Exposes the borrowed [`Array`] handles carried by a value. Traced placement runs in the tracer's existing contexts,
+/// so [`Session::place`] checks that those handles belong to the receiving session and its PJRT client.
 trait RuntimeArrays {
     /// Returns borrowed handles to the runtime arrays of this value, including the array itself or arrays wrapped
     /// by a tracer (e.g., those in the primal and tangent of a differentiated value). Host values and abstract
     /// tracers return an empty list.
     fn runtime_arrays(&self) -> Vec<&Array>;
-}
-
-impl RuntimeArrays for Array {
-    #[inline]
-    fn runtime_arrays(&self) -> Vec<&Array> {
-        vec![self]
-    }
 }
 
 impl RuntimeArrays for Value {
@@ -1782,6 +1619,20 @@ impl RuntimeArrays for Value {
             Self::Array(value) => vec![value],
             Self::Dimension(_) | Self::Reference(_) => Vec::new(),
         }
+    }
+}
+
+impl<V: RuntimeArrays> RuntimeArrays for ProjectedValue<ArrayType, V> {
+    #[inline]
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        self.value().runtime_arrays()
+    }
+}
+
+impl RuntimeArrays for Array {
+    #[inline]
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        vec![self]
     }
 }
 
@@ -1810,6 +1661,13 @@ impl<C: Context<Value: RuntimeArrays>> RuntimeArrays for PartialTracer<C> {
     }
 }
 
+impl<C: Context<Value: RuntimeArrays>, P: BatchingPolicy<C>> RuntimeArrays for BatchingTracer<C, P> {
+    #[inline]
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        P::value(self.batch()).runtime_arrays()
+    }
+}
+
 impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArrays for DifferentiationTracer<C, P> {
     #[inline]
     fn runtime_arrays(&self) -> Vec<&Array> {
@@ -1821,18 +1679,169 @@ impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArray
     }
 }
 
-impl<C: Context<Value: RuntimeArrays>, P: BatchingPolicy<C>> RuntimeArrays for BatchingTracer<C, P> {
-    #[inline]
-    fn runtime_arrays(&self) -> Vec<&Array> {
-        P::value(self.batch()).runtime_arrays()
-    }
+// TODO(eaplatanios): Review from here onwards.
+
+/// One input parameter and its expanded placement options, shared by [`Session::place`] and
+/// [`place_operation_bindings`].
+struct PlacementArgument<P> {
+    parameter: P,
+    target: Option<PlacementRequest>,
+    source: Option<PlacementRequest>,
+    donate: bool,
+    may_alias: Option<bool>,
 }
 
-impl<V: RuntimeArrays> RuntimeArrays for ProjectedValue<ArrayType, V> {
-    #[inline]
-    fn runtime_arrays(&self) -> Vec<&Array> {
-        self.value().runtime_arrays()
+/// Places the array inputs bound to the given core placement operations as a group. The core operation requires even
+/// splits and keeps the input client, while the session frontend also admits uneven splits and explicit cross-client
+/// transfers. When the call requires distributed admission, a process whose local check fails still participates
+/// before returning its error.
+pub(crate) fn place_operation_bindings(
+    bindings: Vec<(Session, Array, PlaceOperation)>,
+) -> Result<Vec<Array>, ProgramError> {
+    ensure_effect_dispatch_is_allowed()?;
+    let Some((session, _, _)) = bindings.first() else { return Ok(Vec::new()) };
+    let session = session.clone();
+    let comparison = if bindings.iter().all(|(_, _, operation)| operation.target().is_none()) {
+        None
+    } else if bindings.iter().all(|(context, _, _)| context.is_same_session(&session)) {
+        ValueComparison::of_session(&session)?
+    } else {
+        // Each binding keeps its own context. Independent placements can use different contexts. A call that
+        // needs agreement requires one comparison sequence shared by all its arguments.
+        let communicates =
+            bindings.iter().any(|(context, array, operation)| array.communicates(context, operation.target()));
+        for (context, array, operation) in &bindings {
+            let target = operation.target();
+            if ValueComparison::of_session(context)?
+                .is_some_and(|comparison| communicates || (array.is_locally_assigned() && comparison.applies(target)))
+            {
+                return Err(ProgramError::InvalidArgument {
+                    message: "distributed core placement requires the leaves of a tree to share one session"
+                        .to_string(),
+                });
+            }
+        }
+        None
+    };
+
+    let mut contexts = Vec::with_capacity(bindings.len());
+    let mut arguments = Vec::with_capacity(bindings.len());
+    for (context, parameter, operation) in bindings {
+        contexts.push(context);
+        arguments.push(PlacementArgument {
+            parameter,
+            target: operation.target().cloned(),
+            source: operation.source().cloned(),
+            donate: false,
+            may_alias: Some(operation.may_alias()),
+        });
     }
+    let checked = arguments.iter().enumerate().try_for_each(|(index, argument)| {
+        let array = &argument.parameter;
+        let rank = array.r#type().rank();
+        let target = argument.target.clone().map(|target| target.padded(rank)).transpose()?;
+        let source = argument.source.clone().map(|source| source.padded(rank)).transpose()?;
+        PlaceOperation::new(target.clone(), source).infer_output_type_of_value(array, Some(array.sharding()), true)?;
+        contexts[index].validate_input_placement(std::slice::from_ref(array), &[])?;
+        array.validate_placement_client(&contexts[index], target.as_ref())?;
+        array.validate_array_destination(&contexts[index], target)
+    });
+    admit_and_place_arguments(
+        &session,
+        comparison,
+        arguments,
+        checked,
+        |index, argument| {
+            let rank = argument.parameter.r#type().rank();
+            let target = argument.target.map(|target| target.padded(rank)).transpose()?;
+            argument.parameter.place_validated(&contexts[index], target, false, argument.may_alias)
+        },
+        |_, error| error,
+    )
+    .map_err(Into::into)
+}
+
+/// Coordinates any required distributed admission, then places the arguments on every participating process.
+fn admit_and_place_arguments<P: Placeable>(
+    session: &Session,
+    comparison: Option<&ValueComparison>,
+    arguments: Vec<PlacementArgument<P>>,
+    checked: Result<(), Error>,
+    place: impl Fn(usize, PlacementArgument<P>) -> Result<P::Output, Error>,
+    map_error: impl Fn(usize, Error) -> Error,
+) -> Result<Vec<P::Output>, Error> {
+    let Some(comparison) = comparison else {
+        checked?;
+        return arguments
+            .into_iter()
+            .enumerate()
+            .map(|(index, argument)| place(index, argument).map_err(|error| map_error(index, error)))
+            .collect();
+    };
+
+    // Ranks decide whether work communicates from shared placement metadata before a local validation can fail.
+    let process_values = arguments.iter().map(|argument| argument.parameter.process_value()).collect::<Vec<_>>();
+    let admits = arguments.len() > 1
+        && arguments.iter().any(|argument| argument.parameter.communicates(session, argument.target.as_ref()));
+    let compared = arguments
+        .iter()
+        .zip(&process_values)
+        .map(|(argument, value)| value.is_some() && comparison.applies(argument.target.as_ref()))
+        .collect::<Vec<_>>();
+    let mut joins = vec![None; arguments.len()];
+    let verdict = if admits || compared.iter().any(|compared| *compared) {
+        let collective = match comparison.collective(session) {
+            Ok(collective) => collective,
+            Err(error) => {
+                checked?;
+                return Err(error.into());
+            }
+        };
+        let mut checked = checked;
+        let mut digests = Vec::new();
+        for (index, value) in process_values.into_iter().enumerate() {
+            let Some(value) = value else { continue };
+            if compared[index] {
+                joins[index] = Some(value.join());
+                digests.push(if checked.is_ok() { value.digest() } else { None });
+            } else if admits && checked.is_ok() {
+                let argument = &arguments[index];
+                let readiness = if argument.target.is_some() || forces_copy(argument.donate, argument.may_alias) {
+                    sealed::ArrayReadiness::Required
+                } else {
+                    sealed::ArrayReadiness::Unneeded
+                };
+                checked = value.validate(readiness).map_err(|error| map_error(index, error));
+            }
+        }
+
+        let digest = checked.as_ref().ok().and_then(|_| combined_digest(digests));
+        let verdict = collective.submit(session, digest);
+        checked?;
+        let verdict = verdict?;
+        if admits {
+            verdict.block_until_ready()?;
+            None
+        } else {
+            Some(verdict)
+        }
+    } else {
+        drop(process_values);
+        checked?;
+        None
+    };
+
+    arguments
+        .into_iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            let output = place(index, argument).map_err(|error| map_error(index, error))?;
+            Ok(match (&verdict, joins[index]) {
+                (Some(verdict), Some(join)) => join(output, verdict.clone()),
+                _ => output,
+            })
+        })
+        .collect()
 }
 
 /// Resolves a request against an array for physical placement. An in-place request keeps the array's mesh and
@@ -4784,9 +4793,9 @@ mod tests {
         assert!(unshared.is_locally_assigned());
 
         let run = |parameter: PlaceInput<Array>, target, may_alias| {
-            let leaves = vec![
-                PlacementLeaf { parameter, target, source: None, donate: false, may_alias },
-                PlacementLeaf {
+            let arguments = vec![
+                PlacementArgument { parameter, target, source: None, donate: false, may_alias },
+                PlacementArgument {
                     parameter: PlaceInput::from(committed.clone()),
                     target: Some(PlacementRequest::from(remote)),
                     source: None,
@@ -4794,14 +4803,14 @@ mod tests {
                     may_alias: None,
                 },
             ];
-            place_leaves(
+            admit_and_place_arguments(
                 &session,
                 Some(&comparison),
-                leaves,
+                arguments,
                 Ok(()),
-                // The declared peer cannot receive native sends in this test. Stop at dispatch of its leaf.
-                |index, leaf| match index {
-                    0 => leaf.parameter.place_parameter(&session, leaf.target, None, false, leaf.may_alias),
+                // The declared peer cannot receive native sends in this test. Stop at dispatch of its argument.
+                |index, argument| match index {
+                    0 => argument.parameter.place_parameter(&session, argument.target, None, false, argument.may_alias),
                     _ => Ok(committed.clone()),
                 },
                 |_, error| error,

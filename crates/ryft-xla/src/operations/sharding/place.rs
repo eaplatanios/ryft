@@ -5,7 +5,7 @@ use ryft_core::{
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::arrays::placement::place_core_operations;
+use crate::arrays::placement::place_operation_bindings;
 use crate::lowering::types::lower_transfer_to_memory;
 use crate::operations::manipulation::conversions::lower_layout_conversion;
 use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, ToMlir};
@@ -17,7 +17,7 @@ impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {
 
     fn place_operations(bindings: Vec<(Array, PlaceOperation)>) -> Result<Vec<Array>, ProgramError> {
         let bindings = bindings.into_iter().map(|(input, operation)| (input.session().clone(), input, operation));
-        place_core_operations(bindings.collect())
+        place_operation_bindings(bindings.collect())
     }
 }
 
