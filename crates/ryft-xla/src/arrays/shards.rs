@@ -1191,6 +1191,42 @@ mod tests {
     }
 
     #[test]
+    fn test_array_shard_contribution() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let contributions = |array: &Array| {
+            let contribution = |shard: &ArrayShard| array.shard_contribution(shard.descriptor()).into_parts();
+            array.shards().iter().map(contribution).collect::<Vec<_>>()
+        };
+
+        // The devices along `x` hold different slices, and those along the unreduced `y` hold the contributions
+        // to the pending reduction of one slice, which the ordinal tells apart.
+        let mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_unreduced_axes(["y"])
+            .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let bytes = values_to_bytes(&[1f32, 2., 3., 4.]);
+        let array = Array::from_host_buffer(&session, r#type, mesh, Some(sharding), bytes).unwrap();
+        assert_eq!(
+            contributions(&array),
+            [(vec![0..2], 0, vec![]), (vec![0..2], 1, vec![]), (vec![2..4], 0, vec![]), (vec![2..4], 1, vec![])],
+        );
+
+        // The devices along a varying manual axis that splits no dimension hold values of one slice that can differ,
+        // which their coordinates along that axis tell apart.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["m"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let shards = [(devices[0].id(), [1u8].as_slice()), (devices[1].id(), [2u8].as_slice())];
+        let array = Array::from_host_shards(&session, r#type, mesh, Some(sharding), shards).unwrap();
+        assert_eq!(contributions(&array), [(vec![0..1], 0, vec![0]), (vec![0..1], 0, vec![1])]);
+    }
+
+    #[test]
     fn test_validate_addressable_buffer() {
         let client = cpu_client(1);
         let pjrt_device = client.addressable_devices().unwrap().remove(0);

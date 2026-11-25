@@ -977,12 +977,10 @@ impl<T: ArrayMemberType> JitCallOperation<T> {
     }
 }
 
-/// Placement decision of one eager application of a call (i.e., an eager call of a compiled function, refer to
-/// `Session::bind`, or the replay of its callee by a region interpreter, refer to the interpretation of
-/// [`JitCallOperation`]), which [`JitCallOperation::eager_decision`] makes once from the call, its callee, and the
-/// actual arguments. It states the facts that the types of the arguments omit, and every eager path
-/// consumes it instead of deriving any of them again, so that the paths agree with one another and with an execution
-/// of the callee. Partial evaluation, which sees types only, forwards an input through a call only where this decision
+/// Placement decision of one eager application of a call (i.e., an eager call of a compiled function, which
+/// `Session::bind` applies), which [`JitCallOperation::eager_decision`] makes once from the call, its callee, and the
+/// actual arguments. It states the facts that the types of the arguments omit, and the application consumes it instead
+/// of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which sees types only, forwards an input through a call only where this decision
 /// returns it unchanged whatever the arguments are (refer to [`JitCallOperation::returns_input_unchanged`]).
 pub(crate) struct EagerCallDecision<'o> {
     /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
@@ -991,7 +989,7 @@ pub(crate) struct EagerCallDecision<'o> {
     inputs: Cow<'o, [Value]>,
 
     /// Devices on which the application runs, borrowed from the argument that selected them when one did. An eager
-    /// call compiles its callee for these devices and the replay of the callee runs its operations on them.
+    /// call compiles its callee for these devices.
     mesh: Cow<'o, DeviceMesh>,
 
     /// Whether every result of the application is committed, which is when a public argument is committed or when the
@@ -1058,7 +1056,7 @@ impl JitCallOperation<Type> {
     /// Returns the placement decision of an eager application of this call of `callee` on `inputs`, executed by
     /// `session` (refer to [`EagerCallDecision`]). This is the one place that decides where an eager call runs, which
     /// arguments it admits, where they move, whether its results are committed, and whether its devices were chosen by
-    /// this process alone, for an eager call and for the replay of its callee alike.
+    /// this process alone.
     ///
     ///   - Every argument, captures included, must belong to the client of `session`, which an execution requires too
     ///     (refer to `validate_input_clients`).
@@ -1066,14 +1064,13 @@ impl JitCallOperation<Type> {
     ///     every input is placed there as its effective boundary sharding requests (refer to
     ///     [`Self::boundary_input_sharding`]), or keeps its sharding when the mesh topologies agree and is replicated
     ///     otherwise. Its devices are named for every process, so they are not locally assigned.
-    ///   - A call that the session applies itself, rather than the replay of another call (refer to
-    ///     [`Session::replays_call`]), runs on the mesh of its function (refer to [`Self::with_function_mesh`]) in the
-    ///     same way when that mesh is named (refer to [`is_named_mesh`]), as JAX runs a `jit` function under
-    ///     `set_mesh`, and commits its results. On the anonymous mesh of one device, it does so only when no public
-    ///     argument is committed, as JAX runs a `jit` function under `default_device`, with uncommitted results, and a
-    ///     committed public argument decides as below. A call replayed inside the replay of another call runs where
-    ///     that call runs, as a nested call runs where its compiled caller runs, and so does a call in a region of an
-    ///     eager operation (e.g., `condition`), which `Session::bind` compiles into the computation of that operation.
+    ///   - A call runs on the mesh of its function (refer to [`Self::with_function_mesh`]) in the same way when that
+    ///     mesh is named (refer to [`is_named_mesh`]), as JAX runs a `jit` function under `set_mesh`, and commits its
+    ///     results. On the anonymous mesh of one device, it does so only when no public argument is committed, as JAX
+    ///     runs a `jit` function under `default_device`, with uncommitted results, and a committed public argument
+    ///     decides as below. This decision is taken only for the call that the session applies. A call nested in its
+    ///     callee, or in a region of another eager operation (e.g., `condition`), is compiled into the computation of
+    ///     that call or operation and runs where it runs, as a nested call runs where its compiled caller runs.
     ///   - Any other call runs where its public arguments are, as JAX runs a `jit` function without shardings.
     ///     Committed public arguments must agree on their devices, as JAX rejects a `jit` call whose committed
     ///     arguments are on different devices ("Received incompatible devices for jitted computation"), and they
@@ -1090,8 +1087,8 @@ impl JitCallOperation<Type> {
     ///
     /// The arguments are admitted before anything moves, and whether or not anything moves: an argument that carries a
     /// pending reduction that the executable of the callee cannot receive is rejected wherever it is (refer to
-    /// `validate_input_reduction`), because a reshard never completes a pending reduction, so the replay of the
-    /// callee, which runs no executable, rejects what an eager call and an execution reject. The results are
+    /// `validate_input_reduction`), because a reshard never completes a pending reduction, so an eager call rejects
+    /// what an execution rejects, whatever placement the decision chooses. The results are
     /// committed when a public argument is committed or when the callee commits its public outputs on the selected
     /// devices (refer to [`Self::requests_placement`] and [`commits_public_outputs`]), which includes every
     /// application that runs on the named mesh of its function, as JAX commits every result of a `jit` function under
@@ -1531,9 +1528,9 @@ impl JitCallOperation<Type> {
             };
             prepared.to_mut()[index] = Value::Array(capture.with_committed(false));
         }
-        // Eager dispatch compiles the callee on its first array operand's logical mesh. Region replay executes
-        // individual operations, whose type rules see the runtime shardings. Give replicated arguments the same
-        // logical mesh on those devices, so replay can combine them with the capture just as compiled execution can.
+        // Eager dispatch compiles the callee on the logical mesh of its first array operand, which is a capture here. A
+        // replicated public argument on the devices of the captures is given that logical mesh too, which moves no
+        // data, so that the array operands of the call name the logical mesh on which its callee runs.
         let callee_mesh = prepared[..self.capture_count]
             .iter()
             .enumerate()
@@ -1552,22 +1549,6 @@ impl JitCallOperation<Type> {
             }
         }
         Ok(prepared)
-    }
-
-    /// Returns `array`, the result `index` of this call that `session` interprets eagerly, placed on the devices of
-    /// the mesh of the call as the override of that result requests, like an execution of the callee places it, or
-    /// `array` unchanged when the result has no override.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of placing the result.
-    fn boundary_output(&self, session: &Session, index: usize, array: Array) -> Result<Array, Error> {
-        match (&self.mesh, self.output_sharding(index)) {
-            (Some(mesh), Some(sharding)) if array.mesh() != mesh || array.sharding() != sharding => {
-                array.reshard_on_devices(session, mesh, sharding, false)
-            }
-            _ => Ok(array),
-        }
     }
 }
 
@@ -2777,17 +2758,15 @@ where
     }
 }
 
-// Eager interpretation of a staged `jit_call` operation over concrete [`Array`](crate::Array)s. Top-level flat programs
-// containing `jit_call` instructions (e.g., the pullbacks produced by eager `vjp` and `grad`) replay through
-// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
-// region to [`Context::bind`] so the call is compiled whole through this session's dispatch cache and executed on its
-// PJRT client. This mirrors JAX dispatching a `jit`-compiled function called from eager code straight to the compiled
-// executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
-// entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
-// through this same session. Both entry points take the placement decision of the call (refer to
-// `JitCallOperation::eager_decision`) before running the callee, so they run it on the same devices with the same
-// admitted and placed arguments, including those that the callee returns as they are. Region replay also applies
-// output overrides and the call's commitment to the results of the individually dispatched operations.
+// Eager interpretation of a staged `jit_call` operation over concrete [`Array`](crate::Array)s. Every route that
+// runs a call on a session reaches `Session::bind`, which compiles the callee whole through the eager dispatch cache of
+// the session and executes it on its PJRT client, as JAX dispatches a `jit` function called from eager code straight to
+// its executable. Interpreting a program on a session (e.g., the pullbacks of eager `vjp` and `grad`, partial
+// evaluation with an eager known side, or the body of a composite whose inputs refine its traced types) binds each of
+// its instructions, nested calls included, through `Context::bind`. This rule only runs when a caller applies the
+// operation directly, and it hands the call to the bind channel of the driver, so that it runs exactly as a call that
+// the session binds itself (i.e., with the same placement decision, compiled program, and results). The callee is
+// copied into an owned program for that bind, because the driver only lends a view of it.
 impl InterpretableOperation<Session> for JitCallOperation<Type> {
     fn interpret<D: InterpretationDriver<Session>>(
         &self,
@@ -2795,244 +2774,9 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
         driver: &D,
         inputs: &[Value],
     ) -> Result<Vec<Value>, ProgramError> {
-        let callee = driver.region(0)?;
-        let output_types = callee.output_types();
-        let renaming = self.output_renaming(&callee.input_types(), &output_types)?;
-        let invalid_argument = |error: Error| ProgramError::InvalidArgument { message: error.to_string() };
-        let decision = self.eager_decision(context, inputs, callee).map_err(invalid_argument)?;
-        // The results are committed exactly as the decision states, as an eager call commits them, and not as the
-        // replayed operations commit their own results on the pinned session below.
-        let committed = decision.committed();
-        let locally_assigned = decision.locally_assigned();
-        let mesh = decision.mesh().clone();
-        let unread = decision.unread_captures.clone();
-        let inputs = replayed_arguments(context, &mesh, unread.as_deref(), decision.inputs.into_owned())
-            .map_err(invalid_argument)?;
-        // The callee runs on the devices on which an eager execution of the call runs, so the operations of the callee
-        // that take no array input (e.g., a `fill`) are replayed there rather than on the default mesh of the session,
-        // as an execution of the callee places them. The calls in the callee then run where this call runs (refer to
-        // `Session::replays_call`).
-        // The guard of the replay lives until the replay returns, so that no handle of it replays a call afterwards.
-        // The regions that the operations of the callee take read its captures as the arguments of this call, which
-        // the replay carries for `Session::bind` (refer to `bind_replayed_captures`), so that the supplied driver
-        // interprets the callee whether or not a region reads a capture. A capture that `unread` flags is not carried.
-        let captures = inputs[..self.capture_count.min(inputs.len())]
-            .iter()
-            .enumerate()
-            .map(|(index, input)| read_array(unread.as_deref(), index, input).cloned())
-            .collect();
-        // Every result of an execution of the call carries the completion of the whole execution, which waits for every
-        // argument that the callee reads, so that a failed argument fails every result. The results of the replay carry
-        // that completion as well, rather than only that of the operations that produced each of them.
-        let completion = replayed_call_completion(unread.as_deref(), &inputs).map_err(invalid_argument)?;
-        let (session, _replay) = context.replaying_call(mesh, captures);
-        let outputs = driver.interpret_region(&session, 0, inputs)?;
-        let renames_outputs = !renaming.is_identity();
-        outputs
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                // Release the original handle before attaching the completion so only a genuine alias needs a new
-                // capture identity.
-                let output = if renames_outputs {
-                    let renamed = value.rename_type_identities(&renaming)?;
-                    drop(value);
-                    renamed
-                } else {
-                    value
-                };
-                match output {
-                    // Results belong to `context`, which applied the call, so a subsequent call does not inherit the
-                    // replay handle. Execution and replay use the memory and layout declared by the callee. For
-                    // example, a returned argument can keep its buffers even when the result declares no layout.
-                    Value::Array(array) => {
-                        let array = self.boundary_output(context, index, array).map_err(invalid_argument)?;
-                        let array = array.with_session(context).map_err(invalid_argument)?;
-                        let array = match &output_types[index] {
-                            Type::Array(declared) => array.place_storage(declared.memory(), declared.layout().cloned()),
-                            _ => Ok(array),
-                        }
-                        .map_err(invalid_argument)?;
-                        let fences = array.execution_fence().cloned().into_iter().chain([completion.clone()]);
-                        let array = array.with_execution_fence(ExecutionFence::join(fences));
-                        Ok(Value::Array(array.with_committed(committed).with_locally_assigned(locally_assigned)))
-                    }
-                    Value::Dimension(dimension) => {
-                        Ok(Value::Dimension(Dimension::new(dimension.into_value(), context.clone())))
-                    }
-                    value => Ok(value),
-                }
-            })
-            .collect()
+        let regions = AttachedRegions::Owned(driver.region_programs());
+        driver.bind(context, Operation::JitCall(self.clone()), regions, inputs)
     }
-}
-
-/// Returns `inputs`, the arguments of a call whose callee is replayed on `mesh` as its placement decision states them
-/// (refer to [`EagerCallDecision::inputs`]), as an executable of the callee receives them, through the rules of the
-/// boundary of that executable. An argument that lacks the buffer of a device of this process receives a copy of a
-/// local replica of the same contribution (refer to `Session::reshard_input_if_needed`), an argument is completed where
-/// it enters (refer to [`entered_argument`]), and an argument with a contribution that no local replica holds is
-/// rejected at the call with the error of the execution arguments of the executable (refer to
-/// [`ExecutionArguments::from_arrays`]), rather than by the replayed operations or by a readback of a result. A capture
-/// that `unread_captures` flags is passed as it is, because that executable has no argument for it (refer to
-/// [`EagerCallDecision::unread_captures`]).
-///
-/// # Errors
-///
-/// Returns the error of supplying, completing, or passing an argument.
-fn replayed_arguments(
-    session: &Session,
-    mesh: &DeviceMesh,
-    unread_captures: Option<&[bool]>,
-    mut inputs: Vec<Value>,
-) -> Result<Vec<Value>, Error> {
-    for (index, input) in inputs.iter_mut().enumerate() {
-        if read_array(unread_captures, index, input).is_some()
-            && let Value::Array(array) = input
-        {
-            let (array_mesh, sharding) = (array.mesh().clone(), array.sharding().clone());
-            let supplied = session.reshard_input_if_needed(&array_mesh, &sharding, array.clone())?;
-            *array = entered_argument(session, supplied)?;
-        }
-    }
-    let process_index = session.client().process_index()?;
-    let device_ids = mesh
-        .devices()
-        .iter()
-        .filter(|device| device.process_index() == process_index)
-        .map(Device::id)
-        .collect::<Vec<_>>();
-    // Arguments of the zero data type have no buffers and an executable receives no argument for them.
-    let arguments = inputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, input)| match read_array(unread_captures, index, input) {
-            Some(array) if !array.data_type().is_zero() => Some(array.clone()),
-            _ => None,
-        })
-        .collect();
-    ExecutionArguments::from_arrays(arguments, &device_ids)?;
-    Ok(inputs)
-}
-
-/// Returns the fence of the completion of the arguments `inputs` of a replayed call (refer to [`replayed_arguments`])
-/// that its callee reads, which an execution of the callee waits for before it completes (i.e., the buffers of each
-/// argument and the execution fence of its producer, which also covers an argument without buffers, such as one of the
-/// zero data type). Each result of the replay joins this fence, as each result of an execution joins the fence of the
-/// whole execution (refer to `Session::execute_pjrt_buffers`). A capture that `unread_captures` flags is not observed
-/// (refer to [`EagerCallDecision::unread_captures`]). This function does not wait.
-///
-/// # Errors
-///
-/// Returns the PJRT errors of querying the readiness of the buffers.
-fn replayed_call_completion(unread_captures: Option<&[bool]>, inputs: &[Value]) -> Result<ExecutionFence, Error> {
-    let mut fences = Vec::new();
-    for (index, input) in inputs.iter().enumerate() {
-        let Some(array) = read_array(unread_captures, index, input) else { continue };
-        let events = array
-            .addressable_shards()
-            .filter_map(|shard| shard.buffer())
-            .map(|buffer| buffer.ready())
-            .collect::<Result<Vec<_>, _>>()?;
-        fences.extend(array.execution_fence().cloned());
-        fences.push(ExecutionFence::new(events));
-    }
-    Ok(ExecutionFence::join(fences))
-}
-
-/// Returns `callee`, a region that an operation of the callee of a replayed call takes (refer to
-/// `Session::replaying_call`), whose call received `captures` as the arguments of its lifted captures (refer to
-/// [`replayed_arguments`]), with each constant through which the region reads one of those captures (refer to
-/// `emitted_capture_reads`) replaced by a session constant that retains the argument, declared with the type of the
-/// capture, or [`None`] when the region reads no capture that way. A replay binds the operations of the callee one by
-/// one, so a region that one of them takes (e.g., the body of a scan) is lowered on its own, without the bindings that
-/// the lowering of the whole callee gives those constants (refer to `lower_jit_call`), and `Session::bind` gives them
-/// these bindings instead. As session constants they are arrays that the operation closes over, which its execution
-/// places on the devices of the replayed call (refer to `Session::replays_call`). The callees of the calls in `callee`
-/// name their own captures through their own inputs, so their regions are kept as they are, and so is a constant of a
-/// capture that `captures` holds no array for (i.e., one that the callee never reads, refer to
-/// [`EagerCallDecision::unread_captures`]), which only regions that lowering omits read.
-///
-/// # Errors
-///
-/// Returns the error of sealing the regions of the new program.
-pub(crate) fn bind_replayed_captures(
-    callee: RegionRef<'_, Constant, Operation>,
-    captures: &[Option<Array>],
-) -> Result<Option<FlatProgram>, ProgramError> {
-    if !callee.contains_atom_in_closure(|atom| matches!(atom.as_constant(), Some(Constant::Captured(_)))) {
-        return Ok(None);
-    }
-    let bound = |atom: &Atom<Constant>| {
-        let Some(Constant::Captured(capture)) = atom.as_constant() else { return None };
-        let index = capture.index();
-        let array = captures.get(index)?.as_ref()?;
-        let Type::Array(r#type) = capture.r#type().into_owned() else { return None };
-        Some(Atom::Constant(Constant::Session(RetainedArray::new(array).with_declared_type(r#type))))
-    };
-    let program = callee.to_program();
-    let regions = program.regions().iter().collect::<Vec<_>>();
-    // Regions only attach regions that precede them, so the callees of nested calls and the regions below them are all
-    // found by one pass from the last region to the first.
-    let mut is_nested = vec![false; regions.len()];
-    for (index, region) in regions.iter().enumerate().rev() {
-        for instruction in region.instructions() {
-            if is_nested[index] || matches!(instruction.operation(), Operation::JitCall(_)) {
-                instruction.regions().iter().for_each(|id| is_nested[id.index()] = true);
-            }
-        }
-    }
-    let mut is_bound = false;
-    let regions = regions
-        .into_iter()
-        .zip(is_nested)
-        .map(|(region, is_nested)| {
-            let atoms = region
-                .atoms()
-                .iter()
-                .map(|atom| match bound(atom).filter(|_| !is_nested) {
-                    Some(atom) => {
-                        is_bound = true;
-                        atom
-                    }
-                    None => atom.clone(),
-                })
-                .collect();
-            let (inputs, outputs) = (region.input_ids().to_vec(), region.output_ids().to_vec());
-            CoreRegion::new(atoms, inputs, outputs, region.instructions().to_vec())
-        })
-        .collect();
-    if !is_bound {
-        return Ok(None);
-    }
-    let (input_structure, output_structure) = (program.input_structure().clone(), program.output_structure().clone());
-    FlatProgram::new(input_structure, output_structure, regions, program.entry()).map(Some)
-}
-
-/// Returns `array`, an argument that a call places at the boundary sharding of its callee (e.g., an input override that
-/// states a pending reduction over auto mesh axes), as an executable of the callee holds it once it has entered, which
-/// the replay of the callee gives its body. The entry of an executable completes the reduction state over auto mesh
-/// axes of such an argument with a collective (refer to `entered_argument_sharding`), whose result is the result of a
-/// compiled program rather than the exact value of a placement (e.g., a pending maximum of floating point values whose
-/// contributions hold a NaN completes to the maximum of the other contributions there, while the exact value that
-/// `Array::to_placement` computes on the host is NaN). The argument is therefore completed by the same entry, the
-/// executable of an identity whose input override is the runtime sharding of the argument, which admits and rejects
-/// exactly what the entry of the callee admits and rejects (e.g., a completion that the element type cannot make),
-/// with the same errors. The executable is compiled through the compilation cache of `session`, so repeated replays
-/// share it. Any other argument, which is the common case, is returned as it is after one check of its sharding.
-///
-/// # Errors
-///
-/// Returns the error of compiling or executing that identity.
-fn entered_argument(session: &Session, array: Array) -> Result<Array, Error> {
-    if let Cow::Borrowed(_) = entered_argument_sharding(array.sharding())? {
-        return Ok(array);
-    }
-    let options = Options::new(array.mesh().clone()).with_input_shardings(vec![array.sharding().clone()]);
-    let r#type = array.r#type().into_owned();
-    let identity: CompiledFunction<ArrayType, ArrayType> =
-        crate::compile_with_options(|input: CompileTracer| input, r#type, session, options)?;
-    identity.executable().execute(session, array)
 }
 
 // A call of a compiled function places the values that cross the boundary of its callee as the effective boundary
