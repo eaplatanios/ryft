@@ -795,14 +795,12 @@ impl_placeable!(<C, P> DifferentiationTracer<C, P> where C: Context<Type = Array
 impl_placeable!(<C, P> BatchingTracer<C, P> where C: Context<Type = ArrayType>, P: BatchingPolicy<C>);
 impl_placeable!(<V> ProjectedValue<ArrayType, V>);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates the destination `target` of the upload of a host value whose element type and static shape `r#type`
 /// describes, and returns it with a sharding that is padded to the rank of the value. The upload of a host value onto
-/// a destination is the placement of a value that has no tracked sharding and lives in device memory without a
-/// declared layout, which is how a host value is uploaded without a destination, so the type rule of
-/// [`PlaceOperation`] validates the destination against that type before anything is uploaded, except that the
-/// destination may split a dimension unevenly (refer to [`Session::place`]).
+/// a destination is the placement of a value that has no tracked sharding and lives in device memory without a declared
+/// layout, which is how a host value is uploaded without a destination, so the type rule of [`PlaceOperation`]
+/// validates the destination against that type before anything is uploaded, except that the destination may
+/// split a dimension unevenly (refer to [`Session::place`]).
 fn validate_host_target(
     r#type: &ArrayType,
     target: Option<PlacementRequest>,
@@ -814,10 +812,10 @@ fn validate_host_target(
     Ok(target)
 }
 
-/// Returns the type, with the memory and the layout of the destination, and the placement of the upload of a host
-/// value whose element type and static shape `r#type` describes onto the destination `target`, which
-/// [`validate_host_target`] returned. A destination that names no devices (i.e., an in-place one or none) uploads
-/// the value onto the device that `default_device` returns, which is only called for such a destination.
+/// Returns the type, with the memory and the layout of the destination, and the placement of the upload of a host value
+/// whose element type and static shape `r#type` describes onto the destination `target`, which [`validate_host_target`]
+/// returned. A destination that names no devices (i.e., an in-place one or none) uploads the value onto the device that
+/// `default_device` returns, which is only called for such a destination.
 fn host_upload_destination(
     r#type: &ArrayType,
     target: Option<PlacementRequest>,
@@ -838,13 +836,11 @@ fn host_upload_destination(
 }
 
 /// Returns the device onto which a host value is uploaded when its destination names no devices, which is the default
-/// device of `session` (refer to [`Session::with_default_device`]), as `jax.device_put` uploads such a value onto the
-/// device of `jax.default_device`, or otherwise the first of the `addressable_devices` of its client, whether or not
-/// `session` has a default mesh, as `jax.device_put` keeps such a value on its default device under `jax.set_mesh`.
-/// That includes the anonymous mesh of one device that [`Session::with_device_mesh`] gives, which every process shares
-/// like any other mesh (pinned JAX keeps the value on its default device under `jax.set_mesh` of a mesh without axes
-/// too). The choice reads only what the caller asked for (refer to `Session::default_device_mesh`), so every process
-/// uploads such a value onto a device of its own, uncommitted and locally assigned, for both kinds of handle.
+/// device of `session` (refer to [`Session::with_default_device`]), or otherwise the first of the `addressable_devices`
+/// of its client, whether or not `session` has a default mesh. That includes the anonymous mesh of one device that
+/// [`Session::with_device_mesh`] gives, which every process shares like any other mesh. The choice reads only what
+/// the caller asked for (refer to `Session::default_device_mesh`), so every process uploads such a value onto a
+/// device of its own, uncommitted and locally assigned, for both kinds of handle.
 fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'static>]) -> Result<Device, Error> {
     if let Some(mesh) = session.default_device_mesh() {
         return Ok(mesh.devices()[0]);
@@ -852,6 +848,8 @@ fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'s
     let device = addressable_devices.first().ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
     Ok(Device::from_pjrt(device)?)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Input leaf of [`Session::place`] that holds a host value, a runtime [`Array`], or a [`CompileTracer`].
 /// A [`Parameterized`] tree has one leaf type, so use [`PlaceInput`] to mix these values in one call.

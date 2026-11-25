@@ -358,6 +358,16 @@ impl CoreValue for Value {
         }
     }
 
+    fn relocatable_type(&self) -> Option<Self::Type> {
+        // An uncommitted array whose type records nothing beyond replication enters a transform without a sharding,
+        // which is the type for which a `jit` dispatcher specializes such an argument, so that a call moves it onto
+        // the devices where it runs under a transform as it does outside of one.
+        match self {
+            Self::Array(array) => argument_type(array, &array.r#type()).map(Type::Array),
+            Self::Dimension(_) | Self::Reference(_) => None,
+        }
+    }
+
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as CoreType>::Identity>,
@@ -369,16 +379,6 @@ impl CoreValue for Value {
                 value.handle().rename_type_identities(renaming)?,
                 value.session().clone(),
             ))),
-        }
-    }
-
-    fn relocatable_type(&self) -> Option<Self::Type> {
-        // An uncommitted array whose type records nothing beyond replication enters a transform without a sharding,
-        // which is the type for which a `jit` dispatcher specializes such an argument, so that a call moves it onto
-        // the devices where it runs under a transform as it does outside of one.
-        match self {
-            Self::Array(array) => argument_type(array, &array.r#type()).map(Type::Array),
-            Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
 
@@ -401,6 +401,40 @@ impl CoreValue for Value {
             Self::Array(_) | Self::Dimension(_) => None,
             Self::Reference(value) => Some(value.handle().id()),
         }
+    }
+}
+
+// The host-side consumer contracts below delegate to the generic `ArrayIrValue` implementations in `ryft-core`, so
+// their member-kind semantics (e.g., which members can act as predicates and how equal dimension carries pass through
+// a batched selection) have a single source of truth.
+
+impl Concretizable<bool> for Value {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        self.clone().into_array_ir_value().concretize()
+    }
+}
+
+impl WhilePredicate for Value {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        self.clone().into_array_ir_value().any_true()
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let output = self
+            .clone()
+            .into_array_ir_value()
+            .select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
+        Ok(Self::from_array_ir_value(output, on_true.session())?)
+    }
+}
+
+impl AssertionValue for Value {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        self.clone().into_array_ir_value().assertion_observation()
+    }
+
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
+        self.clone().into_array_ir_value().assertion_array()
     }
 }
 
@@ -506,40 +540,6 @@ impl From<Dimension> for Value {
 impl From<Reference> for Value {
     fn from(value: Reference) -> Self {
         Self::Reference(value)
-    }
-}
-
-// The host-side consumer contracts below delegate to the generic `ArrayIrValue` implementations in `ryft-core`, so
-// their member-kind semantics (e.g., which members can act as predicates and how equal dimension carries pass through
-// a batched selection) have a single source of truth.
-
-impl Concretizable<bool> for Value {
-    fn concretize(&self) -> Result<bool, ProgramError> {
-        self.clone().into_array_ir_value().concretize()
-    }
-}
-
-impl WhilePredicate for Value {
-    fn any_true(&self) -> Result<bool, ProgramError> {
-        self.clone().into_array_ir_value().any_true()
-    }
-
-    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let output = self
-            .clone()
-            .into_array_ir_value()
-            .select(&on_true.clone().into_array_ir_value(), &on_false.clone().into_array_ir_value())?;
-        Ok(Self::from_array_ir_value(output, on_true.session())?)
-    }
-}
-
-impl AssertionValue for Value {
-    fn assertion_observation(&self) -> Result<String, ProgramError> {
-        self.clone().into_array_ir_value().assertion_observation()
-    }
-
-    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
-        self.clone().into_array_ir_value().assertion_array()
     }
 }
 
@@ -666,29 +666,6 @@ impl CoreValue for ArrayConstant {
     }
 }
 
-impl ValueProjection<ArrayType> for ArrayConstant {
-    type Projected = Self;
-    type ProjectedRef<'v> = &'v Self;
-
-    #[inline]
-    fn from_projected(value: Self::Projected) -> Self {
-        value
-    }
-
-    #[inline]
-    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
-    where
-        ArrayType: 'v,
-    {
-        Ok(self)
-    }
-
-    #[inline]
-    fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        Ok(self)
-    }
-}
-
 impl CaptureConstant for ArrayConstant {
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
@@ -712,6 +689,16 @@ impl Concretizable<bool> for ArrayConstant {
 }
 
 impl AssertionValue for ArrayConstant {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Captured(value) => value.assertion_observation(),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot inspect a session constant assertion observation before execution".to_owned(),
+            }),
+            Self::Boolean(value) => Ok(value.to_string()),
+        }
+    }
+
     fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
         match self {
             Self::Captured(value) => value.assertion_array(),
@@ -721,15 +708,28 @@ impl AssertionValue for ArrayConstant {
             Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
         }
     }
+}
 
-    fn assertion_observation(&self) -> Result<String, ProgramError> {
-        match self {
-            Self::Captured(value) => value.assertion_observation(),
-            Self::Session(_) => Err(ProgramError::Concretization {
-                message: "cannot inspect a session constant assertion observation before execution".to_owned(),
-            }),
-            Self::Boolean(value) => Ok(value.to_string()),
-        }
+impl ValueProjection<ArrayType> for ArrayConstant {
+    type Projected = Self;
+    type ProjectedRef<'v> = &'v Self;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(self)
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        Ok(self)
     }
 }
 
@@ -855,6 +855,53 @@ impl CaptureConstant for Constant {
     }
 }
 
+impl TryFrom<bool> for Constant {
+    type Error = ProgramError;
+
+    fn try_from(value: bool) -> Result<Self, ProgramError> {
+        Ok(Self::Boolean(value))
+    }
+}
+
+impl Concretizable<bool> for Constant {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Boolean(value) => Ok(*value),
+            _ => Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from the staged XLA constant `{self}`"),
+            }),
+        }
+    }
+}
+
+impl AssertionValue for Constant {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        match self {
+            Self::Dimension(value) => Ok(value.extent().to_string()),
+            Self::Boolean(value) => Ok(value.to_string()),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a captured constant reference".to_owned(),
+            }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a session constant handle".to_owned(),
+            }),
+        }
+    }
+
+    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
+        match self {
+            Self::Dimension(_) => Ok(None),
+            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
+            Self::Captured(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a captured constant reference".to_owned(),
+            }),
+            Self::Session(_) => Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a session constant handle".to_owned(),
+            }),
+        }
+    }
+}
+
 impl ValueProjection<ArrayType> for Constant {
     type Projected = ArrayConstant;
     type ProjectedRef<'v> = ProjectedValue<ArrayType, &'v Self>;
@@ -931,53 +978,6 @@ impl From<DimensionValue> for Constant {
     #[inline]
     fn from(value: DimensionValue) -> Self {
         Self::Dimension(value)
-    }
-}
-
-impl TryFrom<bool> for Constant {
-    type Error = ProgramError;
-
-    fn try_from(value: bool) -> Result<Self, ProgramError> {
-        Ok(Self::Boolean(value))
-    }
-}
-
-impl Concretizable<bool> for Constant {
-    fn concretize(&self) -> Result<bool, ProgramError> {
-        match self {
-            Self::Boolean(value) => Ok(*value),
-            _ => Err(ProgramError::Concretization {
-                message: format!("cannot extract a concrete boolean from the staged XLA constant `{self}`"),
-            }),
-        }
-    }
-}
-
-impl AssertionValue for Constant {
-    fn assertion_array(&self) -> Result<Option<CoreArray>, ProgramError> {
-        match self {
-            Self::Dimension(_) => Ok(None),
-            Self::Boolean(value) => Ok(Some(CoreArray::scalar(*value)?)),
-            Self::Captured(_) => Err(ProgramError::Concretization {
-                message: "cannot read an assertion array from a captured constant reference".to_owned(),
-            }),
-            Self::Session(_) => Err(ProgramError::Concretization {
-                message: "cannot read an assertion array from a session constant handle".to_owned(),
-            }),
-        }
-    }
-
-    fn assertion_observation(&self) -> Result<String, ProgramError> {
-        match self {
-            Self::Dimension(value) => Ok(value.extent().to_string()),
-            Self::Boolean(value) => Ok(value.to_string()),
-            Self::Captured(_) => Err(ProgramError::Concretization {
-                message: "cannot read an assertion observation from a captured constant reference".to_owned(),
-            }),
-            Self::Session(_) => Err(ProgramError::Concretization {
-                message: "cannot read an assertion observation from a session constant handle".to_owned(),
-            }),
-        }
     }
 }
 
