@@ -38,12 +38,12 @@ use std::fmt::{Debug, Display};
 use std::sync::{Arc, OnceLock};
 
 use ryft_core::{
-    Add, And, Array as CoreArray, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType, DeviceId,
-    DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
+    Add, And, Array as CoreArray, ArrayElement, ArrayType, AssertionValue, Axis, Broadcast, Concretizable, DataType,
+    DeviceId, DeviceMesh, DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
     DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, Memory, Mul,
     Neg, Not, Operation, Or, Parameter, ParameterPath, Parameterized, Placed, Placement, ProgramError,
-    ProjectedContext, Select, Shape, ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed, UnreducedKind,
-    Value, ValueDomainDispatch, WhilePredicate, Xor,
+    ProjectedContext, Rem, Select, Shape, ShapeChangingCollectiveValue, Sharding, StaticShape, Sub, Typed,
+    UnreducedKind, Value, ValueDomainDispatch, WhilePredicate, Xor, dispatch_on_array_element_type, encode_elements,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
@@ -1301,12 +1301,53 @@ impl std::ops::Mul for Array {
     }
 }
 
+impl std::ops::Mul<f64> for Array {
+    type Output = Self;
+
+    fn mul(self, right: f64) -> Self {
+        // Convert before multiplying so the scalar follows the input dtype's rounding and saturation rules.
+        let data_type = self.data_type();
+        let factor_type = ArrayType::scalar(data_type).with_memory(self.r#type().memory());
+        let bytes = dispatch_on_array_element_type!(data_type, |Element| {
+            Element::from_real(right).and_then(|element| encode_elements(&factor_type, &[element]))
+        })
+        .expect("`mul` operation failed");
+
+        // The scalar carries the input's manual variation and is reduced over both sets of reduction axes. This
+        // lets multiplication scale each pending partial sum while preserving the input's completed reductions.
+        let input = self.sharding();
+        let factor_sharding = Sharding::replicated(input.mesh().clone(), 0)
+            .with_varying_manual_axes(input.varying_manual_axes().iter().cloned())
+            .and_then(|sharding| {
+                sharding.with_reduced_axes(input.unreduced_axes().union(input.reduced_axes()).cloned())
+            })
+            .expect("`mul` operation failed");
+
+        // Upload on the input mesh and let the input's commitment and assignment govern eager placement.
+        let factor =
+            Self::from_host_buffer(self.session(), factor_type, self.mesh().clone(), Some(factor_sharding), bytes)
+                .expect("`mul` operation failed")
+                .with_committed(self.is_committed())
+                .with_locally_assigned(self.is_locally_assigned());
+        Mul::mul(&self, &factor).expect("`mul` operation failed")
+    }
+}
+
 impl std::ops::Div for Array {
     type Output = Self;
 
     #[inline]
     fn div(self, right: Self) -> Self {
         Div::div(&self, &right).expect("`div` operation failed")
+    }
+}
+
+impl std::ops::Rem for Array {
+    type Output = Self;
+
+    #[inline]
+    fn rem(self, right: Self) -> Self {
+        Rem::rem(&self, &right).expect("`rem` operation failed")
     }
 }
 
@@ -2987,7 +3028,8 @@ mod tests {
         assert_eq!(read(a.clone() + b.clone()), vec![4f32, 7.]);
         assert_eq!(read(b.clone() - a.clone()), vec![2f32, 3.]);
         assert_eq!(read(a.clone() * b.clone()), vec![3f32, 10.]);
-        assert_eq!(read(b / a.clone()), vec![3f32, 2.5]);
+        assert_eq!(read(b.clone() / a.clone()), vec![3f32, 2.5]);
+        assert_eq!(read(b % a.clone()), vec![0f32, 1.]);
         assert_eq!(read(-a), vec![-1f32, -2.]);
 
         let truths = replicated_array(&session, &mesh, DataType::Boolean, &[4], &[1, 1, 0, 0]);
@@ -2996,6 +3038,46 @@ mod tests {
         assert_eq!((truths.clone() | mixed.clone()).copy_to_host_bytes().unwrap(), vec![1u8, 1, 1, 0]);
         assert_eq!((truths ^ mixed.clone()).copy_to_host_bytes().unwrap(), vec![0u8, 1, 1, 0]);
         assert_eq!((!mixed).copy_to_host_bytes().unwrap(), vec![0u8, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_array_mul_scalar_preserves_dtype_and_memory() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let memory = Memory::Host { pinned: true };
+        let r#type = ArrayType::new_static(DataType::I32, [2]).with_memory(memory);
+        let array =
+            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(&[-3i32, 4])).unwrap();
+        let mesh = array.mesh().clone();
+
+        // The integer coefficient is truncated before multiplication. An implicit coefficient also keeps the
+        // input's memory and leaves the operation on its locally assigned device.
+        let scaled = array * 2.75f64;
+        assert_eq!(scaled.r#type().as_ref(), &r#type);
+        assert_eq!(scaled.mesh(), &mesh);
+        assert!(!scaled.is_committed());
+        assert!(scaled.is_locally_assigned());
+        assert_eq!(scaled.copy_to_host().unwrap().elements::<i32>().unwrap(), [-6, 8]);
+    }
+
+    #[test]
+    fn test_array_mul_scalar_preserves_reduction_state() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let array =
+            unreduced_scalar(&session, DataType::F32, UnreducedKind::Sum, [&2f32.to_ne_bytes(), &3f32.to_ne_bytes()]);
+        let mesh = array.mesh().clone();
+        let pending = array.sharding().clone();
+        let scaled = array * 2.0f64;
+        assert_eq!(scaled.mesh(), &mesh);
+        assert_eq!(scaled.sharding(), &pending);
+        assert!(scaled.is_committed());
+        assert_eq!(scaled.copy_to_host().unwrap().elements::<f32>().unwrap(), [10.]);
+
+        let reduced = Sharding::replicated(mesh.logical_mesh().clone(), 0).with_reduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::scalar(DataType::F32);
+        let array = Array::from_host_buffer(&session, r#type, mesh, Some(reduced.clone()), 5f32.to_ne_bytes()).unwrap();
+        let scaled = array * 2.0f64;
+        assert_eq!(scaled.sharding(), &reduced);
+        assert_eq!(scaled.copy_to_host().unwrap().elements::<f32>().unwrap(), [10.]);
     }
 
     #[test]

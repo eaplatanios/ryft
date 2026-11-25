@@ -25,12 +25,12 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue, CaptureConstant,
-    CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context, DataType, DimensionType,
-    DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Parameter, Placed, Placement, ProgramError,
-    ProjectedContext, ProjectedValue, ReferenceId, ReferenceType, Sub, Type as CoreType, TypeError,
-    TypeIdentityRenaming, Typed, Value as CoreValue, ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
-    WhilePredicate,
+    Add, And, Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, AssertionValue,
+    CaptureConstant, CaptureReference, Compare, CompareOperation, ComparisonDirection, Concretizable, Context,
+    DataType, DimensionType, DimensionValue, Div, EagerContext, LiteralIdentity, Mul, Neg, Not, Or, Parameter, Placed,
+    Placement, ProgramError, ProjectedContext, ProjectedValue, ReferenceId, ReferenceType, Rem, Sub, Type as CoreType,
+    TypeError, TypeIdentityRenaming, Typed, Value as CoreValue, ValueDirectDispatch, ValueDomainDispatch,
+    ValueProjection, WhilePredicate, Xor,
 };
 use ryft_macros::Parameter;
 
@@ -651,6 +651,51 @@ impl std::ops::Div for Value {
     #[inline]
     fn div(self, right: Self) -> Self {
         Div::div(&self, &right).expect("`div` operation failed")
+    }
+}
+
+impl std::ops::Rem for Value {
+    type Output = Self;
+
+    #[inline]
+    fn rem(self, right: Self) -> Self {
+        Rem::rem(&self, &right).expect("`rem` operation failed")
+    }
+}
+
+impl std::ops::Not for Value {
+    type Output = Self;
+
+    #[inline]
+    fn not(self) -> Self {
+        Not::not(&self).expect("`not` operation failed")
+    }
+}
+
+impl std::ops::BitAnd for Value {
+    type Output = Self;
+
+    #[inline]
+    fn bitand(self, right: Self) -> Self {
+        And::and(&self, &right).expect("`and` operation failed")
+    }
+}
+
+impl std::ops::BitOr for Value {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, right: Self) -> Self {
+        Or::or(&self, &right).expect("`or` operation failed")
+    }
+}
+
+impl std::ops::BitXor for Value {
+    type Output = Self;
+
+    #[inline]
+    fn bitxor(self, right: Self) -> Self {
+        Xor::xor(&self, &right).expect("`xor` operation failed")
     }
 }
 
@@ -1624,7 +1669,15 @@ mod tests {
         assert_eq!(read::<f32>(&(two.clone() + four.clone())), vec![6.0]);
         assert_eq!(read::<f32>(&(two.clone() - four.clone())), vec![-2.0]);
         assert_eq!(read::<f32>(&(two.clone() * four.clone())), vec![8.0]);
-        assert_eq!(read::<f32>(&(four / two)), vec![2.0]);
+        assert_eq!(read::<f32>(&(four.clone() / two.clone())), vec![2.0]);
+        assert_eq!(read::<f32>(&(two % four)), vec![2.0]);
+
+        let truths = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 1, 0, 0], &[4]));
+        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 0, 1, 0], &[4]));
+        assert_eq!(read::<u8>(&(truths.clone() & mixed.clone())), [1, 0, 0, 0]);
+        assert_eq!(read::<u8>(&(truths.clone() | mixed.clone())), [1, 1, 1, 0]);
+        assert_eq!(read::<u8>(&(truths ^ mixed.clone())), [0, 1, 1, 0]);
+        assert_eq!(read::<u8>(&!mixed), [0, 1, 0, 1]);
     }
 
     #[test]
@@ -1667,6 +1720,7 @@ mod tests {
         assert_eq!(two.mul(&three), Ok(dimension(&session, 6)));
         assert_eq!(three.div(&two), Ok(dimension(&session, 1)));
         assert_eq!(three.rem(&two), Ok(dimension(&session, 1)));
+        assert_eq!(three.clone() % two.clone(), dimension(&session, 1));
         assert_eq!(two.pow(&three), Ok(dimension(&session, 8)));
         assert_eq!(two.min(&three), Ok(dimension(&session, 2)));
         assert_eq!(two.max(&three), Ok(dimension(&session, 3)));
