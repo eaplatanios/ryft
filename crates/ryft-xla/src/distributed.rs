@@ -810,37 +810,42 @@ struct CompilationCompatibilityManifest {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::File;
-    #[cfg(feature = "cuda-13")]
-    use std::io::Write;
-    #[cfg(feature = "cuda-13")]
-    use std::process::Stdio;
     use std::process::{Child, Command};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use std::{env, fs, ptr, thread};
 
     #[cfg(feature = "cuda-13")]
-    use indoc::indoc;
+    use std::io::Write;
+    #[cfg(feature = "cuda-13")]
+    use std::process::Stdio;
+
     use pretty_assertions::assert_eq;
+    use sha2::{Digest, Sha256};
+
+    #[cfg(feature = "cuda-13")]
+    use indoc::indoc;
+
     use ryft_core::{
         ArrayType, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType, Device, DeviceMesh,
         LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
-    };
-    #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{
-        BufferType, Client, ExecutionDeviceInputs, ExecutionInput, GpuMemoryAllocator, GpuPlatform,
-        Program as PjrtProgram, load_cuda_13_plugin,
     };
     use ryft_pjrt::{
         ClientOptions, CpuClientOptions, DistributedRuntimeClientOptions, DistributedRuntimeServiceOptions,
         Error as PjrtError, GpuClientOptions, KeyValueStore, load_cpu_plugin,
     };
-    use sha2::{Digest, Sha256};
+
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{
+        BufferType, Client, ExecutionDeviceInputs, ExecutionInput, GpuMemoryAllocator, GpuPlatform,
+        Program as PjrtProgram, load_cuda_13_plugin,
+    };
+
+    use crate::tests::{loopback_address, values_from_bytes, values_to_bytes};
+    use crate::{Array, Error, Platform, Session};
 
     #[cfg(feature = "cuda-13")]
     use crate::tests::test_compilation_options;
-    use crate::tests::{loopback_address, values_from_bytes, values_to_bytes};
-    use crate::{Array, Error, Platform, Session};
 
     use super::{
         ARTIFACT_EXCHANGE_SCHEMA_VERSION, CompilationArtifactManifest, CompilationCompatibilityManifest,
@@ -888,11 +893,11 @@ pub(crate) mod tests {
     }
 
     // TODO(eaplatanios): Split the workers that check many behaviors in one test, so that each multi-process test
-    // checks one behavior of its owning item. The largest are `check_shard_map_multi_host_scenarios` in
-    // `operations/sharding/shard_map.rs`, `test_session_place_cpu_process_helper` in `arrays/placement.rs`, the
-    // step lists that `check_cuda_rank_pair_placement_steps` runs in `arrays/resharding.rs`, and the modes of
-    // `test_distributed_kernel_process` in `kernels/distributed.rs`, whose launcher should also be replaced by
-    // this one.
+    //  checks one behavior of its owning item. The largest are `check_shard_map_multi_host_scenarios` in
+    //  `operations/sharding/shard_map.rs`, `test_session_place_cpu_process_helper` in `arrays/placement.rs`, the
+    //  step lists that `check_cuda_rank_pair_placement_steps` runs in `arrays/resharding.rs`, and the modes of
+    //  `test_distributed_kernel_process` in `kernels/distributed.rs`, whose launcher should also be replaced by
+    //  this one.
     /// Runs the worker test `helper`, given as its path within this test binary, in `process_count` processes that
     /// stand for the ranks of one job, with `environment` added to their environment, and returns their standard
     /// outputs in rank order. Each process finds its rank and a coordinator address on a free loopback port with
