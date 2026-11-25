@@ -61,6 +61,24 @@ impl CompilationDomain for Session {
         dispatch_signature(inputs, options)
     }
 
+    // Every compiled function places its captures where its call runs (refer to `captured_type`). The mesh on which it
+    // receives them comes from `options` when it is lowered.
+    fn capture_placement(_options: &Options) -> CapturePlacement {
+        CapturePlacement::FollowCall
+    }
+
+    // A capture follows the call of the function that captures it, so the function receives every capture whose type
+    // records nothing beyond replication with a type that names no mesh (refer to `captured_type`), as a session
+    // constant of that type, whose array lowering places only if the function uses it. Every runtime array that enters
+    // the trace of a compiled function takes this route, an explicit capture and an import alike. A capture whose type
+    // records more (e.g., a split over explicit mesh axes) stays an ordinary capture with its own type, and one that the
+    // function cannot receive on its mesh is rejected by lowering only if the function uses it.
+    fn capture_constant(capture: &Value) -> Result<Option<Constant>, ProgramError> {
+        let Value::Array(array) = capture else { return Ok(None) };
+        let Some(captured_type) = captured_type(&array.r#type()) else { return Ok(None) };
+        Ok(Some(Constant::Session(RetainedArray::new(array).with_declared_type(captured_type))))
+    }
+
     // A `jit_call` of a compiled function carries the boundary of that function (i.e., its sharding overrides and the
     // device mesh that the function names, refer to `JitCallOperation::with_boundary`), because the callee cannot show
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
@@ -96,24 +114,6 @@ impl CompilationDomain for Session {
             }
             operation => operation,
         }
-    }
-
-    // Every compiled function places its captures where its call runs (refer to `captured_type`). The mesh on which it
-    // receives them comes from `options` when it is lowered.
-    fn capture_placement(_options: &Options) -> CapturePlacement {
-        CapturePlacement::FollowCall
-    }
-
-    // A capture follows the call of the function that captures it, so the function receives every capture whose type
-    // records nothing beyond replication with a type that names no mesh (refer to `captured_type`), as a session
-    // constant of that type, whose array lowering places only if the function uses it. Every runtime array that enters
-    // the trace of a compiled function takes this route, an explicit capture and an import alike. A capture whose type
-    // records more (e.g., a split over explicit mesh axes) stays an ordinary capture with its own type, and one that the
-    // function cannot receive on its mesh is rejected by lowering only if the function uses it.
-    fn capture_constant(capture: &Value) -> Result<Option<Constant>, ProgramError> {
-        let Value::Array(array) = capture else { return Ok(None) };
-        let Some(captured_type) = captured_type(&array.r#type()) else { return Ok(None) };
-        Ok(Some(Constant::Session(RetainedArray::new(array).with_declared_type(captured_type))))
     }
 
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
@@ -1157,7 +1157,7 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// (i.e., replicated over `mesh`). Each placement is computed once for each captured array and destination, which every
 /// retention of the array and every program that captures it share, and lives until the array and every retention of it
 /// are gone (refer to [`RetainedArray::placed`]), so no execution, eager call, or other program that captures the array
-/// moves the capture again. A placement that cannot communicate (refer to [`RetainedArray::can_communicate`])
+/// moves the capture again. A placement that cannot communicate (refer to [`RetainedArray::placement_communicates`])
 /// starts from a copy on the same devices whose work has already completed when there is one (e.g., for meshes that
 /// differ only in their axis names), so that such destinations share its buffers, but only from a copy with the memory
 /// and the declared layout of the capture, so that the result is what a placement of the capture itself gives, whatever
@@ -1174,7 +1174,7 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// found it there (e.g., a capture without a target on a function on the first device of the first process, which the
 /// first process finds on that device and every other process places there). The exception is such a capture that lacks
 /// the buffer of a shard of this process that has no elements or that another local replica of the same contribution
-/// holds (e.g., a partial import, refer to [`RetainedArray::fills_missing_local_replicas`]), which is placed onto its
+/// holds (e.g., a partial import, refer to [`RetainedArray::can_fill_missing_local_buffers`]), which is placed onto its
 /// own mesh and sharding once, as any other destination is, so that the copy of that replica is made once rather than
 /// by every execution. Each process decides this from its own buffers, but that placement moves every shard to its own
 /// device and copies only between devices of one process, so a process that places it submits no transfer that another
@@ -1213,7 +1213,7 @@ pub(crate) fn placed_constant(
     let (target, sharding) = if constant.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
         // A capture on the devices of `mesh` is placed onto its own mesh and sharding only to fill its missing local
         // replicas.
-        if constant.mesh().devices() == mesh.devices() && !constant.fills_missing_local_replicas()? {
+        if constant.mesh().devices() == mesh.devices() && !constant.can_fill_missing_local_buffers()? {
             return Ok(Some(constant.on_named_devices()));
         }
         (DeviceMesh::new(constant.sharding().mesh().clone(), mesh.devices().to_vec())?, constant.sharding().clone())
@@ -1249,7 +1249,7 @@ pub(crate) fn placed_constant(
     let placed = constant.placed(&target, &sharding, |source| {
         let replicated = |copy: &RetainedArray| copy.sharding().is_replicated() && sharding.is_replicated();
         let reusable = |copy: &RetainedArray| one_process || replicated(copy);
-        let copy = if source.can_communicate(&target, &sharding) {
+        let copy = if source.placement_communicates(&target, &sharding) {
             None
         } else {
             source.completed_placement_on(target.devices(), reusable)
@@ -6085,7 +6085,7 @@ mod tests {
         };
         let buffer = |array: &Array| Arc::clone(array.addressable_shards().next().unwrap().buffer().unwrap());
         let target = mesh("n0".to_string());
-        assert!(!retained.can_communicate(&target, &Sharding::replicated(target.logical_mesh().clone(), 0)));
+        assert!(!retained.placement_communicates(&target, &Sharding::replicated(target.logical_mesh().clone(), 0)));
         let first = place(0);
         first.block_until_ready().unwrap();
         let buffers = (0..8).map(|index| buffer(&place(index))).collect::<Vec<_>>();

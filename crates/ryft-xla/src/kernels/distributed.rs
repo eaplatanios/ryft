@@ -802,6 +802,10 @@ mod tests {
         i32::from_ne_bytes(bytes.as_slice().try_into().unwrap())
     }
 
+    // TODO(eaplatanios): Start these workers with the launcher that the other multi-process tests share
+    // (`crate::distributed::tests::run_test_processes`, which must become visible to this module), passing the mode
+    // in its `environment`, and delete this launcher and the `RYFT_KERNEL_*` variables.
+    // `test_distributed_kernel_process` then reads its process with `crate::distributed::tests::test_process`.
     /// Runs real child processes with required sockets, retaining both child statuses for the qualification log.
     fn processes(mode: &str) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
