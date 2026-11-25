@@ -536,13 +536,13 @@ impl DistributedCompilationArtifactExchange {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
+    #[inline]
     fn process_index(&self) -> usize {
         self.process_index
     }
 
+    #[inline]
     fn process_count(&self) -> usize {
         self.process_count
     }
@@ -563,6 +563,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 message: "exchange process coordinates are invalid".to_string(),
             });
         }
+
         if key.len() > self.maximum_compatibility_key_size {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
@@ -578,9 +579,11 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
                 process_count: self.process_count as u64,
             };
+
             let manifest = serde_json::to_vec(&manifest).map_err(|error| CompilationArtifactExchangeError::Failed {
                 message: format!("failed to encode compilation compatibility manifest: {error}"),
             })?;
+
             // The key is written before the manifest so that a follower that observes the manifest also finds the key.
             self.put_if_absent(&self.key(key, b"preflight/key"), key)?;
             return self.put_if_absent(&self.key(key, b"preflight/manifest"), manifest.as_slice());
@@ -596,27 +599,31 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 error => CompilationArtifactExchangeError::Failed { message: error.to_string() },
             })
         };
+
         let manifest = get(b"preflight/manifest")?;
         let manifest: CompilationCompatibilityManifest =
             serde_json::from_slice(manifest.as_slice()).map_err(|error| CompilationArtifactExchangeError::Failed {
                 message: format!("failed to decode compilation compatibility manifest: {error}"),
             })?;
+
         if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
-                    "process {leader} uses compilation artifact exchange schema {}, but this process uses schema {}",
-                    manifest.schema_version, ARTIFACT_EXCHANGE_SCHEMA_VERSION,
+                    "process {} uses compilation artifact exchange schema {}, but this process uses schema {}",
+                    leader, manifest.schema_version, ARTIFACT_EXCHANGE_SCHEMA_VERSION,
                 ),
             });
         }
+
         if manifest.process_count != self.process_count as u64 {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
-                    "process {leader} expects {} processes, but this process expects {}",
-                    manifest.process_count, self.process_count,
+                    "process {} expects {} processes, but this process expects {}",
+                    leader, manifest.process_count, self.process_count,
                 ),
             });
         }
+
         if get(b"preflight/key")?.as_slice() != key {
             return Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
@@ -624,6 +631,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 ),
             });
         }
+
         Ok(())
     }
 
@@ -637,6 +645,7 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 ),
             });
         }
+
         // Every artifact published for one key is interchangeable, so a key whose artifact is already published (e.g.,
         // because the leader compiled it again after evicting it) needs no new publication. A terminal failure that
         // was already published for the key cannot be replaced, because the store never overwrites values.
@@ -658,12 +667,14 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             Err(ryft_pjrt::Error::NotFound { .. }) => {}
             Err(error) => return Err(CompilationArtifactExchangeError::Failed { message: error.to_string() }),
         }
+
         // A chunk that an earlier publication of the same artifact already stored is kept, so a publication that
         // failed before its manifest can be repeated.
         let checksum = Sha256::digest(artifact).into();
         for (index, chunk) in artifact.chunks(self.chunk_size).enumerate() {
             self.put_if_absent(&self.chunk_key(key, &checksum, index), chunk)?;
         }
+
         let manifest = CompilationArtifactManifest {
             schema_version: ARTIFACT_EXCHANGE_SCHEMA_VERSION,
             size: artifact.len() as u64,
@@ -671,9 +682,11 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             checksum,
             failure: None,
         };
+
         let manifest = serde_json::to_vec(&manifest).map_err(|error| CompilationArtifactExchangeError::Failed {
             message: format!("failed to encode artifact manifest: {error}"),
         })?;
+
         self.put_if_absent(&self.key(key, b"manifest"), manifest.as_slice())
     }
 
@@ -685,9 +698,11 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             checksum: Sha256::digest(b"").into(),
             failure: Some(message.to_string()),
         };
+
         let manifest = serde_json::to_vec(&manifest).map_err(|error| CompilationArtifactExchangeError::Failed {
             message: format!("failed to encode artifact failure: {error}"),
         })?;
+
         // An artifact or failure that was already published for this key stays authoritative.
         self.put_if_absent(&self.key(key, b"manifest"), manifest.as_slice())
     }
@@ -699,31 +714,38 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
             Err(ryft_pjrt::Error::NotFound { .. } | ryft_pjrt::Error::DeadlineExceeded { .. }) => return Ok(None),
             Err(error) => return Err(CompilationArtifactExchangeError::Failed { message: error.to_string() }),
         };
+
         let manifest: CompilationArtifactManifest = serde_json::from_slice(manifest.as_slice()).map_err(|error| {
             CompilationArtifactExchangeError::Failed { message: format!("failed to decode artifact manifest: {error}") }
         })?;
+
         if manifest.schema_version != ARTIFACT_EXCHANGE_SCHEMA_VERSION {
             return Err(CompilationArtifactExchangeError::Failed {
                 message: format!("unsupported compiled artifact exchange schema {}", manifest.schema_version),
             });
         }
+
         if let Some(message) = manifest.failure {
             return Err(CompilationArtifactExchangeError::Failed {
                 message: format!("compilation producer failed: {message}"),
             });
         }
+
         let size = usize::try_from(manifest.size).map_err(|_| CompilationArtifactExchangeError::Failed {
             message: "compiled artifact size overflows `usize`".to_string(),
         })?;
+
         let chunk_count =
             usize::try_from(manifest.chunk_count).map_err(|_| CompilationArtifactExchangeError::Failed {
                 message: "compiled artifact chunk count overflows `usize`".to_string(),
             })?;
+
         if size > self.maximum_artifact_size || chunk_count != size.div_ceil(self.chunk_size) {
             return Err(CompilationArtifactExchangeError::Failed {
                 message: "compiled artifact manifest exceeds configured bounds".to_string(),
             });
         }
+
         let mut artifact = Vec::with_capacity(size);
         for index in 0..chunk_count {
             let remaining = timeout.checked_sub(start.elapsed()).ok_or(CompilationArtifactExchangeError::TimedOut)?;
@@ -734,18 +756,22 @@ impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
                 }
                 error => CompilationArtifactExchangeError::Failed { message: error.to_string() },
             })?;
+
             if chunk.len() > self.chunk_size || artifact.len().saturating_add(chunk.len()) > size {
                 return Err(CompilationArtifactExchangeError::Failed {
                     message: "compiled artifact chunk violates manifest bounds".to_string(),
                 });
             }
+
             artifact.extend_from_slice(chunk.as_slice());
         }
+
         if artifact.len() != size || <[u8; 32]>::from(Sha256::digest(artifact.as_slice())) != manifest.checksum {
             return Err(CompilationArtifactExchangeError::Failed {
                 message: "compiled artifact checksum mismatch".to_string(),
             });
         }
+
         Ok(Some(artifact))
     }
 }
@@ -778,6 +804,8 @@ struct CompilationCompatibilityManifest {
     /// Number of processes that the leader expects to participate in the exchange.
     process_count: u64,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 pub(crate) mod tests {
