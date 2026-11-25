@@ -678,12 +678,12 @@ impl<T: CoreType> JitCallOperation<T> {
     /// placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
     /// `has_placement_requests_in_region`), which `callee_names_devices` says and which is asked only when the call
     /// records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when the
-    /// function is staged, from its whole program, so a call whose outputs pruning dropped (refer to `pruned_program`)
-    /// can record a mesh that only a request of a dropped output named, which this function no longer reports, as JAX
-    /// lowers a nested `jit` function pruned to the outputs that its caller uses and so without the shardings of the
-    /// dropped ones. The analysis of a program (refer to `placement_requests` and `pruned_program`) answers
-    /// `callee_names_devices` with the facts of the callee that it derives in the same pass over the program, so that it
-    /// never analyses a callee again for each call that encloses it.
+    /// function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
+    /// `pruned_for_lowering`) can record a mesh that only a request of a dropped output named, which this function no
+    /// longer reports, as JAX lowers a nested `jit` function pruned to the outputs that its caller uses and so without
+    /// the shardings of the dropped ones. The analysis of a program (refer to `placement_requests` and
+    /// `pruned_for_lowering`) answers `callee_names_devices` with the facts of the callee that it derives in the same
+    /// pass over the program, so that it never analyses a callee again for each call that encloses it.
     pub(crate) fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)

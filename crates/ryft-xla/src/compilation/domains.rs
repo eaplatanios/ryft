@@ -29,7 +29,7 @@ use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
 use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
 use crate::compilation::placements::{
     EntryResultPlacement, entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings,
-    has_placement_requests, pruned_program,
+    has_placement_requests, pruned_for_lowering,
 };
 use crate::compilation::programs::{
     CompiledProgram, EagerDispatchProgram, LoweredProgram, OutputDeviceAssignment, ProgramLowering, RemoteEagerProgram,
@@ -108,7 +108,7 @@ impl CompilationDomain for Session {
                 let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
                 // No session is at hand here, so the callee is read for no target, and the pruning of the program
                 // that lowering emits for its target drops the mesh of a call whose callee names devices only inside a
-                // body that the target replaces (refer to `pruned_program`).
+                // body that the target replaces (refer to `pruned_for_lowering`).
                 let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
                 let call =
                     call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
@@ -317,9 +317,9 @@ impl Session {
     ) -> Result<ProgramLowering, Error> {
         validate_mesh_devices(self, options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
-        // `pruned_program`), as the analysis of its placement requests does.
+        // `pruned_for_lowering`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
-        self.lower_pruned_program(&pruned_program(program, target_platform)?, capture_count, options, function)
+        self.lower_pruned_program(&pruned_for_lowering(program, target_platform)?, capture_count, options, function)
     }
 
     /// Lowers `program` after dead instruction pruning.

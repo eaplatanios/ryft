@@ -25,7 +25,7 @@ use ryft_core::{
 };
 
 use crate::compilation::placements::{
-    entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, pruned_program,
+    entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, pruned_for_lowering,
 };
 use crate::lowering::emissions::collect_session_constants;
 use crate::lowering::modules::lower_mlir_module_for_program_with_value_shardings;
@@ -137,7 +137,7 @@ where
         let as_array_type = |r#type: Type| <&ArrayType>::try_from(&r#type).cloned().map_err(ProgramError::from);
         let input_type = self.input_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
         let output_type = self.output_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
-        let program = pruned_program(self, None)?;
+        let program = pruned_for_lowering(self, None)?;
         let input_shardings: Vec<_> = match input_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
@@ -296,21 +296,19 @@ where
         )?)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ConstrainSharding, DataType, Device, DeviceMesh, Dimension, EffectClass, Error as CoreError, ImportingContext,
-        LogicalMesh, MeshAxis, MeshAxisType, Place, Placement, Print, RegionRole, Reshape, Reshard, Shape,
+        ConstrainSharding, DataType, Device, DeviceMesh, Dimension, DimensionValue, EffectClass, Error as CoreError,
+        ImportingContext, LogicalMesh, MeshAxis, MeshAxisType, Place, Placement, Print, Reshape, Reshard, Shape,
         ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, ValueProjection, shard_map,
     };
-    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::test_sharding;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -347,95 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trace() {
-        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(x, y): (ArrayTracer, ArrayTracer)| x.sin().unwrap() * y,
-            (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
-        )
-        .unwrap();
-        assert_eq!(
-            traced.to_string(),
-            indoc! {"
-                lambda %0:f32[4], %1:f32[4] .
-                let %2:f32[4] = sin %0
-                    %3:f32[4] = mul %2 %1
-                in (%3)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_trace_with_context() {
-        // Failures of the traced function propagate unchanged as core program errors.
-        assert!(matches!(
-            trace_with_context::<_, ArrayType, ArrayTracer>(
-                |_, _| Err(ProgramError::MalformedProgram("traced function failure".to_string())),
-                ArrayType::new_static(DataType::F32, [4]),
-            ),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::MalformedProgram(message))
-                    if message == "traced function failure",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_trace_statistics() {
-        // A traced program is the simplified staged program, whose statistics these are. The asserted numbers are
-        // cross-checked against `traced.to_string()`, which renders the entry region as one `shard_map`
-        // instruction that attaches a body region with a single `sin` instruction.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            {
-                let mesh = mesh.clone();
-                move |x: ArrayTracer| {
-                    shard_map(
-                        |local_x: ArrayTracer| local_x.sin(),
-                        x,
-                        mesh.clone(),
-                        sharding.clone(),
-                        sharding.clone(),
-                        ShardMapOptions::new(),
-                    )
-                    .unwrap()
-                }
-            },
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
-        )
-        .unwrap();
-
-        let statistics = traced.statistics();
-        assert_eq!(statistics.region_count(), 2);
-
-        let body = &statistics.regions()[0];
-        assert_eq!(body.input_count(), 1);
-        assert_eq!(body.output_count(), 1);
-        assert_eq!(body.instruction_count(), 1);
-        assert_eq!(body.constant_count(), 0);
-        assert_eq!(body.operation_counts(), &BTreeMap::from([("sin", 1usize)]));
-        assert_eq!(body.maximum_output_dependency_depth(), 1);
-        assert_eq!(body.attached_regions(), &[]);
-
-        let entry = statistics.entry_region_statistics();
-        assert_eq!(entry.input_count(), 1);
-        assert_eq!(entry.output_count(), 1);
-        assert_eq!(entry.instruction_count(), 1);
-        assert_eq!(entry.operation_counts(), &BTreeMap::from([("shard_map", 1usize)]));
-        assert_eq!(entry.maximum_output_dependency_depth(), 1);
-        assert_eq!(entry.attached_regions().len(), 1);
-        let edge = &entry.attached_regions()[0];
-        assert_eq!(edge.instruction_index(), 0);
-        assert_eq!(edge.operation(), "shard_map");
-        assert_eq!(edge.region_slot(), "body");
-        assert_eq!(edge.region_role(), RegionRole::Computation);
-        assert_eq!(edge.region_index(), 0);
-        assert_eq!(edge.label(), "shard_map.body");
-    }
-
-    #[test]
     fn test_program_extension_to_mlir_module() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
@@ -452,16 +361,17 @@ mod tests {
 
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
                     %0 = stablehlo.sine %arg0 : tensor<8xf32>
-                    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<8xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{\"x\"}]> : tensor<8xf32>
                     return %1 : tensor<8xf32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
@@ -487,16 +397,17 @@ mod tests {
 
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}, {}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<8xf32>
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {\"x\"}, {}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<8xf32>
                     %1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>
                     return %1 : tensor<1x8x1xf32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
@@ -528,15 +439,16 @@ mod tests {
 
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=2, "a"=2]>
-                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x", ?}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", "a"}]> : tensor<8xf32>
+                  sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\", ?}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", \"a\"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
@@ -559,15 +471,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<8xf32>
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
@@ -591,19 +504,72 @@ mod tests {
         .unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["device"=1]>
-                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                  sdy.mesh @mesh = <[\"device\"=1]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> \
+                        (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
                     return %arg0 : tensor<f32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_signature_shardings_rejects_imports_over_other_topologies() {
+    fn test_program_extension_to_mlir_module_with_shardings() {
+        // Explicit shardings are attached to the arguments and the results of the function. The global types have no
+        // sharding here, so without explicit shardings the signature is not annotated, as `to_mlir_module` renders it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(|x: ArrayTracer| x.sin().unwrap(), ArrayType::new_static(DataType::F32, [8])).unwrap();
+        let shardings = Some(std::slice::from_ref(&sharding));
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", shardings, shardings).unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", None, None).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            traced.to_mlir_module_with_shardings("main", None, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_rejects_boundaries_that_are_not_arrays() {
+        // The export reads array types at the boundary of the program, so a program whose input is a dimension is
+        // rejected before anything is lowered.
+        let dimension_type = Type::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
+        let (_, program) =
+            DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), vec![dimension_type]).unwrap();
+        assert_eq!(
+            program.to_mlir_module_with_shardings("main", None, None).unwrap_err().to_string(),
+            "expected array type but got dimension type",
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_rejects_imports_over_other_topologies() {
         // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
         // cannot hold an array over two devices, and the error names the cause and the way forward.
         let client = cpu_client(2);
@@ -641,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_closes_unconstrained_result_placements() {
+    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_placements() {
         // The runtime placement of a result reads an unconstrained dimension of the target of the `place` that produces
         // it, or of a result sharding override, as replicated, so the result is annotated with that dimension closed,
         // as compilation annotates it, while the constraint inside the function keeps it open.
@@ -668,15 +634,16 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(move |x: ArrayTracer| x.place(&target, None).unwrap(), ArrayType::new_static(DataType::I32, [4, 4]))
                 .unwrap();
-        let expected = indoc! {r#"
+        let expected = indoc! {"
             module {
-              sdy.mesh @mesh = <["x"=2, "r"=2]>
-              func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"r"}]>}) -> (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
-                %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}, {?}]> : tensor<4x4xi32>
+              sdy.mesh @mesh = <[\"x\"=2, \"r\"=2]>
+              func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {\"r\"}]>}) -> \
+                    (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) {
+                %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}, {?}]> : tensor<4x4xi32>
                 return %0 : tensor<4x4xi32>
               }
             }
-        "#};
+        "};
         assert_eq!(
             traced
                 .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
@@ -696,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_closes_unconstrained_result_types() {
+    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_types() {
         // A result that is computed from the result of a `place` inherits the unconstrained dimension of its target in
         // its type, which its runtime placement reads as replicated as well, so it is annotated with that dimension
         // closed, as compilation annotates it.
@@ -732,21 +699,22 @@ mod tests {
             traced
                 .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
                 .unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=2, "r"=2]>
-                  func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}, {?}]> : tensor<4x4xi32>
+                  sdy.mesh @mesh = <[\"x\"=2, \"r\"=2]>
+                  func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) -> \
+                        (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}, {?}]> : tensor<4x4xi32>
                     %1 = stablehlo.add %0, %0 : tensor<4x4xi32>
                     return %1 : tensor<4x4xi32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_leaves_results_open_over_auto_axes() {
+    fn test_program_extension_to_mlir_module_with_shardings_leaves_results_open_over_auto_axes() {
         // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
         // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
         // result is annotated open over it, as compilation annotates it.
@@ -768,21 +736,22 @@ mod tests {
         .unwrap();
         assert_eq!(
             traced.to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&replicated)), None).unwrap(),
-            indoc! {r#"
+            indoc! {"
                 module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x"}]> : tensor<4xf32>
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> \
+                        (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<4xf32>
                     %1 = stablehlo.add %0, %0 : tensor<4xf32>
                     return %1 : tensor<4xf32>
                   }
                 }
-            "#},
+            "},
         );
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_signature_shardings_keeps_effectful_dead_shard_maps() {
+    fn test_program_extension_to_mlir_module_with_shardings_keeps_effectful_dead_shard_maps() {
         // Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
         // ordinary results, so the lowered manual computation only threads the effect token of its body.
         let (traced, sharding) = traced_effectful_dead_shard_map();
@@ -801,7 +770,8 @@ mod tests {
                         (tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
                     %0 = stablehlo.after_all  : !stablehlo.token
                     %1 = sdy.manual_computation(%arg0, %0) in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, []>] \
-                        out_shardings=[<@mesh, []>] manual_axes={\"x\"} (%arg1: tensor<2xf64>, %arg2: !stablehlo.token) {
+                        out_shardings=[<@mesh, []>] manual_axes={\"x\"} \
+                        (%arg1: tensor<2xf64>, %arg2: !stablehlo.token) {
                       %2 = stablehlo.custom_call @ryft.print(%arg1, %arg2) {api_version = 4 : i32, \
                           backend_config = {label = \"body\"}, has_side_effect = true, \
                           operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
@@ -817,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_signature_shardings_executes_effectful_dead_shard_maps_on_cpu() {
+    fn test_program_extension_to_mlir_module_with_shardings_executes_effectful_dead_shard_maps_on_cpu() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
             .to_mlir_module_with_shardings(
@@ -829,7 +799,7 @@ mod tests {
         let client = cpu_client(2);
         ensure_print_handler_registered(client).unwrap();
         let executable = client
-            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
         let shards = [vec![1.5f64, 2.5], vec![3.5f64, 4.5]];
         let inputs = executable
@@ -840,7 +810,7 @@ mod tests {
             .map(|(device, shard)| {
                 let bytes = values_to_bytes(shard.as_slice());
                 vec![ExecutionInput {
-                    buffer: std::sync::Arc::new(
+                    buffer: Arc::new(
                         client.buffer(bytes.as_slice(), BufferType::F64, [2u64], None, device.clone(), None).unwrap(),
                     ),
                     donatable: false,
@@ -873,5 +843,95 @@ mod tests {
         }
         lines.sort();
         assert_eq!(lines, vec!["body: [1.5, 2.5]".to_string(), "body: [3.5, 4.5]".to_string()]);
+    }
+
+    #[test]
+    fn test_trace() {
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| x.sin().unwrap() * y,
+            (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = sin %0
+                    %3:f32[4] = mul %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // A `shard_map` is staged as one instruction whose body is a region of the simplified program.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
+                shard_map(
+                    |local_x: ArrayTracer| local_x.sin(),
+                    x,
+                    mesh,
+                    sharding.clone(),
+                    sharding,
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            ArrayType::new_static(DataType::F32, [8]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_string(),
+            indoc! {"
+                lambda %0:f32[8] .
+                let %1:f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}]}] = shard_map [
+                    mesh=['x'=4:manual],
+                    input_shardings=[{mesh<['x'=4:manual]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=4:manual]>, [{'x'}]}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}]}]],
+                    global_output_types=[f32[8][sharding={mesh<['x'=4:manual]>, [{'x'}]}]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] .
+                        let %1:f32[2][sharding={mesh<['x'=4:manual]>, [{}], varying_manual={'x'}}] = sin %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_trace_with_context() {
+        // The traced function receives the tracing context together with its inputs and may fail.
+        let traced =
+            trace_with_context::<_, ArrayType, ArrayTracer>(|_, x| x.sin(), ArrayType::new_static(DataType::F32, [4]))
+                .unwrap();
+        assert_eq!(
+            traced.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4] = sin %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Failures of the traced function propagate unchanged as core program errors.
+        assert!(matches!(
+            trace_with_context::<_, ArrayType, ArrayTracer>(
+                |_, _| Err(ProgramError::MalformedProgram("traced function failure".to_string())),
+                ArrayType::new_static(DataType::F32, [4]),
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::MalformedProgram(message))
+                    if message == "traced function failure",
+            ),
+        ));
     }
 }

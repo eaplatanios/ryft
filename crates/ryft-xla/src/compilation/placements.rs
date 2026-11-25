@@ -31,7 +31,7 @@ use crate::{Constant, Error, JitCallOperation, Operation, RetainedArray, Type};
 /// whether or not that value reaches a result. These are the analogues of the `device_put` and
 /// `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX commit every output of a
 /// `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Only a request of the program that
-/// lowering emits counts (refer to [`pruned_program`] and [`placement_requests`]), as JAX lowers a `jit` function
+/// lowering emits counts (refer to [`pruned_for_lowering`] and [`placement_requests`]), as JAX lowers a `jit` function
 /// without its dead equations and a nested `jit` function pruned to the outputs that its caller uses, so a wrapper that
 /// drops the only result of a callee that places a value requests nothing. Such calls count because their
 /// callees cannot show their overrides (e.g., a replicated override over auto mesh axes stages nothing). The callees of
@@ -103,7 +103,7 @@ where
 ///
 /// Returns the errors of [`Program::into_pruned`](ryft_core::Program::into_pruned) and
 /// [`Program::into_simplified`](ryft_core::Program::into_simplified).
-pub(crate) fn pruned_program<ProgramInput, ProgramOutput>(
+pub(crate) fn pruned_for_lowering<ProgramInput, ProgramOutput>(
     program: &Program<Constant, Operation, ProgramInput, ProgramOutput>,
     target_platform: Option<&str>,
 ) -> Result<Program<Constant, Operation, ProgramInput, ProgramOutput>, ProgramError>
@@ -182,7 +182,7 @@ pub(crate) enum RequestedPlacement {
 }
 
 /// Returns what `analyse` returns for the entry region of the program that lowering emits for `region` (refer to
-/// [`pruned_program`]), every output of `region` being used, which is `region` with its closure without the unused
+/// [`pruned_for_lowering`]), every output of `region` being used, which is `region` with its closure without the unused
 /// outputs of instructions that carry regions and without dead instructions and constants, or with its closure
 /// unchanged when it cannot be pruned (a program that cannot be pruned cannot be lowered either, so that an analysis of
 /// it never hides anything of such a program). This is the one program that the summary of a region reads (refer to
@@ -350,7 +350,7 @@ fn entry_session_constants<O: LowerableOperationFamily>(
 /// mesh reads of its callee (refer to [`JitCallOperation::names_devices`]). Each region of the program is analysed at
 /// most once, and its fact is read by every call of it and by every region that encloses it, so a pass over a program
 /// with nested calls is linear in the size of the program. The program must be the one that lowering emits (i.e., it
-/// is already pruned, refer to [`pruned_program`]), because a callee is analysed as the program holds it. The regions
+/// is already pruned, refer to [`pruned_for_lowering`]), because a callee is analysed as the program holds it. The regions
 /// of an instruction whose lowering for the target platform omits them are not analysed (refer to `omits_regions`).
 struct DeviceNamingAnalysis<'t> {
     /// Whether the region at each index of the arena of the program names devices, or [`None`] if it has not been
@@ -1082,7 +1082,7 @@ mod tests {
                 let program = function.source_program().program();
                 let requested = requested_placement_mesh(program.entry_region_ref(), None).unwrap();
                 assert_eq!(requested.map(|(requested, _)| requested.into_owned()), Some(mesh.clone()));
-                assert_eq!(pruned_program(program, None).unwrap().to_string(), program.to_string());
+                assert_eq!(pruned_for_lowering(program, None).unwrap().to_string(), program.to_string());
                 (mesh, placement_requests(program.entry_region_ref(), None))
             })
             .unwrap()
