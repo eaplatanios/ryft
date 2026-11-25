@@ -1103,8 +1103,6 @@ impl From<bool> for ArrayConstant {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::hash::DefaultHasher;
@@ -1417,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_value_placement() {
-        // Only array members live on devices, so only they have a placement.
+        // Only array members live on devices, so only they have a placement, which records the memory of their type.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
@@ -1425,7 +1423,11 @@ mod tests {
         let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), session.clone()));
         assert_eq!(
             Value::Array(array).placement(),
-            Some(Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0)).unwrap()),
+            Some(
+                Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0))
+                    .unwrap()
+                    .with_memory(Memory::Device),
+            ),
         );
         assert_eq!(dimension(&session, 3).placement(), None);
         assert_eq!(reference.placement(), None);
@@ -1529,7 +1531,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let program_count = session.cached_program_count();
         let scalar = dimension(&session, 2).to_scalar().unwrap();
-        assert_eq!(scalar.r#type().to_string(), "SCALAR_TYPE_PLACEHOLDER");
+        assert_eq!(scalar.r#type().to_string(), "i64[]");
         assert_eq!(read::<i64>(&scalar), vec![2]);
         assert_eq!(session.cached_program_count(), program_count);
     }
@@ -2113,7 +2115,7 @@ mod tests {
             Constant::Captured(CaptureReference::new(2, Type::Array(vector_type()))).to_string(),
             "capture#2:f64[4]"
         );
-        assert_eq!(Constant::Dimension(extent).to_string(), "EXTENT_PLACEHOLDER");
+        assert_eq!(Constant::Dimension(extent).to_string(), "4");
         assert_eq!(Constant::Boolean(true).to_string(), "true");
     }
 
