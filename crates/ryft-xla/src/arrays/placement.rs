@@ -1679,6 +1679,28 @@ impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArray
     }
 }
 
+/// Option values of the leaves of one [`Session::place`] input, which [`broadcast_placement_option`] produces. An
+/// omitted prefix and a prefix with one leaf at the root give every leaf the same value, so they hold that value once
+/// rather than one copy per leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PlacementOptionValues<Value> {
+    /// Value of every leaf, or `None` if no prefix was given.
+    Uniform(Option<Value>),
+
+    /// Values of the leaves, in the order of the leaves.
+    PerParameter(Vec<Value>),
+}
+
+impl<Value> PlacementOptionValues<Value> {
+    /// Returns the supplied value of the leaf at `index`, if any.
+    fn get(&self, index: usize) -> Option<&Value> {
+        match self {
+            Self::Uniform(value) => value.as_ref(),
+            Self::PerParameter(values) => Some(&values[index]),
+        }
+    }
+}
+
 // TODO(eaplatanios): Review from here onwards.
 
 /// One input parameter and its expanded placement options, shared by [`Session::place`] and
@@ -1962,28 +1984,6 @@ fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Er
             array_error => ArrayError::FailedParameterPlacement { path, source: Arc::new(array_error.into()) }.into(),
         },
         error => ArrayError::FailedParameterPlacement { path, source: Arc::new(error) }.into(),
-    }
-}
-
-/// Option values of the leaves of one [`Session::place`] input, which [`broadcast_placement_option`] produces. An
-/// omitted prefix and a prefix with one leaf at the root give every leaf the same value, so they hold that value once
-/// rather than one copy per leaf.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum PlacementOptionValues<Value> {
-    /// Value of every leaf, or `None` if no prefix was given.
-    Uniform(Option<Value>),
-
-    /// Values of the leaves, in the order of the leaves.
-    PerParameter(Vec<Value>),
-}
-
-impl<Value> PlacementOptionValues<Value> {
-    /// Returns the supplied value of the leaf at `index`, if any.
-    fn get(&self, index: usize) -> Option<&Value> {
-        match self {
-            Self::Uniform(value) => value.as_ref(),
-            Self::PerParameter(values) => Some(&values[index]),
-        }
     }
 }
 
