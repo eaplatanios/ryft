@@ -124,7 +124,6 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::metadata::resolve_placement;
-use crate::arrays::placement::single_device_placement;
 use crate::arrays::shards::{ArrayShard, ShardContribution, ShardDescriptor, ShardLayout};
 use crate::arrays::{Array, ArrayError};
 use crate::devices::PjrtDeviceExtension;
@@ -2320,7 +2319,7 @@ impl Array {
             }
         };
 
-        let placement = single_device_placement(device, 0)?;
+        let placement = Placement::single_device(device, 0);
         let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
         let readback = maximum.clone();
 
@@ -5881,7 +5880,7 @@ mod tests {
 
         let placed_local = session.place(3i32, PlacementOptions::to(local)).unwrap();
         assert_eq!(values_from_bytes::<i32>(&placed_local.copy_to_host_bytes().unwrap()), vec![3]);
-        let remote_only = single_device_placement(remote, 0).unwrap();
+        let remote_only = Placement::single_device(remote, 0);
         let placed_remote = session.place(3i32, PlacementOptions::to(remote_only)).unwrap();
         assert_eq!(placed_remote.addressable_shards().count(), 0);
         placed_remote.block_until_ready().unwrap();

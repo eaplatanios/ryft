@@ -10,7 +10,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::sharding::ShardingError;
-use crate::arrays::sharding::meshes::DeviceMesh;
+use crate::arrays::sharding::meshes::{Device, DeviceMesh, LogicalMesh};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
@@ -73,6 +73,17 @@ impl Placement {
     pub fn new(mesh: DeviceMesh, sharding: Sharding) -> Result<Self, ShardingError> {
         check_sharding!(mesh, sharding);
         Ok(Self { mesh, sharding, layout: None, memory: None, batch_shardings: Vec::new() })
+    }
+
+    /// Creates a replicated placement of a value of rank `rank` on `device`, using the
+    /// [canonical one-device mesh](LogicalMesh::single_device). The [`Memory`] and [`Layout`] are unspecified.
+    #[inline]
+    pub fn single_device(device: Device, rank: usize) -> Self {
+        // A single device matches the canonical mesh and cannot have duplicate IDs. The sharding uses the same
+        // logical mesh, so its topology is guaranteed to match.
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
+        Self::new(mesh, sharding).unwrap()
     }
 
     /// Returns this [`Placement`] with its sharding replaced by `sharding`, keeping its mesh, [`Layout`], [`Memory`],
@@ -233,7 +244,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::sharding::meshes::{Device, LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::meshes::{MeshAxis, MeshAxisType};
     use crate::arrays::types::layouts::TiledLayout;
 
     use super::*;
@@ -276,6 +287,20 @@ mod tests {
             Placement::new(mesh.clone(), Sharding::replicated(other_mesh.clone(), 1)),
             Err(ShardingError::MeshMismatch { expected: mesh.logical_mesh().clone(), actual: other_mesh }),
         );
+    }
+
+    #[test]
+    fn test_placement_single_device() {
+        let device = Device::new(7, 2);
+        let logical_mesh = LogicalMesh::single_device();
+        let placement = Placement::single_device(device, 2);
+        assert_eq!(placement.mesh().logical_mesh(), &logical_mesh);
+        assert_eq!(placement.mesh().devices(), &[device]);
+        assert_eq!(placement.sharding(), &Sharding::replicated(logical_mesh, 2));
+        assert_eq!(placement.memory(), None);
+        assert_eq!(placement.layout(), None);
+        assert!(placement.batch_shardings().is_empty());
+        assert!(Placement::single_device(device, 0).sharding().dimensions().is_empty());
     }
 
     #[test]

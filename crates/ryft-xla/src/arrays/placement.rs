@@ -23,7 +23,6 @@
 //! transfer strategies, blocking cases, and failures reported by readiness and readback functions.
 
 use std::borrow::Cow;
-use std::convert::identity;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -31,7 +30,7 @@ use ryft_core::{
     Array as CoreArray, ArrayType, BatchingPolicy, BatchingTracer, CapturePlacement, CapturePlacementContext, Context,
     Device, DeviceMesh, DifferentiationPolicy, DifferentiationTracer, ImportingContext, LogicalMesh, Parameter,
     ParameterPath, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placeholder,
-    Placement, PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture, ThroughParent, Tracer, Typed,
+    Placement, PlacementRequest, ProgramError, ProjectedValue, ThroughCapture, ThroughParent, Tracer, Typed,
     UnreducedKind, Value as CoreValue,
 };
 use ryft_macros::Parameter;
@@ -56,8 +55,9 @@ use sealed::PlaceableParameter;
 /// leafwise:
 ///
 ///   - `Target` specifies the destination, and `Source` describes the expected input placement. Their leaves implement
-///     [`SessionPlacementRequestParameter`]. A consumed [`Sharding`] resolves against the session's default mesh.
-///     To mix resolved placements and explicit requests in a prefix, use [`PlacementRequest::from`].
+///     [`SessionPlacementRequestParameter`]. A consumed [`Sharding`](ryft_core::Sharding) resolves against the
+///     session's default mesh. To mix resolved placements and explicit requests in a prefix, use
+///     [`PlacementRequest::from`].
 ///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the result when donation
 ///     is possible.
 ///   - `MayAlias` has leaves that convert into `Option<bool>`. A `false` or `Some(false)` leaf requests a copy, `true`
@@ -230,6 +230,7 @@ impl Default for PlacementOptions {
 /// place (refer to [`Session::place`]), which covers the host values and the locally assigned [`Array`]s. Both need
 /// to know every kind of leaf, so this trait is sealed (i.e., only this crate implements it). A type that is made of
 /// these leaves is placed as a [`Parameterized`] tree of them.
+#[expect(private_bounds, reason = "the sealed supertrait handles arguments internal to placement")]
 pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output> {
     /// Leaf type that placing this leaf produces, which is [`Array`] for host values and runtime arrays, and the leaf
     /// type itself for traced values.
@@ -361,8 +362,8 @@ impl<T: HostValue + Parameter> Placeable for T {
 }
 
 /// Target or source parameter accepted by [`Session::place`]. This includes [`Placement`], [`PlacementRequest`],
-/// [`Device`], [`Memory`](ryft_core::Memory), [`Sharding`], and their optional forms. A bare [`Sharding`] pairs
-/// with the default [`DeviceMesh`] of the session when a leaf uses it.
+/// [`Device`], [`Memory`](ryft_core::Memory), [`Sharding`](ryft_core::Sharding), and their optional forms. A bare
+/// sharding pairs with the default [`DeviceMesh`] of the session when a leaf uses it.
 pub trait SessionPlacementRequestParameter: Clone + Parameter + sealed::RequestParameter {}
 
 impl<R: Clone + Parameter + sealed::RequestParameter> SessionPlacementRequestParameter for R {}
@@ -375,13 +376,13 @@ mod sealed {
     use crate::arrays::Array;
     use crate::{Error, Session};
 
-    use super::validate_parameter_options;
+    use super::{PlacementArgument, validate_parameter_options};
 
     /// What [`Session::place`] asks of a leaf that it places as an `Output` before it places any leaf of a tree. Every
     /// [`Placeable`](super::Placeable) implements this trait for its output, which seals that trait, because only this
     /// crate can name this one. [`place_parameter`](super::Placeable::place_parameter) below is the function of that
     /// trait that places the leaf.
-    pub trait PlaceableParameter<Output> {
+    pub(super) trait PlaceableParameter<Output> {
         /// Checks, without placing this leaf, what [`place_parameter`](super::Placeable::place_parameter) would check
         /// from metadata alone before it submits any work for the same options, and returns the same error that it
         /// would return for them. [`Session::place`] calls this function for every leaf of a tree before it places any
@@ -440,27 +441,24 @@ mod sealed {
             true
         }
 
-        /// Prepares `parameters` in place after [`Session::place`] validates every leaf and before placing any
-        /// leaf. A replacement must satisfy the options already validated for its position. For example, a mixed
-        /// [`PlaceInput`](super::PlaceInput) tree lifts host values into its compilation trace. `requests` returns the
-        /// target and the source of a leaf, for a check that needs the whole tree (e.g., one that depends on the trace
-        /// that the leaves join), and `path` returns the path of a leaf. The default implementation leaves the slice
-        /// unchanged.
+        /// Prepares the parameters of `arguments` in place after [`Session::place`] validates every leaf and before
+        /// placing any leaf. A replacement must satisfy its argument's validated options. For example, a mixed
+        /// [`PlaceInput`](super::PlaceInput) tree lifts host values into its compilation trace. `path` returns the
+        /// path of a leaf by its index. The default implementation leaves the arguments unchanged.
         ///
         /// # Errors
         ///
         /// Returns the error of the first leaf that cannot be prepared, or an error of the whole tree.
         #[inline]
-        fn prepare_parameters(
-            parameters: &mut [Self],
+        fn prepare_arguments(
+            arguments: &mut [PlacementArgument<Self>],
             session: &Session,
-            requests: &dyn Fn(usize) -> (Option<PlacementRequest>, Option<PlacementRequest>),
             path: &dyn Fn(usize) -> ParameterPath,
         ) -> Result<(), Error>
         where
             Self: Sized,
         {
-            let _ = (parameters, session, requests, path);
+            let _ = (arguments, session, path);
             Ok(())
         }
     }
@@ -829,9 +827,9 @@ fn host_upload_destination(
             let layout = placement.layout().cloned();
             (placement, layout)
         }
-        Some(PlacementRequest::Device { device, layout, .. }) => (single_device_placement(device, rank)?, layout),
-        Some(PlacementRequest::InPlace { layout, .. }) => (single_device_placement(default_device()?, rank)?, layout),
-        None => (single_device_placement(default_device()?, rank)?, None),
+        Some(PlacementRequest::Device { device, layout, .. }) => (Placement::single_device(device, rank), layout),
+        Some(PlacementRequest::InPlace { layout, .. }) => (Placement::single_device(default_device()?, rank), layout),
+        None => (Placement::single_device(default_device()?, rank), None),
     };
     Ok((r#type.clone().with_memory(memory).with_layout(layout), placement))
 }
@@ -1042,7 +1040,7 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         }
 
         // One leaf does not see the trace that its tree joins, so this check assumes the capture placement of a
-        // compiled function. `Self::prepare_parameters` checks the leaves again for a trace that preserves it.
+        // compiled function. `Self::prepare_arguments` checks the leaves again for a trace that preserves it.
         self.validate_placement_in_trace(session, target, source, CapturePlacement::FollowCall)
     }
 
@@ -1055,19 +1053,18 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         }
     }
 
-    fn prepare_parameters(
-        parameters: &mut [Self],
+    fn prepare_arguments(
+        arguments: &mut [PlacementArgument<Self>],
         session: &Session,
-        requests: &dyn Fn(usize) -> (Option<PlacementRequest>, Option<PlacementRequest>),
         path: &dyn Fn(usize) -> ParameterPath,
     ) -> Result<(), Error> {
-        if parameters.is_empty() {
+        if arguments.is_empty() {
             return Ok(());
         }
 
         // The first tracer supplies the context into which the host and concrete leaves are imported.
         // Every other tracer must share its builder so that all leaves belong to one program.
-        let mut traced = parameters.iter().filter_map(|parameter| match parameter {
+        let mut traced = arguments.iter().filter_map(|argument| match &argument.parameter {
             Self::Host(_) | Self::Concrete(_) => None,
             Self::Runtime(value) => Some(value),
         });
@@ -1095,14 +1092,14 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         // which the check of each leaf did not assume, so a placement that this type rejects is reported before any
         // leaf is uploaded or enters the trace, where a failed placement would stay recorded.
         if context.capture_placement() == CapturePlacement::Preserve {
-            for (index, parameter) in parameters.iter().enumerate() {
-                if matches!(parameter, Self::Host(_) | Self::Concrete(_)) {
-                    let (target, source) = requests(index);
-                    parameter
+            for (index, argument) in arguments.iter().enumerate() {
+                if matches!(argument.parameter, Self::Host(_) | Self::Concrete(_)) {
+                    argument
+                        .parameter
                         .validate_placement_in_trace(
                             session,
-                            target.as_ref(),
-                            source.as_ref(),
+                            argument.target.as_ref(),
+                            argument.source.as_ref(),
                             CapturePlacement::Preserve,
                         )
                         .map_err(|error| with_parameter_path(error, || path(index)))?;
@@ -1112,14 +1109,14 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
 
         // Upload each host leaf on the default device and bind concrete arrays to the session before adding
         // them as captures in the existing compilation trace.
-        for (index, parameter) in parameters.iter_mut().enumerate() {
-            let array = match parameter {
+        for (index, argument) in arguments.iter_mut().enumerate() {
+            let array = match &argument.parameter {
                 Self::Host(value) => value.clone().place_parameter(session, None, None, false, None),
                 Self::Concrete(value) => value.clone().place_parameter(session, None, None, false, None),
                 Self::Runtime(_) => continue,
             };
 
-            *parameter = Self::Runtime(
+            argument.parameter = Self::Runtime(
                 array
                     .and_then(|array| {
                         Ok(ImportingContext::<Session, ThroughParent<ThroughCapture>>::import(
@@ -1216,17 +1213,17 @@ impl Session {
     /// The input `x` may be one supported leaf or a [`Parameterized`] tree of supported leaves (i.e., of
     /// [`Placeable`]s). Any provided `target`, `source`, `donate`, and `may_alias` options follow tree prefix
     /// broadcasting semantics over `x`. The destination and source prefixes accept [`Placement`], [`PlacementRequest`],
-    /// bare [`Device`], bare [`Memory`](ryft_core::Memory), and bare [`Sharding`] leaves, so a destination can be one
-    /// device (refer to [`PlacementRequest::Device`]) or a memory that leaves every leaf on its devices (refer to
-    /// [`PlacementRequest::InPlace`]). Either can be optional, so a tree can mix explicit placements with `None` to
-    /// omit an option on a branch. A tree has one leaf type, so a tree that mixes host values and [`Array`]s holds them
-    /// as [`PlaceInput`]s, and so does a tree that mixes host values and traced values inside a compiled or staged
-    /// function, whose host leaves become constants of the trace of its traced leaves and are then placed like those
-    /// (refer to [`PlaceInput`]). A prefix leaf may also cover only subtrees without leaves, in which case it places
-    /// nothing (e.g., one of two destinations for an empty [`Vec`] and a scalar, or a single destination for an empty
-    /// [`Vec`]). A bare sharding that reaches an input leaf requires a compatible default mesh, including a source
-    /// for an eager host upload. The upload ignores the resolved source. A host leaf lifted into a trace uses its
-    /// source like other traced leaves. Each option tree is validated against the nodes of `x` (refer to
+    /// bare [`Device`], bare [`Memory`](ryft_core::Memory), and bare [`Sharding`](ryft_core::Sharding) leaves, so a
+    /// destination can be one device (refer to [`PlacementRequest::Device`]) or a memory that leaves every leaf on its
+    /// devices (refer to [`PlacementRequest::InPlace`]). Either can be optional, so a tree can mix explicit placements
+    /// with `None` to omit an option on a branch. A tree has one leaf type, so a tree that mixes host values and
+    /// [`Array`]s holds them as [`PlaceInput`]s, and so does a tree that mixes host values and traced values inside a
+    /// compiled or staged function, whose host leaves become constants of the trace of its traced leaves and are then
+    /// placed like those (refer to [`PlaceInput`]). A prefix leaf may also cover only subtrees without leaves, in which
+    /// case it places nothing (e.g., one of two destinations for an empty [`Vec`] and a scalar, or a single destination
+    /// for an empty [`Vec`]). A bare sharding that reaches an input leaf requires a compatible default mesh, including
+    /// a source for an eager host upload. The upload ignores the resolved source. A host leaf lifted into a trace uses
+    /// its source like other traced leaves. Each option tree is validated against the nodes of `x` (refer to
     /// [`Parameterized::paths`] and [`Parameterized::broadcast_to_parameter_structure`]), so every node of an option
     /// tree must be a node of `x`, and every node of `x` must be a node of the option tree or lie at or below one of
     /// its leaves (e.g., the destinations `[d]` for an input `[]`, `[[d]]` for `[[x], []]`, `[[d], []]` for `[[x]]`,
@@ -1466,7 +1463,7 @@ impl Session {
         SourcePlacement: SessionPlacementRequestParameter,
         Source: Parameterized<SourcePlacement>,
         Donate: Parameterized<bool>,
-        Aliasing: Parameter + Into<Option<bool>>,
+        Aliasing: Clone + Parameter + Into<Option<bool>>,
         MayAlias: Parameterized<Aliasing>,
     >(
         &self,
@@ -1489,7 +1486,7 @@ impl Session {
         SourcePlacement: SessionPlacementRequestParameter,
         Source: Parameterized<SourcePlacement>,
         Donate: Parameterized<bool>,
-        Aliasing: Parameter + Into<Option<bool>>,
+        Aliasing: Clone + Parameter + Into<Option<bool>>,
         MayAlias: Parameterized<Aliasing>,
     >(
         &self,
@@ -1502,18 +1499,19 @@ impl Session {
     {
         let structure = x.parameter_structure();
         let (target, source, donate, may_alias) = options.into_parts();
-        let target_values = broadcast_placement_option(target, &structure, identity)?;
-        let source_values = broadcast_placement_option(source, &structure, identity)?;
-        let donate_values = broadcast_placement_option(donate, &structure, identity)?;
-        let may_alias_values = broadcast_placement_option(may_alias, &structure, Into::into)?;
+        let target_values = broadcast_placement_option(target, &structure)?;
+        let source_values = broadcast_placement_option(source, &structure)?;
+        let donate_values = broadcast_placement_option(donate, &structure)?;
+        let may_alias_values = broadcast_placement_option(may_alias, &structure)?;
 
         // Resolve only requests that reached a leaf. Preserve the targets of the other leaves if a request fails,
         // so distributed admission can still determine whether this call would otherwise communicate.
         let path = |index: usize| structure.parameter_paths().nth(index).unwrap();
-        let mut parameters = x.into_parameters().collect::<Vec<_>>();
         let mut checked = Ok(());
-        let leaf_options = (0..parameters.len())
-            .map(|index| {
+        let mut arguments = x
+            .into_parameters()
+            .enumerate()
+            .map(|(index, parameter)| {
                 let mut resolve = |result: Result<Option<PlacementRequest>, Error>| match result {
                     Ok(request) => request,
                     Err(error) => {
@@ -1526,45 +1524,33 @@ impl Session {
                 let target = resolve(target_values.get(index).cloned().map_or(Ok(None), |r| r.resolve(self)));
                 let source = resolve(source_values.get(index).cloned().map_or(Ok(None), |r| r.resolve(self)));
                 let donate = donate_values.get(index).copied().unwrap_or_default();
-                let may_alias = may_alias_values.get(index).copied().flatten();
+                let may_alias = may_alias_values.get(index).cloned().and_then(Into::into);
                 if checked.is_ok() {
                     checked =
                         validate_parameter_options(|| path(index), target.as_ref(), source.as_ref(), donate, may_alias);
                 }
-                (target, source, donate, may_alias)
+                PlacementArgument { parameter, context: (), target, source, donate, may_alias }
             })
             .collect::<Vec<_>>();
 
+        // Validate the options of the whole tree before inspecting its values, and validate every value before
+        // preparation can upload host values or import them into a trace.
         let checked = checked
             .and_then(|()| {
-                parameters.iter().zip(&leaf_options).enumerate().try_for_each(
-                    |(index, (parameter, (target, source, donate, may_alias)))| {
-                        parameter
-                            .validate_placement(self, target.as_ref(), source.as_ref(), *donate, *may_alias)
-                            .map_err(|error| with_parameter_path(error, || path(index)))
-                    },
-                )
+                arguments.iter().enumerate().try_for_each(|(index, argument)| {
+                    argument
+                        .parameter
+                        .validate_placement(
+                            self,
+                            argument.target.as_ref(),
+                            argument.source.as_ref(),
+                            argument.donate,
+                            argument.may_alias,
+                        )
+                        .map_err(|error| with_parameter_path(error, || path(index)))
+                })
             })
-            .and_then(|()| {
-                let requests = |index: usize| {
-                    let (target, source, ..) = &leaf_options[index];
-                    (target.clone(), source.clone())
-                };
-                P::prepare_parameters(&mut parameters, self, &requests, &path)
-            });
-
-        let arguments = parameters
-            .into_iter()
-            .zip(leaf_options)
-            .map(|(parameter, (target, source, donate, may_alias))| PlacementArgument {
-                parameter,
-                context: (),
-                target,
-                source,
-                donate,
-                may_alias,
-            })
-            .collect();
+            .and_then(|()| P::prepare_arguments(&mut arguments, self, &path));
 
         let output_parameters = admit_and_place_arguments(
             self,
@@ -1732,7 +1718,7 @@ impl Array {
                     .with_reduced_axes(Vec::<String>::new())?;
                 (Placement::new(mesh, sharding)?, layout)
             }
-            PlacementRequest::Device { device, layout, .. } => (single_device_placement(device, rank)?, layout),
+            PlacementRequest::Device { device, layout, .. } => (Placement::single_device(device, rank), layout),
             PlacementRequest::InPlace { layout, .. } => {
                 (Placement::new(self.mesh().clone(), self.sharding().clone())?, layout)
             }
@@ -1921,13 +1907,6 @@ fn admit_and_place_arguments<P: Placeable, C>(
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns the replicated placement of a value of rank `rank` over the canonical mesh of one device.
-pub(super) fn single_device_placement(device: Device, rank: usize) -> Result<Placement, Error> {
-    let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device])?;
-    let sharding = Sharding::replicated(mesh.logical_mesh().clone(), rank);
-    Ok(Placement::new(mesh, sharding)?)
-}
-
 /// Checks the precondition of [`Placeable::place_parameter`], which rejects the per-leaf options that no leaf accepts
 /// and does not depend on the leaf. [`Session::place`] calls this function for every leaf before it places any leaf,
 /// and every implementation of [`Placeable::place_parameter`] calls it first, with [`ParameterPath::root`] as `path`,
@@ -1999,20 +1978,19 @@ fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Er
 /// Expands an optional placement prefix into its value for each input leaf.
 /// A prefix with one leaf at the root covers the whole input, so it needs no path matching or structure cloning, and
 /// neither it nor an omitted prefix allocates per leaf (refer to [`PlacementOptionValues`]). Structured prefixes
-/// use [`Parameterized::broadcast_parameter_values`] to validate every node, including empty containers.
-fn broadcast_placement_option<Leaf: Parameter, Value: Clone>(
+/// use [`Parameterized::broadcast_parameters`] to validate every node, including empty containers.
+fn broadcast_placement_option<Leaf: Clone + Parameter>(
     prefix: Option<impl Parameterized<Leaf>>,
     structure: &impl Parameterized<Placeholder>,
-    mut convert: impl FnMut(Leaf) -> Value,
-) -> Result<PlacementOptionValues<Value>, Error> {
+) -> Result<PlacementOptionValues<Leaf>, Error> {
     let Some(prefix) = prefix else {
         return Ok(PlacementOptionValues::Uniform(None));
     };
     // A sole parameter below the root still belongs to a structured prefix, so it needs full tree validation.
     if prefix.parameter_count() == 1 && prefix.named_parameters().next().is_some_and(|(path, _)| path.is_root()) {
-        return Ok(PlacementOptionValues::Uniform(Some(convert(prefix.into_parameters().next().unwrap()))));
+        return Ok(PlacementOptionValues::Uniform(prefix.into_parameters().next()));
     }
-    Ok(PlacementOptionValues::PerParameter(prefix.broadcast_parameter_values(structure, convert)?))
+    Ok(PlacementOptionValues::PerParameter(prefix.broadcast_parameters(structure)?))
 }
 
 #[cfg(test)]
@@ -2491,7 +2469,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             split_array.resolve_placement_request(destination(devices[1])).unwrap(),
-            single_device_placement(devices[1], 1).unwrap().with_memory(memory),
+            Placement::single_device(devices[1], 1).with_memory(memory),
         );
 
         // A device target without a memory selects the default memory of its device, as JAX's `device_put` does,
@@ -3937,10 +3915,10 @@ mod tests {
 
         // Omitted and root options are stored once even when the input has many parameters.
         let structure = input.parameter_structure();
-        let expansion = broadcast_placement_option(None::<PlacementRequest>, &structure, identity);
+        let expansion = broadcast_placement_option(None::<PlacementRequest>, &structure);
         assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(None))));
-        let expansion = broadcast_placement_option(Some(false), &structure, Option::from);
-        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(Some(false))))));
+        let expansion = broadcast_placement_option(Some(false), &structure);
+        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(false)))));
 
         // Already resident leaves without any option stay where they are.
         let placed = session.place(input.clone(), PlacementOptions::default()).unwrap();
@@ -3985,15 +3963,14 @@ mod tests {
         }
 
         impl PlaceableParameter<u8> for Leaf {
-            fn prepare_parameters(
-                parameters: &mut [Self],
+            fn prepare_arguments(
+                arguments: &mut [PlacementArgument<Self>],
                 session: &Session,
-                requests: &dyn Fn(usize) -> (Option<PlacementRequest>, Option<PlacementRequest>),
                 path: &dyn Fn(usize) -> ParameterPath,
             ) -> Result<(), Error> {
-                let _ = (session, requests, path);
-                for parameter in parameters {
-                    parameter.0 += 1;
+                let _ = (session, path);
+                for argument in arguments {
+                    argument.parameter.0 += 1;
                 }
                 Ok(())
             }
@@ -4593,7 +4570,7 @@ mod tests {
             .unwrap()
         };
         let (matrix, vector) = (upload(&[2, 2]), upload(&[2]));
-        let matrix_placement = single_device_placement(vector.mesh().devices()[0], 2).unwrap();
+        let matrix_placement = Placement::single_device(vector.mesh().devices()[0], 2);
         let empty = PlacementRequest::InPlace { memory: None, layout: None };
         let target_message = "`place` in-place target must name a memory or a layout";
         let rank_message = "`place` target sharding rank (2) does not match the input rank (1)";

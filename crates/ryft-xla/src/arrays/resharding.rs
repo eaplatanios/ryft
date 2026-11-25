@@ -208,7 +208,6 @@ use crate::arrays::host::{
     validate_mesh_devices, validate_one_value_per_contribution,
 };
 use crate::arrays::metadata::ArrayMetadata;
-use crate::arrays::placement::single_device_placement;
 use crate::arrays::shards::{
     ArrayShard, ShardContribution, ShardDescriptor, ShardIndex, ShardLayout, read_shard_to_host,
 };
@@ -2091,7 +2090,7 @@ impl Array {
         device: Device,
         buffer: Arc<Buffer<'static>>,
     ) -> Result<Self, Error> {
-        let placement = single_device_placement(device, r#type.rank())?;
+        let placement = Placement::single_device(device, r#type.rank());
         let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
         let r#type = if r#type.layout().is_some() {
             r#type

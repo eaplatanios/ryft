@@ -1044,6 +1044,7 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// have no prefix leaf, in the order of [`Self::paths`]. Otherwise, it returns
     /// [`ParameterError::UnusedParameters`] with the sorted paths of the prefix leaves that are not node paths of
     /// `structure` and that have no such prefix leaf below them.
+    #[inline]
     fn from_broadcasted_named_parameters<I: IntoIterator<Item = (ParameterPath, P)>>(
         structure: Self::ParameterStructure,
         parameters: I,
@@ -1051,29 +1052,30 @@ pub trait Parameterized<P: Parameter>: Sized {
     where
         P: Clone,
     {
-        broadcast_named_parameters(structure, parameters, None)
+        let values = broadcast_named_parameters(&structure, parameters, None)?;
+        Self::from_parameters(structure, values)
     }
 
-    /// Broadcasts this [`Parameterized`] value, as a tree prefix, into the provided target `structure`, returning a new
-    /// value of type `T`. Each leaf of `structure` receives the value of its most specific prefix leaf (i.e., the leaf
+    /// Broadcasts this [`Parameterized`] value, as a tree prefix, into the provided `target` structure, returning a new
+    /// value of type `T`. Each leaf of `target` receives the value of its most specific prefix leaf (i.e., the leaf
     /// of this value whose path is the longest prefix of its path). The nodes of both trees (refer to [`Self::paths`])
     /// are matched by path, including the containers without leaves, and as in the tree prefix checks of JAX, the
     /// following rules apply to them:
     ///
-    ///   - Every leaf of `structure` must have a leaf of this value whose path is equal to or a prefix of its path.
-    ///   - Every node path of this value must be a node path of `structure`.
-    ///   - Every node path of `structure` must be a node path of this value or lie at or below a leaf of this value.
-    ///   - Distinct nodes of this value must have distinct paths, and so must distinct nodes of `structure`, except
+    ///   - Every leaf of `target` must have a leaf of this value whose path is equal to or a prefix of its path.
+    ///   - Every node path of this value must be a node path of `target`.
+    ///   - Every node path of `target` must be a node path of this value or lie at or below a leaf of this value.
+    ///   - Distinct nodes of this value must have distinct paths, and so must distinct nodes of `target`, except
     ///     strictly below a leaf of this value, which gives the same value to all the nodes below it.
     ///
     /// For example, `(a, b)` is a prefix of `(Vec::new(), x)`, a single leaf is a prefix of an empty [`Vec`], `[a, b]`
     /// is a prefix of `[[x], []]`, and `[[], b]` is a prefix of `[[], y]`. In contrast, `[a]` and `[[a]]` are not
     /// prefixes of `[[x], []]`, which has the node `$[1]` that they lack and that none of their leaves covers, and
     /// `[[a], []]` is not a prefix of `[[x]]`, nor is `[[]]` a prefix of `[]`, because each has a node (i.e., `$[1]`
-    /// and `$[0]`, respectively) that the structure lacks. These checks apply to containers without leaves in both
+    /// and `$[0]`, respectively) that the target lacks. These checks apply to containers without leaves in both
     /// directions. [`Self::from_broadcasted_named_parameters`] broadcasts the named leaves of a tree prefix without
-    /// its containers instead, and so it cannot check the nodes of `structure` without leaves. Note that since one
-    /// leaf of this value may need to populate multiple leaves of `structure`, this function requires `P: Clone`. For
+    /// its containers instead, and so it cannot check the nodes of `target` without leaves. Note that since one
+    /// leaf of this value may need to populate multiple leaves of `target`, this function requires `P: Clone`. For
     /// fully worked examples, refer to the examples provided in the top-level documentation of the [`Parameterized`]
     /// trait.
     ///
@@ -1086,31 +1088,52 @@ pub trait Parameterized<P: Parameter>: Sized {
     /// Nodes are matched by their paths only, which is intended. This value may therefore have another type than `T`
     /// whose nodes have the same paths (e.g., a derived struct with the same parameter fields as `T`, or an array for
     /// a [`Vec`]), and a node of the same type whose static metadata (i.e., the values of its non-parameter fields)
-    /// differs also matches, in which case the result takes that metadata from `structure`.
+    /// differs also matches, in which case the result takes that metadata from `target`.
     ///
     /// # Errors
     ///
-    /// Returns [`ParameterError::DuplicateParameterPaths`] when this value or, after it, `structure` has nodes that
+    /// Returns [`ParameterError::DuplicateParameterPaths`] when this value or, after it, `target` has nodes that
     /// violate the fourth rule, with the sorted duplicated paths. Otherwise, it returns
-    /// [`ParameterError::MissingParameters`] when `structure` has nodes that violate the first or the third rule. The
+    /// [`ParameterError::MissingParameters`] when `target` has nodes that violate the first or the third rule. The
     /// descendants of such a node violate them too, and so the error only lists the paths of the violating nodes
     /// without violating children (e.g., the leaves without a leaf of this value above them and the containers
     /// without children that this value does not reach, such as `$[1]` for the prefix `[[a]]` of `[[x], []]`), in the
     /// order of [`Self::paths`]. Otherwise, it returns [`ParameterError::UnusedParameters`] when this value has nodes
     /// that violate the second rule, with the sorted paths of the violating nodes without violating children (e.g.,
     /// `$[0]` for the prefix `[[]]` of `[]`).
+    #[inline]
     fn broadcast_to_parameter_structure<T: Parameterized<P>>(
         &self,
-        structure: T::ParameterStructure,
+        target: T::ParameterStructure,
     ) -> Result<T, ParameterError>
     where
         P: Clone,
     {
-        broadcast_named_parameters(
-            structure,
+        let values = broadcast_named_parameters(
+            &target,
             self.named_parameters().map(|(path, parameter)| (path, parameter.clone())),
             Some(self.paths()),
-        )
+        )?;
+        T::from_parameters(target, values)
+    }
+
+    /// Broadcasts this [`Parameterized`] value, as a tree prefix, over `target` and returns the values that the leaves
+    /// of `target` receive, in the order of its leaves. Each leaf of `target` receives a clone of its most specific
+    /// prefix leaf, as in [`Self::broadcast_to_parameter_structure`], which builds a parameterized value from the same
+    /// values. This function is for callers that consume the values directly, and it needs `target` only as a tree of
+    /// [`Placeholder`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::broadcast_to_parameter_structure`], including those of the checks for containers
+    /// without leaves and for duplicate paths.
+    #[inline]
+    fn broadcast_parameters<S: Parameterized<Placeholder>>(self, target: &S) -> Result<Vec<P>, ParameterError>
+    where
+        P: Clone,
+    {
+        let prefix_node_paths = self.paths();
+        broadcast_named_parameters(target, self.into_named_parameters(), Some(prefix_node_paths))
     }
 
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided fallible `map_fn` to a [`Parameter`]
@@ -1441,17 +1464,16 @@ pub(crate) fn find_duplicate_paths<'p, P: IntoIterator<Item = &'p ParameterPath>
     duplicate_paths
 }
 
-/// Reconstructs a value of type `T` having the provided `structure` from a tree prefix of it, which is
-/// given as its leaves, `parameters`, and optionally as its nodes, `prefix_node_paths` (i.e., the paths that
-/// [`Parameterized::paths`] returns for it, which include the paths of its leaves). This is the shared implementation
-/// of [`Parameterized::broadcast_to_parameter_structure`], which provides the node paths and applies all of its rules,
-/// and of [`Parameterized::from_broadcasted_named_parameters`], which does not provide them and so skips only the check
-/// that the nodes of `structure` without leaves are nodes of the prefix tree or lie below one of its leaves.
-fn broadcast_named_parameters<P: Clone + Parameter, T: Parameterized<P>>(
-    structure: T::ParameterStructure,
-    parameters: impl IntoIterator<Item = (ParameterPath, P)>,
+/// Returns the values of a tree prefix in the parameter order of `structure`. The prefix is given as its named
+/// `parameters` and optionally as its `prefix_node_paths` (i.e., the paths that [`Parameterized::paths`] returns for
+/// it, including the paths of its leaves). [`Parameterized::from_broadcasted_named_parameters`] supplies only the
+/// named parameters, so it skips the check that nodes of `structure` without leaves are also nodes of the prefix or
+/// lie below one of its leaves.
+fn broadcast_named_parameters<S: Parameterized<Placeholder>, T: Clone, P: IntoIterator<Item = (ParameterPath, T)>>(
+    structure: &S,
+    parameters: P,
     prefix_node_paths: Option<Vec<ParameterPath>>,
-) -> Result<T, ParameterError> {
+) -> Result<Vec<T>, ParameterError> {
     // This function uses a small local prefix trie to resolve each path to the most specific prefix leaf (i.e.,
     // the longest matching prefix) in path-depth time, instead of scanning all prefix leaves for every path.
     // That is usually much faster when many prefix leaves are provided, at the cost of the additional trie
@@ -1594,7 +1616,7 @@ fn broadcast_named_parameters<P: Clone + Parameter, T: Parameterized<P>>(
         return Err(ParameterError::UnusedParameters { paths: Some(unused_paths) });
     }
 
-    T::from_parameters(structure, values)
+    Ok(values)
 }
 
 /// Iterator adapter that prefixes each yielded [`ParameterPath`] with a stored [`ParameterPathSegment`]. This exists as
@@ -3676,6 +3698,24 @@ mod tests {
         assert_eq!(
             prefix.broadcast_to_parameter_structure::<BTreeMap<&str, Vec<i32>>>(target),
             Ok(BTreeMap::from([(key.as_str(), vec![7; 2])])),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_broadcast_parameters() {
+        // Each leaf of the target receives the value of its most specific prefix leaf, in the order of the target.
+        let target = (vec![Placeholder; 2], (Placeholder, Vec::<Placeholder>::new()));
+        let prefix = (false, (true, Vec::<bool>::new()));
+        assert_eq!(prefix.broadcast_parameters(&target), Ok(vec![false, false, true]));
+
+        // An omitted empty container is still a missing node, and an extra empty container is still an unused node.
+        assert_eq!(
+            vec![true].broadcast_parameters(&vec![vec![Placeholder], Vec::new()]),
+            Err(ParameterError::MissingParameters { expected_count: 1, paths: Some(vec!["$[1]".to_string()]) }),
+        );
+        assert_eq!(
+            vec![vec![true], Vec::new()].broadcast_parameters(&vec![vec![Placeholder]]),
+            Err(ParameterError::UnusedParameters { paths: Some(vec!["$[1]".to_string()]) }),
         );
     }
 
