@@ -562,65 +562,8 @@ mod sealed {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validates the destination `target` of the upload of a host value whose element type and static shape `r#type`
-/// describes, and returns it with a sharding that is padded to the rank of the value. The upload of a host value onto
-/// a destination is the placement of a value that has no tracked sharding and lives in device memory without a
-/// declared layout, which is how a host value is uploaded without a destination, so the type rule of
-/// [`PlaceOperation`] validates the destination against that type before anything is uploaded, except that the
-/// destination may split a dimension unevenly (refer to [`Session::place`]).
-fn validate_host_target(
-    r#type: &ArrayType,
-    target: Option<PlacementRequest>,
-) -> Result<Option<PlacementRequest>, Error> {
-    let target = target.map(|target| target.padded(r#type.rank())).transpose()?;
-    if let Some(target) = &target {
-        PlaceOperation::infer_output_type_allowing_uneven_splits(r#type, None, Some(target), None)?;
-    }
-    Ok(target)
-}
-
-/// Returns the type, with the memory and the layout of the destination, and the placement of the upload of a host
-/// value whose element type and static shape `r#type` describes onto the destination `target`, which
-/// [`validate_host_target`] returned. A destination that names no devices (i.e., an in-place one or none) uploads
-/// the value onto the device that `default_device` returns, which is only called for such a destination.
-fn host_upload_destination(
-    r#type: &ArrayType,
-    target: Option<PlacementRequest>,
-    default_device: impl FnOnce() -> Result<Device, Error>,
-) -> Result<(ArrayType, Placement), Error> {
-    let rank = r#type.rank();
-    let memory = target.as_ref().and_then(PlacementRequest::target_memory).unwrap_or_default();
-    let (placement, layout) = match target {
-        Some(PlacementRequest::Resolved(placement)) => {
-            let layout = placement.layout().cloned();
-            (placement, layout)
-        }
-        Some(PlacementRequest::Device { device, layout, .. }) => (single_device_placement(device, rank)?, layout),
-        Some(PlacementRequest::InPlace { layout, .. }) => (single_device_placement(default_device()?, rank)?, layout),
-        None => (single_device_placement(default_device()?, rank)?, None),
-    };
-    Ok((r#type.clone().with_memory(memory).with_layout(layout), placement))
-}
-
-/// Returns the device onto which a host value is uploaded when its destination names no devices, which is the default
-/// device of `session` (refer to [`Session::with_default_device`]), as `jax.device_put` uploads such a value onto the
-/// device of `jax.default_device`, or otherwise the first of the `addressable_devices` of its client, whether or not
-/// `session` has a default mesh, as `jax.device_put` keeps such a value on its default device under `jax.set_mesh`.
-/// That includes the anonymous mesh of one device that [`Session::with_device_mesh`] gives, which every process shares
-/// like any other mesh (pinned JAX keeps the value on its default device under `jax.set_mesh` of a mesh without axes
-/// too). The choice reads only what the caller asked for (refer to `Session::default_device_mesh`), so every process
-/// uploads such a value onto a device of its own, uncommitted and locally assigned, for both kinds of handle.
-fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'static>]) -> Result<Device, Error> {
-    if let Some(mesh) = session.default_device_mesh() {
-        return Ok(mesh.devices()[0]);
-    }
-    let device = addressable_devices.first().ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
-    Ok(Device::from_pjrt(device)?)
-}
-
 impl PlaceableParameter<Array> for Array {
+    #[inline]
     fn validate_placement(
         &self,
         session: &Session,
@@ -657,15 +600,18 @@ impl PlaceableParameter<Array> for Array {
         if self.is_locally_assigned() || !std::ptr::eq(self.client(), session.client()) {
             return false;
         }
+
         let Some(target) = target else {
             return false;
         };
+
         // In-place requests only change storage on the source devices. Explicit destinations may move shards.
         let target_devices = match target {
             PlacementRequest::Resolved(placement) => placement.mesh().devices(),
             PlacementRequest::Device { device, .. } => std::slice::from_ref(device),
             PlacementRequest::InPlace { .. } => return false,
         };
+
         resolve_array_placement(target.clone(), self).map_or_else(
             |_| {
                 // If resolution fails, conservatively identify potential peers from the source mesh and the
@@ -680,6 +626,7 @@ impl PlaceableParameter<Array> for Array {
 impl Placeable for Array {
     type Output = Array;
 
+    #[inline]
     fn place_parameter(
         self,
         session: &Session,
@@ -692,6 +639,8 @@ impl Placeable for Array {
         self.execute_array_placement(session, target, donate, may_alias)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Executes an admitted placement using the same copy and completion rules for both eager entry points.
@@ -761,7 +710,7 @@ impl Array {
     }
 }
 
-macro_rules! impl_traced_placeable {
+macro_rules! impl_placeable {
     // Implements `Placeable` for a traced value type, whose context records or executes its placement.
     ([$($generics:tt)*] $value:ty where $($bounds:tt)*) => {
         impl<$($generics)*> PlaceableParameter<$value> for $value
@@ -821,39 +770,95 @@ macro_rules! impl_traced_placeable {
     };
 }
 
-impl_traced_placeable!(
+impl_placeable!(
     [C: Context<Type = ArrayType>] Tracer<C>
     where
         Tracer<C>: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
 );
 
-impl_traced_placeable!(
+impl_placeable!(
     [C: Context<Type = ArrayType>] PartialTracer<C>
     where
         PartialTracer<C>:
             ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
 );
 
-impl_traced_placeable!(
+impl_placeable!(
     [C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>] DifferentiationTracer<C, P>
     where
         DifferentiationTracer<C, P>: ConcreteArrays
             + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
 );
 
-impl_traced_placeable!(
+impl_placeable!(
     [C: Context<Type = ArrayType>, P: BatchingPolicy<C>] BatchingTracer<C, P>
     where
         BatchingTracer<C, P>:
             ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
 );
 
-impl_traced_placeable!(
+impl_placeable!(
     [V] ProjectedValue<ArrayType, V>
     where
         ProjectedValue<ArrayType, V>: ConcreteArrays
             + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
 );
+
+/// Validates the destination `target` of the upload of a host value whose element type and static shape `r#type`
+/// describes, and returns it with a sharding that is padded to the rank of the value. The upload of a host value onto
+/// a destination is the placement of a value that has no tracked sharding and lives in device memory without a
+/// declared layout, which is how a host value is uploaded without a destination, so the type rule of
+/// [`PlaceOperation`] validates the destination against that type before anything is uploaded, except that the
+/// destination may split a dimension unevenly (refer to [`Session::place`]).
+fn validate_host_target(
+    r#type: &ArrayType,
+    target: Option<PlacementRequest>,
+) -> Result<Option<PlacementRequest>, Error> {
+    let target = target.map(|target| target.padded(r#type.rank())).transpose()?;
+    if let Some(target) = &target {
+        PlaceOperation::infer_output_type_allowing_uneven_splits(r#type, None, Some(target), None)?;
+    }
+    Ok(target)
+}
+
+/// Returns the type, with the memory and the layout of the destination, and the placement of the upload of a host
+/// value whose element type and static shape `r#type` describes onto the destination `target`, which
+/// [`validate_host_target`] returned. A destination that names no devices (i.e., an in-place one or none) uploads
+/// the value onto the device that `default_device` returns, which is only called for such a destination.
+fn host_upload_destination(
+    r#type: &ArrayType,
+    target: Option<PlacementRequest>,
+    default_device: impl FnOnce() -> Result<Device, Error>,
+) -> Result<(ArrayType, Placement), Error> {
+    let rank = r#type.rank();
+    let memory = target.as_ref().and_then(PlacementRequest::target_memory).unwrap_or_default();
+    let (placement, layout) = match target {
+        Some(PlacementRequest::Resolved(placement)) => {
+            let layout = placement.layout().cloned();
+            (placement, layout)
+        }
+        Some(PlacementRequest::Device { device, layout, .. }) => (single_device_placement(device, rank)?, layout),
+        Some(PlacementRequest::InPlace { layout, .. }) => (single_device_placement(default_device()?, rank)?, layout),
+        None => (single_device_placement(default_device()?, rank)?, None),
+    };
+    Ok((r#type.clone().with_memory(memory).with_layout(layout), placement))
+}
+
+/// Returns the device onto which a host value is uploaded when its destination names no devices, which is the default
+/// device of `session` (refer to [`Session::with_default_device`]), as `jax.device_put` uploads such a value onto the
+/// device of `jax.default_device`, or otherwise the first of the `addressable_devices` of its client, whether or not
+/// `session` has a default mesh, as `jax.device_put` keeps such a value on its default device under `jax.set_mesh`.
+/// That includes the anonymous mesh of one device that [`Session::with_device_mesh`] gives, which every process shares
+/// like any other mesh (pinned JAX keeps the value on its default device under `jax.set_mesh` of a mesh without axes
+/// too). The choice reads only what the caller asked for (refer to `Session::default_device_mesh`), so every process
+/// uploads such a value onto a device of its own, uncommitted and locally assigned, for both kinds of handle.
+fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'static>]) -> Result<Device, Error> {
+    if let Some(mesh) = session.default_device_mesh() {
+        return Ok(mesh.devices()[0]);
+    }
+    let device = addressable_devices.first().ok_or_else(|| Error::from(ArrayError::MissingDefaultDevice))?;
+    Ok(Device::from_pjrt(device)?)
+}
 
 /// Input leaf of [`Session::place`] that holds a host value, a runtime [`Array`], or a [`CompileTracer`].
 /// A [`Parameterized`] tree has one leaf type, so use [`PlaceInput`] to mix these values in one call.
