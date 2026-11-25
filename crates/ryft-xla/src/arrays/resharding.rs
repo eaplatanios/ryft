@@ -1,18 +1,15 @@
-//! Placement of runtime [`Array`]s on other devices, shardings, memories, and layouts.
-//!
-//! [`Array::to_placement`] copies an array to a destination and leaves the source usable, and
-//! [`Array::into_placement`] consumes the source so that a compiled reshard may reuse its buffers. Both are the
-//! analogues of `jax.device_put` for arrays that already live on devices, and [`Session::place`] and the placement
-//! operation of `ryft_core` use them for runtime arrays. Host values go through the uploads of [`crate::arrays::host`]
-//! instead. The same device work also moves the inputs of compiled programs and eager operations whose placement
-//! differs from the one that the program needs.
+//! Placement of runtime [`Array`]s on other devices, shardings, memories, and layouts. [`Array::to_placement`] copies
+//! an array to a destination and leaves the source usable, and [`Array::into_placement`] consumes the source so that a
+//! compiled reshard may reuse its buffers. Host values go through the uploads of [`crate::arrays::host`] instead. The
+//! same device work also moves the inputs of compiled programs and eager operations whose placement differs from the
+//! one that the program needs.
 //!
 //! # Strategies
 //!
 //! A placement that keeps the devices and sharding of its source only changes the storage of each shard, copying it
 //! to the requested memory and converting it to the requested layout on its device, or through host memory when that
 //! conversion cannot be compiled. Any other placement chooses one device strategy, which is the first of the
-//! following that applies.
+//! following that applies:
 //!
 //!   1. **Exact Shards:** Every destination shard with elements has the slices of one source shard, and both shardings
 //!      hold one value per slice, or the placement only moves the contributions of a pending reduction or of manual
