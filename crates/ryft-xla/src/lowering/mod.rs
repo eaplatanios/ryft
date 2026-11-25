@@ -1872,8 +1872,8 @@ where
 /// it for `target_platform` (refer to [`has_placement_requests`] and [`placement_requests`]), every output of `region`
 /// being used. This is the one test of whether a program requests a placement, which commitment (refer to
 /// `commits_public_outputs` in `crate::compilation::domains`), whether a compiled function names the devices of its
-/// mesh, the replay of a call, and partial evaluation all read. It reads the requests that [`placement_requests`]
-/// retains with `region`, so it analyses each region once for each platform.
+/// mesh, the placement decision of an eager call, and partial evaluation all read. It reads the requests that
+/// [`placement_requests`] retains with `region`, so it analyses each region once for each platform.
 pub(crate) fn has_placement_requests_in_region<V, O>(
     region: RegionRef<'_, V, O>,
     target_platform: Option<&str>,
@@ -2251,8 +2251,8 @@ impl<'t> DeviceNamingAnalysis<'t> {
 /// the regions of an instruction whose lowering omits them for `target_platform` (refer to [`omits_regions`]), as
 /// lowering never emits those regions, while [`None`] omits only the body of a scan whose length admits no iteration,
 /// which no target emits. The requests are read from the summary of `region` (refer to [`region_placement_summary`]),
-/// so every later analysis of the same region and platform (e.g., of the callee of each application of a call that
-/// region replay or partial evaluation forwards) only looks them up.
+/// so every later analysis of the same region and platform (e.g., of the callee of each eager application of a call or
+/// of a call that partial evaluation forwards) only looks them up.
 pub(crate) fn placement_requests<V, O>(
     region: RegionRef<'_, V, O>,
     target_platform: Option<&str>,

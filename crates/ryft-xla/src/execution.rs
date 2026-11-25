@@ -1906,7 +1906,7 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
 /// must never reach PJRT, and nothing else tells them apart, because two clients can number their devices alike, so
 /// that the mesh, the sharding, and the layout of such an array can match those that a call expects. This is the client
 /// admission of every call boundary: of an execution (refer to `Session::prepare_compiled_execution`) and of an eager
-/// call or its region replay (refer to `JitCallOperation::eager_decision`), so that they reject such an array alike.
+/// call (refer to `JitCallOperation::eager_decision`), so that they reject such an array alike.
 pub(crate) fn validate_input_clients<'a>(
     session: &Session,
     inputs: impl IntoIterator<Item = Option<&'a Array>>,

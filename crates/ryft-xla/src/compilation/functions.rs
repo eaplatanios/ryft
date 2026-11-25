@@ -40,9 +40,9 @@
 //!     argument is or when the function requests a placement. A function compiled for the lowering session's
 //!     process-local default device retains that assignment when it uses its anonymous mesh. Placement requests
 //!     that name devices use a shared assignment.
-//!   - **Nested.** A call inside another compiled function, inside a region of an eager operation (e.g.,
-//!     `condition`), or replayed inside the eager replay of another call follows its caller. It runs where that
-//!     function, operation, or call runs, and its results are committed as theirs are.
+//!   - **Nested.** A call inside another compiled function or inside a region of an eager operation (e.g.,
+//!     `condition`) is compiled into the computation of its caller and follows it. It runs where that function or
+//!     operation runs, and its results are committed as theirs are.
 //!   - **Pullbacks.** The transposed call of the pullback of an eager VJP carries the function's mesh, with or
 //!     without residuals (e.g., of `x * x` and of `x + x`). The cotangent follows the placement and commitment of
 //!     the transposed call. When the recorded primal output has a named sharding, place the seed on that sharding

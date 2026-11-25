@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayMemberType, ArrayType, Atom, AtomId,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayMemberType, ArrayType, AtomId,
     AttachedRegions, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     CaptureConstant, CastOperation, CompositeKey, Concretizable, ConstrainShardingOperation, Context,
     CotangentAccumulator, CotangentDestinations, Device, DeviceMesh, DifferentiableOperation, DifferentiableType,
@@ -33,15 +33,12 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility,
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
-use ryft_pjrt::ExecutionFence;
 
 use crate::compilation::domains::{
     argument_type, boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
     is_named_mesh, states_boundary_placement,
 };
-use crate::execution::{
-    ExecutionArguments, validate_committed_input_devices, validate_input_clients, validate_input_reduction,
-};
+use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output};
 use crate::lowering::{
@@ -54,8 +51,8 @@ use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{FlatProgram, Operation, Program};
 use crate::{
-    Array, CompileTracer, CompiledFunction, Constant, Dimension, Error, ExecutionError, LowerableOperation,
-    LowerableOperationFamily, Lowerer, LoweringError, Options, RetainedArray, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    Session, Type, Value,
 };
 
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
@@ -4345,7 +4342,8 @@ mod tests {
             inputs: &[Value],
         ) -> Result<Vec<Value>, ProgramError> {
             let _ = (context, inputs);
-            let message = format!("the driver rejects `{}` with region count {}", operation.name(), regions.region_count());
+            let message =
+                format!("the driver rejects `{}` with region count {}", operation.name(), regions.region_count());
             Err(ProgramError::InvalidArgument { message })
         }
     }
@@ -10924,10 +10922,11 @@ mod tests {
             let mut inputs = caller.source_program().captures().to_vec();
             inputs.push(Value::Array(input));
             let driver = RejectingBindDriver(EagerInterpretationDriver::new(&regions));
-            let bound = operation.interpret(&session, &driver, &inputs).map(|outputs| outputs.len());
+            let bound = operation.interpret(&session, &driver, &inputs).map_err(|error| error.to_string());
+            let expected = Err("the driver rejects `jit_call` with region count 1".to_string());
             assert_eq!(
-                (inputs.len(), bound.map_err(|error| error.to_string())),
-                (if reads_capture { 2 } else { 1 }, Err("the driver rejects `jit_call` with region count 1".to_string())),
+                (inputs.len(), bound.map(|outputs| outputs.len())),
+                (if reads_capture { 2 } else { 1 }, expected),
             );
         }
     }
@@ -10957,7 +10956,8 @@ mod tests {
         let call = JitCallOperation::new(0);
         let expected = "`jit_call` carries reference state that XLA eager execution cannot lower; discharge references \
                         before lowering";
-        let bound = session.bind(Operation::JitCall(call.clone()), AttachedRegions::Callees(&[callee.clone()]), &inputs);
+        let bound =
+            session.bind(Operation::JitCall(call.clone()), AttachedRegions::Callees(&[callee.clone()]), &inputs);
         assert!(matches!(bound, Err(ProgramError::UnsupportedOperation { message }) if message == expected));
         let interpreted = call.interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs);
         assert!(matches!(interpreted, Err(ProgramError::UnsupportedOperation { message }) if message == expected));

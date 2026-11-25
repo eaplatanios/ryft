@@ -32,9 +32,9 @@
 //! input sharding overrides.
 //!
 //! [`LoweredProgram`](crate::LoweredProgram) contains StableHLO and the metadata needed for compilation.
-//! [`CompiledProgram`] contains the loaded executable and its invocation contract. These flat artifacts are distinct
-//! from the typed function handles in [`crate::compilation::functions`], which also retain input and output container
-//! structures. The session's [`CompilationCache`] coordinates artifact reuse, and
+//! [`CompiledProgram`](crate::CompiledProgram) contains the loaded executable and its invocation contract. These flat
+//! artifacts are distinct from the typed function handles in [`crate::compilation::functions`], which also retain input
+//! and output container structures. The session's [`CompilationCache`] coordinates artifact reuse, and
 //! [`CompilationKey`](crate::CompilationKey) records the exact computation and compilation configuration.
 //! [`CompilationAnalysis`](crate::CompilationAnalysis) and [`OptimizedProgram`](crate::OptimizedProgram)
 //! expose compiler diagnostics for a compiled program.
@@ -100,12 +100,13 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ryft_core::macros::check_count;
 use ryft_core::{
     Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Atom, AttachedRegions, COMPOSITE_OPERATION_NAME,
-    CapturePlacementContext, CapturingContext, CastType, Compare, CompilationCache, Concretizable,
+    CapturePlacement, CapturePlacementContext, CapturingContext, CastType, Compare, CompilationCache, Concretizable,
     Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar,
     DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext,
     EffectClass, EmptyRegionDriver, ImportingContext, InputRegionProvenance, InterpretableOperation, LogicalMesh,
@@ -118,10 +119,11 @@ use ryft_core::{
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
 
-use crate::arrays::host::HostUploadWorkers;
+use crate::arrays::host::{HostUploadWorkers, ValueComparison, validate_mesh_devices};
 use crate::arrays::statistics::ArrayTracker;
-use crate::compilation::domains::{declared_input_sharding, placed_constant};
+use crate::compilation::domains::{captured_type, declared_input_sharding, is_named_mesh, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
+use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::{
     RequestedPlacement, emitted_regions, merge_requested_placement, owned_session_constants, placement_requests,
     render_devices, requested_placement_mesh,
@@ -133,7 +135,7 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
-    Array, ArrayShard, ArrayStatistics, CompiledProgram, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
+    Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
     LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
@@ -153,7 +155,7 @@ pub use targets::{Target, TargetDevice};
 
 /// Represents errors produced while selecting a [`Platform`] or configuring the PJRT client for a [`Session`],
 /// or while using a session that lacks something that an operation needs.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum SessionError {
     #[error("platform `{platform}` is unavailable because `ryft-xla` was built without its `{feature}` feature")]
     UnavailablePlatform { platform: Platform, feature: &'static str },
@@ -163,6 +165,22 @@ pub enum SessionError {
 
     #[error("session has no device mesh")]
     MissingMesh,
+
+    #[error("placement comparison requires a shared native PJRT topology without explicit remote device declarations")]
+    PlacementComparisonUnavailable,
+
+    #[error(
+        "default device `{device}` belongs to process {}, but this session runs in process {process_index} and its \
+         default device must be one of its own; use `Session::with_device_mesh` for a device of another process",
+        device.process_index(),
+    )]
+    ForeignDefaultDevice { device: Device, process_index: usize },
+
+    #[error(
+        "device `{device}` was declared as a remote device, but it belongs to process {process_index}, which is the \
+         process of this session; declare only the devices of other processes as remote"
+    )]
+    LocalRemoteDevice { device: Device, process_index: usize },
 }
 
 /// Default maximum number of compiled operation applications retained in a session's eager dispatch cache, which
@@ -193,7 +211,10 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// request the same configuration. [`SessionBuilder::client`] instead takes a client that the caller created, which
 /// is the extension point for clients that Ryft's XLA backend cannot directly create. Every client of a session lives
 /// for the rest of the process and is never destroyed, which is why sessions and their values carry no lifetime for
-/// their underlying clients. [`Self::mesh`] creates device meshes over the devices of the client.
+/// their underlying clients. [`Self::mesh`] creates device meshes over the devices of the client. The session is the
+/// authority on which devices exist: [`Self::devices`] lists every device that it knows, which are the devices that its
+/// client lists and the devices of other processes that [`SessionBuilder::remote_devices`] declares, and every function
+/// that accepts a [`Device`] rejects any other one.
 ///
 /// # Shared and Selected State
 ///
@@ -258,8 +279,9 @@ pub struct Session {
     /// State of this session that contains resources shared by every handle of this session.
     state: Arc<SessionState>,
 
-    /// Default device mesh of this handle, which eager binds without array inputs execute on.
-    mesh: Option<DeviceMesh>,
+    /// Default device mesh of this handle, which eager binds without array inputs execute on, together with how it
+    /// was chosen.
+    default_mesh: DefaultMesh,
 
     /// Selected ordering and completion scope, which clones of this handle share and which
     /// [`Self::with_new_effect_scope`] replaces.
@@ -281,6 +303,8 @@ impl Session {
             eager_dispatch_cache_capacity: DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY,
             live_array_tracking: false,
             runtime_extensions: RuntimeExtensions::new(),
+            value_comparison: true,
+            remote_devices: Vec::new(),
         }
     }
 
@@ -299,17 +323,91 @@ impl Session {
 
     /// Returns a handle of this session whose default mesh is `mesh`. Host uploads through [`Array::from_host_buffer`]
     /// and eager operations without array inputs, such as creating constants or zeros, use this mesh when none is
-    /// specified, and their results are then [committed](Array::is_committed) to it. The handle also exposes it through
-    /// [`MeshContext::default_mesh`] for calls like `shard_map(.., None, ..)`. The handle shares the resources and the
-    /// effect scope of this session.
+    /// specified, and their results are then [committed](Array::is_committed) to it and are not locally assigned, also
+    /// on the anonymous mesh of one device, which is a mesh that every process shares like any other (a process-local
+    /// default device is [`Self::with_default_device`]). The handle also exposes it through
+    /// [`MeshContext::default_mesh`] for calls like `shard_map(.., None, ..)`. The handle
+    /// shares the resources and the effect scope of this session.
     ///
     /// In a distributed run, `mesh` must be the same on every process, because the arrays that it places are treated
     /// as arrays whose devices every process knows. A choice of devices that differs between processes is expressible
-    /// only by naming no device (e.g., a session without a default mesh), which leaves the choice to each process
-    /// (refer to [`crate::arrays::resharding`]).
+    /// only by naming no device (e.g., a session without a default mesh) or by a default device of each process (refer
+    /// to [`Self::with_default_device`]), which leaves the choice to each process. Every device of `mesh` must be a
+    /// device that this session knows (refer to [`Self::devices`]). This function does not query the client, so the
+    /// uploads, eager operations, and compilations that use `mesh` check its devices, and they reject a device that
+    /// this session does not know with [`ArrayError::UnknownDevice`] before they submit any work. On a shared mesh of
+    /// one device, pure eager operations with static result shapes run on the owner. Other processes construct result
+    /// metadata and retain the producer dependencies they hold. A nonowner reports an error for effectful operations
+    /// and results whose shapes depend on device execution. This also applies when an eager operand selects the
+    /// singleton mesh.
+    ///
+    /// When `mesh` is a named mesh (i.e., any mesh other than the anonymous mesh of one device,
+    /// [`LogicalMesh::single_device`]), the handle places eager operations as `jax.set_mesh` does. Every operation that
+    /// it binds and that has array operands or captured arrays moves its uncommitted operands onto `mesh` where they
+    /// can move (i.e., when they are replicated or already over the logical mesh of `mesh`), and returns results that
+    /// are committed to the devices of `mesh` and are not locally assigned. Before any work is submitted, it rejects
+    /// an operand that is committed to other devices, an uncommitted operand that cannot move onto those devices, and,
+    /// when either mesh has an explicit axis, an operand that is over another named mesh on the same devices, whether
+    /// it is committed there or stays there because it is split along the axes of that mesh. A result is over `mesh`,
+    /// unless an operand is over another mesh on the same devices that this rule admits (i.e., one without explicit
+    /// axes when `mesh` has none either, or the anonymous mesh of the device of a `mesh` of one device), which the
+    /// result is then over. An operation that names its own devices keeps its own rule and wins (i.e., a call of a
+    /// compiled function, a placement, a `shard_map`, and an operation whose regions request a placement onto devices),
+    /// and operations that are decided on the host (e.g., the size of a dimension) move nothing. The handle reports
+    /// that values follow the computation (refer to [`CapturePlacementContext::capture_placement`]), so the regions of
+    /// an operation (e.g., the body of a `scan`) are traced at the relocatable types of its uncommitted operands, which
+    /// name no mesh, and receive the arrays that they close over without the placement that those only happen to have.
+    /// Such operands and arrays move onto `mesh` whatever their logical mesh. A region that was traced at the type of
+    /// an uncommitted operand over another logical mesh (i.e., one split along the axes of that mesh) is rejected
+    /// before any work is submitted, because the move would change that type. Place such an operand on `mesh` first.
+    /// Refer to [Where Compiled Functions Run](crate::compilation::functions#where-compiled-functions-run) for the
+    /// analogous rule of compiled functions.
     #[inline]
     pub fn with_device_mesh(&self, mesh: DeviceMesh) -> Self {
-        Self { mesh: Some(mesh), ..self.clone() }
+        Self { default_mesh: DefaultMesh::Shared(mesh), ..self.clone() }
+    }
+
+    /// Returns a handle of this session whose default device is `device`, a device of this process, whose default
+    /// mesh is the anonymous mesh of `device` (i.e., [`LogicalMesh::single_device`]) as for [`Self::with_device_mesh`].
+    /// It places values as `jax.default_device(device)` does within its scope. Values that nothing commits go to
+    /// `device` and stay [uncommitted](Array::is_committed). These are host uploads through [`Array::from_host_buffer`]
+    /// without a mesh, the results of eager operations without array operands (e.g., constants and zeros), and the
+    /// results of eager operations whose operands are all uncommitted, which first move onto `device`. A committed
+    /// operand is not moved, so the results of an operation with one stay on its devices, committed, and the
+    /// uncommitted operands follow it there. A placement without a target leaves its input where it is, and one with
+    /// a target places it there, committed. A call of a compiled function runs where its function and arguments say
+    /// (e.g., a function compiled for the mesh of `device` runs there, and its results are uncommitted unless an
+    /// argument is committed). [`Self::place`] uploads a host value without a destination onto `device` as well.
+    /// Because nothing that the handle places is committed, `device` may differ between the processes of a distributed
+    /// run, and the values that it places are locally assigned, like those of a handle without a default mesh. Only
+    /// this process can hold such values, so each process passes a device of its own. A device that every process names
+    /// alike is a mesh that they share, which [`Self::with_device_mesh`] places on with its anonymous mesh, committed,
+    /// on every process alike.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ForeignDefaultDevice`] if `device` belongs to another process,
+    /// [`ArrayError::NonAddressableDevice`] if it is not one of the [addressable devices](Self::addressable_devices),
+    /// [`Error::Pjrt`] if the devices of the client cannot be queried, and a
+    /// [`ShardingError`](ryft_core::ShardingError) if the anonymous mesh of `device` cannot be formed.
+    pub fn with_default_device(&self, device: Device) -> Result<Self, Error> {
+        let process_index = self.client().process_index()?;
+        if device.process_index() != process_index {
+            return Err(SessionError::ForeignDefaultDevice { device, process_index }.into());
+        }
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device])?;
+        validate_mesh_devices(self, &mesh)?;
+        Ok(Self { default_mesh: DefaultMesh::Device(mesh), ..self.clone() })
+    }
+
+    /// Returns an internal handle whose default mesh and assignment come from `source`. It places host uploads and
+    /// eager operations without array inputs or captures on that mesh. Other eager operations follow their operands
+    /// without applying the placement rules of a user-selected mesh or default device.
+    #[inline]
+    pub(crate) fn with_derived_mesh(&self, source: &Array) -> Self {
+        let default_mesh =
+            DefaultMesh::Internal { mesh: source.mesh().clone(), locally_assigned: source.is_locally_assigned() };
+        Self { default_mesh, ..self.clone() }
     }
 
     /// Returns a handle of this session with a new and empty effect scope, which shares the resources of this session
@@ -327,6 +425,48 @@ impl Session {
     #[inline]
     pub fn client(&self) -> &'static Client<'static> {
         self.state.client
+    }
+
+    /// Returns every device that this session knows, sorted by their process indices and then by their identifiers.
+    /// These are the devices that the client of the session lists and the devices of other processes that were declared
+    /// through [`SessionBuilder::remote_devices`], and they are the only devices that the functions of the session
+    /// accept (e.g., in the meshes of uploads, placements, and compiled functions). Obtain devices from this function
+    /// or from [`Self::addressable_devices`] rather than constructing them, so that they name devices that exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried.
+    pub fn devices(&self) -> Result<Vec<Device>, Error> {
+        let mut devices = self
+            .client()
+            .devices()?
+            .iter()
+            .map(Device::from_pjrt)
+            .chain(self.remote_devices().iter().copied().map(Ok))
+            .collect::<Result<Vec<_>, PjrtError>>()?;
+        devices.sort_by_key(|device| (device.process_index(), device.id()));
+        devices.dedup();
+        Ok(devices)
+    }
+
+    // TODO(eaplatanios): Should this be renamed to `local_devices` and `remote_devices` be made public?
+    /// Returns the devices of this process that this session can address, in the order in which the client
+    /// of the session enumerates them. A value that only this process holds (e.g., on the device of
+    /// [`Self::with_default_device`]) must be on one of these devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried.
+    #[inline]
+    pub fn addressable_devices(&self) -> Result<Vec<Device>, Error> {
+        Ok(self.client().addressable_devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns the devices of other processes declared through [`SessionBuilder::remote_devices`],
+    /// sorted by identifier, including any devices the client already lists.
+    #[inline]
+    pub(crate) fn remote_devices(&self) -> &[Device] {
+        &self.state.remote_devices
     }
 
     /// Returns the default [`CompilationOptions`] that every compilation of this [`Session`] forwards to
@@ -383,11 +523,32 @@ impl Session {
     }
 
     /// Returns the default [`DeviceMesh`] of this [`Session`], or [`SessionError::MissingMesh`] if this session has no
-    /// default mesh. Eager binds execute on the mesh of their array inputs and only use this mesh when they have none.
-    /// Refer to [`Self::with_device_mesh`] for more information.
+    /// default mesh. Host uploads without a mesh and eager operations without array operands or captured arrays are
+    /// placed on this mesh. Eager operations with such operands run where their operands are, unless this mesh is a
+    /// named mesh that was set through [`Self::with_device_mesh`], which then places those operations as that function
+    /// describes.
     #[inline]
     pub fn device_mesh(&self) -> Result<&DeviceMesh, Error> {
-        self.mesh.as_ref().ok_or_else(|| Error::from(SessionError::MissingMesh))
+        self.default_mesh.mesh().ok_or_else(|| Error::from(SessionError::MissingMesh))
+    }
+
+    /// Returns the mesh of the default device of this handle (refer to [`Self::with_default_device`]), which is its
+    /// mesh when the user gave it through that function, or [`None`] otherwise. It reads only that recorded choice,
+    /// never which process owns the device, so a handle that [`Self::with_device_mesh`] gave the anonymous mesh of
+    /// one device is a mesh that every process shares, on the process that owns the device and on the others alike.
+    #[inline]
+    pub(crate) fn default_device_mesh(&self) -> Option<&DeviceMesh> {
+        match &self.default_mesh {
+            DefaultMesh::Device(mesh) => Some(mesh),
+            _ => None,
+        }
+    }
+
+    /// Returns whether the process locally chose the default device used by `mesh`.
+    #[inline]
+    pub(crate) fn uses_local_default_device(&self, mesh: &DeviceMesh) -> bool {
+        self.default_mesh.is_locally_assigned()
+            && self.default_mesh.mesh().is_some_and(|default| default.devices() == mesh.devices())
     }
 
     /// Creates a [`Placement`] for `sharding` on this session's [default mesh](Self::device_mesh). Use the placement
@@ -404,6 +565,7 @@ impl Session {
         Ok(Placement::new(self.device_mesh()?.clone(), sharding)?)
     }
 
+    // TODO(eaplatanios): Why does this need `addressable_devices`? Can it not get them from `self.addressable_devices`?
     /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
     /// computed from `inputs` is placed where they live, so the first input's mesh takes precedence over the mesh
     /// configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in enumeration
@@ -412,21 +574,29 @@ impl Session {
     /// [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on sessions without
     /// a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller omits the mesh.
     /// Whether the value is committed to the resolved mesh is decided by [`Self::commits_placement`].
+    /// `addressable_devices` are the addressable devices of the client when the caller has already queried them,
+    /// so that they are queried at most once for one placement, and [`None`] queries them here if they are needed.
     pub(crate) fn device_mesh_for(
         &self,
         inputs: &[Array],
         logical_mesh: Option<&LogicalMesh>,
+        addressable_devices: Option<&[ryft_pjrt::Device<'static>]>,
     ) -> Result<DeviceMesh, ProgramError> {
-        // The eager dispatch cache keys its entries on this same choice between the first input's mesh and the mesh of
-        // this handle, in `Context::bind`. The two must stay in agreement.
-        if let Some(mesh) = inputs.first().map(Array::mesh).or(self.mesh.as_ref()) {
+        // Eager dispatch selects its operand mesh in `Context::bind` and uses the same mesh to key and lower the
+        // compiled operation. It only calls this helper when the operands supply no mesh.
+        if let Some(mesh) = inputs.first().map(Array::mesh).or(self.default_mesh.mesh()) {
             return Ok(mesh.clone());
         }
 
-        let devices = self
-            .client()
-            .addressable_devices()
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let devices = match addressable_devices {
+            Some(devices) => Cow::Borrowed(devices),
+            None => Cow::Owned(
+                self.client()
+                    .addressable_devices()
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?,
+            ),
+        };
+
         if let Some(logical_mesh) = logical_mesh {
             let device_count = logical_mesh.device_count();
             if devices.len() < device_count {
@@ -468,40 +638,51 @@ impl Session {
     /// [`Array::is_committed`]). [`Array::commit_if`] extends this rule for eager results and host uploads without a
     /// mesh, which it also commits when they live on more than one device. The value is committed when its mesh was
     /// chosen on purpose, which is the case when an input or a capture is committed or, without array inputs, when
-    /// this handle has a configured mesh. It is uncommitted when its mesh is only a fallback, which is the case when
-    /// all inputs and captures are uncommitted or, without array inputs and committed captures, when this handle has
-    /// no mesh and the value is placed on devices that the client enumerates first. Values with array inputs are
-    /// placed on the mesh of their inputs rather than on the mesh of this handle, so that mesh does not commit them.
+    /// this handle has a configured mesh that is not a default device (refer to [`Self::with_default_device`]), whose
+    /// values stay uncommitted as under `jax.default_device`. It is uncommitted when its mesh is only a fallback, which
+    /// is the case when all inputs and captures are uncommitted or, without array inputs and committed captures, when
+    /// this handle has no mesh and the value is placed on devices that the client enumerates first. An internal handle
+    /// whose mesh comes from a locally assigned array likewise treats that mesh as a fallback. Values with array inputs
+    /// are placed on the mesh of their inputs rather than on the mesh of this handle, so that mesh does not commit
+    /// them, except that an eager operation that a named mesh of the user places is committed to it by
+    /// `Session::bind` (refer to [`Self::with_device_mesh`]).
     pub(crate) fn commits_placement<'a, I: IntoIterator<Item = &'a Array>>(
         &self,
         inputs: I,
         captures: &[RetainedArray],
     ) -> bool {
         let mut inputs = inputs.into_iter().peekable();
-        let committed = if inputs.peek().is_some() { inputs.any(Array::is_committed) } else { self.mesh.is_some() };
+        let committed = if inputs.peek().is_some() {
+            inputs.any(Array::is_committed)
+        } else {
+            self.default_mesh.mesh().is_some() && !self.default_mesh.is_locally_assigned()
+        };
         committed || captures.iter().any(RetainedArray::is_committed)
     }
 
     /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays `captures`
     /// lives on devices that this process chose on its own (i.e., [`Array::is_locally_assigned`] returns `true`), which
     /// is decided by what selected those devices. This is the one rule of every eager application, including eager
-    /// calls of compiled functions and their region replay (refer to `JitCallOperation::eager_decision`), so that a
-    /// later transfer of the value to another process is planned as a shared transfer whenever every process takes
-    /// part in it. The value is locally assigned only when everything that could have selected its devices was itself
-    /// locally assigned, which errs in the safe direction: a value that is wrongly marked as shared costs a transfer
-    /// plan in which every process takes part, while a value that is wrongly marked as locally assigned is placed by
-    /// each process on its own, so that a process that holds no part of it never sends its data to the others.
+    /// calls of compiled functions (refer to `JitCallOperation::eager_decision`), so that a later transfer of the value
+    /// to another process is planned as a shared transfer whenever every process takes part in it. The value is locally
+    /// assigned only when everything that could have selected its devices was itself locally assigned, which errs in
+    /// the safe direction: a value that is wrongly marked as shared costs a transfer plan in which every process takes
+    /// part, while a value that is wrongly marked as locally assigned is placed by each process on its own, so that a
+    /// process that holds no part of it never sends its data to the others.
     ///
     ///   - When a boundary named the devices (i.e., `named` is set because a call of a function that names devices or a
     ///     live placement request of a region of the operation names devices, whether or not it was needed to select
-    ///     them, e.g., when a committed operand already lives where the request places a value), they are information
+    ///     them, e.g., when a committed operand already lives where the request places a value, or because a named
+    ///     mesh of the user placed the operation, refer to [`Self::with_device_mesh`]), they are information
     ///     that every process shares, so the value is not locally assigned, as a value that a placement onto a device
     ///     is not.
     ///   - When uncommitted inputs moved to the devices of the application (i.e., `moved` is set, refer to
     ///     `Self::place_uncommitted_inputs`), those devices are the devices of the committed inputs and captures, whose
     ///     facts the value takes, or, without committed ones, the [default mesh](Self::device_mesh) of this handle,
-    ///     which every process shares, or the first device of the client, which this process chose on its own. A moved
-    ///     input keeps the fact of the array that it was moved from, which therefore says nothing here.
+    ///     which is shared when explicitly named and local when derived from a locally assigned array or specified
+    ///     with [`Self::with_default_device`]. Without a configured mesh, this process chooses the first device
+    ///     of the client. A moved input keeps the fact of the array that it was moved from, which therefore says
+    ///     nothing here.
     ///   - Otherwise the operation runs on the devices of its array inputs, which its committed captures share (an
     ///     operand on other devices would have moved or would have been rejected), so the value is locally assigned
     ///     exactly when all of its inputs and committed captures are. Without array inputs, it runs on the devices of
@@ -532,7 +713,11 @@ impl Session {
             .map(Array::is_locally_assigned)
             .chain(committed_captures.map(RetainedArray::is_locally_assigned))
             .peekable();
-        if committed.peek().is_some() { committed.all(|local| local) } else { self.mesh.is_none() }
+        if committed.peek().is_some() {
+            committed.all(|local| local)
+        } else {
+            self.default_mesh.mesh().is_none() || self.default_mesh.is_locally_assigned()
+        }
     }
 
     /// Returns whether `other` is a handle of the same underlying [`Session`] as this one (i.e., whether the two share
@@ -660,25 +845,18 @@ impl Session {
         Ok(())
     }
 
-    /// Creates a [`DeviceMesh`] with the provided `axes` over the devices of this session's client. The mesh takes as
-    /// many devices as its axes require, in the order in which the client reports them. In a program with multiple
-    /// processes, these include devices that other processes own.
+    /// Creates a [`DeviceMesh`] with the provided `axes` over the first devices in [`Self::devices`] order.
+    /// The inventory includes remote devices reported by PJRT or declared through [`SessionBuilder::remote_devices`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Pjrt`] if the devices of the client cannot be queried, and a
     /// [`ShardingError`](ryft_core::ShardingError) if `axes` do not form a valid mesh or require more devices than
-    /// the client has.
+    /// this session knows.
     #[inline]
     pub fn mesh<A: IntoIterator<Item = MeshAxis>>(&self, axes: A) -> Result<DeviceMesh, Error> {
         let logical_mesh = LogicalMesh::new(axes.into_iter().collect())?;
-        let devices = self
-            .target()?
-            .devices()
-            .iter()
-            .take(logical_mesh.device_count())
-            .map(TargetDevice::device)
-            .collect();
+        let devices = self.devices()?.into_iter().take(logical_mesh.device_count()).collect();
         Ok(DeviceMesh::new(logical_mesh, devices)?)
     }
 
@@ -754,6 +932,7 @@ impl Session {
     /// ordering and errors. Before submitting ordered I/O, check for input tokens with
     /// [`EffectReservation::wait_for_predecessor_tokens`]. Once PJRT accepts the submission, finish the
     /// handoff with [`EffectReservation::publish`]. Dropping the reservation before handoff cancels it.
+    #[inline]
     pub(crate) fn reserve_effects(&self, devices: Option<&[DeviceId]>) -> Result<EffectReservation, Error> {
         self.effect_scope.reserve(devices)
     }
@@ -764,14 +943,44 @@ impl Session {
     /// soon as its work is enqueued. Dropping the reservation hands off completion tracking to the session, including
     /// when the submitting function returns early. The submission stays pending until the attached work finishes.
     /// If no work was attached, the reservation completes as soon as it is dropped.
+    #[inline]
     pub(crate) fn reserve_work(&self) -> WorkReservation {
         self.state.work.reserve()
     }
 
     /// Returns the [`HostUploadWorkers`] that all handles of this session share, which run the host uploads that
     /// continue in the background after their destination buffers have been handed out.
+    #[inline]
     pub(crate) fn host_upload_workers(&self) -> &HostUploadWorkers {
         &self.state.host_upload_workers
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns whether placements of this session compare the values that the processes of a run place onto a
+    /// destination that all of them share (refer to [`SessionBuilder::value_comparison`]).
+    #[inline]
+    pub(crate) fn compares_values_across_processes(&self) -> bool {
+        self.state.value_comparison
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the participants and transport for comparisons of values of this session, which are discovered once.
+    #[inline]
+    pub(crate) fn comparison_participants(&self) -> Result<Option<&ValueComparison>, Error> {
+        if let Some(comparison) = self.state.comparison_participants.get() {
+            return Ok(comparison.as_ref());
+        }
+        let comparison = ValueComparison::discover(self)?;
+        Ok(self.state.comparison_participants.get_or_init(|| comparison).as_ref())
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the position of the next comparison of values across processes in the sequence of comparisons of this
+    /// session and advances it. Every process of a run that makes the same sequence of comparing placements assigns the
+    /// same position to the same comparison, which its contributed digest binds.
+    #[inline]
+    pub(crate) fn next_value_comparison(&self) -> u64 {
+        self.state.value_comparisons.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Moves the uncommitted arrays among `inputs` to the mesh that an eager operation runs on, given the arrays that
@@ -812,7 +1021,8 @@ impl Session {
     /// `requested` is the mesh that the regions of an operation without committed operands request placements onto
     /// (refer to [`requested_placement_mesh`]), which is then the target mesh instead, so that every uncommitted input
     /// that lives elsewhere moves there by the rules above, as the uncommitted arguments of an eager call of a function
-    /// that names devices move onto its mesh.
+    /// that names devices move onto its mesh. It is also the mesh of this handle for an operation without committed
+    /// operands that a named mesh of the user places.
     pub(crate) fn place_uncommitted_inputs(
         &self,
         inputs: &[Array],
@@ -863,7 +1073,7 @@ impl Session {
                 if operand_meshes().all(|mesh| device_ids(mesh) == first_device_ids) {
                     return Ok(None);
                 }
-                let Ok(mesh) = self.device_mesh_for(&[], None) else {
+                let Ok(mesh) = self.device_mesh_for(&[], None, None) else {
                     return Ok(None);
                 };
                 default_mesh = mesh;
@@ -1002,7 +1212,11 @@ impl Session {
 impl Clone for Session {
     #[inline]
     fn clone(&self) -> Self {
-        Self { state: Arc::clone(&self.state), mesh: self.mesh.clone(), effect_scope: Arc::clone(&self.effect_scope) }
+        Self {
+            state: Arc::clone(&self.state),
+            default_mesh: self.default_mesh.clone(),
+            effect_scope: Arc::clone(&self.effect_scope),
+        }
     }
 }
 
@@ -1035,11 +1249,24 @@ impl MeshContext for Session {
         // A session handle that was given a device mesh through `Session::with_device_mesh` owns the logical view of
         // that mesh as its default, so eager code bound in it can omit meshes (e.g., `shard_map(.., None, ..)`), same
         // as under JAX's `jax.set_mesh`. A handle without a mesh has no default.
-        self.mesh.as_ref().map(|mesh| mesh.logical_mesh().clone())
+        self.default_mesh.mesh().map(|mesh| mesh.logical_mesh().clone())
     }
 }
 
-impl CapturePlacementContext for Session {}
+impl CapturePlacementContext for Session {
+    #[inline]
+    fn capture_placement(&self) -> CapturePlacement {
+        // A named mesh that the user gave this handle places eager operations as `jax.set_mesh` does (refer to
+        // `Self::with_device_mesh`), so the arrays that the regions of its eager operations close over follow the
+        // operation onto that mesh, as JAX traces an uncommitted array of one device without a mesh.
+        match self.default_mesh.mesh() {
+            Some(mesh) if self.default_mesh.is_explicit() && is_named_mesh(mesh.logical_mesh()) => {
+                CapturePlacement::FollowCall
+            }
+            _ => CapturePlacement::Preserve,
+        }
+    }
+}
 
 impl Context for Session {
     fn lift(&self, constant: Constant) -> Result<Value, ProgramError> {
@@ -1053,19 +1280,18 @@ impl Context for Session {
             ))
             .into()),
             // A capture of a compiled function whose type names no mesh follows the call that runs the function (refer
-            // to `captured_type`), so a session that runs on given devices (e.g., the session on which region replay
-            // runs a callee on the devices of its call) receives it there.
-            Constant::Session(constant) => match &self.mesh {
+            // to `captured_type`), so a session that runs on given devices (e.g., one with a mesh that the user gave,
+            // or a handle derived from an array) receives it there.
+            Constant::Session(constant) => match self.default_mesh.mesh() {
                 Some(mesh) if constant.r#type().sharding().is_none() => {
-                    // A capture of another client is rejected with the same typed error as without a session mesh.
-                    constant.validate_client(self.client())?;
                     placed_constant(self, &constant, mesh)
                         .and_then(|placed| {
                             // Reuse the placed capture for these devices, with the original capture's commitment,
                             // which is what the capture means to its function (a capture never commits the results of
                             // the function), but committed when it lives on more than one device, as every array that
                             // the session hands out there is (refer to `Array::commit_if`). View its buffers over the
-                            // logical mesh of the call so replay can combine them with its values.
+                            // logical mesh of the session so that the operations that read it can combine them with
+                            // their other operands.
                             let array =
                                 placed.as_ref().unwrap_or(&constant).to_array(self)?.commit_if(constant.is_committed());
                             let runtime = array.sharding().clone();
@@ -1088,7 +1314,7 @@ impl Context for Session {
                             array.reshard_on_devices(self, mesh, &sharding, false)
                         })
                         .map(Value::Array)
-                        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })
+                        .map_err(ProgramError::from)
                 }
                 _ => Ok(Value::Array(constant.to_array(self)?.commit_if(constant.is_committed()))),
             },
@@ -1139,6 +1365,7 @@ impl Context for Session {
 
         let operation = operation.into();
         let regions = regions.into();
+
         operation.validate_region_interfaces(&regions.region_interfaces())?;
 
         // Reference operations act on shared handles rather than on device computations, so they run on the host
@@ -1240,10 +1467,10 @@ impl Context for Session {
             });
         }
 
-        // A call takes its placement decision, which region replay takes too, so that the two agree on where the call
-        // runs, which arguments it admits and where they move, whether its arguments commit its results, and whether
-        // its devices were chosen by this process alone (refer to `JitCallOperation::eager_decision`). Nothing below
-        // derives any of these facts again for a call.
+        // A call takes its placement decision, which states where the call runs, which arguments it admits and where
+        // they move, whether its arguments commit its results, and whether its devices were chosen by this process
+        // alone (refer to `JitCallOperation::eager_decision`). Nothing below derives any of these facts again for a
+        // call.
         let decision = match &operation {
             Operation::JitCall(call) => Some(
                 call.eager_decision(self, inputs, regions.region(0)?)
@@ -1435,35 +1662,147 @@ impl Context for Session {
                             .any(|(request, _)| matches!(request, RequestedPlacement::Devices(_)))
                     }));
 
-        // The regions of the operation were traced for the types of the inputs that they receive, so an uncommitted
-        // input over another logical mesh than the one that the regions request cannot be moved there, because the
-        // move changes its type (e.g., an uncommitted value on the canonical mesh of one device that the regions place
-        // onto a named mesh of one device). This is reported here, with the ways forward, rather than as the mismatch
-        // of the type of a region input that the move would cause.
-        if let Some(requested) = &requested_mesh {
+        // A named mesh that the user gave this handle places the operations that do not name their own devices, as
+        // `jax.set_mesh` does (refer to `Self::with_device_mesh`). Operations that are decided on the host only read
+        // their operands, a placement and a `shard_map` name their own devices like a call does, and operations without
+        // array operands or captures are placed on the mesh of this handle already. Handles without a mesh that the
+        // user chose pay for the first test alone. The operands that are committed elsewhere are rejected here, before
+        // anything moves, and the uncommitted ones move onto the mesh below, unless a committed operand, which is on
+        // its devices then, decides where they move. A default device that the user gave this handle (refer to
+        // `Self::with_default_device`) places the same operations when none of their operands is committed, as
+        // `jax.default_device` does, by moving their uncommitted operands onto it, and it neither commits their
+        // results nor rejects anything.
+        let placing_mesh = match self.default_mesh.mesh() {
+            Some(mesh)
+                if self.default_mesh.is_explicit()
+                    && !is_call
+                    && !named
+                    && (!array_inputs.is_empty() || !captures.is_empty())
+                    && !matches!(
+                        operation,
+                        Operation::Array(ArrayOperation::Place(_))
+                            | Operation::ShardMap(_)
+                            | Operation::DimensionSize(_)
+                            | Operation::DimensionFromScalar(_)
+                    )
+                    && !matches!(&operation, Operation::Cast(cast) if matches!(cast.output_type(), Type::Dimension(_))) =>
+            {
+                Some(mesh)
+            }
+            _ => None,
+        };
+        let session_mesh = placing_mesh.filter(|mesh| is_named_mesh(mesh.logical_mesh()));
+        let default_device_target = placing_mesh.filter(|_| {
+            self.default_device_mesh().is_some()
+                && !array_inputs.iter().any(Array::is_committed)
+                && !captures.iter().any(RetainedArray::is_committed)
+        });
+
+        // An operand on the devices of the session mesh `mesh` over another named mesh `other` is rejected when either
+        // mesh has an explicit axis, as `jax.set_mesh` rejects an operand whose mesh differs from the mesh of the
+        // context unless neither has one. Meshes without explicit axes carry no sharding in types, so the operation
+        // runs over the mesh of the operand then, and an operand over the anonymous mesh of the device of a session
+        // mesh of one device names no mesh and is kept. This one rule applies to committed operands before anything
+        // moves and to uncommitted operands where they are after the move.
+        let is_explicit =
+            |logical_mesh: &LogicalMesh| logical_mesh.axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
+        let names_another_mesh = |mesh: &DeviceMesh, other: &DeviceMesh| {
+            is_named_mesh(other.logical_mesh())
+                && other.logical_mesh() != mesh.logical_mesh()
+                && (is_explicit(other.logical_mesh()) || is_explicit(mesh.logical_mesh()))
+        };
+        let session_target = match session_mesh {
+            Some(mesh) => {
+                let shares_devices =
+                    |other: &DeviceMesh| std::ptr::eq(other, mesh) || other.devices() == mesh.devices();
+                let incompatible = |operand: String, other: &DeviceMesh| ProgramError::InvalidArgument {
+                    message: format!(
+                        "received incompatible devices for eager XLA execution: {} is committed to devices {} \
+                         but the session mesh is on devices {}",
+                        operand,
+                        render_devices(other.devices()),
+                        render_devices(mesh.devices()),
+                    ),
+                };
+
+                let incompatible_mesh = |operand: String, other: &DeviceMesh| ProgramError::InvalidArgument {
+                    message: format!(
+                        "received incompatible meshes for eager XLA execution: {} is committed to the mesh `{}` \
+                         but the session mesh is `{}`",
+                        operand,
+                        other.logical_mesh(),
+                        mesh.logical_mesh(),
+                    ),
+                };
+
+                for (index, input) in array_inputs.iter().enumerate() {
+                    if input.is_committed() && !shares_devices(input.mesh()) {
+                        return Err(incompatible(format!("input #{index}"), input.mesh()));
+                    }
+                    if input.is_committed() && names_another_mesh(mesh, input.mesh()) {
+                        return Err(incompatible_mesh(format!("input #{index}"), input.mesh()));
+                    }
+                }
+
+                for (index, capture) in captures.iter().enumerate() {
+                    if capture.is_committed() && !shares_devices(capture.mesh()) {
+                        return Err(incompatible(format!("captured array #{index}"), capture.mesh()));
+                    }
+                    if capture.is_committed() && names_another_mesh(mesh, capture.mesh()) {
+                        return Err(incompatible_mesh(format!("captured array #{index}"), capture.mesh()));
+                    }
+                }
+
+                let committed =
+                    array_inputs.iter().any(Array::is_committed) || captures.iter().any(RetainedArray::is_committed);
+                (!committed).then_some(mesh)
+            }
+            None => None,
+        };
+
+        // The regions of the operation were traced for the types that they declare for the inputs that they receive,
+        // so an uncommitted input that a region receives with a type over another logical mesh than the one that the
+        // regions request, or than the mesh of this handle that it moves onto, cannot be moved there, because the move
+        // changes its type. A region that declares the input without a sharding receives it wherever it moves. This
+        // includes inputs on the anonymous mesh of one device and any inputs whose relocatable types the handle uses
+        // when it reports that values follow the computation (refer to `CapturePlacementContext for Session`).
+        if let Some(target) = requested_mesh.as_ref().or(session_target).or(default_device_target) {
             for (region_index, region) in regions.regions().enumerate() {
                 if operation.region_role(region_index) != Some(RegionRole::Computation) {
                     continue;
                 }
-                for region_input in 0..region.input_ids().len() {
+                let region_input_types = region.input_types();
+                for (region_input, region_input_type) in region_input_types.iter().enumerate() {
                     if let InputRegionProvenance::Input { index } =
                         operation.input_region_provenance(region_index, region_input)
                         && let Some(Value::Array(array)) = inputs.get(index)
                         && !array.is_committed()
-                        && array.sharding().mesh() != requested.logical_mesh()
+                        && let Type::Array(region_input_type) = region_input_type
+                        && let Some(declared) = region_input_type.sharding()
+                        && declared.mesh() != target.logical_mesh()
                     {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
+                        let message = match requested_mesh {
+                            Some(_) => format!(
                                 "the regions of an eager `{}` request the mesh `{}`, but its uncommitted input #{} is \
                                  over the mesh `{}`, for whose type the regions were traced; place the input on the \
                                  mesh `{}` before the operation, or place the value onto a device in the regions",
                                 operation.name(),
-                                requested.logical_mesh(),
+                                target.logical_mesh(),
                                 index,
                                 array.sharding().mesh(),
-                                requested.logical_mesh(),
+                                target.logical_mesh(),
                             ),
-                        });
+                            None => format!(
+                                "the uncommitted input #{} of an eager `{}` is over the mesh `{}`, for whose type its \
+                                 regions were traced, and cannot move onto the session mesh `{}`; place the input on \
+                                 the session mesh before the operation",
+                                index,
+                                operation.name(),
+                                array.sharding().mesh(),
+                                target.logical_mesh(),
+                            ),
+                        };
+                        return Err(ProgramError::InvalidArgument { message });
                     }
                 }
             }
@@ -1476,8 +1815,68 @@ impl Context for Session {
         let moved_array_inputs = if is_call {
             None
         } else {
-            self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice(), requested_mesh.as_ref())?
+            let target = requested_mesh.as_ref().or(session_target).or(default_device_target);
+            self.place_uncommitted_inputs(array_inputs.as_slice(), captures.as_slice(), target)?
         };
+
+        // An uncommitted input that cannot move onto the mesh of this handle (refer to
+        // `Self::place_uncommitted_inputs`) is rejected like an operand committed elsewhere, rather than run where it
+        // is. So is an uncommitted input or captured array that stays over another named mesh that the rule above does
+        // not admit (e.g., one that is split along an axis of another mesh on the same devices), which would otherwise
+        // commit the result to that mesh. An uncommitted operand whose type records nothing beyond replication, whatever
+        // logical mesh that replication names, follows the computation instead, by the one rule of relocatable values
+        // (refer to `argument_type`), as an uncommitted input moves onto `mesh` replicated and as execution places a
+        // captured array on the mesh of its program (e.g., a capture uploaded replicated over another named mesh of
+        // the same device), so that operations without regions, region operands, and captures agree, as under
+        // `jax.set_mesh`. An input that cannot move leaves every input where it is, so nothing of the
+        // operation has been submitted when either is rejected.
+        if let Some(mesh) = session_mesh {
+            let placed = moved_array_inputs.as_deref().unwrap_or(array_inputs.as_slice());
+            if let Some(target) = session_target
+                && let Some((index, input)) =
+                    placed.iter().enumerate().find(|(_, input)| input.mesh().devices() != target.devices())
+            {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "received incompatible devices for eager XLA execution: uncommitted input #{} on devices {} \
+                         cannot move onto the session mesh on devices {}",
+                        index,
+                        render_devices(input.mesh().devices()),
+                        render_devices(target.devices()),
+                    ),
+                });
+            }
+
+            let incompatible_mesh = |operand: String, other: &DeviceMesh| ProgramError::InvalidArgument {
+                message: format!(
+                    "received incompatible meshes for eager XLA execution: uncommitted {} over the mesh `{}` \
+                     cannot move onto the session mesh `{}`",
+                    operand,
+                    other.logical_mesh(),
+                    mesh.logical_mesh(),
+                ),
+            };
+
+            let stays_over_another_mesh = |other: &DeviceMesh, r#type: &ArrayType| {
+                names_another_mesh(mesh, other) && r#type.sharding().is_some() && captured_type(r#type).is_none()
+            };
+
+            for (index, input) in placed.iter().enumerate() {
+                if !input.is_committed() && stays_over_another_mesh(input.mesh(), &input.r#type()) {
+                    return Err(incompatible_mesh(format!("input #{index}"), input.mesh()));
+                }
+            }
+
+            for (index, capture) in captures.iter().enumerate() {
+                if !capture.is_committed() && stays_over_another_mesh(capture.mesh(), &capture.r#type()) {
+                    return Err(incompatible_mesh(format!("captured array #{index}"), capture.mesh()));
+                }
+            }
+        }
+
+        // Devices that the mesh of this handle selected are named for every process, as the devices that a region
+        // requests are.
+        let named = named || session_mesh.is_some();
 
         // What selected the devices decides whether this process alone chose them (refer to
         // `Self::assigns_placement_locally`), so this is decided before the moved inputs replace the original ones.
@@ -1485,11 +1884,11 @@ impl Context for Session {
             Some(decision) => decision.locally_assigned(),
             None => self.assigns_placement_locally(&array_inputs, &captures, named, moved_array_inputs.is_some()),
         };
+
         let moved_inputs = if let Some(moved_array_inputs) = moved_array_inputs {
             // Placement returns one replacement for each array in `inputs`, in order. Splitting at those slots
             // gives one run of non-array inputs before each replacement and one trailing run.
             check_count!("input", moved_array_inputs, array_inputs.len(), ProgramError);
-
             let mut moved_inputs = Vec::with_capacity(inputs.len());
             let mut non_array_inputs = inputs.split(|input| matches!(input, Value::Array(_)));
             for (preceding_inputs, array) in
@@ -1504,6 +1903,7 @@ impl Context for Session {
         } else {
             None
         };
+
         let inputs = moved_inputs.as_deref().unwrap_or(inputs);
 
         // These operations are decided on the host and return without compiling a program. `Context::bind` has already
@@ -1534,14 +1934,14 @@ impl Context for Session {
                 let array = <Value as ValueProjection<ArrayType>>::projected(&inputs[0])?;
                 let extent = array.dimension_size(operation.axis())?;
                 let value = DimensionValue::new(operation.output_type().clone(), extent)?;
-                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_derived_mesh(array)))]);
             }
             Operation::DimensionFromScalar(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 operation.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
                 let array = <Value as ValueProjection<ArrayType>>::projected(&inputs[0])?;
                 let value = array.to_dimension(operation.output_type().to_variable())?;
-                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_device_mesh(array.mesh().clone())))]);
+                return Ok(vec![Value::Dimension(Dimension::new(value, self.with_derived_mesh(array)))]);
             }
             Operation::DimensionToScalar(_) => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -1591,53 +1991,12 @@ impl Context for Session {
                 return Ok(vec![Value::Array(output)]);
             }
             Operation::Array(ArrayOperation::Place(operation)) => {
-                // A placement can move a value to the devices of another mesh, which no single compiled program can
-                // do, because a program runs on the devices of one mesh. The move is therefore decided on the host and
-                // carried out like `Array::to_placement`, which shares the buffers of whole shards that stay on their
-                // devices, copies whole shards between devices, and compiles a program only when the shards themselves
-                // change. The binding never donates its input, because other handles may share it. The result has the
-                // type that type inference returns, because the resolver selects the memory that the target omits as
-                // the type rule does (i.e., the default memory of the device for a device target, and the memory of
-                // the array otherwise, refer to `PlacementRequest::target_memory`), and it keeps the layout of the
-                // array only while that layout still describes each shard of the result, as the type rule does.
+                // A placement may move the input between meshes, which requires eager host dispatch. It uses the
+                // same admission and completion rules as the member placement capability.
                 check_count!("input", inputs, 1, ProgramError);
                 let array = <Value as ValueProjection<ArrayType>>::into_projected(inputs[0].clone())?;
-
-                // The runtime sharding of the array records its placement along auto mesh axes, including a pending
-                // reduction over them, which its type omits, so the type rule is applied with it, as the placement of
-                // an array through `Session::place` applies it.
-                operation.infer_output_type_requiring_even_splits(&array.r#type(), Some(array.sharding()))?;
-
-                // The result belongs to this session, so its buffers must belong to the client of this session. An
-                // array of another client is therefore rejected like the inputs of any other operation, even when it
-                // lives on devices with the same IDs, rather than returned as it is or mixed with buffers of this
-                // client.
-                self.validate_input_placement(std::slice::from_ref(&array), &[])?;
-
-                // The source of the operation says where the value was expected to live when the operation was staged,
-                // which transposition needs. It is not compared with the placement of the array, which is known exactly
-                // here and can legitimately differ from it. For example, a gradient seed is created on the mesh of this
-                // session and not on the mesh of the output that it seeds, and a cotangent computed on the target mesh
-                // can be placed along auto mesh axes differently from what the source of the transposed placement says.
-                // Type inference has already checked the sharding that types do track. A placement that must not alias
-                // its input copies whatever buffers the result still shares with any other array (e.g., the input
-                // itself, which the caller still holds, when the placement leaves it where it is), as `Session::place`
-                // does for an `Array` leaf. A placement without a target leaves the array where it is, so its result
-                // is the array itself, associated with this session.
-                //
-                // A device or in-place target resolves against the array here, through the one resolver that also
-                // resolves the destinations of `Session::place` for an `Array` leaf (refer to
-                // `Array::run_placement_request`), so that the array takes exactly the type that the type rule of the
-                // request infers (e.g., an array on more devices is gathered onto a device target, replicated over the
-                // canonical mesh of one device). Like every placement with a target, its result is committed, as JAX
-                // commits the result of `device_put` onto a device or a memory space.
-                let output = match operation.target() {
-                    Some(target) => array.run_placement_request(self, target.clone(), false),
-                    None => array.with_session(self),
-                }
-                .and_then(|output| if operation.may_alias() { Ok(output) } else { output.into_unaliased() })
-                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                return Ok(vec![Value::Array(output)]);
+                return crate::arrays::placement::place_core_operations(vec![(self.clone(), array, operation.clone())])
+                    .map(|outputs| outputs.into_iter().map(Value::Array).collect());
             }
             Operation::Cast(operation) if matches!(operation.output_type(), Type::Dimension(_)) => {
                 // `Context::bind` rejects attached regions. Validate the original declaration before observing
@@ -1712,21 +2071,42 @@ impl Context for Session {
         // through a borrowed query, and the owned key is only built on a miss.
         let region_keys = dispatch_regions.into_iter().map(|region| region.key).collect::<Vec<_>>();
 
-        // The program runs on the mesh of its first array input. Without array inputs, a committed capture decides
-        // where it runs, like a committed input would. A call whose callee names devices, and a call without array
-        // inputs, runs on the mesh of its decision, and any other call runs on the devices where its decision placed
-        // every input (whose logical mesh is that of its first array input), and an operation whose regions request
-        // devices runs on them.
+        // An ordinary operation runs on the mesh of its first array input. If that mesh is anonymous, an input
+        // that names explicit axes on the same devices supplies the logical mesh for lowering. Without array inputs,
+        // a committed capture decides where it runs. An operation whose regions request devices runs on those devices.
+        // A call whose callee names devices or that has no array inputs runs on the mesh of its decision. Other calls
+        // use the first array input the callee reads after the decision has placed the inputs.
         let call_mesh = match (&operation, &decision) {
             (Operation::JitCall(call), Some(decision)) if call.mesh().is_some() || array_inputs.is_empty() => {
                 Some(decision.mesh())
             }
+            (Operation::JitCall(_), Some(decision)) if let Some(unread) = decision.unread_captures() => Some(
+                inputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, input)| match input {
+                        Value::Array(array) if unread.get(index) != Some(&true) => Some(array.mesh()),
+                        _ => None,
+                    })
+                    .unwrap_or(decision.mesh()),
+            ),
             _ => None,
         };
         let operand_mesh = call_mesh.or(requested_mesh.as_ref()).or_else(|| {
             array_inputs
                 .first()
-                .map(Array::mesh)
+                .map(|first| {
+                    let mesh = first.mesh();
+                    if !is_call && !is_named_mesh(mesh.logical_mesh()) {
+                        for input in &array_inputs[1..] {
+                            let other = input.mesh();
+                            if other.devices() == mesh.devices() && is_explicit(other.logical_mesh()) {
+                                return other;
+                            }
+                        }
+                    }
+                    mesh
+                })
                 .or_else(|| captures.iter().find(|capture| capture.is_committed()).map(RetainedArray::mesh))
         });
         let query = EagerDispatchQuery::new(
@@ -1737,7 +2117,7 @@ impl Context for Session {
             // `Self::device_mesh_for` derives from the devices of the client, and it must stay in agreement with the
             // mesh that a miss selects below. The fallbacks depend only on the operation and the client, which the key
             // already covers, and leaving them out keeps cache hits free of device queries.
-            operand_mesh.or(self.mesh.as_ref()),
+            operand_mesh.or(self.default_mesh.mesh()),
         );
 
         let compiled = match self.state.eager_dispatch_cache.get(&query as &dyn EagerDispatchKeyView) {
@@ -1788,7 +2168,10 @@ impl Context for Session {
                         // places them, which `JitCallOperation::eager_input_placement` decides for every array input
                         // (e.g., a call that a program transform created leaves the residuals that the transform added
                         // where they are, rather than gathering them to the placement of their traced types). Either
-                        // way the call returns what that execution returns.
+                        // way the call returns what that execution returns. A capture that the callee never reads has
+                        // no argument to place (refer to `EagerCallDecision::unread_captures`).
+                        let unread_captures = decision.as_ref().and_then(EagerCallDecision::unread_captures);
+                        let is_unread = |index: usize| unread_captures.is_some_and(|unread| unread[index]);
                         let input_placements = match (&operation, &callee_input_types) {
                             (Operation::JitCall(call), Some(declared)) => Some(
                                 inputs
@@ -1796,6 +2179,7 @@ impl Context for Session {
                                     .zip(declared)
                                     .enumerate()
                                     .filter_map(|(index, (input, declared))| match input {
+                                        Value::Array(_) if is_unread(index) => Some(None),
                                         Value::Array(array) => Some(call.eager_input_placement(index, array, declared)),
                                         Value::Dimension(_) | Value::Reference(_) => None,
                                     })
@@ -1950,7 +2334,7 @@ impl Context for Session {
                             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
                         let mesh = match operand_mesh {
                             Some(mesh) => mesh.clone(),
-                            None => self.device_mesh_for(&[], logical_mesh)?,
+                            None => self.device_mesh_for(&[], logical_mesh, None)?,
                         };
                         let options = match (input_shardings, input_placements) {
                             (Some(input_shardings), _) => {
@@ -1965,10 +2349,9 @@ impl Context for Session {
                         // The program of a call returns each output as an execution of the callee returns it, so the
                         // output overrides of the callee are the output overrides of the program, which would otherwise
                         // place its results as its own exit places them (e.g., completing a pending sum over an auto
-                        // mesh axis that an override states, which no type records). A direct execution, the replay of
-                        // the callee (refer to `JitCallOperation::boundary_output`), and this program then return the
-                        // same runtime placement. A callee states overrides for all of its outputs or for none of them,
-                        // and the outputs without arrays leave the program.
+                        // mesh axis that an override states, which no type records). A direct execution and this
+                        // program then return the same runtime placement. A callee states overrides for all of its
+                        // outputs or for none of them, and the outputs without arrays leave the program.
                         let output_shardings = output_overrides
                             .iter()
                             .any(Option::is_some)
@@ -1986,36 +2369,25 @@ impl Context for Session {
                             None => options,
                         };
 
-                        // Lower the program and compile it through the compilation cache of the session, so that
-                        // equal lowerings share one compiled program even when their dispatch keys differ.
-                        let lowered = self
-                            .lower_program(&program, 0, &options)
-                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                        let program = self
-                            .compilation_cache()
-                            .compile(self, &lowered)
-                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                        // A capture that the callee of a call never reads has no argument in an executable of the
+                        // callee, so it has none in the program of the call either, which would otherwise require its
+                        // buffers for passing it on (refer to `EagerCallDecision::unread_captures`). The inputs of
+                        // the program are the array inputs of the application, in order.
+                        let options = match unread_captures {
+                            Some(_) => options.with_unread_inputs(
+                                inputs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, input)| matches!(input, Value::Array(_)))
+                                    .map(|(index, _)| is_unread(index))
+                                    .collect(),
+                            ),
+                            None => options,
+                        };
 
-                        // Each hidden argument names its source constant. Record the first position of that constant
-                        // in the application so the cache can recover it at execution time.
-                        let mut slots = HashMap::with_capacity(session_constants.len());
-                        for (slot, constant) in session_constants.iter().enumerate() {
-                            slots.entry(constant).or_insert(slot);
-                        }
-                        let constants = lowered
-                            .session_constants()
-                            .iter()
-                            .map(|binding| {
-                                let source = binding.source();
-                                slots.get(source).copied().ok_or_else(|| {
-                                    ProgramError::MalformedProgram(format!(
-                                        "lowered session constant `{source}` comes from no session constant \
-                                         of the eager application",
-                                    ))
-                                })
-                            })
-                            .collect::<Result<_, _>>()?;
-                        producer.insert(EagerDispatchEntry { program, constants, mesh, outputs })
+                        let (program, constants) =
+                            self.prepare_eager_program(&program, &options, &session_constants)?;
+                        producer.insert(EagerDispatchEntry { program, constants: constants.into(), mesh, outputs })
                     }
                 }
             }
@@ -2029,8 +2401,8 @@ impl Context for Session {
         // An operation with regions also commits its results when a region requests a placement (refer to
         // `CompiledProgram::committed_outputs`), as an execution of a compiled function commits them and as JAX commits
         // the result of a `lax.cond` whose branches place their values. The results of a call are committed exactly as
-        // its decision states (refer to `JitCallOperation::eager_decision`), which the replay of its callee reads too,
-        // so that neither the mesh of this session nor a capture commits them. The commitment of the results of an
+        // its decision states (refer to `JitCallOperation::eager_decision`), so that neither the mesh of this session
+        // nor a capture commits them. The commitment of the results of an
         // operation without regions follows its inputs alone, even when the operation is itself a placement request
         // (e.g., a sharding constraint).
         let mut arguments = compiled
@@ -2045,29 +2417,34 @@ impl Context for Session {
                 placed.as_ref().unwrap_or(constant).to_array(self)
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         let committed = match &decision {
             Some(decision) => decision.committed(),
-            None => self.commits_placement(&array_inputs, &captures),
+            None => session_mesh.is_some() || self.commits_placement(&array_inputs, &captures),
         };
+
         arguments.extend(array_inputs);
-        let mut arrays = self
-            .execute_program(&compiled.program, arguments)
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
-            .into_iter();
+
+        let mut arrays = match &compiled.program {
+            EagerDispatchProgram::Local(program) => self.execute_program(program, arguments),
+            EagerDispatchProgram::Remote(program) => program.execute(self, &arguments),
+        }
+        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+        .into_iter()
+        .zip(compiled.program.committed_outputs());
+
         compiled
             .outputs
             .iter()
             .map(|output| match output {
                 EagerDispatchOutput::Array => {
-                    let array = arrays.next().ok_or_else(|| {
+                    let (array, &commits_output) = arrays.next().ok_or_else(|| {
                         ProgramError::MalformedProgram(
                             "eager program returned fewer arrays than its outputs".to_string(),
                         )
                     })?;
 
-                    // The execution commits an output when a public argument is committed, which `committed` already
-                    // covers, or when the compiled program commits it, which the decision of a call covers too.
-                    let committed = committed || (!is_call && has_regions && array.is_committed());
+                    let committed = committed || (!is_call && has_regions && commits_output);
                     Ok(Value::Array(array.commit_if(committed).with_locally_assigned(locally_assigned)))
                 }
                 EagerDispatchOutput::Dimension(value) => {
@@ -2127,8 +2504,8 @@ impl CoreConstant<Value, Constant> for Session {
         // extent materializes directly and a Boolean literal uploads a replicated scalar, while a `Constant::Captured`
         // payload carries only a type and no data and is always rejected outside a surrounding capture table. The
         // implementation exists because operation families that support interpretation and batching require a
-        // `ryft_core::Constant` leaf on their contexts. Programs whose constants were compiled into capture tables
-        // never take the captured path.
+        // `ryft_core::Constant` leaf on their contexts. Programs whose constants were compiled into capture
+        // tables never take the captured path.
         self.lift(value)
     }
 }
@@ -2169,6 +2546,25 @@ struct SessionState {
     /// Bounded workers that run the background host uploads of the session. They start lazily and exit once this state
     /// is dropped and their queued uploads have run.
     host_upload_workers: HostUploadWorkers,
+
+    // TODO(eaplatanios): Review this.
+    /// Whether placements compare the values that the processes of a run place onto a destination that all of them
+    /// share (refer to [`SessionBuilder::value_comparison`]).
+    value_comparison: bool,
+
+    // TODO(eaplatanios): Review this.
+    /// Devices of other processes declared through [`SessionBuilder::remote_devices`], sorted by identifier.
+    /// Redundant declarations of devices the client already lists still indicate an explicitly declared topology.
+    remote_devices: Box<[Device]>,
+
+    // TODO(eaplatanios): Review this.
+    /// Participants and transport of value comparisons, discovered when a placement first needs them.
+    comparison_participants: OnceLock<Option<ValueComparison>>,
+
+    // TODO(eaplatanios): Review this.
+    /// Number of comparisons of values across processes that placements of the session have submitted, which is the
+    /// position of the next one in their sequence (refer to [`Session::next_value_comparison`]).
+    value_comparisons: AtomicU64,
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
@@ -2226,6 +2622,15 @@ pub struct SessionBuilder {
 
     /// [`RuntimeExtensions`] of the session.
     runtime_extensions: RuntimeExtensions,
+
+    // TODO(eaplatanios): Review this.
+    /// Whether placements of the session compare the values of the processes of a run (refer to
+    /// [`Self::value_comparison`]).
+    value_comparison: bool,
+
+    // TODO(eaplatanios): Review this.
+    /// Devices of the other processes of the run that the client does not list (refer to [`Self::remote_devices`]).
+    remote_devices: Vec<Device>,
 }
 
 impl SessionBuilder {
@@ -2361,15 +2766,68 @@ impl SessionBuilder {
         self
     }
 
+    // TODO(eaplatanios): Review this.
+    /// Sets whether the placements of the session check that the processes of a run place equal values onto a
+    /// destination that all of them share, which is enabled by default. Every process uploads a host value, or places
+    /// an array whose devices it chose on its own (e.g., one uploaded without a destination that names devices), onto
+    /// its own devices of such a destination, so processes that pass different values would otherwise silently form an
+    /// array that none of them holds. With the check, a call of [`Session::place`], [`Array::to_placement`], or
+    /// [`Array::into_placement`] that places such values onto a mesh or sharding whose devices belong to exactly the
+    /// processes known to the session compares their SHA-256 digests bit for bit with a compiled 64-byte maximum
+    /// all-reduce. Each compared runtime array is read back on the calling thread. Host values are hashed from host
+    /// memory. Different values, data types, or shapes produce a failed precondition on every process through the
+    /// call or the readiness of its results.
+    ///
+    /// The all-reduce requires a common native PJRT device topology. The CPU plugin can enumerate only its local
+    /// devices in a multi-process run, even when it uses a coordination service. If any process needs explicit
+    /// device declarations, configure [`Self::remote_devices`] on every participant, including those that can
+    /// already enumerate every device. A placement that needs comparison on such a session returns
+    /// [`SessionError::PlacementComparisonUnavailable`] before comparison readback or collective submission.
+    /// Independent placements remain usable. Every participant must use the same comparison setting and make the
+    /// same sequence of comparing calls (refer to [`Session::place`]). Runs of one process, destinations on a subset
+    /// of the processes, device destinations, explicit host uploads, and traced values compare nothing. Disabling
+    /// comparison leaves equality as an unchecked precondition.
+    #[inline]
+    pub fn value_comparison(mut self, enabled: bool) -> Self {
+        self.value_comparison = enabled;
+        self
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Declares `devices`, the devices of the other processes of the run, as devices of the session, in place of any
+    /// that were declared before. The session is the authority on which devices exist, as the client is in JAX, whose
+    /// `jax.devices()` lists every device of a run. A session knows the devices that its client lists, which for most
+    /// distributed clients (e.g., the CUDA plugin in a distributed runtime) are the devices of every process, and the
+    /// devices declared here. Every function that accepts a [`Device`] (e.g., the meshes of uploads and placements,
+    /// [`Session::with_default_device`], and the meshes of compiled functions) rejects any other device with
+    /// [`ArrayError::UnknownDevice`] before any work is submitted, so a mistyped device fails rather than silently
+    /// receiving no buffer. Declare the devices of the other processes for clients that list only their own (e.g., CPU
+    /// clients, also when they share a coordination service) and for tests that stand for several processes with
+    /// several clients. Every process must declare the devices of the others alike, so that every process accepts the
+    /// same devices. A nonempty declaration also selects declared topology on this session, even when the client
+    /// already enumerates all declared devices (refer to [`Self::value_comparison`]).
+    ///
+    /// # Errors
+    ///
+    /// This function itself cannot fail, but it makes [`Self::build`] return [`SessionError::LocalRemoteDevice`] for a
+    /// device of the process of the client, and [`ArrayError::DeviceProcessIndexMismatch`] for a device that the client
+    /// lists, or that `devices` repeats, for another process.
+    #[inline]
+    pub fn remote_devices<D: IntoIterator<Item = Device>>(mut self, devices: D) -> Self {
+        self.remote_devices = devices.into_iter().collect();
+        self
+    }
+
     /// Builds a [`Session`] with a fresh effect scope.
     ///
     /// # Errors
     ///
     /// Returns a [`SessionError`] if the requested platform is unavailable in this build or if client options were
     /// supplied for [`Platform::Auto`] or for a client that the caller created, [`Error::Pjrt`] if the plugin of the
-    /// session cannot be loaded or initialized or its client cannot be created, and [`Error::Io`] if the disk cache
-    /// that the environment configures is invalid. A session that is only given [`Self::client`] and resources that
-    /// do not read the environment cannot fail.
+    /// session cannot be loaded or initialized or its client cannot be created, [`Error::Io`] if the disk cache that
+    /// the environment configures is invalid, and the errors of [`Self::remote_devices`] for the devices that it
+    /// declares. Building a session only from [`Self::client`] and resources that do not read the environment is
+    /// infallible when no remote devices are declared.
     pub fn build(self) -> Result<Session, Error> {
         let client: &'static Client<'static> = match (self.client_source, self.client_options) {
             (ClientSource::Platform(platform), client_options) => platform.client(client_options)?,
@@ -2392,6 +2850,7 @@ impl SessionBuilder {
             Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_cache.with_disk_cache(disk_cache),
             Some(DiskCacheSource::Environment) => self.compilation_cache.with_disk_cache_from_env()?,
         };
+        let remote_devices = validated_remote_devices(client, self.remote_devices)?;
 
         Ok(Session {
             state: Arc::new(SessionState {
@@ -2404,11 +2863,102 @@ impl SessionBuilder {
                 work: SessionWorkTracker::default(),
                 array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
                 host_upload_workers: HostUploadWorkers::default(),
+                value_comparison: self.value_comparison,
+                remote_devices,
+                comparison_participants: OnceLock::new(),
+                value_comparisons: AtomicU64::new(0),
             }),
-            mesh: None,
+            default_mesh: DefaultMesh::None,
             effect_scope: Arc::new(EffectScope::default()),
         })
     }
+}
+
+/// Default device mesh of a [`Session`] handle together with how it was chosen, which decides how the mesh takes
+/// part in eager placement.
+#[derive(Clone)]
+enum DefaultMesh {
+    /// The handle has no default mesh.
+    None,
+
+    /// Mesh that the user gave through [`Session::with_device_mesh`]. Every process names it alike, including an
+    /// anonymous mesh of one device, so it commits what is placed on it and can place eager operands and results.
+    Shared(DeviceMesh),
+
+    /// Mesh of the default device that the user gave through [`Session::with_default_device`]. This process chose it
+    /// on its own, so it can place eager operands and results without committing them.
+    Device(DeviceMesh),
+
+    /// Fallback mesh of an internal handle (refer to [`Session::with_derived_mesh`]), which applies none of the
+    /// placement rules of a mesh that the user chose.
+    Internal {
+        /// Mesh that the handle falls back to.
+        mesh: DeviceMesh,
+
+        /// Whether this process chose `mesh` on its own (i.e., whether it was derived from a locally assigned array).
+        locally_assigned: bool,
+    },
+}
+
+impl DefaultMesh {
+    /// Returns the default [`DeviceMesh`], if there is one.
+    #[inline]
+    fn mesh(&self) -> Option<&DeviceMesh> {
+        match self {
+            Self::None => None,
+            Self::Shared(mesh) | Self::Device(mesh) | Self::Internal { mesh, .. } => Some(mesh),
+        }
+    }
+
+    /// Returns whether the user chose the mesh (i.e., through [`Session::with_device_mesh`] or
+    /// [`Session::with_default_device`]), which lets it place eager operands and results.
+    #[inline]
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::Shared(_) | Self::Device(_))
+    }
+
+    /// Returns whether this process chose the mesh on its own, either through [`Session::with_default_device`]
+    /// or by deriving it from a locally assigned array, rather than naming a mesh that every process shares.
+    #[inline]
+    fn is_locally_assigned(&self) -> bool {
+        matches!(self, Self::Device(_) | Self::Internal { locally_assigned: true, .. })
+    }
+}
+
+// TODO(eaplatanios): Inline this.
+/// Returns `devices`, which a [`SessionBuilder`] declared as the devices of the other processes of the run of `client`
+/// (refer to [`SessionBuilder::remote_devices`]), sorted by identifier with repeated declarations removed.
+fn validated_remote_devices(client: &Client<'_>, mut devices: Vec<Device>) -> Result<Box<[Device]>, Error> {
+    if devices.is_empty() {
+        return Ok(Box::default());
+    }
+
+    let process_index = client.process_index()?;
+    let listed_devices = client
+        .devices()?
+        .iter()
+        .map(|device| Ok((device.id()?, device.process_index()?)))
+        .collect::<Result<HashMap<_, _>, PjrtError>>()?;
+    devices.sort_by_key(Device::id);
+
+    let mut remote_devices = Vec::<Device>::with_capacity(devices.len());
+    for device in devices {
+        if device.process_index() == process_index {
+            return Err(SessionError::LocalRemoteDevice { device, process_index }.into());
+        }
+        let repeated = remote_devices.last().filter(|last| last.id() == device.id()).map(Device::process_index);
+        if let Some(actual) = listed_devices.get(&device.id()).copied().or(repeated)
+            && actual != device.process_index()
+        {
+            let (device_id, expected) = (device.id(), device.process_index());
+            return Err(ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }.into());
+        }
+        if repeated.is_none() {
+            remote_devices.push(device);
+        }
+    }
+
+    Ok(remote_devices.into_boxed_slice())
 }
 
 /// Key and session constants that [`Context::bind`] caches for an attached region. This type also identifies the
@@ -2449,12 +2999,10 @@ impl Transform<Region<Constant, Operation>> for RequestedPlacementMesh {
 /// than runtime values (i.e., one whose [`CapturingContext::Capture`] is [`Constant`], such as the body of a
 /// [`rematerialize`](ryft_core::rematerialize) or [`composite`](ryft_core::composite) call) imports runtime XLA
 /// [`Value`]s. Arrays enter the trace as [`Constant::Session`] handles, which retain them for as long as a handle
-/// exists and which are equal for one array and one declared type. Under
-/// [`CapturePlacement::FollowCall`](ryft_core::CapturePlacement::FollowCall) (refer to
-/// [`CapturePlacementContext::capture_placement`]), an array is declared with the type with which
-/// the compiled function receives it, as an explicit capture is. Dimensions enter as immediate
-/// [`Constant::Dimension`]s, and references are rejected because their state cannot be
-/// shared with a trace that outlives the current transform.
+/// exists and which are equal for one array and one declared type. Under [`CapturePlacement::FollowCall`] (refer to
+/// [`CapturePlacementContext::capture_placement`]), an array is declared with the type with which the compiled function
+/// receives it, as an explicit capture is. Dimensions enter as immediate [`Constant::Dimension`]s, and references are
+/// rejected because their state cannot be shared with a trace that outlives the current transform.
 pub struct ThroughSession;
 
 impl ImportingContext<Session, ThroughSession> for TracingContext<Constant, Operation, Constant> {
@@ -2503,8 +3051,8 @@ enum EagerDispatchOutput {
 /// program, the retained arrays that it takes as hidden arguments, and how its outputs are assembled).
 #[derive(Clone)]
 struct EagerDispatchEntry {
-    /// Compiled program of the eager application.
-    program: Arc<CompiledProgram>,
+    /// Program of the eager application for this process.
+    program: EagerDispatchProgram,
 
     /// Positions, among the session constants of the regions of the application (refer to [`DispatchRegion`]), of
     /// the constants whose arrays, placed where the program receives them (refer to `placed_constant`), the compiled
@@ -2562,20 +3110,21 @@ pub(crate) mod tests {
 
     use ryft_core::{
         AbsOperation, Add, AddOperation, AndOperation, Array as CoreArray, ArrayOperation, ArrayReference,
-        Atan2Operation, AttachedRegions, BatchAxis, CaptureReference, Cast, CastOperation, CompareOperation,
-        ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, Condition,
+        Atan2Operation, AttachedRegions, BatchAxis, BatchingError, CaptureReference, Cast, CastOperation,
+        CompareOperation, ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, Condition,
         ConditionOperation, ConstantOperation, ConstrainSharding, DataType, DenseDifferentiableType, Device,
-        DifferentiableType, Differentiate, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
-        DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionSizeOperation,
-        DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
+        DifferentiableType, Differentiate, DifferentiationError, Dimension as CoreDimension, DimensionAddOperation,
+        DimensionBounds, DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionSizeOperation,
+        DimensionToScalar, DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
         DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout, LinearizationTracer,
         Memory, MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Place,
         PlaceDispatch, PlaceOperation, Placeholder, Placement, PlacementRequest, ProjectedContext, ProjectedValue,
-        Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation,
-        ScanOptions, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
-        Sharding, ShardingDimension, ShardingError, Sin, StaticShape, SubOperation, TiledLayout, Tracer as CoreTracer,
-        Typed, Value as CoreValue, WhileOperation, WhileOptions, ZeroOperation, batch, differentiate_at, i4,
-        rematerialize, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, r#while,
+        Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, Reshape, Round,
+        ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation,
+        ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin, StaticShape, StopGradient, SubOperation,
+        TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, WhileOptions, ZeroOperation,
+        batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings, r#while,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -2595,12 +3144,12 @@ pub(crate) mod tests {
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::sessions::effects::EffectCallbackGuard;
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, other_cpu_client, replicated_array, values_from_bytes,
-        values_to_bytes,
+        assert_send_sync, cpu_client, execution_client, other_cpu_client, peer_devices, replicated_array,
+        session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
         CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
-        JitCallOperation, PlacementOptions, ProgramBuilder, Reference, compile, jit,
+        JitCallOperation, LoweringError, PlacementOptions, ProgramBuilder, Reference, compile, jit,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -2663,6 +3212,31 @@ pub(crate) mod tests {
     pub(crate) fn f32_vector(session: &Session, mesh: &DeviceMesh, values: &[f32]) -> Array {
         let r#type = replicated_vector_type(mesh, values.len());
         Array::from_host_buffer(session, r#type, mesh.clone(), None, values_to_bytes::<f32>(values).as_slice()).unwrap()
+    }
+
+    /// Uploads a vector using the session's default device.
+    fn upload_derivative_vector(session: &Session, values: &[f32]) -> Array {
+        Array::from_host_buffer(
+            session,
+            ArrayType::new_static(DataType::F32, [values.len()]),
+            None,
+            None,
+            values_to_bytes(values),
+        )
+        .unwrap()
+    }
+
+    /// Returns the assignment and values of a single-device derivative result.
+    fn observe_derivative_result(array: &Array) -> (Device, bool, Vec<f32>) {
+        let [device] = array.mesh().devices() else { panic!("expected one device") };
+        (*device, array.is_committed(), array.copy_to_host().unwrap().elements::<f32>().unwrap())
+    }
+
+    /// Creates a replicated placement on a named mesh of one device.
+    fn derivative_singleton_placement(device: Device) -> Placement {
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap()
     }
 
     /// Uploads a replicated `f32` test scalar.
@@ -2821,6 +3395,107 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_builder_remote_devices() {
+        // A declared device must belong to another process than the client, and to the process that the client lists
+        // it for, or that an earlier declaration of the same device names. Repeated declarations of one device, and the
+        // declaration of a device of another process that the client lists, are accepted.
+        let client = cpu_client(1);
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let build = |devices: Vec<Device>| {
+            let session = Session::builder().client(client).remote_devices(devices).build();
+            session.map(|session| session.devices().unwrap()).map_err(|error| error.to_string())
+        };
+        let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        assert_eq!(
+            [
+                build(vec![local]),
+                build(vec![Device::new(local.id(), local.process_index() + 1)]),
+                build(vec![remote, Device::new(remote.id(), remote.process_index() + 1)]),
+                build(vec![remote, remote]),
+            ],
+            [
+                Err(format!(
+                    "device `{local}` was declared as a remote device, but it belongs to process {}, which is the \
+                     process of this session; declare only the devices of other processes as remote",
+                    local.process_index(),
+                )),
+                Err(format!(
+                    "device {} reports process index {}, but expected {}",
+                    local.id(),
+                    local.process_index(),
+                    local.process_index() + 1,
+                )),
+                Err(format!(
+                    "device {} reports process index {}, but expected {}",
+                    remote.id(),
+                    remote.process_index(),
+                    remote.process_index() + 1,
+                )),
+                Ok(vec![local, remote]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_place_reports_the_local_nested_batch_item_error() {
+        let client = cpu_client(1);
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote = Device::new(local.id() + 1, 1);
+        let session = Session::builder().client(client).remote_devices([remote]).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local, remote]).unwrap();
+        let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh, sharding).unwrap();
+        let input =
+            Array::from_host_buffer(&session, ArrayType::new_static(DataType::U8, [2, 2, 3]), None, None, [1u8; 12])
+                .unwrap();
+        assert!(input.is_locally_assigned());
+        let axis = BatchAxis::new(0);
+        let result: Result<Array, BatchingError> = batch(
+            |outer| {
+                Ok(batch(
+                    |item| session.place(item, PlacementOptions::to(target)).map_err(ProgramError::from),
+                    outer,
+                    axis,
+                    axis,
+                    None,
+                )?)
+            },
+            input,
+            axis,
+            axis,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            BatchingError::Type(TypeError::invalid(
+                "`place` target sharding splits dimension #0 with extent 3 into 2 shards, which do not divide it evenly",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_session_devices() {
+        // A session lists the devices of its client and the devices of other processes that it declares, sorted by
+        // process and identifier, as `jax.devices()` lists every device of a run, and only the devices of its client as
+        // addressable, as `jax.local_devices()` does.
+        let client = cpu_client(2);
+        let local = client.addressable_devices().unwrap();
+        let local = local.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let session = Session::builder().client(client).build().unwrap();
+        assert_eq!(
+            (session.devices().unwrap(), session.addressable_devices().unwrap()),
+            (local.clone(), local.clone())
+        );
+        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
+        let (first, second, third) =
+            (Device::new(next_id, 2), Device::new(next_id + 1, 1), Device::new(next_id + 2, 1));
+        let declared = session_with_remote_devices(client, [first, third, second]);
+        let devices = [local.clone(), vec![second, third, first]].concat();
+        assert_eq!((declared.devices().unwrap(), declared.addressable_devices().unwrap()), (devices, local));
+    }
+
+    #[test]
     fn test_session_new() {
         // Sessions that are created with the default configuration run on the process-wide client of the selected
         // platform, and they share nothing else.
@@ -2844,6 +3519,269 @@ pub(crate) mod tests {
 
         // The handle that the mesh was added to is unaffected.
         assert!(matches!(session.device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
+    }
+
+    #[test]
+    fn test_session_with_default_device() {
+        // Each row is a case that pinned JAX 0.12.0.1 runs within `jax.default_device(jax.devices()[2])` on four CPU
+        // devices, where `u0` is uncommitted on the first device, `c0` is committed to it, and `c1` is committed to the
+        // second device. The JAX results are in the comments.
+        let client = cpu_client(4);
+        let plain = Session::builder().client(client).build().unwrap();
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let default = plain.with_default_device(devices[2]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[2]]).unwrap();
+        assert_eq!(default.device_mesh().unwrap(), &mesh);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let u0 = session_mesh_vector(&plain, &[1.0, 2.0]).with_session(&default).unwrap();
+        let committed = |device: Device| {
+            session_mesh_vector(&plain, &[1.0, 2.0])
+                .place(&device, None)
+                .unwrap()
+                .with_session(&default)
+                .unwrap()
+        };
+        let (c0, c1) = (committed(devices[0]), committed(devices[1]));
+        let host = || CoreArray::vector(vec![1f32, 2.]).unwrap();
+        let function: CompiledFunction<ArrayType, ArrayType> =
+            compile(|x: CompileTracer| x.clone() + x, r#type.clone(), &default, mesh.clone()).unwrap();
+        let outcomes = vec![
+            // `jax.device_put(np.array(..))` and `jnp.array(..)`: `[2] False`.
+            session_mesh_facts::<Error>(Ok(session_mesh_vector(&default, &[1.0, 2.0]))),
+            // `jnp.zeros(2)`: `[2] False`.
+            session_mesh_value_facts(default.zero(&Type::Array(r#type.clone()))),
+            // `u0 + u0`: `[2] False`, because uncommitted operands move onto the default device.
+            session_mesh_facts(u0.add(&u0)),
+            // `c0 + c0`: `[0] True`, because a committed operand is not moved.
+            session_mesh_facts(c0.add(&c0)),
+            // `u0 + c1`: `[1] True`, because uncommitted operands follow the committed one.
+            session_mesh_facts(u0.add(&c1)),
+            // `jax.device_put(u0)` and `jax.device_put(c0)`: `[0] False` and `[0] True`.
+            session_mesh_facts(default.place(u0.clone(), PlacementOptions::default())),
+            session_mesh_facts(default.place(c0.clone(), PlacementOptions::default())),
+            // `jax.device_put(u0, d[1])` and `jax.device_put(np.array(..), d[1])`: `[1] True`.
+            session_mesh_facts(default.place(u0.clone(), PlacementOptions::to(devices[1]))),
+            session_mesh_facts(default.place(host(), PlacementOptions::to(devices[1]))),
+            // `jax.jit(lambda x: x + x)` at `u0` and at `c0`: `[2] False` and `[0] True`. The function is compiled for
+            // the mesh of the default device, which each process chose for itself, so its result is locally assigned
+            // like the result of the eager operation.
+            session_mesh_facts(function.call(u0.clone())),
+            session_mesh_facts(function.call(c0.clone())),
+            // `jax.device_put(np.array(..))`: `[2] False`.
+            session_mesh_facts(default.place(host(), PlacementOptions::default())),
+        ];
+        assert_eq!(
+            outcomes,
+            vec![
+                session_mesh_outcome(&devices, &[2], false, true, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[2], false, true, &[0.0, 0.0]),
+                session_mesh_outcome(&devices, &[2], false, true, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[0], true, false, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[1], true, false, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[0], false, true, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[0], true, false, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[1], true, false, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[1], true, false, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[2], false, true, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[0], true, false, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[2], false, true, &[1.0, 2.0]),
+            ],
+        );
+
+        // The same anonymous mesh given through `Session::with_device_mesh` is a mesh that every process shares, so an
+        // upload through that handle is committed to it and is not locally assigned (refer to
+        // `test_session_with_default_device_is_process_local_while_a_mesh_of_one_device_is_shared`).
+        let shared = plain.with_device_mesh(mesh.clone());
+        assert_eq!(shared.default_device_mesh(), None);
+        assert_eq!(default.default_device_mesh(), Some(&mesh));
+        assert_eq!(
+            session_mesh_facts::<Error>(Ok(session_mesh_vector(&shared, &[1.0, 2.0]))),
+            session_mesh_outcome(&devices, &[2], true, false, &[1.0, 2.0]),
+        );
+    }
+
+    #[test]
+    fn test_session_with_default_device_is_process_local_while_a_mesh_of_one_device_is_shared() {
+        // Two single-device clients stand for two processes, and both name the device of the first one. Through
+        // `Session::with_device_mesh`, its anonymous mesh is a mesh that every process shares, so an upload without a
+        // mesh, a constant, and an eager operation are committed to it and are not locally assigned on both processes,
+        // while a host value that `Session::place` uploads without a destination goes to the own device of each process,
+        // uncommitted and locally assigned, as `jax.device_put` keeps it on its default device under `jax.set_mesh`.
+        // Through `Session::with_default_device`, the values of the owner stay uncommitted and locally assigned, and
+        // the other process cannot make that device its default device. Before, both handles were a default device on
+        // the owner and a shared mesh on the other process, which therefore planned later placements differently.
+        let clients = [0, 1].map(|process| {
+            let options = CpuClientOptions { device_count: Some(1), process_id: Some(process) };
+            let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+            let client: &'static Client<'static> = Box::leak(Box::new(client));
+            client
+        });
+        let own_devices = clients.map(|client| Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap());
+        let owner = own_devices[0];
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let facts =
+            |array: &Array| (array.mesh().devices().to_vec(), array.is_committed(), array.is_locally_assigned());
+        let observe = |handle: &Session| {
+            let upload = session_mesh_vector(handle, &[1.0, 2.0]);
+            let host = CoreArray::vector(vec![1f32, 2.]).unwrap();
+            let placed = handle.place(host, PlacementOptions::default()).unwrap();
+            let zero = handle.zero(&Type::Array(r#type.clone())).unwrap();
+            let zero = program_array(&zero);
+            let sum = upload.add(&upload).unwrap();
+            assert_eq!(sum.sharding(), upload.sharding());
+            assert_eq!(zero.sharding(), upload.sharding());
+            assert_eq!(sum.r#type(), upload.r#type());
+            assert_eq!(zero.r#type(), upload.r#type());
+            let check = |array: &Array, expected: &[f32]| {
+                array.block_until_ready().unwrap();
+                let owns_device = handle.client().process_index().unwrap() == array.mesh().devices()[0].process_index();
+                assert_eq!(array.addressable_shards().count(), usize::from(owns_device));
+                if owns_device {
+                    assert_eq!(read_first_shard::<f32>(handle.client(), array), expected);
+                }
+            };
+            check(zero, &[0.0, 0.0]);
+            check(&sum, &[2.0, 4.0]);
+            (facts(&upload), facts(&placed), facts(zero), facts(&sum))
+        };
+        let outcomes = clients.map(|client| {
+            let session = session_with_remote_devices(client, peer_devices(client, &clients));
+            let shared = session.with_device_mesh(DeviceMesh::new(LogicalMesh::single_device(), vec![owner]).unwrap());
+            let default = session.with_default_device(owner).map(|default| observe(&default));
+            let shared_observation = observe(&shared);
+
+            if client.process_index().unwrap() != owner.process_index() {
+                assert_eq!(session.cached_program_count(), 0);
+                // The cache hit represents a new computation with its own producer dependencies.
+                let (event, promise) = client.event(()).unwrap();
+                let input =
+                    session_mesh_vector(&shared, &[1.0, 2.0]).with_execution_fence(ExecutionFence::new(vec![event]));
+                let sum = input.add(&input).unwrap();
+                let chained = sum.add(&sum).unwrap();
+                assert_eq!(chained.addressable_shards().count(), 0);
+                promise.set(Some(PjrtError::failed_precondition("remote input failed"))).unwrap();
+                assert!(matches!(
+                    chained.block_until_ready(),
+                    Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. })) if message == "remote input failed",
+                ));
+
+                let undeclared = Session::builder()
+                    .client(client)
+                    .build()
+                    .unwrap()
+                    .with_device_mesh(shared.device_mesh().unwrap().clone());
+                let error = undeclared.zero(&Type::Array(r#type.clone())).unwrap_err();
+                assert!(matches!(error, ProgramError::Custom(_)));
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "device {} of process {} is not a device of the session; declare the devices of other \
+                         processes that the PJRT client does not list with `SessionBuilder::remote_devices`",
+                        owner.id(),
+                        owner.process_index(),
+                    ),
+                );
+            }
+
+            (shared_observation, default.map_err(|error| error.to_string()))
+        });
+        let shared = |own: Device| {
+            let computed = (vec![owner], true, false);
+            (computed.clone(), (vec![own], false, true), computed.clone(), computed)
+        };
+        let local = (vec![owner], false, true);
+        assert_eq!(
+            outcomes,
+            [
+                (shared(own_devices[0]), Ok((local.clone(), local.clone(), local.clone(), local))),
+                (
+                    shared(own_devices[1]),
+                    Err(format!(
+                        "default device `{owner}` belongs to process 0, but this session runs in process 1 and its \
+                         default device must be one of its own; use `Session::with_device_mesh` for a device of \
+                         another process",
+                    )),
+                ),
+            ],
+        );
+
+        // Each process makes its own device its default device. A function compiled for the mesh of that device runs
+        // there on each process, on another device on each, so its result is locally assigned like the result of the
+        // eager operation. Before, each process took the result of the call for an array that every process holds on
+        // the same device, and planned a later placement of it across processes as a transfer between them.
+        for (client, own) in clients.into_iter().zip(own_devices) {
+            let default = Session::builder().client(client).build().unwrap().with_default_device(own).unwrap();
+            let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![own]).unwrap();
+            let upload = session_mesh_vector(&default, &[1.0, 2.0]);
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x: CompileTracer| x.clone() + x, r#type.clone(), &default, mesh).unwrap();
+            let called = function.call(upload.clone()).unwrap();
+            let executed = function.executable().execute(&default, upload.clone()).unwrap();
+            let added = upload.add(&upload).unwrap();
+            let locally_assigned = (vec![own], false, true);
+            for output in [&called, &executed, &added] {
+                assert_eq!(facts(output), locally_assigned);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dimension_derived_scalars_keep_process_local_assignment() {
+        let clients = [0, 1].map(|rank| {
+            let options = CpuClientOptions { device_count: Some(1), process_id: Some(rank) };
+            let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+            let client: &'static Client<'static> = Box::leak(Box::new(client));
+            client
+        });
+        let devices = clients.map(|client| Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap());
+        let axis = MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap();
+        for (rank, client) in clients.into_iter().enumerate() {
+            let session = Session::builder()
+                .client(client)
+                .remote_devices([devices[1 - rank]])
+                .value_comparison(false)
+                .build()
+                .unwrap();
+            let mesh = session.mesh([axis.clone()]).unwrap();
+            assert_eq!(mesh.devices(), &devices);
+            let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0)).unwrap();
+
+            let default = session.with_default_device(devices[rank]).unwrap();
+            let shared = session.with_device_mesh(default.device_mesh().unwrap().clone());
+            for (handle, local) in [(&session, true), (&default, true), (&shared, false)] {
+                let scalar =
+                    Array::from_host_buffer(handle, ArrayType::scalar(DataType::I64), None, None, 2i64.to_ne_bytes())
+                        .unwrap();
+                let output_type = DimensionValue::constant(2).unwrap().r#type().into_owned();
+                let from_scalar = handle
+                    .bind(DimensionFromScalarOperation::new(output_type), Vec::new(), &[Value::Array(scalar)])
+                    .unwrap()
+                    .remove(0);
+                let vector = session_mesh_vector(handle, &[1.0, 2.0]);
+                let size = DimensionSizeOperation::new(vector.r#type().as_ref(), 0).unwrap();
+                let vector = Value::Array(vector);
+                let extent = vector.dimension_size(0).unwrap();
+                let bound_extent = handle.bind(size, Vec::new(), &[vector]).unwrap().remove(0);
+                for dimension in [from_scalar, extent, bound_extent] {
+                    let scalar = dimension.to_scalar().unwrap();
+                    let scalar = program_array(&scalar);
+                    assert_eq!(scalar.mesh().devices(), &[devices[rank]]);
+                    assert_eq!((scalar.is_committed(), scalar.is_locally_assigned()), (!local, local));
+                    assert_eq!(read_first_shard::<i64>(client, scalar), vec![2]);
+                    if local {
+                        let replicated = scalar.to_placement(&session, target.clone()).unwrap();
+                        assert_eq!(replicated.mesh(), &mesh);
+                        assert_eq!(replicated.addressable_shards().count(), 1);
+                        assert_eq!(read_first_shard::<i64>(client, &replicated), vec![2]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2947,13 +3885,13 @@ pub(crate) mod tests {
         let second_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![wide_mesh.devices()[1]]).unwrap();
 
         // Without inputs, a mesh of the handle, or a logical mesh, the first addressable device forms a mesh.
-        assert_eq!(session.device_mesh_for(&[], None), Ok(first_mesh.clone()));
+        assert_eq!(session.device_mesh_for(&[], None, None), Ok(first_mesh.clone()));
 
         // A logical mesh is laid out over the addressable devices, in the order in which the client reports them.
-        assert_eq!(session.device_mesh_for(&[], Some(wide_mesh.logical_mesh())), Ok(wide_mesh.clone()));
+        assert_eq!(session.device_mesh_for(&[], Some(wide_mesh.logical_mesh()), None), Ok(wide_mesh.clone()));
         let large_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Auto).unwrap()]).unwrap();
         assert_eq!(
-            session.device_mesh_for(&[], Some(&large_mesh)),
+            session.device_mesh_for(&[], Some(&large_mesh), None),
             Err(ProgramError::InvalidArgument {
                 message: format!(
                     "eager XLA placement of a value without array inputs over mesh {large_mesh:?} requires 4 \
@@ -2964,9 +3902,9 @@ pub(crate) mod tests {
 
         // The mesh of the handle takes precedence over a logical mesh, and the mesh of the first input over both.
         let meshed = session.with_device_mesh(second_mesh.clone());
-        assert_eq!(meshed.device_mesh_for(&[], Some(wide_mesh.logical_mesh())), Ok(second_mesh));
+        assert_eq!(meshed.device_mesh_for(&[], Some(wide_mesh.logical_mesh()), None), Ok(second_mesh));
         let input = f32_vector(&session, &first_mesh, &[1.0]);
-        assert_eq!(meshed.device_mesh_for(&[input], Some(wide_mesh.logical_mesh())), Ok(first_mesh));
+        assert_eq!(meshed.device_mesh_for(&[input], Some(wide_mesh.logical_mesh()), None), Ok(first_mesh));
     }
 
     #[test]
@@ -3131,11 +4069,11 @@ pub(crate) mod tests {
     fn test_session_mesh() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = session.target().unwrap().devices().iter().map(TargetDevice::device).collect::<Vec<_>>();
+        let devices = session.devices().unwrap();
         let x = MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap();
         let y = MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap();
 
-        // A mesh takes the first devices of the client that its axes require, in the order of the client.
+        // A mesh takes the first devices in the session inventory that its axes require.
         let mesh = session.mesh([x.clone(), y.clone()]).unwrap();
         assert_eq!(mesh.logical_mesh(), &LogicalMesh::new(vec![x.clone(), y]).unwrap());
         assert_eq!(mesh.devices(), devices.as_slice());
@@ -3584,7 +4522,11 @@ pub(crate) mod tests {
         // computation without the region. An array that only dead instructions use selects nothing, as JAX traces a
         // jaxpr that holds only the constants that its equations use, and an array that a compiled function called in
         // a region captures belongs to that call, which runs where its argument runs, as JAX ignores where the arrays
-        // that a `jit` function closes over live. The captured array lives on the second device, committed.
+        // that a `jit` function closes over live. The captured array lives on the second device, committed. The region
+        // compiles the call into its own computation, which runs where its operand runs, so the call follows it as a
+        // call nested in a compiled function does, whereas a direct call of the function, compiled for the anonymous
+        // mesh of the first device, runs on that device, which its mesh names, so only the direct call of an
+        // uncommitted operand says that its devices are not locally assigned.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -3641,6 +4583,10 @@ pub(crate) mod tests {
                 let committed = operand.is_committed();
                 match row {
                     "live import" if committed => assert!(region.is_err() && eager.is_err()),
+                    "nested call" if !committed => {
+                        let expected = |local| Ok::<_, ProgramError>((vec![devices[0]], false, local, vec![14.0]));
+                        assert_eq!((region, eager), (expected(true), expected(false)));
+                    }
                     _ => assert_eq!((committed, row, region), (committed, row, eager)),
                 }
             }
@@ -3651,7 +4597,10 @@ pub(crate) mod tests {
     fn test_session_bind_calls_compiled_functions_in_regions_as_it_calls_them_directly() {
         // A compiled function called in a branch of an eager `condition` keeps its own placement boundary, so the
         // result has the facts of the direct call, for a function that places its value onto a device (which names it)
-        // and for one that captures an array on the other device (which selects nothing).
+        // and, up to whether the devices are locally assigned, for one that captures an array on the other device
+        // (which selects nothing). A direct call of the latter runs on the device of the anonymous mesh that it was
+        // compiled for, which that mesh names for every process, while the `condition` compiles the call into its own
+        // computation, which runs where its uncommitted operand runs, as a call nested in a compiled function does.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -3684,9 +4633,9 @@ pub(crate) mod tests {
             let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
             (array.mesh().devices().to_vec(), array.is_committed(), array.is_locally_assigned(), values)
         };
-        for (function, expected) in [
-            (placing, (vec![devices[0]], true, false, vec![7.0])),
-            (capturing, (vec![devices[0]], false, true, vec![14.0])),
+        for (function, expected, conditional_expected) in [
+            (placing, (vec![devices[0]], true, false, vec![7.0]), (vec![devices[0]], true, false, vec![7.0])),
+            (capturing, (vec![devices[0]], false, false, vec![14.0]), (vec![devices[0]], false, true, vec![14.0])),
         ] {
             let conditional = Value::Array(predicate.clone())
                 .condition(
@@ -3696,7 +4645,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             assert_eq!(facts(function.call(input.clone()).unwrap()), expected);
-            assert_eq!(facts(program_array(&conditional).clone()), expected);
+            assert_eq!(facts(program_array(&conditional).clone()), conditional_expected);
         }
     }
 
@@ -3864,8 +4813,9 @@ pub(crate) mod tests {
     fn test_session_bind_calls_functions_with_output_overrides_that_state_reduction_state() {
         // An output override can state reduction state over an auto mesh axis, which no type records, and a direct
         // execution returns its output with that runtime placement. An eager call, the interpretation of a staged
-        // caller, and the replay of the callee return the same placement and the same shards, because the program of
-        // an eager call returns each output with the override of the callee rather than as its own exit would place it.
+        // caller, and the interpretation rule of the call return the same placement and the same shards, because the
+        // program of an eager call returns each output with the override of the callee rather than as its own exit
+        // would place it.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
@@ -3915,8 +4865,8 @@ pub(crate) mod tests {
             );
             let driver = ryft_core::EagerInterpretationDriver::new(&regions);
             let inputs = [Value::Array(input.clone())];
-            let replayed = ryft_core::InterpretableOperation::interpret(call, &session, &driver, &inputs);
-            assert_eq!(observe(program_array(&replayed.unwrap()[0]).clone()), expected);
+            let applied = ryft_core::InterpretableOperation::interpret(call, &session, &driver, &inputs);
+            assert_eq!(observe(program_array(&applied.unwrap()[0]).clone()), expected);
         }
     }
 
@@ -3943,8 +4893,10 @@ pub(crate) mod tests {
         assert!(!program_array(&session.lift(Constant::Boolean(true)).unwrap()).is_committed());
         assert!(program_array(&meshed_session.lift(Constant::Boolean(true)).unwrap()).is_committed());
 
-        // With array inputs, a result is committed when one of its inputs is, whatever the mesh of the session.
-        assert!(!program_array(&negate(&meshed_session, &constant)).is_committed());
+        // With array inputs, a result is committed when one of its inputs is or when a named mesh of the session placed
+        // it (refer to `Session::with_device_mesh`), which moves an uncommitted input onto that mesh.
+        assert!(!program_array(&negate(&session, &constant)).is_committed());
+        assert!(program_array(&negate(&meshed_session, &constant)).is_committed());
         let committed = Value::Array(f32_scalar(&session, &mesh, 2.0));
         assert!(program_array(&negate(&session, &committed)).is_committed());
 
@@ -4050,9 +5002,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session_bind_rejects_moves_of_region_inputs_onto_another_logical_mesh() {
-        // Regions that request a named mesh of one device cannot receive an uncommitted value of the canonical mesh of
-        // one device, because they were traced for its type over that mesh, which the move would change. The error
-        // says how to proceed, and placing the value on the named mesh first works.
+        // Regions that request a named mesh of one device cannot move an uncommitted value whose type tracks a
+        // different mesh. An uncommitted anonymous input has no sharding in its type and can follow the region.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let named = LogicalMesh::new(vec![MeshAxis::new("a", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -4060,25 +5011,30 @@ pub(crate) mod tests {
         let target =
             Placement::new(DeviceMesh::new(named.clone(), vec![second]).unwrap(), Sharding::replicated(named, 0))
                 .unwrap();
-        let input = Value::Array(
-            Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 7f32.to_ne_bytes())
-                .unwrap(),
+        let scalar = ArrayType::scalar(DataType::F32);
+        let input = Array::from_host_buffer(&session, scalar.clone(), None, None, 7f32.to_ne_bytes()).unwrap();
+        let first = input.mesh().devices()[0];
+        let other = LogicalMesh::new(vec![MeshAxis::new("b", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other = DeviceMesh::new(other, vec![first]).unwrap();
+        let named_input = Value::Array(
+            Array::from_host_buffer(&session, scalar, other, None, 7f32.to_ne_bytes())
+                .unwrap()
+                .with_committed(false),
         );
         let predicate = Value::Array(
             Array::from_host_buffer(&session, ArrayType::scalar(DataType::Boolean), None, None, [1]).unwrap(),
         );
         assert_eq!(
             predicate
-                .condition(|value| value.place(&target, None), |value| value.place(&target, None), input.clone())
+                .condition(|value| value.place(&target, None), |value| value.place(&target, None), named_input)
                 .unwrap_err()
                 .to_string(),
             "the regions of an eager `condition` request the mesh `['a'=1:explicit]`, but its uncommitted input #1 is over \
-             the mesh `['device'=1:auto]`, for whose type the regions were traced; place the input on the mesh \
+             the mesh `['b'=1:explicit]`, for whose type the regions were traced; place the input on the mesh \
              `['a'=1:explicit]` before the operation, or place the value onto a device in the regions",
         );
-        let placed = input.place(&target, None).unwrap();
         let output = predicate
-            .condition(|value| value.place(&target, None), |value| value.place(&target, None), placed)
+            .condition(|value| value.place(&target, None), |value| value.place(&target, None), Value::Array(input))
             .unwrap();
         assert_eq!(program_array(&output).mesh().devices(), [second]);
     }
@@ -5236,7 +6192,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_session_bind_executes_on_the_mesh_of_its_inputs() {
-        // An operation executes on the mesh of its array inputs, even when the handle has another default mesh.
+        // An operation executes on the mesh of its array inputs, even when the handle has another default mesh on the
+        // same devices, as long as neither mesh has an explicit axis. A named default mesh on other devices rejects an
+        // input committed to them (refer to `Session::with_device_mesh`).
         let client = execution_client();
         let default_mesh = domain_mesh(client, "x", 1);
         let input_mesh = domain_mesh(client, "y", 1);
@@ -5262,22 +6220,605 @@ pub(crate) mod tests {
             Session::builder().client(client).build().unwrap().with_device_mesh(default_mesh),
         );
         let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
-        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].mesh(), &input_mesh);
-        assert_eq!(read_first_shard::<f32>(client, &outputs[0]), vec![-1.0, 2.0]);
+        assert_eq!(
+            domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap_err().to_string(),
+            "received incompatible devices for eager XLA execution: input #0 is committed to devices [0] but \
+             the session mesh is on devices [0, 1]",
+        );
 
-        // An input on a device other than the first one of the client stays on that device.
+        // An input on a device other than the first one of the client too.
         let input_mesh = DeviceMesh::new(
             input_mesh.logical_mesh().clone(),
             vec![domain.parent().device_mesh().unwrap().devices()[1]],
         )
         .unwrap();
         let input = f32_vector(domain.parent(), &input_mesh, &[1.0, -2.0]);
-        let outputs = domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].mesh(), &input_mesh);
-        assert_eq!(read_sharded_f32_array(&outputs[0]), vec![-1.0, 2.0]);
+        assert_eq!(
+            domain.bind(NegOperation::new(), Vec::new(), &[input]).unwrap_err().to_string(),
+            "received incompatible devices for eager XLA execution: input #0 is committed to devices [1] but \
+             the session mesh is on devices [0, 1]",
+        );
+    }
+
+    /// Devices, commitment, local assignment, and values of an eager `f32` result, or the rendered error.
+    type SessionMeshFacts = Result<(Vec<Device>, bool, bool, Vec<f32>), String>;
+
+    /// Returns the [`SessionMeshFacts`] of `array`.
+    fn session_mesh_facts<E: std::fmt::Display>(array: Result<Array, E>) -> SessionMeshFacts {
+        array.map_err(|error| error.to_string()).map(|array| {
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            (array.mesh().devices().to_vec(), array.is_committed(), array.is_locally_assigned(), values)
+        })
+    }
+
+    /// Returns the [`SessionMeshFacts`] of the array that `value` carries.
+    fn session_mesh_value_facts<E: std::fmt::Display>(value: Result<Value, E>) -> SessionMeshFacts {
+        session_mesh_facts(value.map(|value| program_array(&value).clone()))
+    }
+
+    /// Returns the devices of `client`, which has at least four, and two named session meshes: one of one device on the
+    /// second device and one of two devices on the third and fourth.
+    fn named_session_meshes(client: &Client<'_>) -> (Vec<Device>, [DeviceMesh; 2]) {
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = |size| LogicalMesh::new(vec![MeshAxis::new("q", size, MeshAxisType::Explicit).unwrap()]);
+        let one = DeviceMesh::new(logical_mesh(1).unwrap(), vec![devices[1]]).unwrap();
+        let two = DeviceMesh::new(logical_mesh(2).unwrap(), vec![devices[2], devices[3]]).unwrap();
+        (devices, [one, two])
+    }
+
+    /// Returns the [`SessionMeshFacts`] of a result on the devices of `devices` at `indices`.
+    fn session_mesh_outcome(
+        devices: &[Device],
+        indices: &[usize],
+        committed: bool,
+        locally_assigned: bool,
+        values: &[f32],
+    ) -> SessionMeshFacts {
+        let devices = indices.iter().map(|&index| devices[index]).collect();
+        Ok((devices, committed, locally_assigned, values.to_vec()))
+    }
+
+    /// Uploads `values` as an `f32` vector through `session` without a destination.
+    fn session_mesh_vector(session: &Session, values: &[f32]) -> Array {
+        let r#type = ArrayType::new_static(DataType::F32, [values.len()]);
+        Array::from_host_buffer(session, r#type, None, None, values_to_bytes(values)).unwrap()
+    }
+
+    #[test]
+    fn test_session_eager_multiply_uses_explicit_sharding_mesh_on_shared_devices() {
+        let client = cpu_client(4);
+        let (devices, [mesh, _]) = named_session_meshes(client);
+        let session = Session::builder().client(client).build().unwrap();
+        let x = session_mesh_vector(&session, &[2.0, 3.0]).place(&devices[1], None).unwrap();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let placement = Placement::new(mesh.clone(), sharding.clone()).unwrap();
+        let y = session_mesh_vector(&session, &[5.0, 7.0]).place(&placement, None).unwrap();
+
+        for (left, right) in [(&x, &y), (&y, &x)] {
+            let output = left.mul(right).unwrap();
+            assert_eq!(output.mesh(), &mesh);
+            assert_eq!(output.sharding(), &sharding);
+            assert_eq!(
+                session_mesh_facts(Ok::<_, ProgramError>(output)),
+                session_mesh_outcome(&devices, &[1], true, false, &[10.0, 21.0]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_the_operands_of_eager_operations() {
+        // Under a named session mesh, eager operations without regions on operands that are uncommitted elsewhere,
+        // committed to the session mesh, and committed elsewhere, unary and binary, mixed, on a mesh of one device and
+        // on one of two devices.
+        let client = cpu_client(4);
+        let (devices, meshes) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let mut outcomes = Vec::new();
+        for mesh in meshes {
+            let mesh_devices = mesh.devices().to_vec();
+            let meshed = plain.with_device_mesh(mesh);
+            let uncommitted = || Value::Array(session_mesh_vector(&plain, &[1.0, 2.0]).with_session(&meshed).unwrap());
+            let on_mesh = || Value::Array(session_mesh_vector(&meshed, &[10.0, 20.0]));
+            let elsewhere = || {
+                let array = session_mesh_vector(&plain, &[10.0, 20.0]).place(&devices[0], None).unwrap();
+                Value::Array(array.with_session(&meshed).unwrap())
+            };
+            // An array over a mesh `r` on the devices of the session mesh, replicated or split along `r`, committed or
+            // uncommitted.
+            let over_r = |axis_type: MeshAxisType, split: bool, committed: bool| {
+                let axis = MeshAxis::new("r", mesh_devices.len(), axis_type).unwrap();
+                let mesh = DeviceMesh::new(LogicalMesh::new(vec![axis]).unwrap(), mesh_devices.clone()).unwrap();
+                let sharding = split.then(|| {
+                    Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["r"])]).unwrap()
+                });
+                let r#type = ArrayType::new_static(DataType::F32, [2]);
+                let array = Array::from_host_buffer(&plain, r#type, mesh, sharding, values_to_bytes(&[10f32, 20.0]));
+                Value::Array(array.unwrap().with_committed(committed).with_session(&meshed).unwrap())
+            };
+            let renamed = || over_r(MeshAxisType::Explicit, false, true);
+            let bind = |operation: Operation, inputs: &[Value]| {
+                let output = meshed.bind(operation, Vec::new(), inputs).map(|mut outputs| outputs.remove(0));
+                session_mesh_value_facts(output)
+            };
+            let negate = || Operation::Array(NegOperation::new().into());
+            let add = || Operation::Array(AddOperation::new().into());
+            outcomes.push(vec![
+                bind(negate(), &[renamed()]),
+                bind(negate(), &[uncommitted()]),
+                bind(negate(), &[on_mesh()]),
+                bind(negate(), &[elsewhere()]),
+                bind(add(), &[uncommitted(), uncommitted()]),
+                bind(add(), &[uncommitted(), on_mesh()]),
+                bind(add(), &[on_mesh(), uncommitted()]),
+                bind(add(), &[uncommitted(), elsewhere()]),
+                bind(add(), &[elsewhere(), on_mesh()]),
+                bind(negate(), &[over_r(MeshAxisType::Explicit, false, false)]),
+                bind(negate(), &[over_r(MeshAxisType::Explicit, true, false)]),
+                bind(negate(), &[over_r(MeshAxisType::Auto, true, false)]),
+                bind(add(), &[on_mesh(), over_r(MeshAxisType::Explicit, true, false)]),
+            ]);
+            let replicated = meshed.bind(negate(), Vec::new(), &[over_r(MeshAxisType::Explicit, false, false)]);
+            let replicated = program_array(&replicated.unwrap()[0]).sharding().mesh().clone();
+            assert_eq!(&replicated, meshed.device_mesh().unwrap().logical_mesh());
+        }
+
+        // Every operation runs on the session mesh and commits its results there, which every process knows, as under
+        // `jax.set_mesh`: uncommitted operands move there, and an operand committed to other devices is rejected
+        // before type inference (which rejected the ninth row for its meshes before the session mesh placed
+        // operations), and so is an operand committed to the devices of the session mesh over another named mesh (the
+        // first row). An uncommitted operand over another named mesh on those devices moves onto the session mesh when
+        // its type records nothing beyond replication, which is when it is replicated (the tenth row, whose result is
+        // over the session mesh) or split along an auto axis, which types do not record (the twelfth row), and is
+        // rejected like a committed one when it is split along an explicit axis of that mesh, alone or beside a
+        // committed operand (the eleventh and the last row, which ran over that mesh and committed their results to it
+        // before this was rejected, or failed type inference beside a committed operand).
+        let on = |indices: &[usize], values: &[f32]| session_mesh_outcome(&devices, indices, true, false, values);
+        let rejected = |input: usize, mesh: &[usize]| {
+            Err(format!(
+                "received incompatible devices for eager XLA execution: input #{input} is committed to devices [0] but \
+                 the session mesh is on devices {mesh:?}",
+            ))
+        };
+        let split = |input: usize, axis_type: &str, size: usize| {
+            Err(format!(
+                "received incompatible meshes for eager XLA execution: uncommitted input #{input} over the mesh \
+                 `['r'={size}:{axis_type}]` cannot move onto the session mesh `['q'={size}:explicit]`",
+            ))
+        };
+        let expected = |mesh: &[usize]| {
+            vec![
+                Err(format!(
+                    "received incompatible meshes for eager XLA execution: input #0 is committed to the mesh \
+                     `['r'={size}:explicit]` but the session mesh is `['q'={size}:explicit]`",
+                    size = mesh.len(),
+                )),
+                on(mesh, &[-1.0, -2.0]),
+                on(mesh, &[-10.0, -20.0]),
+                rejected(0, mesh),
+                on(mesh, &[2.0, 4.0]),
+                on(mesh, &[11.0, 22.0]),
+                on(mesh, &[11.0, 22.0]),
+                rejected(1, mesh),
+                rejected(0, mesh),
+                on(mesh, &[-10.0, -20.0]),
+                split(0, "explicit", mesh.len()),
+                on(mesh, &[-10.0, -20.0]),
+                split(1, "explicit", mesh.len()),
+            ]
+        };
+        assert_eq!(outcomes, vec![expected(&[1]), expected(&[2, 3])]);
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_the_operands_of_region_operations() {
+        // Under a named session mesh, region operations whose operands are uncommitted on other devices, over the
+        // canonical mesh of one device and over the logical mesh of the session. Each frontend traces its regions at
+        // the relocatable types of its operands before the operation is bound.
+        let client = cpu_client(4);
+        let (devices, meshes) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let mut outcomes = Vec::new();
+        for mesh in meshes {
+            let meshed = plain.with_device_mesh(mesh.clone());
+            let elsewhere =
+                DeviceMesh::new(mesh.logical_mesh().clone(), devices[..mesh.devices().len()].to_vec()).unwrap();
+            for over_session_logical_mesh in [false, true] {
+                let upload = |data_type: DataType, bytes: Vec<u8>| {
+                    let r#type = ArrayType::scalar(data_type);
+                    let array = match over_session_logical_mesh {
+                        true => Array::from_host_buffer(&plain, r#type, elsewhere.clone(), None, bytes),
+                        false => Array::from_host_buffer(&plain, r#type, None, None, bytes),
+                    };
+                    Value::Array(array.unwrap().with_committed(false).with_session(&meshed).unwrap())
+                };
+                let scalar = |value: f32| upload(DataType::F32, value.to_ne_bytes().to_vec());
+                let predicate = upload(DataType::Boolean, vec![1]);
+                let rows = vec![
+                    predicate.condition(|value| value.add(&value), |value| value.add(&value), scalar(3.0)),
+                    scan(
+                        |_, carry, ()| Ok((carry.add(&carry)?, ())),
+                        scalar(3.0),
+                        (),
+                        ScanOptions::new().with_iteration_count(2usize),
+                    )
+                    .map(|(value, ())| value),
+                    r#while(
+                        |(count, limit, _)| count.less_than(&limit),
+                        |(count, limit, value)| Ok((count.add(&count)?, limit, value.add(&value)?)),
+                        (scalar(1.0), scalar(2.0), scalar(3.0)),
+                        WhileOptions::new(),
+                    )
+                    .map(|(_, _, value)| value),
+                    rematerialize(|value: Tracer| Ok(value.add(&value)?)).call(scalar(3.0)),
+                ];
+                outcomes.push(rows.into_iter().map(session_mesh_value_facts).collect::<Vec<_>>());
+            }
+        }
+
+        // The regions are traced at the relocatable types of the operands, which name no mesh, so an operand moves
+        // whatever its logical mesh, and every operation runs on the session mesh and commits its results there, as
+        // `cond`, `scan`, `while_loop` and `checkpoint` do under `jax.set_mesh` for an uncommitted operand on another
+        // device. Operands over the canonical mesh were rejected with a remedy before the frontends traced their regions
+        // at those types, and every row ran where its operands were before the session mesh placed operations.
+        let moved = |mesh: &[usize]| {
+            [6.0, 12.0, 6.0, 6.0]
+                .into_iter()
+                .map(|value| session_mesh_outcome(&devices, mesh, true, false, &[value]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outcomes, vec![moved(&[1]), moved(&[1]), moved(&[2, 3]), moved(&[2, 3])]);
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_the_operands_and_captures_of_region_operations() {
+        // Under a named session mesh of one device on the second device, region operations whose operands and captured
+        // arrays are uncommitted on the first device, mirroring `jax.set_mesh` with `lax.scan` (a carry at lengths zero
+        // and one, a capture that the body adds to itself, stacked inputs), `lax.cond`, `lax.while_loop`, and
+        // `jax.checkpoint`, and a carry that is committed to the first device.
+        let client = cpu_client(4);
+        let (devices, [mesh, _]) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let meshed = plain.with_device_mesh(mesh);
+        let upload = |r#type: ArrayType, bytes: Vec<u8>| {
+            let array = Array::from_host_buffer(&plain, r#type, None, None, bytes).unwrap();
+            Value::Array(array.with_session(&meshed).unwrap())
+        };
+        let vector =
+            |values: &[f32]| upload(ArrayType::new_static(DataType::F32, [values.len()]), values_to_bytes(values));
+        let carry = || vector(&[1.0]);
+        let capture = vector(&[3.0]);
+        let limit = upload(ArrayType::scalar(DataType::F32), values_to_bytes(&[5f32]));
+        let stacked = || upload(ArrayType::new_static(DataType::F32, [3, 1]), values_to_bytes(&[0f32, 1.0, 2.0]));
+        let predicate = upload(ArrayType::scalar(DataType::Boolean), vec![1]);
+        let committed = session_mesh_vector(&plain, &[1.0]).place(&devices[0], None).unwrap();
+        let committed = Value::Array(committed.with_session(&meshed).unwrap());
+
+        // A host upload replicated over the named mesh `r` of one device without a device mesh is uncommitted on the
+        // first device, and it records nothing beyond replication, so it follows the computation as a capture, as a
+        // region operand, and as the operand of an operation without regions alike.
+        let r_mesh = LogicalMesh::new(vec![MeshAxis::new("r", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated_over_r = |values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, [values.len()]);
+            let sharding = Sharding::replicated(r_mesh.clone(), 1);
+            let array = Array::from_host_buffer(&plain, r#type, None, Some(sharding), values_to_bytes(values)).unwrap();
+            assert_eq!((array.mesh().devices(), array.is_committed()), (&devices[..1], false));
+            Value::Array(array.with_session(&meshed).unwrap())
+        };
+        let length = |count: usize| ScanOptions::new().with_iteration_count(count);
+        let doubled_carry = |carry: Value, count: usize| {
+            scan(|_, carry, ()| Ok((carry.add(&carry)?, ())), carry, (), length(count)).map(|(carry, ())| carry)
+        };
+        let doubled_capture = |capture: &Value, count: usize| {
+            scan(
+                |_, carry, ()| {
+                    let capture =
+                        ImportingContext::<Session, ThroughSession>::import(carry.context(), capture.clone())?;
+                    Ok((carry, capture.add(&capture)?))
+                },
+                carry(),
+                (),
+                length(count),
+            )
+            .map(|(_, outputs)| outputs)
+        };
+        let accumulated =
+            || scan(|_, carry, x| Ok((carry.add(&x)?, x.add(&x)?)), carry(), stacked(), ScanOptions::new());
+        let rows = vec![
+            doubled_carry(carry(), 0),
+            doubled_carry(carry(), 1),
+            doubled_capture(&capture, 0),
+            doubled_capture(&capture, 1),
+            accumulated().map(|(carry, _)| carry),
+            accumulated().map(|(_, outputs)| outputs),
+            predicate.condition(
+                |value| {
+                    let capture =
+                        ImportingContext::<Session, ThroughSession>::import(value.context(), capture.clone())?;
+                    value.add(&capture)
+                },
+                |value| value.add(&value),
+                carry(),
+            ),
+            r#while(
+                |value| {
+                    let limit = ImportingContext::<Session, ThroughSession>::import(value.context(), limit.clone())?;
+                    value.less_than(&limit)
+                },
+                |value| value.add(&value),
+                upload(ArrayType::scalar(DataType::F32), values_to_bytes(&[1f32])),
+                WhileOptions::new(),
+            ),
+            rematerialize(|value: Tracer| {
+                let capture = ImportingContext::<Session, ThroughSession>::import(value.context(), capture.clone())?;
+                let capture = ValueProjection::<ArrayType>::into_projected(capture)?;
+                let value = ValueProjection::<ArrayType>::into_projected(value)?;
+                Ok(value.sin()?.add(&capture)?.into_value())
+            })
+            .call(carry()),
+            doubled_capture(&replicated_over_r(&[3.0]), 1),
+            doubled_carry(replicated_over_r(&[1.0]), 1),
+            replicated_over_r(&[1.0]).add(&replicated_over_r(&[1.0])),
+            doubled_carry(committed, 1),
+        ];
+        let outcomes = rows
+            .into_iter()
+            .map(|row| {
+                let mesh = row.as_ref().ok().map(|value| {
+                    let r#type = program_array(value).r#type();
+                    r#type.sharding().map(|sharding| sharding.mesh().to_string())
+                });
+                (session_mesh_value_facts(row), mesh.flatten())
+            })
+            .collect::<Vec<_>>();
+
+        // JAX moves every uncommitted operand and captured array onto the session mesh and returns every result
+        // committed there with a sharding over `q` (`regions.py` prints `NamedSharding(mesh=Mesh('q': 1, ...))` and
+        // `True` for each), with the values `[1.0]`, `[2.0]`, `[]`, `[[6.0]]`, `[4.0]`, `[0.0, 2.0, 4.0]`, `[4.0]`,
+        // `8.0` (`[8.0]` for a vector there), and `sin(1) + 3`, and rejects the carry that is committed to the first
+        // device. Before the frontends traced regions at relocatable types, every operand row was rejected with a
+        // remedy because its operand is over the canonical mesh of the first device. The capture that is replicated
+        // over `r` was rejected as an uncommitted captured array over another mesh before it followed the computation
+        // like the other uncommitted replicated operands, which JAX moves as it moves any uncommitted array.
+        let on = |values: &[f32]| {
+            (session_mesh_outcome(&devices, &[1], true, false, values), Some("['q'=1:explicit]".to_string()))
+        };
+        assert_eq!(
+            outcomes,
+            vec![
+                on(&[1.0]),
+                on(&[2.0]),
+                on(&[]),
+                on(&[6.0]),
+                on(&[4.0]),
+                on(&[0.0, 2.0, 4.0]),
+                on(&[4.0]),
+                on(&[8.0]),
+                on(&[1f32.sin() + 3.0]),
+                on(&[6.0]),
+                on(&[2.0]),
+                on(&[2.0]),
+                (
+                    Err("received incompatible devices for eager XLA execution: input #0 is committed to devices [0] \
+                         but the session mesh is on devices [1]"
+                        .to_string()),
+                    None,
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_eager_transforms() {
+        // Under a named session mesh, eager JVP, VJP, and `vmap` at a value that is uncommitted elsewhere, whose
+        // transform contexts recover the session from that value. The VJP seeds are committed to the session mesh and
+        // uncommitted elsewhere.
+        let client = cpu_client(4);
+        let (devices, meshes) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let mut outcomes = Vec::new();
+        for mesh in meshes {
+            let meshed = plain.with_device_mesh(mesh);
+            let elsewhere = |values: &[f32]| session_mesh_vector(&plain, values).with_session(&meshed).unwrap();
+            let mut rows = Vec::new();
+            let jvp: Result<(Array, Array), _> =
+                differentiate_at(elsewhere(&[1.0, 2.0])).jvp(elsewhere(&[1.0, 1.0]), |x| x.mul(&x));
+            match jvp {
+                Ok((value, tangent)) => {
+                    rows.push(session_mesh_facts::<ProgramError>(Ok(value)));
+                    rows.push(session_mesh_facts::<ProgramError>(Ok(tangent)));
+                }
+                Err(error) => rows.push(Err(error.to_string())),
+            }
+            match differentiate_at(elsewhere(&[1.0, 2.0])).vjp(|x| x.mul(&x)) {
+                Ok((value, pullback)) => {
+                    rows.push(session_mesh_facts::<ProgramError>(Ok(value)));
+                    let seed = session_mesh_vector(&meshed, &[1.0, 1.0]);
+                    rows.push(session_mesh_facts(pullback.apply_materialized(seed)));
+                    rows.push(session_mesh_facts(pullback.apply_materialized(elsewhere(&[1.0, 1.0]))));
+                }
+                Err(error) => rows.push(Err(error.to_string())),
+            }
+            let batched: Result<Array, _> =
+                batch(|x| Ok(x.clone() * x), elsewhere(&[1.0, 2.0]), BatchAxis::new(0), BatchAxis::new(0), None);
+            rows.push(session_mesh_facts(batched));
+            outcomes.push(rows);
+        }
+
+        // Every value, tangent, and cotangent comes back on the session mesh, committed, as under `jax.set_mesh`.
+        // Before the session mesh placed operations, everything ran where the value was, and the pullback rejected the
+        // seed on the session mesh, because the output that it seeds was recorded over the canonical mesh.
+        let expected = |mesh: &[usize]| {
+            [[1.0, 4.0], [2.0, 4.0], [1.0, 4.0], [2.0, 4.0], [2.0, 4.0], [1.0, 4.0]]
+                .iter()
+                .map(|values| session_mesh_outcome(&devices, mesh, true, false, values))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outcomes, vec![expected(&[1]), expected(&[2, 3])]);
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_keeps_the_rules_of_calls_and_maps() {
+        // Under a named session mesh, a call of a function compiled for the session mesh, for another named mesh, and
+        // for the anonymous mesh, and a `shard_map`, at an argument that is uncommitted elsewhere, keep their own
+        // rules.
+        let client = cpu_client(4);
+        let (devices, [mesh, _]) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let meshed = plain.with_device_mesh(mesh.clone());
+        let r#type = ArrayType::scalar(DataType::F32);
+        let other_logical_mesh = LogicalMesh::new(vec![MeshAxis::new("r", 1, MeshAxisType::Explicit).unwrap()]);
+        let other = DeviceMesh::new(other_logical_mesh.unwrap(), vec![devices[2]]).unwrap();
+        let anonymous = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[3]]).unwrap();
+        let mut outcomes = Vec::new();
+        for function_mesh in [mesh, other, anonymous] {
+            let function: CompiledFunction<ArrayType, ArrayType> =
+                compile(|x: CompileTracer| x.clone() + x, r#type.clone(), &meshed, function_mesh).unwrap();
+            let argument = Array::from_host_buffer(&plain, r#type.clone(), None, None, 3f32.to_ne_bytes()).unwrap();
+            outcomes.push(session_mesh_facts(function.call(argument.with_session(&meshed).unwrap())));
+        }
+
+        // The map is over the logical mesh of a session mesh of two devices, and its operand is uncommitted on two
+        // other devices, or committed there.
+        let logical_mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let meshed = plain.with_device_mesh(DeviceMesh::new(logical_mesh.clone(), devices[2..].to_vec()).unwrap());
+        let elsewhere = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+        for committed in [false, true] {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            let operand =
+                Array::from_host_buffer(&plain, r#type, elsewhere.clone(), None, values_to_bytes(&[1f32, 2.]))
+                    .unwrap()
+                    .with_committed(committed)
+                    .with_session(&meshed)
+                    .unwrap();
+            outcomes.push(session_mesh_facts(shard_map(
+                |x: ProjectedValue<ArrayType, DomainTracer<Session>>| Ok(x.clone() + x),
+                operand,
+                logical_mesh.clone(),
+                replicated.clone(),
+                replicated.clone(),
+                ShardMapOptions::new(),
+            )));
+        }
+        let on = |indices: &[usize], committed, values: &[f32]| {
+            session_mesh_outcome(&devices, indices, committed, false, values)
+        };
+        assert_eq!(
+            outcomes,
+            vec![
+                on(&[1], true, &[6.0]),
+                on(&[2], true, &[6.0]),
+                on(&[3], false, &[6.0]),
+                on(&[0, 1], true, &[2.0, 4.0]),
+                on(&[0, 1], true, &[2.0, 4.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_host_uploads_without_a_destination() {
+        // A host upload without a destination through a handle with a named mesh, and the first eager operation on it.
+        // The upload is committed to the session mesh, where JAX would leave it uncommitted on the default device until
+        // the first operation moves it, so the operation finds it there and every row ends where JAX ends.
+        let client = cpu_client(4);
+        let (devices, [mesh, _]) = named_session_meshes(client);
+        let meshed = Session::builder().client(client).build().unwrap().with_device_mesh(mesh);
+        let upload = session_mesh_vector(&meshed, &[1.0, 2.0]);
+        assert_eq!(
+            vec![session_mesh_facts::<ProgramError>(Ok(upload.clone())), session_mesh_facts(upload.add(&upload))],
+            vec![
+                session_mesh_outcome(&devices, &[1], true, false, &[1.0, 2.0]),
+                session_mesh_outcome(&devices, &[1], true, false, &[2.0, 4.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_places_arrays_of_a_mesh_that_only_names_axes() {
+        // A handle with a named mesh of two devices, used to name axes, whose arrays live on another device, committed
+        // by an upload onto that device or uncommitted.
+        let client = cpu_client(4);
+        let (devices, _) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let meshed = plain.with_device_mesh(DeviceMesh::new(logical_mesh, devices[2..].to_vec()).unwrap());
+        let first = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let committed = Array::from_host_buffer(&meshed, r#type, first, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let uncommitted = session_mesh_vector(&plain, &[1.0, 2.0]).with_session(&meshed).unwrap();
+        assert_eq!(
+            vec![
+                session_mesh_facts(committed.add(&committed)),
+                session_mesh_facts(uncommitted.add(&uncommitted)),
+                session_mesh_facts(uncommitted.sin()),
+            ],
+            // Before the session mesh placed operations, all three ran on the first device, and the uncommitted ones
+            // left their results uncommitted there.
+            vec![
+                Err(String::from(
+                    "received incompatible devices for eager XLA execution: input #0 is committed to devices [0] but \
+                     the session mesh is on devices [2, 3]",
+                )),
+                session_mesh_outcome(&devices, &[2, 3], true, false, &[2.0, 4.0]),
+                session_mesh_outcome(&devices, &[2, 3], true, false, &[0.84147096, 0.9092974]),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_with_device_mesh_is_not_set_by_internal_handles() {
+        // The handles that carry a mesh without a choice of the user (the session that `Value::domain` derives from a
+        // value of a handle without a mesh, and the session of a dimension result) leave an eager operation on an
+        // operand that is uncommitted elsewhere where that operand is.
+        let client = cpu_client(4);
+        let (devices, [mesh, _]) = named_session_meshes(client);
+        let plain = Session::builder().client(client).build().unwrap();
+        let negate = |session: &Session| {
+            let operand = Value::Array(session_mesh_vector(&plain, &[1.0, 2.0]));
+            let operation = Operation::Array(NegOperation::new().into());
+            let output = session.bind(operation, Vec::new(), &[operand]).map(|mut outputs| outputs.remove(0));
+            session_mesh_value_facts(output)
+        };
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let on_mesh = Array::from_host_buffer(&plain, r#type, mesh.clone(), None, [0u8; 8]).unwrap();
+        let derived = Value::Array(on_mesh.clone()).domain();
+        let operation = DimensionSizeOperation::new(on_mesh.r#type().as_ref(), 0).unwrap();
+        let Value::Dimension(dimension) =
+            plain.bind(operation, Vec::new(), &[Value::Array(on_mesh)]).unwrap().remove(0)
+        else {
+            panic!("expected a dimension");
+        };
+        assert_eq!((derived.device_mesh().unwrap(), dimension.session().device_mesh().unwrap()), (&mesh, &mesh));
+        assert_eq!(
+            vec![negate(&derived), negate(dimension.session())],
+            vec![session_mesh_outcome(&devices, &[0], false, true, &[-1.0, -2.0]); 2],
+        );
+
+        // A region that closes over an array committed to the second device runs where the committed array is, on an
+        // uncommitted operand, and rejects an operand committed to the first device.
+        let captured = session_mesh_vector(&plain, &[10.0, 20.0]).place(&devices[1], None).unwrap();
+        let operands = [
+            session_mesh_vector(&plain, &[1.0, 2.0]),
+            session_mesh_vector(&plain, &[1.0, 2.0]).place(&devices[0], None).unwrap(),
+        ];
+        let outcomes = operands
+            .iter()
+            .map(|operand| session_mesh_facts(add_captures(operand, std::slice::from_ref(&captured))))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                session_mesh_outcome(&devices, &[1], true, false, &[11.0, 22.0]),
+                Err("received incompatible devices for eager XLA execution: captured array #0 is placed on devices [1] \
+                     but input #0 is placed on devices [0]"
+                    .to_string()),
+            ],
+        );
     }
 
     #[test]
@@ -5341,6 +6882,7 @@ pub(crate) mod tests {
 
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
+
         // The input placement propagates to the output, so the result stays sharded over the same mesh axis, while
         // its type, like that of the input, records no placement over that auto mesh axis.
         assert_eq!(output.r#type(), input.r#type());
@@ -5416,11 +6958,12 @@ pub(crate) mod tests {
         // the operation directly and asserts the failure to resolve the axis that surfaces at compile time.
         let input = f32_vector(domain.parent(), &mesh, &[1.0, 2.0]);
         let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
-        assert!(matches!(
-            domain.bind(operation, Vec::new(), &[input]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "collective over axis `i` can only be lowered inside a `shard_map` manual region",
-        ));
+        assert_eq!(
+            domain.bind(operation, Vec::new(), &[input]).unwrap_err(),
+            ProgramError::UnsupportedOperation {
+                message: "collective over axis `i` can only be lowered inside a `shard_map` manual region".into(),
+            },
+        );
     }
 
     #[test]
@@ -6303,13 +7846,14 @@ pub(crate) mod tests {
     #[test]
     fn test_session_bind_rejects_uncommitted_inputs_that_cannot_move() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
             .iter()
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
+        let remote = Device::new(devices[1].id() + 1, devices[1].process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
         let operation = Operation::Array(AddOperation::new().into());
 
         // An uncommitted input that is sharded over a mesh other than the mesh of the committed input keeps its
@@ -6338,7 +7882,6 @@ pub(crate) mod tests {
         // An uncommitted input does not move to a committed input with shards in other processes, because each process
         // chooses the devices of its uncommitted arrays for itself, so the operation fails with the placement error.
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let remote = Device::new(devices[1].id() + 1, devices[1].process_index() + 1);
         let remote_mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote]).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(logical_mesh, 1))
@@ -6386,9 +7929,9 @@ pub(crate) mod tests {
         // of that mesh, as an explicit placement of the input onto that mesh does. A mesh without a device of this
         // process still moves nothing (refer to `test_session_bind_rejects_uncommitted_inputs_that_cannot_move`).
         let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local, remote]).unwrap();
         let replicated = Sharding::replicated(logical_mesh, 0);
@@ -6501,6 +8044,289 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_session_bind_jvp_preserves_independent_assignments() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]).place(&devices[1], None).unwrap();
+
+        for (value, derivative) in [
+            differentiate_at(primal.clone()).jvp(tangent.clone(), Ok).unwrap(),
+            differentiate_at(primal).jvp(tangent, |x| x.reshape([1, 2])).unwrap(),
+        ] {
+            assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![1., 2.]));
+            assert_eq!(observe_derivative_result(&derivative), (devices[1], true, vec![3., 4.]));
+        }
+    }
+
+    #[test]
+    fn test_session_bind_jvp_preserves_independent_clients() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let other_session = Session::builder().client(other_cpu_client(1)).build().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&other_session, &[3., 4.]);
+        let (value, derivative) = differentiate_at(primal).jvp(tangent, |x| x.add(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&value), (session.addressable_devices().unwrap()[0], false, vec![2., 4.]));
+        assert_eq!(
+            observe_derivative_result(&derivative),
+            (other_session.addressable_devices().unwrap()[0], false, vec![6., 8.]),
+        );
+        assert!(std::ptr::eq(value.client(), session.client()));
+        assert!(std::ptr::eq(derivative.client(), other_session.client()));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_with_structural_zero_on_primal_devices() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]).place(&devices[1], None).unwrap();
+        let (value, derivative) = differentiate_at(primal).jvp(tangent, |x| x.round()).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![1., 2.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[0], false, vec![0., 0.]));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_evaluates_primal_and_tangent_on_separate_devices() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]).place(&devices[1], None).unwrap();
+
+        // The primal computation receives only the primal inputs. The tangent computations can use the
+        // committed tangent's device, including when multiplication also reads an uncommitted primal coefficient.
+        let (value, derivative) = differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.add(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![2., 4.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[1], true, vec![6., 8.]));
+
+        let (value, derivative) = differentiate_at(primal).jvp(tangent.clone(), |x| x.mul(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![1., 4.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[1], true, vec![6., 16.]));
+
+        let primal = upload_derivative_vector(&session, &[0., 0.]);
+        let (value, derivative) = differentiate_at(primal).jvp(tangent, |x| x.sin()).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![0., 0.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[1], true, vec![3., 4.]));
+    }
+
+    #[test]
+    fn test_session_bind_pushforward_add_follows_its_committed_tangent() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]).place(&devices[1], None).unwrap();
+        let (value, pushforward) = differentiate_at(primal).linearize(|x| x.add(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[0], false, vec![2., 4.]));
+        assert_eq!(observe_derivative_result(&pushforward.apply(tangent).unwrap()), (devices[1], true, vec![6., 8.]));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_keeps_the_tangent_independent_of_a_stopped_primal() {
+        let session = Session::builder().client(cpu_client(3)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        let fixed_primal = primal.place(&devices[1], None).unwrap();
+        let ignored = tangent.place(&devices[2], None).unwrap();
+        let input = (fixed_primal, primal);
+
+        let (value, derivative) = differentiate_at(input.clone())
+            .jvp((ignored.clone(), tangent.clone()), |(fixed, movable)| fixed.stop_gradient()?.add(&movable))
+            .unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[1], true, vec![2., 4.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[0], false, vec![3., 4.]));
+        let (_, pushforward) =
+            differentiate_at(input).linearize(|(fixed, movable)| fixed.stop_gradient()?.add(&movable)).unwrap();
+        assert_eq!(
+            observe_derivative_result(&pushforward.apply((ignored, tangent)).unwrap()),
+            (devices[0], false, vec![3., 4.]),
+        );
+    }
+
+    #[test]
+    fn test_session_bind_jvp_preserves_named_tangent_placement() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source = derivative_singleton_placement(devices[1]);
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        let named_primal = primal.place(&source, None).unwrap();
+        let named_tangent = tangent.place(&source, None).unwrap();
+        let (value, derivative) = differentiate_at(named_primal).jvp(named_tangent, |x| x.add(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&value), (devices[1], true, vec![2., 4.]));
+        assert_eq!(observe_derivative_result(&derivative), (devices[1], true, vec![6., 8.]));
+        assert_eq!(derivative.mesh(), source.mesh());
+        assert_eq!(derivative.sharding(), source.sharding());
+
+        let same_device_primal = primal.place(&devices[0], None).unwrap();
+        let (_, derivative) = differentiate_at(same_device_primal).jvp(tangent, |x| x.add(&x)).unwrap();
+        assert_eq!(observe_derivative_result(&derivative), (devices[0], false, vec![6., 8.]));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_rejects_committed_named_and_anonymous_type_mismatches() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let target = derivative_singleton_placement(device);
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        let named_primal = primal.place(&target, None).unwrap();
+        let named_tangent = tangent.place(&target, None).unwrap();
+        let anonymous_primal = primal.place(&device, None).unwrap();
+        let anonymous_tangent = tangent.place(&device, None).unwrap();
+        let (_, pushforward) = differentiate_at(named_primal.clone()).linearize(|x| x.add(&x)).unwrap();
+        assert!(matches!(
+            pushforward.apply(anonymous_tangent.clone()),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward tangent 0 has type f32[2] but its primal boundary requires tangent type \
+                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]",
+        ));
+        assert!(matches!(
+            differentiate_at(named_primal).jvp(anonymous_tangent, |x| x.add(&x)),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "tangent type f32[2] does not match type \
+                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}] required by primal type \
+                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]",
+        ));
+        assert!(matches!(
+            differentiate_at(anonymous_primal).jvp(named_tangent, |x| x.add(&x)),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "tangent type f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}] \
+                               does not match type f32[2] required by primal type f32[2]",
+        ));
+    }
+
+    #[test]
+    fn test_session_bind_pushforward_assigns_devices_from_its_dependencies() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source = derivative_singleton_placement(devices[1]);
+        let primal = upload_derivative_vector(&session, &[1., 2.]).place(&source, None).unwrap();
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+
+        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.add(&x)).unwrap();
+        assert_eq!(
+            observe_derivative_result(&pushforward.apply(tangent.clone()).unwrap()),
+            (devices[0], false, vec![6., 8.]),
+        );
+        let primal = upload_derivative_vector(&session, &[0., 0.]).place(&source, None).unwrap();
+        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.sin()).unwrap();
+        assert_eq!(observe_derivative_result(&pushforward.apply(tangent).unwrap()), (devices[1], true, vec![3., 4.]));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_rejects_incompatible_meshes_during_tangent_alignment() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source = derivative_singleton_placement(devices[1]);
+        let primal = upload_derivative_vector(&session, &[1., 2.]).place(&source, None).unwrap();
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        for result in [
+            differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.add(&x)),
+            differentiate_at(primal).jvp(tangent, |x| x.sin()),
+        ] {
+            let DifferentiationError::Program(error) = result.unwrap_err() else { unreachable!() };
+            assert_eq!(
+                error.downcast_custom(),
+                Some(&LoweringError::MismatchedMeshTopology {
+                    expected: LogicalMesh::single_device(),
+                    actual: source.mesh().logical_mesh().clone(),
+                }),
+            );
+            assert_eq!(
+                error.to_string(),
+                "mesh `['other'=1:explicit]` does not have the topology of the module mesh `['device'=1:auto]`",
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_bind_jvp_rejects_a_derivative_operation_with_committed_inputs_on_different_devices() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
+        let tangent = upload_derivative_vector(&session, &[3., 4.]).place(&devices[0], None).unwrap();
+        assert!(matches!(
+            differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.sin()),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "received incompatible devices for eager XLA execution: input #1 is placed on \
+                               devices [0] but input #0 is placed on devices [1]",
+        ));
+        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.sin()).unwrap();
+        assert!(matches!(
+            pushforward.apply(tangent),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "received incompatible devices for eager XLA execution: input #1 is placed on \
+                               devices [0] but input #0 is placed on devices [1]",
+        ));
+    }
+
+    #[test]
+    fn test_session_bind_pushforward_keeps_independent_output_placement() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source = derivative_singleton_placement(devices[1]);
+        let primal = upload_derivative_vector(&session, &[1., 2.]).place(&source, None).unwrap();
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        let (_, pushforward) = differentiate_at((primal.clone(), primal))
+            .linearize(|(identity, placed)| Ok((identity, placed.place(&source, None)?)))
+            .unwrap();
+        let (identity, placed) = pushforward.apply((tangent.clone(), tangent.clone())).unwrap();
+        assert_eq!(observe_derivative_result(&identity), (devices[0], false, vec![3., 4.]));
+        assert_eq!(observe_derivative_result(&placed), (devices[1], true, vec![3., 4.]));
+
+        let wrong_shape = upload_derivative_vector(&session, &[3.]);
+        assert!(matches!(
+            pushforward.apply((wrong_shape, tangent)),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward tangent 0 has type f32[1] but its primal boundary requires tangent type \
+                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]",
+        ));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_rejects_a_derivative_operation_with_inputs_on_different_clients() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let other_session = Session::builder().client(other_cpu_client(1)).build().unwrap();
+        let primal = upload_derivative_vector(&session, &[1., 2.]);
+        let tangent = upload_derivative_vector(&other_session, &[3., 4.]);
+        assert!(matches!(
+            differentiate_at(primal).jvp(tangent, |x| x.sin()),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "received incompatible devices for eager XLA execution: input #1 is owned by a \
+                               different PJRT client than this session's client",
+        ));
+    }
+
+    #[test]
+    fn test_session_bind_jvp_preserves_process_local_assignment() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let local_session = session.with_default_device(devices[1]).unwrap();
+        let primal = upload_derivative_vector(&local_session, &[0., 0.]).place(&Memory::Device, None).unwrap();
+        assert!(primal.is_committed() && primal.is_locally_assigned());
+        let tangent = upload_derivative_vector(&session, &[3., 4.]);
+        let (primal, derivative) = differentiate_at(primal).jvp(tangent, |x| x.sin()).unwrap();
+        for (value, expected) in [(&primal, vec![0., 0.]), (&derivative, vec![3., 4.])] {
+            assert_eq!(observe_derivative_result(value), (devices[1], true, expected));
+            assert!(value.is_locally_assigned());
+        }
+
+        let client = other_cpu_client(2);
+        let peer = Device::new(1000, 1);
+        let destination = session_with_remote_devices(client, [peer]);
+        let local = destination.addressable_devices().unwrap()[0];
+        let logical_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("destination", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![local, peer]).unwrap();
+        let target = Placement::new(mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap();
+        let result = derivative.to_placement(&destination, target).unwrap();
+        assert_eq!(result.mesh(), &mesh);
+        assert!(result.is_committed() && !result.is_locally_assigned());
+        assert_eq!(read_device_f32s(&result), vec![vec![3., 4.]]);
+    }
+
+    #[test]
     fn test_session_bind_executes_value_and_gradient() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -6538,6 +8364,72 @@ pub(crate) mod tests {
         let cotangent = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0]);
         let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
         assert_eq!(read_first_shard::<f32>(client, &input_cotangent), vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_session_bind_executes_linearize_and_jacobian_forward_at_uncommitted_arguments() {
+        // An uncommitted argument enters the linearization at its relocatable type (refer to
+        // `Value::relocatable_type`), whose tangent type has no sharding, so its pushforward accepts a tangent with
+        // any placement and runs where the tangent and the argument meet, as an eager operation does. The argument
+        // committed to the second device is the control, whose pushforward accepts tangents of its own type.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let vector_type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |values: &[f32]| {
+            Array::from_host_buffer(&session, vector_type.clone(), None, None, values_to_bytes(values)).unwrap()
+        };
+        let square = |x: LinearizationTracer<Session>| -> Result<LinearizationTracer<Session>, ProgramError> {
+            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+            Ok(x.mul(&x)?.into_value())
+        };
+        let observe = |value: Result<Value, ProgramError>| {
+            value.map_err(|error| error.to_string()).map(|value| {
+                let array = program_array(&value);
+                let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
+                let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+                (devices, array.is_committed(), array.r#type().to_string(), values)
+            })
+        };
+        let tangent = upload(&[1.0, 1.0]);
+        let committed_tangent = upload(&[3.0, 5.0]).to_placement(&session, second_device).unwrap();
+        let mut outcomes = Vec::new();
+        for argument in [upload(&[1.0, 2.0]), upload(&[1.0, 2.0]).to_placement(&session, second_device).unwrap()] {
+            let differentiation = session.differentiate_at(Value::Array(argument));
+            let (output, pushforward) = differentiation.clone().linearize(square).unwrap();
+            let jacobian = differentiation.jacobian_forward(square).unwrap();
+            outcomes.push(vec![
+                observe(Ok(output)),
+                observe(pushforward.apply(Value::Array(tangent.clone()))),
+                observe(pushforward.apply(Value::Array(committed_tangent.clone()))),
+                observe(Ok(jacobian.iter_blocks().next().unwrap().value().clone())),
+            ]);
+        }
+
+        // The columns are the output, the tangents for the uncommitted tangent on the first device and for the tangent
+        // committed to the second device, and the Jacobian.
+        let vector = "f32[2]".to_string();
+        let matrix = "f32[2, 2]".to_string();
+        let on = |device: usize, committed: bool, r#type: &String, values: &[f32]| {
+            Ok::<_, String>((vec![device], committed, r#type.clone(), values.to_vec()))
+        };
+        assert_eq!(
+            outcomes,
+            vec![
+                vec![
+                    on(0, false, &vector, &[1.0, 4.0]),
+                    on(0, false, &vector, &[2.0, 4.0]),
+                    on(1, true, &vector, &[6.0, 20.0]),
+                    on(0, false, &matrix, &[2.0, 0.0, 0.0, 4.0]),
+                ],
+                vec![
+                    on(1, true, &vector, &[1.0, 4.0]),
+                    on(1, true, &vector, &[2.0, 4.0]),
+                    on(1, true, &vector, &[6.0, 20.0]),
+                    on(1, true, &matrix, &[2.0, 0.0, 0.0, 4.0]),
+                ],
+            ],
+        );
     }
 
     #[test]
@@ -6582,7 +8474,12 @@ pub(crate) mod tests {
             .keys()
             .iter()
             .filter_map(|key| cache.get(key))
-            .map(|entry| entry.program.expected_argument_shardings().to_vec())
+            .map(|entry| match &entry.program {
+                EagerDispatchProgram::Local(program) => program.expected_argument_shardings().to_vec(),
+                EagerDispatchProgram::Remote(_) => {
+                    panic!("an eager program on the local client must have an executable")
+                }
+            })
             .filter(|shardings| shardings.len() == 2)
             .collect::<Vec<_>>();
         assert_eq!(argument_shardings, vec![vec![Sharding::replicated(mesh.logical_mesh().clone(), 0), split]]);
@@ -6769,12 +8666,18 @@ pub(crate) mod tests {
     #[test]
     fn test_session_bind_executes_jacobian_reverse_on_joined_condition_outputs() {
         // The compiled branch and the identity branch join at an unspecified sharding. The public pullback
-        // validates seed sharding against the concretely replicated result of execution.
+        // validates seed sharding against the concretely replicated result of execution. The branches are traced at
+        // the type of the argument, so the argument is committed, because an uncommitted argument would enter the
+        // linearization at its type without a sharding (refer to `Value::relocatable_type`), which those branch inputs
+        // do not accept.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let x = Array::from_host_buffer(&session, scalar_type.clone(), None, None, 3f32.to_ne_bytes()).unwrap();
-        let device = x.mesh().devices()[0];
+        // The identity branch needs a tracked input type for the join to combine two different declarations.
+        let device = session.addressable_devices().unwrap()[0];
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("branch", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let x = f32_scalar(&session, &mesh, 3.0);
         let square: CompiledFunction<ArrayType, ArrayType> = compile(
             |x: CompileTracer| x.mul(&x).unwrap().place(&device, None).unwrap(),
             scalar_type.clone(),

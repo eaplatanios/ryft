@@ -1005,7 +1005,7 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
 /// completes such a pending reduction where the argument enters (refer to the lowering of entry arguments in
 /// `crate::lowering`), and a completed-reduction marker states nothing about the buffers, so the body of a function,
 /// and every result that returns the argument, holds the completed value without either. The lowering of a nested
-/// call and the region replay of its callee receive an operand at this sharding for the same reason (refer to
+/// call receives an operand at this sharding for the same reason (refer to
 /// [`JitCallOperation::boundary_input_sharding`]). The dimensions, including their splits along auto mesh axes, and the
 /// reduction state that a type records (i.e., over explicit or manual mesh axes) are kept, unlike
 /// [`Sharding::without_auto_axes`], which also drops the splits along auto mesh axes. A sharding without reduction state
@@ -1151,13 +1151,13 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// Returns `constant`, an array that a function captures (i.e., a session constant of its program), placed where the
 /// executable of the function that is compiled for `mesh` receives it, or [`None`] when the executable cannot receive
 /// it on `mesh` (e.g., a capture whose type records a split over a mesh of another topology, or one with a pending
-/// reduction over auto mesh axes, which lowering and admission reject). Lowering, eager dispatch, and region replay use
-/// this placement rule. A capture with the same logical mesh topology as `mesh` keeps its runtime sharding on the
+/// reduction over auto mesh axes, which lowering and admission reject). Lowering and eager dispatch use this placement
+/// rule. A capture with the same logical mesh topology as `mesh` keeps its runtime sharding on the
 /// devices of `mesh`, so that it adds no gather, and any other capture is placed as [`capture_sharding`] receives it
 /// (i.e., replicated over `mesh`). Each placement is computed once for each captured array and destination, which every
 /// retention of the array and every program that captures it share, and lives until the array and every retention of it
-/// are gone (refer to [`RetainedArray::placed`]), so no execution, eager call, replay, or other program that captures
-/// the array moves the capture again. A placement that cannot communicate (refer to [`RetainedArray::can_communicate`])
+/// are gone (refer to [`RetainedArray::placed`]), so no execution, eager call, or other program that captures the array
+/// moves the capture again. A placement that cannot communicate (refer to [`RetainedArray::can_communicate`])
 /// starts from a copy on the same devices whose work has already completed when there is one (e.g., for meshes that
 /// differ only in their axis names), so that such destinations share its buffers, but only from a copy with the memory
 /// and the declared layout of the capture, so that the result is what a placement of the capture itself gives, whatever
@@ -1231,7 +1231,7 @@ pub(crate) fn placed_constant(
     // The placed copy lives on devices that the mesh of the function names for every process, so it is committed to
     // them and not locally assigned, as an array that a placement onto named devices gives is, whatever the commitment
     // and the local assignment of the captured array are. The source constant stays in the IR and keeps its own
-    // commitment for eager dispatch and replay.
+    // commitment for eager dispatch and for the interpretation of a program that holds it.
     //
     // When the placement cannot communicate, a copy on the same devices (e.g., for a mesh that differs only in its axis
     // names) whose work has already completed without an error is placed instead of the capture, which shares its
@@ -1418,8 +1418,8 @@ pub(crate) fn jit_compilation_options(
 /// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
 /// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
 /// for the mesh on which the application runs (refer to `JitCallOperation::eager_decision`), so that `.call`, the
-/// replay of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an execution
-/// does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
+/// interpretation of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an
+/// execution does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
 pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, requests_placement: bool) -> bool {
     requests_placement || mesh.devices().len() > 1 || function_mesh && is_named_mesh(mesh.logical_mesh())
 }
@@ -1989,7 +1989,7 @@ mod tests {
     use crate::{
         Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FlatProgram, FromPjrt,
         JitCallOperation, Operation, Options, PlacementOptions, ProgramBuilder, RetainedArray, Session,
-        StatefulCompiledFunction, Type, Value, compile, compile_statefully_with_captures, jit_with_options, stage,
+        StatefulCompiledFunction, Type, Value, compile, compile_statefully_with_captures, jit_with_options,
     };
 
     #[cfg(feature = "mps")]
