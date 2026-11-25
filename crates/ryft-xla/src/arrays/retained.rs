@@ -1,18 +1,22 @@
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use ryft_core::{
-    ArrayType, DeviceMesh, Parameter, ProgramError, Sharding, Type, TypeError, TypeIdentityRenaming, Typed,
+    ArrayType, Device, DeviceMesh, Parameter, ProgramError, Sharding, Type, TypeError, TypeIdentityRenaming, Typed,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Client, ExecutionFence};
 
-use crate::Session;
+use crate::arrays::host::validate_mesh_devices;
 use crate::arrays::metadata::ArrayMetadata;
-use crate::arrays::shards::ArrayShard;
-use crate::arrays::{Array, ArrayParts};
+use crate::arrays::resharding::placement_communicates;
+use crate::arrays::shards::{ArrayShard, ShardContribution};
+use crate::arrays::{Array, ArrayError, ArrayParts};
+use crate::{Error, Session};
 
 /// Storage of an [`Array`] that is kept alive without the [`Session`] of that array, so that staged
 /// programs can hold it as a constant. A trace whose capture table cannot hold runtime arrays (e.g., the body of a
@@ -75,17 +79,21 @@ use crate::arrays::{Array, ArrayParts};
 ///     uploads buffers, and on a process that holds no buffer of its result), the move of an input to the devices that
 ///     an operation runs on, and an array that a retained array is turned back into ([`RetainedArray::to_array`]) are
 ///     new arrays.
+///   - **New Array with Shared Placements:** An array with an additional execution dependency (i.e., one that also
+///     waits for the completion of another execution) has its own capture identity and shares placements of the
+///     underlying buffers. Each capture observes the completion of its own producer.
 ///
 /// Donation never changes these rules, because it only consumes the input. An operation whose result is a new array
-/// but that would return the storage of its input on some process gets storage of its own from one function,
-/// `Array::with_new_identity`.
+/// but that would return the storage of its input on some process gives that result storage of its own instead, on
+/// every process.
 ///
 /// # Ownership
 ///
 /// A retained array owns its shards, and its clones share them. The programs, regions, derivative rules, and caches
 /// that hold one therefore keep the device buffers alive, and the buffers are released together with the last value
 /// that refers to them. Any session of the PJRT client that owns the buffers can turn a retained array back into an
-/// [`Array`].
+/// [`Array`]. Every array and retention that shares a placement index keeps alive its copies on other devices,
+/// even after the functions that needed those copies are gone.
 #[derive(Clone, Parameter)]
 pub struct RetainedArray {
     /// [`ArrayType`] that this retained array declares as a constant of a program, which is what its [`Typed`]
@@ -123,25 +131,32 @@ pub struct RetainedArray {
     /// PJRT [`Client`] that owns the buffers of the retained array.
     client: &'static Client<'static>,
 
-    /// Placements of this retention of the array on other devices, by the mesh and the sharding of each, which
-    /// [`Self::placed`] records so that a function that receives the array on other devices places it once rather
-    /// than once for each lowering, execution, or replay. Clones of one retention share them, so they live exactly as
-    /// long as the programs that hold this constant (i.e., one placed copy for each distinct mesh and sharding on which
-    /// a function that holds the constant receives it, for as long as such a function or program lives), and they take
-    /// no part in its identity.
+    /// Cache of the placements of this array on other devices, keyed by the destination mesh and sharding and by
+    /// whether the source is locally assigned (which decides whether a transfer communicates between processes).
+    /// [`Self::placed`] fills it, so that a function that receives the array on other devices places it once rather
+    /// than once for each lowering, execution, or interpretation. Every retention of the same [`Array`] and their
+    /// clones share this cache, which lives as long as any of them, and a handle without storage (i.e., one for which
+    /// [`Self::without_storage`] returns `true`) has an empty one of its own. It takes no part in the identity of the
+    /// retained array.
     ///
-    /// The lock is held only to look a placement up and to record one, never while a placement is computed, so it is
-    /// never held while another lock is taken (e.g., a lock of a cache or of the work tracker of a session, which a
-    /// placement takes when it compiles and submits work), and it imposes no order on the other locks. A panic while it
-    /// is held leaves the list valid, because every critical section either reads it or appends one complete entry, so
-    /// a poisoned lock is recovered rather than propagated.
-    placements: Arc<Mutex<Vec<(DeviceMesh, Sharding, RetainedArray)>>>,
+    /// Each entry is one placement attempt. The first caller that misses records the attempt before it places
+    /// anything, and every other caller of that entry waits for it rather than submitting its own. An attempt keeps
+    /// its outcome for the lifetime of the cache, except for a failure of a placement that cannot communicate, which
+    /// is removed (refer to [`Self::placed`]).
+    ///
+    /// The lock of this cache is a leaf lock. It is held only to look up, record, or remove an attempt, or to copy
+    /// out a completed one (refer to [`Self::completed_placement_on`]), and never while an attempt is awaited, while
+    /// readiness is queried, or while another lock is taken. A running attempt holds only its own once-cell while it
+    /// compiles and submits work, and it never waits for another attempt of a retained array. Every critical section
+    /// leaves the cache valid, so a poisoned lock is recovered rather than propagated.
+    placements: Arc<PlacementIndex>,
 }
 
 impl RetainedArray {
     /// Retains `array` without its session. Its device buffers stay alive for as long as the returned value or any of
     /// its clones exists. Retaining one array more than once returns equal values, so that repeatedly importing the
-    /// same captured array (e.g., the weights that a compiled function captures) stages the same constant every time.
+    /// same captured array (e.g., the weights that a compiled function captures) stages the same constant every time,
+    /// and every retention shares the placements of the array.
     #[inline]
     pub fn new(array: &Array) -> Self {
         Self {
@@ -154,7 +169,7 @@ impl RetainedArray {
             committed: array.is_committed(),
             locally_assigned: array.is_locally_assigned(),
             client: array.client(),
-            placements: Arc::new(Mutex::new(Vec::new())),
+            placements: Arc::clone(array.parts.placements.get_or_init(Arc::default)),
         }
     }
 
@@ -189,10 +204,11 @@ impl RetainedArray {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError::Type`] error if the buffers are owned by another PJRT client than the one
-    /// of `session`, which cannot use them.
+    /// Returns [`ProgramError::Type`] if the buffers belong to a different PJRT client, or a backend error if
+    /// the session cannot validate the retained array's devices and process assignments against its inventory.
     pub fn to_array(&self, session: &Session) -> Result<Array, ProgramError> {
         self.validate_client(session.client())?;
+        validate_mesh_devices(session, self.mesh())?;
 
         // The new array has storage of its own, and its shards refer to the same device buffers.
         // The parts need no validation because they come from an array that was already validated.
@@ -234,47 +250,221 @@ impl RetainedArray {
             shards: Arc::from([]),
             execution_fence: None,
             send_fence: None,
-            placements: Arc::new(Mutex::new(Vec::new())),
+            placements: Arc::default(),
             ..self.clone()
         }
     }
 
-    /// Returns a retained copy of the array that `place` puts on `mesh` as `sharding`. Clones of the source share
-    /// the placement, including clones with a different declared type. The placement records the type and commitment
-    /// of the array that `place` returns. Each source keeps its own declared type and identity for use in the program.
+    /// Returns a retained copy of the array that `place` puts on `mesh` as `sharding`. Every retention of the source
+    /// array and their clones share the physical placement, including clones with a different declared type. The
+    /// placement records the type and commitment of the array that `place` returns. Each source keeps its own declared
+    /// type and identity for use in the program. The source passed to `place` carries only buffer readiness, so the
+    /// attempt records completion of the placement itself. Each returned handle joins that completion with the
+    /// requesting source's execution fence. An earlier placement's sends belong to that placement.
     ///
-    /// `place` runs without the lock of the placements, so two threads that place the same retention on the same mesh
-    /// and sharding at the same time may both place it, in which case the placement that is recorded first is kept and
-    /// returned to both, and the other one is dropped.
+    /// Exactly one `place` runs for each source ownership, mesh, and sharding on every process, whatever the
+    /// interleaving of the threads that request it and however many retentions of the array request it. A placement may
+    /// communicate (e.g., a cross-host transfer, which PJRT pairs between processes by the order of submission), so a
+    /// transfer that one process submits twice and its peer once would wait forever or pair with later work. The first
+    /// caller that misses records an attempt before it places anything, every other caller waits for that attempt
+    /// without holding any lock that `place` takes, and placements of other arrays, meshes, or shardings proceed
+    /// independently. The placed copy is kept until the array and every retention of it are gone.
+    ///
+    /// Whether a placement can communicate is decided alike on every process (refer to [`Self::can_communicate`]).
+    /// A key of a placement that can communicate has one attempt for the lifetime of the array on every process, so
+    /// its outcome is kept, failure included. This is the exception to the rule that no cache of this crate keeps an
+    /// error, because the outcome is local while the work communicates: a placement can succeed on the process that
+    /// sends and fail on the process that receives (e.g., in its copy to the requested memory after the receive), and
+    /// a retry by that process alone would submit a receive that no send pairs with. Such a failed attempt is therefore
+    /// reported to every later caller, and the array must be created again (on every process) to retry it. A failed
+    /// attempt of a placement that cannot communicate is reported to the callers that waited for it and then removed,
+    /// so that a later request runs `place` again. A `place` that panics may already have submitted a transfer, so its
+    /// attempt records a failure as well, and the panic then continues on the thread that ran it. A failure of the
+    /// placed array after a successful submission (e.g., of its transfer) is reported by that array itself (i.e., by
+    /// its readiness and its readbacks), which stays cached for the same reason. `place` must not request a placement
+    /// of this array (i.e., its source), which it would wait for forever, but it may look for a completed placement of
+    /// it on other meshes or shardings (refer to [`Self::completed_placement_on`]), which never waits and holds the
+    /// lock of the placements only to copy out their handles, since `place` runs without that lock. A caller therefore
+    /// consults its exact key before any other source is chosen, and a caller that finds its key never waits for other
+    /// work.
     ///
     /// # Errors
     ///
-    /// Returns the error of `place`.
-    pub(crate) fn placed<E>(
+    /// Returns the error of `place` to every caller of a failed attempt of a placement that cannot communicate, and
+    /// [`ArrayError::FailedCapturePlacement`] with the error of `place` as its source to every caller of a failed
+    /// attempt of one that can, the caller that ran `place` included, which says that the capture must be created
+    /// again to retry it.
+    pub(crate) fn placed(
         &self,
         mesh: &DeviceMesh,
         sharding: &Sharding,
-        place: impl FnOnce() -> Result<Array, E>,
-    ) -> Result<Self, E> {
-        let find = |placements: &[(DeviceMesh, Sharding, RetainedArray)]| {
-            placements
-                .iter()
-                .find(|(placed_mesh, placed_sharding, _)| placed_mesh == mesh && placed_sharding == sharding)
-                .map(|(_, _, placed)| placed.clone())
+        place: impl FnOnce(Self) -> Result<Array, Error>,
+    ) -> Result<Self, Error> {
+        let communicates = self.can_communicate(mesh, sharding);
+        let key = || (mesh.clone(), sharding.clone(), self.locally_assigned);
+        let device_key = || (mesh.devices().to_vec(), self.locally_assigned);
+        let attempt = {
+            let mut placements = self.placements.lock().unwrap_or_else(PoisonError::into_inner);
+            let PlacementEntries { attempts, attempts_by_devices } = &mut *placements;
+            let attempt = attempts.entry(key()).or_insert_with(|| {
+                let attempt = PlacementAttempt::default();
+                attempts_by_devices.entry(device_key()).or_default().push(Arc::clone(&attempt));
+                attempt
+            });
+            Arc::clone(attempt)
         };
 
-        if let Some(placed) = find(&self.placements.lock().unwrap_or_else(PoisonError::into_inner)) {
-            return Ok(placed);
+        // The once-cell runs `place` on the first thread that reaches it and blocks every other one until it finishes.
+        // A panic is caught so that the cell records a failure rather than staying empty for another `place`. Which
+        // caller runs `place` depends on the interleaving, so the cell records the failure as every caller receives it.
+        let mut panic = None;
+        let placed = attempt
+            .get_or_init(|| {
+                let source = Self { execution_fence: None, send_fence: None, ..self.clone() };
+                let placed = match catch_unwind(AssertUnwindSafe(|| place(source))) {
+                    Ok(placed) => placed,
+                    Err(payload) => {
+                        panic = Some(payload);
+                        let message = "the placement panicked".to_string();
+                        Err(Error::from(ProgramError::InvalidArgument { message }))
+                    }
+                };
+                placed.map(|array| RetainedArray::new(&array)).map_err(|error| {
+                    if !communicates {
+                        return error;
+                    }
+                    let source = Arc::new(error);
+                    Error::from(ArrayError::FailedCapturePlacement { sharding: sharding.clone(), source })
+                })
+            })
+            .clone();
+
+        // A failed attempt of a placement that cannot communicate is removed once it has completed, unless a later
+        // request already replaced it, so that the next request places the array again.
+        if !communicates && placed.is_err() {
+            let mut placements = self.placements.lock().unwrap_or_else(PoisonError::into_inner);
+            let key = key();
+            if placements.attempts.get(&key).is_some_and(|recorded| Arc::ptr_eq(recorded, &attempt)) {
+                placements.attempts.remove(&key);
+                let device_key = device_key();
+                if let Some(recorded) = placements.attempts_by_devices.get_mut(&device_key) {
+                    recorded.retain(|recorded| !Arc::ptr_eq(recorded, &attempt));
+                    if recorded.is_empty() {
+                        placements.attempts_by_devices.remove(&device_key);
+                    }
+                }
+            }
         }
 
-        let placed = RetainedArray::new(&place()?);
-        let mut placements = self.placements.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(placed) = find(&placements) {
-            return Ok(placed);
+        if let Some(payload) = panic {
+            resume_unwind(payload);
         }
 
-        placements.push((mesh.clone(), sharding.clone(), placed.clone()));
-        Ok(placed)
+        placed.map(|mut placed| {
+            if let Some(source_fence) = &self.execution_fence {
+                placed.execution_fence =
+                    Some(ExecutionFence::join(std::iter::once(source_fence.clone()).chain(placed.execution_fence)));
+            }
+            placed
+        })
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns whether placing this retention may communicate, using its runtime placement and the shared planner.
+    pub(crate) fn can_communicate(&self, mesh: &DeviceMesh, sharding: &Sharding) -> bool {
+        placement_communicates(
+            &self.metadata,
+            self.shards.iter().map(ArrayShard::descriptor),
+            self.locally_assigned,
+            mesh,
+            sharding,
+        )
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the first successful placement of this retained array (refer to [`Self::placed`]), in the order in which
+    /// they were recorded, whose devices are `devices` in that order, whose memory and declared layout are those of
+    /// this array, and which `accepts`, if its work has already completed without an error. A placement from such a
+    /// copy has the type that a placement from this array has, because a placement keeps the memory of its source and
+    /// derives its layout from the layout of its source and the destination alone (refer to
+    /// `Array::placement_layout`), whereas a copy that dropped the layout of this array (e.g., a replicated copy of
+    /// column shards) would drop it from every placement made from it as well. It never waits: it skips attempts that
+    /// are still running and returns nothing while the work of the first such placement is pending, because a
+    /// placement that was submitted can still fail, and a copy made from it would share its failed buffers. Only that
+    /// first candidate is queried, so that a pending one does not make every later lookup (e.g., one for each new axis
+    /// name of the same devices) query the readiness of every earlier candidate, and nothing is always a correct
+    /// answer, because the caller then places from this array itself. It holds the lock of the placements only to copy
+    /// out one candidate at a time, and queries the readiness of the first such candidate after releasing it.
+    pub(crate) fn completed_placement_on(&self, devices: &[Device], accepts: impl Fn(&Self) -> bool) -> Option<Self> {
+        let r#type = self.metadata.r#type();
+        let keeps_storage = |placed: &Self| {
+            let placed_type = placed.metadata.r#type();
+            placed_type.memory() == r#type.memory() && placed_type.layout() == r#type.layout()
+        };
+        let key = (devices.to_vec(), self.locally_assigned);
+        let candidate = (0..)
+            .map_while(|position| {
+                let placements = self.placements.lock().unwrap_or_else(PoisonError::into_inner);
+                placements.attempts_by_devices.get(&key)?.get(position).map(Arc::clone)
+            })
+            .find_map(|attempt| match attempt.get() {
+                Some(Ok(placed)) if keeps_storage(placed) && accepts(placed) => Some(placed.clone()),
+                _ => None,
+            })?;
+
+        // The work that produced the candidate must have completed without an error, which is checked without waiting
+        // for it. Pending work and a failed readiness query count as not completed.
+        let fence_completed =
+            |fence: &Option<ExecutionFence>| fence.as_ref().is_none_or(|fence| matches!(fence.is_ready(), Ok(true)));
+        let completed = fence_completed(&candidate.execution_fence)
+            && fence_completed(&candidate.send_fence)
+            && candidate
+                .shards
+                .iter()
+                .filter_map(ArrayShard::buffer)
+                .all(|buffer| buffer.ready().is_ok_and(|event| matches!(event.error(), Ok(None))));
+        completed.then_some(candidate)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns whether a shard of this retained array on a device of this process has no buffer, and every such shard
+    /// either has no elements or has another shard on this process that holds the same contribution (refer to
+    /// `ShardContribution`) with a buffer, so that a placement of this array onto its own mesh and sharding fills every
+    /// missing local buffer with a copy of a local replica or a new empty buffer (refer to
+    /// `Array::with_local_replicas`). This mirrors the rule by which execution supplies the missing buffers of an
+    /// argument (refer to `Array::serves_missing_local_buffers`), which an array of the zero data type never needs, so
+    /// that every buffer that execution would supply on every call is supplied here once. It reads the placement
+    /// metadata and the buffers of this process only, and such a placement moves every shard to its own device, so it
+    /// communicates with nobody, whatever buffers the other processes hold (refer to `placed_constant`).
+    pub(crate) fn fills_missing_local_replicas(&self) -> Result<bool, Error> {
+        let process_index = self.client.process_index()?;
+        let local = |shard: &&ArrayShard| shard.device().process_index() == process_index;
+        let missing = |shard: &&ArrayShard| shard.buffer().is_none();
+        let is_empty = |shard: &ArrayShard| shard.slice().iter().any(|range| range.is_empty());
+        let has_missing = self.shards.iter().filter(local).any(|shard| missing(&shard));
+        if !has_missing || self.metadata.r#type().data_type().is_zero() {
+            return Ok(false);
+        }
+        let mesh = self.mesh();
+        let sharding = self.sharding();
+        let varying_manual_axes = mesh
+            .logical_mesh()
+            .axes()
+            .iter()
+            .map(|axis| axis.name())
+            .filter(|name| sharding.varying_manual_axes().contains(*name))
+            .collect::<Vec<_>>();
+        let contribution =
+            |shard: &ArrayShard| ShardContribution::ordered(mesh, sharding, shard.descriptor(), &varying_manual_axes);
+        let held = self
+            .shards
+            .iter()
+            .filter(local)
+            .filter(|shard| shard.buffer().is_some())
+            .map(contribution)
+            .collect::<HashSet<_>>();
+        let is_served = |shard: &ArrayShard| is_empty(shard) || held.contains(&contribution(shard));
+        Ok(self.shards.iter().filter(local).filter(missing).all(is_served))
     }
 
     /// Returns this retained array as a placement of it onto the devices where it already lives, which a program names
@@ -351,20 +541,54 @@ impl Typed for RetainedArray {
     }
 }
 
+/// Placement index of the storage of an [`Array`], which [`RetainedArray::placed`] keeps for every retention of it.
+pub(super) type PlacementIndex = Mutex<PlacementEntries>;
+
+/// Entries of a [`PlacementIndex`], grouped by the source's local assignment as well as the destination. The device
+/// index keeps attempts in submission order for [`RetainedArray::completed_placement_on`].
+#[derive(Default)]
+pub(super) struct PlacementEntries {
+    attempts: HashMap<(DeviceMesh, Sharding, bool), PlacementAttempt>,
+    attempts_by_devices: HashMap<(Vec<Device>, bool), Vec<PlacementAttempt>>,
+}
+
+/// Attempt of [`RetainedArray::placed`] to place a retained array on one mesh and sharding, which every caller that
+/// requests that placement while the attempt runs or after it waits for and shares, whether it succeeds or fails.
+type PlacementAttempt = Arc<OnceLock<Result<RetainedArray, Error>>>;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DataType, Device, DimensionBounds, DimensionVariable, Memory, ShardingDimension};
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_core::{
+        DataType, Device, DimensionBounds, DimensionVariable, Error as CoreError, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Placement, ShardingDimension,
+    };
+    use ryft_pjrt::{Buffer, BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::sessions::tests::{domain_mesh, f32_scalar, replicated_scalar_type, shares_effect_scope};
-    use crate::tests::{cpu_client, execution_client, hash_of, other_cpu_client, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, hash_of, other_cpu_client, peer_devices, session_with_remote_devices,
+        values_to_bytes,
+    };
     use crate::{FromPjrt, PlacementOptions};
 
     use super::*;
+
+    /// Returns a mesh with axis `name` over the first device of `client` and a device of another process, which device
+    /// metadata alone describes, so that a placement onto it can communicate.
+    fn communicating_mesh(client: &Client<'static>, name: &str) -> DeviceMesh {
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(name, 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        DeviceMesh::new(logical_mesh, vec![local, remote]).unwrap()
+    }
 
     #[test]
     fn test_retained_array_new() {
@@ -477,7 +701,7 @@ mod tests {
         assert_eq!(
             retained.to_array(&foreign_session),
             Err(TypeError::invalid(
-                "session constant `session:f32[][sharding={mesh<['device'=1:auto]>, []}]` retains an array of a \
+                "session constant `session:f32[]` retains an array of a \
                  different PJRT client than the client of this session",
             )
             .into()),
@@ -528,7 +752,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
-        assert_eq!(RetainedArray::new(&array).to_string(), "session:f32[][sharding={mesh<['device'=1:auto]>, []}]");
+        assert_eq!(RetainedArray::new(&array).to_string(), "session:f32[]");
     }
 
     #[test]
@@ -551,6 +775,378 @@ mod tests {
     }
 
     #[test]
+    fn test_retained_array_placed() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let upload =
+            || Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes());
+
+        // A capture with locally assigned devices never communicates (refer to `RetainedArray::can_communicate`),
+        // so the source names its devices for every process.
+        let source = upload().unwrap().with_locally_assigned(false);
+        let retained = RetainedArray::new(&source);
+        let attempts = AtomicUsize::new(0);
+        let place = |outcome: Result<(), &str>| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            match outcome {
+                Ok(()) => Ok(upload()?),
+                Err(message) => Err(Error::from(ProgramError::InvalidArgument { message: message.to_string() })),
+            }
+        };
+        let cause = |message: &str| CoreError::from(ProgramError::InvalidArgument { message: message.to_string() });
+        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 0);
+
+        // A placement that can communicate has one attempt for the lifetime of the array, whose failure every later
+        // caller receives without placing the array again, because a retry by one process alone would unpair the
+        // cross-host transfers of the processes. The capture must be created again to retry. Every caller, the one
+        // that ran the attempt included, receives the same typed failure, whose source is the original error of the
+        // attempt, so that callers can match on its cause.
+        let failure = |outcome: Result<RetainedArray, Error>| {
+            let Err(error) = outcome else { panic!("expected a failed placement") };
+            let message = error.to_string();
+            let Error::Array(error) = error else { panic!("expected an array error, got {message}") };
+            let ArrayError::FailedCapturePlacement { sharding, source } = *error else {
+                panic!("expected a failed capture placement, got {message}");
+            };
+            (message, sharding, source)
+        };
+        let message = |sharding: &Sharding, cause: &str| {
+            format!(
+                "the placement of this captured array as `{sharding}` failed with: {cause}; a failed placement of a \
+                 capture is not retried, because a retry by one process alone would unpair its cross-host transfers, \
+                 so create the capture again on every process to retry it",
+            )
+        };
+        let mesh = communicating_mesh(client, "x");
+        let sharding = replicated(&mesh);
+        assert_eq!(
+            (
+                retained.can_communicate(&mesh, &sharding),
+                RetainedArray::new(&upload().unwrap()).can_communicate(&mesh, &sharding),
+            ),
+            (true, false),
+        );
+        let first = failure(retained.placed(&mesh, &sharding, |_| place(Err("placement failed"))));
+        let later = failure(RetainedArray::new(&source).placed(&mesh, &sharding, |_| place(Ok(()))));
+        assert_eq!((&first.0, &first.1), (&message(&sharding, "placement failed"), &sharding));
+        assert_eq!((&later.0, &later.1), (&first.0, &first.1));
+        assert!(Arc::ptr_eq(&first.2, &later.2));
+        assert!(matches!(first.2.as_ref(), Error::Core(error) if **error == cause("placement failed")));
+
+        // A placement whose producer panics may already have submitted a transfer, so its attempt records a failure
+        // as well, and the panic continues on the thread that ran it.
+        let other_mesh = communicating_mesh(client, "y");
+        let other_sharding = replicated(&other_mesh);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            retained.placed(&other_mesh, &other_sharding, |_| panic!("producer panicked"))
+        }));
+        assert!(panicked.is_err());
+        let later = failure(retained.placed(&other_mesh, &other_sharding, |_| place(Ok(()))));
+        assert_eq!((&later.0, &later.1), (&message(&other_sharding, "the placement panicked"), &other_sharding));
+        assert!(matches!(later.2.as_ref(), Error::Core(error) if **error == cause("the placement panicked")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // A placement whose devices all belong to one process cannot communicate, so its failure is returned as it
+        // is, its attempt is removed once it completes, and the next request, from any retention, places the array
+        // again. A panic is retried as well.
+        let single_process = |outcome: Result<RetainedArray, Error>| match outcome {
+            Err(Error::Core(error)) => *error,
+            Err(error) => panic!("expected the error of the placement, got {error}"),
+            Ok(_) => panic!("expected a failed placement"),
+        };
+        let local_mesh = domain_mesh(client, "x", 2);
+        let local_sharding = replicated(&local_mesh);
+        let failed = retained.placed(&local_mesh, &local_sharding, |_| place(Err("placement failed")));
+        assert_eq!(single_process(failed), cause("placement failed"));
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            retained.placed(&local_mesh, &local_sharding, |_| panic!("producer panicked"))
+        }));
+        assert!(panicked.is_err());
+        let failed = retained.placed(&local_mesh, &local_sharding, |_| place(Err("placement failed again")));
+        assert_eq!(single_process(failed), cause("placement failed again"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let placed = RetainedArray::new(&source).placed(&local_mesh, &local_sharding, |_| place(Ok(()))).unwrap();
+        assert_eq!(retained.placed(&local_mesh, &local_sharding, |_| place(Ok(()))).unwrap(), placed);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+
+        // A successful placement is recorded and shared by every clone of the retention, including a clone with
+        // another declared type.
+        let third_mesh = domain_mesh(client, "z", 2);
+        let third_sharding = replicated(&third_mesh);
+        let placed = retained.placed(&third_mesh, &third_sharding, |_| place(Ok(()))).unwrap();
+        let declared_type = ArrayType::scalar(DataType::F32).with_sharding(Some(third_sharding.clone())).unwrap();
+        let shared = retained.with_declared_type(declared_type).placed(&third_mesh, &third_sharding, |_| place(Ok(())));
+        assert_eq!(shared.unwrap(), placed);
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+
+        // The two ownership modes can submit different cross-process work, even for identical destination keys.
+        let local = RetainedArray::new(&source.with_locally_assigned(true));
+        assert!(!local.can_communicate(&mesh, &sharding));
+        local.placed(&mesh, &sharding, |_| place(Ok(()))).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 6);
+        let later = failure(retained.placed(&mesh, &sharding, |_| place(Ok(()))));
+        assert!(Arc::ptr_eq(&first.2, &later.2));
+    }
+
+    #[test]
+    fn test_retained_array_placed_retries_a_local_replica_fill_on_a_shared_mesh() {
+        let client = cpu_client(2);
+        let local = client.addressable_devices().unwrap();
+        let first = Device::from_pjrt(&local[0]).unwrap();
+        let second = Device::from_pjrt(&local[1]).unwrap();
+        let remote = Device::new(second.id() + 1, second.process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![first, second, remote]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1);
+        let buffer = client.buffer([7u8].as_slice(), BufferType::U8, [1u64], None, local[0].clone(), None).unwrap();
+        let array = Array::from_addressable_buffers(
+            &session,
+            ArrayType::new_static(DataType::U8, [1]),
+            mesh.clone(),
+            Some(sharding.clone()),
+            vec![buffer],
+        )
+        .unwrap();
+        let retained = RetainedArray::new(&array);
+        assert!(retained.fills_missing_local_replicas().unwrap());
+        assert!(!retained.can_communicate(&mesh, &sharding));
+        let failure = CoreError::from(ProgramError::InvalidArgument { message: "replica fill failed".to_string() });
+        let failed = retained.placed(&mesh, &sharding, |_| Err(failure.clone().into()));
+        assert!(matches!(failed, Err(Error::Core(error)) if *error == failure));
+        let retry = RetainedArray::new(&array)
+            .placed(&mesh, &sharding, |source| {
+                source.to_array(&session)?.reshard_on_devices(&session, &mesh, &sharding, false)
+            })
+            .unwrap();
+        let output = retry.to_array(&session).unwrap();
+        output.block_until_ready().unwrap();
+        let local = output.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+        assert_eq!(local, [vec![7], vec![7]]);
+        assert!(output.device_shard(remote.id()).unwrap().buffer().is_none());
+
+        // Moving off a shared mesh can still use a local replica. Its failed copy must also be retried.
+        let singleton = |device| {
+            let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            Placement::new(mesh, sharding).unwrap()
+        };
+        let local = singleton(second);
+        let distant = singleton(Device::new(remote.id() + 1, remote.process_index() + 1));
+        for (target, communicates) in [(&local, false), (&distant, true)] {
+            assert_eq!(array.placement_communicates(target), communicates);
+            assert_eq!(retained.can_communicate(target.mesh(), target.sharding()), communicates);
+        }
+        let failed = retained.placed(local.mesh(), local.sharding(), |_| Err(failure.clone().into()));
+        assert!(matches!(failed, Err(Error::Core(error)) if *error == failure));
+        let retry = retained
+            .placed(local.mesh(), local.sharding(), |source| {
+                source.to_array(&session)?.reshard_on_devices(&session, local.mesh(), local.sharding(), false)
+            })
+            .unwrap()
+            .to_array(&session)
+            .unwrap();
+        retry.block_until_ready().unwrap();
+        assert_eq!(retry.mesh(), local.mesh());
+        assert_eq!(retry.copy_to_host_bytes().unwrap(), [7]);
+    }
+
+    #[test]
+    fn test_retained_array_placed_shares_copies_between_retentions_for_the_lifetime_of_the_array() {
+        // Independent retentions of one array share one placement for each destination, whose copy lives until the
+        // array and every retention of it are gone, in whichever order they are dropped.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let r#type = ArrayType::scalar(DataType::F32);
+        let submissions = AtomicUsize::new(0);
+        let place = |_| {
+            submissions.fetch_add(1, Ordering::SeqCst);
+            let (mesh, sharding) = (mesh.clone(), Some(sharding.clone()));
+            Ok::<_, Error>(Array::from_host_buffer(&session, r#type.clone(), mesh, sharding, 1f32.to_ne_bytes())?)
+        };
+        let buffers = |array: &RetainedArray| {
+            array.shards.iter().map(|shard| Arc::clone(shard.buffer().unwrap())).collect::<Vec<_>>()
+        };
+        for array_dropped_first in [false, true] {
+            let mut source =
+                Some(Array::from_host_buffer(&session, r#type.clone(), None, None, 1f32.to_ne_bytes()).unwrap());
+            let mut retentions = Some((0..4).map(|_| RetainedArray::new(source.as_ref().unwrap())).collect::<Vec<_>>());
+            let copies = retentions
+                .iter()
+                .flatten()
+                .map(|retained| retained.placed(&mesh, &sharding, place).unwrap())
+                .collect::<Vec<_>>();
+            assert!(copies.iter().all(|copy| *copy == copies[0]));
+            assert!(copies.iter().all(|copy| {
+                buffers(copy).iter().zip(buffers(&copies[0])).all(|(buffer, first)| Arc::ptr_eq(buffer, &first))
+            }));
+            let copy_buffers = buffers(&copies[0]).iter().map(Arc::downgrade).collect::<Vec<Weak<Buffer<'static>>>>();
+            let live = || copy_buffers.iter().filter(|buffer| buffer.strong_count() > 0).count();
+            assert_eq!(live(), 2);
+            drop(copies);
+            if array_dropped_first {
+                source = None;
+            } else {
+                retentions = None;
+            }
+            assert_eq!(live(), 2);
+            drop((source, retentions));
+            assert_eq!(live(), 0);
+        }
+        assert_eq!(submissions.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_retained_array_placed_starts_over_for_a_new_identity_that_keeps_its_storage() {
+        // A new logical array that keeps uniquely owned storage (refer to `Array::with_new_identity`) inherits none of
+        // the placements of the old one, so it places again on every process, whether that process kept its storage
+        // or allocated new storage, as a process without the buffers of the array does.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let r#type = ArrayType::scalar(DataType::F32);
+        let submissions = AtomicUsize::new(0);
+        let place = |_| {
+            submissions.fetch_add(1, Ordering::SeqCst);
+            let (mesh, sharding) = (mesh.clone(), Some(sharding.clone()));
+            Ok::<_, Error>(Array::from_host_buffer(&session, r#type.clone(), mesh, sharding, 1f32.to_ne_bytes())?)
+        };
+        let array = Array::from_host_buffer(&session, r#type.clone(), None, None, 1f32.to_ne_bytes()).unwrap();
+        let retained = RetainedArray::new(&array);
+        retained.placed(&mesh, &sharding, place).unwrap();
+        RetainedArray::new(&array).placed(&mesh, &sharding, place).unwrap();
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+        drop(retained);
+        let storage = Arc::as_ptr(&array.parts);
+        let array = array.with_new_identity();
+        assert_eq!(Arc::as_ptr(&array.parts), storage);
+        RetainedArray::new(&array).placed(&mesh, &sharding, place).unwrap();
+        assert_eq!(submissions.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_retained_array_placed_shares_one_attempt_between_concurrent_callers() {
+        // The first caller records the attempt before it places anything, and its `place` blocks until it is
+        // released, while four other callers, two of them through another retention of the same array, request the
+        // same placement. It is released only once every waiter holds the recorded attempt, which a waiter takes before
+        // it waits for that attempt, so every waiter arrives while the attempt runs. Each shares its outcome and never
+        // submits a placement of its own, for a success and for a failure alike.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local_mesh = domain_mesh(client, "x", 1);
+        let remote_mesh = communicating_mesh(client, "x");
+        let upload =
+            || Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes());
+        let outcomes = |succeed: bool, mesh: &DeviceMesh| {
+            let sharding = &Sharding::replicated(mesh.logical_mesh().clone(), 0);
+            let array = upload().unwrap().with_locally_assigned(false);
+            let retentions = [RetainedArray::new(&array), RetainedArray::new(&array)];
+            let submission_count = AtomicUsize::new(0);
+            let submissions = &submission_count;
+            let (started_sender, started) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let place = move |_| {
+                submissions.fetch_add(1, Ordering::SeqCst);
+                started_sender.send(()).unwrap();
+                released.recv().unwrap();
+                if succeed {
+                    Ok(upload()?)
+                } else {
+                    Err(Error::from(ProgramError::InvalidArgument { message: "placement failed".to_string() }))
+                }
+            };
+            let outcomes = std::thread::scope(|scope| {
+                let first = scope.spawn(|| retentions[0].placed(mesh, sharding, place));
+
+                // The attempt is recorded before `place` runs, so every waiter below finds it.
+                started.recv().unwrap();
+                let waiters = (0..4)
+                    .map(|index| {
+                        let retained = &retentions[index % 2];
+                        scope.spawn(move || {
+                            retained.placed(mesh, sharding, |_| {
+                                submissions.fetch_add(1, Ordering::SeqCst);
+                                Ok(upload()?)
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                // The two records of the placements (by key and by devices), the first caller, and the four waiters
+                // hold the attempt, which none of them releases before the attempt finishes.
+                let attempt_holders = || {
+                    let placements = retentions[1].placements.lock().unwrap();
+                    Arc::strong_count(placements.attempts.values().next().unwrap())
+                };
+
+                // A regression that keeps a waiter from the attempt fails the test rather than hanging it, after the
+                // producer is released so that every thread of the scope finishes.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while attempt_holders() < 7 {
+                    if Instant::now() >= deadline {
+                        release.send(()).unwrap();
+                        panic!("the waiters did not all hold the attempt within 60 seconds");
+                    }
+                    std::thread::yield_now();
+                }
+                release.send(()).unwrap();
+                [first].into_iter().chain(waiters).map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
+            });
+            let recorded = {
+                let placements = retentions[0].placements.lock().unwrap();
+                (placements.attempts.len(), placements.attempts_by_devices.values().map(Vec::len).sum::<usize>())
+            };
+            (submission_count.load(Ordering::SeqCst), recorded, outcomes)
+        };
+
+        for mesh in [&local_mesh, &remote_mesh] {
+            let (submissions, recorded, placed) = outcomes(true, mesh);
+            assert_eq!((submissions, recorded), (1, (1, 1)));
+            let placed = placed.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+            assert!(placed.iter().all(|array| *array == placed[0]));
+        }
+
+        // Every caller of a placement that can communicate receives the same typed failure, which shares the original
+        // error of the attempt as its source, and the attempt stays recorded.
+        let cause = CoreError::from(ProgramError::InvalidArgument { message: "placement failed".to_string() });
+        let (submissions, recorded, failed) = outcomes(false, &remote_mesh);
+        assert_eq!((submissions, recorded), (1, (1, 1)));
+        let sharding = Sharding::replicated(remote_mesh.logical_mesh().clone(), 0);
+        let sources = failed
+            .into_iter()
+            .map(|outcome| match outcome.map(|_| ()) {
+                Err(Error::Array(error)) => match *error {
+                    ArrayError::FailedCapturePlacement { sharding: failed_sharding, source } => {
+                        assert_eq!(failed_sharding, sharding);
+                        source
+                    }
+                    error => panic!("expected a failed capture placement, got {error}"),
+                },
+                outcome => panic!("expected an array error, got {outcome:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 5);
+        assert!(sources.iter().all(|source| Arc::ptr_eq(source, &sources[0])));
+        assert!(matches!(sources[0].as_ref(), Error::Core(error) if **error == cause));
+
+        // Every caller of a placement that cannot communicate receives the error of the attempt as it is, and the
+        // attempt is removed once it completes.
+        let (submissions, recorded, failed) = outcomes(false, &local_mesh);
+        assert_eq!((submissions, recorded), (1, (0, 0)));
+        let errors = failed
+            .into_iter()
+            .map(|outcome| match outcome.map(|_| ()) {
+                Err(Error::Core(error)) => *error,
+                outcome => panic!("expected the error of the placement, got {outcome:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec![cause; 5]);
+    }
+
+    #[test]
     fn test_retained_array_eq_follows_the_producing_operation_on_every_process() {
         // Two single-device clients stand for two processes. Each places a scalar on the device of process 0, so that
         // only process 0 holds a buffer of it, and derives arrays from it with every function that returns an array
@@ -563,7 +1159,7 @@ mod tests {
         });
         let device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
         let rows = clients.map(|client| {
-            let session = Session::builder().client(client).build().unwrap();
+            let session = session_with_remote_devices(client, peer_devices(client, &clients));
             let local = session.place(4f32, PlacementOptions::default()).unwrap();
             let array = session.place(local.clone(), PlacementOptions::to(device)).unwrap();
             let holds_buffer = client.process_index().unwrap() == 0;
@@ -605,7 +1201,7 @@ mod tests {
                     "forced copy on its own placement",
                     same(&array, &session.place(array.clone(), copy_on_device).unwrap()),
                 ),
-                ("donated forced copy", same(&array, &session.place(array.clone(), donated_copy).unwrap())),
+                ("donated without alias", same(&array, &session.place(array.clone(), donated_copy).unwrap())),
                 ("unaliased", same(&array, &array.clone().into_unaliased().unwrap())),
                 ("copied shard buffers", same(&array, &array.with_copied_shard_buffers(|_| true).unwrap())),
                 (
@@ -648,7 +1244,7 @@ mod tests {
                 ("in-place placement of a locally assigned array", true),
                 ("forced copy", false),
                 ("forced copy on its own placement", false),
-                ("donated forced copy", false),
+                ("donated without alias", true),
                 ("unaliased", false),
                 ("copied shard buffers", false),
                 ("reshard on its own devices", false),
