@@ -13,7 +13,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::CollectiveLoweringState;
-use crate::lowering::compositions::{NamedCompositionKey, lower_decomposition_call, named_composition_input_types};
+use crate::operations::composites::{NamedCompositionKey, lower_decomposition_call, named_composition_input_types};
 use crate::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,

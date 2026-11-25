@@ -19,9 +19,8 @@
 //! compositions.
 //!
 //! The crate-internal submodules own the parts of this pipeline. `admission` rejects data-dependent dynamic programs
-//! whose padding could become observable, `compositions` emits the shared private functions of named compositions,
-//! `regions` lowers nested programs and regions inline, `signature` defines the executable signature, and `types`
-//! lowers types, constants, and dynamic dimensions.
+//! whose padding could become observable, `regions` lowers nested programs and regions inline, `signature` defines the
+//! executable signature, and `types` lowers types, constants, and dynamic dimensions.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -56,14 +55,14 @@ use crate::arrays::host::{
     partial_completion_rejection,
 };
 use crate::devices::MemoryExtension;
-use crate::lowering::compositions::{
-    NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
-};
 use crate::lowering::regions::{lower_nested_program_inline, lower_program_outputs_with_inputs};
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
     lower_tensor_type, lower_unplaced_constant_output, stable_hlo_dynamic_dimension_bound, validate_boundary_memory,
+};
+use crate::operations::composites::{
+    NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::sharding::{ShardyTensorSharding, lower_closed_sharding_constraint};
@@ -183,8 +182,6 @@ pub enum RaggedDotLoweringStrategy {
 }
 
 pub(crate) mod admission;
-/// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot).
-pub(crate) mod compositions;
 /// Lowering of nested programs and regions inline into an enclosing block.
 pub(crate) mod regions;
 /// Logical and physical signatures of lowered XLA executables.

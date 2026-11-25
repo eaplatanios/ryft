@@ -1,21 +1,31 @@
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Operation, Parameter, Placeholder, ProgramError, RematerializationOptimizationBarrier, Typed,
+    DifferentiableType, Operation, Parameter, Parameterized, Placeholder, ProgramError, RegionId, RegionRef,
+    RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
-use ryft_mlir::ValueRef;
-#[cfg(test)]
-use ryft_mlir::{Block as _, Operation as _, Value as _};
+use ryft_mlir::dialects::func;
+use ryft_mlir::{
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility,
+    Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
+};
 
 use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::types::{lower_array_ir_type, lower_tensor_type};
+use crate::lowering::{CollectiveLoweringState, EffectTokens, omits_regions};
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
 use crate::operations::jit_call::lower_shared_function_call;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::operations::quantization::{
+    scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
+};
+use crate::operations::{FlatProgram, Program};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 /// Backend implementation that replaces the calls of a named composite when the XLA lowering targets a
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
@@ -286,17 +296,312 @@ where
     }
 }
 
+/// Returns the backend-local input types of a named decomposition after boundary validation and differentiation, which
+/// are `input_types` with their varying manual axes cleared.
+///
+/// Private decomposition functions contain local array computations and bind no manual axes. Manual variation has
+/// already determined the explicit transitions and adjoints of the enclosing program, so it must not trigger new
+/// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
+/// in the [`NamedCompositionKey`] so the external operation contract remains unchanged.
+pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<Type>, Error> {
+    input_types
+        .iter()
+        .map(|input| {
+            let sharding = input
+                .sharding()
+                .map(|sharding| sharding.clone().with_varying_manual_axes(Vec::<String>::new()))
+                .transpose()?;
+            Ok(Type::from(input.clone().with_sharding(sharding)?))
+        })
+        .collect()
+}
+
+/// Calls one emitted typed decomposition function at its registered array boundary.
+pub(crate) fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
+    function: &NamedCompositionFunction,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let result_types = output_types
+        .iter()
+        .map(|r#type| lower_tensor_type(r#type, context, location).map(|r#type| r#type.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let call = block.append_operation(func::call(
+        function.symbol.as_str(),
+        func::CallProperties {
+            arguments: input_values
+                .iter()
+                .map(|value| ValueAndAttributes { value: *value, attributes: None })
+                .collect(),
+            results: result_types
+                .iter()
+                .map(|r#type| TypeAndAttributes { r#type: *r#type, attributes: None })
+                .collect(),
+            no_inline: false,
+        },
+        location,
+    )?)?;
+    Ok((0..output_types.len()).map(|index| call.result(index).unwrap().as_ref()).collect())
+}
+
+/// Identity of one generated decomposition of a named composition at a concrete typed boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NamedCompositionKey {
+    /// Semantic identity of the composition, whose name also names the emitted private function.
+    composite: CompositeKey,
+
+    /// Logical operand types of the composition boundary.
+    input_types: Vec<ArrayType>,
+
+    /// Logical result types of the composition boundary.
+    output_types: Vec<ArrayType>,
+}
+
+impl NamedCompositionKey {
+    /// Creates the key of the decomposition of `composite` at the boundary with the provided logical types.
+    pub(crate) fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
+        Self { composite, input_types, output_types }
+    }
+}
+
+/// Private decomposition function emitted for one [`NamedCompositionKey`].
+pub(crate) struct NamedCompositionFunction {
+    /// Module-unique decomposition symbol.
+    symbol: String,
+
+    /// Canonical typed decomposition program.
+    program: FlatProgram,
+}
+
+impl NamedCompositionFunction {
+    /// Returns the module-unique decomposition symbol.
+    #[inline]
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+/// Module-owned registry of canonical named compositions and their private decomposition functions.
+#[derive(Default)]
+pub(crate) struct NamedCompositionFunctionMap {
+    /// Functions indexed by semantic operation and typed boundary.
+    functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
+
+    /// Keys in the stable order of their first occurrence, used for deterministic function emission.
+    order: Vec<NamedCompositionKey>,
+}
+
+impl NamedCompositionFunctionMap {
+    /// Returns the functions indexed by semantic operation and typed boundary.
+    #[inline]
+    pub(crate) fn functions(&self) -> &HashMap<NamedCompositionKey, NamedCompositionFunction> {
+        &self.functions
+    }
+
+    /// Returns the keys in the stable order of their first occurrence, used for deterministic function emission.
+    #[inline]
+    pub(crate) fn order(&self) -> &[NamedCompositionKey] {
+        &self.order
+    }
+
+    /// Returns the registered decomposition for `operation` at the provided typed boundary, or `None` when no
+    /// decomposition is registered for it.
+    pub(crate) fn get(
+        &self,
+        operation: &ScaledDotOperation,
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Option<&NamedCompositionFunction>, Error> {
+        Ok(self.functions.get(&scaled_dot_composition_key(operation, input_types, output_types)?))
+    }
+
+    /// Registers one typed decomposition lazily, sharing an existing private function when the complete semantic key
+    /// is already present. The registry is independent of the operation family that produced `key` and `program`, and
+    /// closed backend operation enums only decide when to call this seam. A key whose composite name is already taken
+    /// by another key receives a symbol suffixed with the number of earlier keys of that name.
+    fn register<F: FnOnce() -> Result<FlatProgram, Error>>(
+        &mut self,
+        key: NamedCompositionKey,
+        program: F,
+    ) -> Result<(), Error> {
+        if self.functions.contains_key(&key) {
+            return Ok(());
+        }
+        let name = key.composite.name();
+        let symbol = match self.order.iter().filter(|existing| existing.composite.name() == name).count() {
+            0 => name.to_string(),
+            count => format!("{name}_{count}"),
+        };
+        self.functions.insert(key.clone(), NamedCompositionFunction { symbol, program: program()? });
+        self.order.push(key);
+        Ok(())
+    }
+}
+
+/// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
+/// Only the regions that lowering emits for `target_platform` contribute (refer to [`omits_regions`]), so neither a
+/// composite call that a backend implementation replaces on that target nor the body of a scan that admits no
+/// iteration contributes compositions.
+pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
+    program: &Program<Input, Output, O>,
+    target_platform: Option<&str>,
+) -> Result<NamedCompositionFunctionMap, Error>
+where
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
+{
+    /// Registers the compositions of `region` and of the computation regions that its instructions attach, visiting
+    /// each region at most once.
+    fn walk<O: LowerableOperationFamily>(
+        region: RegionRef<'_, Constant, O>,
+        map: &mut NamedCompositionFunctionMap,
+        visited: &mut HashSet<RegionId>,
+        target_platform: Option<&str>,
+    ) -> Result<(), Error> {
+        if !visited.insert(region.id()) {
+            return Ok(());
+        }
+        for instruction in region.instructions() {
+            let operation = instruction.operation();
+            if omits_regions(region, instruction, target_platform) {
+                continue;
+            }
+            for (index, nested) in instruction.regions().iter().enumerate() {
+                if operation.region_role(index) == Some(RegionRole::Computation) {
+                    walk(RegionRef::new(region.arena(), *nested)?, map, visited, target_platform)?;
+                }
+            }
+            // Payloads are recognized through their projections, so any family that embeds them gets their
+            // compositions.
+            let scaled_dot = operation.projected_payload::<ScaledDotOperation>();
+            let Some(operation) = scaled_dot else {
+                continue;
+            };
+            let input_types = instruction
+                .inputs()
+                .iter()
+                .map(|input| {
+                    let r#type = region.atoms()[input.index()].r#type();
+                    <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output_types = instruction
+                .outputs()
+                .iter()
+                .map(|output| {
+                    let r#type = region.atoms()[output.index()].r#type();
+                    <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Calls that lower to the block-scaled-dot custom call need no composition.
+            if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
+                operation,
+                input_types.as_slice(),
+                output_types.as_slice(),
+                target_platform,
+            )? {
+                map.register(
+                    scaled_dot_composition_key(
+                        operation,
+                        composition_input_types.as_slice(),
+                        composition_output_types.as_slice(),
+                    )?,
+                    || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut map = NamedCompositionFunctionMap::default();
+    walk(program.entry_region_ref(), &mut map, &mut HashSet::new(), target_platform)?;
+    Ok(map)
+}
+
+/// Emits the private decomposition function of one named composition into `module_block`.
+pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
+    module_block: &mut BlockRef<'b, 'c, 't>,
+    function: &NamedCompositionFunction,
+    collective_state: &CollectiveLoweringState,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let input_types = function.program.input_types();
+    let output_types = function.program.output_types();
+    let argument_tensor_types = input_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types = output_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let function_block = context.block(
+        argument_tensor_types
+            .iter()
+            .map(|tensor_type| (*tensor_type, location))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    {
+        let mut function_block_ref = function_block.as_ref();
+        let input_values = (0..input_types.len())
+            .map(|index| function_block.argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        let mut effect_tokens = EffectTokens::default();
+        let outputs = lower_nested_program_inline(
+            &function.program,
+            input_values.as_slice(),
+            &mut function_block_ref,
+            context,
+            location,
+            &[],
+            &RematerializationOptimizationBarrier::None,
+            // Decompositions are traced independently of the lowered program and contain no `jit_call` sharing.
+            None,
+            collective_state,
+            &mut effect_tokens,
+        )?;
+        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+    }
+    let mut function_region = context.region();
+    function_region.append_block(function_block)?;
+    module_block.append_operation(func::func(
+        function.symbol.as_str(),
+        func::FuncAttributes {
+            arguments: argument_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            results: result_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            visibility: SymbolVisibility::Private,
+            ..Default::default()
+        },
+        function_region,
+        location,
+    )?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeJvpRule,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Error as CoreError, Mul,
-        MulOperation, NamedComposite, PrintOperation, Program, ProjectedContext, Reduce, Softmax, batch, composite,
-        differentiate_at, softmax,
+        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeAttribute,
+        CompositeJvpRule, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer,
+        DomainTracingContext, DotDimensionNumbers, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Mul,
+        MulOperation, NamedComposite, PrintOperation, Program, ProjectedContext, Reduce, ScanOperation, Shape,
+        Sharding, ShardingDimension, Softmax, batch, composite, differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
@@ -305,7 +610,7 @@ mod tests {
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Constant, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, Session, Tracer, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1084,5 +1389,128 @@ mod tests {
                         StableHLO; transpose it before lowering",
             ),
         ));
+    }
+
+    #[test]
+    fn test_named_composition_input_types() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("placed", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("unreduced", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["placed"])])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_unreduced_axes(["unreduced"])
+            .unwrap();
+        let local = ArrayType::new(DataType::F32, Shape::new(vec![4.into()])).with_sharding(sharding.clone()).unwrap();
+        let boundary = local.clone().with_sharding(sharding.with_varying_manual_axes(["varying"]).unwrap()).unwrap();
+        let unsharded = ArrayType::scalar(DataType::F32);
+
+        assert_eq!(
+            named_composition_input_types(&[boundary, unsharded.clone()]).unwrap(),
+            vec![Type::from(local), Type::from(unsharded)],
+        );
+    }
+
+    #[test]
+    fn test_named_composition_function_map_register() {
+        // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
+        // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
+        let boundary_type = ArrayType::scalar(DataType::F32);
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| Ok(inputs),
+            vec![Type::from(boundary_type.clone())],
+        )
+        .unwrap();
+        let program = program.into_simplified().unwrap();
+        let key = NamedCompositionKey {
+            composite: CompositeKey::new("downstream.example", 1)
+                .with_attribute("enabled", CompositeAttribute::Boolean(true)),
+            input_types: vec![boundary_type.clone()],
+            output_types: vec![boundary_type],
+        };
+        let trace_count = Cell::new(0);
+        let mut registry = NamedCompositionFunctionMap::default();
+        registry
+            .register(key.clone(), || {
+                trace_count.set(trace_count.get() + 1);
+                Ok(program.clone())
+            })
+            .unwrap();
+        registry
+            .register(key, || {
+                trace_count.set(trace_count.get() + 1);
+                Ok(program)
+            })
+            .unwrap();
+
+        assert_eq!(trace_count.get(), 1);
+        assert_eq!(registry.functions.len(), 1);
+        assert_eq!(registry.order.len(), 1);
+        assert_eq!(registry.functions.values().next().unwrap().symbol, "downstream.example");
+    }
+
+    #[test]
+    fn test_named_composition_function_map_register_suffixes_shared_names() {
+        // Keys that share a composite name but differ in their boundary types receive distinct symbols, suffixed with
+        // the number of earlier keys of that name.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![4.into()]));
+        let composite = CompositeKey::new("downstream.example", 1);
+        let mut registry = NamedCompositionFunctionMap::default();
+        for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
+            let (_, program) = DomainTracingContext::<Session>::trace(
+                |inputs: Vec<Tracer>| Ok(inputs),
+                vec![Type::from(boundary_type.clone())],
+            )
+            .unwrap();
+            let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);
+            registry.register(key, || Ok(program.into_simplified().unwrap())).unwrap();
+        }
+
+        assert_eq!(
+            registry.order().iter().map(|key| registry.functions()[key].symbol()).collect::<Vec<_>>(),
+            vec!["downstream.example", "downstream.example_1"],
+        );
+        assert_eq!(registry.order()[1].input_types, vec![vector_type]);
+    }
+
+    #[test]
+    fn test_collect_named_composition_functions_skips_the_bodies_of_scans_without_iterations() {
+        // A scaled dot in the body of a scan needs its composition when the length of the scan admits an iteration,
+        // and not on any target when its length is zero, because lowering then emits nothing of its body (refer to
+        // `omits_regions`).
+        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![2.into(), 16.into()]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 1.into()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
+        let carry_types = [output_type, element_type.clone(), element_type, scale_type.clone(), scale_type];
+        let body = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carries = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
+            let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+            let operation = ScaledDotOperation::new(dimensions, DataType::F32, true, true);
+            let output = builder.add_instruction(operation, Vec::new(), carries[1..].to_vec(), None).unwrap()[0];
+            let outputs = std::iter::once(output).chain(carries[1..].iter().copied()).collect();
+            Arc::new(builder.build(outputs, vec![Placeholder; 6], vec![Placeholder; 5]).unwrap())
+        };
+        let symbols = |length: usize| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let inputs = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect();
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let scan = ScanOperation::<Type>::new(5, length);
+            let outputs = builder.add_instruction(scan, regions, inputs, None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
+                .unwrap();
+            let map = collect_named_composition_functions(&program, None).unwrap();
+            map.order().iter().map(|key| map.functions()[key].symbol().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(symbols(0), Vec::<String>::new());
+        assert_eq!(symbols(1), vec!["xla.scaled_dot".to_string()]);
     }
 }

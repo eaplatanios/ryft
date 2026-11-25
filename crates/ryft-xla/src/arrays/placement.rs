@@ -1726,8 +1726,6 @@ struct PlacementArgument<P, C = ()> {
     may_alias: Option<bool>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Places the array inputs bound to the given core placement operations as a group. The core operation requires even
 /// splits and keeps the input client, while the session frontend also admits uneven splits and explicit cross-client
 /// transfers. When the call requires distributed admission, a process whose local check fails still participates
@@ -1743,8 +1741,8 @@ pub(crate) fn place_operation_bindings(
     } else if bindings.iter().all(|(context, _, _)| context.is_same_session(&session)) {
         ValueComparison::of_session(&session)?
     } else {
-        // Each binding keeps its own context. Independent placements can use different contexts. A call that
-        // needs agreement requires one comparison sequence shared by all its arguments.
+        // Each binding keeps its own context. Independent placements can use different contexts.
+        // A call that needs agreement requires one comparison sequence shared by all its arguments.
         let communicates =
             bindings.iter().any(|(context, array, operation)| array.communicates(context, operation.target()));
         for (context, array, operation) in &bindings {
@@ -1772,6 +1770,7 @@ pub(crate) fn place_operation_bindings(
             may_alias: Some(operation.may_alias()),
         })
         .collect::<Vec<_>>();
+
     let checked = arguments.iter().try_for_each(|argument| {
         let array = &argument.parameter;
         let context = &argument.context;
@@ -1783,6 +1782,7 @@ pub(crate) fn place_operation_bindings(
         array.validate_placement_client(context, target.as_ref())?;
         array.validate_array_destination(context, target)
     });
+
     admit_and_place_arguments(
         &session,
         comparison,
@@ -1834,6 +1834,7 @@ fn admit_and_place_arguments<P: Placeable, C>(
                 return Err(error.into());
             }
         };
+
         let mut checked = checked;
         let mut digests = Vec::new();
         for (index, value) in process_values.into_iter().enumerate() {
@@ -1880,6 +1881,8 @@ fn admit_and_place_arguments<P: Placeable, C>(
         })
         .collect()
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Resolves a request against an array for physical placement. An in-place request keeps the array's mesh and
 /// sharding. A device request keeps the logical mesh and sharding of a single-device array, with its reduction state
