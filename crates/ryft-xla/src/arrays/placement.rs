@@ -51,6 +51,8 @@ use crate::devices::PjrtDeviceExtension;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{CompileTracer, Error, FromPjrt, Session, Value};
 
+use sealed::PlaceableParameter;
+
 /// Options of [`Session::place`]. The four type parameters describe whole tree prefixes. Each option can be a single
 /// value that applies to the entire input, or a tuple or other parameterized tree that sets different values for
 /// different branches. [`Session::place`] broadcasts these prefixes over the input and applies the resulting options
@@ -226,63 +228,24 @@ impl Default for PlacementOptions {
 /// so that a traced leaf over arrays of another PJRT client or of another session can be rejected.
 ///
 /// [`Placeable::place_parameter`] is the per-leaf primitive of [`Session::place`], like
-/// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding, and
-/// [`Placeable::validate_placement`] is the check that [`Session::place`] makes for every leaf before it places any.
-/// The session owns the comparison of the values that the processes of a run place (refer to [`Session::place`]),
-/// which covers the host values and the locally assigned [`Array`]s of the implementations of this crate only. A leaf
-/// of an implementation outside this crate is never compared, and the session assumes that its placement can make one
-/// process wait for another.
-pub trait Placeable: Parameter {
+/// [`ReshardDispatch::reshard`](ryft_core::ReshardDispatch::reshard) is for resharding. [`Session::place`] also checks
+/// every leaf of a tree before it places any, and it owns the comparison of the values that the processes of a run
+/// place (refer to [`Session::place`]), which covers the host values and the locally assigned [`Array`]s. Both need
+/// to know every kind of leaf, so this trait is sealed (i.e., only this crate implements it). A type that is made of
+/// these leaves is placed as a [`Parameterized`] tree of them.
+pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output> {
     /// Leaf type that placing this leaf produces, which is [`Array`] for host values and runtime arrays, and the leaf
     /// type itself for traced values.
     type Output: Parameter;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Checks, without placing this leaf, what [`Self::place_parameter`] would check from metadata alone before it
-    /// submits any work for the same options, and returns the same error that it would return for them.
-    /// [`Session::place`] calls this function for every leaf of a tree before it places any leaf, so that no leaf is
-    /// transferred, uploaded, or donated when a later leaf is rejected. The implementations of this crate check the
-    /// options that no leaf accepts (refer to [`validate_parameter_options`]) and then
-    ///
-    ///   - for a host value, the type rule of [`PlaceOperation`] for its destination and the admission of its upload
-    ///     (e.g., a device that the client of `session` cannot address, unavailable memory on an addressable device,
-    ///     or a data type without the additive identity that an unreduced destination needs),
-    ///   - for an [`Array`], that it belongs to the PJRT client of `session` or has a destination that names
-    ///     devices, the type rule of [`PlaceOperation`] for its destination and source with its runtime sharding, and
-    ///     the devices of its resolved destination or, for an array of another client, the transfer onto them (refer
-    ///     to [`Array::to_placement`]), and
-    ///   - for a traced value, that the arrays that it wraps belong to `session`, because the type rule of a traced
-    ///     value is applied by the context that records or executes its placement.
-    ///
-    /// The default implementation checks only the options that no leaf accepts, so an implementation outside this
-    /// crate whose placement can fail after it submits work should override it with its own metadata checks.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error that [`Self::place_parameter`] returns for the same options when one of these checks fails.
-    #[inline]
-    fn validate_placement(
-        &self,
-        session: &Session,
-        target: Option<&PlacementRequest>,
-        source: Option<&PlacementRequest>,
-        donate: bool,
-        may_alias: Option<bool>,
-    ) -> Result<(), Error> {
-        let _ = session;
-        validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)
-    }
-
     /// Places this leaf using the provided leafwise placement options. Some combinations of options are invalid for
     /// every leaf (i.e., a `donate` of `true` with a `may_alias` of `Some(true)`, and a [`PlacementRequest::InPlace`]
-    /// `target` or `source` that names neither a memory nor a layout). Every implementation in this crate rejects them
-    /// before it does anything else, with the errors that [`Session::place`] reports for them, which checks them for
-    /// every leaf before it places any leaf, so the same options are accepted whether a leaf is placed directly or
-    /// through [`Session::place`]. An implementation outside this crate must reject them as well, by calling
-    /// [`validate_parameter_options`] first, which is the check that every implementation shares. A sharding that is
-    /// shorter than the rank of the leaf is padded with replicated dimensions by every implementation, and the rank of
-    /// a sharding and the other checks that depend on the leaf are handled by the implementation of this function.
+    /// `target` or `source` that names neither a memory nor a layout). Every implementation rejects them before it
+    /// does anything else, with the errors that [`Session::place`] reports for them, which checks them for every leaf
+    /// before it places any leaf, so the same options are accepted whether a leaf is placed directly or through
+    /// [`Session::place`]. A sharding that is shorter than the rank of the leaf is padded with replicated dimensions
+    /// by every implementation, and the rank of a sharding and the other checks that depend on the leaf are handled
+    /// by the implementation of this function.
     ///
     /// # Parameters
     ///
@@ -299,18 +262,16 @@ pub trait Placeable: Parameter {
     /// Implementations return an [`Error`] instead of a placed leaf, and never a partially placed one, when the leaf
     /// cannot be placed by `session` as requested. This covers the invalid options above, which are reported with
     /// [`ArrayError::DonatedArrayMayAlias`] at the root path for a donated leaf that may alias, and with the
-    /// [`TypeError`] of the type rule of [`PlaceOperation`] for an in-place request that names nothing (also for the
-    /// source of a host leaf, which otherwise ignores its source), a leaf whose arrays belong to another PJRT client
-    /// than `session`, a traced leaf whose arrays belong to another session (refer to [`Session::place`] for the rules
-    /// of concrete and traced leaves), a `target` or `source` that the type rule of [`PlaceOperation`] rejects for a
-    /// concrete leaf, except for an uneven split (i.e., a [`TypeError`] of
-    /// [`PlaceOperation::infer_output_type_allowing_uneven_splits`]), and a placement that fails to execute or to
-    /// stage (e.g., a failed transfer, or a target that the rules of [`PlaceOperation`] reject for a traced leaf). The
-    /// leaf is consumed either way. [`Session::place`] returns the first error of any leaf as its
-    /// own, before it places any leaf when [`Self::validate_placement`] reports it, and otherwise after the leaves
-    /// before it were placed.
-    ///
-    /// [`TypeError`]: ryft_core::TypeError
+    /// [`TypeError`](ryft_core::TypeError) of the type rule of [`PlaceOperation`] for an in-place request that names
+    /// nothing (also for the source of a host leaf, which otherwise ignores its source), a leaf whose arrays belong
+    /// to another PJRT client than `session`, a traced leaf whose arrays belong to another session (refer to
+    /// [`Session::place`] for the rules of concrete and traced leaves), a `target` or `source` that the
+    /// type rule of [`PlaceOperation`] rejects for a concrete leaf, except for an uneven split (i.e., a
+    /// [`TypeError`](ryft_core::TypeError) of [`PlaceOperation::infer_output_type_allowing_uneven_splits`]),
+    /// and a placement that fails to execute or to stage (e.g., a failed transfer, or a target that the rules of
+    /// [`PlaceOperation`] reject for a traced leaf). The leaf is consumed either way. [`Session::place`] returns the
+    /// first error of any leaf as its own, before it places any leaf when its check of the leaves reports it, and
+    /// otherwise after the leaves before it were placed.
     fn place_parameter(
         self,
         session: &Session,
@@ -319,56 +280,11 @@ pub trait Placeable: Parameter {
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Self::Output, Error>;
-
-    /// Returns the comparison metadata of a concrete leaf. A host value or locally assigned [`Array`] provides a
-    /// digest when the session compares its value across processes. The decision to compare is independent of the
-    /// value's shape or bytes. The session owns the comparison and attaches its verdict to compared results.
-    #[doc(hidden)]
-    #[inline]
-    fn process_value(&self, token: sealed::Token) -> Option<sealed::ProcessValue<'_, Self::Output>> {
-        let _ = token;
-        None
-    }
-
-    /// Returns whether placing this leaf onto `target` can make this process wait for another process of its run
-    /// (e.g., for a cross-host transfer), from metadata that every process that makes the same call holds alike, so
-    /// that [`Session::place`] admits the whole call on every process before it places such a leaf. This function
-    /// describes work submitted directly by this frontend. A built-in tracer delegates to its context, which owns
-    /// admission of any concrete placement it dispatches. Processes must agree on whether each array belongs to
-    /// their own session's client. All downstream leaves are assumed to communicate.
-    #[doc(hidden)]
-    #[inline]
-    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>, token: sealed::Token) -> bool {
-        let _ = (session, target, token);
-        true
-    }
-
-    /// Prepares `parameters` in place after [`Session::place`] validates every leaf and before placing any leaf.
-    /// A replacement must satisfy the options already validated for its position. For example, a mixed
-    /// [`PlaceInput`] tree lifts host values into its compilation trace. `requests` returns the target and the source
-    /// of a leaf, for a check that needs the whole tree (e.g., one that depends on the trace that the leaves join),
-    /// and `path` returns the path of a leaf. The default implementation leaves the slice unchanged.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of the first leaf that cannot be prepared, or an error of the whole tree.
-    fn prepare_parameters(
-        parameters: &mut [Self],
-        session: &Session,
-        requests: &dyn Fn(usize) -> (Option<PlacementRequest>, Option<PlacementRequest>),
-        path: &dyn Fn(usize) -> ParameterPath,
-    ) -> Result<(), Error>
-    where
-        Self: Sized,
-    {
-        let _ = (parameters, session, requests, path);
-        Ok(())
-    }
 }
 
-impl<T: IntoHostArray + Parameter> Placeable for T {
-    type Output = Array;
+// TODO(eaplatanios): Review from here onwards.
 
+impl<T: IntoHostArray + Parameter> PlaceableParameter<Array> for T {
     fn validate_placement(
         &self,
         session: &Session,
@@ -387,6 +303,21 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
         let (r#type, placement) = host_upload_destination(&r#type, target, default_device)?;
         Array::validate_host_upload(session, r#type, placement.mesh(), placement.sharding())
     }
+
+    #[inline]
+    fn process_value(&self) -> Option<sealed::ProcessValue<'_, Array>> {
+        Some(sealed::ProcessValue::new(|| self.host_value_digest(), |_| self.validate_host_value()))
+    }
+
+    #[inline]
+    fn communicates(&self, _: &Session, _: Option<&PlacementRequest>) -> bool {
+        // Every process uploads its own value onto the devices that it addresses.
+        false
+    }
+}
+
+impl<T: IntoHostArray + Parameter> Placeable for T {
+    type Output = Array;
 
     fn place_parameter(
         self,
@@ -432,17 +363,6 @@ impl<T: IntoHostArray + Parameter> Placeable for T {
             .with_committed(committed)
             .with_locally_assigned(locally_assigned))
     }
-
-    #[inline]
-    fn process_value(&self, _: sealed::Token) -> Option<sealed::ProcessValue<'_, Array>> {
-        Some(sealed::ProcessValue::new(|| self.host_value_digest(), |_| self.validate_host_value()))
-    }
-
-    #[inline]
-    fn communicates(&self, _: &Session, _: Option<&PlacementRequest>, _: sealed::Token) -> bool {
-        // Every process uploads its own value onto the devices that it addresses.
-        false
-    }
 }
 
 /// Target or source parameter accepted by [`Session::place`]. This includes [`Placement`], [`PlacementRequest`],
@@ -452,16 +372,102 @@ pub trait SessionPlacementRequestParameter: Clone + Parameter + sealed::RequestP
 
 impl<R: Clone + Parameter + sealed::RequestParameter> SessionPlacementRequestParameter for R {}
 
-/// Items that only this crate can name, which keep the functions of [`Placeable`] that take them to this crate.
+/// Items that only this crate can name, which seal the traits of this module that depend on them.
 mod sealed {
-    use ryft_core::{Device, Memory, Placement, PlacementRequest, PlacementRequestParameter, Sharding};
+    use ryft_core::{Device, Memory, ParameterPath, Placement, PlacementRequest, PlacementRequestParameter, Sharding};
     use ryft_pjrt::ExecutionFence;
 
-    use crate::Error;
     use crate::arrays::Array;
+    use crate::{Error, Session};
 
-    /// Token that only this crate can construct.
-    pub struct Token;
+    use super::validate_parameter_options;
+
+    /// What [`Session::place`] asks of a leaf that it places as an `Output` before it places any leaf of a tree. Every
+    /// [`Placeable`](super::Placeable) implements this trait for its output, which seals that trait, because only this
+    /// crate can name this one. [`place_parameter`](super::Placeable::place_parameter) below is the function of that
+    /// trait that places the leaf.
+    pub trait PlaceableParameter<Output> {
+        /// Checks, without placing this leaf, what [`place_parameter`](super::Placeable::place_parameter) would check
+        /// from metadata alone before it submits any work for the same options, and returns the same error that it
+        /// would return for them. [`Session::place`] calls this function for every leaf of a tree before it places any
+        /// leaf, so that no leaf is transferred, uploaded, or donated when a later leaf is rejected. The
+        /// implementations check the options that no leaf accepts (refer to [`validate_parameter_options`]) and then
+        ///
+        ///   - for a host value, the type rule of [`PlaceOperation`](ryft_core::PlaceOperation) for its destination
+        ///     and the admission of its upload (e.g., a device that the client of `session` cannot address,
+        ///     unavailable memory on an addressable device, or a data type without the additive identity that an
+        ///     unreduced destination needs),
+        ///   - for an [`Array`], that it belongs to the PJRT client of `session` or has a destination that names
+        ///     devices, the type rule of [`PlaceOperation`](ryft_core::PlaceOperation) for its destination and source
+        ///     with its runtime sharding, and the devices of its resolved destination or, for an array of another
+        ///     client, the transfer onto them (refer to [`Array::to_placement`]), and
+        ///   - for a traced value, that the arrays that it wraps belong to `session`, because the type rule of a
+        ///     traced value is applied by the context that records or executes its placement.
+        ///
+        /// The default implementation checks only the options that no leaf accepts.
+        ///
+        /// # Errors
+        ///
+        /// Returns the error that [`place_parameter`](super::Placeable::place_parameter) returns for the same options
+        /// when one of these checks fails.
+        #[inline]
+        fn validate_placement(
+            &self,
+            session: &Session,
+            target: Option<&PlacementRequest>,
+            source: Option<&PlacementRequest>,
+            donate: bool,
+            may_alias: Option<bool>,
+        ) -> Result<(), Error> {
+            let _ = session;
+            validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)
+        }
+
+        /// Returns the comparison metadata of a concrete leaf. A host value or locally assigned [`Array`] provides a
+        /// digest when the session compares its value across processes. The decision to compare is independent of
+        /// the value's shape or bytes. The session owns the comparison and attaches its verdict to compared results.
+        /// The default implementation returns [`None`], for a leaf whose value is never compared.
+        #[inline]
+        fn process_value(&self) -> Option<ProcessValue<'_, Output>> {
+            None
+        }
+
+        /// Returns whether placing this leaf onto `target` can make this process wait for another process of its run
+        /// (e.g., for a cross-host transfer), from metadata that every process that makes the same call holds alike,
+        /// so that [`Session::place`] admits the whole call on every process before it places such a leaf. This
+        /// function describes work submitted directly by this frontend. A tracer delegates to its context, which owns
+        /// admission of any concrete placement it dispatches. Processes must agree on whether each array belongs to
+        /// their own session's client. The default implementation returns `true`, so that a leaf that does not state
+        /// otherwise is admitted with its tree.
+        #[inline]
+        fn communicates(&self, session: &Session, target: Option<&PlacementRequest>) -> bool {
+            let _ = (session, target);
+            true
+        }
+
+        /// Prepares `parameters` in place after [`Session::place`] validates every leaf and before placing any leaf.
+        /// A replacement must satisfy the options already validated for its position. For example, a mixed
+        /// [`PlaceInput`](super::PlaceInput) tree lifts host values into its compilation trace. `requests` returns the
+        /// target and the source of a leaf, for a check that needs the whole tree (e.g., one that depends on the trace
+        /// that the leaves join), and `path` returns the path of a leaf. The default implementation leaves the slice
+        /// unchanged.
+        ///
+        /// # Errors
+        ///
+        /// Returns the error of the first leaf that cannot be prepared, or an error of the whole tree.
+        fn prepare_parameters(
+            parameters: &mut [Self],
+            session: &Session,
+            requests: &dyn Fn(usize) -> (Option<PlacementRequest>, Option<PlacementRequest>),
+            path: &dyn Fn(usize) -> ParameterPath,
+        ) -> Result<(), Error>
+        where
+            Self: Sized,
+        {
+            let _ = (parameters, session, requests, path);
+            Ok(())
+        }
+    }
 
     /// Converts the request forms accepted by the session frontend.
     pub trait RequestParameter {
@@ -469,14 +475,14 @@ mod sealed {
         ///
         /// # Errors
         ///
-        /// Returns the error of [`Session::placement`](super::Session::placement) when the sharding cannot resolve.
-        fn resolve(self, session: &super::Session) -> Result<Option<PlacementRequest>, Error>;
+        /// Returns the error of [`Session::placement`] when the sharding cannot resolve.
+        fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error>;
     }
 
     macro_rules! impl_resolved_request_parameter {
         ($request:ty) => {
             impl RequestParameter for $request {
-                fn resolve(self, session: &super::Session) -> Result<Option<PlacementRequest>, Error> {
+                fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
                     let _ = session;
                     Ok(self.into_request())
                 }
@@ -490,13 +496,13 @@ mod sealed {
     impl_resolved_request_parameter!(Memory);
 
     impl RequestParameter for Sharding {
-        fn resolve(self, session: &super::Session) -> Result<Option<PlacementRequest>, Error> {
+        fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
             session.placement(self).map(|placement| Some(placement.into()))
         }
     }
 
     impl<R: RequestParameter> RequestParameter for Option<R> {
-        fn resolve(self, session: &super::Session) -> Result<Option<PlacementRequest>, Error> {
+        fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
             self.map_or(Ok(None), |request| request.resolve(session))
         }
     }
@@ -620,9 +626,7 @@ fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'s
     Ok(Device::from_pjrt(device)?)
 }
 
-impl Placeable for Array {
-    type Output = Array;
-
+impl PlaceableParameter<Array> for Array {
     fn validate_placement(
         &self,
         session: &Session,
@@ -635,20 +639,8 @@ impl Placeable for Array {
         self.validate_array_destination(session, target)
     }
 
-    fn place_parameter(
-        self,
-        session: &Session,
-        target: Option<PlacementRequest>,
-        source: Option<PlacementRequest>,
-        donate: bool,
-        may_alias: Option<bool>,
-    ) -> Result<Array, Error> {
-        let target = self.admit_placement(session, target, source, donate, may_alias)?;
-        self.execute_array_placement(session, target, donate, may_alias)
-    }
-
     #[inline]
-    fn process_value(&self, _: sealed::Token) -> Option<sealed::ProcessValue<'_, Array>> {
+    fn process_value(&self) -> Option<sealed::ProcessValue<'_, Array>> {
         self.is_locally_assigned().then(|| {
             sealed::ProcessValue::new(
                 || array_value_digest(self),
@@ -665,7 +657,7 @@ impl Placeable for Array {
     }
 
     #[inline]
-    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>, _: sealed::Token) -> bool {
+    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>) -> bool {
         // Each process places a locally assigned value independently. A placement between two clients uses host
         // readback and upload on the destination owner. Comparing local values is a separate step.
         if self.is_locally_assigned() || !std::ptr::eq(self.client(), session.client()) {
@@ -678,6 +670,22 @@ impl Placeable for Array {
             |_| request_spans_processes(self.mesh(), target),
             |placement| self.placement_communicates(placement.mesh(), placement.sharding()),
         )
+    }
+}
+
+impl Placeable for Array {
+    type Output = Array;
+
+    fn place_parameter(
+        self,
+        session: &Session,
+        target: Option<PlacementRequest>,
+        source: Option<PlacementRequest>,
+        donate: bool,
+        may_alias: Option<bool>,
+    ) -> Result<Array, Error> {
+        let target = self.admit_placement(session, target, source, donate, may_alias)?;
+        self.execute_array_placement(session, target, donate, may_alias)
     }
 }
 
@@ -749,80 +757,85 @@ impl Array {
     }
 }
 
-macro_rules! impl_traced_placeable_methods {
-    // Defines the shared placement methods inside an existing traced value implementation.
-    () => {
-        type Output = Self;
+macro_rules! impl_traced_placeable {
+    // Implements `Placeable` for a traced value type, whose context records or executes its placement.
+    ([$($generics:tt)*] $value:ty where $($bounds:tt)*) => {
+        impl<$($generics)*> PlaceableParameter<$value> for $value
+        where
+            $($bounds)*
+        {
+            #[inline]
+            fn validate_placement(
+                &self,
+                session: &Session,
+                target: Option<&PlacementRequest>,
+                source: Option<&PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<(), Error> {
+                validate_traced(self, session, target, source, donate, may_alias)
+            }
 
-        #[inline]
-        fn validate_placement(
-            &self,
-            session: &Session,
-            target: Option<&PlacementRequest>,
-            source: Option<&PlacementRequest>,
-            donate: bool,
-            may_alias: Option<bool>,
-        ) -> Result<(), Error> {
-            validate_traced(self, session, target, source, donate, may_alias)
+            #[inline]
+            fn communicates(&self, _: &Session, _: Option<&PlacementRequest>) -> bool {
+                false
+            }
         }
 
-        #[inline]
-        fn place_parameter(
-            self,
-            session: &Session,
-            target: Option<PlacementRequest>,
-            source: Option<PlacementRequest>,
-            donate: bool,
-            may_alias: Option<bool>,
-        ) -> Result<Self, Error> {
-            place_traced(self, session, target, source, donate, may_alias)
-        }
+        impl<$($generics)*> Placeable for $value
+        where
+            $($bounds)*
+        {
+            type Output = Self;
 
-        #[inline]
-        fn communicates(&self, _: &Session, _: Option<&PlacementRequest>, _: sealed::Token) -> bool {
-            false
+            #[inline]
+            fn place_parameter(
+                self,
+                session: &Session,
+                target: Option<PlacementRequest>,
+                source: Option<PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<Self, Error> {
+                place_traced(self, session, target, source, donate, may_alias)
+            }
         }
     };
 }
 
-impl<C: Context<Type = ArrayType>> Placeable for Tracer<C>
-where
-    Tracer<C>: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
-{
-    impl_traced_placeable_methods!();
-}
+impl_traced_placeable!(
+    [C: Context<Type = ArrayType>] Tracer<C>
+    where
+        Tracer<C>: CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Tracer<C>>>,
+);
 
-impl<C: Context<Type = ArrayType>> Placeable for PartialTracer<C>
-where
-    PartialTracer<C>:
-        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
-{
-    impl_traced_placeable_methods!();
-}
+impl_traced_placeable!(
+    [C: Context<Type = ArrayType>] PartialTracer<C>
+    where
+        PartialTracer<C>:
+            ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, PartialTracer<C>>>,
+);
 
-impl<C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>> Placeable for DifferentiationTracer<C, P>
-where
-    DifferentiationTracer<C, P>:
-        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
-{
-    impl_traced_placeable_methods!();
-}
+impl_traced_placeable!(
+    [C: Context<Type = ArrayType>, P: DifferentiationPolicy<C>] DifferentiationTracer<C, P>
+    where
+        DifferentiationTracer<C, P>: ConcreteArrays
+            + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, DifferentiationTracer<C, P>>>,
+);
 
-impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C>> Placeable for BatchingTracer<C, P>
-where
-    BatchingTracer<C, P>:
-        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
-{
-    impl_traced_placeable_methods!();
-}
+impl_traced_placeable!(
+    [C: Context<Type = ArrayType>, P: BatchingPolicy<C>] BatchingTracer<C, P>
+    where
+        BatchingTracer<C, P>:
+            ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, BatchingTracer<C, P>>>,
+);
 
-impl<V> Placeable for ProjectedValue<ArrayType, V>
-where
-    ProjectedValue<ArrayType, V>:
-        ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
-{
-    impl_traced_placeable_methods!();
-}
+impl_traced_placeable!(
+    [V] ProjectedValue<ArrayType, V>
+    where
+        ProjectedValue<ArrayType, V>: ConcreteArrays
+            + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, ProjectedValue<ArrayType, V>>>,
+);
 
 /// Input leaf of [`Session::place`] that holds a host value, a runtime [`Array`], or a [`CompileTracer`].
 /// A [`Parameterized`] tree has one leaf type, so use [`PlaceInput`] to mix these values in one call.
@@ -890,9 +903,7 @@ impl From<Array> for PlaceInput {
     }
 }
 
-impl Placeable for PlaceInput {
-    type Output = Array;
-
+impl PlaceableParameter<Array> for PlaceInput {
     fn validate_placement(
         &self,
         session: &Session,
@@ -909,6 +920,26 @@ impl Placeable for PlaceInput {
         }
     }
 
+    #[inline]
+    fn process_value(&self) -> Option<sealed::ProcessValue<'_, Array>> {
+        match self {
+            Self::Host(value) => PlaceableParameter::process_value(value),
+            Self::Runtime(value) | Self::Concrete(value) => PlaceableParameter::process_value(value),
+        }
+    }
+
+    #[inline]
+    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>) -> bool {
+        match self {
+            Self::Host(value) => PlaceableParameter::communicates(value, session, target),
+            Self::Runtime(value) | Self::Concrete(value) => PlaceableParameter::communicates(value, session, target),
+        }
+    }
+}
+
+impl Placeable for PlaceInput {
+    type Output = Array;
+
     fn place_parameter(
         self,
         session: &Session,
@@ -922,22 +953,6 @@ impl Placeable for PlaceInput {
             Self::Runtime(value) | Self::Concrete(value) => {
                 value.place_parameter(session, target, source, donate, may_alias)
             }
-        }
-    }
-
-    #[inline]
-    fn process_value(&self, token: sealed::Token) -> Option<sealed::ProcessValue<'_, Array>> {
-        match self {
-            Self::Host(value) => Placeable::process_value(value, token),
-            Self::Runtime(value) | Self::Concrete(value) => Placeable::process_value(value, token),
-        }
-    }
-
-    #[inline]
-    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>, token: sealed::Token) -> bool {
-        match self {
-            Self::Host(value) => Placeable::communicates(value, session, target, token),
-            Self::Runtime(value) | Self::Concrete(value) => Placeable::communicates(value, session, target, token),
         }
     }
 }
@@ -994,9 +1009,7 @@ impl PlaceInput<CompileTracer> {
     }
 }
 
-impl Placeable for PlaceInput<CompileTracer> {
-    type Output = CompileTracer;
-
+impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
     fn validate_placement(
         &self,
         session: &Session,
@@ -1014,29 +1027,12 @@ impl Placeable for PlaceInput<CompileTracer> {
         self.validate_placement_in_trace(session, target, source, CapturePlacement::FollowCall)
     }
 
-    fn place_parameter(
-        self,
-        session: &Session,
-        target: Option<PlacementRequest>,
-        source: Option<PlacementRequest>,
-        donate: bool,
-        may_alias: Option<bool>,
-    ) -> Result<CompileTracer, Error> {
-        match self {
-            Self::Host(_) | Self::Concrete(_) => {
-                validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
-                Err(untraced_host_value_error())
-            }
-            Self::Runtime(value) => value.place_parameter(session, target, source, donate, may_alias),
-        }
-    }
-
     #[inline]
-    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>, token: sealed::Token) -> bool {
+    fn communicates(&self, session: &Session, target: Option<&PlacementRequest>) -> bool {
         // The leaves that are not traced are rejected before anything is placed unless they joined the trace.
         match self {
             Self::Host(_) | Self::Concrete(_) => false,
-            Self::Runtime(value) => Placeable::communicates(value, session, target, token),
+            Self::Runtime(value) => PlaceableParameter::communicates(value, session, target),
         }
     }
 
@@ -1090,6 +1086,27 @@ impl Placeable for PlaceInput<CompileTracer> {
             );
         }
         Ok(())
+    }
+}
+
+impl Placeable for PlaceInput<CompileTracer> {
+    type Output = CompileTracer;
+
+    fn place_parameter(
+        self,
+        session: &Session,
+        target: Option<PlacementRequest>,
+        source: Option<PlacementRequest>,
+        donate: bool,
+        may_alias: Option<bool>,
+    ) -> Result<CompileTracer, Error> {
+        match self {
+            Self::Host(_) | Self::Concrete(_) => {
+                validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
+                Err(untraced_host_value_error())
+            }
+            Self::Runtime(value) => value.place_parameter(session, target, source, donate, may_alias),
+        }
     }
 }
 
@@ -1297,7 +1314,7 @@ impl Session {
     ///
     /// With [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison) enabled, a mesh or
     /// sharding destination spanning every process in a multi-process run compares the host or locally assigned
-    /// values for that leaf. Leaves of [`Placeable`] implementations outside this crate do not provide digests.
+    /// values for that leaf.
     /// After the local checks and before placing any leaf, each process hashes its compared leaves with SHA-256 in
     /// leaf order. This reads back each compared [`Array`] on the calling thread. The comparison also binds its
     /// position in the session's sequence of comparisons. A process contributes a poison digest if the call's
@@ -1316,7 +1333,7 @@ impl Session {
     /// input while a peer with a valid input reaches the collective.
     ///
     /// A placement tree with multiple leaves is admitted as a whole when a leaf's placement can make one process wait
-    /// for another (e.g., an [`Array`] that moves shards between processes or a downstream [`Placeable`] leaf).
+    /// for another (e.g., an [`Array`] that moves shards between processes).
     /// Each process submits the comparison as above, even if it has no values to compare, and waits for its verdict
     /// before it places any leaf. Admission checks host encodings and reports known producer failures for locally
     /// assigned arrays with an explicit destination or a forced copy. When a leaf fails its checks on one process
@@ -1351,7 +1368,7 @@ impl Session {
     /// leaf in order, that it is not donated while it may alias and that its in-place source and destination name a
     /// memory or a layout. An empty [`PlacementRequest::InPlace`] produces the [`TypeError`] from [`PlaceOperation`].
     /// The requested storage must also be supported. Mixed leaves from different traces or an unavailable group
-    /// comparison can fail the whole call. Before placement, [`Placeable::validate_placement`] checks each leaf's
+    /// comparison can fail the whole call. Before placement, this function checks each leaf's
     /// metadata. For host values and concrete arrays, this includes the source and destination type rules, the
     /// array's PJRT client and the session's inventory of destination devices. Forward source devices are advisory. The
     /// compiling session checks the destinations of abstract tracers. A preflight error leaves every leaf untouched,
@@ -1418,7 +1435,7 @@ impl Session {
     }
 
     /// Implements [`Self::place`] with `comparison`, the comparison of the values of the processes that the call makes
-    /// for the leaves that every process places on its own (refer to [`Placeable::process_value`]), if any.
+    /// for the leaves that every process places on its own (refer to [`PlaceableParameter::process_value`]), if any.
     pub(crate) fn place_with_comparison<
         P: Placeable,
         Input: Parameterized<P>,
@@ -1555,9 +1572,8 @@ pub(crate) fn place_core_operations(
     } else {
         // A placement keeps the context of each leaf. Independent placements can use different contexts. A tree
         // which needs agreement requires one comparison sequence shared by all its leaves.
-        let communicates = bindings
-            .iter()
-            .any(|(context, array, operation)| array.communicates(context, operation.target(), sealed::Token));
+        let communicates =
+            bindings.iter().any(|(context, array, operation)| array.communicates(context, operation.target()));
         for (context, array, operation) in &bindings {
             let target = operation.target();
             if ValueComparison::of_session(context)?
@@ -1628,9 +1644,9 @@ fn place_leaves<P: Placeable>(
     };
 
     // Ranks decide whether work communicates from shared placement metadata before a local validation can fail.
-    let process_values = leaves.iter().map(|leaf| leaf.parameter.process_value(sealed::Token)).collect::<Vec<_>>();
-    let admits = leaves.len() > 1
-        && leaves.iter().any(|leaf| leaf.parameter.communicates(session, leaf.target.as_ref(), sealed::Token));
+    let process_values = leaves.iter().map(|leaf| leaf.parameter.process_value()).collect::<Vec<_>>();
+    let admits =
+        leaves.len() > 1 && leaves.iter().any(|leaf| leaf.parameter.communicates(session, leaf.target.as_ref()));
     let compared = leaves
         .iter()
         .zip(&process_values)
@@ -1704,7 +1720,7 @@ trait IntoHostArray {
     /// Returns this value as a host array of the reference backend.
     fn into_host_array(self) -> CoreArray;
 
-    /// Returns the digest of the dense value of this value (refer to [`Placeable::process_value`]).
+    /// Returns the digest of the dense value of this value (refer to [`PlaceableParameter::process_value`]).
     fn host_value_digest(&self) -> Option<[u32; 8]>;
 
     /// Validates the host element encodings without hashing the value.
@@ -1968,9 +1984,8 @@ pub(super) fn single_device_placement(device: Device, rank: usize) -> Result<Pla
 
 /// Checks the precondition of [`Placeable::place_parameter`], which rejects the per-leaf options that no leaf accepts
 /// and does not depend on the leaf. [`Session::place`] calls this function for every leaf before it places any leaf,
-/// and every implementation of [`Placeable::place_parameter`] calls it first, with [`ParameterPath::root`] as `path`
-/// (an implementation outside this crate included), so that a leaf placed directly accepts the same options as one
-/// placed through [`Session::place`].
+/// and every implementation of [`Placeable::place_parameter`] calls it first, with [`ParameterPath::root`] as `path`,
+/// so that a leaf placed directly accepts the same options as one placed through [`Session::place`].
 ///
 /// # Parameters
 ///
@@ -1985,7 +2000,7 @@ pub(super) fn single_device_placement(device: Device, rank: usize) -> Result<Pla
 /// wrapped in [`ArrayError::FailedParameterPlacement`] when `path` returns a path other than the root.
 ///
 /// [`TypeError`]: ryft_core::TypeError
-pub fn validate_parameter_options(
+fn validate_parameter_options(
     path: impl FnOnce() -> ParameterPath,
     target: Option<&PlacementRequest>,
     source: Option<&PlacementRequest>,
@@ -2106,8 +2121,8 @@ fn place_traced<V: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceD
 }
 
 /// Checks the placement of the traced `value` as [`place_traced`] does before it records or executes the placement,
-/// which implements [`Placeable::validate_placement`] for every traced value type. Refer to [`place_traced`] for the
-/// rules of the sessions of the arrays that `value` wraps.
+/// which implements [`PlaceableParameter::validate_placement`] for every traced value type. Refer to [`place_traced`] for
+/// the rules of the sessions of the arrays that `value` wraps.
 fn validate_traced<V: ConcreteArrays>(
     value: &V,
     session: &Session,
@@ -2310,6 +2325,8 @@ mod tests {
     }
 
     impl Parameter for PairPlacingLeaf {}
+
+    impl PlaceableParameter<Array> for PairPlacingLeaf {}
 
     impl Placeable for PairPlacingLeaf {
         type Output = Array;
@@ -4118,7 +4135,9 @@ mod tests {
                 let _ = (session, target, source, donate, may_alias);
                 Ok(self.0)
             }
+        }
 
+        impl PlaceableParameter<u8> for Leaf {
             fn prepare_parameters(
                 parameters: &mut [Self],
                 session: &Session,
@@ -4837,12 +4856,10 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_admits_a_tree_of_downstream_leaves() {
+    fn test_session_place_admits_a_tree_of_leaves_that_can_communicate() {
         struct Wrapper(Array);
         impl Parameter for Wrapper {}
-        impl Placeable for Wrapper {
-            type Output = Array;
-
+        impl PlaceableParameter<Array> for Wrapper {
             fn validate_placement(
                 &self,
                 session: &Session,
@@ -4853,6 +4870,9 @@ mod tests {
             ) -> Result<(), Error> {
                 self.0.validate_placement(session, target, source, donate, may_alias)
             }
+        }
+        impl Placeable for Wrapper {
+            type Output = Array;
 
             fn place_parameter(
                 self,

@@ -320,8 +320,9 @@ impl DistributedRuntime {
 
     /// Creates a PJRT [`Client`] of `plugin` that uses the key-value store of this runtime, so that it takes part in
     /// the cross-host transfers and collectives of the job. The client borrows this handle, which must outlive it.
-    /// `options` are completed with the process coordinates of this runtime as [`Self::client_options`] describes.
-    /// A [`Session`](crate::Session) creates its client this way when it is built with
+    /// `options` are completed with the process coordinates of this runtime where they leave them unset (i.e., the
+    /// `process_id` of [`ClientOptions::CPU`], and the `node_id` and `node_count` of [`ClientOptions::GPU`]). A
+    /// [`Session`](crate::Session) creates its client this way when it is built with
     /// [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime).
     ///
     /// # Errors
@@ -1342,11 +1343,14 @@ pub(crate) mod tests {
         assert_eq!(later.remote_devices(), [devices[1 - rank]]);
         assert!(matches!(runtime.remote_devices(session.client()), Ok(remote) if remote == [devices[1 - rank]]));
 
-        // Both processes have finished before either disconnects from the coordination service.
+        // Both processes have finished before either disconnects from the coordination service, and the coordinator
+        // keeps its service until the other process has disconnected, which the shutdown waits for. The session keeps
+        // a handle of the runtime for the rest of the process, so dropping this one would not shut it down.
         let finished = |rank: usize| format!("ryft/test/remote-devices/finished/{rank}");
         let store = runtime.key_value_store();
         store.put(finished(rank).as_bytes(), b"ready").unwrap();
         assert_eq!(store.get(finished(1 - rank).as_bytes(), Duration::from_secs(10)).unwrap(), b"ready");
+        runtime.shutdown().unwrap();
     }
 
     #[test]
