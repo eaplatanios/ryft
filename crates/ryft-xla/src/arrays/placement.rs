@@ -572,7 +572,7 @@ impl PlaceableParameter<Array> for Array {
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<(), Error> {
-        let target = self.admit_placement(session, target.cloned(), source.cloned(), donate, may_alias)?;
+        let target = self.validate_placement_requests(session, target.cloned(), source.cloned(), donate, may_alias)?;
         self.validate_array_destination(session, target)
     }
 
@@ -635,16 +635,44 @@ impl Placeable for Array {
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array, Error> {
-        let target = self.admit_placement(session, target, source, donate, may_alias)?;
-        self.execute_array_placement(session, target, donate, may_alias)
+        let target = self.validate_placement_requests(session, target, source, donate, may_alias)?;
+        self.place_validated(session, target, donate, may_alias)
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Array {
-    /// Executes an admitted placement using the same copy and completion rules for both eager entry points.
-    fn execute_array_placement(
+    /// Checks the placement of this array as [`Placeable::place_parameter`] does before it resolves its destination,
+    /// and returns `target` with a sharding that is padded to the rank of this array. Both [`Placeable`] functions of
+    /// [`Array`] call this function, so that they accept the same placements.
+    fn validate_placement_requests(
+        &self,
+        session: &Session,
+        target: Option<PlacementRequest>,
+        source: Option<PlacementRequest>,
+        donate: bool,
+        may_alias: Option<bool>,
+    ) -> Result<Option<PlacementRequest>, Error> {
+        // Reject the options that no leaf accepts, as `Session::place` does before it looks at any leaf, and then a
+        // foreign PJRT client before validating either placement request, unless the target names the devices onto
+        // which such an array is transferred. Dispatch binds the result to `session` when there is a target.
+        validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
+        self.validate_placement_client(session, target.as_ref())?;
+
+        let rank = self.r#type().rank();
+        let target = target.map(|target| target.padded(rank)).transpose()?;
+        let source = source.map(|source| source.padded(rank)).transpose()?;
+
+        // Runtime sharding supplies the reduction state and shard shapes along auto axes that the type omits, and an
+        // array that is free to be placed elsewhere satisfies the source through its relocatable type, as on every
+        // other path that places a concrete value (refer to `PlaceOperation::infer_output_type_of_value`).
+        PlaceOperation::new(target.clone(), source).infer_output_type_of_value(self, Some(self.sharding()), false)?;
+
+        Ok(target)
+    }
+
+    /// Performs a placement that [`Self::validate_placement_requests`] accepted, using the same copy and completion
+    /// rules for both eager entry points.
+    fn place_validated(
         self,
         session: &Session,
         target: Option<PlacementRequest>,
@@ -681,33 +709,6 @@ impl Array {
             Ok(output)
         }
     }
-
-    /// Checks the placement of this array as [`Placeable::place_parameter`] does before it resolves its destination,
-    /// and returns `target` with a sharding that is padded to the rank of this array. Both [`Placeable`] functions of
-    /// [`Array`] call this function, so that they admit the same placements.
-    fn admit_placement(
-        &self,
-        session: &Session,
-        target: Option<PlacementRequest>,
-        source: Option<PlacementRequest>,
-        donate: bool,
-        may_alias: Option<bool>,
-    ) -> Result<Option<PlacementRequest>, Error> {
-        // Reject the options that no leaf accepts, as `Session::place` does before it looks at any leaf, and then a
-        // foreign PJRT client before validating either placement request, unless the target names the devices onto
-        // which such an array is transferred. Dispatch binds the result to `session` when there is a target.
-        validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
-        self.validate_placement_client(session, target.as_ref())?;
-        let rank = self.r#type().rank();
-        let target = target.map(|target| target.padded(rank)).transpose()?;
-        let source = source.map(|source| source.padded(rank)).transpose()?;
-
-        // Runtime sharding supplies the reduction state and shard shapes along auto axes that the type omits, and an
-        // array that is free to be placed elsewhere satisfies the source through its relocatable type, as on every
-        // other path that places a concrete value (refer to `PlaceOperation::infer_output_type_of_value`).
-        PlaceOperation::new(target.clone(), source).infer_output_type_of_value(self, Some(self.sharding()), false)?;
-        Ok(target)
-    }
 }
 
 macro_rules! impl_placeable {
@@ -726,7 +727,23 @@ macro_rules! impl_placeable {
                 donate: bool,
                 may_alias: Option<bool>,
             ) -> Result<(), Error> {
-                validate_traced(self, session, target, source, donate, may_alias)
+                // Donation only applies to concrete arrays, but a donated leaf that may alias is rejected
+                // for every leaf.
+                validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
+
+                for array in self.concrete_arrays() {
+                    // Placement uses the contexts already attached to the tracer. Rebinding would lose state such as
+                    // the residual program owned by a partial evaluation context. Check the PJRT client before the
+                    // session because device IDs are scoped to a client. Other handles of the same session are
+                    // accepted.
+                    array.validate_session_client(session)?;
+                    if !array.session().is_same_session(session) {
+                        let message = "cannot place a traced value over arrays of another session";
+                        return Err(PjrtError::invalid_argument(message).into());
+                    }
+                }
+
+                Ok(())
             }
 
             #[inline]
@@ -750,8 +767,7 @@ macro_rules! impl_placeable {
                 donate: bool,
                 may_alias: Option<bool>,
             ) -> Result<Self, Error> {
-                // Dispatch uses the tracer's context, so any concrete arrays it wraps must belong to this session.
-                validate_traced(&self, session, target.as_ref(), source.as_ref(), donate, may_alias)?;
+                self.validate_placement(session, target.as_ref(), source.as_ref(), donate, may_alias)?;
 
                 // Pad explicit shardings to the value's rank, which is the per-item rank of a batched value. Keep
                 // bare device and in-place requests in their original form so the placement rule can validate them
@@ -769,6 +785,8 @@ macro_rules! impl_placeable {
         }
     };
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl_placeable!(
     [C: Context<Type = ArrayType>] Tracer<C>
@@ -1675,7 +1693,7 @@ pub(crate) fn place_core_operations(
         |index, leaf| {
             let rank = leaf.parameter.r#type().rank();
             let target = leaf.target.map(|target| target.padded(rank)).transpose()?;
-            leaf.parameter.execute_array_placement(&contexts[index], target, false, leaf.may_alias)
+            leaf.parameter.place_validated(&contexts[index], target, false, leaf.may_alias)
         },
         |_, error| error,
     )
@@ -1961,30 +1979,6 @@ fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Er
         },
         error => ArrayError::FailedParameterPlacement { path, source: Arc::new(error) }.into(),
     }
-}
-
-/// Checks the leaf options and session ownership of the concrete arrays that a traced value wraps.
-fn validate_traced<V: ConcreteArrays>(
-    value: &V,
-    session: &Session,
-    target: Option<&PlacementRequest>,
-    source: Option<&PlacementRequest>,
-    donate: bool,
-    may_alias: Option<bool>,
-) -> Result<(), Error> {
-    // Donation only applies to concrete arrays, but a donated leaf that may alias is rejected for every leaf.
-    validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
-    for array in value.concrete_arrays() {
-        // Placement uses the contexts already attached to the tracer. Rebinding would lose state such as the
-        // residual program owned by a partial evaluation context. Check the PJRT client before the session
-        // because device IDs are scoped to a client. Other handles of the same session are accepted.
-        array.validate_session_client(session)?;
-        if !array.session().is_same_session(session) {
-            let message = "cannot place a traced value over arrays of another session";
-            return Err(PjrtError::invalid_argument(message).into());
-        }
-    }
-    Ok(())
 }
 
 /// Option values of the leaves of one [`Session::place`] input, which [`broadcast_placement_option`] produces. An
