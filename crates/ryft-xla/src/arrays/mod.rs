@@ -17,9 +17,8 @@
 //! placement over auto mesh axes when the caller supplies runtime sharding. [`Array::copy_to_host`] and
 //! [`ArrayShard::copy_to_host_bytes`] read values back to the host. The [`host`](mod@host) module implements the
 //! uploads and the readback of whole arrays, including the combination of the separate values that devices hold along
-//! unreduced mesh axes. [`Array::to_placement`], [`Array::into_placement`], and [`Session::place`] move arrays and host
-//! values to other devices or shardings. The [`placement`](mod@placement) module defines what a placement is and how to
-//! request one, and the [`resharding`](mod@resharding) module implements the moves. As in JAX, an array is committed to
+//! unreduced mesh axes. See [`placement`](mod@placement) for the placement entry points and
+//! [`resharding`](mod@resharding) for the strategies that move runtime arrays. As in JAX, an array is committed to
 //! its devices when they were chosen on purpose (e.g., by a placement with a destination) and uncommitted when they are
 //! only a default (e.g., for a host value that was uploaded to the first device), and eager operations move uncommitted
 //! inputs to the devices of committed ones (refer to [`Array::is_committed`]). Array failures are reported through
@@ -49,11 +48,12 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
-use crate::arrays::host::validate_mesh_device_processes;
+use crate::arrays::host::validate_mesh_devices;
 use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
 use crate::arrays::retained::PlacementIndex;
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
+use crate::compilation::domains::argument_type;
 use crate::types::ArrayTypeExtension;
 use crate::{Error, Session, Type};
 
@@ -65,7 +65,9 @@ pub mod retained;
 pub mod shards;
 pub mod statistics;
 
-pub use placement::{PlaceInput, Placeable, PlacementOptions, validate_parameter_options};
+pub use placement::{
+    PlaceInput, Placeable, PlacementOptions, SessionPlacementRequestParameter, validate_parameter_options,
+};
 pub use retained::RetainedArray;
 pub use shards::{ArrayShard, ArrayShardStorage, ShardDescriptor, ShardIndex, ShardLayout};
 pub use statistics::{ArrayStatistics, LiveArray};
@@ -74,10 +76,13 @@ pub use statistics::{ArrayStatistics, LiveArray};
 /// or materializing arrays on the host. Array APIs return these errors through [`Error::Array`]. Core and PJRT failures
 /// generally retain their original error types. [`Self::InvalidShardDimension`] also records the shard and dimension
 /// that failed transport encoding alongside the original core error.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum ArrayError {
     #[error("expected static shape but got `{shape}`")]
     DynamicShape { shape: Shape },
+
+    #[error("tokens are created by effectful operations and cannot be constructed, uploaded, or placed as arrays")]
+    TokenArray,
 
     #[error("no default local device is available, because the PJRT client has no addressable devices")]
     MissingDefaultDevice,
@@ -127,6 +132,12 @@ pub enum ArrayError {
 
     #[error("device {device_id} is not addressable by the PJRT client in process {process_index}")]
     NonAddressableDevice { device_id: DeviceId, process_index: usize },
+
+    #[error(
+        "device {device_id} of process {process_index} is not a device of the session; a session learns the devices \
+         of other processes that its PJRT client does not list from `SessionBuilder::distributed_runtime`"
+    )]
+    UnknownDevice { device_id: DeviceId, process_index: usize },
 
     #[error("device {device_id} has no addressable memory for `{memory}`")]
     UnsupportedMemory { device_id: DeviceId, memory: Memory },
@@ -190,6 +201,9 @@ pub enum ArrayError {
 /// transferring, executing with, or materializing buffers that this process can access directly. This distinction is
 /// what allows array movement, execution argument assembly, and cross-host transfers to preserve the full global
 /// sharding contract without requiring every process to own every shard buffer.
+///
+/// On the canonical single-device mesh, the array type carries no sharding. The device and commitment are available
+/// through [`Self::mesh`] and [`Self::is_committed`].
 ///
 /// Note that the current StableHLO execution path represents logical one-bit integers with predicate buffers. Arrays
 /// retain their logical `I1` or `U1` type while using one byte per element in this physical representation. This
@@ -261,9 +275,9 @@ impl Array {
     /// when the PJRT client reports another process for a device of `mesh` than the one that `mesh` assigns to it, and
     /// [`ArrayError::NonAddressableDevice`] when `mesh` assigns a device to this process that the PJRT client does not
     /// address. Both device checks apply whether or not a buffer is supplied for that device, because no process would
-    /// then hold the buffer of its shard, so a partial import accepts the same meshes as a host upload. A device that
-    /// the client does not list keeps the process that `mesh` assigns to it, because it can belong to a process whose
-    /// devices the client cannot see. A layout of `r#type` that does not address the shape of each shard is rejected
+    /// then hold the buffer of its shard, so a partial import accepts the same meshes as a host upload. A device of
+    /// another process that `session` does not know (i.e., that is not in[`Session::devices`]) is rejected with
+    /// [`ArrayError::UnknownDevice`]. A layout of `r#type` that does not address the shape of each shard is rejected
     /// with the [`TypeError`](ryft_core::TypeError) of [`ArrayType::validate_layout`], even without buffers.
     /// [`ArrayError::BufferTypeMismatch`] reports a data type or static shape that differs from the shard type derived
     /// from `r#type`, `mesh`, and the effective sharding. A buffer whose physical memory differs from `r#type.memory()`
@@ -296,6 +310,7 @@ impl Array {
             r#type,
             sharding,
             mesh,
+            None,
             buffers.into_iter().map(Arc::new).collect(),
             true,
         )
@@ -317,6 +332,7 @@ impl Array {
             r#type,
             sharding,
             mesh,
+            None,
             buffers.into_iter().map(Arc::new).collect(),
             false,
         )
@@ -330,19 +346,22 @@ impl Array {
     /// The mesh describes every device, whether or not a buffer is supplied for it, so a device of this process that
     /// the mesh assigns to another process, or a device that the mesh assigns to this process but that this process
     /// does not address, would otherwise leave its shard without a buffer on any process. The other constructors build
-    /// their meshes and buffers from ones that were validated already.
+    /// their meshes and buffers from ones that were validated already. A caller that has already resolved the placement
+    /// and derived its [`ShardLayout`] passes it as `layout` (refer to [`ArrayMetadata::new`]), so that the global
+    /// layout of the array is derived once, and any other caller passes `None`.
     fn from_addressable_buffers_internal(
         session: &Session,
         r#type: ArrayType,
         sharding: Option<Sharding>,
         mesh: DeviceMesh,
+        layout: Option<ShardLayout>,
         buffers: Vec<Arc<Buffer<'static>>>,
         imported: bool,
     ) -> Result<Self, Error> {
         // Derive the metadata and the global shard descriptors implied by the runtime placement and the device mesh.
-        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh)?;
+        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh, layout)?;
         if imported {
-            validate_mesh_device_processes(session.client(), metadata.mesh())?;
+            validate_mesh_devices(session, metadata.mesh())?;
         }
 
         // Index the provided `Buffer`s by device while rejecting duplicate local buffers for the same device and
@@ -404,7 +423,7 @@ impl Array {
             .into());
         }
 
-        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh)?;
+        let (metadata, descriptors) = ArrayMetadata::new(r#type, sharding, mesh, None)?;
         let client = session.client();
         let process_index = client.process_index()?;
         let addressable_device_ids =
@@ -504,10 +523,18 @@ impl Array {
         }
     }
 
-    /// Attaches the whole-execution completion fence that produced this array. This never waits and is used by the
-    /// XLA executor when reassembling pending PJRT output buffers.
+    /// Attaches the whole-execution completion fence that produced this array without waiting. When the result
+    /// aliases an existing array, it has a distinct capture identity because its readiness can differ from the
+    /// existing array's. Both arrays can still share physical placements of their buffers.
     #[inline]
     pub(crate) fn with_execution_fence(mut self, fence: ExecutionFence) -> Self {
+        if Arc::get_mut(&mut self.parts).is_none() {
+            let placements = Arc::clone(self.parts.placements.get_or_init(Arc::default));
+            let metadata = Arc::clone(&self.parts.metadata);
+            let mut parts = ArrayParts::new(self.session(), metadata, self.parts.shards.clone());
+            parts.placements = OnceLock::from(placements);
+            self.parts = Arc::new(parts);
+        }
         self.execution_fence = Some(fence);
         self
     }
@@ -560,9 +587,9 @@ impl Array {
     ///
     /// Returns an [`Error::Pjrt`] that wraps an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error if
     /// `session` belongs to a different PJRT client. The array's addressable shard buffers belong to its original
-    /// client.
+    /// client. A session with a different remote device inventory must also recognize this array's mesh.
     pub(crate) fn with_session(mut self, session: &Session) -> Result<Self, Error> {
-        self.validate_session_client(session)?;
+        self.validate_session_placement(session)?;
         self.session = session.clone();
         Ok(self)
     }
@@ -571,11 +598,10 @@ impl Array {
     /// placement, buffers, completion fences, commitment, and locally assigned devices. Any new storage is registered
     /// as one logical array with the array's [session](Self::session). An operation whose result is a new array calls
     /// this function wherever it would otherwise return the storage of its input on this process (e.g., a forced copy
-    /// on a process that holds no buffer to copy), and no other function creates such storage. Storage that no other
-    /// handle refers to (i.e., that has no clone and no [`RetainedArray`]) is kept, because nothing can tell it apart
-    /// from new storage once its placements (refer to [`RetainedArray::placed`]) are cleared, so whether this function
-    /// allocates depends on the handles of this process, while its result is a new array on every process, which
-    /// starts without placements on every process alike.
+    /// on a process that holds no buffer to copy). Storage that no other handle refers to (i.e., that has no clone and
+    /// no [`RetainedArray`]) is kept once its placements (refer to [`RetainedArray::placed`]) are cleared. Whether
+    /// this function allocates depends on the handles of this process, while its result is a new array that starts
+    /// without placements on every process.
     pub(crate) fn with_new_identity(mut self) -> Self {
         match Arc::get_mut(&mut self.parts) {
             Some(parts) => parts.placements = OnceLock::new(),
@@ -605,8 +631,9 @@ impl Array {
         self.parts.metadata.r#type().layout()
     }
 
-    /// Returns the runtime placement of this [`Array`] over all mesh axes. Unlike the sharding of its [`Typed`] type,
-    /// which records only placement over explicit and manual mesh axes, it also records placement over auto mesh axes.
+    /// Returns the runtime placement of this [`Array`] over all mesh axes, including auto mesh axes. The sharding
+    /// of its [`Typed`] type records placement over explicit and manual mesh axes and omits the anonymous mesh of
+    /// one device.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         self.parts.metadata.sharding()
@@ -632,13 +659,15 @@ impl Array {
     ///   - **Session Mesh:** It was created without a mesh and without array inputs by a [`Session`] that has a
     ///     [default mesh](Session::device_mesh), which then decides its placement. This covers
     ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the results of eager operations without
-    ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, such arrays are uncommitted,
-    ///     unless they live on more than one device (e.g., when [`Self::from_host_buffer`] without a mesh lays the
-    ///     logical mesh of a sharding out over the first addressable devices).
+    ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, or with a default device
+    ///     (refer to [`Session::with_default_device`]), such arrays are uncommitted, unless they live on more than one
+    ///     device (e.g., when [`Self::from_host_buffer`] without a mesh lays the logical mesh of a sharding out over
+    ///     the first addressable devices).
     ///   - **Explicit Placement:** It was placed with a destination by [`Self::to_placement`],
     ///     [`Self::into_placement`], [`Session::place`], or a [`PlaceOperation`](ryft_core::PlaceOperation) with a
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted, and it goes to
-    ///     the first addressable device of the client whether or not the session has a default mesh.
+    ///     the default device of the session or, without one, to the first addressable device of the client whether
+    ///     or not the session has a default mesh.
     ///   - **Committed Inputs:** It is the result of an eager operation with a committed array input or a committed
     ///     array that the operation captures, or an output of a compiled function with a committed public argument.
     ///     The arrays that a compiled function captures never commit its outputs, whether it is executed directly or
@@ -689,11 +718,12 @@ impl Array {
     /// An array is locally assigned when no destination that names devices was ever given for it or for the
     /// arrays that it derives from. That is the case for the following arrays, and for no others:
     ///
-    ///   - **Default Uploads:** It is a host value that was uploaded without a mesh by a [`Session`] without a
-    ///     [default mesh](Session::device_mesh) (e.g., through [`Self::from_host_buffer`]), or a host value that
-    ///     [`Session::place`] uploaded without a destination or with a destination that names only a memory or a
-    ///     layout, which lands on the first addressable device of the client whether or not the session has a default
-    ///     mesh.
+    ///   - **Default Uploads:** It is a host value that was uploaded without a mesh (e.g., through
+    ///     [`Self::from_host_buffer`]) by a [`Session`] without a [default mesh](Session::device_mesh) or with a
+    ///     default device (refer to [`Session::with_default_device`]), or a host value that [`Session::place`]
+    ///     uploaded without a destination or with a destination that names only a memory or a layout, which lands on
+    ///     that default device or, without one, on the first addressable device of the client whether or not the
+    ///     session has a default mesh.
     ///   - **Storage Placements:** It is the result of a placement of such an array that names only a memory or a
     ///     layout, or a copy of such an array on its own devices.
     ///   - **Eager Results:** It is the result of an eager operation whose array inputs are all locally assigned,
@@ -902,6 +932,15 @@ impl Array {
         }
         Ok(())
     }
+
+    /// Validates that `session` owns the buffers and recognizes the mesh of this array.
+    fn validate_session_placement(&self, session: &Session) -> Result<(), Error> {
+        self.validate_session_client(session)?;
+        if self.session().remote_devices() != session.remote_devices() {
+            validate_mesh_devices(session, self.mesh())?;
+        }
+        Ok(())
+    }
 }
 
 impl Debug for Array {
@@ -977,23 +1016,29 @@ impl Placed for Array {
 }
 
 impl Value for Array {
-    // A concrete `Array` binds and executes every operation through its PJRT-backed `Session`. It uses
-    // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (e.g., arithmetic, comparison, selection,
-    // manipulation, and reductions) bind their operations through `domain()` and execute them eagerly, operation by
-    // operation, through the session recovered below, and free transform entry points (e.g., `ryft_core::batch`)
-    // recover the same session. Only capabilities without blanket implementations that bind operations (e.g.,
-    // `Concretizable<bool>`, `WhilePredicate`, and the foreign `std::ops` sugar) get the direct implementations
-    // that follow.
+    // Most capabilities use `ValueDomainDispatch` to bind their operations through `domain()` and execute them
+    // eagerly through the PJRT-backed session recovered below. Free transform entry points (e.g., `ryft_core::batch`)
+    // recover the same session. Placement dispatch also uses that session and can admit an entire placement tree
+    // before it executes the individual operations.
 
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<Session, ArrayType>;
 
+    #[inline]
     fn domain(&self) -> Self::Domain {
         // Recovers the eager `Session` this `Array` belongs to, which `Array::session` also returns, and with it
         // the session, compilation cache, effect scope, and compilation options that receiver-based operations execute
         // with. Association is per value, so receiver-based `x + y` and `y + x` may choose different scopes even when
         // their numerical values match. Start new scopes at task boundaries rather than inside expressions.
         ProjectedContext::new(self.session.clone())
+    }
+
+    #[inline]
+    fn relocatable_type(&self) -> Option<Self::Type> {
+        // An array is relocatable by the rule of the session for the arguments of its transforms, which the
+        // `Value::Array` representation of the same array also follows, so both representations of one input
+        // accept the same tangents and seeds.
+        argument_type(self, &self.r#type())
     }
 }
 
@@ -1333,8 +1378,8 @@ struct ArrayParts {
     shards: Vec<ArrayShard>,
 
     /// Placements of the [`Array`] on other devices that functions which capture it receive, which every retention of
-    /// the array shares (refer to [`RetainedArray::placed`]). It is created by the first retention, so an array that
-    /// is never captured allocates nothing, and it lives as long as the array or any retention of it.
+    /// the array shares (refer to [`RetainedArray::placed`]). It is created when an array is first retained or gains
+    /// an alias with its own execution fence, and lives as long as any of those arrays or retentions.
     placements: OnceLock<Arc<PlacementIndex>>,
 
     /// Registration of this storage as one logical array of the session that created it, which keeps the array counted
@@ -1344,8 +1389,8 @@ struct ArrayParts {
 }
 
 impl ArrayParts {
-    /// Creates new [`ArrayParts`] and registers them as one logical array of `session`.
-    /// Storage can only be created through this function, so every logical array is counted exactly once.
+    /// Creates new [`ArrayParts`] and registers them as one logical array of `session`. Storage of a logical array can
+    /// only be created through this function, so every logical array is counted exactly once.
     fn new(session: &Session, metadata: Arc<ArrayMetadata>, shards: Vec<ArrayShard>) -> Self {
         let registration = session.array_tracker().register(&metadata, &shards);
         Self { metadata, shards, placements: OnceLock::new(), _registration: registration }
@@ -1367,7 +1412,7 @@ mod tests {
         Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed, UnreducedKind, Value,
         WhilePredicate,
     };
-    use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionFence};
+    use ryft_pjrt::{BufferType, Client, Error as PjrtError, ExecutionFence};
 
     use crate::arrays::metadata::ArrayOutputPlan;
     use crate::arrays::shards::ArrayShard;
@@ -1375,7 +1420,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, shares_effect_scope};
     use crate::tests::{
         assert_send_sync, cpu_client, execution_client, logical_mesh_2x2, other_cpu_client, replicated_array,
-        values_from_bytes, values_to_bytes,
+        session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
     use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt};
@@ -1414,12 +1459,18 @@ mod tests {
         Array::from_addressable_buffers(session, r#type, mesh, None, buffers).unwrap()
     }
 
-    /// Builds a rank-1 `f32` array whose only shard is on a device of another process, so that it has no storage in
-    /// this process. The device is one that the client of `session` does not list, as a device of another process is.
-    fn remote_array(session: &Session) -> Array {
-        let devices = session.client().addressable_devices().unwrap();
+    /// Returns a device of another process that `client` does not list, which [`remote_array`] places its shard on and
+    /// which the session of such an array must therefore declare (refer to `DeclareRemoteDevices`).
+    fn remote_device(client: &Client<'_>) -> Device {
+        let devices = client.addressable_devices().unwrap();
         let local = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).max_by_key(Device::id).unwrap();
-        let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        Device::new(local.id() + 1, local.process_index() + 1)
+    }
+
+    /// Builds a rank-1 `f32` array whose only shard is on a device of another process, so that it has no storage in
+    /// this process. The device is [`remote_device`], which `session` must declare.
+    fn remote_array(session: &Session) -> Array {
+        let remote = remote_device(session.client());
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![remote]).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [2])
@@ -1680,9 +1731,10 @@ mod tests {
             assert_eq!(error.to_string(), message);
         }
 
-        // A device that the client does not know can belong to a process whose devices it cannot see, so its shard is
-        // described without a buffer.
+        // A device of another process that the session declares (refer to `DeclareRemoteDevices`) is described
+        // without a buffer.
         let remote = Device::new(devices[1].id() + 1, devices[1].process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
         let mesh = DeviceMesh::new(logical_mesh, vec![devices[0], remote]).unwrap();
         let array = Array::from_addressable_buffers(&session, r#type, mesh, None, vec![upload().unwrap()]).unwrap();
         assert_eq!(array.addressable_shards().count(), 1);
@@ -2089,7 +2141,7 @@ mod tests {
 
     #[test]
     fn test_array_with_locally_assigned() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let session = session_with_remote_devices(cpu_client(1), [remote_device(cpu_client(1))]);
         let r#type = ArrayType::new_static(DataType::F32, [2]);
         let uploaded = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
         assert!(uploaded.is_locally_assigned());
@@ -2294,7 +2346,7 @@ mod tests {
     #[test]
     fn test_array_shards() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [remote_device(client)]);
 
         // There is one shard per mesh device, in the order of the mesh devices, whether or not it is addressable.
         let (array, mesh, _) = sharded_vector(&session);
@@ -2314,7 +2366,7 @@ mod tests {
     #[test]
     fn test_array_addressable_shards() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [remote_device(client)]);
         let (array, mesh, _) = sharded_vector(&session);
         assert_eq!(array.addressable_shards().map(ArrayShard::device).collect::<Vec<_>>(), mesh.devices().to_vec(),);
 
@@ -2325,7 +2377,7 @@ mod tests {
     #[test]
     fn test_array_device_shard() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [remote_device(client)]);
         let (array, mesh, _) = sharded_vector(&session);
         for device in mesh.devices() {
             assert_eq!(array.device_shard(device.id()).map(ArrayShard::device), Some(*device));
@@ -2341,7 +2393,7 @@ mod tests {
     #[test]
     fn test_array_addressable_device_shard() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [remote_device(client)]);
         let (array, mesh, _) = sharded_vector(&session);
         for device in mesh.devices() {
             assert_eq!(array.addressable_device_shard(device.id()).map(ArrayShard::device), Some(*device));
@@ -2469,11 +2521,11 @@ mod tests {
     #[test]
     fn test_array_debug() {
         let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
         let shape = Shape::new(vec![Dimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        // The device belongs to another process, whose devices the client does not list.
+        // The device belongs to another process, whose devices the client does not list, so the session declares it.
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(1, 1)]).unwrap();
+        let session = session_with_remote_devices(client, [Device::new(1, 1)]);
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, shape);
@@ -2508,7 +2560,7 @@ mod tests {
     #[test]
     fn test_array_eq() {
         let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [remote_device(client)]);
         let mesh = domain_mesh(client, "x", 1);
 
         // Equality is the identity of the storage rather than of the elements, so arrays that hold equal elements in
