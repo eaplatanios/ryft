@@ -463,22 +463,29 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         context: &C,
         inputs: Vec<C::Value>,
     ) -> Result<Vec<C::Value>, ProgramError> {
-        self.interpret_in_context_admitting(context, inputs, &[])
+        self.interpret_in_context_refining_with_declared_input_types(context, inputs, None)
     }
 
-    /// Interprets this borrowed [`Region`](crate::Region) as [`Self::interpret_in_context`] does, except that
-    /// every input whose flag in `admitted` is set enters with its declared type, wherever it lives (refer to
-    /// [`RegionInterpreter::new_with_admitted_inputs`]). Only the application of a pullback admits inputs,
-    /// for a seed whose only consumer it has shown to accept it.
-    pub(crate) fn interpret_in_context_admitting<C: Context<Type = V::Type, Constant = V, Operation = O>>(
+    /// Interprets this borrowed [`Region`](crate::Region) as [`Self::interpret_in_context`] does, using the declared
+    /// type for input refinement at each position whose flag in `use_declared_input_types` is set. [`None`] applies
+    /// ordinary input refinement. A pullback sets the flag for a seed after checking that each of its consumers
+    /// accepts the original value.
+    pub(crate) fn interpret_in_context_refining_with_declared_input_types<
+        C: Context<Type = V::Type, Constant = V, Operation = O>,
+    >(
         self,
         context: &C,
         inputs: Vec<C::Value>,
-        admitted: &[bool],
+        use_declared_input_types: Option<&[bool]>,
     ) -> Result<Vec<C::Value>, ProgramError> {
         // Eager and symbolic replay share one traversal. Eager values establish their relationships at the boundary,
         // while symbolic replay binds the family's guard to preserve relationships that still need runtime checks.
-        let mut interpretation = RegionInterpreter::new_with_admitted_inputs(context.clone(), self, inputs, admitted)?;
+        let mut interpretation = RegionInterpreter::new_refining_with_declared_input_types(
+            context.clone(),
+            self,
+            inputs,
+            use_declared_input_types,
+        )?;
         while !interpretation.is_complete() {
             interpretation = interpretation.step()?;
         }
@@ -990,24 +997,24 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     /// [`ProgramError::UnboundAtomId`] when a region input identifier lies outside its atom table, and a
     /// [`ProgramError::Type`] error when the input types do not satisfy the declared input signature.
     /// Failures of type identity renaming and of lifting constants through `context` are propagated.
+    #[inline]
     pub fn new(
         context: C,
         region: RegionRef<'r, C::Constant, C::Operation>,
         inputs: Vec<C::Value>,
     ) -> Result<Self, ProgramError> {
-        Self::new_with_admitted_inputs(context, region, inputs, &[])
+        Self::new_refining_with_declared_input_types(context, region, inputs, None)
     }
 
-    /// Creates a new [`RegionInterpreter`] as [`Self::new`] does, except that every input whose flag in `admitted` is
-    /// set (where `admitted` may be shorter than `inputs`, leaving the remaining flags unset) enters with its declared
-    /// type for refinement and is bound to the value as it is, wherever it lives, as a value that is free to be placed
-    /// elsewhere enters. The caller must have shown that every operation that consumes such an input accepts it (i.e.,
-    /// the application of a pullback for a seed whose only consumer is a placement that moves it).
-    fn new_with_admitted_inputs(
+    /// Creates a new [`RegionInterpreter`] as [`Self::new`] does, using the declared type for input refinement at each
+    /// position whose flag in `use_declared_input_types` is set. [`None`] applies ordinary input refinement, and
+    /// missing flags are treated as unset. Replay binds the original value, so the caller must show that each
+    /// consumer accepts it (e.g., a pullback seed whose consumers are all placements that move it).
+    fn new_refining_with_declared_input_types(
         context: C,
         region: RegionRef<'r, C::Constant, C::Operation>,
         mut inputs: Vec<C::Value>,
-        admitted: &[bool],
+        use_declared_input_types: Option<&[bool]>,
     ) -> Result<Self, ProgramError> {
         // Both direct region calls and structured Program calls arrive here with flat values.
         // Check their count before validating types or binding instructions.
@@ -1022,18 +1029,17 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
             }
         }
 
-        // A value that is free to be placed elsewhere enters with the declared type when it may be placed as that type
-        // states (refer to `Value::is_relocatable_to`), and the operations of the region move it, as they would move
-        // it from wherever it lives. An admitted value enters with the declared type as well. Every other value enters
-        // with its own type.
+        // A flag selects the declared type for input refinement. An unflagged input also uses its declared type if
+        // its actual type fails refinement and it can relocate (refer to `Value::is_relocatable_to`). Every other
+        // input contributes its actual type. The region's operations receive the values from wherever they live.
         let input_types = input_ids
             .iter()
             .zip(&inputs)
             .enumerate()
             .map(|(index, (id, input))| {
                 let declared = region.atoms()[id.index()].r#type();
-                let is_admitted = admitted.get(index).copied().unwrap_or(false);
-                if is_admitted
+                let use_declared_type = use_declared_input_types.is_some_and(|flags| flags.get(index) == Some(&true));
+                if use_declared_type
                     || (!declared.is_refined_by(input.r#type().as_ref()) && input.is_relocatable_to(declared.as_ref()))
                 {
                     declared.into_owned()

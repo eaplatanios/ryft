@@ -100,7 +100,8 @@ pub struct PartialEvaluationValue<V: Value> {
     /// Underlying [`PartialValue`] that represents the abstract known/unknown classification of the value.
     value: PartialValue<V>,
 
-    /// Staged type of a known value whose runtime type refines it.
+    /// Staged type explicitly retained for a known value. It can equal the runtime type at this point while later
+    /// eager work specializes the result beyond its staged declaration.
     declared_type: Option<Rc<V::Type>>,
 
     /// [`PartialValueMaterialization`] that describes how the underlying value is represented at the residual program
@@ -166,20 +167,21 @@ impl<V: Value> PartialEvaluationValue<V> {
     ///
     /// Returns a [`TypeError`] when the known value does not refine the declaration.
     pub(crate) fn set_declared_type(&mut self, declaration: &V::Type) -> Result<(), TypeError> {
-        if self.is_unknown() || self.r#type().as_ref() == declaration {
+        if self.is_unknown() || self.declared_type() == Some(declaration) {
             return Ok(());
         }
 
-        let actual = self.value.r#type();
-        if !declaration.is_refined_by(&actual) {
-            return Err(TypeError::invalid(format!(
-                "known result type {actual} does not refine declared type {declaration}",
-            )));
+        if self.r#type().as_ref() != declaration {
+            let actual = self.value.r#type();
+            if !declaration.is_refined_by(&actual) {
+                return Err(TypeError::invalid(format!(
+                    "known result type {actual} does not refine declared type {declaration}",
+                )));
+            }
+            self.materialization = Rc::new(Cell::new(PartialValueMaterialization::Input { residual_atom: None }));
         }
 
-        self.declared_type = (actual.as_ref() != declaration).then(|| Rc::new(declaration.clone()));
-        self.materialization = Rc::new(Cell::new(PartialValueMaterialization::Input { residual_atom: None }));
-
+        self.declared_type = Some(Rc::new(declaration.clone()));
         Ok(())
     }
 
@@ -205,7 +207,7 @@ impl<V: Value> PartialEvaluationValue<V> {
         &self.value
     }
 
-    /// Returns the staged declaration when it differs from the known value's type.
+    /// Returns the explicit staged declaration, which can agree with the known value's current type.
     #[inline]
     pub fn declared_type(&self) -> Option<&V::Type> {
         self.declared_type.as_deref()

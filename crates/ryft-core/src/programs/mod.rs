@@ -222,7 +222,7 @@ pub enum ProgramError {
     #[error(transparent)]
     Axis(#[from] AxisError),
 
-    #[error("{0}")]
+    #[error(transparent)]
     Custom(Arc<dyn CustomError>),
 }
 

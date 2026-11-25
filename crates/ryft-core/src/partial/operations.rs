@@ -468,9 +468,10 @@ where
 /// partial values cannot represent values belonging to other members of the heterogeneous universe. This preserves
 /// correct folding and residualization without a second projected partial-value protocol, including for payloads that
 /// require fresh storage (refer to [`Operation::requires_fresh_storage`]), which that path keeps residual under a
-/// context that does not allow copies to fold. Variants that declare `#[ryft(family)]` use the default path, because
-/// the rule of a nested family belongs to programs over that family. Refer to the documentation of [`Operation`] for
-/// the full derive contract.
+/// context that does not allow copies to fold. A projected member can select a rule over the enclosing universe
+/// with `#[ryft(partial_evaluation = path)]`. Variants that declare `#[ryft(family)]` use the default path, because
+/// the rule of a nested family belongs to programs over that family. Refer to the documentation of [`Operation`]
+/// for the full derive contract.
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses

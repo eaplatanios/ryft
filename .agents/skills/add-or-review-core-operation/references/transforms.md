@@ -9,9 +9,9 @@ extents, or explicit dense-buffer kernel contracts. Use the owning transform's c
   user explicitly asks for a different abstraction. If an experimental staging hook or lowering path is removed or
   superseded, delete its public trait methods, helper functions, and test-only scaffolding instead of leaving unused
   compatibility layers behind.
-- Keep domain-specific construction and transform-specific execution policy out of the central `Operation` trait. Prefer
-  existing operation providers and the owning transform's validated execution path; add a core hook only when a general
-  operation contract requires it, rather than to simplify one domain's dispatch.
+- Keep domain-specific construction and transform-specific execution policy out of the shared `Value`, `Context`,
+  and `Operation` contracts. Use existing value capabilities, operation providers, and the owning transform's rules.
+  A new hook on a shared contract needs a purpose independent of the transform that first requires it.
 - Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
   diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
   differentiation.

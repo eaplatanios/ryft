@@ -1811,9 +1811,9 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
             atom
         } else {
-            // A declared feeder may use a different type from other feeders for this known-side atom.
+            // A feeder whose type differs from its known-side atom needs its own residual input.
             let staged_atom = match self.state.parent.resolve(known) {
-                ValueResolution::Staged(atom) if value.declared_type().is_none() => Some(atom),
+                ValueResolution::Staged(atom) if value.r#type() == known.r#type() => Some(atom),
                 _ => None,
             };
             let existing = staged_atom.and_then(|staged| self.state.staged_feeders.borrow().get(&staged).copied());
@@ -2290,6 +2290,15 @@ impl<C: Context> Value for PartialTracer<C> {
     fn domain(&self) -> PartialEvaluationContext<C> {
         self.context().clone()
     }
+
+    #[inline]
+    fn relocatable_type(&self) -> Option<C::Type> {
+        // Linearization can explicitly declare a known value at its relocatable type. It stays movable under that
+        // declaration. A different staged declaration constrains the value, as does a residual variable.
+        let value = self.value().ok()?;
+        let declaration = value.as_known()?.relocatable_type()?;
+        value.declared_type().is_none_or(|declared| declared == &declaration).then_some(declaration)
+    }
 }
 
 impl<C: Context, T: Type> ValueProjection<T> for PartialTracer<C>
@@ -2321,6 +2330,11 @@ where
         let r#type = <&T>::try_from(self.r#type().as_ref())?.clone();
         Ok(ProjectedValue::new(self, r#type))
     }
+
+    #[inline]
+    fn projected_relocatable_type(&self) -> Option<T> {
+        <&T>::try_from(&self.relocatable_type()?).ok().cloned()
+    }
 }
 
 #[cfg(test)]
@@ -2342,6 +2356,7 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, ConditionOperation, CustomCallOperation, DimensionAddOperation, DimensionSizeOperation,
@@ -2365,7 +2380,7 @@ mod tests {
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, InstructionId, Operation, ProgramBuilder,
         ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
-        RegionSlot, TypeError, Typed, TypedProgram,
+        RegionSlot, TypeError, Typed, TypedProgram, ValueDirectDispatch,
     };
     use crate::tests::{TestArrayContext, TestArrayTracingContext, TestOrderedStateOperation, TestRegionOperation};
     use crate::tracing::TracingContext;
@@ -2857,6 +2872,14 @@ mod tests {
         let outputs = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[input], None).unwrap();
         assert_eq!(outputs[0].declared_type(), Some(&declaration));
         assert_eq!(outputs[0].as_known(), Some(&Array::from_elements(placed_type, &[-2.0f32]).unwrap()));
+
+        let mut input = PartialEvaluationValue::known(Array::scalar(2.0f32).unwrap());
+        input.set_declared_type(&declaration).unwrap();
+        assert_eq!(input.declared_type(), Some(&declaration));
+        assert_eq!(input.materialization(), PartialValueMaterialization::Undecided);
+        let outputs = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[input], None).unwrap();
+        assert_eq!(outputs[0].declared_type(), Some(&declaration));
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(-2.0f32).unwrap()));
     }
 
     #[test]
@@ -2955,6 +2978,95 @@ mod tests {
             .unwrap();
         assert_eq!(outputs[0].as_known(), Some(&input));
         assert!(context.state.builder.borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_preserves_fresh_storage_input_requirements() {
+        #[derive(Clone, Debug)]
+        struct MovableArray(Array);
+
+        impl Display for MovableArray {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.0, formatter)
+            }
+        }
+
+        impl Parameter for MovableArray {}
+
+        impl Typed for MovableArray {
+            type Type = ArrayType;
+
+            fn r#type(&self) -> Cow<'_, ArrayType> {
+                self.0.r#type()
+            }
+        }
+
+        impl Value for MovableArray {
+            type Dispatch = ValueDirectDispatch;
+            type Domain = EagerContext<Self, FreshCopy>;
+
+            fn domain(&self) -> Self::Domain {
+                EagerContext::new()
+            }
+
+            fn relocatable_type(&self) -> Option<ArrayType> {
+                self.r#type().into_owned().with_sharding(None).ok()
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        struct FreshCopy;
+
+        impl Operation for FreshCopy {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "fresh_copy"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                regions: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                check_count!("region", regions, 0, TypeError);
+                if input_types[0].sharding().is_some() {
+                    return Err(TypeError::invalid("fresh copy requires an input without declared sharding"));
+                }
+                Ok(input_types.to_vec())
+            }
+
+            fn requires_fresh_storage(&self) -> bool {
+                true
+            }
+        }
+
+        impl_guardless_operation!(FreshCopy);
+
+        impl InterpretableOperation<EagerContext<MovableArray, FreshCopy>> for FreshCopy {
+            fn interpret<D: InterpretationDriver<EagerContext<MovableArray, FreshCopy>>>(
+                &self,
+                _context: &EagerContext<MovableArray, FreshCopy>,
+                _driver: &D,
+                inputs: &[MovableArray],
+            ) -> Result<Vec<MovableArray>, ProgramError> {
+                let types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                let [r#type] = self.infer_output_types(&types, &[])?.try_into().unwrap();
+                let data = inputs[0].0.elements::<f32>().unwrap();
+                Ok(vec![MovableArray(Array::from_elements(r#type, &data).unwrap())])
+            }
+        }
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let r#type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let input = MovableArray(Array::from_elements(r#type, &[1.0f32]).unwrap());
+        let context = PartialEvaluationContext::new(input.domain()).with_allow_copy_folding(false);
+        let input = context.known_value(input);
+        assert_eq!(
+            context.fold_or_residualize(FreshCopy, Vec::new(), &[input], None).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid("fresh copy requires an input without declared sharding"))),
+        );
     }
 
     #[test]

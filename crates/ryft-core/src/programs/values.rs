@@ -373,6 +373,16 @@ pub trait ValueProjection<T: Type>: Value {
     /// Consumes this [`Value`] and returns an owned representation of its `T`-typed member, transferring rather than
     /// copying any contained payload. Returns a [`TypeError`] when this value holds a different member kind.
     fn into_projected(self) -> Result<Self::Projected, TypeError>;
+
+    /// Returns the [relocatable type](Value::relocatable_type) of this [`Value`]'s `T`-typed member, which is
+    /// the relocatable type of this value when that type is of the `T` member kind, and [`None`] otherwise. A
+    /// [`ProjectedValue`] reports it as its own relocatable type, so that the member rules of a heterogeneous universe
+    /// admit a value that is free to be placed elsewhere as the rules of the member universe do. The default returns
+    /// [`None`], which is right for a value that is never free to be placed elsewhere (e.g., a staged [`Tracer`]).
+    #[inline]
+    fn projected_relocatable_type(&self) -> Option<T> {
+        None
+    }
 }
 
 /// Extension trait applying [`ValueProjection`] to a whole [`Parameterized`] tree at a boundary, rather than
@@ -523,6 +533,13 @@ where
     fn reference_id(&self) -> Option<ReferenceId> {
         self.value.reference_id()
     }
+
+    #[inline]
+    fn relocatable_type(&self) -> Option<T> {
+        // A member of a value that is free to be placed elsewhere is free to be placed elsewhere too,
+        // and the projection of the value knows how to narrow its relocatable type to that member.
+        <V as ValueProjection<T>>::projected_relocatable_type(&self.value)
+    }
 }
 
 impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> {
@@ -586,8 +603,52 @@ mod tests {
     };
     use crate::contexts::EagerContext;
     use crate::operations::{Add, Mul};
+    use crate::tests::{ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue};
 
     use super::*;
+
+    type SyntheticProjectionParent = ProjectedMemberType<4>;
+    type SyntheticProjectionMember = ProjectedMemberType<3>;
+
+    impl From<SyntheticProjectionMember> for SyntheticProjectionParent {
+        fn from(_: SyntheticProjectionMember) -> Self {
+            ProjectedMemberType
+        }
+    }
+
+    impl From<ProjectedMemberOperation<3>> for ProjectedMemberOperation<4> {
+        fn from(operation: ProjectedMemberOperation<3>) -> Self {
+            match operation {
+                ProjectedMemberOperation::Identity => Self::Identity,
+                ProjectedMemberOperation::Add => Self::Add,
+                ProjectedMemberOperation::Scoped => Self::Scoped,
+            }
+        }
+    }
+
+    impl OperationProjection<SyntheticProjectionMember> for ProjectedMemberOperation<4> {
+        type Projected = ProjectedMemberOperation<3>;
+    }
+
+    impl ValueProjection<SyntheticProjectionMember> for ProjectedMemberValue<4> {
+        type Projected = ProjectedMemberValue<3>;
+        type ProjectedRef<'v> = Self::Projected;
+
+        fn from_projected(value: Self::Projected) -> Self {
+            Self(value.0)
+        }
+
+        fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+        where
+            SyntheticProjectionMember: 'v,
+        {
+            Ok(ProjectedMemberValue(self.0))
+        }
+
+        fn into_projected(self) -> Result<Self::Projected, TypeError> {
+            Ok(ProjectedMemberValue(self.0))
+        }
+    }
 
     #[test]
     fn test_value() {
@@ -697,5 +758,75 @@ mod tests {
         assert_eq!(projected.r#type(), Cow::Borrowed(&r#type));
         assert_eq!(projected.to_string(), value);
         assert_eq!(projected.into_value(), &value);
+    }
+
+    #[test]
+    fn test_projected_value_synthesizes_member_type() {
+        // The parent has its own type and constructs member metadata from scratch.
+        type Parent = SyntheticProjectionParent;
+        type Member = SyntheticProjectionMember;
+
+        #[derive(Clone, Debug)]
+        struct View(usize);
+
+        impl Display for View {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.0, formatter)
+            }
+        }
+
+        impl Parameter for View {}
+
+        impl Typed for View {
+            type Type = Parent;
+
+            fn r#type(&self) -> Cow<'_, Parent> {
+                Cow::Owned(ProjectedMemberType)
+            }
+        }
+
+        struct ViewDomain;
+
+        impl Domain for ViewDomain {
+            type Type = Parent;
+            type Value = View;
+            type Constant = ProjectedMemberValue<4>;
+            type Operation = ProjectedMemberOperation<4>;
+        }
+
+        impl Value for View {
+            type Dispatch = ValueDirectDispatch;
+            type Domain = ViewDomain;
+
+            fn domain(&self) -> Self::Domain {
+                ViewDomain
+            }
+        }
+
+        impl ValueProjection<Member> for View {
+            type Projected = ProjectedValue<Member, Self>;
+            type ProjectedRef<'v> = ProjectedValue<Member, &'v Self>;
+
+            fn from_projected(value: Self::Projected) -> Self {
+                value.into_value()
+            }
+
+            fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+            where
+                Member: 'v,
+            {
+                Ok(ProjectedValue::new(self, ProjectedMemberType))
+            }
+
+            fn into_projected(self) -> Result<Self::Projected, TypeError> {
+                Ok(ProjectedValue::new(self, ProjectedMemberType))
+            }
+        }
+
+        let projected = View(7).into_projected().unwrap();
+        assert_eq!(projected.r#type().into_owned(), ProjectedMemberType::<3>);
+        assert_eq!(Value::relocatable_type(&projected), None);
+        let _: ProjectedContext<ViewDomain, Member> = projected.domain();
+        assert_eq!(View::from_projected(projected).0, 7);
     }
 }

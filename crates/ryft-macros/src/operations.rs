@@ -794,7 +794,8 @@ impl OperationCodeGenerator {
     /// family payload belongs to programs over its own family and cannot consume the partial values of the enclosing
     /// family without a separate parent-boundary contract. That path still keeps an application whose payload requires
     /// fresh storage residual under a context that does not allow copies to fold, because the enum forwards
-    /// `Operation::requires_fresh_storage` to its payloads.
+    /// `Operation::requires_fresh_storage` to its payloads. An explicitly configured projected member can instead
+    /// call a rule that receives the complete application in the enclosing universe.
     fn generate_partial_evaluation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let operation_type = &self.operation_type;
@@ -820,7 +821,10 @@ impl OperationCodeGenerator {
             syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::PartiallyEvaluatableOperation<__Context>)
         }));
         let arms = self.variants.iter().map(|variant| {
-            if delegates(variant) {
+            if let Some(rule) = &variant.partial_evaluation {
+                let receiver = variant.receiver();
+                variant.arm(quote! { #rule(#receiver, self.clone(), context, driver, inputs) })
+            } else if delegates(variant) {
                 let payload_type = &variant.program_payload_type;
                 let receiver = variant.receiver();
                 variant.arm(quote! {
@@ -1229,13 +1233,16 @@ impl OperationCodeGenerator {
         let operation_type = &self.operation_type;
         let self_type = &self.self_type;
         let mut generics = self.operation_generics.clone();
+
         let value_type: syn::Type = if self.has_separate_runtime_value_type {
             generics.params.push(syn::parse_quote!(__TranspositionValue));
             syn::parse_quote!(__TranspositionValue)
         } else {
             self.constant_type.clone()
         };
+
         let where_clause = generics.make_where_clause();
+
         if self.has_separate_runtime_value_type {
             where_clause.predicates.push(syn::parse_quote!(#value_type: #ryft::Value<Type = #operation_type>));
             where_clause
@@ -1245,6 +1252,7 @@ impl OperationCodeGenerator {
         where_clause
             .predicates
             .push(syn::parse_quote!(#self_type: #ryft::Operation<Type = #operation_type>));
+
         for variant in &self.variants {
             let payload_type = &variant.payload_type;
             match &variant.class {
@@ -1296,6 +1304,7 @@ impl OperationCodeGenerator {
                 }
             }
         }
+
         let arms = self.variants.iter().map(|variant| {
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
@@ -1316,10 +1325,30 @@ impl OperationCodeGenerator {
                 }),
             }
         });
+
         let tracer_type: syn::Type = syn::parse_quote! {
             #ryft::Tracer<#ryft::TracingContext<#value_type, #self_type>>
         };
+
+        let placement_arms = self.variants.iter().map(|variant| {
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            match &variant.class {
+                OperationVariantClass::FamilyNative => variant.arm(quote! {
+                    <#payload_type as #ryft::TransposableOperation<#value_type, #self_type>>::
+                        accepts_unaligned_derivative_input(#receiver, input_index)
+                }),
+                OperationVariantClass::ProjectedMember { structural: false, .. } => variant.arm(quote! {
+                    <#payload_type as #ryft::MemberTransposableOperation<#value_type, #self_type>>::
+                        accepts_unaligned_derivative_input(#receiver, input_index)
+                }),
+                // A mixed member's projected inputs need not have the same positions as the parent's inputs.
+                _ => variant.wildcard_arm(quote!(false)),
+            }
+        });
+
         let (impl_generics, _, where_clause) = generics.split_for_impl();
+
         quote! {
             #[automatically_derived]
             impl #impl_generics #ryft::TransposableOperation<#value_type, #self_type> for #self_type #where_clause {
@@ -1333,6 +1362,12 @@ impl OperationCodeGenerator {
                     accumulators: &[#ryft::CotangentAccumulator],
                 ) -> ::std::result::Result<(), #ryft::DifferentiationError> {
                     match self { #(#arms)* }
+                }
+
+                #[inline]
+                fn accepts_unaligned_derivative_input(&self, input_index: usize) -> bool {
+                    let _ = input_index;
+                    match self { #(#placement_arms)* }
                 }
             }
         }
@@ -1977,7 +2012,8 @@ impl OperationParser {
     ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
     ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        let (class, generate_from, is_collective, is_lockstep, is_family) = self.extract_variant_attributes(variant);
+        let (class, generate_from, is_collective, is_lockstep, is_family, partial_evaluation) =
+            self.extract_variant_attributes(variant);
         let field = match &variant.fields {
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
             _ => {
@@ -2037,6 +2073,7 @@ impl OperationParser {
             is_collective,
             is_lockstep,
             is_family,
+            partial_evaluation,
         })
     }
 
@@ -2049,15 +2086,17 @@ impl OperationParser {
     /// to its payload, and the lockstep marker is `true` when it declares `#[ryft(lockstep)]`, which does the same for
     /// the generated `LockstepOperation` implementation. The family marker is `true` when the variant declares
     /// `#[ryft(family)]` (refer to [`OperationVariant::is_family`]), which only family-native variants may declare.
+    /// A projected variant may specify a custom parent-universe partial evaluation rule by path.
     fn extract_variant_attributes(
         &mut self,
         variant: &syn::Variant,
-    ) -> (OperationVariantClass, bool, bool, bool, bool) {
+    ) -> (OperationVariantClass, bool, bool, bool, bool, Option<syn::Path>) {
         let mut class = None::<OperationVariantClass>;
         let mut generate_from = true;
         let mut is_collective = false;
         let mut is_lockstep = false;
         let mut is_family = false;
+        let mut partial_evaluation = None;
         variant.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &SKIP_FROM_ATTRIBUTE && !generate_from => {
@@ -2088,6 +2127,13 @@ impl OperationParser {
                     is_family = true;
                     Ok(())
                 }
+                path if path == &PARTIAL_EVALUATION_DISPATCHER => {
+                    if partial_evaluation.is_some() {
+                        return Err(meta.error("duplicate ryft operation variant attribute `partial_evaluation`"));
+                    }
+                    partial_evaluation = Some(meta.value()?.parse::<syn::Path>()?);
+                    Ok(())
+                }
                 path if path == &PROJECTED_ATTRIBUTE || path == &MIXED_ATTRIBUTE => {
                     let candidate = OperationVariantClass::parse(&meta, &self.members)?;
                     match &class {
@@ -2112,7 +2158,7 @@ impl OperationParser {
                 )),
                 _ => Err(meta.error(format_args!(
                     "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, `family`, \
-                     `collective`, `lockstep`, and `skip_from` are supported here",
+                     `collective`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
                     meta.path.to_compact_string(),
                 ))),
             })
@@ -2127,7 +2173,18 @@ impl OperationParser {
             );
         }
 
-        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from, is_collective, is_lockstep, is_family)
+        if partial_evaluation.is_some() && !matches!(class, Some(OperationVariantClass::ProjectedMember { .. })) {
+            self.add_error(&variant.ident, "`partial_evaluation` requires a projected member variant");
+        }
+
+        (
+            class.unwrap_or(OperationVariantClass::FamilyNative),
+            generate_from,
+            is_collective,
+            is_lockstep,
+            is_family,
+            partial_evaluation,
+        )
     }
 
     /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
@@ -2424,6 +2481,9 @@ struct OperationVariant {
     /// dispatcher uses the canonical fold-or-residualize path of the complete enum, because the partial evaluation
     /// rule of the payload family belongs to programs over that family.
     is_family: bool,
+
+    /// Rule that partially evaluates an opted-in projected member in the enclosing universe.
+    partial_evaluation: Option<syn::Path>,
 }
 
 impl OperationVariant {
@@ -3046,7 +3106,7 @@ mod tests {
         let variant: syn::Variant = syn::parse_quote!(Zero(ZeroOperation<DataType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, false, false),
+            (OperationVariantClass::FamilyNative, true, false, false, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote! {
             #[ryft(skip_from)]
@@ -3055,18 +3115,24 @@ mod tests {
         };
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false, false),
+            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote!(#[ryft(lockstep)] While(WhileOperation<ArrayIrType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, true, false),
+            (OperationVariantClass::FamilyNative, true, false, true, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote!(#[ryft(family, collective)] Portable(ArrayIrOperation<Array>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, true, false, true),
+            (OperationVariantClass::FamilyNative, true, true, false, true, None),
         ));
+        let variant: syn::Variant = syn::parse_quote! {
+            #[ryft(projected(ArrayType), partial_evaluation = Rules::partially_evaluate)]
+            Array(ArrayOperation<A>)
+        };
+        let (_, _, _, _, _, rule) = parser.extract_variant_attributes(&variant);
+        assert_eq!(rule, Some(syn::parse_quote!(Rules::partially_evaluate)));
         assert_eq!(errors(&parser), Vec::<String>::new());
 
         // Test using invalid variant attributes.
@@ -3075,6 +3141,11 @@ mod tests {
             (quote!(#[ryft(collective, collective)]), "duplicate ryft operation variant attribute `collective`"),
             (quote!(#[ryft(lockstep, lockstep)]), "duplicate ryft operation variant attribute `lockstep`"),
             (quote!(#[ryft(family, family)]), "duplicate ryft operation variant attribute `family`"),
+            (quote!(#[ryft(partial_evaluation = rule)]), "`partial_evaluation` requires a projected member variant"),
+            (
+                quote!(#[ryft(projected(ArrayType), partial_evaluation = first, partial_evaluation = second)]),
+                "duplicate ryft operation variant attribute `partial_evaluation`",
+            ),
             (
                 quote!(#[ryft(family, projected(ArrayType))]),
                 "contradictory ryft operation variant attributes `family` and `projected`",
@@ -3098,7 +3169,7 @@ mod tests {
             (
                 quote!(#[ryft(transpose = custom)]),
                 "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, `family`, \
-                 `collective`, `lockstep`, and `skip_from` are supported here",
+                 `collective`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
             ),
         ] {
             let mut parser = OperationParser::new();
@@ -3763,7 +3834,7 @@ mod tests {
             #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), dispatch(partial_evaluation))]
             enum Operation<A: Value<Type = ArrayType>, Extension> {
                 Add(AddOperation<ArrayIrType>),
-                #[ryft(projected(ArrayType))]
+                #[ryft(projected(ArrayType), partial_evaluation = ArrayOperation::partially_evaluate_member)]
                 Array(ArrayOperation<A>),
                 #[ryft(family)]
                 Portable(ArrayIrOperation<A>),
@@ -3807,12 +3878,9 @@ mod tests {
                                 <AddOperation<ArrayIrType> as ryft::PartiallyEvaluatableOperation<__Context>>::
                                     partially_evaluate(operation, context, driver, inputs)
                             },
-                            Self::Array(..) => {
-                                context.fold_or_residualize(
-                                    self.clone(),
-                                    driver.region_programs(),
-                                    inputs,
-                                    ::std::option::Option::None,
+                            Self::Array(operation) => {
+                                ArrayOperation::partially_evaluate_member(
+                                    operation, self.clone(), context, driver, inputs
                                 )
                             },
                             Self::Portable(..) => {
@@ -4112,6 +4180,7 @@ mod tests {
                 .replace(">::jvp(", ">::jvp_for_transpose(")
                 .replace(">::jvp_in_parent(", ">::jvp_for_transpose_in_parent("),
         );
+        assert_eq!(generated.items.len(), 2);
     }
 
     #[test]
@@ -4302,6 +4371,27 @@ mod tests {
                             Self::Gather(operation) => {
                                 context.transpose_mixed_operation(operation, inputs, outputs, accumulators)
                             },
+                        }
+                    }
+
+                    #[inline]
+                    fn accepts_unaligned_derivative_input(&self, input_index: usize) -> bool {
+                        let _ = input_index;
+                        match self {
+                            Self::Add(operation) => {
+                                <AddOperation<ArrayIrType> as ryft::TransposableOperation<
+                                    __TranspositionValue,
+                                    Operation<A>,
+                                >>::accepts_unaligned_derivative_input(operation, input_index)
+                            },
+                            Self::Array(operation) => {
+                                <ArrayOperation<A> as ryft::MemberTransposableOperation<
+                                    __TranspositionValue,
+                                    Operation<A>,
+                                >>::accepts_unaligned_derivative_input(&**operation, input_index)
+                            },
+                            Self::Dimension(..) => { false },
+                            Self::Gather(..) => { false },
                         }
                     }
                 }

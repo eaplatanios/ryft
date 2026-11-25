@@ -243,8 +243,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// An empty list, an unknown token, and a repeated token are all compilation errors. The interpretation implementation
 /// is always generated and therefore never appears in `dispatch(...)`. Select a dispatcher only when a program over the
 /// family needs it, because every generated implementation adds code and trait obligations. A family that needs its own
-/// rule for one of these traits (e.g., a partial evaluation rule that specializes one of its variants) leaves the
-/// dispatcher unselected and implements the trait by hand. The selected dispatchers generate the following
+/// dispatcher leaves it unselected and implements the trait by hand. The selected dispatchers generate the following
 /// per-variant arms:
 ///
 ///   - `identity` generates [`PartialEq`], [`Eq`], and [`Hash`] implementations that delegate to the payload of each
@@ -274,7 +273,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     fold-or-residualize path, which also consults their [`Operation::fold`] rules without a second partial-value
 ///     protocol, because the partial evaluation rule of a member or nested family belongs to programs over that family.
 ///     That path still keeps an application with known inputs residual when the payload requires fresh storage under
-///     a context that does not allow copies to fold (refer to [`Operation::requires_fresh_storage`]).
+///     a context that does not allow copies to fold (refer to [`Operation::requires_fresh_storage`]). A projected
+///     member can select a custom rule with `#[ryft(partial_evaluation = path)]`. The function receives the borrowed
+///     payload, the cloned containing operation, the partial evaluation context, the driver, and the inputs, in that
+///     order. It returns partial evaluation values in the containing family's type universe.
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation and dispatches mixed variants in either role to the payload's parent-universe
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation) implementation. Projected variants use the policy

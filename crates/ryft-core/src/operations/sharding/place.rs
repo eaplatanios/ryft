@@ -58,8 +58,8 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrType, ArrayIrValue,
-    ArrayType, Device, DeviceMesh, Dimension, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxisType, Placement,
-    Shape, Sharding, ShardingDimension, decode_logical_bytes,
+    ArrayMemberType, ArrayType, Device, DeviceMesh, Dimension, DimensionVariable, Layout, LogicalMesh, Memory,
+    MeshAxisType, Placement, Shape, Sharding, ShardingDimension, decode_logical_bytes,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -75,10 +75,14 @@ use crate::operations::Capability;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, find_duplicate_paths};
-use crate::partial::{PartialTracer, PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialTracer, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, Typed, Value, ValueDirectDispatch, ValueDomainDispatch, ValueProjection,
+    AttachedRegions, MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError,
+    ProjectedValue, RegionInterface, Type, TypeError, Typed, Value, ValueDirectDispatch, ValueDomainDispatch,
+    ValueProjection,
 };
 use crate::tracing::Tracer;
 
@@ -119,8 +123,8 @@ use crate::tracing::Tracer;
 ///   - A value that the input type tracks over a logical mesh of one device keeps that logical mesh and its sharding,
 ///     laid over the target device.
 ///   - A value that the input type tracks over a logical mesh of more than one device is gathered onto the device,
-///     so the output type is replicated over the canonical logical mesh of one device (i.e.,
-///     [`LogicalMesh::single_device`]), which is also the mesh that backends give such a value.
+///     so the output type has no sharding. Backends place it on the anonymous mesh of the target device (i.e.,
+///     [`LogicalMesh::single_device`]).
 ///   - A value without a tracked sharding stays without one.
 ///   - Without a memory, the output is in the default memory of the device (i.e., [`Memory::Device`]), so a value
 ///     leaves any other memory (e.g., pinned host memory), as JAX 0.12.0.1 did on CPU for an eager `device_put` onto
@@ -218,7 +222,8 @@ pub enum PlacementRequest {
         /// Optional [`Memory`] space of the output. When it is [`None`], the value keeps its memory.
         memory: Option<Memory>,
 
-        /// Optional storage [`Layout`] of the output. When it is [`None`], the value keeps its layout.
+        /// Optional storage [`Layout`] of the output. When it is [`None`], a target keeps the layout of the value,
+        /// which still describes each shard because the sharding is unchanged, and a source states nothing about it.
         layout: Option<Layout>,
     },
 }
@@ -268,7 +273,9 @@ impl PlacementRequest {
         }
     }
 
-    /// Returns the storage [`Layout`] that this request selects, or [`None`] if it keeps the layout of the value.
+    /// Returns the storage [`Layout`] that this request names, or [`None`] if it names none. A target without a layout
+    /// keeps the layout of the value only while that layout still describes each shard of the output, and the output
+    /// declares no layout otherwise (refer to [`PlacementRequest`]). A source without a layout states nothing about it.
     #[inline]
     pub fn layout(&self) -> Option<&Layout> {
         match self {
@@ -282,6 +289,37 @@ impl PlacementRequest {
     #[inline]
     pub fn moves(&self) -> bool {
         !matches!(self, Self::InPlace { .. })
+    }
+
+    /// Returns this request for a value of rank `rank`, with the sharding of a [`PlacementRequest::Resolved`] request
+    /// that has fewer dimensions than `rank` padded with trailing replicated dimensions. The batch shardings, memory,
+    /// and layout of the placement are kept. A sharding with more dimensions than `rank` is returned unchanged, so that
+    /// the type rule of [`PlaceOperation`] rejects it, and the device and in-place forms have no sharding to pad. Every
+    /// entry point that places a value (i.e., [`Place`], [`PlaceDispatch`], and the backends that place concrete values
+    /// outside a program) pads its requests through this function, so that a staged [`PlaceOperation`] always names
+    /// full rank shardings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the padded sharding is not valid for the placement, which cannot happen for a valid
+    /// placement.
+    pub fn padded(self, rank: usize) -> Result<Self, TypeError> {
+        let Self::Resolved(placement) = self else {
+            return Ok(self);
+        };
+        let sharding = placement.sharding();
+        let padding = rank.saturating_sub(sharding.rank());
+        if padding == 0 {
+            return Ok(Self::Resolved(placement));
+        }
+        let dimensions = sharding
+            .dimensions()
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat_n(ShardingDimension::Replicated, padding))
+            .collect();
+        let sharding = sharding.with_dimensions(dimensions)?;
+        Ok(Self::Resolved(placement.with_sharding(sharding)?))
     }
 
     /// Returns the source that a placement records for a value that concretely lives on `placement`, if anywhere
@@ -410,25 +448,32 @@ impl From<Memory> for Option<PlacementRequest> {
     }
 }
 
-/// Target or source leaf accepted by [`Place::place`]. A leaf can be a [`Placement`], a [`PlacementRequest`],
-/// a [`Device`], a [`Memory`], or an [`Option`] of any of them. A [`None`] leaf omits its target or source.
-/// The trait is sealed to these types.
+/// Target or source leaf accepted by array placement frontends. A leaf can be a [`Placement`], a [`PlacementRequest`],
+/// a [`Device`], a [`Memory`], or an [`Option`] of any of them. A [`None`] leaf omits its target or source. Pair a
+/// [`Sharding`] with its physical mesh in a [`Placement`].
+///
+/// ```compile_fail
+/// # use ryft_core::{PlacementRequestParameter, Sharding};
+/// fn request_from_sharding(sharding: Sharding) {
+///     sharding.into_request();
+/// }
+/// ```
 pub trait PlacementRequestParameter: Clone + Parameter + sealed::Sealed {
-    /// Returns this element as the optional target or source of a [`PlaceOperation`].
-    fn into_optional_placement_request(self) -> Option<PlacementRequest>;
+    /// Converts this leaf to an optional placement request.
+    fn into_request(self) -> Option<PlacementRequest>;
 }
 
 impl<R: Clone + Parameter + sealed::Sealed + Into<PlacementRequest>> PlacementRequestParameter for R {
     #[inline]
-    fn into_optional_placement_request(self) -> Option<PlacementRequest> {
+    fn into_request(self) -> Option<PlacementRequest> {
         Some(self.into())
     }
 }
 
-impl<R: Clone + Parameter + sealed::Sealed + Into<PlacementRequest>> PlacementRequestParameter for Option<R> {
+impl<R: PlacementRequestParameter> PlacementRequestParameter for Option<R> {
     #[inline]
-    fn into_optional_placement_request(self) -> Option<PlacementRequest> {
-        self.map(Into::into)
+    fn into_request(self) -> Option<PlacementRequest> {
+        self.and_then(PlacementRequestParameter::into_request)
     }
 }
 
@@ -445,7 +490,7 @@ mod sealed {
 
     impl Sealed for super::Memory {}
 
-    impl<R: Sealed + Into<super::PlacementRequest>> Sealed for Option<R> {}
+    impl<R: Sealed> Sealed for Option<R> {}
 }
 
 /// Canonical operation name for [`PlaceOperation`].
@@ -481,8 +526,8 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// Unlike a [`ReshardOperation`](crate::ReshardOperation), which redistributes a value over the mesh that it already
 /// lives on, a placement may move the value to another mesh, so the target mesh need not define the axes of the input's
 /// mesh. A [`Placement`] target still changes only where a value lives and never its reduction state, so its sharding
-/// must restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and the
-/// target mesh must define each of those axes with the same size and type as the input's mesh (refer to
+/// must restate the unreduced and reduced axes of the input's tracked sharding (and its unreduced kind) exactly, and
+/// the target mesh must define each of those axes with the same size and type as the input's mesh (refer to
 /// [`Self::infer_output_type_allowing_uneven_splits`], through which backends also apply every check of this rule but
 /// the even split below to the concrete values that they place outside a program). Every shard of a partitioned
 /// dimension of the output has the same extent, so for each dimension that the target sharding partitions, the number
@@ -519,13 +564,15 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// of the input exactly (i.e., its unreduced axes, reduced axes, and unreduced kind, which are empty and a sum for an
 /// input without a tracked sharding) over a mesh that defines those axes like the input's mesh. When the input type
 /// tracks a sharding, the source sharding without its auto axes must also equal it. A device source is rejected for an
-/// input that its type tracks over a mesh of more than one device. These checks guarantee that the cotangent that
-/// transposition moves back to the source devices has the cotangent type of the input (up to a placement-only broadcast
-/// for an input without a tracked sharding). The memory and the layout that a source of any form names are checked
-/// against the input type as [`PlacementRequest`] states. Backends that execute the operation on a concrete value move
-/// the value from wherever it actually lives, without comparing the devices of that placement with the source on any
-/// path, as JAX never compares them either, so a source that names other devices sends the cotangent to the devices
-/// that it names.
+/// input that its type tracks over a mesh of more than one device. A concrete value that is free to be placed elsewhere
+/// (refer to [`Value::relocatable_type`]) may be placed on the source first, so these last two checks compare the
+/// source with its relocatable type instead, and every other check keeps its type and concrete sharding (refer to
+/// [`Self::infer_output_type_of_value`]). These checks guarantee that the cotangent that transposition moves back to
+/// the source devices has the cotangent type of the input (up to a placement-only broadcast for an input without a
+/// tracked sharding). The memory and the layout that a source of any form names are checked against the input type as
+/// [`PlacementRequest`] states. Backends that execute the operation on a concrete value move the value from wherever it
+/// actually lives, without comparing the devices of that placement with the source on any path, as JAX never compares
+/// them either, so a source that names other devices sends the cotangent to the devices that it names.
 ///
 /// The operation also carries a copy policy (refer to [`Self::with_may_alias`]), which is the Ryft analogue of the
 /// `copy_semantics` of JAX's `device_put` primitive. By default, the output may share storage with the input (e.g.,
@@ -556,14 +603,22 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// source, the primal uses its concrete placement as its source, if it has one, and an in-place source is completed
 /// with that placement (refer to [`PlacementRequest::resolve_source`]) after the request is validated as it is given,
 /// as interpretation and batching also do. A tangent is free to live elsewhere than its primal, so a concrete tangent
-/// uses its own placement instead, and a staged tangent records that of the primal as an inferred source, which only
-/// transposition reads and which is never validated against the tangent. Transposition moves the cotangent back to
-/// where the input lived whenever the source says where that is, for every form of the target, and rejects a cotangent
-/// that it cannot return to the mesh of the input (refer to [`PlacementRequest`]), and it always forces a copy, as
-/// JAX's `device_put` transpose does. Like that transpose, which swaps the devices and the sources of `device_put`,
-/// it swaps the two ends of the placement, so that transposing twice moves the value to the forward target again,
-/// except that an in-place target names no devices and so becomes no source. A device source of an input that its
-/// type tracks over a mesh of one device becomes a placement over the logical mesh of the input on that device.
+/// uses its own placement instead, and a staged tangent keeps the caller's source as its forward source (refer to
+/// [`Self::source`]), which constrains the tangent, and records the completed source of the primal as its return
+/// placement (refer to [`Self::return_placement`]), which only transposition reads, which is never validated against
+/// the tangent, and which interpretation and batching carry along. An operation that already records such a return
+/// placement is a saved linear map, so differentiating it again (e.g., linearizing it or pulling it back at a tangent
+/// on other devices) keeps that return placement, as JAX keeps the sources of a saved `device_put`. Transposition
+/// moves the cotangent back to where the input lived whenever the source says where that is, for every form of the
+/// target, and rejects a cotangent that it cannot return to the mesh of the input (refer to [`PlacementRequest`]), and
+/// it always forces a copy, as JAX's `device_put` transpose does. Like that transpose, which swaps the devices and the
+/// sources of `device_put`, it swaps the two ends of the placement, so that transposing twice moves the value to the
+/// forward target again, except that an in-place target names no devices and so becomes no source. Outside the cases
+/// that transpose in place (refer to [`Self::transposes_in_place`]), the forward target becomes the return placement of
+/// the transposed placement and not its forward source, so that the transposed placement accepts a cotangent wherever
+/// it lives (e.g., a gradient seed committed on other devices), as JAX's transpose does. A device source of an input
+/// that its type tracks over a mesh of one device becomes a placement over the logical mesh of the input on that
+/// device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaceOperation {
     /// Optional source [`PlacementRequest`] where the input is expected to live, which is informative only.
@@ -576,12 +631,13 @@ pub struct PlaceOperation {
     /// have storage of its own.
     may_alias: bool,
 
-    /// Boolean indicating whether `source` was inferred (e.g., by differentiation from where a concrete primal lives),
-    /// rather than being provided by the caller. Such a source is the source of the placement of a tangent, which is
-    /// free to live elsewhere than its primal, so it only tells transposition where to return the cotangent and is
-    /// never validated against the input or recorded by the rules that place a value of their own (i.e., interpretation
-    /// and batching).
-    is_source_inferred: bool,
+    /// Optional return placement that differentiation inferred from where a concrete primal lives for the placement
+    /// of its tangent, which is free to live elsewhere than its primal, or that transposition recorded from the target
+    /// of the placement that it transposed, so that the cotangent may live anywhere. It tells transposition where to
+    /// return the cotangent in place of `source` (refer to [`Self::source`]), is never validated against the input, and
+    /// is [`None`] when it would equal `source`. The rules that rebuild the operation (i.e., interpretation, batching,
+    /// and differentiation) carry it along.
+    inferred_source: Option<PlacementRequest>,
 }
 
 impl PlaceOperation {
@@ -593,7 +649,7 @@ impl PlaceOperation {
     /// with its input (refer to [`Self::with_may_alias`]).
     #[inline]
     pub fn new(target: impl Into<Option<PlacementRequest>>, source: impl Into<Option<PlacementRequest>>) -> Self {
-        Self { source: source.into(), target: target.into(), may_alias: true, is_source_inferred: false }
+        Self { source: source.into(), target: target.into(), may_alias: true, inferred_source: None }
     }
 
     /// Returns this [`PlaceOperation`] with its copy policy replaced by `may_alias`. With `true`, which is the default,
@@ -615,17 +671,39 @@ impl PlaceOperation {
         self
     }
 
-    /// Returns the source [`PlacementRequest`] where the input is expected to live, or [`None`] if it is not known.
+    /// Returns this [`PlaceOperation`] with `inferred_source` as its inferred return placement, unless that says
+    /// nothing more than the forward source. Refer to [`Self::return_placement`] for more information.
+    #[inline]
+    fn with_inferred_source(mut self, inferred_source: Option<PlacementRequest>) -> Self {
+        self.inferred_source = inferred_source.filter(|inferred_source| Some(inferred_source) != self.source.as_ref());
+        self
+    }
+
+    /// Returns this [`PlaceOperation`] with its target and source padded for an input of rank `rank`.
+    /// Refer to [`PlacementRequest::padded`] for more information.
+    fn padded(mut self, rank: usize) -> Result<Self, TypeError> {
+        self.target = self.target.map(|target| target.padded(rank)).transpose()?;
+        self.source = self.source.map(|source| source.padded(rank)).transpose()?;
+        Ok(self)
+    }
+
+    /// Returns the forward source of this placement (i.e., the [`PlacementRequest`] that its caller gave as where the
+    /// input is expected to live), or [`None`] if the caller gave none. This is what type inference, interpretation,
+    /// and batching validate the input against. A backend likewise validates and lowers a placement against its forward
+    /// source, and reads the return placement (refer to [`Self::return_placement`]) only when it transposes it.
     #[inline]
     pub fn source(&self) -> Option<&PlacementRequest> {
         self.source.as_ref()
     }
 
-    /// Returns the source that the input is validated against, which is the source unless differentiation inferred it
-    /// for a tangent. Refer to [`Self::is_source_inferred`] for more information.
+    /// Returns the return placement of this placement (i.e., the [`PlacementRequest`] where transposition returns
+    /// the cotangent), or [`None`] if it is not known. It is the forward source (refer to [`Self::source`]), unless
+    /// differentiation inferred another one from where a concrete primal lives or transposition recorded the target
+    /// of the placement that it transposed (refer to the documentation of [`PlaceOperation`]), which then constrains
+    /// nothing that the placement receives.
     #[inline]
-    fn validated_source(&self) -> Option<&PlacementRequest> {
-        self.source.as_ref().filter(|_| !self.is_source_inferred)
+    pub fn return_placement(&self) -> Option<&PlacementRequest> {
+        self.inferred_source.as_ref().or(self.source.as_ref())
     }
 
     /// Returns the [`PlacementRequest`] that the input is moved to, or [`None`] if the input stays where it is.
@@ -669,21 +747,21 @@ impl PlaceOperation {
         Ok(())
     }
 
-    /// Returns whether the transposition of this placement, for an input of type `input`, leaves the cotangent on the
-    /// devices where it lives and changes at most its memory (i.e., the transposed placement has no target or an
+    /// Returns whether the transposition of this placement, for an input of type `input`, leaves the cotangent on
+    /// the devices where it lives and changes at most its memory (i.e., the transposed placement has no target or an
     /// in-place target, refer to [`PlacementRequest`]), when the transposition succeeds. That is the case when the
     /// source of this placement is an in-place request, which names no devices to return the cotangent to, and when
     /// this placement moves nothing (i.e., it has no target or an in-place target) and either its source is not known
     /// or its input lives inside a manual region, whose cotangent lives in the same region. Otherwise, the transposed
     /// placement moves the cotangent to the devices of the source, or, without a source, onto the placement or the
     /// device of the forward target. Transposition decides the form of the transposed placement with this function,
-    /// so the two agree for every placement, and backends that reject moves of values inside manual regions share
-    /// it (e.g., the lowering of a source that names devices inside a manual region, which only matters when
-    /// transposition moves the cotangent to it).
+    /// so the two agree for every placement. A source that names devices constrains nothing forward, so a backend
+    /// that rejects moves of values inside manual regions rejects only the transposed placement that this function
+    /// says moves the cotangent, through its target, and admits the forward placement.
     #[inline]
     pub fn transposes_in_place(&self, input: &ArrayType) -> bool {
         let target_moves = self.target.as_ref().is_some_and(PlacementRequest::moves);
-        match &self.source {
+        match self.return_placement() {
             Some(PlacementRequest::InPlace { .. }) => true,
             Some(_) => !target_moves && input.sharding().is_some_and(is_manual_region_sharding),
             None => !target_moves,
@@ -699,9 +777,10 @@ impl PlaceOperation {
     /// validates as the placement of a value with the type of that host value), so that such a placement checks
     /// everything that the type rule checks, in the same order and with the same errors, and splits a dimension
     /// unevenly only where it places a concrete value. The interpretation, batching, and differentiation rules of
-    /// [`PlaceOperation`] also call it to validate a placement as it is given before they complete its source with the
-    /// placement of a concrete value (refer to [`PlacementRequest::resolve_source`]), so that the completed source
-    /// never hides a request that the type rule rejects.
+    /// [`PlaceOperation`] also validate a placement as it is given, through [`Self::infer_output_type_of_value`],
+    /// before they complete its source with the placement of a concrete value (refer to
+    /// [`PlacementRequest::resolve_source`]), so that the completed source never hides
+    /// a request that the type rule rejects.
     ///
     /// `concrete_sharding` is the sharding over every mesh axis of the concrete value that is placed, when it is known
     /// (i.e., the sharding of its [`Placed`] placement, such as the runtime sharding of a backend array), and [`None`]
@@ -725,8 +804,89 @@ impl PlaceOperation {
     /// Returns a [`TypeError`] for every request that [`Operation::infer_output_types`] rejects, except for a target
     /// that splits an extent unevenly, and for every request that the concrete sharding shows to change the reduction
     /// state of the value or to have a layout that does not address its shards.
+    #[inline]
     pub fn infer_output_type_allowing_uneven_splits(
         input: &ArrayType,
+        concrete_sharding: Option<&Sharding>,
+        target: Option<&PlacementRequest>,
+        source: Option<&PlacementRequest>,
+    ) -> Result<ArrayType, TypeError> {
+        Self::infer_output_type_of_input_allowing_uneven_splits(input, None, concrete_sharding, target, source)
+    }
+
+    /// Validates this operation for a concrete value of type `input` whose sharding over every mesh axis is
+    /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule of
+    /// this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the target
+    /// splits each extent evenly as far as the type of the value can tell, which is exactly for a static extent and for
+    /// at least one extent of each dimension variable that its bounds admit and that splits every dimension of that
+    /// variable evenly at once), made with the concrete sharding of the value, so it is what a backend calls when it
+    /// executes this operation on a concrete value (e.g., when an eager context binds it), where the reduction state
+    /// and the shards of the value are known more precisely than its type records them. When the target splits a
+    /// dimension variable, its target layout and the layout of its input (i.e., the one that its source asserts,
+    /// or otherwise the one that the input type declares) are then also checked at the smallest extent of each such
+    /// variable that splits its dimensions evenly, because a strided layout that addresses the shards of some extent
+    /// addresses those of every smaller one, so that all checks decide with the same extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], one for a target that splits a
+    /// static extent of the value unevenly or the dimensions of a dimension variable unevenly for every extent that its
+    /// bounds admit, and one for a target or input layout that addresses the shards of no extent that splits evenly.
+    #[inline]
+    pub fn infer_output_type_requiring_even_splits(
+        &self,
+        input: &ArrayType,
+        concrete_sharding: Option<&Sharding>,
+    ) -> Result<ArrayType, TypeError> {
+        self.infer_output_type_of_input_requiring_even_splits(input, None, concrete_sharding)
+    }
+
+    /// Validates this placement of the concrete value `input`, whose sharding over every mesh axis is
+    /// `concrete_sharding`, when it is known (e.g., the runtime sharding of a backend array), and returns the type of
+    /// the placed value. This is [`Self::infer_output_type_requiring_even_splits`] when `require_even_splits` is
+    /// `true` and [`Self::infer_output_type_allowing_uneven_splits`] otherwise, for the type of `input`, except that a
+    /// value that is free to be placed elsewhere (refer to [`Value::relocatable_type`], e.g., an uncommitted array of a
+    /// backend) may be placed on the source first, so the source must describe where its relocatable type says it
+    /// lives rather than where it happens to live. That is the one check that a relocatable type relaxes (i.e., that
+    /// the sharding of a placement source matches the input type and that a device source names the one device of an
+    /// input that its type tracks over a mesh of one device). Every other check, including those of the reduction
+    /// state of the value against the source and the target, uses the type and the concrete sharding of the value, and
+    /// so does the output type. Every path that places a concrete value calls this function (i.e., the interpretation,
+    /// batching, and differentiation rules of [`PlaceOperation`] and backends that place a concrete value), so that
+    /// they all admit the same placements. A staged value has no relocatable type, so it is validated strictly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`TypeError`] of [`Self::infer_output_type_requiring_even_splits`] or of
+    /// [`Self::infer_output_type_allowing_uneven_splits`] for the placement of the value, with the source compared with
+    /// its relocatable type when it has one.
+    pub fn infer_output_type_of_value<V: Value<Type = ArrayType>>(
+        &self,
+        input: &V,
+        concrete_sharding: Option<&Sharding>,
+        require_even_splits: bool,
+    ) -> Result<ArrayType, TypeError> {
+        let (r#type, relocatable_type) = (input.r#type(), input.relocatable_type());
+        if require_even_splits {
+            self.infer_output_type_of_input_requiring_even_splits(&r#type, relocatable_type.as_ref(), concrete_sharding)
+        } else {
+            let (target, source) = (self.target(), self.source());
+            Self::infer_output_type_of_input_allowing_uneven_splits(
+                &r#type,
+                relocatable_type.as_ref(),
+                concrete_sharding,
+                target,
+                source,
+            )
+        }
+    }
+
+    /// Validates a placement as [`Self::infer_output_type_allowing_uneven_splits`] does, for an input of type `input`
+    /// that is free to be placed elsewhere with type `relocatable_type`, when that is given, which the source is then
+    /// compared with (refer to [`Self::infer_output_type_of_value`]).
+    fn infer_output_type_of_input_allowing_uneven_splits(
+        input: &ArrayType,
+        relocatable_type: Option<&ArrayType>,
         concrete_sharding: Option<&Sharding>,
         target: Option<&PlacementRequest>,
         source: Option<&PlacementRequest>,
@@ -793,27 +953,44 @@ impl PlaceOperation {
 
         // A given source must also describe where the input lives as far as its type can tell, which excludes the
         // placement over auto axes that types do not record. A device source states that the input lives on that one
-        // device, which an input that its type tracks over a mesh of more devices does not.
-        if let Some(source) = source
-            && let Some(input_sharding) = input.sharding()
-        {
+        // device, which an input that its type tracks over a mesh of more devices does not. An input that is free to be
+        // placed elsewhere may be placed on the source first, so these two checks, and only they, compare the source
+        // with its relocatable type, while every other check keeps its type and its concrete sharding (e.g., a source
+        // never lets a placement change a pending reduction over an auto axis that only the concrete sharding shows).
+        let located = relocatable_type.unwrap_or(input);
+        if let Some(source) = source {
             let source = source.without_auto_axes();
-            if input_sharding != &source {
+            if let Some(located_sharding) = located.sharding()
+                && located_sharding != &source
+            {
                 return Err(TypeError::invalid(format!(
-                    "`{PLACE_OPERATION_NAME}` source sharding `{source}` does not match the input type `{input}`",
+                    "`{PLACE_OPERATION_NAME}` source sharding `{source}` does not match the input type `{located}`",
+                )));
+            }
+
+            // A concrete input on the anonymous mesh omits its sharding from the type. A source of a value
+            // that cannot relocate must still match the sharding recorded at runtime.
+            if located.sharding().is_none()
+                && relocatable_type.is_none()
+                && let Some(actual) =
+                    concrete_sharding.filter(|sharding| sharding.mesh() == &LogicalMesh::single_device())
+                && actual.without_auto_axes() != source
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{PLACE_OPERATION_NAME}` source sharding `{source}` does not match the input sharding `{actual}`",
                 )));
             }
         }
 
         if let Some(PlacementRequest::Device { .. }) = source_request
-            && let Some(input_sharding) = input.sharding()
-            && input_sharding.mesh().device_count() > 1
+            && let Some(located_sharding) = located.sharding()
+            && located_sharding.mesh().device_count() > 1
         {
             return Err(TypeError::invalid(format!(
                 "`{}` device source names one device, but the input type `{}` is tracked over {} devices",
                 PLACE_OPERATION_NAME,
-                input,
-                input_sharding.mesh().device_count(),
+                located,
+                located_sharding.mesh().device_count(),
             )));
         }
 
@@ -844,9 +1021,8 @@ impl PlaceOperation {
 
         // Without a target, the value stays where it is, so it keeps its type. A device target names no mesh, so the
         // output keeps the sharding that the input type tracks over a mesh of one device without the reduction state
-        // that one device completes, and it is replicated over the canonical mesh of one device for an input that the
-        // type tracks over more devices. An in-place target keeps the sharding exactly, and only a placement target
-        // replaces it.
+        // that one device completes. A device target gathers an input that the type tracks over more devices, and
+        // its type omits the anonymous mesh where that value lives. An in-place target keeps the sharding exactly.
         let Some(destination) = destination else {
             return Ok(input.clone());
         };
@@ -856,17 +1032,16 @@ impl PlaceOperation {
             // A device target leaves a value that lives wholly on that device, so the output has no reduction state,
             // which one device completes (refer to `Self::validate_reduction_state`, which rejected the reduction state
             // that it does not complete). A value on a mesh of more devices is gathered onto the device, so it can no
-            // longer be distributed over that mesh, and it is replicated over the canonical mesh of one device instead,
-            // which is also where backends place it when the placement executes.
+            // longer be distributed over that mesh.
             output = if input_sharding.mesh().device_count() > 1 {
-                output.with_sharding(Sharding::replicated(LogicalMesh::single_device(), input.rank()))?
+                output.with_sharding(None)?
             } else {
                 input.without_reduction_axes()
             };
         }
 
         if let Some(target) = target {
-            output = output.with_sharding(target.without_auto_axes()).map_err(TypeError::from)?;
+            output = output.with_sharding(target.without_auto_axes())?;
         }
 
         if let Some(memory) = destination.target_memory() {
@@ -961,31 +1136,24 @@ impl PlaceOperation {
         Ok(output)
     }
 
-    /// Validates this operation for a concrete value of type `input` whose sharding over every mesh axis is
-    /// `concrete_sharding`, when it is known, and returns the type of the placed value. This is the whole type rule of
-    /// this operation (i.e., [`Self::infer_output_type_allowing_uneven_splits`] followed by the check that the target
-    /// splits each extent evenly as far as the type of the value can tell, which is exactly for a static extent and for
-    /// at least one extent of each dimension variable that its bounds admit and that splits every dimension of that
-    /// variable evenly at once), made with the concrete sharding of the value, so it is what a backend calls when it
-    /// executes this operation on a concrete value (e.g., when an eager context binds it), where the reduction state
-    /// and the shards of the value are known more precisely than its type records them. When the target splits a
-    /// dimension variable, its target layout and the layout of its input (i.e., the one that its source asserts,
-    /// or otherwise the one that the input type declares) are then also checked at the smallest extent of each such
-    /// variable that splits its dimensions evenly, because a strided layout that addresses the shards of some extent
-    /// addresses those of every smaller one, so that all checks decide with the same extent.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TypeError`] of [`Self::infer_output_type_allowing_uneven_splits`], one for a target that splits a
-    /// static extent of the value unevenly or the dimensions of a dimension variable unevenly for every extent that its
-    /// bounds admit, and one for a target or input layout that addresses the shards of no extent that splits evenly.
-    pub fn infer_output_type_requiring_even_splits(
+    /// Validates this placement as [`Self::infer_output_type_requiring_even_splits`] does, for an input of type `input`
+    /// that is free to be placed elsewhere with type `relocatable_type`, when that is given, which the source is then
+    /// compared with (refer to [`Self::infer_output_type_of_value`]).
+    fn infer_output_type_of_input_requiring_even_splits(
         &self,
         input: &ArrayType,
+        relocatable_type: Option<&ArrayType>,
         concrete_sharding: Option<&Sharding>,
     ) -> Result<ArrayType, TypeError> {
-        let source = self.validated_source();
-        let output = Self::infer_output_type_allowing_uneven_splits(input, concrete_sharding, self.target(), source)?;
+        let source = self.source();
+        let output = Self::infer_output_type_of_input_allowing_uneven_splits(
+            input,
+            relocatable_type,
+            concrete_sharding,
+            self.target(),
+            source,
+        )?;
+
         let extents = Self::validate_even_splits(input, self.target())?;
         if extents.is_empty() {
             return Ok(output);
@@ -1012,8 +1180,9 @@ impl PlaceOperation {
         if let Some(target) = self.target()
             && let (Some(placement), Some(layout)) = (target.placement(), target.layout())
         {
+            let sharding_is_complete = true;
             at_extents(&output)
-                .validate_shard_layout(layout, Some(placement.sharding()), true)
+                .validate_shard_layout(layout, Some(placement.sharding()), sharding_is_complete)
                 .map_err(|error| {
                     TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
                 })?;
@@ -1072,14 +1241,15 @@ impl PlaceOperation {
         layout: &Layout,
         shards: Option<(Option<&Sharding>, bool)>,
     ) -> Result<(), TypeError> {
+        let sharding_is_complete = true;
         match (layout, shards) {
             (_, Some((sharding, is_complete))) => r#type.validate_shard_layout(layout, sharding, is_complete),
-            (Layout::Tiled(_), None) => r#type.validate_shard_layout(layout, None, true),
+            (Layout::Tiled(_), None) => r#type.validate_shard_layout(layout, None, sharding_is_complete),
             (Layout::Strided(_), None) => {
                 let dimensions = r#type.shape().dimensions().iter();
                 let dimensions = dimensions.map(|dimension| Dimension::Static(dimension.bounds().lower().min(1)));
                 let smallest_shard = r#type.clone().with_shape(Shape::new(dimensions.collect()));
-                smallest_shard.validate_shard_layout(layout, None, true)
+                smallest_shard.validate_shard_layout(layout, None, sharding_is_complete)
             }
         }
     }
@@ -1312,6 +1482,59 @@ impl PlaceOperation {
 
         Ok(extents)
     }
+    /// Applies the placement rule while retaining the surrounding operation family's residual program.
+    pub(crate) fn partially_evaluate_in_family<C: Context<Type: ArrayMemberType>, D: PartialEvaluationDriver<C>>(
+        &self,
+        operation: C::Operation,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        if let Some(error) = context.error() {
+            return Err(error);
+        }
+
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
+        let input_type = input.r#type();
+        if driver.region_count() == 0
+            && input.declared_type().is_none()
+            && let Some(known) = input.as_known()
+        {
+            let can_fold = self.may_alias() || context.allow_copy_folding();
+            let eager = context.parent().is_eager();
+            if can_fold && eager {
+                // A known placement uses the parent's admission rule, which sees the full concrete sharding,
+                // including reduction state and shard shapes over auto mesh axes that the abstract type omits.
+                match context.parent().bind(operation.clone(), AttachedRegions::Empty, std::slice::from_ref(known)) {
+                    Err(ProgramError::UnsupportedOperation { .. }) => (),
+                    outputs => return Ok(outputs?.into_iter().map(|value| context.known_value(value)).collect()),
+                }
+            }
+
+            let actual = input_type.as_array_type()?;
+            if self.source().is_some()
+                && let Some(declaration) = known.relocatable_type()
+                && declaration.as_array_type()? != actual
+                && let Err(error) = self.infer_output_type_requiring_even_splits(actual, None)
+            {
+                // Relocation relaxes the source placement check. A residual operation still validates its other
+                // requirements against the actual type before giving the feeder its relocatable declaration.
+                self.infer_output_type_of_input_requiring_even_splits(actual, Some(declaration.as_array_type()?), None)
+                    .map_err(|_| error)?;
+                if can_fold && !eager {
+                    let outputs =
+                        context.parent().bind(operation, AttachedRegions::Empty, std::slice::from_ref(known))?;
+                    return Ok(outputs.into_iter().map(|value| context.known_value(value)).collect());
+                }
+                let mut feeder = input.clone();
+                feeder.set_declared_type(&declaration)?;
+                return context.residualize(operation, AttachedRegions::Empty, &[feeder]);
+            }
+        }
+
+        context.fold_or_residualize(operation, driver.region_programs(), inputs, None)
+    }
 }
 
 impl Display for PlaceOperation {
@@ -1332,11 +1555,16 @@ impl Hash for PlaceOperation {
             Some(PlacementRequest::Resolved(placement)) => Some(placement).hash(state),
             Some(end @ (PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. })) => Some(end).hash(state),
         };
-        hash(&self.source, state);
+
+        // An inferred source is hashed after the rest, so that operations without one hash as they always have.
+        hash(if self.source.is_some() { &self.source } else { &self.inferred_source }, state);
         hash(&self.target, state);
         self.may_alias.hash(state);
-        if self.is_source_inferred {
+        if self.inferred_source.is_some() {
             true.hash(state);
+            if self.source.is_some() {
+                hash(&self.inferred_source, state);
+            }
         }
     }
 }
@@ -1367,22 +1595,31 @@ impl Operation for PlaceOperation {
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         // An omitted source or target is not rendered, and neither is the default copy policy, so that the rendering
-        // of a placement stays compact. An identity placement therefore renders as its name alone. A source that
-        // differentiation inferred for a tangent renders under its own name, because it is not validated.
+        // of a placement stays compact. An identity placement therefore renders as its name alone. A return placement
+        // that differentiation inferred for a tangent renders under its own name, because it is not validated.
         let formatter = OperationFormatter::new(formatter, indentation, self.name())?;
-        if self.source.is_none() && self.target.is_none() && self.may_alias {
+
+        if self.source.is_none() && self.inferred_source.is_none() && self.target.is_none() && self.may_alias {
             return Ok(());
         }
+
         formatter.bracketed(|operation| {
             if let Some(source) = &self.source {
-                operation.field(if self.is_source_inferred { "inferred_source" } else { "source" }, source)?;
+                operation.field("source", source)?;
             }
+
+            if let Some(inferred_source) = &self.inferred_source {
+                operation.field("inferred_source", inferred_source)?;
+            }
+
             if let Some(target) = &self.target {
                 operation.field("target", target)?;
             }
+
             if !self.may_alias {
                 operation.field("may_alias", false)?;
             }
+
             Ok(())
         })
     }
@@ -1401,33 +1638,45 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         // The placement flows through the dispatch primitive of `Place`, which also carries the optional target and the
         // copy policy, so that interpretation over staging values (e.g., program batching, re-tracing, etc.) preserves
-        // them, while concrete values move to the target or stay where they are without one. A source that
-        // differentiation inferred describes the primal of the linearization that recorded it, not the value
-        // placed here (e.g., a tangent that lives elsewhere), so it is dropped like an absent source.
+        // them, while concrete values move to the target or stay where they are without one. A return placement that
+        // differentiation inferred describes the primal of the linearization that recorded it, not the value placed
+        // here (e.g., a tangent that lives elsewhere), so it is not validated or resolved, but it is passed along,
+        // so that replaying a staged placement keeps where its transpose returns the cotangent.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
 
         let placement = input.placement();
-        if let Some(placement) = &placement {
-            // Validate the stated source before completing it with the concrete placement.
-            Self::infer_output_type_allowing_uneven_splits(
-                &input.r#type(),
-                Some(placement.sharding()),
-                self.target(),
-                self.validated_source(),
-            )?;
-        }
 
-        let source = PlacementRequest::resolve_source(self.validated_source().cloned(), placement);
-        Ok(vec![<C::Value as Value>::Dispatch::place(input, self.target.as_ref(), source, self.may_alias)?])
+        // Validate the stated source before completing it with the concrete placement. A backend that compares
+        // placements across processes needs this result even when the local value is rejected.
+        let checked = placement.as_ref().map_or(Ok(()), |placement| {
+            self.infer_output_type_of_value(input, Some(placement.sharding()), false)
+                .map(|_| ())
+                .map_err(Into::into)
+        });
+
+        let source = PlacementRequest::resolve_source(self.source().cloned(), placement);
+        let operation = PlaceOperation::new(self.target.clone(), source)
+            .with_may_alias(self.may_alias)
+            .with_inferred_source(self.inferred_source.clone());
+        let outputs = <C::Value as Value>::Dispatch::place_operations(vec![(input.clone(), operation)], checked)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs)
     }
 }
 
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PlaceOperation
-where
-    C::Operation: From<PlaceOperation>,
+impl<C: Context<Type = ArrayType, Operation: From<PlaceOperation>>> PartiallyEvaluatableOperation<C>
+    for PlaceOperation
 {
-    // The copy policy is enforced where applications fold, through `Operation::requires_fresh_storage`.
+    #[inline]
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        self.partially_evaluate_in_family(self.clone().into(), context, driver, inputs)
+    }
 }
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
@@ -1481,88 +1730,129 @@ where
         // so that the batched placement rejects every request that the placement of a batch item rejects with the same
         // error. An unmapped input is its own batch item. A concrete batch reports the placement of a batch item, whose
         // sharding records what the type of the item omits (e.g., a pending reduction over an auto mesh axis), so the
-        // rule is applied with it, as the interpretation and differentiation rules apply it.
-        let item_placement = inputs[0].placement();
-        self.infer_output_type_requiring_even_splits(
-            &inputs[0].unbatched_type(),
-            item_placement.as_ref().map(Placement::sharding),
-        )?;
+        // rule is applied with it, as the interpretation and differentiation rules apply it. A packed value that is
+        // free to be placed elsewhere frees its batch items too (refer to `Self::infer_output_type_of_value`).
+        let prepare = || -> Result<_, BatchingError> {
+            let item_placement = inputs[0].placement();
+            let item_relocatable_type = inputs[0]
+                .value()
+                .relocatable_type()
+                .map(|r#type| r#type.unbatched(inputs[0].batch_axis()))
+                .transpose()?;
 
-        let mut target = self.target.clone();
-        let mut source = self.validated_source().cloned();
-        let pop_batch_sharding = |end: &mut Option<PlacementRequest>| match end {
-            Some(PlacementRequest::Resolved(placement)) => placement.pop_batch_sharding(),
-            Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => None,
-        };
-        let target_batch_sharding = pop_batch_sharding(&mut target);
-        let source_batch_sharding = pop_batch_sharding(&mut source);
-        let is_split = matches!(&target_batch_sharding, Some(ShardingDimension::Sharded(axes)) if !axes.is_empty());
-        let input = match inputs[0].batch_axis_position() {
-            None if is_split => {
-                // The new batch dimension is materialized where the input lives, which can be another mesh than the
-                // one whose axes the sharding of the batch of this level names (e.g., a cotangent that lives on the
-                // target mesh of a forward placement while the batch is split over the source mesh), so it is
-                // replicated there. The placement below then splits it as the target records.
-                let context = context.clone().with_axis_sharding(ShardingDimension::Replicated);
-                P::match_axis(&context, &inputs[0], Axis::from(0))?
-            }
-            _ => inputs[0].clone(),
-        };
+            self.infer_output_type_of_input_requiring_even_splits(
+                &inputs[0].unbatched_type(),
+                item_relocatable_type.as_ref(),
+                item_placement.as_ref().map(Placement::sharding),
+            )?;
 
-        if let Some(batch_axis) = input.batch_axis_position() {
-            if target.as_ref().and_then(PlacementRequest::layout).is_some() {
+            let mut target = self.target.clone();
+            let mut source = self.source().cloned();
+            let mut inferred_source = self.inferred_source.clone();
+            let pop_batch_sharding = |end: &mut Option<PlacementRequest>| match end {
+                Some(PlacementRequest::Resolved(placement)) => placement.pop_batch_sharding(),
+                Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => None,
+            };
+            let target_batch_sharding = pop_batch_sharding(&mut target);
+            let source_batch_sharding = pop_batch_sharding(&mut source);
+            let inferred_source_batch_sharding = pop_batch_sharding(&mut inferred_source);
+            let is_split = matches!(&target_batch_sharding, Some(ShardingDimension::Sharded(axes)) if !axes.is_empty());
+            if (is_split || inputs[0].batch_axis_position().is_some())
+                && target.as_ref().and_then(PlacementRequest::layout).is_some()
+            {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "`{PLACE_OPERATION_NAME}` cannot batch a target with an explicit layout, because the layout \
-                         does not describe the batch dimension",
+                     does not describe the batch dimension",
                     ),
                 });
             }
 
-            let batched = |placement: &Placement, batch_sharding: ShardingDimension| -> Result<_, BatchingError> {
-                let sharding = placement.sharding().batched(batch_axis, batch_sharding)?;
-                Ok(placement.clone().with_sharding(sharding).map_err(TypeError::from)?)
+            let input = match inputs[0].batch_axis_position() {
+                None if is_split => {
+                    // The new batch dimension is materialized where the input lives, which can be another mesh than the
+                    // one whose axes the sharding of the batch of this level names (e.g., a cotangent that lives on the
+                    // target mesh of a forward placement while the batch is split over the source mesh), so it is
+                    // replicated there. The placement below then splits it as the target records.
+                    let context = context.clone().with_axis_sharding(ShardingDimension::Replicated);
+                    P::match_axis(&context, &inputs[0], Axis::from(0))?
+                }
+                _ => inputs[0].clone(),
             };
 
-            if let Some(PlacementRequest::Resolved(placement)) = &target {
-                let batch_sharding = target_batch_sharding.unwrap_or(ShardingDimension::Replicated);
-                target = Some(PlacementRequest::Resolved(batched(placement, batch_sharding)?));
+            if let Some(batch_axis) = input.batch_axis_position() {
+                let batched = |placement: &Placement, batch_sharding: ShardingDimension| -> Result<_, BatchingError> {
+                    let sharding = placement.sharding().batched(batch_axis, batch_sharding)?;
+                    Ok(placement.clone().with_sharding(sharding).map_err(TypeError::from)?)
+                };
+
+                if let Some(PlacementRequest::Resolved(placement)) = &target {
+                    let batch_sharding = target_batch_sharding.unwrap_or(ShardingDimension::Replicated);
+                    target = Some(PlacementRequest::Resolved(batched(placement, batch_sharding)?));
+                }
+
+                // An inferred return placement is batched like a source, except that it is not validated against the
+                // input, so it gains the placement that the packed input type records for its batch dimension only when
+                // that type is tracked over the logical mesh of the return placement. Otherwise it is replicated.
+                let batched_source = |source: Option<PlacementRequest>,
+                                      batch_sharding: Option<ShardingDimension>,
+                                      is_inferred: bool|
+                 -> Result<_, BatchingError> {
+                    Ok(match source {
+                        Some(PlacementRequest::Resolved(placement)) => {
+                            let batch_sharding = batch_sharding.unwrap_or_else(|| {
+                                input
+                                    .r#type()
+                                    .sharding()
+                                    .filter(|sharding| {
+                                        !is_inferred || sharding.mesh() == placement.mesh().logical_mesh()
+                                    })
+                                    .map_or(ShardingDimension::Replicated, |sharding| {
+                                        sharding.dimensions()[batch_axis].clone()
+                                    })
+                            });
+                            Some(PlacementRequest::Resolved(batched(&placement.without_layout(), batch_sharding)?))
+                        }
+                        Some(source @ PlacementRequest::Device { .. }) => Some(source.without_layout()),
+                        Some(PlacementRequest::InPlace { memory, .. }) => {
+                            // An in-place source that named only a layout names nothing without it, so it is dropped.
+                            memory.map(|memory| PlacementRequest::InPlace { memory: Some(memory), layout: None })
+                        }
+                        None => None,
+                    })
+                };
+                source = batched_source(source, source_batch_sharding, false)?;
+                inferred_source = batched_source(inferred_source, inferred_source_batch_sharding, true)?;
             }
 
-            source = match source {
-                Some(PlacementRequest::Resolved(placement)) => {
-                    let batch_sharding = source_batch_sharding.unwrap_or_else(|| {
-                        input
-                            .r#type()
-                            .sharding()
-                            .map_or(ShardingDimension::Replicated, |sharding| sharding.dimensions()[batch_axis].clone())
-                    });
-                    Some(PlacementRequest::Resolved(batched(&placement.without_layout(), batch_sharding)?))
-                }
-                Some(source @ PlacementRequest::Device { .. }) => Some(source.without_layout()),
-                Some(PlacementRequest::InPlace { memory, .. }) => {
-                    // An in-place source that named only a layout names nothing without it, so it is dropped.
-                    memory.map(|memory| PlacementRequest::InPlace { memory: Some(memory), layout: None })
-                }
-                None => None,
-            };
-        }
+            // Placement changes preserve the packed shape and mapped batch axis. The copy policy applies unchanged
+            // to the packed value.
+            let packed = input.value();
+            let placement = packed.placement();
+            if let Some(placement) = &placement {
+                let validated = PlaceOperation::new(target.clone(), source.clone());
+                validated.infer_output_type_of_value(packed, Some(placement.sharding()), false)?;
+            }
+            let source = PlacementRequest::resolve_source(source, placement);
+            let operation = PlaceOperation::new(target, source)
+                .with_may_alias(self.may_alias)
+                .with_inferred_source(inferred_source);
+            Ok((input, operation))
+        };
 
-        // Placement changes preserve the packed shape and mapped batch axis, and the copy policy applies to the packed
-        // value unchanged.
-        let packed = input.value();
-        let placement = packed.placement();
-        if let Some(placement) = &placement {
-            Self::infer_output_type_allowing_uneven_splits(
-                &packed.r#type(),
-                Some(placement.sharding()),
-                target.as_ref(),
-                source.as_ref(),
-            )?;
-        }
-        let source = PlacementRequest::resolve_source(source, placement);
-        let output = <C::Value as Value>::Dispatch::place(packed, target.as_ref(), source, self.may_alias)?;
-        Ok(vec![ArrayBatch::new(output, input.batch_axis())?])
+        let (input, operation, checked) = match prepare() {
+            Ok((input, operation)) => (input, operation, Ok(())),
+            Err(error) => {
+                // The original operation still identifies the same destination processes. A backend can submit
+                // the local failure at the comparison that the packed placement would have used.
+                (inputs[0].clone(), self.clone(), Err(ProgramError::custom(error)))
+            }
+        };
+
+        let batch_axis = input.batch_axis();
+        let outputs = <C::Value as Value>::Dispatch::place_operations(vec![(input.into_value(), operation)], checked)?;
+        check_count!("output", outputs, 1, ProgramError);
+        outputs.into_iter().map(|output| ArrayBatch::new(output, batch_axis)).collect()
     }
 }
 
@@ -1574,7 +1864,7 @@ impl_differentiable_operation! {
         C::Value: Placed + Value<Dispatch: PlaceDispatch<ArrayType, C::Value>>,
         C::Operation: From<PlaceOperation>,
     {
-        |operation, context, _driver, inputs| {
+        |operation, _context, _driver, inputs| {
             // A placement is linear, so the tangent is placed with the same target and copy policy as the primal, and
             // symbolic zero tangents stay symbolic without allocation. The tangent can have another element type than
             // the primal (e.g., an `f8e8m0fnu` primal has an `f32` tangent), for which the layouts of the target and
@@ -1583,29 +1873,37 @@ impl_differentiable_operation! {
             // which leaves it where it is, as the primal is, and such an in-place source is replaced like an absent
             // one.
             //
-            // Without a source, the primal records where it concretely lives as its source, if anywhere. That source
-            // also tells the transpose of the linear map that places the tangent where to move the cotangent back to,
-            // but it does not constrain the tangent, which is free to live elsewhere (e.g., the tangent of an
-            // uncommitted primal on another mesh, which JAX accepts as well). So a concrete tangent is validated
-            // against the source that the caller gave and records where it lives itself, and a staged tangent records
-            // the source of the primal as inferred (refer to `PlaceOperation::is_source_inferred`), which transposition
-            // reads and which nothing validates against the tangent that the linear map is later applied to.
+            // Without a source, the primal records where it concretely lives as its source, if anywhere, and an
+            // in-place or device source is completed with that placement. That completed source also tells the
+            // transpose of the linear map that places the tangent where to move the cotangent back to, but it does not
+            // constrain the tangent, which is free to live elsewhere (e.g., the tangent of an uncommitted primal on
+            // another mesh, or in the memory that the caller's source names on another mesh, which JAX accepts as
+            // well). So a concrete tangent is validated against the source that the caller gave and records where it
+            // lives itself, and a staged tangent keeps the source that the caller gave as its forward source and
+            // records the completed source of the primal as its inferred return placement (refer to
+            // `PlaceOperation::return_placement`), which transposition reads and which nothing validates against the
+            // tangent that the linear map is later applied to. Both the primal and a concrete tangent are validated as
+            // concrete values (refer to `PlaceOperation::infer_output_type_of_value`), so either may be placed on the
+            // given source first when it is free to be placed elsewhere.
             check_count!("input", inputs, 1, ProgramError);
             let may_alias = operation.may_alias();
-            let given = operation.validated_source();
+            let given = operation.source();
             let input = inputs[0].primal();
             let placement = input.placement();
             if let Some(placement) = &placement {
-                let sharding = Some(placement.sharding());
-                PlaceOperation::infer_output_type_allowing_uneven_splits(
-                    &input.r#type(),
-                    sharding,
-                    operation.target(),
-                    given,
-                )?;
+                operation.infer_output_type_of_value(input, Some(placement.sharding()), false)?;
             }
+
+            let is_placed = placement.is_some();
+            let clears_reduction_state = placement.as_ref().is_some_and(|placement| {
+                !placement.sharding().unreduced_axes().is_empty() || !placement.sharding().reduced_axes().is_empty()
+            });
+
             let source = PlacementRequest::resolve_source(given.cloned(), placement);
-            let primal = <C::Value as Value>::Dispatch::place(input, operation.target(), source.clone(), may_alias)?;
+            let primal_operation = PlaceOperation::new(operation.target().cloned(), source.clone())
+                .with_may_alias(may_alias)
+                .with_inferred_source(operation.inferred_source.clone());
+            let primal = <C::Value as Value>::Dispatch::place_operation(input, primal_operation)?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
@@ -1613,32 +1911,63 @@ impl_differentiable_operation! {
                         end.map(PlacementRequest::without_layout)
                             .filter(|end| !matches!(end, PlacementRequest::InPlace { memory: None, layout: None }))
                     };
-                    let target = without_layout(operation.target().cloned());
+                    let mut target = without_layout(operation.target().cloned());
+                    let tangent_placement = tangent.placement();
+
+                    // A bare device target retains a one-device logical mesh from its input and can clear its
+                    // reduction state. Keep that request for an on-mesh tangent, including a staged tangent whose
+                    // future value may carry the same reduction state as the primal. Otherwise save the primal's
+                    // destination for tangents that can arrive from another mesh, including the effective memory.
+                    let primal_type = primal.r#type();
+                    if let Some(request @ PlacementRequest::Device { device, .. }) = &target
+                        && let Some(sharding) = primal_type.sharding()
+                        && is_placed
+                        && sharding.mesh().device_count() == 1
+                        && input.r#type().sharding() == Some(sharding)
+                        && match &tangent_placement {
+                            Some(placement) => placement.sharding().mesh() != sharding.mesh(),
+                            None => !clears_reduction_state || tangent.r#type().sharding() != Some(sharding),
+                        }
+                    {
+                        let mesh = DeviceMesh::new(sharding.mesh().clone(), vec![*device]).map_err(TypeError::from)?;
+                        let placement = Placement::new(mesh, sharding.clone()).map_err(TypeError::from)?
+                            .with_memory(request.target_memory().expect("a device target always selects memory"));
+                        target = Some(PlacementRequest::Resolved(placement));
+                    }
+
                     let given = without_layout(given.cloned());
-                    MaybeZero::Value(match (tangent.placement(), without_layout(source)) {
-                        (Some(placement), _) => {
-                            let r#type = tangent.r#type();
-                            let sharding = Some(placement.sharding());
-                            PlaceOperation::infer_output_type_allowing_uneven_splits(
-                                &r#type,
-                                sharding,
-                                target.as_ref(),
-                                given.as_ref(),
-                            )?;
+                    MaybeZero::Value(match tangent_placement {
+                        Some(placement) => {
+                            let validated = PlaceOperation::new(target.clone(), given.clone());
+                            validated.infer_output_type_of_value(tangent, Some(placement.sharding()), false)?;
                             let source = PlacementRequest::resolve_source(given, Some(placement));
-                            <C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?
+                            let operation = PlaceOperation::new(target, source)
+                                .with_may_alias(may_alias)
+                                .with_inferred_source(without_layout(operation.inferred_source.clone()));
+                            <C::Value as Value>::Dispatch::place_operation(tangent, operation)?
                         }
-                        (None, Some(source)) if given.is_none() => {
-                            let operation =
-                                PlaceOperation { source: Some(source), target, may_alias, is_source_inferred: true };
-                            context.tangent().bind(operation, Vec::new(), std::slice::from_ref(tangent))?.remove(0)
-                        }
-                        (None, source) => {
-                            <C::Value as Value>::Dispatch::place(tangent, target.as_ref(), source, may_alias)?
+                        None => {
+                            // A placement that already records an inferred return placement is a saved linear map
+                            // that is being rebound (e.g., linearized again or pulled back at another point), whose
+                            // cotangent returns where its linearization said, as JAX's saved `device_put` keeps its
+                            // sources, and not where the primal of this rebinding concretely lives. Otherwise, the
+                            // return placement is the completed source of a concrete primal, and a staged primal says
+                            // nothing about where it lives, so the tangent returns the cotangent where the transpose
+                            // of this placement would.
+                            let returned = without_layout(match &operation.inferred_source {
+                                Some(inferred_source) => Some(inferred_source.clone()),
+                                None if is_placed => source,
+                                None => operation.return_placement().cloned(),
+                            });
+                            let operation = PlaceOperation::new(target, given)
+                                .with_may_alias(may_alias)
+                                .with_inferred_source(returned);
+                            <C::Value as Value>::Dispatch::place_operation(tangent, operation)?
                         }
                     })
                 }
             };
+
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
@@ -1647,6 +1976,7 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<BroadcastOperation> + From<PlaceOperation>,
     {
+        unaligned_derivative_input |input_index| { input_index == 0 }
         |operation, context, _driver, inputs, outputs, accumulators| {
             // A placement is the identity linear map between two placements, so its transpose moves the output
             // cotangent back to where the input lived, as JAX's `device_put` transpose does by swapping its devices
@@ -1678,7 +2008,7 @@ impl_differentiable_operation! {
             // the type rule checked that such a source restates the state that the type records. The reduction state
             // whose cotangent dual the input cotangent must carry is therefore that of a placement source, and that
             // of the type of the input otherwise, so that no decision below drops a state that only the source shows.
-            let input_sharding = match operation.source() {
+            let input_sharding = match operation.return_placement() {
                 Some(PlacementRequest::Resolved(placement)) => Some(placement.sharding()),
                 _ => input_type.sharding(),
             };
@@ -1733,7 +2063,7 @@ impl_differentiable_operation! {
             // the input cotangent would lose it even over an axis of size one, where an explicit axis keeps it. Such
             // transpositions are rejected rather than returning a cotangent without the dual state.
             if !operation.transposes_in_place(&input_type) {
-                let auto_axes = [operation.source(), operation.target()]
+                let auto_axes = [operation.return_placement(), operation.target()]
                     .into_iter()
                     .flatten()
                     .filter_map(PlacementRequest::placement)
@@ -1816,24 +2146,27 @@ impl_differentiable_operation! {
             // a placement swap. An in-place source after a target that moved the value names no devices to return it
             // to, so a cotangent that a device target gathered or that lives on a mesh of another topology is rejected.
             let in_place = || -> Result<PlaceOperation, ProgramError> {
-                let has_in_place_source = operation.source().is_some_and(|source| !source.moves());
+                let has_in_place_source = operation.return_placement().is_some_and(|source| !source.moves());
                 if has_in_place_source && is_gathered {
                     return Err(gathered_error());
                 }
+
                 if has_in_place_source && crosses_meshes {
                     return Err(cross_mesh_error());
                 }
+
                 let memory = Some(input_type.memory());
                 let target = (operation.target().is_some() || has_in_place_source)
                     .then_some(PlacementRequest::InPlace { memory, layout: None });
-                let source = match operation.source() {
+                let source = match operation.return_placement() {
                     Some(source) if source.moves() => Some(source),
                     _ => operation.target(),
                 };
+
                 Ok(PlaceOperation::new(target, source.map(transposed_end).transpose()?.flatten()))
             };
 
-            let transposed = match (operation.source(), operation.target()) {
+            let transposed = match (operation.return_placement(), operation.target()) {
                 _ if operation.transposes_in_place(&input_type) => in_place()?,
                 (Some(source), target) => {
                     // With a known source, the cotangent moves back to the source in the memory of the input for every
@@ -1843,10 +2176,13 @@ impl_differentiable_operation! {
                     // source becomes the placement of the input cotangent over the logical mesh of the input on that
                     // device (or stays a device for an input without a tracked sharding), and an in-place source, which
                     // names no devices, transposes in place (refer to `in_place`). The forward target becomes the
-                    // transposed source, so that a second transposition moves the value to the forward target again,
-                    // except for an in-place target, which says nothing about where the output cotangent lives. After
-                    // a device target, the output cotangent has no reduction state, so a placement source loses its
-                    // reduction state too, because a placement cannot change it, and the broadcast below restores it.
+                    // return placement of the transposed placement (refer to `PlaceOperation::return_placement`) and
+                    // not its source, so that a second transposition moves the value to the forward target again while
+                    // nothing constrains where the output cotangent lives (e.g., a gradient seed committed on other
+                    // devices, which JAX's transpose moves from wherever it is), except for an in-place target, which
+                    // says nothing about where the output cotangent lives. After a device target, the output cotangent
+                    // has no reduction state, so a placement source loses its reduction state too, because a placement
+                    // cannot change it, and the broadcast below restores it.
                     let memory = Some(input_type.memory());
                     let transposed_target = match source {
                         PlacementRequest::Resolved(placement) => {
@@ -1884,7 +2220,7 @@ impl_differentiable_operation! {
                         }
                     };
                     let transposed_source = target.map(transposed_end).transpose()?.flatten();
-                    PlaceOperation::new(transposed_target, transposed_source)
+                    PlaceOperation::new(transposed_target, None).with_inferred_source(transposed_source)
                 }
                 (None, None | Some(PlacementRequest::InPlace { .. })) => {
                     // Without a source, the devices of the input are not known, so an in-place target returns the
@@ -1901,9 +2237,9 @@ impl_differentiable_operation! {
                     // an unknown source where it is. Restoring the input's tracked sharding and memory keeps the
                     // cotangent well typed, and it is exact inside a compiled program, which runs on a single mesh.
                     // An input that is tracked over another mesh did change meshes, and its devices are not known.
-                    // The forward target becomes the transposed source, as for a known source, so that a second
-                    // transposition moves the value to the forward target again, including its placement along auto
-                    // mesh axes, which neither type records.
+                    // The forward target becomes the return placement of the transposed placement, as for a known
+                    // source, so that a second transposition moves the value to the forward target again,
+                    // including its placement along auto mesh axes, which neither type records.
                     if crosses_meshes {
                         return Err(cross_mesh_error().into());
                     }
@@ -1913,7 +2249,8 @@ impl_differentiable_operation! {
                     };
                     let source = transposed_end(&PlacementRequest::Resolved(target.clone()))?;
                     let placement = target.clone().with_sharding(sharding).map_err(TypeError::from)?;
-                    PlaceOperation::new(placement.without_layout().with_memory(input_type.memory()), source)
+                    PlaceOperation::new(placement.without_layout().with_memory(input_type.memory()), None)
+                        .with_inferred_source(source)
                 }
                 (None, Some(PlacementRequest::Device { device, .. })) => {
                     // Without a source, the devices of the input are not known, so the cotangent stays on the device
@@ -2078,12 +2415,12 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
     }
 }
 
-/// Executes one [`PlaceOperation`] for a leaf through its [`Value::Dispatch`] policy. A domain-dispatched leaf binds
-/// the operation in its own context. Direct backends can implement this trait on [`ValueDirectDispatch`] for their
-/// values. This primitive and [`Place`], which calls it for each leaf, use the source that they are given as is. A
-/// source is inferred only by the rules of [`PlaceOperation`] that execute a placement on a value that concretely lives
-/// somewhere (i.e., interpretation, batching, and differentiation, refer to [`PlacementRequest::resolve_source`]).
-/// Array IR values project the array member, place it, and lift the result back into their original universe.
+/// Executes [`PlaceOperation`]s through a leaf's [`Value::Dispatch`] policy. A [`PlaceThroughDomain`] value binds
+/// the operation in its own context. A backend can implement this trait for its array value to coordinate placement
+/// across leaves. This primitive and [`Place`] use the source that they are given as is. A source is inferred only
+/// by the rules of [`PlaceOperation`] that execute a placement on a value that concretely lives somewhere (i.e.,
+/// interpretation, batching, and differentiation, refer to [`PlacementRequest::resolve_source`]). Array IR values
+/// project the array member, place it, and lift the result back into their original universe.
 ///
 /// Unlike [`Place`], which takes trees of targets and sources and places each leaf with a copy policy that
 /// lets the output share storage with its input, this primitive places one value, takes its target and source as
@@ -2098,31 +2435,57 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
 /// computes for it.
 pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
     /// Moves `input` to `target` and records `source` as its expected placement. A [`None`] target leaves it where it
-    /// is. The result may share storage with `input` only when `may_alias` is `true`.
+    /// is. The result may share storage with `input` only when `may_alias` is `true`. This places `input` with a new
+    /// [`PlaceOperation`] through [`Self::place_operation`].
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects the target or the source for
-    /// the type of `input` (e.g., when their ranks differ from that of `input` or the target changes its reduction
-    /// state), and [`ProgramError::InvalidInputCount`] or [`ProgramError::InvalidOutputCount`] when a context binds
-    /// the placement with an unexpected number of values. Array IR values return [`ProgramError::Type`] for a member
-    /// that is not an array. Backends that execute the placement on concrete values return their own errors (e.g.,
-    /// when a transfer to the devices of `target` fails), and staging contexts return the errors of staging it.
+    /// Returns the errors of [`Self::place_operation`].
+    #[inline]
     fn place(
         input: &V,
         target: Option<&PlacementRequest>,
         source: Option<PlacementRequest>,
         may_alias: bool,
-    ) -> Result<V, ProgramError>;
+    ) -> Result<V, ProgramError> {
+        Self::place_operation(input, PlaceOperation::new(target.cloned(), source).with_may_alias(may_alias))
+    }
+
+    /// Places `input` with `operation` (i.e., moves it to the target of `operation` and records its forward source,
+    /// refer to [`PlaceOperation::source`], with its copy policy). Implementations for staged values must also record
+    /// the return placement of `operation` (refer to [`PlaceOperation::return_placement`]), which the rules of
+    /// [`PlaceOperation`] that rebuild it pass along, so that the transpose of the staged placement returns the
+    /// cotangent there, and implementations for concrete values may ignore it. A target or source sharding with fewer
+    /// dimensions than `input` is first padded with trailing replicated dimensions (via [`PlacementRequest::padded`]),
+    /// so that the placement that is executed or staged names full rank shardings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::Type`] when [`PlaceOperation`] type inference rejects the target or the source for
+    /// the type of `input` (e.g., when their shardings have more dimensions than `input` or the target changes its
+    /// reduction state), and [`ProgramError::InvalidInputCount`] or [`ProgramError::InvalidOutputCount`] when a
+    /// context binds the placement with an unexpected number of values. Array IR values return [`ProgramError::Type`]
+    /// for a member that is not an array. Backends that execute the placement on concrete values return their own
+    /// errors (e.g., when a transfer to the devices of the target fails), and staging contexts return the errors
+    /// of staging it.
+    fn place_operation(input: &V, operation: PlaceOperation) -> Result<V, ProgramError>;
+
+    /// Places independent leaves in order, each with its own operation. A distributed dispatch can admit the whole
+    /// group before any leaf starts device work. A failed `checked` result is returned before executing any leaf.
+    /// The bindings still identify the placement participants, so a distributed dispatch can report the failure
+    /// through its admission before returning.
+    #[inline]
+    fn place_operations(
+        bindings: Vec<(V, PlaceOperation)>,
+        checked: Result<(), ProgramError>,
+    ) -> Result<Vec<V>, ProgramError> {
+        checked?;
+        bindings.into_iter().map(|(input, operation)| Self::place_operation(&input, operation)).collect()
+    }
 }
 
 impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
-    fn place(
-        input: &Array,
-        target: Option<&PlacementRequest>,
-        source: Option<PlacementRequest>,
-        may_alias: bool,
-    ) -> Result<Array, ProgramError> {
+    fn place_operation(input: &Array, operation: PlaceOperation) -> Result<Array, ProgramError> {
         // A reference array is a host value without devices, so placing it keeps its elements unchanged. Its type still
         // records the placement, and the output type comes from the `PlaceOperation` type inference rule itself, so
         // that eager evaluation validates the target and source exactly like staged programs do. The layout determines
@@ -2133,13 +2496,14 @@ impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
         // the output type is the input type, so the storage is shared or copied as the copy policy says.
         //
         // A layout describes each shard of a value, whereas a reference array stores the whole value in one buffer,
-        // so it can only materialize a layout that also addresses the whole value. The type rule accepts a layout that
-        // addresses each shard of a split value only (e.g., the byte strides of a column shard of a matrix, which
+        // so it can only materialize a layout that also addresses the whole value. The type rule accepts a layout
+        // that addresses each shard of a split value only (e.g., the byte strides of a column shard of a matrix, which
         // overlap the rows of the whole matrix), which a backend that stores shards materializes, and this backend
         // rejects it here with an error that says so, rather than applying it to the whole value. The storage of an
         // array is publicly mutable, so it is decoded with the fallible decoder, which rejects element encodings that
-        // are not valid (e.g., a Boolean byte other than `0` and `1`).
-        let operation = PlaceOperation::new(target.cloned(), source).with_may_alias(may_alias);
+        // are not valid (e.g., a Boolean byte other than `0` and `1`). A reference array lives nowhere, so it has no
+        // return placement to keep.
+        let operation = operation.padded(input.r#type().rank())?;
         let mut output_types = operation.infer_output_types(&[input.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
         let output_type = output_types.remove(0);
@@ -2153,7 +2517,7 @@ impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
                 });
             }
             Array::from_logical_bytes(output_type, &decode_logical_bytes(&input.r#type(), input.storage_bytes())?)
-        } else if may_alias {
+        } else if operation.may_alias() {
             Ok(Array::new_unchecked(output_type, input.shared_storage_bytes().clone()))
         } else {
             Ok(Array::new_unchecked(output_type, Arc::new(input.storage_bytes().to_vec())))
@@ -2161,26 +2525,42 @@ impl PlaceDispatch<ArrayType, Array> for ValueDirectDispatch {
     }
 }
 
-impl<
-    V: Value<
-            Type = ArrayType,
-            Dispatch = ValueDomainDispatch,
-            Domain: Context<Type = ArrayType, Operation: From<PlaceOperation>>,
-        >,
-> PlaceDispatch<ArrayType, V> for ValueDomainDispatch
+/// Opts an array value into binding [`PlaceOperation`] through its [`Value::domain`]. The provided [`PlaceDispatch`]
+/// implementation applies when that context supports the operation. The opt-in keeps this blanket implementation
+/// disjoint from a backend's own [`PlaceDispatch`] implementation for arrays that also use [`ValueDomainDispatch`]
+/// for their other capabilities. That lets the backend coordinate a whole tree through
+/// [`PlaceDispatch::place_operations`].
+pub trait PlaceThroughDomain: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> {}
+
+impl<C: Context> PlaceThroughDomain for Tracer<C> where Self: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> {}
+
+impl<C: Context> PlaceThroughDomain for PartialTracer<C> where
+    Self: Value<Type = ArrayType, Dispatch = ValueDomainDispatch>
+{
+}
+
+impl<C: Context, P: BatchingPolicy<C>> PlaceThroughDomain for BatchingTracer<C, P> where
+    Self: Value<Type = ArrayType, Dispatch = ValueDomainDispatch>
+{
+}
+
+impl<C: Context, P: DifferentiationPolicy<C>> PlaceThroughDomain for DifferentiationTracer<C, P> where
+    Self: Value<Type = ArrayType, Dispatch = ValueDomainDispatch>
+{
+}
+
+impl<V> PlaceThroughDomain for ProjectedValue<ArrayType, V> where
+    Self: Value<Type = ArrayType, Dispatch = ValueDomainDispatch>
+{
+}
+
+impl<V: PlaceThroughDomain<Domain: Context<Type = ArrayType, Operation: From<PlaceOperation>>>>
+    PlaceDispatch<ArrayType, V> for ValueDomainDispatch
 {
     #[inline]
-    fn place(
-        input: &V,
-        target: Option<&PlacementRequest>,
-        source: Option<PlacementRequest>,
-        may_alias: bool,
-    ) -> Result<V, ProgramError> {
-        let outputs = input.domain().bind(
-            PlaceOperation::new(target.cloned(), source).with_may_alias(may_alias),
-            Vec::new(),
-            std::slice::from_ref(input),
-        )?;
+    fn place_operation(input: &V, operation: PlaceOperation) -> Result<V, ProgramError> {
+        let operation = operation.padded(input.r#type().rank())?;
+        let outputs = input.domain().bind(operation, Vec::new(), std::slice::from_ref(input))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.into_iter().next().unwrap())
     }
@@ -2192,15 +2572,27 @@ impl<
 > PlaceDispatch<ArrayIrType, V> for V::Dispatch
 {
     #[inline]
-    fn place(
-        input: &V,
-        target: Option<&PlacementRequest>,
-        source: Option<PlacementRequest>,
-        may_alias: bool,
-    ) -> Result<V, ProgramError> {
+    fn place_operation(input: &V, operation: PlaceOperation) -> Result<V, ProgramError> {
         let input = input.clone().into_projected()?;
-        let output = <V::Projected as Value>::Dispatch::place(&input, target, source, may_alias)?;
-        Ok(V::from_projected(output))
+        Ok(V::from_projected(<V::Projected as Value>::Dispatch::place_operation(&input, operation)?))
+    }
+
+    fn place_operations(
+        bindings: Vec<(V, PlaceOperation)>,
+        checked: Result<(), ProgramError>,
+    ) -> Result<Vec<V>, ProgramError> {
+        let bindings = bindings
+            .into_iter()
+            .map(|(input, operation)| Ok((input.into_projected()?, operation)))
+            .collect::<Result<_, ProgramError>>();
+        let bindings = match bindings {
+            Ok(bindings) => bindings,
+            Err(error) => return checked.and(Err(error)),
+        };
+        Ok(<V::Projected as Value>::Dispatch::place_operations(bindings, checked)?
+            .into_iter()
+            .map(V::from_projected)
+            .collect())
     }
 }
 
@@ -2237,7 +2629,9 @@ impl<P: PlacementRequestParameter, S: Parameterized<P>> PlacementSources<P, S> f
 /// also be any other [`PlacementRequest`] (e.g., a [`Device`], which without a memory also selects the default memory
 /// of that device, or a bare [`Memory`], which changes only the memory of a value where it lives), whose forms follow
 /// the contract that [`PlacementRequest`] states. Refer to [`PlaceOperation`] for the validation that the target and
-/// source go through.
+/// source go through. A target or source sharding with fewer dimensions than the value is padded with trailing
+/// replicated dimensions, as JAX pads a short partition specification (refer to [`PlacementRequest::padded`]),
+/// and one with more dimensions than the value is rejected.
 ///
 /// The source is informative. It states where the value is expected to live when the placement is created. Placement
 /// over auto mesh axes and devices are runtime state that types do not record, so transposition uses the source to move
@@ -2262,10 +2656,12 @@ impl<P: PlacementRequestParameter, S: Parameterized<P>> PlacementSources<P, S> f
 ///
 /// A single value accepts its target followed by an optional source. A [`Parameterized`] receiver accepts placements
 /// with the same structure (i.e., the same ordered parameter paths and containers without children) and preserves its
-/// structure and static fields. The leaf parameter `P` defaults to `Self`, so single-value bounds can use `Place`, and
-/// a structured receiver implements `Place<P>` for its leaf type `P`. The universe parameter `T` defaults to the leaf's
-/// [`Capability`] universe, which is [`ArrayType`] for homogeneous arrays and [`ArrayIrType`] for array IR values, and
-/// a structure uses the same universe as its leaves.
+/// structure and static fields. Distributed eager backends can admit the tree as a group before placing any leaf.
+/// Callers must make matching tree calls on the ranks that the backend requires for that agreement. The leaf parameter
+/// `P` defaults to `Self`, so single-value bounds can use `Place`, and a structured receiver implements `Place<P>` for
+/// its leaf type `P`. The universe parameter `T` defaults to the leaf's [`Capability`] universe, which is [`ArrayType`]
+/// for homogeneous arrays and [`ArrayIrType`] for array IR values, and a structure uses the same universe as its
+/// leaves.
 ///
 /// # Examples
 ///
@@ -2300,17 +2696,18 @@ pub trait Place<P: Parameter + Capability = Self, T = <P as Capability>::Univers
     /// The sources follow the same conversion. Pass `None` to infer all sources, `Some(&sources)` to supply a tree of
     /// [`Placement`]s, or a borrowed tree of any [`PlacementRequestParameter`] (e.g., `&(None, Some(device))`) to
     /// supply the sources of its elements and infer those that are [`None`]. Each inferred source comes from the
-    /// leaf's [`Placed::placement`], which can itself be unknown.
+    /// leaf's [`Placed::placement`], which can itself be unknown. Map keys are matched by their
+    /// [`Debug`](std::fmt::Debug) text. In corresponding maps, callers must ensure that equivalent keys render
+    /// identically and that different keys render differently across the receiver, targets, and sources.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::Parameter`] with [`ParameterError::DuplicateParameterPaths`] before placing any leaf
     /// if distinct nodes of the receiver have the same path (e.g., the entries of two map keys with the same `Debug`
-    /// text), which could not be matched with their targets and sources otherwise, and
-    /// [`ProgramError::InvalidArgument`] before placing any leaf if the ordered parameter paths or the node paths
-    /// (refer to [`Parameterized::paths`]) of the receiver, targets, or supplied sources differ, and otherwise the
-    /// first error that placing a leaf returns (refer to [`PlaceDispatch::place`]), such as a [`ProgramError::Type`]
-    /// when [`PlaceOperation`] type inference rejects the target or source of that leaf.
+    /// text). Returns [`ProgramError::InvalidArgument`] before placing any leaf if the receiver, targets, or supplied
+    /// sources have different ordered leaf or node paths. Otherwise, returns the first error that placing a leaf
+    /// returns (refer to [`PlaceDispatch::place`]), such as a [`ProgramError::Type`] when [`PlaceOperation`] type
+    /// inference rejects the target or source of that leaf.
     fn place<Target: PlacementRequestParameter, Source: PlacementRequestParameter>(
         &self,
         targets: &<Self as Parameterized<P>>::To<Target>,
@@ -2334,13 +2731,8 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
         S::Family: ParameterizedFamily<Target> + ParameterizedFamily<Source>,
     {
         // Distinct nodes of one tree with the same path (e.g., the entries of two map keys with the same `Debug` text)
-        // cannot be told apart by path, so the leaves of the receiver would be matched with those of the targets and
-        // the sources by position, which could give one key the placement of another. They are rejected as the tree
-        // prefix expansion of `Parameterized::broadcast_to_parameter_structure` rejects them. The targets and the
-        // sources must have the node paths of the receiver, so checking the receiver covers them. Two structures with
-        // the same leaf paths can still differ in their other nodes (e.g., `[[x], []]` and `[[x]]`), and two
-        // structures with the same node paths can still differ in their leaves (e.g., `[x]` and `[[]]`), so both are
-        // compared.
+        // cannot be told apart by path. Reject duplicate receiver paths before aligning the three trees. Compare both
+        // node paths and leaf paths so that empty containers are distinguished from missing nodes and from leaves.
         let sources = sources.as_parameterized();
         let paths = self.paths();
         let duplicate_paths = find_duplicate_paths(&paths);
@@ -2363,19 +2755,20 @@ impl<T, P: Value<Dispatch: PlaceDispatch<P::Type, P>> + Capability<Universe = T>
         }
 
         let mut sources = sources.into_iter().flat_map(|sources| sources.parameters());
-        let outputs = self
+        let bindings = self
             .parameters()
             .zip(targets.parameters())
             .map(|(input, target)| {
                 // The source is placed as it is given, and the rule that executes the placement on a value that
                 // concretely lives somewhere completes it with that placement after it validates it (refer to
-                // `PlacementRequest::resolve_source`), so that this capability never accepts a request that the type
-                // rule rejects.
-                let source = sources.next().and_then(|source| source.clone().into_optional_placement_request());
-                let target = target.clone().into_optional_placement_request();
-                P::Dispatch::place(input, target.as_ref(), source, true)
+                // `PlacementRequest::resolve_source`), so that this capability never accepts a request that
+                // the type rule rejects.
+                let source = sources.next().cloned().and_then(PlacementRequestParameter::into_request);
+                let target = target.clone().into_request();
+                (input.clone(), PlaceOperation::new(target, source))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
+        let outputs = P::Dispatch::place_operations(bindings, Ok(()))?;
 
         Ok(S::from_parameters(self.parameter_structure(), outputs)?)
     }
@@ -2433,11 +2826,11 @@ mod tests {
         DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, Shape, StridedLayout, TiledLayout, UnreducedKind,
     };
     use crate::axes::{NamedAxes, NamedAxis};
-    use crate::batching::{BatchAxis, batch};
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationError, NothingSavable, TransposableOperation,
-        TranspositionContext, differentiate_at,
+        TranspositionContext, differentiate_at, rematerialize,
     };
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::comparisons::Compare;
@@ -2508,6 +2901,8 @@ mod tests {
             self.placement.clone()
         }
     }
+
+    impl PlaceThroughDomain for PlacedArray {}
 
     /// Eager context that records the operations bound in it and interprets them over reference arrays. The outputs
     /// of a placement live on its target, or where its input lives when it has no target, and all other outputs, as
@@ -2753,6 +3148,29 @@ mod tests {
         assert!(PlacementRequest::from(placement(&mesh_x(), vec![ShardingDimension::Replicated])).moves());
         assert!(PlacementRequest::from(Device::new(0, 0)).moves());
         assert!(!PlacementRequest::from(PINNED_HOST).moves());
+    }
+
+    #[test]
+    fn test_placement_request_padded() {
+        // A sharding with fewer dimensions than the value is padded with trailing replicated dimensions, and the batch
+        // shardings and the storage of the placement are kept. A sharding of the rank of the value or of a greater
+        // rank, a device, and an in-place request are returned as they are.
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let short = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])])
+            .with_batch_sharding(ShardingDimension::Replicated)
+            .unwrap()
+            .with_memory(PINNED_HOST)
+            .with_layout(layout);
+        let dimensions = vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated];
+        let sharding = Sharding::new(mesh_x().logical_mesh().clone(), dimensions).unwrap();
+        let padded = PlacementRequest::from(short.clone().with_sharding(sharding).unwrap());
+        assert_eq!(PlacementRequest::from(short.clone()).padded(2), Ok(padded.clone()));
+        assert_eq!(PlacementRequest::from(short.clone()).padded(1), Ok(PlacementRequest::from(short.clone())));
+        assert_eq!(padded.clone().padded(1), Ok(padded));
+        let device = PlacementRequest::from(Device::new(0, 0));
+        assert_eq!(device.clone().padded(2), Ok(device));
+        let in_place = PlacementRequest::from(PINNED_HOST);
+        assert_eq!(in_place.clone().padded(2), Ok(in_place));
     }
 
     #[test]
@@ -3637,12 +4055,11 @@ mod tests {
     #[test]
     fn test_place_operation_type_inference_device_target() {
         // A device target names no mesh, so the output keeps the sharding that the input type tracks over a mesh of one
-        // device, an input that the type tracks over more devices is gathered (i.e., replicated over the canonical mesh
-        // of one device), and the output takes the memory and layout of the target. A layout must still address the
+        // device. An input that the type tracks over more devices is gathered and its output type has no sharding.
+        // The output takes the memory and layout of the target. A layout must still address the
         // input shape, and a value inside a manual region still cannot be moved. Reduction state over a mesh axis
         // larger than one cannot live on one device.
         let device = Device::new(0, 0);
-        let gathered = Sharding::replicated(LogicalMesh::single_device(), 1);
         let single_device_mesh =
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let single_device_input_type = ArrayType::new_static(DataType::F32, [4])
@@ -3676,7 +4093,7 @@ mod tests {
             }, {
                 input_types = [pinned_input_type.clone()],
                 output_types = [
-                    input_type.clone().with_sharding(gathered.clone()).unwrap().with_layout(layout.clone()),
+                    input_type.clone().with_layout(layout.clone()),
                 ],
             }, {
                 input_types = [unreduced_input_type],
@@ -3708,10 +4125,10 @@ mod tests {
             operation = PlaceOperation::new(PlacementRequest::from(device), source.clone()),
             cases = [{
                 input_types = [pinned_input_type.clone()],
-                output_types = [input_type.clone().with_sharding(gathered.clone()).unwrap()],
+                output_types = [input_type.clone()],
             }, {
                 input_types = [pinned_input_type.clone().with_layout(layout.clone())],
-                output_types = [input_type.clone().with_sharding(gathered).unwrap().with_layout(layout.clone())],
+                output_types = [input_type.clone().with_layout(layout.clone())],
             }, {
                 input_types = [replicated_input_type.clone()],
                 error = format!(
@@ -3719,6 +4136,16 @@ mod tests {
                      `{replicated_input_type}`",
                     source.sharding(),
                 ),
+            }],
+        );
+
+        let anonymous = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let target = placement(&anonymous, vec![ShardingDimension::Replicated]);
+        check_operation_type_inference!(
+            operation = PlaceOperation::new(target, None),
+            cases = [{
+                input_types = [replicated_input_type],
+                output_types = [input_type],
             }],
         );
     }
@@ -3748,7 +4175,6 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
         let small_sharded = Sharding::new(small_mesh, vec![ShardingDimension::sharded(["w"])]).unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
-        let gathered = Sharding::replicated(LogicalMesh::single_device(), 1);
         let with_sharding = |sharding: Sharding| input_type.clone().with_sharding(sharding).unwrap();
         let unreduced = small_sharded.clone().with_unreduced_axes(["x"]).unwrap().with_reduced_axes(["y"]).unwrap();
         let maximum = small_sharded
@@ -3771,12 +4197,12 @@ mod tests {
                 input_types = [with_sharding(
                     Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x", "z"]).unwrap(),
                 )],
-                output_types = [with_sharding(gathered.clone())],
+                output_types = [input_type.clone()],
             }, {
                 input_types = [with_sharding(
                     sharded.with_unreduced_axes(["x"]).unwrap().with_reduced_axes(["y"]).unwrap(),
                 )],
-                output_types = [with_sharding(gathered)],
+                output_types = [input_type.clone()],
             }, {
                 input_types = [with_sharding(
                     Sharding::replicated(mesh, 1)
@@ -4101,7 +4527,6 @@ mod tests {
                 ),
             }],
         );
-        let gathered = Sharding::replicated(LogicalMesh::single_device(), 2);
         let tiled = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         for (target, output_type) in [
             (
@@ -4113,7 +4538,7 @@ mod tests {
                 PlacementRequest::from(replicated.clone()),
                 input_type.clone().with_sharding(replicated.sharding().clone()).unwrap(),
             ),
-            (PlacementRequest::from(Device::new(0, 0)), input_type.clone().with_sharding(gathered.clone()).unwrap()),
+            (PlacementRequest::from(Device::new(0, 0)), input_type.clone().with_sharding(None).unwrap()),
         ] {
             check_operation_type_inference!(
                 operation = PlaceOperation::new(target, None),
@@ -4127,7 +4552,7 @@ mod tests {
             operation = PlaceOperation::new(Device::new(0, 0), None),
             cases = [{
                 input_types = [input_type.clone().with_layout(tiled.clone())],
-                output_types = [input_type.clone().with_sharding(gathered).unwrap().with_layout(tiled)],
+                output_types = [input_type.clone().with_sharding(None).unwrap().with_layout(tiled)],
             }],
         );
 
@@ -4243,8 +4668,10 @@ mod tests {
         // target, and at the smallest shard for a device source.
         let split_rows = placement(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
         let untracked_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let single_shard_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("one", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let single_shard_type =
-            untracked_type.clone().with_sharding(Sharding::replicated(LogicalMesh::single_device(), 2)).unwrap();
+            untracked_type.clone().with_sharding(Sharding::replicated(single_shard_mesh, 2)).unwrap();
         let column_shard_strides = Layout::Strided(StridedLayout::new(vec![4, 4]));
         let replicated_source = placement(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
         let device = Device::new(0, 0);
@@ -4290,6 +4717,16 @@ mod tests {
                 "{target} {source:?} {input_type}",
             );
         }
+        let anonymous_sharding = Sharding::replicated(LogicalMesh::single_device(), 2);
+        assert_eq!(
+            PlaceOperation::infer_output_type_allowing_uneven_splits(
+                &untracked_type,
+                Some(&anonymous_sharding),
+                Some(&in_place),
+                None,
+            ),
+            Err(overlapping_columns("target").unwrap_err()),
+        );
 
         // Without a target layout, whether an in-place output keeps the layout of its input depends on the type of the
         // input alone, so the output type is the same with and without the concrete sharding (which here describes
@@ -4377,9 +4814,7 @@ mod tests {
                 ))),
                 "{state}",
             );
-            let gathered = ArrayType::scalar(DataType::F32)
-                .with_sharding(Sharding::replicated(LogicalMesh::single_device(), 0))
-                .unwrap();
+            let gathered = ArrayType::scalar(DataType::F32);
             let device_result = match state {
                 "unreduced" => Err(TypeError::invalid(format!(
                     "`{PLACE_OPERATION_NAME}` cannot move a value with reduction state over mesh axes larger than one \
@@ -4681,8 +5116,8 @@ mod tests {
         );
 
         // For `f32[n, n]` with `1 <= n < 3` whose columns are split in two, the extent one splits unevenly and the
-        // strides `[0, 4]` overlap the rows of the shards of the extent two, so the layout is checked at the extent two,
-        // the smallest that splits evenly, and rejected as it is for the static extent two.
+        // strides `[0, 4]` overlap the rows of the shards of the extent two, so the layout is checked at the extent
+        // two, the smallest that splits evenly, and rejected as it is for the static extent two.
         let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(3)).unwrap());
         let dynamic = vec![Dimension::Dynamic(n.clone()), Dimension::Dynamic(n)];
         let static_two = vec![Dimension::Static(2), Dimension::Static(2)];
@@ -4761,11 +5196,13 @@ mod tests {
         // whose type tracks no sharding are not known, so a device target drops its layout.
         let row_major = Layout::Strided(StridedLayout::new(vec![8, 4]));
         let same_replicated = PlaceOperation::new(placement(&mesh, vec![ShardingDimension::Replicated; 2]), None);
-        let single_device = Sharding::replicated(LogicalMesh::single_device(), 2);
+        let single_device_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("one", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let single_device = Sharding::replicated(single_device_mesh, 2);
         let on_device = PlaceOperation::new(Device::new(0, 0), None);
         let other_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(1, 0)]).unwrap();
         let on_other_device =
-            PlaceOperation::new(Placement::new(other_device_mesh, single_device.clone()).unwrap(), None);
+            PlaceOperation::new(placement(&other_device_mesh, vec![ShardingDimension::Replicated; 2]), None);
         for (operation, input_type, expected) in [
             (&memory_only, input_type(&unbounded, None, &tiled), input_type(&unbounded, None, &tiled)),
             (&memory_only, input_type(&bounded, None, &strided), input_type(&bounded, None, &strided)),
@@ -4793,7 +5230,7 @@ mod tests {
             (
                 &on_other_device,
                 input_type(&unbounded, Some(&single_device), &row_major),
-                input_type(&unbounded, Some(&single_device), &row_major),
+                input_type(&unbounded, None, &row_major),
             ),
             (
                 &on_device,
@@ -6453,7 +6890,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}], %1:f32[4] .
-                let %2:f32[2, 4][sharding={mesh<['device'=1:auto]>, [{}, {}]}]@Host[Pinned] = place [
+                let %2:f32[2, 4]@Host[Pinned] = place [
                     source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}},
                     target=device(0, memory=Host[Pinned]),
                 ] %0
@@ -6944,13 +7381,9 @@ mod tests {
 
         let output = pushforward(None).unwrap();
         assert_eq!(output.array, Array::from_elements(tangent_type.clone(), &[3.0f32, 4.0]).unwrap());
-        assert_eq!(output.placement, Some(tangent_placement));
-        let inferred = PlaceOperation {
-            source: Some(PlacementRequest::from(primal_placement.clone())),
-            target: None,
-            may_alias: true,
-            is_source_inferred: true,
-        };
+        assert_eq!(output.placement, Some(tangent_placement.clone()));
+        let inferred_source = Some(PlacementRequest::from(primal_placement.clone()));
+        let inferred = PlaceOperation::new(None, None).with_inferred_source(inferred_source);
         assert_eq!(
             context.0.take(),
             vec![
@@ -6966,7 +7399,42 @@ mod tests {
             )))),
         );
 
-        // Both transpositions move the cotangent back to where the primal lives.
+        // A source that names only a memory constrains the memory of the tangent and not its devices, so the tangent
+        // on `mesh_y` satisfies it, and the placement of the primal completed with that memory is kept only as the
+        // return placement. A tangent in another memory is rejected, already at the boundary of the pushforward.
+        let memory = Some(PlacementRequest::from(Memory::Device));
+        context.0.take();
+        let output = pushforward(memory.clone()).unwrap();
+        assert_eq!(output.array, Array::from_elements(tangent_type.clone(), &[3.0f32, 4.0]).unwrap());
+        assert_eq!(output.placement, Some(tangent_placement.clone()));
+        let primal_device_placement = primal_placement.clone().with_memory(Memory::Device);
+        assert_eq!(
+            context.0.take(),
+            vec![
+                ArrayOperation::Place(PlaceOperation::new(None, primal_device_placement.clone())),
+                ArrayOperation::Place(
+                    PlaceOperation::new(None, memory.clone())
+                        .with_inferred_source(Some(PlacementRequest::from(primal_device_placement))),
+                ),
+            ],
+        );
+        let pinned_type = tangent_type.clone().with_memory(PINNED_HOST);
+        let pinned_tangent = PlacedArray {
+            array: Array::from_elements(pinned_type.clone(), &[3.0f32, 4.0]).unwrap(),
+            placement: Some(tangent_placement.clone().with_memory(PINNED_HOST)),
+            context: context.clone(),
+        };
+        let (_, pinned_pushforward) = differentiate_at(primal.clone())
+            .linearize(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, memory.clone(), true))
+            .unwrap();
+        assert_eq!(
+            pinned_pushforward.apply(pinned_tangent).map(|output| output.array),
+            Err(ProgramError::MalformedProgram(format!(
+                "pushforward tangent 0 has type {pinned_type} but its primal boundary requires tangent type f32[2]",
+            ))),
+        );
+
+        // Every transposition moves the cotangent back to where the primal lives.
         let transposed = |source: Option<PlacementRequest>| {
             let (_, pullback) = differentiate_at(primal.clone())
                 .vjp(|x| <ValueDomainDispatch as PlaceDispatch<ArrayType, _>>::place(&x, None, source, true))
@@ -6984,6 +7452,135 @@ mod tests {
         };
         assert_eq!(transposed(None), expected);
         assert_eq!(transposed(given), expected);
+        assert_eq!(transposed(memory), expected);
+    }
+
+    #[test]
+    fn test_place_operation_differentiation_inferred_source_batching() {
+        // Batching the pushforward of a placement keeps the return placement that differentiation inferred from where
+        // the primal lives, so the batched transpose returns the cotangent there, as the unbatched transpose does,
+        // rather than leaving it on the target mesh.
+        let primal_placement = placement(&mesh_x(), vec![ShardingDimension::Replicated]);
+        let target = placement(&mesh_y(), vec![ShardingDimension::Replicated]);
+        let context = RecordingContext::default();
+        let primal = PlacedArray {
+            array: Array::vector(vec![1.0f32, 2.0]).unwrap(),
+            placement: Some(primal_placement.clone()),
+            context: context.clone(),
+        };
+        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&target, None)).unwrap();
+        let program = pushforward.program();
+        let (batched, _) = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        context.0.take();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2] .
+                let %1:f32[3, 2][sharding={mesh<['y'=4:explicit]>, [{}, {}]}] = place [
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{}, {}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{}, {}]}},
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            batched.transpose().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[3, 2][sharding={mesh<['y'=4:explicit]>, [{}, {}]}] .
+                let %1:f32[3, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = place [
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{}, {}]}},
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{}, {}]}, memory=Device},
+                    may_alias=false,
+                ] %0
+                    %2:f32[3, 2] = broadcast [output_type=f32[3, 2], output_axes=[0, 1]] %1
+                in (%2)"
+            },
+        );
+
+        // The cotangents are replayed in the recording context, which records where each transposed placement moves
+        // them, and the elements are unchanged.
+        let cotangent = |r#type: ArrayType, elements: &[f32], placement: Placement| PlacedArray {
+            array: Array::from_elements(r#type.with_sharding(placement.sharding().clone()).unwrap(), elements).unwrap(),
+            placement: Some(placement),
+            context: context.clone(),
+        };
+        let unbatched_type = ArrayType::new_static(DataType::F32, [2]);
+        let unbatched_outputs = program
+            .transpose()
+            .unwrap()
+            .interpret_in_context(&context, vec![cotangent(unbatched_type, &[1.0, 2.0], target.clone())])
+            .unwrap();
+        assert_eq!(unbatched_outputs[0].array, Array::vector(vec![1.0f32, 2.0]).unwrap());
+        let unbatched_operations = context.0.take();
+        assert_eq!(
+            unbatched_operations[0],
+            ArrayOperation::Place(
+                PlaceOperation::new(primal_placement.clone().with_memory(Memory::Device), None)
+                    .with_may_alias(false)
+                    .with_inferred_source(Some(target.clone().into())),
+            ),
+        );
+
+        let batched_target = placement(&mesh_y(), vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
+        let elements = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let batched_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let batched_outputs = batched
+            .transpose()
+            .unwrap()
+            .interpret_in_context(&context, vec![cotangent(batched_type.clone(), &elements, batched_target.clone())])
+            .unwrap();
+        assert_eq!(batched_outputs[0].array, Array::from_elements(batched_type, &elements).unwrap());
+        let batched_primal_placement =
+            placement(&mesh_x(), vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
+        assert_eq!(
+            context.0.take()[0],
+            ArrayOperation::Place(
+                PlaceOperation::new(batched_primal_placement.with_memory(Memory::Device), None)
+                    .with_may_alias(false)
+                    .with_inferred_source(Some(batched_target.into())),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_place_operation_interpretation_inferred_source() {
+        // Replaying a staged placement over staged values keeps the return placement that differentiation inferred.
+        let inferred_source = PlacementRequest::from(placement(&mesh_x(), vec![ShardingDimension::Replicated]));
+        let operation = PlaceOperation::new(placement(&mesh_y(), vec![ShardingDimension::Replicated]), None)
+            .with_inferred_source(Some(inferred_source.clone()));
+        assert_eq!(operation.source(), None);
+        assert_eq!(operation.return_placement(), Some(&inferred_source));
+        let input_type = ArrayType::new_static(DataType::F32, [2]);
+        let (_, replayed) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, input| Ok(operation.interpret(context, &EmptyRegionDriver, &[input])?.remove(0)),
+            input_type.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let recorded =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            recorded.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2][sharding={mesh<['y'=4:explicit]>, [{}]}] = place [
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{}]}},
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(replayed.to_string(), recorded.to_string());
     }
 
     #[test]
@@ -7050,7 +7647,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] .
                 let %1:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}, {'x'}]}, memory=Device},
@@ -7210,11 +7807,11 @@ mod tests {
         assert_eq!(
             context.0.borrow().last(),
             Some(&ArrayOperation::Place(
-                PlaceOperation::new(
-                    gradient_placement.clone(),
-                    Placement::new(other_mesh_x, Sharding::replicated(auto_mesh.clone(), 2)).unwrap(),
-                )
-                .with_may_alias(false),
+                PlaceOperation::new(gradient_placement.clone(), None)
+                    .with_may_alias(false)
+                    .with_inferred_source(Some(
+                        Placement::new(other_mesh_x, Sharding::replicated(auto_mesh.clone(), 2)).unwrap().into(),
+                    )),
             )),
         );
         assert_eq!(
@@ -7421,7 +8018,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
@@ -7444,7 +8041,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -7462,7 +8060,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -7486,6 +8085,75 @@ mod tests {
                     "cannot transpose `{PLACE_OPERATION_NAME}` across device meshes without a source placement",
                 ),
         ));
+    }
+
+    #[test]
+    fn test_place_operation_transposition_admits_seeds_on_other_meshes() {
+        // The transposed placement moves its cotangent back to the source from wherever it lives, so a pullback admits
+        // a seed on another mesh than its cotangent type states when placements are its only consumers, as JAX does,
+        // also when two placements move it back to two sources. A seed that another operation consumes (i.e., the
+        // transposed negation, also next to a placement, or the accumulation of the two cotangents of a sum) is
+        // rejected with the error of the seed check, and so is a seed whose placement is inside a rematerialized
+        // function, whose transposed call has an attached region (a registered limit).
+        let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
+        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(source.sharding().clone()).unwrap();
+        let input = Array::from_elements(input_type.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let mesh_z = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let seed_type =
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(Sharding::replicated(mesh_z, 1)).unwrap();
+        let seed = Array::from_elements(seed_type.clone(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap();
+        let rejection = |output: &Array| -> Result<Array, ProgramError> {
+            Err(ProgramError::MalformedProgram(format!(
+                "pullback cotangent 0 has type {seed_type} but its primal boundary requires cotangent type {}",
+                output.r#type().cotangent().unwrap(),
+            )))
+        };
+
+        let (_, pullback) = differentiate_at(input.clone()).vjp(|x| x.place(&target, Some(&source))).unwrap();
+        assert_eq!(
+            pullback.apply_materialized(seed.clone()),
+            Ok(Array::from_elements(input_type.cotangent().unwrap(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap()),
+        );
+
+        let (output, pullback) =
+            differentiate_at(input.clone()).vjp(|x| Ok(-x.place(&target, Some(&source))?)).unwrap();
+        assert_eq!(pullback.apply_materialized(seed.clone()), rejection(&output));
+
+        let (output, pullback) = differentiate_at(input.clone())
+            .vjp(|x| {
+                let y = x.place(&target, Some(&source))?;
+                Ok(y.clone() + y)
+            })
+            .unwrap();
+        assert_eq!(pullback.apply_materialized(seed.clone()), rejection(&output));
+
+        let other_source = placement(&mesh_x(), vec![ShardingDimension::replicated()]);
+        let other_type =
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(other_source.sharding().clone()).unwrap();
+        let other = Array::from_elements(other_type.clone(), &[9.0f32, 10.0, 11.0, 12.0]).unwrap();
+        let (_, pullback) = differentiate_at((input.clone(), other.clone()))
+            .vjp(|(x, y)| Ok(x.place(&target, Some(&source))? + y.place(&target, Some(&other_source))?))
+            .unwrap();
+        assert_eq!(
+            pullback.apply_materialized(seed.clone()),
+            Ok((
+                Array::from_elements(input_type.cotangent().unwrap(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap(),
+                Array::from_elements(other_type.cotangent().unwrap(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap(),
+            )),
+        );
+
+        let placed_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(target.sharding().clone()).unwrap();
+        let placed = Array::from_elements(placed_type, &[9.0f32, 10.0, 11.0, 12.0]).unwrap();
+        let (output, pullback) = differentiate_at((input.clone(), placed))
+            .vjp(|(x, y)| Ok(x.place(&target, Some(&source))? + -y))
+            .unwrap();
+        assert_eq!(pullback.apply_materialized(seed.clone()).map(|_| ()), rejection(&output).map(|_| ()));
+
+        let function =
+            rematerialize(|x: Tracer<TracingContext<Array, ArrayOperation<Array>>>| x.place(&target, Some(&source)));
+        let (output, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(pullback.apply_materialized(seed), rejection(&output));
     }
 
     #[test]
@@ -7549,7 +8217,6 @@ mod tests {
         // cotangent dual of the source sharding and the memory of the input, and the device of the forward target
         // becomes its source, without the memory of the forward target, as the two ends of a placement swap.
         let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
-        let gathered = Sharding::replicated(LogicalMesh::single_device(), 1);
         let target = PlacementRequest::Device { device: Device::new(0, 0), memory: Some(PINNED_HOST), layout: None };
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(source.sharding().clone()).unwrap();
         let input = Array::from_elements(input_type.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
@@ -7565,10 +8232,7 @@ mod tests {
             }
         };
         let (output, pullback) = differentiate_at(input.clone()).vjp(place(Some(source.clone()))).unwrap();
-        assert_eq!(
-            output.r#type().as_ref(),
-            &input_type.clone().with_sharding(gathered).unwrap().with_memory(PINNED_HOST),
-        );
+        assert_eq!(output.r#type().as_ref(), &input_type.clone().with_sharding(None).unwrap().with_memory(PINNED_HOST));
         let cotangent = pullback
             .apply_materialized(
                 Array::from_elements(output.r#type().cotangent().unwrap(), &[5.0f32, 6.0, 7.0, 8.0]).unwrap(),
@@ -7579,9 +8243,9 @@ mod tests {
         assert_eq!(
             pullback.into_program().to_string(),
             indoc! {"
-                lambda %0:f32[4][sharding={mesh<['device'=1:auto]>, [{}]}]@Host[Pinned] .
+                lambda %0:f32[4]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    source=device(0),
+                    inferred_source=device(0),
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -7697,7 +8361,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    source=device(1),
+                    inferred_source=device(1),
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -7714,7 +8378,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    source=device(1),
+                    inferred_source=device(1),
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -7735,7 +8399,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    source=device(1),
+                    inferred_source=device(1),
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -7752,7 +8416,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    source=device(1),
+                    inferred_source=device(1),
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -7784,7 +8448,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(output.r#type().sharding(), Some(&Sharding::replicated(LogicalMesh::single_device(), 1)));
+        assert_eq!(output.r#type().sharding(), None);
         assert!(matches!(
             pullback.into_transposed_parts(),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -7836,7 +8500,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}] = place [
-                    source={mesh<['x'=1:explicit]>, devices=[2], sharding={mesh<['x'=1:explicit]>, [{}]}},
+                    inferred_source={mesh<['x'=1:explicit]>, devices=[2], sharding={mesh<['x'=1:explicit]>, [{}]}},
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -7858,7 +8522,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=1:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}] = place [
-                    source={mesh<['y'=1:explicit]>, devices=[2], sharding={mesh<['y'=1:explicit]>, [{'y'}]}},
+                    inferred_source={mesh<['y'=1:explicit]>, devices=[2], sharding={mesh<['y'=1:explicit]>, [{'y'}]}},
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -7874,7 +8538,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}] = place [
-                    source=device(1),
+                    inferred_source=device(1),
                     target={mesh<['x'=1:explicit]>, devices=[0], \
                         sharding={mesh<['x'=1:explicit]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -7903,7 +8567,7 @@ mod tests {
             transposed(&ArrayType::new_static(DataType::F32, [4]), Some(target)),
             indoc! {"
                 lambda %0:f32[4]@Host[Pinned] .
-                let %1:f32[4] = place [source=device(1), target=device(0, memory=Device), may_alias=false] %0
+                let %1:f32[4] = place [inferred_source=device(1), target=device(0, memory=Device), may_alias=false] %0
                 in (%1)"
             },
         );
@@ -7977,7 +8641,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Host[Pinned]},
                     may_alias=false,
@@ -8106,7 +8771,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
@@ -8131,7 +8796,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Device},
                     may_alias=false,
@@ -8163,7 +8829,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[2, 3], \
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[2, 3], \
                         sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}], reduced={'x'}}, memory=Device},
@@ -8189,7 +8855,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[2, 3], \
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[2, 3], \
                         sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}, memory=Device},
@@ -8381,7 +9047,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:auto]>, [{'x'}]}, memory=Device},
                     may_alias=false,
@@ -8439,7 +9106,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = place [
-                    source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                    inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                        sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:explicit]>, [{}]}, memory=Host[Pinned]},
                     may_alias=false,
@@ -8468,7 +9136,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=2:manual]>, []}] .
                 let %1:f32[][sharding={mesh<['x'=2:manual]>, []}] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:manual]>, []}},
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:manual]>, []}},
                     target={mesh<['x'=2:explicit]>, devices=[0, 1], \
                         sharding={mesh<['x'=2:manual]>, []}, memory=Device},
                     may_alias=false,
@@ -8540,7 +9208,8 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
                 let %1:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}]@Host[Pinned] = place [
-                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    inferred_source={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
                     target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
                         sharding={mesh<['y'=4:explicit]>, [{'y'}]}, memory=Host[Pinned]},
                     may_alias=false,
@@ -8587,7 +9256,7 @@ mod tests {
         let expected = indoc! {"
             lambda %0:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}] .
             let %1:f32[4][sharding={mesh<['x'=1:explicit]>, [{'x'}]}] = place [
-                source={mesh<['x'=1:explicit]>, devices=[0], sharding={mesh<['x'=1:explicit]>, [{'x'}]}},
+                inferred_source={mesh<['x'=1:explicit]>, devices=[0], sharding={mesh<['x'=1:explicit]>, [{'x'}]}},
                 target={mesh<['x'=1:explicit]>, devices=[1], \
                     sharding={mesh<['x'=1:explicit]>, [{'x'}]}, memory=Device},
                 may_alias=false,
@@ -8616,7 +9285,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] = place [
-                    source={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{'x'}]}},
+                    inferred_source={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{'x'}]}},
                     target={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{}]}, memory=Device},
                     may_alias=false,
                 ] %0
@@ -8637,7 +9306,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] .
                 let %1:f32[4][sharding={mesh<['x'=2:auto]>, [{}]}] = place [
-                    source={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{}]}},
+                    inferred_source={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{}]}},
                     target={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{'x'}]}, memory=Device},
                     may_alias=false,
                 ] %0
@@ -8834,10 +9503,17 @@ mod tests {
         let copied = ValueDirectDispatch::place(&input, None, None, false).unwrap();
         assert_eq!(copied, input);
         assert!(!Arc::ptr_eq(input.shared_storage_bytes(), copied.shared_storage_bytes()));
+        // A sharding with fewer dimensions than the input is padded with replicated dimensions, as JAX pads a short
+        // partition specification, and one with more dimensions is rejected by the type rule.
         assert_eq!(
             ValueDirectDispatch::place(&input, None, Some(PlacementRequest::from(placement(&mesh_x(), vec![]))), true),
+            Ok(input.clone()),
+        );
+        let rank_2 = placement(&mesh_x(), vec![ShardingDimension::Replicated; 2]);
+        assert_eq!(
+            ValueDirectDispatch::place(&input, None, Some(PlacementRequest::from(rank_2)), true),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` source sharding rank (0) does not match the input rank (1)",
+                "`{PLACE_OPERATION_NAME}` source sharding rank (2) does not match the input rank (1)",
             )))),
         );
 
@@ -8873,6 +9549,15 @@ mod tests {
                 ArrayOperation::Place(PlaceOperation::new(None, None).with_may_alias(false)),
             ],
         );
+
+        let failure = ProgramError::Type(TypeError::invalid("placement preflight failed"));
+        let operation = PlaceOperation::new(None, None);
+        let result = ValueDomainDispatch::place_operations(
+            vec![(placed.clone(), operation.clone()), (placed, operation)],
+            Err(failure.clone()),
+        );
+        assert_eq!(result.unwrap_err(), failure);
+        assert_eq!(context.0.borrow().len(), 3);
     }
 
     #[test]
@@ -9026,18 +9711,58 @@ mod tests {
             .unwrap(),
         );
         assert!(Arc::ptr_eq(input.shared_storage_bytes(), output.shared_storage_bytes()));
+
+        // A target or source sharding with fewer dimensions than the value is padded with trailing replicated
+        // dimensions, as JAX pads a short partition specification, so a split of the first dimension applies to a
+        // matrix and the staged placement names the padded sharding. One with more dimensions is still rejected.
+        let split_rows = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+        let matrix =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(split_rows.sharding().clone()).unwrap(),
+            &[1.0f32, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        assert_eq!(matrix.place(&target, Some(&placement(&mesh_x(), vec![]))), Ok(expected));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.place(&target, None),
+            ArrayType::new_static(DataType::F32, [4, 3]),
+        )
+        .unwrap();
         assert_eq!(
-            input.place(&placement(&mesh_x(), vec![]), None),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 3] .
+                let %1:f32[4, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = place [
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                        sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}},
+                ] %0
+                in (%1)"
+            },
+        );
+        assert_eq!(
+            input.place(&split_rows, None),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` target sharding rank (0) does not match the input rank (1)",
+                "`{PLACE_OPERATION_NAME}` target sharding rank (2) does not match the input rank (1)",
             )))),
         );
         assert_eq!(
-            input.place(&target, Some(&placement(&mesh_x(), vec![]))),
+            input.place(&target, Some(&split_rows)),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{PLACE_OPERATION_NAME}` source sharding rank (0) does not match the input rank (1)",
+                "`{PLACE_OPERATION_NAME}` source sharding rank (2) does not match the input rank (1)",
             )))),
         );
+    }
+
+    #[test]
+    fn test_place_accepts_optional_resolved_target() {
+        let target = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
+        let context = RecordingContext::default();
+        let input = context.lift(Array::vector(vec![1.0f32, 2.0]).unwrap()).unwrap();
+        let output = input.place(&Some(target.clone()), None).unwrap();
+        assert_eq!(output.placement(), Some(target));
+        assert_eq!(output.array.elements::<f32>().unwrap(), [1.0, 2.0]);
+        assert_eq!(context.0.borrow().len(), 1);
     }
 
     #[test]

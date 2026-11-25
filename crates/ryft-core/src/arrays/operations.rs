@@ -4,9 +4,10 @@ use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::references::ArrayReferenceTransform;
-use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::arrays::{ArrayMemberType, ArrayType};
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
+use crate::contexts::Context;
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
     AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, Capability,
@@ -38,7 +39,8 @@ use crate::operations::{
     TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
     UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::programs::{OperationProjection, Value, ValueProjection};
+use crate::partial::{PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue};
+use crate::programs::{OperationProjection, ProgramError, Value, ValueProjection};
 
 /// [`Operation`](crate::Operation) family for ordinary staged [`Program`](crate::Program)s over [`Array`]s.
 #[derive(Clone, Debug, Operation)]
@@ -159,6 +161,29 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Composite(CompositeOperation<V, ArrayOperation<V>>),
     #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
+}
+
+impl<V: Value<Type = ArrayType>> ArrayOperation<V> {
+    /// Partially evaluates this member through its enclosing operation family and keeps all residual values in that
+    /// family's type universe.
+    ///
+    /// # Errors
+    ///
+    /// Returns the placement rule's validation errors or any error from folding or residualizing the operation.
+    #[doc(hidden)]
+    #[inline]
+    pub fn partially_evaluate_member<C: Context<Type: ArrayMemberType>, D: PartialEvaluationDriver<C>>(
+        &self,
+        operation: C::Operation,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        match self {
+            Self::Place(place) => place.partially_evaluate_in_family(operation, context, driver, inputs),
+            _ => context.fold_or_residualize(operation, driver.region_programs(), inputs, None),
+        }
+    }
 }
 
 impl<V: Value<Type = ArrayType>> OperationProjection<ArrayType> for ArrayOperation<V> {
@@ -355,7 +380,13 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Attached regions belong to the array IR universe and cannot pass through this projection. Region-carrying
     /// operations must instead use dedicated array IR family variants that retain access to their regions. Transforms
     /// reject a region-carrying payload constructed here directly, with a diagnostic naming its operation.
-    #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
+    #[ryft(
+        projected(ArrayType),
+        collective,
+        lockstep,
+        skip_from,
+        partial_evaluation = ArrayOperation::partially_evaluate_member
+    )]
     Array(ArrayOperation<A>),
 
     /// Homogeneous [`DimensionOperation`] member.
