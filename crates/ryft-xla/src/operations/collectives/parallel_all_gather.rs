@@ -512,7 +512,7 @@ mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(std::slice::from_ref(&sharded)),
                 Some(&[replicated, sharded.clone()]),

@@ -59,7 +59,7 @@ pub type TracedProgram<Input, Output> = Program<
 pub trait ProgramExtension {
     /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature
     /// carries the shardings of the global input and output types that have one. Refer to
-    /// [`Self::to_mlir_module_with_signature_shardings`] for more information.
+    /// [`Self::to_mlir_module_with_shardings`] for more information.
     ///
     /// # Parameters
     ///
@@ -67,27 +67,27 @@ pub trait ProgramExtension {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Self::to_mlir_module_with_signature_shardings`].
+    /// Returns the errors of [`Self::to_mlir_module_with_shardings`].
     #[inline]
     fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
-        self.to_mlir_module_with_signature_shardings(function_name, None, None)
+        self.to_mlir_module_with_shardings(function_name, None, None)
     }
 
     // TODO(eaplatanios): Review from here onwards.
 
     /// Same as [`Self::to_mlir_module`] but with explicitly provided `sdy.sharding` attributes for the function's
-    /// arguments and/or results. This is what the XLA SPMD partitioner reads to drive boundary slicing of per-device
-    /// output buffers, including for shapes whose dimensions are not divisible by the partition count (e.g., shape
-    /// `[5]` on 2 partitions producing `[3]` + `[2]`). Without explicit shardings, the arguments carry the sharding of
-    /// each of their global types that has one, and the results carry the placement that the program gives them
-    /// (i.e., the target of a `place` that produces them, including over auto mesh axes, or the sharding of the
-    /// argument that they return, also through the callee of a `jit_call`) or otherwise the sharding of their global
-    /// types, as the compilation path of [`Session`] does. Like that path, arguments and results replicate the
-    /// unconstrained dimensions of their shardings, which their runtime placements read as replicated, and results
-    /// whose placement over auto mesh axes nothing fixes are left open over those axes, so that the compiler chooses
-    /// it (refer to `entry_open_results` for what this export can and cannot know). Unlike that path, which places a
-    /// value without either as replicated because it lowers for concrete placed arrays, such a value is left
-    /// unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
+    /// inputs and/or outputs. This is what the XLA Single Program Multiple Data (SPMD) partitioner reads to drive
+    /// boundary slicing of per-device output buffers, including for shapes whose dimensions are not divisible by the
+    /// partition count (e.g., shape `[5]` on 2 partitions producing `[3]` + `[2]`). Without explicit shardings, the
+    /// arguments carry the sharding of each of their global types that has one, and the results carry the placement
+    /// that the program gives them (i.e., the target of a `place` that produces them, including over auto mesh axes,
+    /// or the sharding of the argument that they return, also through the callee of a `jit_call`) or otherwise the
+    /// sharding of their global types, as the compilation path of [`Session`] does. Like that path, arguments and
+    /// results replicate the unconstrained dimensions of their shardings, which their runtime placements read as
+    /// replicated, and results whose placement over auto mesh axes nothing fixes are left open over those axes, so that
+    /// the compiler chooses it (refer to `entry_open_results` for what this export can and cannot know). Unlike that
+    /// path, which places a value without either as replicated because it lowers for concrete placed arrays, such a
+    /// value is left unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
     /// shardings). Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
     /// arguments that precede the inputs and are annotated with the placements of those arrays, as compilation for a
     /// [`Session`] passes them.
@@ -117,11 +117,11 @@ pub trait ProgramExtension {
     /// receives it where it runs instead). Lowering failures use the corresponding [`Error`] variants (e.g., for an
     /// invalid function name, mismatched signature shardings, unresolved references or state, or operations that the
     /// backend cannot lower).
-    fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
+    fn to_mlir_module_with_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
-        argument_shardings: Option<&[Sharding]>,
-        result_shardings: Option<&[Sharding]>,
+        input_shardings: Option<&[Sharding]>,
+        output_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error>;
 }
 
@@ -131,11 +131,11 @@ where
     Input::Family: ParameterizedFamily<ArrayType>,
     Output::Family: ParameterizedFamily<ArrayType>,
 {
-    fn to_mlir_module_with_signature_shardings<S: AsRef<str>>(
+    fn to_mlir_module_with_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
-        argument_shardings: Option<&[Sharding]>,
-        result_shardings: Option<&[Sharding]>,
+        input_shardings: Option<&[Sharding]>,
+        output_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
         // Project the entry signature to array types and reconstruct the program's input and output structures.
         let signature = self.interface();
@@ -160,7 +160,7 @@ where
         )
         .map_err(ProgramError::from)?;
         let simplified_program = pruned_program(self, None)?;
-        let argument_shardings: Vec<_> = match argument_shardings {
+        let argument_shardings: Vec<_> = match input_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
@@ -176,7 +176,7 @@ where
         let signature_mesh = argument_shardings
             .iter()
             .flatten()
-            .chain(result_shardings.into_iter().flatten())
+            .chain(output_shardings.into_iter().flatten())
             .chain(output_type.parameters().filter_map(ArrayType::sharding))
             .map(Sharding::mesh)
             .next();
@@ -210,8 +210,8 @@ where
         let placements =
             entry_result_placements(&simplified_program, output_types.len(), |constant| constant.sharding().clone());
         let result_annotations =
-            entry_result_shardings(&output_types, result_shardings, &placements, &argument_shardings)?;
-        let open_results = entry_open_results(&output_types, result_shardings, &placements, &result_annotations);
+            entry_result_shardings(&output_types, output_shardings, &placements, &argument_shardings)?;
+        let open_results = entry_open_results(&output_types, output_shardings, &placements, &result_annotations);
         Ok(super::lowering::modules::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &capture_types,
@@ -651,10 +651,7 @@ mod tests {
         let signature = Sharding::replicated(LogicalMesh::single_device(), 1);
         let signatures = Some(std::slice::from_ref(&signature));
         assert_eq!(
-            traced
-                .to_mlir_module_with_signature_shardings("main", signatures, signatures)
-                .unwrap_err()
-                .to_string(),
+            traced.to_mlir_module_with_shardings("main", signatures, signatures).unwrap_err().to_string(),
             "the traced program imports an array of type `f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]`, whose mesh \
              does not have the topology of the mesh `['device'=1:auto]` of the signature of the module, because a \
              plain `trace` keeps the type of an array that it imports; stage or compile the function for a device \
@@ -702,13 +699,13 @@ mod tests {
         "#};
         assert_eq!(
             traced
-                .to_mlir_module_with_signature_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
+                .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
                 .unwrap(),
             expected,
         );
         assert_eq!(
             traced
-                .to_mlir_module_with_signature_shardings(
+                .to_mlir_module_with_shardings(
                     "main",
                     Some(std::slice::from_ref(&input_sharding)),
                     Some(std::slice::from_ref(&open_sharding)),
@@ -753,7 +750,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             traced
-                .to_mlir_module_with_signature_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
+                .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
                 .unwrap(),
             indoc! {r#"
                 module {
@@ -790,9 +787,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced
-                .to_mlir_module_with_signature_shardings("main", Some(std::slice::from_ref(&replicated)), None)
-                .unwrap(),
+            traced.to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&replicated)), None).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -813,7 +808,7 @@ mod tests {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         assert_eq!(
             traced
-                .to_mlir_module_with_signature_shardings(
+                .to_mlir_module_with_shardings(
                     "main",
                     Some(std::slice::from_ref(&sharding)),
                     Some(std::slice::from_ref(&sharding)),
@@ -845,7 +840,7 @@ mod tests {
     fn test_program_extension_to_mlir_module_with_signature_shardings_executes_effectful_dead_shard_maps_on_cpu() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(std::slice::from_ref(&sharding)),
                 Some(std::slice::from_ref(&sharding)),

@@ -3801,7 +3801,7 @@ pub(crate) mod tests {
             (),
         )
         .unwrap();
-        let program = traced.to_mlir_module_with_signature_shardings("main", Some(&[]), Some(&[sharded])).unwrap();
+        let program = traced.to_mlir_module_with_shardings("main", Some(&[]), Some(&[sharded])).unwrap();
         assert_eq!(
             program,
             indoc! {r#"
@@ -4054,7 +4054,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let program = traced
-                .to_mlir_module_with_signature_shardings(
+                .to_mlir_module_with_shardings(
                     "main",
                     Some(&[replicated.clone(), sharded.clone()]),
                     Some(&[
@@ -4237,7 +4237,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(&[replicated.clone(), global.clone()]),
                 Some(&[replicated.clone(), replicated.clone(), global.clone()]),
@@ -4370,7 +4370,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(&[shared_sharding.clone(), global.clone()]),
                 Some(&[replicated.clone(), shared_sharding.clone(), global.clone()]),
@@ -4513,7 +4513,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(&[replicated.clone(), sharded.clone(), sharded.clone()]),
                 Some(&[sharded.clone(), replicated.clone(), replicated.clone(), sharded.clone()]),
@@ -4668,7 +4668,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(&[replicated.clone(), sharded.clone(), replicated.clone()]),
                 Some(&[sharded.clone(), sharded.clone()]),
@@ -4848,7 +4848,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(&[replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()]),
                 Some(&[sharded, replicated]),
@@ -5004,7 +5004,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_signature_shardings(
+            .to_mlir_module_with_shardings(
                 "main",
                 Some(std::slice::from_ref(&sharded)),
                 Some(&[replicated, sharded.clone()]),
