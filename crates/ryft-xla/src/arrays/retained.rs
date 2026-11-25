@@ -13,7 +13,7 @@ use ryft_pjrt::{Client, ExecutionFence};
 
 use crate::arrays::host::validate_mesh_devices;
 use crate::arrays::metadata::ArrayMetadata;
-use crate::arrays::resharding::placement_communicates;
+use crate::arrays::resharding::PlacementPlanningView;
 use crate::arrays::shards::{ArrayShard, ShardContribution};
 use crate::arrays::{Array, ArrayError, ArrayParts};
 use crate::{Error, Session};
@@ -92,8 +92,8 @@ use crate::{Error, Session};
 /// A retained array owns its shards, and its clones share them. The programs, regions, derivative rules, and caches
 /// that hold one therefore keep the device buffers alive, and the buffers are released together with the last value
 /// that refers to them. Any session of the PJRT client that owns the buffers can turn a retained array back into an
-/// [`Array`]. Every array and retention that shares a placement index keeps alive its copies on other devices,
-/// even after the functions that needed those copies are gone.
+/// [`Array`]. The array that was retained and every retention of it share its copies on other devices, which stay
+/// alive as long as any of them does, even after the functions that needed those copies are gone.
 #[derive(Clone, Parameter)]
 pub struct RetainedArray {
     /// [`ArrayType`] that this retained array declares as a constant of a program, which is what its [`Typed`]
@@ -270,7 +270,7 @@ impl RetainedArray {
     /// without holding any lock that `place` takes, and placements of other arrays, meshes, or shardings proceed
     /// independently. The placed copy is kept until the array and every retention of it are gone.
     ///
-    /// Whether a placement can communicate is decided alike on every process (refer to [`Self::can_communicate`]).
+    /// Whether a placement can communicate is decided alike on every process (i.e., [`Self::placement_communicates`]).
     /// A key of a placement that can communicate has one attempt for the lifetime of the array on every process, so
     /// its outcome is kept, failure included. This is the exception to the rule that no cache of this crate keeps an
     /// error, because the outcome is local while the work communicates: a placement can succeed on the process that
@@ -300,7 +300,7 @@ impl RetainedArray {
         sharding: &Sharding,
         place: impl FnOnce(Self) -> Result<Array, Error>,
     ) -> Result<Self, Error> {
-        let communicates = self.can_communicate(mesh, sharding);
+        let communicates = self.placement_communicates(mesh, sharding);
         let key = || (mesh.clone(), sharding.clone(), self.locally_assigned);
         let device_key = || (mesh.devices().to_vec(), self.locally_assigned);
         let attempt = {
@@ -369,12 +369,17 @@ impl RetainedArray {
         })
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns whether placing this retention may communicate, using its runtime placement and the shared planner.
-    pub(crate) fn can_communicate(&self, mesh: &DeviceMesh, sharding: &Sharding) -> bool {
-        placement_communicates(
-            &self.metadata,
-            self.shards.iter().map(ArrayShard::descriptor),
+    /// Returns whether placing this retained array on `mesh` with `sharding` can involve other processes (i.e.,
+    /// whether it may send or receive shards across processes, or run a collective with them). It returns `false`
+    /// when this process can carry the placement out on its own, which is the case when the array has locally
+    /// assigned devices, when it is a structural zero (which has no buffers), when it already has that placement,
+    /// or when its devices and those of `mesh` all belong to one process. The answer depends only on the type and
+    /// the placement of the array and on the destination, never on its buffers or on a client, so every process of a
+    /// distributed run computes the same answer. It errs on the side of `true`, so a placement for which it returns
+    /// `true` may end up communicating nothing.
+    #[inline]
+    pub(crate) fn placement_communicates(&self, mesh: &DeviceMesh, sharding: &Sharding) -> bool {
+        PlacementPlanningView::new(&self.metadata, self.shards.iter().map(ArrayShard::descriptor)).communicates(
             self.locally_assigned,
             mesh,
             sharding,
@@ -781,7 +786,7 @@ mod tests {
         let upload =
             || Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes());
 
-        // A capture with locally assigned devices never communicates (refer to `RetainedArray::can_communicate`),
+        // A capture with locally assigned devices never communicates (refer to `RetainedArray::placement_communicates`),
         // so the source names its devices for every process.
         let source = upload().unwrap().with_locally_assigned(false);
         let retained = RetainedArray::new(&source);
@@ -821,8 +826,8 @@ mod tests {
         let sharding = replicated(&mesh);
         assert_eq!(
             (
-                retained.can_communicate(&mesh, &sharding),
-                RetainedArray::new(&upload().unwrap()).can_communicate(&mesh, &sharding),
+                retained.placement_communicates(&mesh, &sharding),
+                RetainedArray::new(&upload().unwrap()).placement_communicates(&mesh, &sharding),
             ),
             (true, false),
         );
@@ -881,7 +886,7 @@ mod tests {
 
         // The two ownership modes can submit different cross-process work, even for identical destination keys.
         let local = RetainedArray::new(&source.with_locally_assigned(true));
-        assert!(!local.can_communicate(&mesh, &sharding));
+        assert!(!local.placement_communicates(&mesh, &sharding));
         local.placed(&mesh, &sharding, |_| place(Ok(()))).unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 6);
         let later = failure(retained.placed(&mesh, &sharding, |_| place(Ok(()))));
@@ -910,7 +915,7 @@ mod tests {
         .unwrap();
         let retained = RetainedArray::new(&array);
         assert!(retained.fills_missing_local_replicas().unwrap());
-        assert!(!retained.can_communicate(&mesh, &sharding));
+        assert!(!retained.placement_communicates(&mesh, &sharding));
         let failure = CoreError::from(ProgramError::InvalidArgument { message: "replica fill failed".to_string() });
         let failed = retained.placed(&mesh, &sharding, |_| Err(failure.clone().into()));
         assert!(matches!(failed, Err(Error::Core(error)) if *error == failure));
@@ -934,8 +939,8 @@ mod tests {
         let local = singleton(second);
         let distant = singleton(Device::new(remote.id() + 1, remote.process_index() + 1));
         for (target, communicates) in [(&local, false), (&distant, true)] {
-            assert_eq!(array.placement_communicates(target), communicates);
-            assert_eq!(retained.can_communicate(target.mesh(), target.sharding()), communicates);
+            assert_eq!(array.placement_communicates(target.mesh(), target.sharding()), communicates);
+            assert_eq!(retained.placement_communicates(target.mesh(), target.sharding()), communicates);
         }
         let failed = retained.placed(local.mesh(), local.sharding(), |_| Err(failure.clone().into()));
         assert!(matches!(failed, Err(Error::Core(error)) if *error == failure));

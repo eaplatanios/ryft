@@ -962,18 +962,16 @@ impl Session {
         &self.state.host_upload_workers
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns whether placements of this session compare the values that the processes of a run place onto a
-    /// destination that all of them share (refer to [`SessionBuilder::value_comparison`]).
+    /// destination that all of them share. Refer to [`SessionBuilder::value_comparison`] for more information.
     #[inline]
     pub(crate) fn compares_values_across_processes(&self) -> bool {
         self.state.value_comparison.enabled
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns the participants and transport for comparisons of values of this session, which are discovered once.
     #[inline]
-    pub(crate) fn comparison_participants(&self) -> Result<Option<&ValueComparison>, Error> {
+    pub(crate) fn value_comparison_participants(&self) -> Result<Option<&ValueComparison>, Error> {
         if let Some(comparison) = self.state.value_comparison.participants.get() {
             return Ok(comparison.as_ref());
         }
@@ -981,7 +979,6 @@ impl Session {
         Ok(self.state.value_comparison.participants.get_or_init(|| comparison).as_ref())
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns the position of the next comparison of values across processes in the sequence of comparisons of this
     /// session and advances it. Every process of a run that makes the same sequence of comparing placements assigns the
     /// same position to the same comparison, which its contributed digest binds.
