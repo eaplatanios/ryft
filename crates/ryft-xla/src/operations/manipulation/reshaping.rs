@@ -18,7 +18,7 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ReshapeOperation {
@@ -153,12 +153,14 @@ impl LowerableOperation for DynamicReshapeOperation {
                 cast.result(0).unwrap().as_ref()
             }
         };
-        if self.output_sharding().is_some() {
+        let result = if self.output_sharding().is_some() {
             let output_sharding = output_type.sharding().unwrap();
-            lower_sharding_constraint(&[result], output_sharding, collective_state.bound_manual_axes(), block, location)
+            let bound_manual_axes = collective_state.bound_manual_axes();
+            lower_sharding_constraint(result, output_sharding, OpenDimensions::All, bound_manual_axes, block, location)?
         } else {
-            Ok(vec![result])
-        }
+            result
+        };
+        Ok(vec![result])
     }
 }
 
@@ -247,12 +249,13 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
         let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
         reshape.result(0).unwrap().as_ref()
     };
-    if operation.output_sharding().is_some() {
+    let result = if operation.output_sharding().is_some() {
         let output_sharding = output_types[0].sharding().unwrap();
-        lower_sharding_constraint(&[result], output_sharding, bound_manual_axes, block, location)
+        lower_sharding_constraint(result, output_sharding, OpenDimensions::All, bound_manual_axes, block, location)?
     } else {
-        Ok(vec![result])
-    }
+        result
+    };
+    Ok(vec![result])
 }
 
 /// Checks equality of the input and output logical element counts without overflowing device-side arithmetic.

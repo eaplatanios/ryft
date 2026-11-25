@@ -1,15 +1,17 @@
 //! Conversions between `ryft` sharding types and their XLA representations. This module lowers [`LogicalMesh`],
 //! [`DeviceMesh`], [`Sharding`], and [`UnreducedKind`] to Shardy MLIR through [`ToMlir`], with the crate-internal
-//! `ShardyTensorSharding` controlling which dimensions of a lowered tensor sharding the compiler may still shard along
-//! auto mesh axes. In the opposite direction, [`OpShardingExtension`] recovers the [`Sharding`] that an XLA
+//! `ShardySharding` controlling which dimensions of a lowered tensor sharding the compiler may still shard along auto
+//! mesh axes. In the opposite direction, [`OpShardingExtension`] recovers the [`Sharding`] that an XLA
 //! [`OpSharding`] describes, e.g., for executable outputs whose placement the compiler chose.
 
-use ryft_core::{DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind};
-use ryft_mlir::Location;
+use ryft_core::{
+    DeviceMesh, LogicalMesh, MeshAxisType, ProgramError, Sharding, ShardingDimension, ShardingError, UnreducedKind,
+};
 use ryft_mlir::dialects::shardy;
+use ryft_mlir::{Block, BlockRef, Location, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use ryft_pjrt::protos::{OpSharding, OpShardingType};
 
-use crate::ToMlir;
+use crate::{Error, ToMlir};
 
 /// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
 pub const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
@@ -53,7 +55,7 @@ impl ToMlir for Sharding {
         &self,
         location: L,
     ) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
-        ShardyTensorSharding::new(self, false).to_mlir(location)
+        ShardySharding::new(self, OpenDimensions::None).to_mlir(location)
     }
 }
 
@@ -288,51 +290,58 @@ impl OpShardingExtension for OpSharding {
     }
 }
 
-/// Lowering of a [`Sharding`] to its Shardy tensor sharding attribute. The replicated and sharded dimensions of the
-/// attribute are closed (i.e., Shardy cannot shard them along further axes) unless the lowering is open over auto axes
-/// and the mesh of the sharding has an [`Auto`](MeshAxisType::Auto) axis, in which case every dimension is open. The
-/// axes that the sharding governs but does not use are listed as replicated either way, so open dimensions can only
-/// gain auto axes. This is how JAX lowers the shardings of types over meshes with auto axes (i.e.,
-/// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along those axes the type
-/// does not describe and the compiler chooses. [`Self::with_closed_dimensions`] keeps individual dimensions closed
-/// in a lowering that is open over auto axes.
+/// Dimensions of a lowered Shardy tensor sharding that the compiler may still shard along the
+/// [`Auto`](MeshAxisType::Auto) axes of its mesh. Refer to [`ShardySharding`] for more information.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct ShardyTensorSharding<'o> {
+pub(crate) enum OpenDimensions<'o> {
+    /// Every dimension is open.
+    All,
+
+    /// Every dimension is open except the listed ones, which are closed.
+    AllExcept(&'o [usize]),
+
+    /// Every replicated or sharded dimension is closed. An unconstrained dimension stays open.
+    None,
+}
+
+/// Lowering of a [`Sharding`] to its Shardy tensor sharding attribute. The replicated and sharded dimensions of the
+/// attribute are closed (i.e., Shardy cannot shard them along further axes) unless the lowering leaves them open (refer
+/// to [`OpenDimensions`]) and the mesh of the sharding has an [`Auto`](MeshAxisType::Auto) axis. The axes that the
+/// sharding governs but does not use are listed as replicated either way, so open dimensions can only gain auto axes.
+/// This is how JAX lowers the shardings of types over meshes with auto axes (i.e., `NamedSharding._to_sdy_sharding`
+/// with `modify_wrt_axis_types=True`), whose placement along those axes the type does not describe and the compiler
+/// chooses.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ShardySharding<'o> {
     /// [`Sharding`] that is being lowered.
     sharding: &'o Sharding,
 
-    /// Whether the dimensions of the lowered attribute are open over the auto axes of the mesh of the sharding.
-    open_over_auto_axes: bool,
-
-    /// Dimensions of the lowered attribute that are closed even when the lowering is open over auto axes.
-    closed_dimensions: &'o [usize],
+    /// Dimensions of the lowered attribute that are open over the auto axes of the mesh of the sharding.
+    open_dimensions: OpenDimensions<'o>,
 }
 
-impl<'o> ShardyTensorSharding<'o> {
-    /// Creates a new [`ShardyTensorSharding`] that lowers `sharding`, with dimensions that are open over the auto
-    /// axes of its mesh if `open_over_auto_axes` is set.
+impl<'o> ShardySharding<'o> {
+    /// Creates a new [`ShardySharding`] that lowers `sharding` with `open_dimensions` open over the auto axes of
+    /// its mesh.
     #[inline]
-    pub(crate) fn new(sharding: &'o Sharding, open_over_auto_axes: bool) -> Self {
-        Self { sharding, open_over_auto_axes, closed_dimensions: &[] }
-    }
-
-    /// Returns this [`ShardyTensorSharding`] with `dimensions` closed, so that Shardy cannot shard them along any
-    /// further axis, including auto axes, even when the lowering is open over auto axes.
-    #[inline]
-    pub(crate) fn with_closed_dimensions(mut self, dimensions: &'o [usize]) -> Self {
-        self.closed_dimensions = dimensions;
-        self
+    pub(crate) fn new(sharding: &'o Sharding, open_dimensions: OpenDimensions<'o>) -> Self {
+        Self { sharding, open_dimensions }
     }
 }
 
-impl ToMlir for ShardyTensorSharding<'_> {
+impl ToMlir for ShardySharding<'_> {
     type Output<'c, 't: 'c> = shardy::TensorShardingAttributeRef<'c, 't>;
 
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
         location: L,
     ) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
-        let Self { sharding, open_over_auto_axes, closed_dimensions } = *self;
+        let Self { sharding, open_dimensions } = *self;
+        let (open_over_auto_axes, closed_dimensions): (bool, &[usize]) = match open_dimensions {
+            OpenDimensions::All => (true, &[]),
+            OpenDimensions::AllExcept(dimensions) => (true, dimensions),
+            OpenDimensions::None => (false, &[]),
+        };
         let context = location.context();
         let closed =
             !open_over_auto_axes || sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto);
@@ -379,13 +388,111 @@ impl ToMlir for ShardyTensorSharding<'_> {
     }
 }
 
+/// Lowers a tensor placement constraint of `input_value` to `sharding`, after excluding the mesh axes bound by
+/// enclosing manual regions, and returns the constrained value. `open_dimensions` selects the dimensions that the
+/// compiler may still shard along auto axes (refer to [`ShardySharding`]):
+///
+///   - The tracked placement of a type is lowered with [`OpenDimensions::All`], because a type does not fully describe
+///     the placement along [`Auto`](MeshAxisType::Auto) axes, so the compiler stays free to place the value along them.
+///   - A constraint that states the whole placement of a value, including along auto axes, is lowered with
+///     [`OpenDimensions::None`]. A constraint that declares a pending reduction must use it, because Shardy drops the
+///     pending reduction of a value whose constraint leaves a dimension open.
+pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
+    input_value: ValueRef<'b, 'c, 't>,
+    sharding: &Sharding,
+    open_dimensions: OpenDimensions<'_>,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    // Bound manual axes describe ownership outside this local tensor and cannot appear on constraints inside the
+    // manual region. Restrict only the attribute's mesh inventory, because its symbol still names the module's full
+    // mesh.
+    let local_sharding;
+    let sharding = if bound_manual_axes.is_empty() {
+        sharding
+    } else {
+        let retain = |axis: &String| !bound_manual_axes.contains(axis);
+        let projected = || -> Result<Sharding, ShardingError> {
+            let mesh = LogicalMesh::new(
+                sharding
+                    .mesh()
+                    .axes()
+                    .iter()
+                    .filter(|axis| !bound_manual_axes.iter().any(|bound| bound == axis.name()))
+                    .cloned()
+                    .collect(),
+            )?;
+            let dimensions = sharding
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    ShardingDimension::Sharded(axes) => {
+                        let axes = axes.iter().filter(|axis| retain(axis)).cloned().collect::<Vec<_>>();
+                        if axes.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axes) }
+                    }
+                    dimension => dimension.clone(),
+                })
+                .collect();
+            let projected_sharding = Sharding::new(mesh, dimensions)?
+                .with_unreduced_axes(sharding.unreduced_axes().iter().filter(|axis| retain(axis)).cloned())?;
+            // The pending reduction keeps its kind unless the projection drops all of its axes.
+            let unreduced_kind = if projected_sharding.unreduced_axes().is_empty() {
+                UnreducedKind::Sum
+            } else {
+                sharding.unreduced_kind()
+            };
+            projected_sharding
+                .with_unreduced_kind(unreduced_kind)?
+                .with_reduced_axes(sharding.reduced_axes().iter().filter(|axis| retain(axis)).cloned())?
+                .with_varying_manual_axes(sharding.varying_manual_axes().iter().filter(|axis| retain(axis)).cloned())
+        };
+        local_sharding = projected().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        &local_sharding
+    };
+    let sharding_attribute = ShardySharding::new(sharding, open_dimensions).to_mlir(location)?;
+    let operation = block.append_operation(shardy::sharding_constraint(input_value, sharding_attribute, location)?)?;
+    Ok(operation.result(0).unwrap().as_ref())
+}
+
+/// Lowers a tensor placement constraint that replicates a value with the tracked placement `sharding` along `axes`
+/// and returns the constrained value. The constraint is that of [`lower_sharding_constraint`] for `sharding` with
+/// those dimensions replicated, except that the dimensions are closed, so that the compiler cannot shard them along
+/// auto axes either. Operations whose lowering XLA cannot distribute along a dimension (e.g., a reduction whose
+/// combiner is not a single operation) use it to have every device hold all of the elements along that dimension.
+pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
+    input_value: ValueRef<'b, 'c, 't>,
+    sharding: &Sharding,
+    axes: &[usize],
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let mut dimensions = sharding.dimensions().to_vec();
+    for axis in axes {
+        dimensions[*axis] = ShardingDimension::Replicated;
+    }
+    let replicated = sharding
+        .with_dimensions(dimensions)
+        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+    lower_sharding_constraint(
+        input_value,
+        &replicated,
+        OpenDimensions::AllExcept(axes),
+        bound_manual_axes,
+        block,
+        location,
+    )
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::MeshAxis;
-    use ryft_mlir::{Block, Context as MlirContext};
+    use ryft_core::{ArrayType, DataType, MeshAxis};
+    use ryft_mlir::Context as MlirContext;
 
+    use crate::lowering::types::lower_tensor_type;
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
@@ -400,6 +507,24 @@ mod tests {
             replicate_on_last_tile_dim,
             ..Default::default()
         }
+    }
+
+    /// Returns the mesh with the manual axis `m`, the explicit axis `x`, and the auto axis `y`, each of size two.
+    pub(crate) fn test_mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// Returns the `f32[4, 2]` type placed along `x` on its first dimension.
+    pub(crate) fn test_input_type() -> ArrayType {
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(sharding).unwrap()
     }
 
     #[test]
@@ -613,18 +738,17 @@ mod tests {
         // Over a mesh with an auto axis, an open lowering leaves every dimension open, so the compiler can only add
         // auto axes, because the unused explicit axes stay replicated. A closed lowering closes every dimension.
         assert_eq!(
-            ShardyTensorSharding::new(&sharding, true).to_mlir(location).unwrap().to_string(),
+            ShardySharding::new(&sharding, OpenDimensions::All).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{?}, {\"y\", ?}], replicated={\"z\"}>",
         );
         assert_eq!(
-            ShardyTensorSharding::new(&sharding, false).to_mlir(location).unwrap().to_string(),
+            ShardySharding::new(&sharding, OpenDimensions::None).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"z\"}>",
         );
 
         // An open lowering keeps the requested dimensions closed, which the compiler cannot shard along auto axes.
         assert_eq!(
-            ShardyTensorSharding::new(&sharding, true)
-                .with_closed_dimensions(&[0])
+            ShardySharding::new(&sharding, OpenDimensions::AllExcept(&[0]))
                 .to_mlir(location)
                 .unwrap()
                 .to_string(),
@@ -635,7 +759,7 @@ mod tests {
         let explicit_mesh = sharding.mesh().with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
         let explicit_sharding = Sharding::new(explicit_mesh.clone(), sharding.dimensions().to_vec()).unwrap();
         assert_eq!(
-            ShardyTensorSharding::new(&explicit_sharding, true).to_mlir(location).unwrap().to_string(),
+            ShardySharding::new(&explicit_sharding, OpenDimensions::All).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"x\", \"z\"}>",
         );
 
@@ -644,8 +768,77 @@ mod tests {
             Sharding::new(explicit_mesh, vec![ShardingDimension::unconstrained(), ShardingDimension::sharded(["y"])])
                 .unwrap();
         assert_eq!(
-            ShardyTensorSharding::new(&unconstrained_sharding, false).to_mlir(location).unwrap().to_string(),
+            ShardySharding::new(&unconstrained_sharding, OpenDimensions::None)
+                .to_mlir(location)
+                .unwrap()
+                .to_string(),
             "#sdy.sharding<@mesh, [{?}, {\"y\"}], replicated={\"x\", \"z\"}>",
+        );
+    }
+
+    #[test]
+    fn test_lower_sharding_constraint() {
+        // The constraints are rendered outside any function, so their detached operands print as unknown SSA values.
+        let input_type = test_input_type();
+        let sharding = input_type.sharding().unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+
+        // The dimensions are open, open except for the listed ones, or closed.
+        let open = lower_sharding_constraint(input, sharding, OpenDimensions::All, &[], &mut block_ref, location);
+        let dimensions = OpenDimensions::AllExcept(&[1]);
+        lower_sharding_constraint(input, sharding, dimensions, &[], &mut block_ref, location).unwrap();
+        lower_sharding_constraint(input, sharding, OpenDimensions::None, &[], &mut block_ref, location).unwrap();
+
+        // An axis that an enclosing manual region binds is left out of the constraint, and with it the dimensions
+        // that are sharded along it alone.
+        let bound = ["m".to_string()];
+        lower_sharding_constraint(input, sharding, OpenDimensions::All, &bound, &mut block_ref, location).unwrap();
+        let bound = ["x".to_string()];
+        lower_sharding_constraint(input, sharding, OpenDimensions::None, &bound, &mut block_ref, location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(open.unwrap(), operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x", ?}, {?}], replicated={"m"}> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x", ?}, {}], replicated={"m"}> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x"}, {}], replicated={"m"}> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x", ?}, {?}]> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {}], replicated={"m"}> : tensor<4x2xf32>"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_lower_replication_constraint() {
+        let input_type = test_input_type();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let output = lower_replication_constraint(
+            input,
+            input_type.sharding().unwrap(),
+            &[0],
+            &[],
+            &mut block.as_ref(),
+            location.as_ref(),
+        )
+        .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {?}], replicated={"m", "x"}> : tensor<4x2xf32>"#,
+            ],
         );
     }
 }

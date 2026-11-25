@@ -19,7 +19,7 @@ use crate::operations::constants::lower_layout_constraint;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
@@ -466,12 +466,13 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         && cast_changes_explicit_placement(input_type, output_type)
     {
         result = lower_sharding_constraint(
-            &[result],
+            result,
             sharding,
+            OpenDimensions::All,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
-        )?[0];
+        )?;
     }
     Ok(result)
 }

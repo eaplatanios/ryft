@@ -13,7 +13,7 @@ use crate::lowering::types::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for GatherOperation {
@@ -33,17 +33,19 @@ impl LowerableOperation for GatherOperation {
             lowerer.context(),
             lowerer.location(),
         )?;
-        if self.output_sharding().is_some() {
-            lower_sharding_constraint(
-                &values,
-                output_types[0].sharding().unwrap(),
-                lowerer.collective_state().bound_manual_axes(),
-                &mut lowerer.block(),
-                lowerer.location(),
-            )
-        } else {
-            Ok(values)
+        if self.output_sharding().is_none() {
+            return Ok(values);
         }
+        check_count!("input", values, 1, ProgramError);
+        let value = lower_sharding_constraint(
+            values[0],
+            output_types[0].sharding().unwrap(),
+            OpenDimensions::All,
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
+        )?;
+        Ok(vec![value])
     }
 }
 

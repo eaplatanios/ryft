@@ -169,25 +169,29 @@ mod tests {
         V::Dispatch::place(value, Some(target), None, true)
     }
 
-    /// Uploads an uncommitted two-element vector for a placement derivative test.
-    fn upload_place_jvp_vector(session: &Session, values: &[f32; 2]) -> Array {
-        Array::from_host_buffer(session, ArrayType::new_static(DataType::F32, [2]), None, None, values_to_bytes(values))
-            .unwrap()
+    /// Uploads `values` as an `f32` array of shape `shape` without a mesh or a sharding, so the array lives on the
+    /// first device of `session` uncommitted, which makes it relocatable.
+    fn upload(session: &Session, shape: &[usize], values: &[f32]) -> Array {
+        let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
+        Array::from_host_buffer(session, r#type, None, None, values_to_bytes(values)).unwrap()
     }
 
-    /// Uploads a named singleton placement primal and a tangent on the session's default device.
-    fn place_jvp_inputs(session: &Session, device: Device) -> (Array, Array) {
+    /// Returns the primal `[1, 2]`, committed to `device` and replicated over the explicit axis `other` of size 1, and
+    /// the tangent `[3, 4]`, uploaded with [`upload`], for the JVP tests of placements whose primal lives on a named
+    /// mesh.
+    fn named_primal_and_tangent(session: &Session, device: Device) -> (Array, Array) {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
         let placement = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let primal = upload_place_jvp_vector(session, &[1., 2.]).place(&placement, None).unwrap();
-        (primal, upload_place_jvp_vector(session, &[3., 4.]))
+        let primal = upload(session, &[2], &[1., 2.]).place(&placement, None).unwrap();
+        (primal, upload(session, &[2], &[3., 4.]))
     }
 
-    /// Reads the value of a single-device derivative result alongside its placement.
-    fn observe_place_jvp(array: &Array) -> (Device, bool, Vec<f32>) {
-        let [device] = array.mesh().devices() else { panic!("expected one device") };
-        (*device, array.is_committed(), array.copy_to_host().unwrap().elements::<f32>().unwrap())
+    /// Returns the devices on which `array` lives, its `f32` elements, and whether it is committed, which is what the
+    /// eager transform tests of placements observe of a result.
+    fn observe_placement(array: Array) -> (Vec<Device>, Vec<f32>, bool) {
+        let elements = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+        (array.mesh().devices().to_vec(), elements, array.is_committed())
     }
 
     #[test]
@@ -626,9 +630,9 @@ mod tests {
         // of a region of one device, or a device outside the program mesh) moves nothing forward, so it compiles
         // forward and executes eagerly, whatever the target is, as pinned JAX compiles and runs a `device_put` with a
         // `src` outside a `shard_map`. The program of reverse mode keeps only the transposed placement, whose target is
-        // that source, and is rejected for it, as pinned JAX rejects the gradient. Before, the forward and eager paths
-        // rejected such a source because of that hypothetical transposition. The same sources of a value that varies
-        // along the manual axis are accepted on every path (refer to
+        // that source, and is rejected for it, as pinned JAX rejects the gradient. The forward and eager paths never
+        // reject such a source because of that transposition. The same sources of a value that varies along the manual
+        // axis are accepted on every path (refer to
         // `test_session_place_agrees_across_paths_for_manual_regions_and_host_values`).
         let pinned = Some(PlacementRequest::from(Memory::Host { pinned: true }));
         for count in [1, 2] {
@@ -1092,254 +1096,6 @@ mod tests {
     }
 
     #[test]
-    fn test_place_operation_eager_partial_evaluation_may_alias() {
-        // The XLA operation family holds the placement through its projected array member. Specializing a program on a
-        // known input of a placement that forces a copy keeps that placement residual, so that two executions of the
-        // specialized program return distinct buffers, while the negation of the unknown input stays residual too.
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
-        )
-        .unwrap();
-        let input = f32_vector(&session, &mesh, &[1., 2.]);
-        let r#type = Type::Array(input.r#type().into_owned());
-        let mut builder = ProgramBuilder::new();
-        let known = builder.add_input(r#type.clone());
-        let unknown = builder.add_input(r#type.clone());
-        let copy = builder
-            .add_instruction(PlaceOperation::new(None, None).with_may_alias(false), Vec::new(), vec![known], None)
-            .unwrap()[0];
-        let negation = builder.add_instruction(NegOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![copy, negation], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let input = Value::Array(input);
-        let evaluation = program
-            .partially_evaluate_in_context(
-                &session,
-                &[PartialValue::Known(input.clone()), PartialValue::Unknown(r#type)],
-            )
-            .unwrap();
-        assert_eq!(
-            evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
-                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [may_alias=false] %1
-                    %3:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = neg %0
-                in (%2, %3)"
-            },
-        );
-        assert_eq!(evaluation.outputs().iter().map(|output| output.is_known()).collect::<Vec<_>>(), vec![false, false]);
-        let first = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
-        let second = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
-        let (Value::Array(first), Value::Array(second), Value::Array(input)) = (&first[0], &second[0], &input) else {
-            unreachable!("placements of arrays return arrays");
-        };
-        assert_eq!(shard_values(first), vec![vec![1., 2.]]);
-        assert_eq!(shard_values(second), vec![vec![1., 2.]]);
-        let buffer = |array: &Array| array.shards()[0].buffer().unwrap().clone();
-        assert!(!Arc::ptr_eq(&buffer(first), &buffer(second)));
-        assert!(!Arc::ptr_eq(&buffer(first), &buffer(input)));
-    }
-
-    #[test]
-    fn test_place_operation_eager_partial_evaluation_uses_declared_reduction_state() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let device = session.addressable_devices().unwrap()[0];
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let session = session.with_device_mesh(mesh);
-        let sharding = Sharding::replicated(logical_mesh, 0).with_reduced_axes(["x"]).unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::scalar(DataType::F32),
-            None,
-            Some(sharding.clone()),
-            values_to_bytes(&[2.0f32]),
-        )
-        .unwrap();
-        assert_eq!(input.sharding(), &sharding);
-        assert_eq!(input.r#type().sharding(), Some(&sharding.without_auto_axes()));
-        let target = input.placement().unwrap();
-        let eager = input.place(&target, None).unwrap();
-        assert_eq!(eager.placement(), Some(target.clone()));
-        assert_eq!(shard_values(&eager), vec![vec![2.0f32]]);
-
-        // The shared fold validates the staged type before it can execute a known placement. That type omits the
-        // physical reduction over the automatic axis, so the resolved target cannot restate that reduction here.
-        let error = ProgramError::Type(TypeError::invalid(
-            "`place` cannot change reduction state; use a reduction (or the corresponding collective) instead",
-        ));
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&input));
-        let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-        assert_eq!(known.place(&target, None).unwrap_err(), error);
-
-        let context = ryft_core::PartialEvaluationContext::new(session);
-        let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input)));
-        assert_eq!(known.place(&target, None).unwrap_err(), error);
-    }
-
-    #[test]
-    fn test_place_operation_eager_partial_evaluation_admits_relocatable_known_values() {
-        // A known partial value keeps the relocatability of the uncommitted upload that it carries, so a targetless
-        // placement with a source on a named mesh of the second device admits it through `Place`, direct
-        // interpretation, and batching, and leaves it where it is, uncommitted, as it does for the upload itself. An
-        // unknown partial value with a declared sharding names a residual program variable, which is staged,
-        // so it is validated strictly against that declaration.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |value: PartialTracer<ryft_core::ProjectedContext<Session, ArrayType>>| {
-            let array = value.value().unwrap().as_known().unwrap().clone();
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let array = upload(&[2], &[1., 2.]);
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
-        let known = PartialTracer::new(context.clone(), context.known_value(array.clone()));
-        let packed = PartialTracer::new(context.clone(), context.known_value(upload(&[1, 2], &[1., 2.])));
-        let operation = PlaceOperation::new(None, source.clone());
-        let outcomes = vec![
-            known.place(&Option::<Placement>::None, &source).map(observe).map_err(|error| error.to_string()),
-            InterpretableOperation::interpret(&operation, &context, &EmptyRegionDriver, &[known.clone()])
-                .map(|mut outputs| observe(outputs.remove(0)))
-                .map_err(|error| error.to_string()),
-            batch(
-                |item| item.place(&Option::<Placement>::None, &source),
-                packed,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .map(observe)
-            .map_err(|error| error.to_string()),
-        ];
-        let accepted = Ok((vec![devices[0].id()], vec![1., 2.], false));
-        assert_eq!(outcomes, vec![accepted.clone(), accepted.clone(), accepted]);
-
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
-        let initial = LogicalMesh::new(vec![MeshAxis::new("initial", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let declaration = array.r#type().into_owned().with_sharding(Sharding::replicated(initial, 1)).unwrap();
-        let unknown = PartialTracer::new(context.clone(), context.unknown_input(declaration.clone(), 0));
-        let placed = unknown
-            .place(&Option::<Placement>::None, &source)
-            .map_err(|error| error.to_string())
-            .and_then(|value| value.value().map(|_| ()).map_err(|error| error.to_string()));
-        assert_eq!(
-            placed,
-            Err(format!(
-                "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input type `{}`",
-                source.sharding(),
-                declaration,
-            )),
-        );
-    }
-
-    #[test]
-    fn test_place_operation_eager_partial_evaluation_folds_and_residualizes_relocatable_values() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let second = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let named_mesh =
-            |axis| LogicalMesh::new(vec![MeshAxis::new(axis, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let initial = Sharding::replicated(named_mesh("first"), 1);
-        let source_mesh = named_mesh("second");
-        let source = Placement::new(
-            DeviceMesh::new(source_mesh.clone(), vec![second]).unwrap(),
-            Sharding::replicated(source_mesh, 1),
-        )
-        .unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let values = [1f32, 2.];
-        let anonymous =
-            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(&values)).unwrap();
-        let named =
-            Array::from_host_buffer(&session, r#type.clone(), None, Some(initial), values_to_bytes(&values)).unwrap();
-        let copy = PlaceOperation::new(None, source).with_may_alias(false);
-        assert!(!named.is_committed());
-        assert!(copy.infer_output_types(&[named.r#type().into_owned()], &[]).is_err());
-
-        for input in [anonymous, named] {
-            let domain = CoreValue::domain(&input);
-            let context = ryft_core::PartialEvaluationContext::new(domain.clone());
-            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-            let [output] = InterpretableOperation::interpret(
-                &copy.clone().with_may_alias(true),
-                &context,
-                &EmptyRegionDriver,
-                &[known],
-            )
-            .unwrap()
-            .try_into()
-            .unwrap();
-            assert_eq!(output.value().unwrap().declared_type(), None);
-            assert_eq!(output.r#type(), input.r#type());
-            assert_eq!(output.value().unwrap().as_known().unwrap().placement(), input.placement());
-
-            let context = ryft_core::PartialEvaluationContext::new(domain.clone()).with_allow_copy_folding(false);
-            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-            let [output] = InterpretableOperation::interpret(&copy, &context, &EmptyRegionDriver, &[known])
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let residual = output.value().unwrap().clone();
-            assert!(residual.is_unknown());
-            drop(output);
-            let evaluation = context.into_evaluation(vec![residual]).unwrap();
-            assert_eq!(
-                evaluation.program().to_string(),
-                format!("lambda %0:{0} .\nlet %1:{0} = {copy} %0\nin (%1)", r#type),
-            );
-
-            let first_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
-            let second_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
-            assert_eq!(first_copy.mesh(), input.mesh());
-            assert_eq!(second_copy.mesh(), input.mesh());
-            assert_eq!(shard_values(&first_copy), vec![values.to_vec()]);
-            assert_eq!(shard_values(&second_copy), vec![values.to_vec()]);
-            let input_addresses = native_buffer_addresses(&input);
-            let first_addresses = native_buffer_addresses(&first_copy);
-            let second_addresses = native_buffer_addresses(&second_copy);
-            assert_ne!(first_addresses, input_addresses);
-            assert_ne!(second_addresses, input_addresses);
-            assert_ne!(first_addresses, second_addresses);
-
-            // The same rule runs through the projected array member of the full session family.
-            let context = ryft_core::PartialEvaluationContext::new(session.clone()).with_allow_copy_folding(false);
-            let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input.clone())));
-            let [output] = context.bind(copy.clone(), Vec::new(), &[known]).unwrap().try_into().unwrap();
-            let residual = output.value().unwrap().clone();
-            assert!(residual.is_unknown());
-            drop(output);
-            let evaluation = context.into_evaluation(vec![residual]).unwrap();
-            assert_eq!(
-                evaluation.program().to_string(),
-                format!("lambda %0:{0} .\nlet %1:{0} = {copy} %0\nin (%1)", r#type),
-            );
-            let output = evaluation.interpret(&session, &[]).unwrap().remove(0);
-            let output = ValueProjection::<ArrayType>::into_projected(output).unwrap();
-            assert_eq!(output.mesh(), input.mesh());
-            assert_eq!(shard_values(&output), vec![values.to_vec()]);
-            assert_ne!(native_buffer_addresses(&output), input_addresses);
-        }
-    }
-
-    #[test]
     fn test_place_operation_eager_device_target() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -1467,74 +1223,72 @@ mod tests {
         // uncommitted. Eager placement, linearization, the fused JVP, batching, and the direct interpretation of the
         // operation all admit it by the same rule, as pinned JAX admits `device_put` with such a source eagerly, under
         // `jvp`, and under `vmap`.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
         let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let first = devices[0].id();
+        let options = || PlacementOptions::default().with_source(source.clone());
+        let first = devices[0];
 
-        let options = PlacementOptions::default().with_source(source.clone());
         assert_eq!(
-            session.place(upload(&[2], &[3., 4.]), options).map(observe).map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4.], false)),
-        );
-        assert_eq!(
-            upload(&[2], &[3., 4.])
-                .place(&Option::<Placement>::None, &source)
-                .map(observe)
+            session
+                .place(upload(&session, &[2], &[3., 4.]), options())
+                .map(observe_placement)
                 .map_err(|error| error.to_string()),
             Ok((vec![first], vec![3., 4.], false)),
         );
-        let (primal, pushforward) = differentiate_at(upload(&[2], &[3., 4.]))
+        assert_eq!(
+            upload(&session, &[2], &[3., 4.])
+                .place(&Option::<Placement>::None, &source)
+                .map(observe_placement)
+                .map_err(|error| error.to_string()),
+            Ok((vec![first], vec![3., 4.], false)),
+        );
+        let (primal, pushforward) = differentiate_at(upload(&session, &[2], &[3., 4.]))
             .linearize(|x| x.place(&Option::<Placement>::None, &source))
             .unwrap();
-        assert_eq!(observe(primal), (vec![first], vec![3., 4.], false));
-        assert_eq!(observe(pushforward.apply(upload(&[2], &[5., 6.])).unwrap()), (vec![first], vec![5., 6.], false));
-        let (primal, tangent) = differentiate_at(upload(&[2], &[3., 4.]))
-            .jvp(upload(&[2], &[5., 6.]), |x| x.place(&Option::<Placement>::None, &source))
+        assert_eq!(observe_placement(primal), (vec![first], vec![3., 4.], false));
+        assert_eq!(
+            observe_placement(pushforward.apply(upload(&session, &[2], &[5., 6.])).unwrap()),
+            (vec![first], vec![5., 6.], false),
+        );
+        let (primal, tangent) = differentiate_at(upload(&session, &[2], &[3., 4.]))
+            .jvp(upload(&session, &[2], &[5., 6.]), |x| x.place(&Option::<Placement>::None, &source))
             .unwrap();
         assert_eq!(
-            (observe(primal), observe(tangent)),
+            (observe_placement(primal), observe_placement(tangent)),
             ((vec![first], vec![3., 4.], false), (vec![first], vec![5., 6.], false)),
         );
         let batched = batch(
             |x| x.place(&Option::<Placement>::None, &source),
-            upload(&[2, 2], &[3., 4., 5., 6.]),
+            upload(&session, &[2, 2], &[3., 4., 5., 6.]),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
         );
         assert_eq!(
-            batched.map(observe).map_err(|error| error.to_string()),
+            batched.map(observe_placement).map_err(|error| error.to_string()),
             Ok((vec![first], vec![3., 4., 5., 6.], false)),
         );
-        let input = upload(&[2], &[3., 4.]);
+        let input = upload(&session, &[2], &[3., 4.]);
         let operation = PlaceOperation::new(None, source.clone());
         let interpreted = InterpretableOperation::interpret(&operation, &input.domain(), &EmptyRegionDriver, &[input])
-            .map(|outputs| outputs.into_iter().map(observe).collect::<Vec<_>>())
+            .map(|outputs| outputs.into_iter().map(observe_placement).collect::<Vec<_>>())
             .map_err(|error| error.to_string());
         assert_eq!(interpreted, Ok(vec![(vec![first], vec![3., 4.], false)]));
 
-        let committed = upload(&[2], &[3., 4.]).to_placement(&session, devices[0]).unwrap();
+        // The same source is rejected for an array committed to the first device, through `Session::place`,
+        // linearization, and `Place`.
+        let committed = upload(&session, &[2], &[3., 4.]).to_placement(&session, devices[0]).unwrap();
         let rejection = format!(
             "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input sharding `{}`",
             source.sharding(),
             committed.sharding(),
+        );
+        assert_eq!(
+            session.place(committed.clone(), options()).map(|_| ()).map_err(|error| error.to_string()),
+            Err(rejection.clone()),
         );
         assert_eq!(
             differentiate_at(committed.clone())
@@ -1547,6 +1301,253 @@ mod tests {
             committed.place(&Option::<Placement>::None, &source).map(|_| ()).map_err(|error| error.to_string()),
             Err(rejection),
         );
+    }
+
+    #[test]
+    fn test_place_operation_eager_partial_evaluation_may_alias() {
+        // The XLA operation family holds the placement through its projected array member. Specializing a program on a
+        // known input of a placement that forces a copy keeps that placement residual, so that two executions of the
+        // specialized program return distinct buffers, while the negation of the unknown input stays residual too.
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            session.addressable_devices().unwrap(),
+        )
+        .unwrap();
+        let input = f32_vector(&session, &mesh, &[1., 2.]);
+        let r#type = Type::Array(input.r#type().into_owned());
+        let mut builder = ProgramBuilder::new();
+        let known = builder.add_input(r#type.clone());
+        let unknown = builder.add_input(r#type.clone());
+        let copy = builder
+            .add_instruction(PlaceOperation::new(None, None).with_may_alias(false), Vec::new(), vec![known], None)
+            .unwrap()[0];
+        let negation = builder.add_instruction(NegOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![copy, negation], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let input = Value::Array(input);
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &session,
+                &[PartialValue::Known(input.clone()), PartialValue::Unknown(r#type)],
+            )
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [may_alias=false] %1
+                    %3:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = neg %0
+                in (%2, %3)"
+            },
+        );
+        assert_eq!(evaluation.outputs().iter().map(|output| output.is_known()).collect::<Vec<_>>(), vec![false, false]);
+        let first = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
+        let second = evaluation.interpret(&session, std::slice::from_ref(&input)).unwrap();
+        let (Value::Array(first), Value::Array(second), Value::Array(input)) = (&first[0], &second[0], &input) else {
+            unreachable!("placements of arrays return arrays");
+        };
+        assert_eq!(shard_values(first), vec![vec![1., 2.]]);
+        assert_eq!(shard_values(second), vec![vec![1., 2.]]);
+        let buffer = |array: &Array| array.shards()[0].buffer().unwrap().clone();
+        assert!(!Arc::ptr_eq(&buffer(first), &buffer(second)));
+        assert!(!Arc::ptr_eq(&buffer(first), &buffer(input)));
+    }
+
+    #[test]
+    fn test_place_operation_eager_partial_evaluation_uses_declared_reduction_state() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let session = session.with_device_mesh(mesh);
+        let sharding = Sharding::replicated(logical_mesh, 0).with_reduced_axes(["x"]).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::scalar(DataType::F32),
+            None,
+            Some(sharding.clone()),
+            values_to_bytes(&[2.0f32]),
+        )
+        .unwrap();
+        assert_eq!(input.sharding(), &sharding);
+        assert_eq!(input.r#type().sharding(), Some(&sharding.without_auto_axes()));
+        let target = input.placement().unwrap();
+        let eager = input.place(&target, None).unwrap();
+        assert_eq!(eager.placement(), Some(target.clone()));
+        assert_eq!(shard_values(&eager), vec![vec![2.0f32]]);
+
+        // The shared fold validates the staged type before it can execute a known placement. That type omits the
+        // physical reduction over the automatic axis, so the resolved target cannot restate that reduction here.
+        let error = ProgramError::Type(TypeError::invalid(
+            "`place` cannot change reduction state; use a reduction (or the corresponding collective) instead",
+        ));
+        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&input));
+        let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
+        assert_eq!(known.place(&target, None).unwrap_err(), error);
+
+        let context = ryft_core::PartialEvaluationContext::new(session);
+        let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input)));
+        assert_eq!(known.place(&target, None).unwrap_err(), error);
+    }
+
+    #[test]
+    fn test_place_operation_eager_partial_evaluation_admits_relocatable_known_values() {
+        // A known partial value keeps the relocatability of the uncommitted upload that it carries, so a targetless
+        // placement with a source on a named mesh of the second device admits it through `Place`, direct
+        // interpretation, and batching, and leaves it where it is, uncommitted, as it does for the upload itself. An
+        // unknown partial value with a declared sharding names a residual program variable, which is staged,
+        // so it is validated strictly against that declaration.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
+        let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
+        let known_array = |value: PartialTracer<ryft_core::ProjectedContext<Session, ArrayType>>| {
+            value.value().unwrap().as_known().unwrap().clone()
+        };
+        let array = upload(&session, &[2], &[1., 2.]);
+        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
+        let known = PartialTracer::new(context.clone(), context.known_value(array.clone()));
+        let packed = PartialTracer::new(context.clone(), context.known_value(upload(&session, &[1, 2], &[1., 2.])));
+        let operation = PlaceOperation::new(None, source.clone());
+        let outcomes = vec![
+            known
+                .place(&Option::<Placement>::None, &source)
+                .map(known_array)
+                .map(observe_placement)
+                .map_err(|error| error.to_string()),
+            InterpretableOperation::interpret(&operation, &context, &EmptyRegionDriver, &[known.clone()])
+                .map(|mut outputs| observe_placement(known_array(outputs.remove(0))))
+                .map_err(|error| error.to_string()),
+            batch(
+                |item| item.place(&Option::<Placement>::None, &source),
+                packed,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .map(known_array)
+            .map(observe_placement)
+            .map_err(|error| error.to_string()),
+        ];
+        let accepted = Ok((vec![devices[0]], vec![1., 2.], false));
+        assert_eq!(outcomes, vec![accepted.clone(), accepted.clone(), accepted]);
+
+        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
+        let initial = LogicalMesh::new(vec![MeshAxis::new("initial", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let declaration = array.r#type().into_owned().with_sharding(Sharding::replicated(initial, 1)).unwrap();
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(declaration.clone(), 0));
+        let placed = unknown
+            .place(&Option::<Placement>::None, &source)
+            .map_err(|error| error.to_string())
+            .and_then(|value| value.value().map(|_| ()).map_err(|error| error.to_string()));
+        assert_eq!(
+            placed,
+            Err(format!(
+                "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input type `{}`",
+                source.sharding(),
+                declaration,
+            )),
+        );
+    }
+
+    #[test]
+    fn test_place_operation_eager_partial_evaluation_folds_and_residualizes_relocatable_values() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let second = session.addressable_devices().unwrap()[1];
+        let named_mesh =
+            |axis| LogicalMesh::new(vec![MeshAxis::new(axis, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let initial = Sharding::replicated(named_mesh("first"), 1);
+        let source_mesh = named_mesh("second");
+        let source = Placement::new(
+            DeviceMesh::new(source_mesh.clone(), vec![second]).unwrap(),
+            Sharding::replicated(source_mesh, 1),
+        )
+        .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let values = [1f32, 2.];
+        let anonymous = upload(&session, &[2], &values);
+        let named = Array::from_host_buffer(&session, r#type, None, Some(initial), values_to_bytes(&values)).unwrap();
+        let copy = PlaceOperation::new(None, source).with_may_alias(false);
+        assert!(!named.is_committed());
+        assert!(matches!(
+            copy.infer_output_types(&[named.r#type().into_owned()], &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`place` source sharding `{mesh<['second'=1:explicit]>, [{}]}` does not match the input \
+                               type `f32[2][sharding={mesh<['first'=1:explicit]>, [{}]}]`",
+        ));
+        let residualized = indoc! {"
+            lambda %0:f32[2] .
+            let %1:f32[2] = place [
+                source={mesh<['second'=1:explicit]>, devices=[1], sharding={mesh<['second'=1:explicit]>, [{}]}},
+                may_alias=false,
+            ] %0
+            in (%1)"
+        };
+
+        // The type rule rejects the source for the named sharding, but both uncommitted uploads are relocatable, so
+        // partial evaluation admits it. A placement that may alias folds to the known input. A copy stays residual when
+        // copy folding is disabled, and each execution of the residual program returns a new buffer.
+        for input in [anonymous, named] {
+            let domain = CoreValue::domain(&input);
+            let context = ryft_core::PartialEvaluationContext::new(domain.clone());
+            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
+            let [output] = InterpretableOperation::interpret(
+                &copy.clone().with_may_alias(true),
+                &context,
+                &EmptyRegionDriver,
+                &[known],
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+            assert_eq!(output.value().unwrap().declared_type(), None);
+            assert_eq!(output.r#type(), input.r#type());
+            assert_eq!(output.value().unwrap().as_known().unwrap().placement(), input.placement());
+
+            let context = ryft_core::PartialEvaluationContext::new(domain.clone()).with_allow_copy_folding(false);
+            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
+            let [output] = InterpretableOperation::interpret(&copy, &context, &EmptyRegionDriver, &[known])
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let residual = output.value().unwrap().clone();
+            assert!(residual.is_unknown());
+            drop(output);
+            let evaluation = context.into_evaluation(vec![residual]).unwrap();
+            assert_eq!(evaluation.program().to_string(), residualized);
+
+            let first_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
+            let second_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
+            assert_eq!(first_copy.mesh(), input.mesh());
+            assert_eq!(second_copy.mesh(), input.mesh());
+            assert_eq!(shard_values(&first_copy), vec![values.to_vec()]);
+            assert_eq!(shard_values(&second_copy), vec![values.to_vec()]);
+            let input_addresses = native_buffer_addresses(&input);
+            let first_addresses = native_buffer_addresses(&first_copy);
+            let second_addresses = native_buffer_addresses(&second_copy);
+            assert_ne!(first_addresses, input_addresses);
+            assert_ne!(second_addresses, input_addresses);
+            assert_ne!(first_addresses, second_addresses);
+
+            // The same rule runs through the projected array member of the full session family.
+            let context = ryft_core::PartialEvaluationContext::new(session.clone()).with_allow_copy_folding(false);
+            let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input.clone())));
+            let [output] = context.bind(copy.clone(), Vec::new(), &[known]).unwrap().try_into().unwrap();
+            let residual = output.value().unwrap().clone();
+            assert!(residual.is_unknown());
+            drop(output);
+            let evaluation = context.into_evaluation(vec![residual]).unwrap();
+            assert_eq!(evaluation.program().to_string(), residualized);
+            let output = evaluation.interpret(&session, &[]).unwrap().remove(0);
+            let output = ValueProjection::<ArrayType>::into_projected(output).unwrap();
+            assert_eq!(output.mesh(), input.mesh());
+            assert_eq!(shard_values(&output), vec![values.to_vec()]);
+            assert_ne!(native_buffer_addresses(&output), input_addresses);
+        }
     }
 
     #[test]
@@ -1572,7 +1573,7 @@ mod tests {
     fn test_place_operation_eager_jvp_admits_relocatable_tangents() {
         let session = Session::builder().client(cpu_client(3)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
+        let (primal, tangent) = named_primal_and_tangent(&session, devices[1]);
         let aligned = tangent.place(&primal.placement().unwrap(), None).unwrap();
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
         let laid_out = aligned
@@ -1585,9 +1586,9 @@ mod tests {
         for tangent in [tangent, aligned, laid_out] {
             let (value, derivative) =
                 differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&target, None)).unwrap();
-            assert_eq!(observe_place_jvp(&value), (target, true, vec![1., 2.]));
-            assert_eq!(observe_place_jvp(&derivative), (target, true, vec![3., 4.]));
-            assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (target, true, vec![3., 4.]));
+            assert_eq!(observe_placement(value), (vec![target], vec![1., 2.], true));
+            assert_eq!(observe_placement(derivative), (vec![target], vec![3., 4.], true));
+            assert_eq!(observe_placement(pushforward.apply(tangent).unwrap()), (vec![target], vec![3., 4.], true));
         }
     }
 
@@ -1595,22 +1596,22 @@ mod tests {
     fn test_place_operation_eager_jvp_moves_committed_inputs_to_an_explicit_device() {
         let session = Session::builder().client(cpu_client(3)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]).place(&devices[0], None).unwrap();
+        let primal = upload(&session, &[2], &[1., 2.]).place(&devices[1], None).unwrap();
+        let tangent = upload(&session, &[2], &[3., 4.]).place(&devices[0], None).unwrap();
         let target = devices[2];
         let (value, derivative) =
             differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&target, None)).unwrap();
         let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&target, None)).unwrap();
-        assert_eq!(observe_place_jvp(&value), (target, true, vec![1., 2.]));
-        assert_eq!(observe_place_jvp(&derivative), (target, true, vec![3., 4.]));
-        assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (target, true, vec![3., 4.]));
+        assert_eq!(observe_placement(value), (vec![target], vec![1., 2.], true));
+        assert_eq!(observe_placement(derivative), (vec![target], vec![3., 4.], true));
+        assert_eq!(observe_placement(pushforward.apply(tangent).unwrap()), (vec![target], vec![3., 4.], true));
     }
 
     #[test]
     fn test_place_operation_eager_jvp_on_explicit_device_feeds_elementwise_arithmetic() {
         let session = Session::builder().client(cpu_client(3)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
+        let (primal, tangent) = named_primal_and_tangent(&session, devices[1]);
         let target = devices[2];
         let (value, derivative) = differentiate_at(primal)
             .jvp(tangent, |x| {
@@ -1618,16 +1619,16 @@ mod tests {
                 placed.add(&placed)
             })
             .unwrap();
-        assert_eq!(observe_place_jvp(&value), (target, true, vec![2., 4.]));
-        assert_eq!(observe_place_jvp(&derivative), (target, true, vec![6., 8.]));
+        assert_eq!(observe_placement(value), (vec![target], vec![2., 4.], true));
+        assert_eq!(observe_placement(derivative), (vec![target], vec![6., 8.], true));
     }
 
     #[test]
     fn test_place_operation_eager_jvp_preserves_devices_for_memory_targets() {
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
+        let primal = upload(&session, &[2], &[1., 2.]).place(&devices[1], None).unwrap();
+        let tangent = upload(&session, &[2], &[3., 4.]);
         let committed = tangent.place(&devices[0], None).unwrap();
         let pinned = Memory::Host { pinned: true };
         let (_, pushforward) = differentiate_at(primal.clone()).linearize(|x| x.place(&pinned, None)).unwrap();
@@ -1637,10 +1638,10 @@ mod tests {
                 differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&pinned, None)).unwrap();
             let saved = pushforward.apply(tangent).unwrap();
             assert_eq!(value.r#type().memory(), pinned);
-            assert_eq!(observe_place_jvp(&value), (devices[1], true, vec![1., 2.]));
+            assert_eq!(observe_placement(value), (vec![devices[1]], vec![1., 2.], true));
             for result in [derivative, saved] {
                 assert_eq!(result.r#type().memory(), pinned);
-                assert_eq!(observe_place_jvp(&result), (devices[0], true, vec![3., 4.]));
+                assert_eq!(observe_placement(result), (vec![devices[0]], vec![3., 4.], true));
             }
         }
     }
@@ -1649,30 +1650,30 @@ mod tests {
     fn test_place_operation_eager_jvp_keeps_memory_placements_for_independent_arithmetic() {
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
+        let primal = upload(&session, &[2], &[1., 2.]).place(&devices[1], None).unwrap();
+        let tangent = upload(&session, &[2], &[3., 4.]);
         let (value, derivative) = differentiate_at(primal.clone())
             .jvp(tangent.clone(), |x| {
                 let placed = x.place(&Memory::Device, None)?;
                 placed.add(&placed)
             })
             .unwrap();
-        assert_eq!(observe_place_jvp(&value), (devices[1], true, vec![2., 4.]));
-        assert_eq!(observe_place_jvp(&derivative), (devices[0], true, vec![6., 8.]));
+        assert_eq!(observe_placement(value), (vec![devices[1]], vec![2., 4.], true));
+        assert_eq!(observe_placement(derivative), (vec![devices[0]], vec![6., 8.], true));
         let (_, pushforward) = differentiate_at(primal)
             .linearize(|x| {
                 let placed = x.place(&Memory::Device, None)?;
                 placed.add(&placed)
             })
             .unwrap();
-        assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (devices[0], true, vec![6., 8.]));
+        assert_eq!(observe_placement(pushforward.apply(tangent).unwrap()), (vec![devices[0]], vec![6., 8.], true));
     }
 
     #[test]
     fn test_place_operation_eager_jvp_rejects_incompatible_devices_after_memory_placement() {
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
+        let (primal, tangent) = named_primal_and_tangent(&session, devices[1]);
         let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&Memory::Device, None)?.sin()).unwrap();
         assert!(matches!(
             pushforward.apply(tangent),
@@ -1686,15 +1687,15 @@ mod tests {
     fn test_place_operation_eager_jvp_rejects_anonymous_tangent_outputs_for_named_memory_placement() {
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
+        let (primal, tangent) = named_primal_and_tangent(&session, devices[1]);
         let pinned = Memory::Host { pinned: true };
         let (_, pushforward) = differentiate_at(primal.clone()).linearize(|x| x.place(&pinned, None)).unwrap();
         assert!(matches!(
             differentiate_at(primal).jvp(tangent.clone(), |x| x.place(&pinned, None)),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "tangent type f32[2]@Host[Pinned] does not match type \
-                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned] required by primal type \
-                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned]",
+                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned] required by \
+                               primal type f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned]",
         ));
         assert!(matches!(
             pushforward.apply(tangent),
@@ -1708,8 +1709,8 @@ mod tests {
     fn test_place_operation_eager_jvp_device_target_uses_default_memory() {
         let session = Session::builder().client(cpu_client(3)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
+        let primal = upload(&session, &[2], &[1., 2.]).place(&devices[1], None).unwrap();
+        let tangent = upload(&session, &[2], &[3., 4.]);
         let pinned = Memory::Host { pinned: true };
         let primal = primal.place(&pinned, None).unwrap();
         let tangent = tangent.place(&pinned, None).unwrap();
@@ -1731,33 +1732,22 @@ mod tests {
         // return placement. Rebinding that linear map at a tangent on the second device (i.e., pulling it back or
         // linearizing it again) keeps that return placement, so every cotangent goes back to the first device, as
         // pinned JAX returns it there in all three cases.
-        let client = cpu_client(3);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let upload = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let x = upload.to_placement(&session, devices[0]).unwrap();
-        let t = upload.to_placement(&session, devices[1]).unwrap();
+        let session = Session::builder().client(cpu_client(3)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let uploaded = upload(&session, &[2], &[1., 2.]);
+        let x = uploaded.to_placement(&session, devices[0]).unwrap();
+        let t = uploaded.to_placement(&session, devices[1]).unwrap();
         let (primal, linear) = differentiate_at(x).linearize(|x| x.place(&devices[2], None)).unwrap();
-        let returned = (vec![devices[0].id()], vec![1., 2.], true);
+        let returned = (vec![devices[0]], vec![1., 2.], true);
         let transposed = linear.program().transpose().unwrap();
-        let direct = transposed.interpret_in_context(&upload.domain(), vec![primal.clone()]).unwrap();
-        assert_eq!(direct.into_iter().map(observe).collect::<Vec<_>>(), vec![returned.clone()]);
+        let direct = transposed.interpret_in_context(&uploaded.domain(), vec![primal.clone()]).unwrap();
+        assert_eq!(direct.into_iter().map(observe_placement).collect::<Vec<_>>(), vec![returned.clone()]);
 
         let (_, pullback) = differentiate_at(t.clone()).vjp(|z| linear.apply_in_context(&z.domain(), z)).unwrap();
-        assert_eq!(observe(pullback.apply_materialized(primal).unwrap()), returned);
+        assert_eq!(observe_placement(pullback.apply_materialized(primal).unwrap()), returned);
 
         let (result, second) = differentiate_at(t).linearize(|z| linear.apply_in_context(&z.domain(), z)).unwrap();
-        assert_eq!(observe(result), (vec![devices[2].id()], vec![1., 2.], true));
+        assert_eq!(observe_placement(result), (vec![devices[2]], vec![1., 2.], true));
         assert_eq!(
             second.program().to_string(),
             indoc! {"
@@ -1848,46 +1838,32 @@ mod tests {
         // to the first device, as JAX does. A seed committed to the first device has the same anonymous abstract
         // sharding. The pullback accepts it and replays the transposed placement on its actual devices (refer to
         // `test_place_operation_eager_vjp_uses_seed_on_its_own_devices`).
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
         let target = Placement::new(mesh.clone(), Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let upload = |values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(values)).unwrap()
-        };
         let seeds = [
-            upload(&[5., 6.]),
+            upload(&session, &[2], &[5., 6.]),
             Array::from_host_buffer(
                 &session,
-                r#type.clone(),
+                ArrayType::new_static(DataType::F32, [2]),
                 mesh,
                 Some(Sharding::replicated(logical_mesh, 1)),
                 values_to_bytes(&[5f32, 6.]),
             )
             .unwrap(),
-            upload(&[5., 6.]).to_placement(&session, devices[0]).unwrap(),
+            upload(&session, &[2], &[5., 6.]).to_placement(&session, devices[0]).unwrap(),
         ];
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
         let mut outcomes = Vec::new();
         for seed in seeds {
-            let through_array = differentiate_at(upload(&[1., 2.]))
+            let through_array = differentiate_at(upload(&session, &[2], &[1., 2.]))
                 .vjp(|x| x.place(&target, None))
                 .map_err(|error| error.to_string())
                 .and_then(|(_, pullback)| pullback.apply_materialized(seed.clone()).map_err(|error| error.to_string()))
-                .map(observe);
+                .map(observe_placement);
             let through_value = session
-                .differentiate_at(Value::Array(upload(&[1., 2.])))
+                .differentiate_at(Value::Array(upload(&session, &[2], &[1., 2.])))
                 .vjp(|x| x.place(&target, None))
                 .map_err(|error| error.to_string())
                 .and_then(|(_, pullback)| {
@@ -1895,39 +1871,18 @@ mod tests {
                         pullback.apply_materialized(Value::Array(seed)).map_err(|error| error.to_string())?;
                     ValueProjection::<ArrayType>::into_projected(cotangent).map_err(|error| error.to_string())
                 })
-                .map(observe);
+                .map(observe_placement);
             outcomes.push(vec![through_array, through_value]);
         }
         // The transposed placement has a target (where the primal lived), so its result is committed to it.
-        let accepted = Ok((vec![devices[0].id()], vec![5., 6.], true));
+        let accepted = Ok((vec![devices[0]], vec![5., 6.], true));
         assert_eq!(outcomes, vec![vec![accepted.clone(), accepted.clone()]; 3]);
-
-        // `Session::place` admits a source on that mesh for the uncommitted upload by the same rule and leaves it where
-        // it lives, while it still rejects that source for the committed array.
-        let source = PlacementRequest::from(target);
-        let options = || PlacementOptions::default().with_source(source.clone());
-        assert_eq!(
-            session.place(upload(&[1., 2.]), options()).map(observe).ok(),
-            Some((vec![devices[0].id()], vec![1., 2.], false)),
-        );
-        let committed = upload(&[1., 2.]).to_placement(&session, devices[0]).unwrap();
-        assert_eq!(
-            session.place(committed, options()).unwrap_err().to_string(),
-            "`place` source sharding `{mesh<['q'=1:explicit]>, [{}]}` does not match the input sharding \
-             `{mesh<['device'=1:auto]>, [{}]}`",
-        );
     }
 
     #[test]
     fn test_place_operation_eager_vjp_uses_seed_on_its_own_devices() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(4)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
         let split = |name: &str, mesh_devices: &[Device]| {
             let axis = MeshAxis::new(name, mesh_devices.len(), MeshAxisType::Explicit).unwrap();
             let logical_mesh = LogicalMesh::new(vec![axis]).unwrap();
@@ -1935,20 +1890,14 @@ mod tests {
             Placement::new(DeviceMesh::new(logical_mesh, mesh_devices.to_vec()).unwrap(), sharding).unwrap()
         };
         let target = split("q", &devices[..2]);
-        let upload = |shape: &[usize], values: &[f32], placement: PlacementRequest| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            let array = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap();
-            array.to_placement(&session, placement).unwrap()
+        let upload_to = |shape: &[usize], values: &[f32], placement: PlacementRequest| {
+            upload(&session, shape, values).to_placement(&session, placement).unwrap()
         };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let x = upload(&[4], &[1., 2., 3., 4.], devices[0].into());
+        let x = upload_to(&[4], &[1., 2., 3., 4.], devices[0].into());
         let [bare_seed, matching_seed, mismatched_seed] = [
-            upload(&[4], &[5., 6., 7., 8.], devices[2].into()),
-            upload(&[4], &[5., 6., 7., 8.], split("q", &devices[2..]).into()),
-            upload(&[4], &[5., 6., 7., 8.], split("r", &devices[2..]).into()),
+            upload_to(&[4], &[5., 6., 7., 8.], devices[2].into()),
+            upload_to(&[4], &[5., 6., 7., 8.], split("q", &devices[2..]).into()),
+            upload_to(&[4], &[5., 6., 7., 8.], split("r", &devices[2..]).into()),
         ];
         let source = devices[0];
 
@@ -1965,10 +1914,14 @@ mod tests {
 
                 // An anonymous seed and the same logical sharding on other devices both pass the boundary.
                 for seed in [&bare_seed, &matching_seed] {
-                    let gradient = pullback.apply_materialized(lift(seed.clone())).map(into_array).map(observe);
-                    assert_eq!(gradient, Ok((vec![source.id()], vec![5., 6., 7., 8.], true)));
+                    let gradient =
+                        pullback.apply_materialized(lift(seed.clone())).map(into_array).map(observe_placement);
+                    assert_eq!(gradient, Ok((vec![source], vec![5., 6., 7., 8.], true)));
                 }
-                let gradient = pullback.apply_materialized(lift(mismatched_seed.clone())).map(into_array).map(observe);
+                let gradient = pullback
+                    .apply_materialized(lift(mismatched_seed.clone()))
+                    .map(into_array)
+                    .map(observe_placement);
                 assert_eq!(
                     gradient,
                     Err(ProgramError::MalformedProgram(format!(
@@ -1980,12 +1933,14 @@ mod tests {
 
                 // Negation runs where the anonymous seed lives and the placement sends the result to the source.
                 let (_, pullback) = differentiate().vjp(|x| x.place(&target, &source)?.neg()).unwrap();
-                let gradient = pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe);
-                assert_eq!(gradient, Ok((vec![source.id()], vec![-5., -6., -7., -8.], true)));
+                let gradient =
+                    pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe_placement);
+                assert_eq!(gradient, Ok((vec![source], vec![-5., -6., -7., -8.], true)));
 
                 // Sine's transpose multiplies the seed by the cosine evaluated on the forward output devices.
                 let (_, pullback) = differentiate().vjp(|x| x.place(&target, &source)?.sin()).unwrap();
-                let gradient = pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe);
+                let gradient =
+                    pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe_placement);
                 assert_eq!(
                     gradient,
                     Err(ProgramError::InvalidArgument {
@@ -2003,7 +1958,7 @@ mod tests {
 
         // Under `vmap`, the seed is the same for every batch item, and the gradient of every item returns to the first
         // device.
-        let packed = upload(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.], devices[0].into());
+        let packed = upload_to(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.], devices[0].into());
         let batched: Result<Array, _> = batch(
             |(x, seed)| {
                 let (_, pullback) = differentiate_at(x).vjp(|x| x.place(&target, None))?;
@@ -2015,11 +1970,11 @@ mod tests {
             None,
         );
         assert_eq!(
-            batched.map(observe).map_err(|error| error.to_string()),
-            Ok((vec![devices[0].id()], vec![5., 6., 7., 8., 5., 6., 7., 8.], true)),
+            batched.map(observe_placement).map_err(|error| error.to_string()),
+            Ok((vec![devices[0]], vec![5., 6., 7., 8., 5., 6., 7., 8.], true)),
         );
 
-        // Transposing the pullback again places the cotangent of the inner seed on the forward destination,
+        // Transposing the pullback again places the cotangent of the inner seed on the forward target,
         // including when that seed lived on a single device outside the mesh.
         let cotangents = [&matching_seed, &bare_seed].map(|inner_seed| -> Result<_, String> {
             let (_, pullback) = differentiate_at((x.clone(), inner_seed.clone()))
@@ -2028,17 +1983,17 @@ mod tests {
                     pullback.apply_materialized(cotangent)
                 })
                 .map_err(|error| error.to_string())?;
-            let seed = upload(&[4], &[9., 10., 11., 12.], devices[3].into());
+            let seed = upload_to(&[4], &[9., 10., 11., 12.], devices[3].into());
             let cotangents = pullback.apply_materialized(seed).map_err(|error| error.to_string())?;
             assert_eq!(cotangents.1.sharding(), target.sharding());
             assert_eq!(shard_values(&cotangents.1), vec![vec![9., 10.], vec![11., 12.]]);
-            Ok(observe(cotangents.1))
+            Ok(observe_placement(cotangents.1))
         });
         assert_eq!(
             cotangents,
             [
-                Ok((vec![devices[0].id(), devices[1].id()], vec![9., 10., 11., 12.], true)),
-                Ok((vec![devices[0].id(), devices[1].id()], vec![9., 10., 11., 12.], true)),
+                Ok((devices[..2].to_vec(), vec![9., 10., 11., 12.], true)),
+                Ok((devices[..2].to_vec(), vec![9., 10., 11., 12.], true)),
             ],
         );
     }
@@ -2181,14 +2136,8 @@ mod tests {
 
     #[test]
     fn test_place_operation_eager_batch_vjp_across_device_sets() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(4)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let source_mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
         let target_mesh = DeviceMesh::new(logical_mesh.clone(), devices[2..].to_vec()).unwrap();
@@ -2232,14 +2181,8 @@ mod tests {
 
     #[test]
     fn test_place_operation_eager_batch_gradient_across_device_sets() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(4)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
 
         // The batch is split along `x` on the first two devices, so each of them holds one `[1, 2]` batch item, and
         // the gradient of each item comes back split in the same way, whatever the type of `x`, rather than as the
@@ -2287,14 +2230,8 @@ mod tests {
 
     #[test]
     fn test_place_operation_eager_batch_gradient_across_differently_named_meshes() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(4)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
 
         // The batch is split along the explicit axis `x` of the mesh of the first two devices, and each batch item is
         // moved to the mesh of the other two devices, whose only axis is the explicit axis `y`. The cotangent of the
@@ -2349,26 +2286,12 @@ mod tests {
         // batching, as it is eagerly (refer to `test_place_operation_eager_admits_relocatable_sources`),
         // because every transform value projects the relocatable type of the value that it wraps. Each leaves the
         // upload where it is, uncommitted, as pinned JAX does.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
         let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let first = devices[0].id();
+        let first = devices[0];
 
         let nested = batch(
             |outer| {
@@ -2380,13 +2303,13 @@ mod tests {
                     None,
                 )?)
             },
-            upload(&[2, 1, 2], &[3., 4., 5., 6.]),
+            upload(&session, &[2, 1, 2], &[3., 4., 5., 6.]),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
         );
         assert_eq!(
-            nested.map(observe).map_err(|error| error.to_string()),
+            nested.map(observe_placement).map_err(|error| error.to_string()),
             Ok((vec![first], vec![3., 4., 5., 6.], false)),
         );
         let batched_jvp = batch(
@@ -2395,17 +2318,17 @@ mod tests {
                     .jvp(outer, |item| item.place(&Option::<Placement>::None, &source))?;
                 Ok(tangent)
             },
-            upload(&[2, 2], &[3., 4., 5., 6.]),
+            upload(&session, &[2, 2], &[3., 4., 5., 6.]),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
         );
         assert_eq!(
-            batched_jvp.map(observe).map_err(|error| error.to_string()),
+            batched_jvp.map(observe_placement).map_err(|error| error.to_string()),
             Ok((vec![first], vec![3., 4., 5., 6.], false)),
         );
-        let jvp_of_batch = differentiate_at(upload(&[2, 2], &[1., 2., 3., 4.]))
-            .jvp(upload(&[2, 2], &[5., 6., 7., 8.]), |x| {
+        let jvp_of_batch = differentiate_at(upload(&session, &[2, 2], &[1., 2., 3., 4.]))
+            .jvp(upload(&session, &[2, 2], &[5., 6., 7., 8.]), |x| {
                 Ok(batch(
                     |item| item.place(&Option::<Placement>::None, &source),
                     x,
@@ -2414,7 +2337,7 @@ mod tests {
                     None,
                 )?)
             })
-            .map(|(primal, tangent)| (observe(primal), observe(tangent)))
+            .map(|(primal, tangent)| (observe_placement(primal), observe_placement(tangent)))
             .map_err(|error| error.to_string());
         assert_eq!(
             jvp_of_batch,
@@ -2424,7 +2347,8 @@ mod tests {
         // The same three compositions through the `Value::Array` representation of the uploads, whose batching levels
         // (refer to `ArrayIrBatchingPolicy`) and array views (i.e., `ProjectedValue`s) project the relocatable type of
         // an array member, give the same results.
-        let observe_value = |value: Value| observe(ValueProjection::<ArrayType>::into_projected(value).unwrap());
+        let observe_value =
+            |value: Value| observe_placement(ValueProjection::<ArrayType>::into_projected(value).unwrap());
         let nested = batch(
             |outer| {
                 Ok(batch(
@@ -2435,7 +2359,7 @@ mod tests {
                     None,
                 )?)
             },
-            Value::Array(upload(&[2, 1, 2], &[3., 4., 5., 6.])),
+            Value::Array(upload(&session, &[2, 1, 2], &[3., 4., 5., 6.])),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
@@ -2446,13 +2370,13 @@ mod tests {
                     .jvp(outer, |item| item.place(&Option::<Placement>::None, &source))?;
                 Ok(tangent)
             },
-            Value::Array(upload(&[2, 2], &[3., 4., 5., 6.])),
+            Value::Array(upload(&session, &[2, 2], &[3., 4., 5., 6.])),
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
         );
-        let jvp_of_batch = differentiate_at(Value::Array(upload(&[2, 2], &[1., 2., 3., 4.]))).jvp(
-            Value::Array(upload(&[2, 2], &[5., 6., 7., 8.])),
+        let jvp_of_batch = differentiate_at(Value::Array(upload(&session, &[2, 2], &[1., 2., 3., 4.]))).jvp(
+            Value::Array(upload(&session, &[2, 2], &[5., 6., 7., 8.])),
             |x| {
                 Ok(batch(
                     |item| item.place(&Option::<Placement>::None, &source),

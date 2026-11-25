@@ -15,7 +15,7 @@ use crate::lowering::types::{
     physical_bound_type, stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
 };
@@ -516,11 +516,13 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
             location,
         )?
     };
-    if let Some(sharding) = output_type.sharding() {
-        lower_sharding_constraint(&result, sharding, bound_manual_axes, block, location)
-    } else {
-        Ok(result)
-    }
+    let Some(sharding) = output_type.sharding() else {
+        return Ok(result);
+    };
+    check_count!("input", result, 1, ProgramError);
+    let result =
+        lower_sharding_constraint(result[0], sharding, OpenDimensions::All, bound_manual_axes, block, location)?;
+    Ok(vec![result])
 }
 
 /// Finishes a constructor whose result takes the type and the runtime shape of an exemplar. `result` must have the
@@ -541,10 +543,13 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     let result = lower_layout_constraint(result, &physical_type, block, location)?;
     let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
     let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
-    match output_type.sharding() {
-        Some(sharding) => lower_sharding_constraint(&[result], sharding, bound_manual_axes, block, location),
-        None => Ok(vec![result]),
-    }
+    let result = match output_type.sharding() {
+        Some(sharding) => {
+            lower_sharding_constraint(result, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
+        }
+        None => result,
+    };
+    Ok(vec![result])
 }
 
 /// Constrains the result of a nullary constructor (a zero, a one, or an iota) to the sharding that its type declares,
@@ -559,10 +564,13 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    match output_type.and_then(ArrayType::sharding) {
-        Some(sharding) => lower_sharding_constraint(&result, sharding, bound_manual_axes, block, location),
-        None => Ok(result),
-    }
+    let Some(sharding) = output_type.and_then(ArrayType::sharding) else {
+        return Ok(result);
+    };
+    check_count!("input", result, 1, ProgramError);
+    let result =
+        lower_sharding_constraint(result[0], sharding, OpenDimensions::All, bound_manual_axes, block, location)?;
+    Ok(vec![result])
 }
 
 /// Selects the compact first-class dimension operands of a dynamic array constructor whose output axes remain

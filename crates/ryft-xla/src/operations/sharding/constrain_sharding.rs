@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ConstrainShardingOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::sharding::lower_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ConstrainShardingOperation {
@@ -17,17 +17,18 @@ impl LowerableOperation for ConstrainShardingOperation {
         // The constraint is untracked, so the output type is the input type, and the emitted constraint must
         // carry the input's tracked placement alongside the constraint's own auto-axis placement. Unlike a tracked
         // placement, the constraint does describe the placement along auto axes, so its dimensions stay closed.
+        check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        lower_constraint(
-            input_values,
+        let value = lower_sharding_constraint(
+            input_values[0],
             &sharding,
-            &[],
+            OpenDimensions::None,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
-            false,
-        )
+        )?;
+        Ok(vec![value])
     }
 }
 

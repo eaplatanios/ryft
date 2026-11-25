@@ -24,7 +24,7 @@ use crate::lowering::{
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::operations::{FlatProgram, Program};
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
 pub(crate) mod condition;
@@ -498,7 +498,7 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
         };
         constrained.push(match explicit_sharding {
             Some(sharding) => {
-                lower_sharding_constraint(&[output], sharding, bound_manual_axes, block, location)?.remove(0)
+                lower_sharding_constraint(output, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
             }
             None => output,
         });

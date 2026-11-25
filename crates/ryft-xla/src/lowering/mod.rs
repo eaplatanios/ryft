@@ -65,7 +65,7 @@ use crate::operations::composites::{
     NamedCompositionFunctionMap, collect_named_composition_functions, emit_named_composition_function,
 };
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
-use crate::sharding::{ShardyTensorSharding, lower_closed_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardySharding, lower_sharding_constraint};
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME,
     JitCallOperation, Operation, Program, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
@@ -3475,7 +3475,7 @@ fn merged_dimensions(operands: &[Rc<[ShardingDimension]>], mesh: &LogicalMesh) -
 /// reduction, and returns the constrained value. Every dimension of the constraint is closed, its unconstrained
 /// dimensions as replicated, so that the constraint states the whole placement of the value, including along auto mesh
 /// axes. Over a mesh with auto axes, an ordinary constraint leaves its dimensions open over them (refer to
-/// `lower_sharding_constraint`), and Shardy's propagation then gives the operation that produces the value an operand
+/// [`OpenDimensions::All`]), and Shardy's propagation then gives the operation that produces the value an operand
 /// without the pending reduction: for `y = x + x; y + y` of an input split along an auto axis `d` and unreduced along
 /// an explicit axis `m`, with the split dimension open (`{"d", ?}`), the optimized program reduces each operand over
 /// `m` with an all-reduce and restores the declared state with a select that keeps the sum on one coordinate of `m`
@@ -3485,7 +3485,7 @@ fn merged_dimensions(operands: &[Rc<[ShardingDimension]>], mesh: &LogicalMesh) -
 /// adds no communication for a value whose placement the program states. Over a mesh without auto axes, the two
 /// constraints are the same.
 /// Inside a manual region, the constraint is the same, without the bound manual axes (refer to
-/// `lower_closed_sharding_constraint`): with a split dimension left open there, `y = x + x; y + y` of a value split
+/// [`lower_sharding_constraint`]): with a split dimension left open there, `y = x + x; y + y` of a value split
 /// along an auto axis and unreduced along an explicit axis in a `shard_map` body all-reduced each operand over the
 /// explicit axis and restored the pending state with a select.
 fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
@@ -3498,7 +3498,7 @@ fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
     let closed = sharding
         .with_dimensions(closed_dimensions(sharding).to_vec())
         .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-    lower_closed_sharding_constraint(value, &closed, bound_manual_axes, block, location)
+    lower_sharding_constraint(value, &closed, OpenDimensions::None, bound_manual_axes, block, location)
 }
 
 /// Validates `declared`, a sharding that the lowering declares on a value of `data_type` (i.e., a result sharding of
@@ -4409,7 +4409,7 @@ where
         .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers the
-    // shardings of output types without `out_shardings` (refer to `ShardyTensorSharding`).
+    // shardings of output types without `out_shardings` (refer to `ShardySharding`).
     let physical_open_results =
         if open_results.is_empty() { Vec::new() } else { signature.project_outputs(open_results) };
     let mut result_sharding_attributes = signature
@@ -4418,9 +4418,10 @@ where
         .enumerate()
         .map(|(index, sharding)| {
             let open = physical_open_results.get(index).copied().unwrap_or(false);
+            let open_dimensions = if open { OpenDimensions::All } else { OpenDimensions::None };
             sharding
                 .as_ref()
-                .map(|sharding| ShardyTensorSharding::new(sharding, open).to_mlir(location))
+                .map(|sharding| ShardySharding::new(sharding, open_dimensions).to_mlir(location))
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;

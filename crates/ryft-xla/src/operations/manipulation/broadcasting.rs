@@ -18,7 +18,7 @@ use crate::lowering::types::{
 use crate::operations::constants::{
     dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
-use crate::sharding::lower_sharding_constraint;
+use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for BroadcastOperation {
@@ -72,17 +72,19 @@ impl LowerableOperation for BroadcastLikeOperation {
         let result = lower_layout_constraint(result, &physical_type, block, location)?;
         let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
         let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
-        if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
+        let result = if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
             lower_sharding_constraint(
-                &[result],
+                result,
                 output_type.sharding().unwrap(),
+                OpenDimensions::All,
                 lowerer.collective_state().bound_manual_axes(),
                 block,
                 location,
-            )
+            )?
         } else {
-            Ok(vec![result])
-        }
+            result
+        };
+        Ok(vec![result])
     }
 }
 
@@ -179,17 +181,19 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 cast.result(0).unwrap().as_ref()
             }
         };
-        if broadcast_changes_explicit_sharding(input_type, output_type, self.output_axes()) {
+        let result = if broadcast_changes_explicit_sharding(input_type, output_type, self.output_axes()) {
             lower_sharding_constraint(
-                &[result],
+                result,
                 output_type.sharding().unwrap(),
+                OpenDimensions::All,
                 collective_state.bound_manual_axes(),
                 block,
                 location,
-            )
+            )?
         } else {
-            Ok(vec![result])
-        }
+            result
+        };
+        Ok(vec![result])
     }
 }
 
@@ -293,11 +297,13 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?)?;
         lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), output_type, block, location)?
     };
-    if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
-        lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), bound_manual_axes, block, location)
+    let result = if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
+        let sharding = output_types[0].sharding().unwrap();
+        lower_sharding_constraint(result, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
     } else {
-        Ok(vec![result])
-    }
+        result
+    };
+    Ok(vec![result])
 }
 
 #[cfg(test)]
