@@ -138,11 +138,9 @@ impl DistributedRuntime {
         Self::initialize_with_options(plugin, coordinator_address, None, service_options, client_options)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Initializes the [`DistributedRuntime`] of one process as [`Self::initialize`] does, with explicit
     /// [`DistributedRuntimeServiceOptions`] and [`DistributedRuntimeClientOptions`] (e.g., for other heartbeat,
-    /// request, or shutdown timeouts). `service_options.num_nodes` is the process count of the job and
+    /// request, or shutdown timeouts). `service_options.num_nodes` is the process count of the distributed job and
     /// `client_options.node_id` is the index of this process. Only the coordinator uses the remaining service options.
     /// A process waits for the launch identity of the coordinator for `client_options.rpc_timeout`, which is also how
     /// long a [`Session`](crate::Session) waits for the device inventories of the other processes.
@@ -178,7 +176,9 @@ impl DistributedRuntime {
             ))
             .into());
         }
+
         let request_timeout = client_options.rpc_timeout;
+
         // The coordinator hosts the service that every process, including the coordinator itself, connects to.
         let service = if process_index == 0 {
             let address = coordinator_bind_address.unwrap_or(coordinator_address);
@@ -186,8 +186,10 @@ impl DistributedRuntime {
         } else {
             None
         };
+
         let client = plugin.distributed_runtime_client(coordinator_address, client_options)?;
         client.connect()?;
+
         let key_value_store = DistributedKeyValueStore::new(client);
         let launch_id = if process_index == 0 {
             let mut identity = Sha256::new();
@@ -203,6 +205,7 @@ impl DistributedRuntime {
                 .try_into()
                 .map_err(|_| ryft_pjrt::Error::invalid_argument("distributed launch identity has the wrong length"))?
         };
+
         Ok(Self {
             state: Arc::new(DistributedRuntimeState {
                 key_value_store,
@@ -217,36 +220,30 @@ impl DistributedRuntime {
         })
     }
 
-    /// Returns the index of this process among the processes of the job, as `jax.process_index()` does.
+    /// Returns the index of this process among the processes of the distributed job.
     #[inline]
     pub fn process_index(&self) -> ProcessIndex {
         self.state.process_index
     }
 
-    /// Returns the number of processes of the job, as `jax.process_count()` does.
+    /// Returns the number of processes of the distributed job.
     #[inline]
     pub fn process_count(&self) -> usize {
         self.state.process_count
     }
 
-    /// Returns the [`DistributedKeyValueStore`] of this runtime, which every process of the job shares, for
-    /// coordination protocols of the caller. The store never overwrites or removes a record.
+    /// Returns the [`DistributedKeyValueStore`] of this runtime, which every process of the distributed job shares,
+    /// for coordination protocols of the caller. The store never overwrites or removes a record.
     #[inline]
     pub fn key_value_store(&self) -> &DistributedKeyValueStore {
         &self.state.key_value_store
     }
 
-    /// Returns whether `other` is a handle of this runtime (i.e., a clone of this handle).
-    #[inline]
-    pub(crate) fn is_same_runtime(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
-
-    /// Disconnects this process from the coordination service and, on the coordinator, stops the service, as
-    /// `jax.distributed.shutdown` does. Disconnecting waits until every process of the job disconnects, for the
-    /// shutdown timeout of the client options. Later calls on any handle of this runtime do nothing. Dropping the last
-    /// handle shuts the runtime down as well, so this function is only needed to shut it down earlier or to observe
-    /// the error of doing so. Clients and exchanges of the runtime cannot use its key-value store afterwards.
+    /// Disconnects this process from the coordination service and, on the coordinator, stops the service. Disconnecting
+    /// waits until every process of the job disconnects, for the shutdown timeout of the client options. Later calls on
+    /// any handle of this runtime do nothing. Dropping the last handle shuts the runtime down as well, so this function
+    /// is only needed to shut it down earlier or to observe the error of doing so. Clients and exchanges of the runtime
+    /// cannot use its key-value store afterwards.
     ///
     /// # Errors
     ///
@@ -256,12 +253,22 @@ impl DistributedRuntime {
         if self.state.is_shut_down.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+
         let disconnected = self.state.key_value_store.client().shutdown();
         if let Some(service) = &self.state.service {
             service.shutdown();
         }
+
         Ok(disconnected?)
     }
+
+    /// Returns whether `other` is a handle of this runtime (i.e., a clone of this handle).
+    #[inline]
+    pub(crate) fn is_same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Reserves one ordered kernel coordinator namespace within the existing distributed launch, returning the launch
     /// identity, the reserved sequence number, the index of this process, and the number of processes.

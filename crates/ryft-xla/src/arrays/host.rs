@@ -850,21 +850,6 @@ impl Array {
         Ok(())
     }
 
-    // TODO(eaplatanios): Either inline this function or inline `validate_one_value_per_contribution` into it and
-    //  switch its callers to this one.
-    /// Checks that a readback of this array can produce one host value, as far as the metadata of its shards tells,
-    /// which every process shares: devices whose coordinates differ along a varying manual mesh axis within one tile
-    /// can hold different values of it (refer to [`Self::readback_shards`]), which are rejected with
-    /// [`ProgramError::InvalidArgument`]. The placement planner also checks this before choosing the owner
-    /// of a host round trip, so the planner never requests a round trip that readback would reject.
-    pub(super) fn validate_one_value_per_contribution(&self) -> Result<(), Error> {
-        validate_one_value_per_contribution(
-            self.mesh(),
-            self.sharding(),
-            self.shards().iter().map(ArrayShard::descriptor),
-        )
-    }
-
     /// Returns an [`ExecutionFence`] that completes once [`Self::copy_to_host_bytes`] can read this array back without
     /// waiting for anything but its own copies (i.e., once the execution that produced this array and the buffers that
     /// the readback copies are ready), and that reports the first error among them. The fence waits for exactly the
@@ -938,9 +923,13 @@ impl Array {
     /// to [`ShardContribution`]) that differ only in their coordinates along those axes (i.e., variation within a
     /// tile). This is the case for a varying axis that does not split the array. Readback accepts variation between
     /// tiles. The check reads only the metadata of every shard, so it rejects the same arrays in every process
-    /// (refer to [`Self::validate_one_value_per_contribution`]).
+    /// (refer to [`validate_one_value_per_contribution`]).
     fn readback_shards(&self) -> Result<Vec<&ArrayShard>, Error> {
-        self.validate_one_value_per_contribution()?;
+        validate_one_value_per_contribution(
+            self.mesh(),
+            self.sharding(),
+            self.shards().iter().map(ArrayShard::descriptor),
+        )?;
         let all_shards = self.shards();
         let contribution = |shard: &ArrayShard| self.shard_contribution(shard.descriptor());
         let required = |shard: &&ArrayShard| !shard.slice().iter().any(Range::is_empty);
@@ -984,11 +973,15 @@ impl Array {
     }
 }
 
-/// Checks from global shard descriptors whether manual variation prevents reading one host value.
-pub(super) fn validate_one_value_per_contribution<'a>(
+/// Checks that a readback of an array on `mesh` with `sharding` and `shards` can produce one host value,
+/// as far as the metadata of its shards tells, which every process shares. Devices whose coordinates differ
+/// along a varying manual mesh axis within one tile can hold different values of it, which are rejected with
+/// [`ProgramError::InvalidArgument`]. The placement planner also checks this before choosing the owner of a
+/// host round trip, so the planner never requests a round trip that readback would reject.
+pub(super) fn validate_one_value_per_contribution<'a, S: Iterator<Item = &'a ShardDescriptor>>(
     mesh: &DeviceMesh,
     sharding: &Sharding,
-    shards: impl Iterator<Item = &'a ShardDescriptor>,
+    shards: S,
 ) -> Result<(), Error> {
     let varying_manual_axes = sharding.varying_manual_axes();
     if !varying_manual_axes.is_empty() {
@@ -2247,10 +2240,8 @@ fn copy_dense_shard_bytes(
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Name of the one axis of the mesh of [`participant_mesh_of`], along which every process contributes the digest of its
-/// value to a [`ValueComparison`].
+/// Name of the one axis of the mesh of [`participant_mesh_of`], along which every process contributes the digest
+/// of its value to a [`ValueComparison`].
 const PROCESS_AXIS: &str = "processes";
 
 /// Number of `u32` words of a SHA-256 digest.
@@ -2258,58 +2249,78 @@ const DIGEST_WORDS: usize = 8;
 
 /// Message of the failed precondition error that the result of a placement, or an admitted placement call, reports
 /// when the processes of a run placed different values onto a destination that all of them share, or when another
-/// process rejected the same call (refer to [`ValueComparison`] and [`Session::place`]).
+/// process rejected the same call. Refer to [`ValueComparison`] and [`Session::place`] for more information.
 pub(crate) const DIFFERENT_VALUES_MESSAGE: &str = "the processes of the run placed different values onto a \
     destination that all of them share, or one of them rejected the same placement call, so their shards would not \
     form one array; place the same value on every process, or use `Array::from_host_shards` to place the part of the \
     array that each process holds";
 
-/// Returns the SHA-256 digest of the logical value of an array of `data_type` with the extents `dimensions` whose dense
-/// row-major elements are `bytes`, as `u32` words. The digest covers, in order, the length and the bytes of the name
-/// of the data type, the rank, every extent as a little-endian `u64`, and `bytes`, so two values have the same digest
-/// exactly when they have the same data type, the same shape, and the same bits, whatever layout they had (e.g., `+0`
-/// and `-0` differ, and two NaN values agree only when their bits do).
-pub(super) fn value_digest(data_type: DataType, dimensions: &[usize], bytes: &[u8]) -> [u32; DIGEST_WORDS] {
-    let name = data_type.to_string();
-    let mut hash = Sha256::new();
-    hash.update((name.len() as u64).to_le_bytes());
-    hash.update(name.as_bytes());
-    hash.update((dimensions.len() as u64).to_le_bytes());
-    for extent in dimensions {
-        hash.update((*extent as u64).to_le_bytes());
+impl Array {
+    /// Returns this array with an execution fence that also joins `comparison`, the fence that
+    /// [`ComparisonCollective::submit`] returned for the placement that produced this array, if any.
+    pub(crate) fn with_value_comparison(mut self, comparison: Option<ExecutionFence>) -> Self {
+        if let Some(comparison) = comparison {
+            let fences = self.execution_fence.take().into_iter().chain([comparison]);
+            return self.with_execution_fence(ExecutionFence::join(fences));
+        }
+        self
     }
-    hash.update(bytes);
-    words_of(&hash.finalize())
-}
 
-/// Returns the words that a process contributes to a [`ValueComparison`] for the digest of its value, which are the
-/// words of `digest` followed by their bitwise complements. A maximum over the processes then gives every process the
-/// largest and, complemented, the smallest value of each word, which are equal exactly when every process contributed
-/// the same digest (refer to [`digests_agree`]). A process without a digest (i.e., one that could not digest its value)
-/// contributes the largest value for every word and every complement, which no maximum of complements can match, so
-/// that the comparison fails on every process.
-fn digest_contribution(digest: Option<[u32; DIGEST_WORDS]>) -> [u32; 2 * DIGEST_WORDS] {
-    match digest {
-        Some(digest) => std::array::from_fn(|index| match index {
-            index if index < DIGEST_WORDS => digest[index],
-            index => !digest[index - DIGEST_WORDS],
-        }),
-        None => [u32::MAX; 2 * DIGEST_WORDS],
+    /// Submits the maximum over `participants` of the `contributions` of the devices of this process (refer to
+    /// [`digest_contribution`]), one for each of its devices of `participants`, and returns the replicated result,
+    /// which every device of `participants` holds once each of them has contributed. The contributions form a pending
+    /// maximum along [`PROCESS_AXIS`], which the placement onto the replicated sharding completes with one compiled
+    /// all-reduce of `u32` values (refer to [`collective_reduction`]).
+    fn digest_maximum(
+        session: &Session,
+        participants: &DeviceMesh,
+        contributions: Vec<(DeviceId, [u32; 2 * DIGEST_WORDS])>,
+    ) -> Result<Self, Error> {
+        let r#type = ArrayType::new_static(DataType::U32, [2 * DIGEST_WORDS]);
+        let replicated = Sharding::replicated(participants.logical_mesh().clone(), 1);
+        let pending =
+            replicated.clone().with_unreduced_axes([PROCESS_AXIS])?.with_unreduced_kind(UnreducedKind::Max)?;
+        let shards = contributions.into_iter().map(|(device, words)| {
+            (device, Arc::<[u8]>::from(words.iter().flat_map(|word| word.to_ne_bytes()).collect::<Vec<_>>()))
+        });
+        let contributions = Self::from_host_shards(session, r#type, participants.clone(), Some(pending), shards)?;
+        contributions.to_placement(session, Placement::new(participants.clone(), replicated)?)
+    }
+
+    /// Returns the [`ExecutionFence`] of the verdict of the comparison whose result `maximum` is (refer to
+    /// [`Self::digest_maximum`]), which completes once `maximum` can be read back and fails with a failed precondition
+    /// error when the digests differ (refer to [`digests_agree`]). The verdict is read back in the background, by the
+    /// upload of one byte onto `device` whose readback checks it (refer to [`Self::from_host_buffer_in_background`]),
+    /// so this function does not wait for the comparison unless the PJRT plugin lacks host to device transfer
+    /// managers, in which case it returns the error of the verdict itself.
+    fn digest_verdict(session: &Session, device: Device, maximum: Self) -> Result<ExecutionFence, Error> {
+        let verdict = |maximum: &Self| -> Result<Vec<u8>, Error> {
+            match digests_agree(&maximum.copy_to_host_bytes()?) {
+                true => Ok(vec![0]),
+                false => Err(PjrtError::failed_precondition(DIFFERENT_VALUES_MESSAGE).into()),
+            }
+        };
+
+        let placement = single_device_placement(device, 0)?;
+        let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
+        let readback = maximum.clone();
+
+        let poison = |error: Error| match error {
+            Error::Pjrt(error) => error,
+            error => PjrtError::internal(error.to_string()),
+        };
+
+        let r#type = ArrayType::scalar(DataType::U8);
+        let sources = maximum.host_readback_fence()?;
+        let readback = move || verdict(&readback);
+        match Self::from_host_buffer_in_background(session, r#type, mesh, sharding, sources, readback, poison)? {
+            Some(array) => Ok(array.execution_fence().cloned().unwrap_or_else(|| ExecutionFence::new(Vec::new()))),
+            None => verdict(&maximum).map(|_| ExecutionFence::new(Vec::new())),
+        }
     }
 }
 
-/// Returns whether the maximum over the processes of their contributions (refer to [`digest_contribution`]), whose
-/// native-endian bytes `maximum` holds, shows that every process contributed the same digest.
-fn digests_agree(maximum: &[u8]) -> bool {
-    let words = maximum.chunks_exact(4).map(|word| u32::from_ne_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
-    words.len() == 2 * DIGEST_WORDS && (0..DIGEST_WORDS).all(|index| words[index] == !words[index + DIGEST_WORDS])
-}
-
-/// Returns the mesh over `devices`, one for each participant of the PJRT collective of a [`ValueComparison`].
-pub(super) fn participant_mesh_of(devices: Vec<Device>) -> Result<DeviceMesh, Error> {
-    let axis = MeshAxis::new(PROCESS_AXIS, devices.len(), MeshAxisType::Explicit)?;
-    Ok(DeviceMesh::new(LogicalMesh::new(vec![axis])?, devices)?)
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Comparison of the values that the processes of a run place onto a destination that all of them share, which the
 /// placements of a session make when it enables it (refer to [`SessionBuilder::value_comparison`]) and its run has
@@ -2426,6 +2437,53 @@ impl ComparisonCollective {
     }
 }
 
+/// Returns the SHA-256 digest of the logical value of an array of `data_type` with the extents `dimensions` whose dense
+/// row-major elements are `bytes`, as `u32` words. The digest covers, in order, the length and the bytes of the name
+/// of the data type, the rank, every extent as a little-endian `u64`, and `bytes`, so two values have the same digest
+/// exactly when they have the same data type, the same shape, and the same bits, whatever layout they had (e.g., `+0`
+/// and `-0` differ, and two NaN values agree only when their bits do).
+pub(super) fn value_digest(data_type: DataType, dimensions: &[usize], bytes: &[u8]) -> [u32; DIGEST_WORDS] {
+    let name = data_type.to_string();
+    let mut hash = Sha256::new();
+    hash.update((name.len() as u64).to_le_bytes());
+    hash.update(name.as_bytes());
+    hash.update((dimensions.len() as u64).to_le_bytes());
+    for extent in dimensions {
+        hash.update((*extent as u64).to_le_bytes());
+    }
+    hash.update(bytes);
+    words_of(&hash.finalize())
+}
+
+/// Returns the words that a process contributes to a [`ValueComparison`] for the digest of its value, which are the
+/// words of `digest` followed by their bitwise complements. A maximum over the processes then gives every process the
+/// largest and, complemented, the smallest value of each word, which are equal exactly when every process contributed
+/// the same digest (refer to [`digests_agree`]). A process without a digest (i.e., one that could not digest its value)
+/// contributes the largest value for every word and every complement, which no maximum of complements can match, so
+/// that the comparison fails on every process.
+fn digest_contribution(digest: Option<[u32; DIGEST_WORDS]>) -> [u32; 2 * DIGEST_WORDS] {
+    match digest {
+        Some(digest) => std::array::from_fn(|index| match index {
+            index if index < DIGEST_WORDS => digest[index],
+            index => !digest[index - DIGEST_WORDS],
+        }),
+        None => [u32::MAX; 2 * DIGEST_WORDS],
+    }
+}
+
+/// Returns whether the maximum over the processes of their contributions (refer to [`digest_contribution`]), whose
+/// native-endian bytes `maximum` holds, shows that every process contributed the same digest.
+fn digests_agree(maximum: &[u8]) -> bool {
+    let words = maximum.chunks_exact(4).map(|word| u32::from_ne_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
+    words.len() == 2 * DIGEST_WORDS && (0..DIGEST_WORDS).all(|index| words[index] == !words[index + DIGEST_WORDS])
+}
+
+/// Returns the mesh over `devices`, one for each participant of the PJRT collective of a [`ValueComparison`].
+pub(super) fn participant_mesh_of(devices: Vec<Device>) -> Result<DeviceMesh, Error> {
+    let axis = MeshAxis::new(PROCESS_AXIS, devices.len(), MeshAxisType::Explicit)?;
+    Ok(DeviceMesh::new(LogicalMesh::new(vec![axis])?, devices)?)
+}
+
 /// Returns the digest that a process contributes for `digest` at the position `position` of the sequence of
 /// comparisons of its session, which is the SHA-256 digest of `position` and the words of `digest`.
 fn sequenced_digest(digest: [u32; DIGEST_WORDS], position: u64) -> [u32; DIGEST_WORDS] {
@@ -2488,68 +2546,6 @@ pub(crate) fn array_value_digest(array: &Array) -> Option<[u32; DIGEST_WORDS]> {
 /// Returns the words of a SHA-256 digest, each read as a little-endian `u32`.
 fn words_of(digest: &[u8]) -> [u32; DIGEST_WORDS] {
     std::array::from_fn(|index| u32::from_le_bytes(digest[4 * index..4 * index + 4].try_into().unwrap()))
-}
-
-impl Array {
-    /// Submits the maximum over `participants` of the `contributions` of the devices of this process (refer to
-    /// [`digest_contribution`]), one for each of its devices of `participants`, and returns the replicated result,
-    /// which every device of `participants` holds once each of them has contributed. The contributions form a pending
-    /// maximum along [`PROCESS_AXIS`], which the placement onto the replicated sharding completes with one compiled
-    /// all-reduce of `u32` values (refer to [`collective_reduction`]).
-    fn digest_maximum(
-        session: &Session,
-        participants: &DeviceMesh,
-        contributions: Vec<(DeviceId, [u32; 2 * DIGEST_WORDS])>,
-    ) -> Result<Self, Error> {
-        let r#type = ArrayType::new_static(DataType::U32, [2 * DIGEST_WORDS]);
-        let replicated = Sharding::replicated(participants.logical_mesh().clone(), 1);
-        let pending =
-            replicated.clone().with_unreduced_axes([PROCESS_AXIS])?.with_unreduced_kind(UnreducedKind::Max)?;
-        let shards = contributions.into_iter().map(|(device, words)| {
-            (device, Arc::<[u8]>::from(words.iter().flat_map(|word| word.to_ne_bytes()).collect::<Vec<_>>()))
-        });
-        let contributions = Self::from_host_shards(session, r#type, participants.clone(), Some(pending), shards)?;
-        contributions.to_placement(session, Placement::new(participants.clone(), replicated)?)
-    }
-
-    /// Returns the [`ExecutionFence`] of the verdict of the comparison whose result `maximum` is (refer to
-    /// [`Self::digest_maximum`]), which completes once `maximum` can be read back and fails with a failed precondition
-    /// error when the digests differ (refer to [`digests_agree`]). The verdict is read back in the background, by the
-    /// upload of one byte onto `device` whose readback checks it (refer to [`Self::from_host_buffer_in_background`]),
-    /// so this function does not wait for the comparison unless the PJRT plugin lacks host to device transfer
-    /// managers, in which case it returns the error of the verdict itself.
-    fn digest_verdict(session: &Session, device: Device, maximum: Self) -> Result<ExecutionFence, Error> {
-        let verdict = |maximum: &Self| -> Result<Vec<u8>, Error> {
-            match digests_agree(&maximum.copy_to_host_bytes()?) {
-                true => Ok(vec![0]),
-                false => Err(PjrtError::failed_precondition(DIFFERENT_VALUES_MESSAGE).into()),
-            }
-        };
-        let placement = single_device_placement(device, 0)?;
-        let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
-        let readback = maximum.clone();
-        let poison = |error: Error| match error {
-            Error::Pjrt(error) => error,
-            error => PjrtError::internal(error.to_string()),
-        };
-        let r#type = ArrayType::scalar(DataType::U8);
-        let sources = maximum.host_readback_fence()?;
-        let readback = move || verdict(&readback);
-        match Self::from_host_buffer_in_background(session, r#type, mesh, sharding, sources, readback, poison)? {
-            Some(array) => Ok(array.execution_fence().cloned().unwrap_or_else(|| ExecutionFence::new(Vec::new()))),
-            None => verdict(&maximum).map(|_| ExecutionFence::new(Vec::new())),
-        }
-    }
-
-    /// Returns this array with an execution fence that also joins `comparison`, the fence that
-    /// [`ComparisonCollective::submit`] returned for the placement that produced this array, if any.
-    pub(crate) fn with_value_comparison(mut self, comparison: Option<ExecutionFence>) -> Self {
-        if let Some(comparison) = comparison {
-            let fences = self.execution_fence.take().into_iter().chain([comparison]);
-            return self.with_execution_fence(ExecutionFence::join(fences));
-        }
-        self
-    }
 }
 
 // TODO(eaplatanios): Review up to here.
