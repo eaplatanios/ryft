@@ -825,6 +825,25 @@ impl Value for Array {
     }
 }
 
+impl LiteralIdentity for Array {
+    // An array's physical storage is canonical for its type (layout holes and tile padding are always zero), so
+    // comparing the type and the storage bytes compares the literal exactly. Shared storage short-circuits the
+    // byte comparison.
+
+    #[inline]
+    fn literal_eq(&self, other: &Self) -> bool {
+        self.r#type() == other.r#type()
+            && (std::ptr::eq(self.storage_bytes(), other.storage_bytes())
+                || self.storage_bytes() == other.storage_bytes())
+    }
+
+    #[inline]
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        self.r#type().hash(state);
+        self.storage_bytes().hash(state);
+    }
+}
+
 impl ValueProjection<ArrayType> for Array {
     type Projected = Self;
     type ProjectedRef<'v> = &'v Self;
@@ -845,25 +864,6 @@ impl ValueProjection<ArrayType> for Array {
     #[inline]
     fn into_projected(self) -> Result<Self::Projected, TypeError> {
         Ok(self)
-    }
-}
-
-impl LiteralIdentity for Array {
-    // An array's physical storage is canonical for its type (layout holes and tile padding are always zero), so
-    // comparing the type and the storage bytes compares the literal exactly. Shared storage short-circuits the
-    // byte comparison.
-
-    #[inline]
-    fn literal_eq(&self, other: &Self) -> bool {
-        self.r#type() == other.r#type()
-            && (std::ptr::eq(self.storage_bytes(), other.storage_bytes())
-                || self.storage_bytes() == other.storage_bytes())
-    }
-
-    #[inline]
-    fn literal_hash<H: Hasher>(&self, state: &mut H) {
-        self.r#type().hash(state);
-        self.storage_bytes().hash(state);
     }
 }
 
