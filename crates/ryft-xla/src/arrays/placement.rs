@@ -366,9 +366,7 @@ pub trait SessionPlacementRequestParameter: Clone + Parameter + sealed::RequestP
 
 impl<R: Clone + Parameter + sealed::RequestParameter> SessionPlacementRequestParameter for R {}
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Items that only this crate can name, which seal the traits of this module that depend on them.
+/// Contains items that only this crate can name, which seal the traits of this module that depend on them.
 mod sealed {
     use ryft_core::{Device, Memory, ParameterPath, Placement, PlacementRequest, PlacementRequestParameter, Sharding};
     use ryft_pjrt::ExecutionFence;
@@ -387,12 +385,12 @@ mod sealed {
         /// from metadata alone before it submits any work for the same options, and returns the same error that it
         /// would return for them. [`Session::place`] calls this function for every leaf of a tree before it places any
         /// leaf, so that no leaf is transferred, uploaded, or donated when a later leaf is rejected. The
-        /// implementations check the options that no leaf accepts (refer to [`validate_parameter_options`]) and then
+        /// implementations check the options that no leaf accepts (refer to [`validate_parameter_options`]) and then:
         ///
         ///   - for a host value, the type rule of [`PlaceOperation`](ryft_core::PlaceOperation) for its destination
-        ///     and the admission of its upload (e.g., a device that the client of `session` cannot address,
-        ///     unavailable memory on an addressable device, or a data type without the additive identity that an
-        ///     unreduced destination needs),
+        ///     and the admission of its upload (e.g., a device that the client of `session` cannot address, unavailable
+        ///     memory on an addressable device, or a data type without the additive identity that an unreduced
+        ///     destination needs),
         ///   - for an [`Array`], that it belongs to the PJRT client of `session` or has a destination that names
         ///     devices, the type rule of [`PlaceOperation`](ryft_core::PlaceOperation) for its destination and source
         ///     with its runtime sharding, and the devices of its resolved destination or, for an array of another
@@ -420,9 +418,9 @@ mod sealed {
         }
 
         /// Returns the comparison metadata of a concrete leaf. A host value or locally assigned [`Array`] provides a
-        /// digest when the session compares its value across processes. The decision to compare is independent of
-        /// the value's shape or bytes. The session owns the comparison and attaches its verdict to compared results.
-        /// The default implementation returns [`None`], for a leaf whose value is never compared.
+        /// digest when the session compares its value across processes. The decision to compare is independent of the
+        /// value's shape or bytes. The session owns the comparison and attaches its verdict to compared results. The
+        /// default implementation returns [`None`], for a leaf whose value is never compared.
         #[inline]
         fn process_value(&self) -> Option<ProcessValue<'_, Output>> {
             None
@@ -441,8 +439,8 @@ mod sealed {
             true
         }
 
-        /// Prepares `parameters` in place after [`Session::place`] validates every leaf and before placing any leaf.
-        /// A replacement must satisfy the options already validated for its position. For example, a mixed
+        /// Prepares `parameters` in place after [`Session::place`] validates every leaf and before placing any
+        /// leaf. A replacement must satisfy the options already validated for its position. For example, a mixed
         /// [`PlaceInput`](super::PlaceInput) tree lifts host values into its compilation trace. `requests` returns the
         /// target and the source of a leaf, for a check that needs the whole tree (e.g., one that depends on the trace
         /// that the leaves join), and `path` returns the path of a leaf. The default implementation leaves the slice
@@ -451,6 +449,7 @@ mod sealed {
         /// # Errors
         ///
         /// Returns the error of the first leaf that cannot be prepared, or an error of the whole tree.
+        #[inline]
         fn prepare_parameters(
             parameters: &mut [Self],
             session: &Session,
@@ -475,9 +474,10 @@ mod sealed {
         fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error>;
     }
 
-    macro_rules! impl_resolved_request_parameter {
+    macro_rules! impl_request_parameter {
         ($request:ty) => {
             impl RequestParameter for $request {
+                #[inline]
                 fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
                     let _ = session;
                     Ok(self.into_request())
@@ -486,18 +486,20 @@ mod sealed {
         };
     }
 
-    impl_resolved_request_parameter!(Placement);
-    impl_resolved_request_parameter!(PlacementRequest);
-    impl_resolved_request_parameter!(Device);
-    impl_resolved_request_parameter!(Memory);
+    impl_request_parameter!(Placement);
+    impl_request_parameter!(PlacementRequest);
+    impl_request_parameter!(Device);
+    impl_request_parameter!(Memory);
 
     impl RequestParameter for Sharding {
+        #[inline]
         fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
             session.placement(self).map(|placement| Some(placement.into()))
         }
     }
 
     impl<R: RequestParameter> RequestParameter for Option<R> {
+        #[inline]
         fn resolve(self, session: &Session) -> Result<Option<PlacementRequest>, Error> {
             self.map_or(Ok(None), |request| request.resolve(session))
         }
@@ -507,6 +509,7 @@ mod sealed {
     pub(super) enum ArrayReadiness {
         /// The runtime array keeps its current buffers.
         Unneeded,
+
         /// The runtime array is moved or copied.
         Required,
     }
@@ -525,9 +528,10 @@ mod sealed {
 
     impl<'a> ProcessValue<'a, Array> {
         /// Returns the comparison metadata for a leaf that is placed as an [`Array`].
-        pub(super) fn new(
-            digest: impl FnOnce() -> Option<[u32; 8]> + 'a,
-            validate: impl FnOnce(ArrayReadiness) -> Result<(), Error> + 'a,
+        #[inline]
+        pub(super) fn new<D: 'a + FnOnce() -> Option<[u32; 8]>, V: 'a + FnOnce(ArrayReadiness) -> Result<(), Error>>(
+            digest: D,
+            validate: V,
         ) -> Self {
             Self {
                 digest: Box::new(digest),
@@ -538,22 +542,27 @@ mod sealed {
     }
 
     impl<Output> ProcessValue<'_, Output> {
-        /// Returns the function that attaches the comparison verdict.
-        pub(super) fn join(&self) -> fn(Output, ExecutionFence) -> Output {
-            self.join
-        }
-
         /// Computes the digest for a leaf that compares its value.
+        #[inline]
         pub(super) fn digest(self) -> Option<[u32; 8]> {
             (self.digest)()
         }
 
         /// Checks a leaf whose value is not compared.
+        #[inline]
         pub(super) fn validate(self, readiness: ArrayReadiness) -> Result<(), Error> {
             (self.validate)(readiness)
         }
+
+        /// Returns the function that attaches the comparison verdict.
+        #[inline]
+        pub(super) fn join(&self) -> fn(Output, ExecutionFence) -> Output {
+            self.join
+        }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Conservatively identifies potential peers when the destination cannot be resolved. Every process sees the same
 /// source mesh for a shared array and the same destination request.
