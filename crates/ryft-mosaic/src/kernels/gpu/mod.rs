@@ -46,6 +46,9 @@ mod tmem;
 
 pub use operations::GpuOperation;
 pub use tmem::TmemOperation;
+
+// TODO(eaplatanios): Review this module.
+
 pub mod synchronization;
 
 /// GPU target, lowering and native source verification errors.

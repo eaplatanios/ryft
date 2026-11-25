@@ -1,0 +1,66 @@
+[package]
+name = "ryft-checkpoints"
+version = "0.0.1"
+readme = "README.md"
+description = "Modular and customizable checkpointing support for Ryft."
+keywords = ["ryft", "checkpoints", "safetensors", "serialization", "machine-learning"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
+
+[dependencies]
+object_store = { workspace = true, optional = true }
+ryft-core.workspace = true
+ryft-pjrt = { workspace = true, optional = true }
+ryft-xla = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+# Apple platforms synchronize files with a plain `fsync`, which the standard library does not expose there.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+pretty_assertions.workspace = true
+tempfile.workspace = true
+
+[features]
+default = ["safetensors"]
+safetensors = []
+object-store = ["dep:object_store", "dep:tokio"]
+zarr = []
+xla = ["dep:ryft-pjrt", "dep:ryft-xla"]
+cuda-12 = ["xla", "ryft-xla/cuda-12"]
+cuda-13 = ["xla", "ryft-xla/cuda-13"]
+rocm-10 = ["xla", "ryft-xla/rocm-10"]
+tpu = ["xla", "ryft-xla/tpu"]
+neuron = ["xla", "ryft-xla/neuron"]
+metal = ["xla", "ryft-xla/metal"]
+mps = ["xla", "ryft-xla/mps"]
+
+[[example]]
+name = "hugging_face"
+required-features = ["safetensors"]

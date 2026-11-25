@@ -15,7 +15,7 @@ use crate::Error;
 /// Represents errors produced while declaring [`RuntimeRequirement`]s, configuring [`RuntimeExtensions`], initializing
 /// a [`RuntimeExtension`], or attaching native user data to [`ExecutionResources`]. Runtime APIs return these errors
 /// through [`Error::Runtime`].
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum RuntimeError {
     #[error("invalid runtime requirement: {reason}")]
     InvalidRequirement { reason: String },

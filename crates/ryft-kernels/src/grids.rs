@@ -45,6 +45,8 @@ use ryft_core::{
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Error produced when constructing a [`Grid`], resolving one of its dimensions, or binding its runtime extents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum GridError {

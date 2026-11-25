@@ -5,8 +5,7 @@ The JAX side runs in a fresh process so that its selected backend is configured 
 parity cases compare named values and declared semantic StableHLO contracts. Collective cases additionally compare
 each backend against an independent host reference. The bounded data-dependent case checks that eager values agree,
 Ryft stages the bounded result, and pinned JAX rejects staging because the result extent depends on traced data.
-The placement derivative case checks per-framework expectations and reports exact matches, expected Ryft rejections,
-and expected placement differences.
+Case validators can check per-framework expectations and summarize the observed results.
 
 This module intentionally does not import JAX at module load time.
 """
@@ -27,7 +26,7 @@ import sys
 import tempfile
 import time
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -78,6 +77,7 @@ class CaseComparison:
 
     case_id: str
     differences: tuple[str, ...]
+    _summary: str = ""
 
     def passed(self) -> bool:
         """Returns whether all observed behavior satisfied the case's expectations."""
@@ -402,7 +402,7 @@ def compare_case(
 
     # Parameters
 
-      - `relationship`: `parity`, `ryft_exceeds_jax`, or `placement_forward_derivatives`.
+      - `relationship`: `parity` or `ryft_exceeds_jax`.
       - `collectives`: Collective projection the registry entry expects from both frameworks.
       - `ryft`: Ryft-side observation.
       - `jax`: JAX-side observation.
@@ -466,10 +466,6 @@ def compare_case(
                 differences.append(f"JAX staging: expected {jax_staging!r} but got {jax.staging!r}")
         if collectives:
             differences.append("StableHLO: a `ryft_exceeds_jax` case does not compare collective projections")
-    elif relationship == "placement_forward_derivatives":
-        from ryft.jax.differential_testing_cases import _validate_placement_forward_derivatives
-
-        differences.extend(_validate_placement_forward_derivatives(ryft, jax))
     else:
         raise ValueError(f"unknown differential relationship '{relationship}'")
     return CaseComparison(case_id=ryft.case_id, differences=tuple(differences))
@@ -797,27 +793,25 @@ def run_comparison(
         root, selected_ids, timeout=timeout, binary=binary, log_directory=log_directory,
     ), "Ryft")
     jax = _record_map(collect_jax_observations(root, selected_ids, timeout=timeout, log_directory=log_directory), "JAX")
-    if set(ryft) != set(selected_ids):
-        raise ValueError(f"Ryft case set {sorted(ryft)} does not match selected cases {sorted(selected_ids)}")
-    if set(jax) != set(selected_ids):
-        raise ValueError(f"JAX case set {sorted(jax)} does not match selected cases {sorted(selected_ids)}")
+    for side, records in (("Ryft", ryft), ("JAX", jax)):
+        if set(records) != set(selected_ids):
+            raise ValueError(f"{side} case set {sorted(records)} does not match selected cases {sorted(selected_ids)}")
     comparisons = []
     for case in cases:
+        ryft_record, jax_record = ryft[case.case_id], jax[case.case_id]
+        if case.relationship is None:
+            if case.validate is None:
+                raise ValueError(f"case '{case.case_id}' requires a comparison or a validator")
+            comparisons.append(case.validate(ryft_record, jax_record))
+            continue
         comparison = compare_case(
-            case.relationship,
-            case.collectives,
-            ryft[case.case_id],
-            jax[case.case_id],
-            case.stablehlo_patterns,
-            None if case.reference is None else case.reference(),
-            case.ryft_staging,
-            case.jax_staging,
+            case.relationship, case.collectives, ryft_record, jax_record, case.stablehlo_patterns,
+            case.reference() if case.reference is not None else None, case.ryft_staging, case.jax_staging,
         )
-        differences = list(comparison.differences)
         if case.validate is not None:
-            for side, observation in (("ryft", ryft[case.case_id]), ("jax", jax[case.case_id])):
-                differences.extend(f"{side} {difference}" for difference in case.validate(observation))
-        comparisons.append(CaseComparison(case_id=case.case_id, differences=tuple(differences)))
+            validated = case.validate(ryft_record, jax_record)
+            comparison = replace(validated, differences=comparison.differences + validated.differences)
+        comparisons.append(comparison)
     return tuple(comparisons)
 
 
@@ -883,10 +877,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 1
     for comparison in comparisons:
         status = "PASS" if comparison.passed() else "FAIL"
-        line = f"{status} {comparison.case_id}"
-        if comparison.case_id == "placement_forward_derivatives" and comparison.passed():
-            line += " (11 exact matches, 9 expected Ryft rejections, 2 expected placement differences)"
-        print(line)
+        summary = f" ({comparison._summary})" if comparison.passed() and comparison._summary else ""
+        print(f"{status} {comparison.case_id}{summary}")
         for difference in comparison.differences:
             print(f"  {difference}")
     return 0 if all(comparison.passed() for comparison in comparisons) else 1

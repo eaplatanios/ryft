@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 // TODO(eaplatanios): Review this.
 
 // TODO(eaplatanios): Promote CUDA errors to dedicated `ryft_xla::Error` variants after

@@ -19,6 +19,8 @@ use crate::kernels::gpu::Error;
 use crate::kernels::gpu::lowering::{Buffer, KernelValue, Lowering, append, shape};
 use crate::kernels::gpu::synchronization::SynchronizationEvent;
 
+// TODO(eaplatanios): Review this module.
+
 /// Checks the exact first WGMMA geometry and returns the two flat shared transport allocation types. The native
 /// caller must provide one complete 128-thread warpgroup and align both allocations to 256 bytes. Plain half-type
 /// contractions are not silently widened: the canonical operation must explicitly request FP32 accumulation.

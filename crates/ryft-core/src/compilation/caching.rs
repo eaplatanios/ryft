@@ -200,7 +200,7 @@ pub struct CompilationEvent {
 /// call and are unaffected by [`CompilationCache::clear_cache`]. Each field is read independently, so a snapshot
 /// taken during concurrent compilations need not correspond to a single point in time. Every attempt of a lookup counts
 /// as exactly one of [`Self::memory_hits`], [`Self::waits`], and [`Self::misses`], and a waiter whose producer fails
-/// retries and counts again. A memory hit or wait whose program [`CompilationCacheDomain::validate_cached_program`]
+/// retries and counts again. A memory hit or wait whose program [`CompilationCacheDomain::reuse_cached_program`]
 /// rejects still counts, although it fails the compilation. Durations are host durations summed over all threads,
 /// so concurrent compilations can make them exceed the elapsed wall-clock time.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -431,10 +431,9 @@ impl<'o, C: CompilationCacheDomain> InFlightProducer<'o, C> {
     }
 
     /// Publishes `program` to the in-memory tier and to every waiter, and returns the shared program.
-    fn finish(mut self, program: C::CompiledProgram) -> Arc<C::CompiledProgram> {
+    fn finish(mut self, program: Arc<C::CompiledProgram>) -> Arc<C::CompiledProgram> {
         let cache_key = self.cache_key.take().unwrap();
         let in_flight = self.in_flight.take().unwrap();
-        let program = Arc::new(program);
 
         // Publish to memory before releasing the producer slot so a racing lookup can find this program.
         // Release each lock before acquiring the next one or notifying waiters.
@@ -507,10 +506,10 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// helpers that look up entries in the cache.
 ///
 /// The cache is keyed by the structural [`CompilationCacheDomain::CacheKey`] of the domain. Equality of keys, rather
-/// than equality of their hashes, guarantees that distinct programs never collide. On a hit, the cached program is
-/// returned without compiling anything. On a miss, persistent storage or artifact exchange restores the program, or
+/// than equality of their hashes, guarantees that distinct compilations never collide. A hit reuses the compiled
+/// artifact without compiling anything. On a miss, persistent storage or artifact exchange restores the program, or
 /// [`CompilationCacheDomain::compile_uncached`] compiles it, and the result is inserted. Every program that a request
-/// does not compile itself must pass [`CompilationCacheDomain::validate_cached_program`] for that request.
+/// does not compile itself must pass [`CompilationCacheDomain::reuse_cached_program`] for that request.
 ///
 /// The in-memory tier uses LRU eviction with a default capacity of `8192` entries, which
 /// [`CompilationCache::with_capacity`] overrides.
@@ -535,7 +534,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 /// └─────────────┬────────────┘
 ///               ▼
 /// ┌──────────────────────────┐  hit   ┌───────────────────────┐ accepted ┌────────────────────────┐
-/// │ 1. In-Memory LRU         ├───────▶│ Validate the Program  ├─────────▶│ `Arc<CompiledProgram>` │◀┐
+/// │ 1. In-Memory LRU         ├───────▶│ Reuse Cached Program  ├─────────▶│ `Arc<CompiledProgram>` │◀┐
 /// └─────────────┬────────────┘        └───────────────────┬───┘          └────────────────────────┘ │
 ///               │ miss    ▲ producer failed         ▲     └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐              │
 ///               ▼         └───────────────┐         │ shared program                 ▼ rejected     │
@@ -561,7 +560,7 @@ const DEFAULT_EVENT_CAPACITY: usize = 0;
 ///
 /// Misses for the same key coordinate one backend producer, while requests for different keys remain concurrent.
 /// The disk cache and the artifact exchange are skipped when they are not configured or when the domain supplies no
-/// persistent key. Programs that they restore are validated like memory hits, and rejected ones count as misses.
+/// persistent key. Their restored programs go through the same reuse hook as memory hits. A rejection counts as a miss.
 /// Every successful source publishes to memory, while persistent writes are best effort and exchange publication is
 /// controlled by the configured policy.
 ///
@@ -774,11 +773,11 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
 
-    /// Compiles `program` through the shared cache and returns the shared compiled program. This function derives the
+    /// Compiles `program` through the shared cache and returns a compiled program for this request. It derives the
     /// exact structural key of `program` through [`CompilationCacheDomain::compilation_key`] and resolves it through
     /// the in-memory tier, the persistent tier, and the artifact exchange, in that order, before it falls back to
     /// [`CompilationCacheDomain::compile_uncached`]. Every program that it does not compile for this request must pass
-    /// [`CompilationCacheDomain::validate_cached_program`] first.
+    /// [`CompilationCacheDomain::reuse_cached_program`] first.
     ///
     /// On a hit, the entry is moved to the most recently used position. On a miss, the new entry is inserted, and the
     /// least recently used entry is evicted if the cache is at capacity.
@@ -796,8 +795,8 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
     /// # Errors
     ///
     /// Returns the errors of [`CompilationCacheDomain::compilation_key`] and of
-    /// [`CompilationCacheDomain::compile_uncached`] when this caller compiles the program. It also returns the error of
-    /// [`CompilationCacheDomain::validate_cached_program`] when the domain rejects a program from the in-memory tier or
+    /// [`CompilationCacheDomain::compile_uncached`] when this caller compiles the program. It also returns the error
+    /// of [`CompilationCacheDomain::reuse_cached_program`] when the domain rejects a program from the in-memory tier or
     /// from another producer. When the artifact exchange policy requires sharing, it also returns the exchange failures
     /// that prevent this process from obtaining or publishing an artifact, including deserialization errors of
     /// received artifacts. Persistent tier failures never fail this function.
@@ -846,9 +845,9 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
 
                 // The producer compiled for its own request. Equal keys must also serve this caller's request, and
                 // rejecting an in-memory result is an error rather than permission to compile a conflicting entry.
-                let validation = domain.validate_cached_program(program, &shared);
-                let outcome = match &validation {
-                    Ok(()) => CompilationLookupOutcome::Hit,
+                let reused = domain.reuse_cached_program(program, shared);
+                let outcome = match &reused {
+                    Ok(_) => CompilationLookupOutcome::Hit,
                     Err(error) => CompilationLookupOutcome::Failed(CompilationStepError::Incompatible {
                         message: error.to_string(),
                     }),
@@ -860,7 +859,7 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
                     &self.statistics.memory_lookup_nanoseconds,
                 );
 
-                return validation.map(|()| shared);
+                return reused;
             }
 
             // A prior producer can insert the program after the first lookup above and remove its in-flight marker
@@ -956,9 +955,8 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         }
     }
 
-    /// Validates the `cached` in-memory program against the requesting `program` and records the lookup that started
-    /// at `lookup_start`. A rejection fails the compilation, because equal exact keys must mean interchangeable
-    /// programs.
+    /// Reuses the `cached` in-memory program for the requesting `program` and records the lookup that started at
+    /// `lookup_start`. A rejection fails the compilation, because equal keys must share a backend compilation.
     fn accept_memory_hit(
         &self,
         domain: &C,
@@ -966,9 +964,9 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         cached: Arc<C::CompiledProgram>,
         lookup_start: Instant,
     ) -> Result<Arc<C::CompiledProgram>, C::Error> {
-        let validation = domain.validate_cached_program(program, &cached);
-        let outcome = match &validation {
-            Ok(()) => CompilationLookupOutcome::Hit,
+        let reused = domain.reuse_cached_program(program, cached);
+        let outcome = match &reused {
+            Ok(_) => CompilationLookupOutcome::Hit,
             Err(error) => {
                 CompilationLookupOutcome::Failed(CompilationStepError::Incompatible { message: error.to_string() })
             }
@@ -978,7 +976,7 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
             lookup_start.elapsed(),
             &self.statistics.memory_lookup_nanoseconds,
         );
-        validation.map(|()| cached)
+        reused
     }
 
     /// Validates compatibility with `exchange` and returns whether it participates in this compilation. A validation
@@ -1025,14 +1023,14 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         program: &C::LoweredProgram,
         disk_cache: &DiskCache,
         digest: &DiskCacheDigest,
-    ) -> Option<(C::CompiledProgram, Vec<u8>)> {
+    ) -> Option<(Arc<C::CompiledProgram>, Vec<u8>)> {
         let lookup_start = Instant::now();
         let (outcome, restored) = match disk_cache.get(digest) {
             Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
-                Ok(Some(restored)) if domain.validate_cached_program(program, &restored).is_err() => {
-                    (CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible), None)
-                }
-                Ok(Some(restored)) => (CompilationLookupOutcome::Hit, Some((restored, bytes))),
+                Ok(Some(restored)) => match domain.reuse_cached_program(program, Arc::new(restored)) {
+                    Ok(restored) => (CompilationLookupOutcome::Hit, Some((restored, bytes))),
+                    Err(_) => (CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible), None),
+                },
                 Ok(None) => (CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible), None),
                 Err(error) => (
                     CompilationLookupOutcome::Failed(CompilationStepError::DeserializationFailed {
@@ -1072,7 +1070,7 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         domain: &C,
         program: &C::LoweredProgram,
         exchange: ActiveExchange<'_>,
-    ) -> Result<Option<C::CompiledProgram>, C::Error> {
+    ) -> Result<Option<Arc<C::CompiledProgram>>, C::Error> {
         self.statistics.exchange_waits.fetch_add(1, Ordering::Relaxed);
         let exchange_start = Instant::now();
         let bytes = match exchange.exchange.receive(exchange.key, exchange.timeout) {
@@ -1117,19 +1115,22 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
         };
         match domain.deserialize_program(bytes.as_slice()) {
             Ok(Some(received)) => {
-                if let Err(error) = domain.validate_cached_program(program, &received) {
-                    self.record_duration(
-                        CompilationStep::ExchangeReceive {
-                            outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
-                        },
-                        exchange_start.elapsed(),
-                        &self.statistics.exchange_nanoseconds,
-                    );
-                    self.require_exchange_or_record_fallback(
-                        format!("received compilation artifact is incompatible: {error}").as_str(),
-                    )?;
-                    return Ok(None);
-                }
+                let received = match domain.reuse_cached_program(program, Arc::new(received)) {
+                    Ok(received) => received,
+                    Err(error) => {
+                        self.record_duration(
+                            CompilationStep::ExchangeReceive {
+                                outcome: CompilationLookupOutcome::Miss(CompilationMissReason::Incompatible),
+                            },
+                            exchange_start.elapsed(),
+                            &self.statistics.exchange_nanoseconds,
+                        );
+                        self.require_exchange_or_record_fallback(
+                            format!("received compilation artifact is incompatible: {error}").as_str(),
+                        )?;
+                        return Ok(None);
+                    }
+                };
                 self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
                 self.record_duration(
                     CompilationStep::ExchangeReceive { outcome: CompilationLookupOutcome::Hit },
@@ -1270,8 +1271,9 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
             }
             persistent => persistent,
         };
+
         if persistent.is_none() && leader_exchange.is_none() {
-            return Ok(producer.finish(program));
+            return Ok(producer.finish(Arc::new(program)));
         }
 
         let serialization_start = Instant::now();
@@ -1352,7 +1354,7 @@ impl<'o, C: CompilationCacheDomain> CompilationCache<'o, C> {
             }
         }
 
-        Ok(producer.finish(program))
+        Ok(producer.finish(Arc::new(program)))
     }
 
     /// Records an exchange step that could not supply an artifact and then applies the fallback policy.
@@ -2035,6 +2037,9 @@ mod tests {
         /// Accepts synthetic fixture artifacts independently of the lowered output count.
         accept_all_programs: bool,
 
+        /// Distinct output count to return when a request reuses a cached program.
+        rebound_output_count: Option<usize>,
+
         /// Index of the exchange leader of every program (refer to
         /// [`CompilationCacheDomain::artifact_exchange_leader`]).
         exchange_leader: usize,
@@ -2104,13 +2109,15 @@ mod tests {
         }
 
         // Direct compilation tests require matching output counts. Synthetic cache fixtures accept every artifact.
-        fn validate_cached_program(
+        fn reuse_cached_program(
             &self,
             program: &TestLoweredProgram,
-            compiled: &TestCompiledProgram,
-        ) -> Result<(), ProgramError> {
-            if self.accept_all_programs || compiled.0 == program.0.len() {
-                Ok(())
+            compiled: Arc<TestCompiledProgram>,
+        ) -> Result<Arc<TestCompiledProgram>, ProgramError> {
+            if let Some(count) = self.rebound_output_count {
+                Ok(Arc::new(TestCompiledProgram(count)))
+            } else if self.accept_all_programs || compiled.0 == program.0.len() {
+                Ok(compiled)
             } else {
                 Err(ProgramError::InvalidArgument {
                     message: format!("cached program {} cannot serve {} outputs", compiled.0, program.0.len()),
@@ -3778,7 +3785,7 @@ mod tests {
         compile_with(&context, &domain, 0, move || Ok(TestCompiledProgram(2))).unwrap();
         context.clear_events();
 
-        // Equal exact keys must mean interchangeable programs, so a rejected in-memory program fails the compilation.
+        // Equal keys must share a backend compilation, so a rejected in-memory program fails the request.
         assert_eq!(
             context.compile(&domain, &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)])),
             Err(ProgramError::InvalidArgument { message: "cached program 2 cannot serve 1 outputs".to_string() }),
@@ -3841,7 +3848,7 @@ mod tests {
         }
         release.store(true, Ordering::Release);
 
-        // The producer compiled the shared program for its own request, so the waiter validates it like a hit.
+        // The producer compiled the shared program for its own request. The waiter uses the same hook as a memory hit.
         assert_eq!(producer.join().unwrap().as_ref(), &TestCompiledProgram(2));
         assert_eq!(
             waiter.join().unwrap(),
@@ -4189,6 +4196,48 @@ mod tests {
             .map(|event| event.duration)
             .sum::<Duration>();
         assert_eq!(context.statistics().memory_lookup_duration, lookup_duration);
+    }
+
+    #[test]
+    fn test_compilation_cache_compile_rebinds_programs_for_waiters() {
+        let cache = CompilationCache::<TestDomain>::new();
+        let release = Arc::new(AtomicBool::new(false));
+        let (producer, waiter) = thread::scope(|scope| {
+            let producer_release = Arc::clone(&release);
+            let producer = scope.spawn(|| {
+                compile_with(&cache, &TestDomain::default(), 1, move || {
+                    while !producer_release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(TestCompiledProgram(1))
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cache.statistics().misses == 0 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            let waiter = scope.spawn(|| {
+                let domain = TestDomain { cache_key: 1, rebound_output_count: Some(2), ..TestDomain::default() };
+                cache.compile(&domain, &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]))
+            });
+            while cache.statistics().waits == 0 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            release.store(true, Ordering::Release);
+            (producer.join().unwrap().unwrap(), waiter.join().unwrap().unwrap())
+        });
+
+        assert_eq!(producer.0, 1);
+        assert_eq!(waiter.0, 2);
+        let cached = cache
+            .compile(
+                &TestDomain { cache_key: 1, ..TestDomain::default() },
+                &TestLoweredProgram(vec![ArrayType::scalar(DataType::F32)]),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &producer));
+        let statistics = cache.statistics();
+        assert_eq!((statistics.compilations, statistics.waits, statistics.memory_hits), (1, 1, 1));
     }
 
     #[test]

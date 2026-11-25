@@ -7,6 +7,8 @@ use crate::drivers::HipDriver;
 use crate::ffi::HipDeviceProperties;
 use crate::{Error, RocmKernelArtifact, RocmKernelLaunch};
 
+// TODO(eaplatanios): Review this module.
+
 /// One loaded module retaining its device's primary context independently of borrowed execution streams.
 struct LoadedKernel {
     /// Owning device ordinal.

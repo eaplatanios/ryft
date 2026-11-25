@@ -1,0 +1,61 @@
+[package]
+name = "ryft-experiments"
+version = "0.0.1"
+readme = "README.md"
+publish = false
+description = "End-to-end training and evaluation experiments built on Ryft."
+keywords = ["ryft", "experiments", "training", "xla", "machine-learning"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "README.md",
+    "../../LICENSE-APACHE",
+    "../../LICENSE-MIT",
+    "../../NOTICE",
+]
+
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}", min = 1 },
+    { file = "CHANGELOG.md", search = "Release Date", replace = "{{date}}", min = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - Release Date\n", exactly = 1 },
+]
+
+[dependencies]
+ryft-checkpoints = { workspace = true, features = ["xla"] }
+ryft-core.workspace = true
+ryft-macros.workspace = true
+ryft-models.workspace = true
+ryft-optimizers.workspace = true
+ryft-pjrt.workspace = true
+ryft-xla.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+
+[features]
+default = ["safetensors"]
+safetensors = ["ryft-checkpoints/safetensors", "ryft-models/safetensors"]
+zarr = ["ryft-checkpoints/zarr"]
+cuda-12 = ["ryft-xla/cuda-12"]
+cuda-13 = ["ryft-xla/cuda-13"]
+rocm-10 = ["ryft-xla/rocm-10"]
+tpu = ["ryft-xla/tpu"]
+neuron = ["ryft-xla/neuron"]
+metal = ["ryft-xla/metal"]
+mps = ["ryft-xla/mps"]
+
+[[bin]]
+name = "inkling2_checkpoint"
+path = "src/bin/inkling2_checkpoint.rs"
+required-features = ["safetensors"]

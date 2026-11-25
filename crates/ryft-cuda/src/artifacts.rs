@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Compute capability reported by a CUDA device (e.g., `9.0` for Hopper or `10.0` for Blackwell).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct CudaComputeCapability {

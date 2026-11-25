@@ -69,6 +69,8 @@ use crate::interpretation::{KernelDebugOptions, KernelTraceEntry};
 use crate::mappings::BoundaryPolicy;
 use crate::operations::{KernelExtension, KernelOperation};
 
+// TODO(eaplatanios): Review this module.
+
 /// Admission and resource limit failures of [`KernelDefinition::interpret_interleavings`], all of which occur before
 /// the execution of any interleaving begins.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]

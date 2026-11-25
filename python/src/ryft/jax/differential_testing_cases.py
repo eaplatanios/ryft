@@ -24,6 +24,7 @@ from ryft.jax.collective_testing import (
 from ryft.jax.differential_testing import (
     PINNED_JAX_VERSION,
     SCHEMA,
+    CaseComparison,
     DifferentialObservation,
     StableHloCollective,
     StagingObservation,
@@ -56,21 +57,31 @@ class DifferentialCase:
     `collectives` is the collective projection both frameworks must produce, in module order. `stablehlo_patterns`
     lists semantic operation or attribute spellings that must occur in both modules. An exact-parity case must declare
     at least one of these contracts or an independent reference. `reference` provides host semantics checked separately
-    against each backend. `validate` checks identities against actual outputs, and `suite` selects related workloads.
+    against each backend. `validate` checks the observed pair, and `suite` selects related workloads.
     Capability cases that compare no module declare neither module contract. A `ryft_exceeds_jax` case declares the
     staging that each framework is expected to report in `ryft_staging` and `jax_staging`.
     """
 
     case_id: str
-    relationship: str
+    relationship: str | None
     build_jax: Callable[[Any, Any, Any], DifferentialObservation]
     collectives: tuple[StableHloCollective, ...] = ()
     stablehlo_patterns: tuple[str, ...] = ()
     reference: Callable[[], dict[str, tuple[tuple[float, ...], ...]]] | None = None
     suite: str = "general"
-    validate: Callable[[DifferentialObservation], tuple[str, ...]] | None = None
+    validate: Callable[[DifferentialObservation, DifferentialObservation], CaseComparison] | None = None
     ryft_staging: StagingObservation | None = None
     jax_staging: StagingObservation | None = None
+
+
+def _validate_each(
+    validate: Callable[[DifferentialObservation], tuple[str, ...]], ryft: DifferentialObservation,
+    jax: DifferentialObservation,
+) -> CaseComparison:
+    """Checks an independent invariant on each framework's observation."""
+
+    differences = (f"{side} {error}" for side, record in (("ryft", ryft), ("jax", jax)) for error in validate(record))
+    return CaseComparison(ryft.case_id, tuple(differences))
 
 
 def _configure_jax_devices(device_count: int = 4) -> None:
@@ -661,14 +672,12 @@ def _placement_forward_derivative_references() -> tuple[
 
 def _validate_placement_forward_derivatives(
     ryft: DifferentialObservation, jax: DifferentialObservation,
-) -> tuple[str, ...]:
+) -> CaseComparison:
     """Checks every placement derivative observation against its framework's expected result."""
 
-    ryft_reference, jax_reference = _placement_forward_derivative_references()
     differences = []
-    for side, observations, expected in (
-        ("Ryft", ryft.observations, ryft_reference), ("JAX", jax.observations, jax_reference),
-    ):
+    for side, record, expected in zip(("Ryft", "JAX"), (ryft, jax), _placement_forward_derivative_references()):
+        observations = record.observations
         for name in sorted(observations.keys() | expected.keys()):
             prefix = f"{side} observation '{name}'"
             if name not in expected:
@@ -679,7 +688,13 @@ def _validate_placement_forward_derivatives(
                 differences.append(f"{prefix}: {observations[name]!r} != expected {expected[name]!r}")
     if ryft.staging != jax.staging:
         differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
-    return tuple(differences)
+    if differences:
+        return CaseComparison(ryft.case_id, tuple(differences))
+    matches = sum(rows == jax.observations[name] for name, rows in ryft.observations.items())
+    rejections = sum(not rows and bool(jax.observations[name]) for name, rows in ryft.observations.items())
+    summary = (f"{matches} exact matches, {rejections} expected Ryft rejections, "
+               f"{len(ryft.observations) - matches - rejections} expected placement differences")
+    return CaseComparison(ryft.case_id, (), summary)
 
 
 DIFFERENTIAL_CASES = (
@@ -751,14 +766,15 @@ DIFFERENTIAL_CASES = (
         "ryft_exceeds_jax",
         _build_condition_varying_predicate_gradient,
         reference=_condition_varying_predicate_gradient_reference,
-        validate=_validate_condition_varying_predicate_gradient,
+        validate=partial(_validate_each, _validate_condition_varying_predicate_gradient),
         ryft_staging=StagingObservation(status="supported", output_type="f32[1]"),
         jax_staging=StagingObservation(status="unsafe", category="collective_inside_branch"),
     ),
     DifferentialCase(
         "placement_forward_derivatives",
-        "placement_forward_derivatives",
+        None,
         _build_placement_forward_derivatives,
+        validate=_validate_placement_forward_derivatives,
     ),
 )
 
@@ -774,9 +790,8 @@ def _collective_cases() -> tuple[DifferentialCase, ...]:
             collective_contract(descriptor),
             reference=partial(collective_reference, descriptor),
             suite="collectives",
-            validate=(
-                partial(validate_collective_observation, descriptor) if descriptor.get("transform") == "vjp" else None
-            ),
+            validate=(partial(_validate_each, partial(validate_collective_observation, descriptor))
+                      if descriptor.get("transform") == "vjp" else None),
         )
         for descriptor in collective_descriptors()
     )
@@ -809,7 +824,8 @@ def _ragged_cases() -> tuple[DifferentialCase, ...]:
             stablehlo_patterns=("ragged_all_to_all",),
             reference=partial(ragged_reference, descriptor),
             suite="cuda-collectives",
-            validate=partial(validate_ragged_observation, descriptor) if descriptor["transform"] == "vjp" else None,
+            validate=(partial(_validate_each, partial(validate_ragged_observation, descriptor))
+                      if descriptor["transform"] == "vjp" else None),
         )
         for descriptor in ragged_descriptors()
     )

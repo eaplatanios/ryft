@@ -71,6 +71,8 @@ use ryft_core::{
 };
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Error produced by [`validate_kernel_body`] when a kernel body or its [`KernelBoundaryContract`] violates the kernel
 /// boundary that preserves references.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]

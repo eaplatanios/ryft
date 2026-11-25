@@ -142,6 +142,8 @@ use ryft_mlir::{
 
 use crate::kernels::{Error, Options};
 
+// TODO(eaplatanios): Review this module.
+
 /// Verified native module and the exact pointer-only logical argument mapping.
 pub(super) struct Lowered<'c, 't> {
     /// Typed module owned for the duration of native compilation.

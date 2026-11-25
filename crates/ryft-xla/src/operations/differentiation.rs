@@ -133,8 +133,8 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayOperation, CaptureReference, Context, CosOperation, DataType, DomainTracingContext,
         Error as CoreError, EverythingSavable, Memory, MulOperation, NothingSavable, Placeholder, PrintOperation,
-        ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram,
-        Value, differentiate_at, rematerialize,
+        ProgramError, ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation,
+        TypedProgram, Value, differentiate_at, rematerialize,
     };
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};

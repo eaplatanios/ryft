@@ -147,6 +147,8 @@ use crate::operations::{
 };
 use crate::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
 
+// TODO(eaplatanios): Review this module.
+
 /// A body or launch lacks a definite initialization or disjointness proof.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelInitializationError {

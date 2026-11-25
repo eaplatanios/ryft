@@ -41,6 +41,8 @@ use crate::calls::KernelDefinition;
 use crate::initialization::{KernelInitializationError, validate_kernel_initialization};
 use crate::operations::{KernelExtension, NoKernelExtension};
 
+// TODO(eaplatanios): Review this module.
+
 /// Compiler admission and invocation failures, distinct from invalid core semantics.
 #[derive(Debug, Error)]
 pub enum KernelCompilationError<E: std::error::Error> {

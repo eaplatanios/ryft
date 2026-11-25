@@ -92,7 +92,7 @@ class DifferentialTestingTest(unittest.TestCase):
                 ("dot_product_attention", "parity", False, True),
                 ("negative_dynamic_slice", "parity", False, True),
                 ("condition_varying_predicate_gradient", "ryft_exceeds_jax", False, False),
-                ("placement_forward_derivatives", "placement_forward_derivatives", False, False),
+                ("placement_forward_derivatives", None, False, False),
             ],
         )
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
@@ -543,6 +543,17 @@ class DifferentialTestingTest(unittest.TestCase):
             redirect_stdout(output),
         ):
             self.assertEqual(main(("--case", case_id)), 0)
+            names = ("add_fused_primal", "add_fused_tangent")
+            ryft_subset = {name: ryft_reference[name] for name in names}
+            jax_subset = {name: jax_reference[name] for name in names}
+            collect_ryft.return_value = (replace(ryft, observations=ryft_subset),)
+            collect_jax.return_value = (replace(jax, observations=jax_subset),)
+            with patch(
+                "ryft.jax.differential_testing_cases._placement_forward_derivative_references",
+                return_value=(ryft_subset, jax_subset),
+            ):
+                self.assertEqual(main(("--case", case_id)), 0)
+            collect_jax.return_value = (jax,)
             changed = {**ryft_reference, "add_fused_primal": jax_reference["add_fused_primal"]}
             collect_ryft.return_value = (replace(ryft, observations=changed),)
             self.assertEqual(main(("--case", case_id)), 1)
@@ -551,15 +562,21 @@ class DifferentialTestingTest(unittest.TestCase):
             del changed["movable_primal_fused_primal"]
             collect_jax.return_value = (replace(jax, observations=changed),)
             self.assertEqual(main(("--case", case_id)), 1)
+            staging = StagingObservation(status="supported", output_type="f32[2]")
+            collect_jax.return_value = (replace(jax, staging=staging),)
+            self.assertEqual(main(("--case", case_id)), 1)
         self.assertEqual(
             output.getvalue().splitlines(),
             [
                 f"PASS {case_id} (11 exact matches, 9 expected Ryft rejections, 2 expected placement differences)",
+                f"PASS {case_id} (0 exact matches, 2 expected Ryft rejections, 0 expected placement differences)",
                 f"FAIL {case_id}",
                 "  Ryft observation 'add_fused_primal': ((2.0, 4.0), (1.0, 1.0, 0.0)) != expected ()",
                 f"FAIL {case_id}",
                 "  JAX observation 'movable_primal_fused_primal': missing",
                 "  JAX observation 'unexpected': unexpected ()",
+                f"FAIL {case_id}",
+                f"  staging: ryft None != jax {staging!r}",
             ],
         )
 

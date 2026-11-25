@@ -22,6 +22,8 @@ use crate::kernels::cutile::{
     Options, Parameter, TILEIRAS_VERSION, Target, Versions, lowering, lowering_sha256,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Compiler installation and optional cancellation signal. Neither owns any CUDA runtime resource.
 #[derive(Clone, Debug)]
 pub struct Compiler {

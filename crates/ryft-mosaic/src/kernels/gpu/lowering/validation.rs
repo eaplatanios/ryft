@@ -13,6 +13,8 @@ use ryft_kernels::{
 use crate::kernels::gpu::lowering::memory::{TmaCopyPlan, plan as plan_tma_copies};
 use crate::kernels::gpu::{Error, GpuOperation, Mma, Options, Target, TmemOperation};
 
+// TODO(eaplatanios): Review this module.
+
 /// Complete immutable resource plan. Every private array receives distinct storage; lifetime reuse is not assumed.
 pub(in crate::kernels::gpu) struct Plan {
     /// All private array values and scratch roots in canonical region/atom order.

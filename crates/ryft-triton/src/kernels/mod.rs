@@ -86,6 +86,8 @@ mod lowering;
 
 pub use compiler::Compiler;
 
+// TODO(eaplatanios): Review this module.
+
 /// Returns the hexadecimal SHA-256 digest of every Rust source file of this adapter (i.e., `kernels/mod.rs`,
 /// `kernels/lowering.rs`, and `kernels/compiler.rs`), in that order and each preceded by its byte length. These files
 /// determine the emitted module and its admission.

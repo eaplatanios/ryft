@@ -5,6 +5,8 @@
 
 use std::ffi::{c_char, c_void};
 
+// TODO(eaplatanios): Review this module.
+
 /// Native device properties returned by `hipGetDevicePropertiesR0600`.
 ///
 /// The bitfield-only `hipDeviceArch_t` occupies one native unsigned integer; no bitfields are inspected.

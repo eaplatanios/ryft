@@ -70,9 +70,8 @@ impl DispatchKey {
 
 /// Exact process-local compilation key for an XLA lowering.
 ///
-/// This key carries the complete StableHLO computation and every field relevant to execution that
-/// [`LoweredProgram`] retains. Equality therefore means that cached compiled artifacts are interchangeable, even when
-/// unrelated call sites happen to share the same input signature.
+/// This key carries the complete StableHLO computation and the executable contract retained by [`LoweredProgram`].
+/// Equal keys share a native executable. Each invocation retains its own device assignment and dimension identities.
 ///
 /// Dynamic dimensions are numbered by first occurrence, so diagnostic variable names do not affect identity.
 /// Compilation options, shardings, the outputs that executions commit, target facts, runtime requirements, and effect
@@ -102,6 +101,7 @@ impl LoweredProgram {
             compilation_options: compilation_options.as_slice(),
             signature: PersistentArraySignature::encode(self.input_types(), self.all_output_types()).into_canonical(),
             input_mapping: persistent_mapping(self.signature().input_mapping())?,
+            unread_inputs: self.signature().unread_inputs(),
             output_mapping: persistent_mapping(self.signature().output_mapping())?,
             input_dimensions: PersistentBoundaryDimension::from_input_dimensions(self.signature()),
             output_dimensions: PersistentBoundaryDimension::from_output_dimensions(self.signature()),
@@ -492,6 +492,12 @@ struct PersistentKey<'o> {
     /// Physical executable argument position for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
 
+    /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
+    /// in which case it is omitted, so that the key of such a program is what it was before unread inputs were
+    /// recorded.
+    #[serde(skip_serializing_if = "<[bool]>::is_empty")]
+    unread_inputs: &'o [bool],
+
     /// Physical executable result position for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
 
@@ -834,9 +840,9 @@ mod tests {
         // agree, at a direct execution and at an eager call, for every argument and every mesh of the function, which
         // is named, so an eager call runs on it as an execution does. An uncommitted argument that records nothing
         // beyond replication moves there (the function compiled ahead of time is compiled for its type without a
-        // sharding), whereas the mesh of the function rejects a committed argument or a split over another logical
-        // mesh. Before, every dispatcher on a named mesh of one device rejected an uncommitted upload with "mesh
-        // mismatch". Each observation includes the runtime sharding of the result, because an eager call and an
+        // sharding). A committed anonymous argument is admitted on the same device. The mesh of the function still
+        // rejects incompatible devices and a split over another logical mesh. Each observation includes the runtime
+        // sharding of the result, because an eager call and an
         // execution of one dispatcher must view an uncommitted argument alike (refer to `argument_type`): before, an
         // eager call specialized for its type on the canonical mesh of its device, so it rejected a placement onto a
         // bare device that every other entry point accepted.
@@ -892,6 +898,7 @@ mod tests {
         };
         let mut uncommitted_rows = Vec::new();
         let mut split_rows = Vec::new();
+        let mut committed_rows = Vec::new();
         let mut rejected_rows = Vec::new();
         for (mesh_name, mesh) in &meshes {
             let dispatcher = jit::<_, (), ArrayType, ArrayType>(|(), x| Ok(x), &session, mesh.clone());
@@ -923,8 +930,12 @@ mod tests {
                     // dispatcher keeps its inputs where they are").
                     Err(error) => {
                         assert_eq!(execution, Err(error.to_string()), "{mesh_name}, {argument_name}");
-                        rejected_rows.push((*mesh_name, *argument_name, call.clone()));
                     }
+                }
+                if call.is_err() {
+                    rejected_rows.push((*mesh_name, *argument_name, call.clone()));
+                } else if argument.is_committed() && argument.mesh().logical_mesh() == &LogicalMesh::single_device() {
+                    committed_rows.push((*mesh_name, execution.clone(), call.clone()));
                 }
                 if !argument.is_committed() {
                     uncommitted_rows.push((*mesh_name, *argument_name, execution, call));
@@ -977,6 +988,14 @@ mod tests {
         };
         let canonical_split = on(vec![0], true, "{mesh<['x'=1:auto]>, [{}]}");
         let named = |device: usize| on(vec![device], true, "{mesh<['q'=1:explicit]>, [{}]}");
+        assert_eq!(
+            committed_rows,
+            vec![
+                ("named here", named(0), named(0)),
+                ("named elsewhere", named(1), named(1)),
+                ("one device", canonical_split.clone(), canonical_split.clone()),
+            ],
+        );
         let one_device_split = "uncommitted split along an auto axis of one device";
         let both_devices = on(vec![0, 1], true, "{mesh<['x'=2:auto]>, [{}]}");
         assert_eq!(
@@ -1004,27 +1023,23 @@ mod tests {
                 "array type sharding `{actual}` does not match the placement `{required}` over the non-auto mesh axes"
             ))
         };
-        let (device, q, x) =
-            ("{mesh<['device'=1:auto]>, [{}]}", "{mesh<['q'=1:explicit]>, [{}]}", "{mesh<['x'=1:auto]>, [{}]}");
+        let (q, x) = ("{mesh<['q'=1:explicit]>, [{}]}", "{mesh<['x'=1:auto]>, [{}]}");
         let (auto_split, explicit_split, committed_split) =
             ("split along an auto axis", "split along an explicit axis", "split along an auto axis of one device");
         assert_eq!(
             rejected_rows,
             vec![
-                ("named here", "committed here", sharded_as(device, q)),
                 ("named here", "committed elsewhere", committed_to("[1]", "[0]")),
                 ("named here", auto_split, committed_to("[0, 1]", "[0]")),
                 ("named here", explicit_split, committed_to("[0, 1]", "[0]")),
                 ("named here", committed_split, sharded_as(x, q)),
                 ("named elsewhere", "committed here", committed_to("[0]", "[1]")),
-                ("named elsewhere", "committed elsewhere", sharded_as(device, q)),
                 ("named elsewhere", auto_split, committed_to("[0, 1]", "[1]")),
                 ("named elsewhere", explicit_split, committed_to("[0, 1]", "[1]")),
                 ("named elsewhere", committed_split, committed_to("[0]", "[1]")),
                 ("two devices", "committed here", committed_to("[0]", "[0, 1]")),
                 ("two devices", "committed elsewhere", committed_to("[1]", "[0, 1]")),
                 ("two devices", committed_split, committed_to("[0]", "[0, 1]")),
-                ("one device", "committed here", sharded_as(device, x)),
                 ("one device", "committed elsewhere", committed_to("[1]", "[0]")),
                 ("one device", auto_split, committed_to("[0, 1]", "[0]")),
                 ("one device", explicit_split, committed_to("[0, 1]", "[0]")),

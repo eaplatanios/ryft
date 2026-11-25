@@ -8,6 +8,8 @@ use ryft_mlir::dialects::arith;
 use crate::kernels::gpu::Error;
 use crate::kernels::gpu::lowering::{KernelValue, Lowering, append};
 
+// TODO(eaplatanios): Review this module.
+
 impl<'c, 't> Lowering<'c, 't> {
     /// Lowers arithmetic whose canonical type bounds prove that no runtime assertion is necessary. Potentially failing arithmetic are rejected until native device failure propagation is supported.
     pub(super) fn dimension(

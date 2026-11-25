@@ -6,6 +6,8 @@ use std::fmt::{Display, Formatter};
 
 use crate::{Error, ffi};
 
+// TODO(eaplatanios): Review this module.
+
 /// CUDA version required by a [`CudaKernelLauncher`](crate::CudaKernelLauncher).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CudaVersion {

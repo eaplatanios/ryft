@@ -14,6 +14,8 @@ use crate::kernels::gpu::lowering::{KernelValue, Lowering, Reference, append};
 use crate::kernels::gpu::synchronization::SynchronizationEvent;
 use crate::kernels::gpu::{Error, Target};
 
+// TODO(eaplatanios): Review this module.
+
 /// One canonical completion token and the full global parameter from which its TMA descriptor is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TmaCopyPlan {

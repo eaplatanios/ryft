@@ -16,6 +16,8 @@ use crate::kernels::gpu::lowering::{Buffer, KernelValue, Lowering, append, shape
 use crate::kernels::gpu::synchronization::SynchronizationEvent;
 use crate::kernels::gpu::{Error, Target};
 
+// TODO(eaplatanios): Review this module.
+
 /// A native tensor-memory allocation, kept separate from ordinary memrefs and their address calculations.
 #[derive(Clone)]
 pub(super) struct Tmem<'c, 't> {

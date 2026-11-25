@@ -18,6 +18,10 @@ pub(crate) struct ExecutableSignature {
     /// Physical argument ordinal for each logical flattened input.
     input_mapping: Arc<[Option<usize>]>,
 
+    /// Whether each logical flattened input is erased because the executable never reads it (refer to
+    /// [`Self::with_unread_inputs`]), or empty when every input is read.
+    unread_inputs: Arc<[bool]>,
+
     /// Physical result ordinal for each logical flattened output.
     output_mapping: Arc<[Option<usize>]>,
 
@@ -151,6 +155,7 @@ impl ExecutableSignature {
         }
         Self {
             input_mapping,
+            unread_inputs: Arc::from([]),
             output_mapping,
             input_dimensions: input_dimensions.into(),
             output_dimensions: output_dimensions.into(),
@@ -167,6 +172,53 @@ impl ExecutableSignature {
     #[inline]
     pub(crate) fn materializes(array_type: &ArrayType) -> bool {
         !array_type.data_type().is_zero() || array_type.static_shape().is_none()
+    }
+
+    /// Erases the logical inputs that `unread_inputs` flags (i.e., one flag per logical input), which the executable
+    /// never reads (refer to `unread_entry_arguments` in `crate::lowering`), and records them, so that executions and
+    /// persisted copies of the executable read which inputs are unread rather than infer it from the mapping, which
+    /// cannot tell an unread input from a read one that has no buffer (e.g., of the zero data type). Every flagged
+    /// input must have a static shape. Flags that state no unread input leave the signature unchanged.
+    pub(crate) fn with_unread_inputs(mut self, unread_inputs: &[bool]) -> Self {
+        if !unread_inputs.contains(&true) {
+            return self;
+        }
+        debug_assert_eq!(unread_inputs.len(), self.input_mapping.len());
+        let mut physical_index = 0;
+        self.input_mapping = self
+            .input_mapping
+            .iter()
+            .zip(unread_inputs)
+            .map(|(mapping, is_unread)| {
+                if mapping.is_none() || *is_unread {
+                    return None;
+                }
+                physical_index += 1;
+                Some(physical_index - 1)
+            })
+            .collect();
+        let input_dimensions = self
+            .input_dimensions
+            .iter()
+            .enumerate()
+            .map(|(offset, dimension)| InputDimension { physical_input_index: physical_index + offset, ..*dimension });
+        self.input_dimensions = input_dimensions.collect();
+        self.unread_inputs = unread_inputs.into();
+        self
+    }
+
+    /// Returns whether the logical input at `index` is erased because the executable never reads it (refer to
+    /// [`Self::with_unread_inputs`]).
+    #[inline]
+    pub(crate) fn is_unread_input(&self, index: usize) -> bool {
+        self.unread_inputs.get(index).copied().unwrap_or(false)
+    }
+
+    /// Returns whether each logical input is erased because the executable never reads it (refer to
+    /// [`Self::with_unread_inputs`]), or an empty slice when every input is read.
+    #[inline]
+    pub(crate) fn unread_inputs(&self) -> &[bool] {
+        &self.unread_inputs
     }
 
     /// Attaches the effect metadata known at compilation time, also used when restoring persistent executable metadata.
@@ -406,6 +458,24 @@ mod tests {
         assert_eq!(signature.output_dimensions()[0].logical_output_index(), 0);
         assert_eq!(signature.output_dimensions()[0].axis(), 0);
         assert_eq!(signature.output_dimensions()[0].physical_output_index(), 1);
+    }
+
+    #[test]
+    fn test_executable_signature_with_unread_inputs() {
+        // An unread input is erased whatever its data type and recorded as unread, while an input of the zero data type
+        // that is read is erased without being recorded, and the hidden extent arguments follow the remaining arrays.
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let vector = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let input_types = [vector.clone(), static_zero.clone(), static_zero, vector, dynamic];
+        let signature = ExecutableSignature::new(&input_types, &[]);
+        assert_eq!(signature.clone().with_unread_inputs(&[false; 5]), signature);
+        let signature = signature.with_unread_inputs(&[true, true, false, false, false]);
+        assert_eq!(signature.input_mapping(), &[None, None, None, Some(0), Some(1)]);
+        assert_eq!(signature.unread_inputs(), &[true, true, false, false, false]);
+        assert_eq!([0, 1, 2].map(|index| signature.is_unread_input(index)), [true, true, false]);
+        assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
+        assert_eq!(signature.physical_input_count(), 3);
     }
 
     #[test]

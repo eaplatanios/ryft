@@ -141,9 +141,9 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// where it runs) declares no placement that it only happens to have, so this type is one that its own type refines
     /// (refer to [`Type::is_refined_by`]) and that omits that placement. An eager linearization (e.g., of an eager
     /// Vector-Jacobian Product) declares each known input that it creates from a concrete value with this type and
-    /// derives the tangent and cotangent types of that input from it, so the derivatives of the value are not pinned
-    /// to its placement either, and a pullback compares a seed by this type (i.e., accepts a seed whose declaration
-    /// the cotangent type refines). The default returns [`None`].
+    /// derives the tangent and cotangent types of that input from it, leaving those derivatives free to move as well.
+    /// A pullback checks the seed's actual type with
+    /// [`accepts_cotangent_seed`](crate::DifferentiableType::accepts_cotangent_seed).
     #[inline]
     fn relocatable_type(&self) -> Option<Self::Type> {
         None

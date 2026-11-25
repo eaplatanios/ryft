@@ -124,6 +124,8 @@ mod lowering;
 #[cfg(feature = "cutile-compiler")]
 pub use compiler::Compiler;
 
+// TODO(eaplatanios): Review this module.
+
 /// Supported Python distribution version; changing this requires requalifying the source and AOT contract.
 pub const CUDA_TILE_VERSION: &str = "1.5.0";
 /// Supported native TileIR assembler distribution version.

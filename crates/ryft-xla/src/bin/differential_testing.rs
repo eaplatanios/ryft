@@ -11,21 +11,21 @@ use std::error::Error;
 use serde::Serialize;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis, BatchingContext, BatchingTracer,
-    BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions, Compare,
+    Add, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
+    ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis, BatchingContext,
+    BatchingTracer, BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration, CollectiveOptions, Compare,
     ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate,
-    Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
-    ParallelSumScatter, Placeholder, Program as CoreProgram, ProgramBuilder, ProgramError, ProjectedContext, Reduce,
-    ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension,
-    TypedProgram, Value, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, dot_product_attention,
-    shard_map,
+    DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
+    DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, Memory,
+    MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute,
+    ParallelReduce, ParallelSumScatter, Place, Placeholder, Placement, Program as CoreProgram, ProgramBuilder,
+    ProgramError, ProjectedContext, Reduce, ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape,
+    ShardMapOptions, Sharding, ShardingDimension, StopGradient, TypeError, Typed, TypedProgram, Value, ValueProjection,
+    ZeroLike, block_scaled_dot, differentiate_at, dot_product_attention, shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
-use ryft_xla::{Array, ArrayTracer, ExecutionArguments, FromPjrt, Session, TracedProgram, Type, trace};
+use ryft_xla::{Array, ArrayTracer, ExecutionArguments, FromPjrt, LoweringError, Session, TracedProgram, Type, trace};
 
 // TODO(eaplatanios): Review this module.
 
@@ -64,7 +64,7 @@ struct DifferentialObservation {
     /// Stable case identifier shared with the JAX registry.
     case_id: String,
 
-    /// Named outputs, represented as one flattened logical value vector per participating device or eager execution.
+    /// Named numeric observations, with case-defined rows such as one flattened output vector per device.
     observations: BTreeMap<&'static str, Vec<Vec<f32>>>,
 
     /// Staging result when the case compares staging capabilities.
@@ -148,6 +148,11 @@ impl DifferentialCase {
             DifferentialCase {
                 case_id: "condition_varying_predicate_gradient",
                 emit: emit_condition_varying_predicate_gradient,
+                suite: Suite::General,
+            },
+            DifferentialCase {
+                case_id: "placement_forward_derivatives",
+                emit: emit_placement_forward_derivatives,
                 suite: Suite::General,
             },
         ];
@@ -993,6 +998,167 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
     })
 }
 
+/// Emits the values and placements of fused and saved derivatives on several CPU devices.
+fn emit_placement_forward_derivatives() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let (client, devices, _) = collective_runtime()?;
+    let devices = devices.devices();
+    let session = Session::builder().client(client).build()?;
+    let shape = ArrayType::new_static(DataType::F32, [2]);
+    let upload = |values: &[f32]| Array::from_host_buffer(&session, shape.clone(), None, None, values_to_bytes(values));
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Explicit)?])?;
+    let source = Placement::new(DeviceMesh::new(mesh.clone(), vec![devices[1]])?, Sharding::replicated(mesh, 1))?;
+    let plain_input = upload(&[1., 2.])?;
+    let input = plain_input.place(&source, None)?;
+    let movable = upload(&[3., 4.])?;
+    let committed = movable.place(&devices[0], None)?;
+    let sharded = "f32[2][sharding={mesh<['source'=1:explicit]>, [{}]}]";
+    let sharded_host = format!("{sharded}@Host[Pinned]");
+    let host = "f32[2]@Host[Pinned]";
+    let tangent_error = |actual: &str, required: &str| {
+        ProgramError::Type(TypeError::invalid(format!(
+            "tangent type {actual} does not match type {required} required by primal type {required}",
+        )))
+    };
+
+    let split = |result: Result<(Array, Array), DifferentiationError>| match result {
+        Ok((primal, tangent)) => (Ok(primal), Ok(tangent)),
+        Err(error) => {
+            let error = ProgramError::from(error);
+            (Err(error.clone()), Err(error))
+        }
+    };
+    let add_committed_rejected =
+        match differentiate_at(input.clone()).jvp(committed.clone(), |x| x.add(&x)).map_err(ProgramError::from) {
+            Ok(_) => false,
+            Err(error) if error == tangent_error("f32[2]", sharded) => true,
+            Err(error) => return Err(error.into()),
+        };
+    let (add_fused_primal, add_fused_tangent) =
+        split(differentiate_at(input.clone()).jvp(movable.clone(), |x| x.add(&x)));
+    let (add_saved_primal, add_saved) = differentiate_at(input.clone()).linearize(|x| x.add(&x))?;
+    let add_saved_movable_tangent = add_saved.apply(movable.clone());
+    let add_saved_committed_tangent = add_saved.apply(committed);
+
+    let fixed_tangent = movable.place(&devices[1], None)?;
+    let (movable_fused_primal, movable_fused_tangent) =
+        split(differentiate_at(plain_input.clone()).jvp(fixed_tangent.clone(), |value| value.add(&value)));
+    let (movable_saved_primal, movable_saved) =
+        differentiate_at(plain_input.clone()).linearize(|value| value.add(&value))?;
+    let movable_saved_tangent = movable_saved.apply(fixed_tangent);
+
+    let anchored = (plain_input.place(&devices[1], None)?, plain_input);
+    let tangents = (movable.place(&devices[2], None)?, movable.clone());
+    let (anchor_fused_primal, anchor_fused_tangent) = split(
+        differentiate_at(anchored.clone()).jvp(tangents.clone(), |(fixed, value)| fixed.stop_gradient()?.add(&value)),
+    );
+    let (anchor_saved_primal, anchor_saved) =
+        differentiate_at(anchored).linearize(|(fixed, value)| fixed.stop_gradient()?.add(&value))?;
+    let anchor_saved_tangent = anchor_saved.apply(tangents);
+
+    let pinned = Memory::Host { pinned: true };
+    let (memory_put_fused_primal, memory_put_fused_tangent) =
+        split(differentiate_at(input.clone()).jvp(movable.clone(), |x| x.place(&pinned, None)));
+    let (memory_put_saved_primal, memory_put_saved) =
+        differentiate_at(input.clone()).linearize(|x| x.place(&pinned, None))?;
+    let memory_put_saved_tangent = memory_put_saved.apply(movable.clone());
+
+    // Build pinned inputs independently so a rejection in the memory-only derivative leaves the device-put cases live.
+    let host_primal = input.place(&pinned, None)?;
+    let host_tangent = movable.place(&pinned, None)?;
+    let destination = devices[2];
+    let (device_put_fused_primal, device_put_fused_tangent) =
+        split(differentiate_at(host_primal.clone()).jvp(host_tangent.clone(), |x| {
+            let placed = x.place(&destination, None)?;
+            placed.add(&placed)
+        }));
+    let (device_put_saved_primal, device_put_saved) = differentiate_at(host_primal).linearize(|x| {
+        let placed = x.place(&destination, None)?;
+        placed.add(&placed)
+    })?;
+    let device_put_saved_tangent = device_put_saved.apply(host_tangent);
+
+    let arrays = [
+        ("add_fused_primal", add_fused_primal),
+        ("add_fused_tangent", add_fused_tangent),
+        ("add_saved_primal", Ok(add_saved_primal)),
+        ("add_saved_movable_tangent", add_saved_movable_tangent),
+        ("add_saved_committed_tangent", add_saved_committed_tangent),
+        ("movable_primal_fused_primal", movable_fused_primal),
+        ("movable_primal_fused_tangent", movable_fused_tangent),
+        ("movable_primal_saved_primal", Ok(movable_saved_primal)),
+        ("movable_primal_saved_tangent", movable_saved_tangent),
+        ("stop_gradient_fused_primal", anchor_fused_primal),
+        ("stop_gradient_fused_tangent", anchor_fused_tangent),
+        ("stop_gradient_saved_primal", Ok(anchor_saved_primal)),
+        ("stop_gradient_saved_tangent", anchor_saved_tangent),
+        ("memory_put_fused_primal", memory_put_fused_primal),
+        ("memory_put_fused_tangent", memory_put_fused_tangent),
+        ("memory_put_saved_primal", Ok(memory_put_saved_primal)),
+        ("memory_put_saved_tangent", memory_put_saved_tangent),
+        ("device_put_fused_primal", device_put_fused_primal),
+        ("device_put_fused_tangent", device_put_fused_tangent),
+        ("device_put_saved_primal", Ok(device_put_saved_primal)),
+        ("device_put_saved_tangent", device_put_saved_tangent),
+    ];
+    let mut observations =
+        BTreeMap::from([("add_fused_committed_rejected", vec![vec![f32::from(u8::from(add_committed_rejected))]])]);
+    for (name, result) in arrays {
+        let array = match result {
+            Ok(array) => array,
+            Err(error) => {
+                let pushforward_error = |actual, required| {
+                    ProgramError::MalformedProgram(format!(
+                        "pushforward tangent 0 has type {actual} but its primal boundary requires tangent type {required}",
+                    ))
+                };
+                let expected = match name {
+                    "add_fused_primal" | "add_fused_tangent" => {
+                        ProgramError::custom(LoweringError::MismatchedMeshTopology {
+                            expected: LogicalMesh::single_device(),
+                            actual: source.mesh().logical_mesh().clone(),
+                        })
+                    }
+                    "add_saved_committed_tangent" => pushforward_error("f32[2]", sharded),
+                    "memory_put_fused_primal"
+                    | "memory_put_fused_tangent"
+                    | "device_put_fused_primal"
+                    | "device_put_fused_tangent" => tangent_error(host, &sharded_host),
+                    "memory_put_saved_tangent" => ProgramError::Type(TypeError::invalid(format!(
+                        "encountered output type {host} which is incompatible with the region's declared type {sharded_host}",
+                    ))),
+                    "device_put_saved_tangent" => pushforward_error(host, &sharded_host),
+                    _ => return Err(error.into()),
+                };
+                if error != expected {
+                    return Err(error.into());
+                }
+                // Zero observation rows encode a checked rejection. Successful arrays always have a placement row.
+                observations.insert(name, Vec::new());
+                continue;
+            }
+        };
+        let [device] = array.mesh().devices() else {
+            return Err(format!("expected one device for `{name}`").into());
+        };
+        let memory = match array.r#type().memory() {
+            Memory::Device => 0.,
+            Memory::Host { pinned: true } => 1.,
+            Memory::Host { pinned: false } => 2.,
+        };
+        let values = array.copy_to_host()?.elements::<f32>()?;
+        // Keep placement in a second row of the existing numeric observation format.
+        let placement = vec![device.id() as f32, f32::from(u8::from(array.is_committed())), memory];
+        observations.insert(name, vec![values, placement]);
+    }
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "placement_forward_derivatives".into(),
+        observations,
+        staging: None,
+        stablehlo: None,
+    })
+}
+
 /// Parses selected case IDs, emits deterministic JSON records, and returns an error for an unknown case.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let cases = DifferentialCase::registry();
@@ -1157,6 +1323,7 @@ mod tests {
                 "dot_product_attention",
                 "negative_dynamic_slice",
                 "condition_varying_predicate_gradient",
+                "placement_forward_derivatives",
                 "rematerialization_nothing_saveable",
                 "rematerialization_everything_saveable",
                 "rematerialization_dots_saveable",
@@ -1181,7 +1348,7 @@ mod tests {
         );
         assert_eq!(
             DifferentialCase::registry().into_iter().map(|case| case.suite.name()).collect::<Vec<_>>(),
-            [[Some("collectives"); 3].as_slice(), &[None; 6], &[Some("rematerialization"); 20]].concat(),
+            [[Some("collectives"); 3].as_slice(), &[None; 7], &[Some("rematerialization"); 20]].concat(),
         );
     }
 

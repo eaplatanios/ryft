@@ -23,18 +23,21 @@ use ryft_pjrt::protos::{
 };
 use ryft_pjrt::{LoadedExecutable, Program as PjrtProgram};
 
-use crate::arrays::host::validate_mesh_device_processes;
+use crate::arrays::host::validate_mesh_devices;
 use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
 use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
-use crate::compilation::programs::{CompiledProgram, InvocationMetadata, LoweredProgram, SessionConstantBinding};
+use crate::compilation::programs::{
+    CompiledProgram, EagerDispatchProgram, LoweredProgram, OutputDeviceAssignment, ProgramLowering, RemoteEagerProgram,
+    SessionConstantBinding,
+};
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::{
-    collect_session_constants, contains_unresolved_references, contains_unresolved_state, emitted_regions,
-    entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings,
-    has_placement_requests, pruned_program, render_devices,
+    EntryResultPlacement, collect_session_constants, contains_unresolved_references, contains_unresolved_state,
+    emitted_capture_reads, emitted_regions, entry_boundary_sharding, entry_open_results, entry_result_placements,
+    entry_result_shardings, has_placement_requests, pruned_program, unread_entry_arguments,
 };
 use crate::operations::composites::omits_regions;
 use crate::{
@@ -127,11 +130,6 @@ impl CompilationDomain for Session {
             .collect::<Result<Vec<_>, Error>>()?;
         let compiled = self.compilation_cache().compile(self, program)?;
 
-        // A program that was compiled for another lowering (e.g., an earlier one in this session or a persisted
-        // executable) has the boundary of `program` up to the identities of its dimension variables, which the cache
-        // validated. Callers compare the types of the result with those of `program` by identity, so the result takes
-        // its boundary from `program` and shares everything else with the cached program.
-        let compiled = CompiledProgram::rebound_to(compiled, program);
         Ok((compiled, session_arrays))
     }
 
@@ -168,13 +166,20 @@ impl Session {
         // reshard them. A capture whose placement the function cannot keep fails here, and only if the function uses
         // it. So does a capture of another client than that of this session, with the error with which a session
         // constant of another client fails (refer to `placed_constant`), because every execution would reject it.
-        // Staging already pruned the captures that the function does not use, which are therefore never checked.
+        // Staging already pruned the captures that the function does not use, which are therefore never checked. A
+        // capture that only regions which lowering omits read (e.g., the body of a scan that admits no iteration) is
+        // not checked either, because the executable never reads it, and lowering erases its argument through the same
+        // decision (refer to `emitted_capture_reads`).
+        let target_platform = Some(self.target()?.platform_name());
+        let entry = staged.source_program().program().entry_region_ref();
+        let is_read = emitted_capture_reads(entry, capture_count, false, target_platform);
         let capture_placements = staged
             .source_program()
             .captures()
             .iter()
             .enumerate()
             .map(|(index, capture)| match capture {
+                Value::Array(_) if !is_read[index] => Ok(None),
                 Value::Array(array) => {
                     if !std::ptr::eq(array.client(), self.client()) {
                         RetainedArray::new(array).validate_client(self.client())?;
@@ -228,11 +233,10 @@ impl Session {
     /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
     /// session. A mesh that assigns a device to another process than the one that owns it, or that assigns to this
     /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
-    /// reject it (refer to `validate_mesh_device_processes`), before anything is lowered, compiled, or looked up in a
-    /// compilation cache, so that every process rejects it alike. A device that the client does not know (e.g., of a
-    /// remote process) is accepted. The program is lowered as the program of an eager application, whose mesh is
-    /// where its operands are, so the mesh does not commit its outputs for being named (refer to
-    /// [`commits_public_outputs`] and `lower_function_program`).
+    /// reject it (refer to `validate_mesh_devices`), before anything is lowered, compiled, or looked up in a
+    /// compilation cache, so that every process rejects it alike. The program is lowered as the program of an eager
+    /// application, whose mesh is where its operands are, so the mesh does not commit its outputs for being named
+    /// (refer to [`commits_public_outputs`] and `lower_function_program`).
     pub(crate) fn lower_program(
         &self,
         program: &FlatProgram,
@@ -242,9 +246,8 @@ impl Session {
         self.lower_function_program(program, capture_count, options, false)
     }
 
-    /// Lowers `program` as [`Self::lower_program`] does, where `function` says whether it is the program of a function
-    /// compiled for the mesh of `options`, which commits its public outputs when that mesh is named (refer to
-    /// [`commits_public_outputs`]).
+    /// Creates a lowering with native compilation metadata. When `function` is true, a named mesh commits the public
+    /// outputs (refer to [`commits_public_outputs`]).
     fn lower_function_program(
         &self,
         program: &FlatProgram,
@@ -252,21 +255,74 @@ impl Session {
         options: &Options,
         function: bool,
     ) -> Result<LoweredProgram, Error> {
-        validate_mesh_device_processes(self.client(), options.mesh())?;
+        let lowering = self.lower_program_invocation(program, capture_count, options, function)?;
+        LoweredProgram::new(lowering, self.target()?)
+    }
+
+    /// Prepares the executable or remote result metadata for an eager application, deriving both from the same lowering.
+    pub(crate) fn prepare_eager_program(
+        &self,
+        program: &FlatProgram,
+        options: &Options,
+        session_constants: &[RetainedArray],
+    ) -> Result<(EagerDispatchProgram, Vec<usize>), ProgramError> {
+        let lowering = self.lower_program_invocation(program, 0, options, false)?;
+        let target = self.target()?;
+
+        // Record the first application slot of each hidden argument's source constant.
+        let mut slots = HashMap::with_capacity(session_constants.len());
+        for (slot, constant) in session_constants.iter().enumerate() {
+            slots.entry(constant).or_insert(slot);
+        }
+        let constants = lowering
+            .session_constants()
+            .iter()
+            .map(|binding| {
+                let source = binding.source();
+                slots.get(source).copied().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "lowered session constant `{source}` comes from no session constant of the eager application",
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let program = if matches!(
+            options.mesh().devices(),
+            [device] if device.process_index() != target.process_index()
+        ) {
+            RemoteEagerProgram::new(&lowering).map(|program| EagerDispatchProgram::Remote(Arc::new(program)))
+        } else {
+            let lowered = LoweredProgram::new(lowering, target)?;
+            self.compilation_cache().compile(self, &lowered).map(EagerDispatchProgram::Local)
+        }?;
+        Ok((program, constants))
+    }
+
+    /// Emits the shared module and invocation contract, including for a declared remote singleton whose device kind
+    /// is unavailable to the local client.
+    fn lower_program_invocation(
+        &self,
+        program: &FlatProgram,
+        capture_count: usize,
+        options: &Options,
+        function: bool,
+    ) -> Result<ProgramLowering, Error> {
+        validate_mesh_devices(self, options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
         // `pruned_program`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
         self.lower_pruned_program(&pruned_program(program, target_platform)?, capture_count, options, function)
     }
 
-    /// Lowers `program` after dead instruction pruning (refer to `lower_function_program` for `function`).
+    /// Lowers `program` after dead instruction pruning.
     fn lower_pruned_program(
         &self,
         program: &FlatProgram,
         capture_count: usize,
         options: &Options,
         function: bool,
-    ) -> Result<LoweredProgram, Error> {
+    ) -> Result<ProgramLowering, Error> {
         // Kernel selection validates the actual attached body and discharges only its owned local state before the
         // ordinary reference discharge and effect gates. Existing lowering, caching, and runtime lifecycle then apply.
         let selected = crate::kernels::select_kernels(program, options.kernel_compiler(), || {
@@ -311,7 +367,7 @@ impl Session {
         discharged: &ReferenceDischargeResult<Constant, Operation>,
         options: &Options,
         function: bool,
-    ) -> Result<LoweredProgram, Error> {
+    ) -> Result<ProgramLowering, Error> {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
         // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
         // containing both a reference and ordered state receives the more precise reference diagnostic.
@@ -342,7 +398,7 @@ impl Session {
         reference_states: &[ExternalReferenceBinding],
         options: &Options,
         function: bool,
-    ) -> Result<LoweredProgram, Error> {
+    ) -> Result<ProgramLowering, Error> {
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "discharged program still contains ordered state, which XLA lowering cannot represent"
@@ -350,7 +406,12 @@ impl Session {
             }
             .into());
         }
-        validate_data_dependent_compilation(program, Some(self.target()?.platform_name()))?;
+        // The target platform gates platform-specific lowerings such as fused attention, and so also the regions that
+        // lowering emits. A client whose platform cannot be queried cannot compile the program either, so a failed
+        // query fails the lowering.
+        let target = self.target()?;
+        let target_platform = Some(target.platform_name());
+        validate_data_dependent_compilation(program, target_platform)?;
         if output_count > program.output_count() {
             return Err(ProgramError::MalformedProgram(format!(
                 "output count {output_count} exceeds the complete discharged output count {}",
@@ -391,11 +452,42 @@ impl Session {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        // The target platform gates platform-specific lowerings such as fused attention, and so also the regions that
-        // lowering emits. A client whose platform cannot be queried cannot compile the program either, so a failed
-        // query fails the lowering.
-        let target = self.target()?;
-        let target_platform = Some(target.platform_name());
+        // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
+        // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
+        // still has to take the replica path. This is why every lowered region is inspected instead of just the
+        // boundary types, which it already subsumes. A target whose plugin cannot compile with Shardy takes that path for
+        // every program, and only on a single device, where lowering can drop every sharding constraint.
+        let supports_shardy = supports_shardy(self.client())?;
+        if !supports_shardy && options.mesh().devices().len() != 1 {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                reason: format!(
+                    "Ryft requires a single-device mesh because the plugin for platform `{}` cannot compile with Shardy",
+                    target.platform_name(),
+                ),
+            }));
+        }
+        let use_shardy_partitioner = supports_shardy && has_only_static_array_types(program, target_platform);
+        // Validate the emitted placement requests before placing any retained arrays on the compilation mesh.
+        validate_placements(program, options.mesh(), use_shardy_partitioner, target_platform)?;
+        // A `shard_map` body only ever has static boundary types, so it can coexist with dynamic tensors staged
+        // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy on any
+        // device count, and bounded dynamic tensors force Shardy off for the whole module.
+        if !use_shardy_partitioner && contains_shard_map(program, target_platform) {
+            return Err(Error::Lowering(crate::LoweringError::UnsupportedOperation {
+                operation: SHARD_MAP_OPERATION_NAME.to_string(),
+                reason: if supports_shardy {
+                    "bounded-dynamic programs cannot contain `shard_map` regions because `sdy.manual_computation` \
+                     requires the Shardy partitioner"
+                        .to_string()
+                } else {
+                    format!(
+                        "platform `{}` cannot run `shard_map` regions because `sdy.manual_computation` requires the \
+                         Shardy partitioner",
+                        target.platform_name(),
+                    )
+                },
+            }));
+        }
         // Assign hidden argument slots from the original constants in the program that lowering emits for the target.
         // Each constant supplies its declared type, and its placed array supplies buffers and runtime sharding.
         let session_constants = collect_session_constants(program, target_platform)
@@ -487,12 +579,27 @@ impl Session {
         // Executable arguments are placed as their runtime arrays are, or as an input override requests, including
         // over the auto mesh axes that their types never record. A runtime placement drops a pending reduction over
         // those axes, which no value of the program can carry, whereas an input override, which states the placement
-        // with which the argument arrives, keeps it (refer to `receivable_argument_sharding`).
+        // with which the argument arrives, keeps it (refer to `receivable_argument_sharding`). An argument that the
+        // executable never reads has no executable argument (refer to `unread_entry_arguments`), so its placement is
+        // neither resolved nor validated, whatever its runtime array is (e.g., split unevenly, or of another client), and
+        // it is annotated replicated, which no physical argument carries.
         let source_capture_count = lowered_capture_count - session_constants.len();
+        let unread_arguments = unread_entry_arguments(
+            program,
+            &effective_input_types,
+            lowered_capture_count,
+            session_constants.len(),
+            options.unread_inputs().unwrap_or(&[]),
+            &reference_state_input_indices,
+            target_platform,
+        );
         let logical_argument_shardings = effective_input_types
             .iter()
             .enumerate()
             .map(|(index, array_type)| {
+                if unread_arguments[index] {
+                    return Ok(Sharding::replicated(options.mesh().logical_mesh().clone(), array_type.rank()));
+                }
                 let placement = if index < source_capture_count {
                     options.capture_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 } else if index < lowered_capture_count {
@@ -616,12 +723,26 @@ impl Session {
         for (index, (array_type, sharding)) in output_types.iter().zip(&result_annotations).enumerate() {
             validate_even_sharding("output", index, array_type, sharding)?;
         }
-        // Execution reconstructs the outputs with the placements of their annotations, so that the two always agree,
-        // stated as their types state them (refer to `runtime_output_sharding`).
+        // Reconstruct the outputs with the placements of their executable annotations, preserving authored
+        // unconstrained dimensions in runtime metadata (refer to `runtime_output_sharding`).
         let mut output_shardings = result_annotations
             .iter()
             .zip(&output_types)
-            .map(|(annotation, array_type)| runtime_output_sharding(annotation, array_type))
+            .enumerate()
+            .map(|(index, (annotation, array_type))| {
+                // An anonymous singleton can omit a requested unconstrained sharding from its array type.
+                // Keep the unclosed placement of an explicit request or of an argument that the output forwards.
+                let requested = options.output_shardings().map(|shardings| &shardings[index]).or_else(|| {
+                    match &placed_outputs[index] {
+                        Some(EntryResultPlacement::Target(sharding)) => Some(sharding),
+                        Some(EntryResultPlacement::Argument(index)) => {
+                            program_argument_shardings.get(*index).and_then(Option::as_ref)
+                        }
+                        None => None,
+                    }
+                });
+                runtime_output_sharding(annotation, array_type.sharding().or(requested))
+            })
             .collect::<Result<Vec<_>, Error>>()?;
         // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden state
         // type and its placement from the same input binding in one pass.
@@ -656,41 +777,13 @@ impl Session {
         let committed_outputs = (0..output_types.len())
             .map(|index| runs_on_multiple_devices || index < output_count && commits_public_outputs)
             .collect::<Vec<_>>();
-        // Shardy rejects bounded dynamic tensors anywhere in the module, not only at the computation boundary, so a
-        // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
-        // still has to take the replica path. This is why every lowered region is inspected instead of just the
-        // boundary types, which it already subsumes. A target whose plugin cannot compile with Shardy takes that path for
-        // every program, and only on a single device, where lowering can drop every sharding constraint.
-        let supports_shardy = supports_shardy(self.client())?;
-        if !supports_shardy && options.mesh().devices().len() != 1 {
-            return Err(Error::Compilation(CompilationError::InvalidOptions {
-                reason: format!(
-                    "Ryft requires a single-device mesh because the plugin for platform `{}` cannot compile with Shardy",
-                    target.platform_name(),
-                ),
-            }));
-        }
-        let use_shardy_partitioner = supports_shardy && has_only_static_array_types(program, target_platform);
-        validate_placements(program, options.mesh(), use_shardy_partitioner, target_platform)?;
-        // A `shard_map` body only ever has static boundary types, so it can coexist with dynamic tensors staged
-        // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy on any
-        // device count, and bounded dynamic tensors force Shardy off for the whole module.
-        if !use_shardy_partitioner && contains_shard_map(program, target_platform) {
-            return Err(Error::Lowering(crate::LoweringError::UnsupportedOperation {
-                operation: SHARD_MAP_OPERATION_NAME.to_string(),
-                reason: if supports_shardy {
-                    "bounded-dynamic programs cannot contain `shard_map` regions because `sdy.manual_computation` \
-                     requires the Shardy partitioner"
-                        .to_string()
-                } else {
-                    format!(
-                        "platform `{}` cannot run `shard_map` regions because `sdy.manual_computation` requires the \
-                         Shardy partitioner",
-                        target.platform_name(),
-                    )
-                },
-            }));
-        }
+        let output_device_assignment = if is_named_mesh(options.mesh().logical_mesh())
+            || requests_placement(program, options, target_platform, false)
+        {
+            OutputDeviceAssignment::Fixed
+        } else {
+            OutputDeviceAssignment::FromCaller
+        };
         // The effective placements of the arguments and results (i.e., their annotations) are checked rather than their
         // types, which do not record placements along auto mesh axes (e.g., an output override that splits an output
         // along an auto axis), so that no replica returns a full buffer where the runtime placement describes a part.
@@ -740,6 +833,7 @@ impl Session {
             supports_shardy,
             reference_states,
             &donation_flags,
+            options.unread_inputs().unwrap_or(&[]),
             options.ragged_dot_lowering_strategy(),
             &open_outputs,
         )?;
@@ -776,7 +870,7 @@ impl Session {
         } else {
             None
         };
-        LoweredProgram::new(
+        Ok(ProgramLowering::new(
             lowered_module,
             compilation_options,
             effective_input_types.into(),
@@ -790,10 +884,10 @@ impl Session {
             output_shardings.into(),
             open_outputs.into(),
             committed_outputs.into(),
+            output_device_assignment,
             options.mesh().clone(),
-            target,
             kernel_execution_facts,
-        )
+        ))
     }
 
     /// Compiles a lowering through this session's client after resolving its runtime requirements, then derives the
@@ -826,7 +920,7 @@ impl Session {
     ) -> Result<(), Error> {
         self.validate_program_owner(current)?;
         self.validate_program_owner(replacement)?;
-        InvocationMetadata::from(current).validate_replacement(replacement.into())
+        current.invocation().validate_replacement(replacement.invocation())
     }
 }
 
@@ -843,20 +937,20 @@ impl CompilationCacheDomain for Session {
         self.compile_program(program)
     }
 
-    fn validate_cached_program(
+    fn reuse_cached_program(
         &self,
         program: &Self::LoweredProgram,
-        compiled: &Self::CompiledProgram,
-    ) -> Result<(), Self::Error> {
+        compiled: Arc<Self::CompiledProgram>,
+    ) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
         // Fresh compilations copy this metadata verbatim, so this rejects only reused programs whose invocation
         // contract does not match the requesting lowering (e.g., a corrupted or colliding persistent or exchanged
         // artifact). The stateful transaction trusts this metadata, so a mismatch must be caught before the first
         // call.
-        match InvocationMetadata::from(program).incompatible_field(compiled.into()) {
+        match program.invocation().incompatible_field(compiled.invocation()) {
             Some(field) => Err(Error::Compilation(CompilationError::IncompatibleExecutable {
                 reason: format!("cached executable has incompatible {field}"),
             })),
-            None => Ok(()),
+            None => Ok(CompiledProgram::rebound_to(compiled, program)),
         }
     }
 
@@ -991,12 +1085,11 @@ pub(crate) fn capture_sharding(
 }
 
 /// Returns the type with which a function traced under [`CapturePlacement::FollowCall`] receives, and is traced with,
-/// an array that it captures or imports, whose type is `array_type`, or [`None`] when the function receives the array
-/// with `array_type` itself. A capture follows the call of the function, so when its type records nothing beyond
-/// replication (i.e., its stored placement is replicated, refer to `entry_boundary_sharding`, which includes the
-/// canonical mesh of an uncommitted array and a split along auto mesh axes only, which types never record) the function
-/// receives it with `array_type` without a sharding, as it receives a public argument whose type declares none, and the
-/// types of the values that it computes from it name no mesh of the capture. A call of a function that names no
+/// an array whose type is `array_type`, or [`None`] when the function must keep the placement that the type records.
+/// A capture follows the call of the function. A type without sharding, including that of a capture on the anonymous
+/// mesh of one device, stays unsharded. When its type records only replication (refer to `entry_boundary_sharding`),
+/// the function receives it without sharding, as it receives a public argument whose type declares none. The types of
+/// the values that it computes from the capture then name no mesh of the capture. A call of a function that names no
 /// devices therefore runs where its caller runs whatever the devices of its captures, as JAX computes
 /// `jit(lambda x: x + c)` on the devices of `x` whether `c` is uncommitted or committed elsewhere. A capture whose type
 /// records more (i.e., a split, a pending reduction, or manual variation), or whose stored placement cannot be
@@ -1007,12 +1100,6 @@ pub(crate) fn capture_sharding(
 /// [`placed_constant`]). An uncommitted public argument follows the call as a capture does, so a `jit` dispatcher
 /// specializes for such an argument with the type that this function returns as well (refer to [`argument_type`]).
 pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
-    relocated_type(array_type).filter(|captured_type| captured_type != array_type)
-}
-
-/// Returns `array_type` without a sharding when it records nothing beyond replication (refer to [`captured_type`]),
-/// and [`None`] otherwise.
-fn relocated_type(array_type: &ArrayType) -> Option<ArrayType> {
     let stored = array_type.sharding().map(entry_boundary_sharding).transpose().ok()?;
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return None;
@@ -1036,7 +1123,7 @@ fn relocated_type(array_type: &ArrayType) -> Option<ArrayType> {
 /// A relocatable argument has no placement over auto mesh axes for the function to specialize on (e.g., an uncommitted
 /// split along an auto axis of one device), because an execution moves it.
 pub(crate) fn argument_type(array: &Array, array_type: &ArrayType) -> Option<ArrayType> {
-    if array.is_committed() { None } else { relocated_type(array_type) }
+    if array.is_committed() { None } else { captured_type(array_type) }
 }
 
 /// Returns the constant that a trace whose capture placement is `capture_placement` (refer to
@@ -1064,33 +1151,35 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 /// Returns `constant`, an array that a function captures (i.e., a session constant of its program), placed where the
 /// executable of the function that is compiled for `mesh` receives it, or [`None`] when the executable cannot receive
 /// it on `mesh` (e.g., a capture whose type records a split over a mesh of another topology, or one with a pending
-/// reduction over auto mesh axes, which lowering and admission reject). Lowering, eager dispatch, and region replay
-/// use this placement rule. A capture with the same logical mesh topology as `mesh` keeps its runtime sharding on the
-/// devices of `mesh`, so that it adds no gather, and any other capture is
-/// placed as [`capture_sharding`] receives it (i.e., replicated over `mesh`). Each placement is computed once for each
-/// captured array and destination, which every retention of the array and every program that captures it share, and
-/// lives until the array and every retention of it are gone (refer to [`RetainedArray::placed`]), so no execution,
-/// eager call, replay, or other program that captures the array moves the capture again. A placement that cannot
-/// communicate (refer to [`RetainedArray::can_communicate`]) starts from a copy on the same devices whose work has
-/// already completed when there is one (e.g., for meshes that differ only in their axis names), so that such
-/// destinations share its buffers, but only from a copy with the memory and the declared layout of the capture, so
-/// that the result is what a placement of the capture itself gives, whatever placements were made before (refer to
-/// [`RetainedArray::completed_placement_on`]). The placement uses device work only, without the host round trip to
-/// which [`Session::place`] can fall back, because only a process that owns every destination device can take that
-/// round trip, so a placement that only it can make (e.g., of uneven column shards that a compiled reshard cannot
-/// produce) is an error for a capture. A capture that already
-/// lives on the devices of `mesh` with that placement is not copied, but it is still handed out as its placement onto
-/// the devices that the function names (refer to [`RetainedArray::on_named_devices`]), which shares its buffers and
-/// keeps nothing alive beyond the capture itself. Every process therefore holds the same facts for the capture of a
-/// function (i.e., committed to its devices and not locally assigned), whether a process placed it or found it there
-/// (e.g., a capture without a target on a function on the first device of the first process, which the first process
-/// finds on that device and every other process places there). The exception is such a capture that lacks the buffer
-/// of a shard of this process that another local replica of the same contribution holds (e.g., a partial import,
-/// refer to [`RetainedArray::fills_missing_local_replicas`]), which is placed onto its own mesh and sharding once, as
-/// any other destination is, so that the copy of that replica is made once rather than by every execution. Each
-/// process decides this from its own buffers, but that placement moves every shard to its own device and copies only
-/// between devices of one process, so a process that places it submits no transfer that another process pairs with,
-/// whichever replicas each process holds, and a contribution without any local replica is left as it is.
+/// reduction over auto mesh axes, which lowering and admission reject). Lowering, eager dispatch, and region replay use
+/// this placement rule. A capture with the same logical mesh topology as `mesh` keeps its runtime sharding on the
+/// devices of `mesh`, so that it adds no gather, and any other capture is placed as [`capture_sharding`] receives it
+/// (i.e., replicated over `mesh`). Each placement is computed once for each captured array and destination, which every
+/// retention of the array and every program that captures it share, and lives until the array and every retention of it
+/// are gone (refer to [`RetainedArray::placed`]), so no execution, eager call, replay, or other program that captures
+/// the array moves the capture again. A placement that cannot communicate (refer to [`RetainedArray::can_communicate`])
+/// starts from a copy on the same devices whose work has already completed when there is one (e.g., for meshes that
+/// differ only in their axis names), so that such destinations share its buffers, but only from a copy with the memory
+/// and the declared layout of the capture, so that the result is what a placement of the capture itself gives, whatever
+/// placements were made before (refer to [`RetainedArray::completed_placement_on`]). The placement moves the capture
+/// with device work, except that a capture whose devices this process chose on its own is read back whole and uploaded,
+/// and a shard whose storage the PJRT plugin cannot change on its device is copied through host memory on its own
+/// (refer to [`Array::reshard_on_devices`]). It never takes the other host round trip to which [`Session::place`] can
+/// fall back, which only a process that owns every destination device can take, so a placement that only that round
+/// trip can make (e.g., of uneven column shards that a compiled reshard cannot produce) is an error for a capture. A
+/// capture that already lives on the devices of `mesh` with that placement is not copied, but it is still handed out as
+/// its placement onto the devices that the function names (refer to [`RetainedArray::on_named_devices`]), which shares
+/// its buffers and keeps nothing alive beyond the capture itself. Every process therefore holds the same facts for the
+/// capture of a function (i.e., committed to its devices and not locally assigned), whether a process placed it or
+/// found it there (e.g., a capture without a target on a function on the first device of the first process, which the
+/// first process finds on that device and every other process places there). The exception is such a capture that lacks
+/// the buffer of a shard of this process that has no elements or that another local replica of the same contribution
+/// holds (e.g., a partial import, refer to [`RetainedArray::fills_missing_local_replicas`]), which is placed onto its
+/// own mesh and sharding once, as any other destination is, so that the copy of that replica is made once rather than
+/// by every execution. Each process decides this from its own buffers, but that placement moves every shard to its own
+/// device and copies only between devices of one process, so a process that places it submits no transfer that another
+/// process pairs with, whichever replicas each process holds, and a contribution without any local replica is left as
+/// it is.
 ///
 /// Only session constants take this route, which are the captures whose types record nothing beyond replication. A
 /// capture whose type records more (e.g., a split over explicit mesh axes) stays an ordinary capture of the
@@ -1099,9 +1188,8 @@ pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacemen
 ///
 /// # Errors
 ///
-/// Returns an error when `constant` retains an array of another client than that of `session`, when `mesh` assigns a
-/// device to another process than the one that owns it as direct placement does (refer to
-/// `validate_mesh_device_processes`), and the error of moving `constant` otherwise.
+/// Returns an error when `constant` retains an array of another client than that of `session`, when the session does
+/// not recognize the devices or process assignments of the source or destination mesh, or when moving `constant` fails.
 pub(crate) fn placed_constant(
     session: &Session,
     constant: &RetainedArray,
@@ -1120,6 +1208,8 @@ pub(crate) fn placed_constant(
     if !follows_mesh || pending_auto_reduction {
         return Ok(None);
     }
+    // The requesting session must recognize the source before it can reuse or record a shared placement.
+    validate_mesh_devices(session, constant.mesh())?;
     let (target, sharding) = if constant.sharding().mesh().has_same_topology(mesh.logical_mesh()) {
         // A capture on the devices of `mesh` is placed onto its own mesh and sharding only to fill its missing local
         // replicas.
@@ -1137,7 +1227,7 @@ pub(crate) fn placed_constant(
     };
     // A destination that assigns a device to another process than the one that owns it is rejected on every process
     // before it can consume a placement attempt, as a direct placement rejects it (refer to `run_placement_dispatch`).
-    validate_mesh_device_processes(session.client(), &target)?;
+    validate_mesh_devices(session, &target)?;
     // The placed copy lives on devices that the mesh of the function names for every process, so it is committed to
     // them and not locally assigned, as an array that a placement onto named devices gives is, whatever the commitment
     // and the local assignment of the captured array are. The source constant stays in the IR and keeps its own
@@ -1149,22 +1239,22 @@ pub(crate) fn placed_constant(
     // attempt), and never waited for, so a request that finds its own placement never waits for other work. A copy is a
     // source only when it keeps the memory and the declared layout of the capture (refer to
     // `RetainedArray::completed_placement_on`), so that the result has the type that a placement of the capture gives,
-    // whichever placements the index already holds. A placement that cannot communicate either has every device on one
-    // process, or a capture with locally assigned devices, which
-    // every process places with local work only. In the second case the copy may span processes, so it is reused only
-    // when it and the destination are both replicated: every destination shard then comes from the shard of the copy
-    // on the same device, and no process communicates. A process whose copy is missing, pending, or failed places from
-    // the capture instead, which communicates neither, so the processes need not agree on the source. A placement that
-    // can communicate always starts from the capture, because a copy can exist on one process and have failed on
-    // another, which would then submit different work.
-    let communicates = constant.can_communicate(&target);
+    // whichever placements the index already holds. If the copy spans processes, it is reused only when it and the
+    // destination are both replicated. Every destination shard then comes from the shard of the copy on the same
+    // device. A process whose copy is missing, pending, or failed places from the capture instead. The shared planner
+    // must classify the placement from the capture as local before processes can choose their own sources, because a
+    // copy can exist on one process and have failed on another.
     let first_process = target.devices()[0].process_index();
     let one_process = target.devices().iter().all(|device| device.process_index() == first_process);
-    let placed = constant.placed(&target, &sharding, || {
+    let placed = constant.placed(&target, &sharding, |source| {
         let replicated = |copy: &RetainedArray| copy.sharding().is_replicated() && sharding.is_replicated();
         let reusable = |copy: &RetainedArray| one_process || replicated(copy);
-        let copy = if communicates { None } else { constant.completed_placement_on(target.devices(), reusable) };
-        let source = copy.as_ref().unwrap_or(constant);
+        let copy = if source.can_communicate(&target, &sharding) {
+            None
+        } else {
+            source.completed_placement_on(target.devices(), reusable)
+        };
+        let source = copy.as_ref().unwrap_or(&source);
         let placed = source.to_array(session)?.reshard_on_devices(session, &target, &sharding, false)?;
         Ok::<_, Error>(placed.with_committed(true).with_locally_assigned(false))
     })?;
@@ -1400,7 +1490,11 @@ fn validate_output_shardings(output_types: &[Type], options: &Options) -> Result
         let Type::Array(array_type) = r#type else {
             continue;
         };
-        if array_type.sharding() != Some(&sharding.without_auto_axes()) {
+        if !array_type
+            .clone()
+            .with_sharding(sharding.without_auto_axes())
+            .is_ok_and(|overridden| overridden == *array_type)
+        {
             return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: format!(
                     "staged output {index} has type `{array_type}`, which does not carry the sharding `{sharding}` \
@@ -1498,23 +1592,21 @@ fn apply_signature_shardings<'t>(
     Ok(())
 }
 
-/// Returns the runtime placement of an output whose result is annotated with `annotation` and whose type is
-/// `output_type`. This is `annotation` with the dimensions that `output_type` records as unconstrained left
-/// unconstrained, because types compare unconstrained dimensions exactly and an array must have the placement that its
-/// type records. The two describe the same buffers, because `annotation` replicates those dimensions (refer to
-/// `entry_result_shardings`) and the runtime placement of an array reads an unconstrained dimension as replicated.
-fn runtime_output_sharding(annotation: &Sharding, output_type: &ArrayType) -> Result<Sharding, Error> {
-    let Some(type_sharding) = output_type.sharding() else {
+/// Returns the runtime placement of an output by restoring unconstrained dimensions of its declared or requested
+/// sharding. The executable annotation closes those dimensions when it must fix their placement. The runtime sharding
+/// keeps the original metadata and represents an unconstrained dimension with replicated buffers.
+fn runtime_output_sharding(annotation: &Sharding, declaration: Option<&Sharding>) -> Result<Sharding, Error> {
+    let Some(declaration) = declaration else {
         return Ok(annotation.clone());
     };
-    if !type_sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
+    if !declaration.dimensions().contains(&ShardingDimension::Unconstrained) {
         return Ok(annotation.clone());
     }
     let dimensions = annotation
         .dimensions()
         .iter()
-        .zip(type_sharding.dimensions())
-        .map(|(dimension, type_dimension)| match type_dimension {
+        .zip(declaration.dimensions())
+        .map(|(dimension, declared)| match declared {
             ShardingDimension::Unconstrained => ShardingDimension::Unconstrained,
             _ => dimension.clone(),
         })
@@ -1625,16 +1717,19 @@ fn contains_shard_map(program: &FlatProgram, target_platform: Option<&str>) -> b
 /// dynamic programs), the compiler runs one fully replicated replica of the program on each device and ignores sharding
 /// constraints, so it would silently ignore a `place` whose target is not replicated.
 ///
-/// A source of either form is validated exactly like the same target, with or without a target, because transposition
-/// turns it into the destination of the cotangent, so that a program whose derivative could not be compiled is
-/// rejected when the program itself is compiled, whereas JAX elides the devices of a `device_put` source inside `jit`
-/// and accepts it. This includes the fully replicated requirement of bounded dynamic programs, which the transposed
-/// placement of a split source would violate. A `place` without a target leaves its input where it is and lowers to
-/// nothing, so only its source is checked. Regions that lowering never reaches (e.g., the rule regions of composites,
-/// the transpose region of a `linear_call`, a body that a backend implementation replaces, or the body of a scan whose
-/// length admits no iteration) are not checked, because they are not part of the compiled program. Entry points that
-/// lower a program without compiling it for a device mesh (e.g.,
-/// [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices and do not run it.
+/// A source is not validated here, because the program moves nothing to it. It states where the caller expects the
+/// input to live, which the type rule of `place` checks against the input type, and JAX likewise elides the devices of
+/// a `device_put` source inside `jit`. So a `place` without a target, which leaves its input where it is and lowers to
+/// nothing, compiles whatever devices its source names. Transposition turns the return placement of a `place` into
+/// the target of the transposed placement, which is validated as a target when the transposed program is compiled,
+/// and the lowering of `place` still rejects a source that names devices inside a manual region where transposition
+/// would move the cotangent to it, as an eager `shard_map` does.
+///
+/// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
+/// a body that a backend implementation replaces, or the body of a scan whose length admits no iteration) are not
+/// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
+/// for a device mesh (e.g., [`TracedProgram::to_mlir_module`](crate::TracedProgram::to_mlir_module)) know no devices
+/// and do not run it.
 ///
 /// # Errors
 ///
@@ -1642,9 +1737,8 @@ fn contains_shard_map(program: &FlatProgram, target_platform: Option<&str>) -> b
 /// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`]
 /// for the first `place` whose device target is not the only device of `mesh`,
 /// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
-/// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose source would be rejected as such a
-/// target, as the source is no destination of the forward program, and for the first `place` whose target or source
-/// sharding or `jit_call` whose effective boundary sharding (i.e., an override or where the executable of the callee
+/// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose
+/// effective boundary sharding (i.e., an override or where the executable of the callee
 /// places an input, refer to [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to
 /// [`Sharding::is_replicated`]), once its unconstrained dimensions are read as replicated (refer to
 /// [`entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has more than one device.
@@ -1722,95 +1816,46 @@ fn validate_placements(
             let Some(place) = instruction.operation().projected_payload::<PlaceOperation>() else {
                 continue;
             };
-            // A source is validated exactly like the same target, because transposition turns it into the target of the
-            // cotangent (refer to `PlacementRequest`), so that a program is rejected when it is compiled rather than
-            // when it is differentiated. A rejected source is reported as such, since nothing is moved to it forward.
-            // The transposition of a placement that moves nothing and whose input lives inside a manual region leaves
-            // the cotangent where it is (refer to `PlaceOperation::transposes_in_place`), so the source of such a
-            // placement is rejected because it names devices where the value cannot live, which its diagnostic says.
-            let transposes_in_place = instruction.inputs().first().is_some_and(|input| {
-                match region.atoms()[input.index()].r#type().as_ref() {
-                    Type::Array(input_type) => place.transposes_in_place(input_type),
-                    _ => false,
+            // Only the target is validated, because it is the only request that the program executes. A source states
+            // where the caller expects the input to live, which the type rule checks against the input type, and the
+            // forward program moves nothing to it, so its devices and its sharding are not checked here, as JAX elides
+            // the source of a `device_put` inside `jit`. Transposition turns the return placement into the target of
+            // the transposed placement, which is validated as a target when the transposed program is compiled.
+            match place.target() {
+                // A device keeps the sharding of the value, which is over the program mesh, so it is valid exactly when
+                // that mesh consists of the device alone.
+                Some(PlacementRequest::Device { device, .. }) if mesh.devices() != [*device] => {
+                    return Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
+                        device: *device,
+                        mesh: mesh.clone(),
+                    }));
                 }
-            });
-            let source_consequence = |devices: &str| {
-                if transposes_in_place {
-                    "where the value cannot live, because the program holds it on its own devices".to_string()
-                } else {
-                    format!("and transposition would return the cotangent to {devices}")
-                }
-            };
-            for (request, is_source) in [(place.target(), false), (place.source(), true)] {
-                let unsupported = |reason: String| {
-                    Error::Lowering(LoweringError::UnsupportedOperation {
-                        operation: PLACE_OPERATION_NAME.to_string(),
-                        reason,
-                    })
-                };
-                match request {
-                    // A device keeps the sharding of the value, which is over the program mesh, so it is valid exactly
-                    // when that mesh consists of the device alone.
-                    Some(PlacementRequest::Device { device, .. }) if mesh.devices() != [*device] => {
-                        return Err(if is_source {
-                            unsupported(format!(
-                                "its source names the device {}, which is not the only device of the mesh `{}` over \
-                                 the devices {} that the program is compiled for, {}",
-                                device,
-                                mesh.logical_mesh(),
-                                render_devices(mesh.devices()),
-                                source_consequence("it"),
-                            ))
-                        } else {
-                            Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
-                                device: *device,
-                                mesh: mesh.clone(),
-                            })
-                        });
+                Some(PlacementRequest::Resolved(placement)) => {
+                    let placement_mesh = placement.mesh();
+                    if placement_mesh.devices() != mesh.devices()
+                        || !placement_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
+                    {
+                        return Err(Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
+                            target: placement_mesh.clone(),
+                            mesh: mesh.clone(),
+                        }));
                     }
-                    Some(PlacementRequest::Resolved(placement)) => {
-                        let placement_mesh = placement.mesh();
-                        if placement_mesh.devices() != mesh.devices()
-                            || !placement_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
-                        {
-                            return Err(if is_source {
-                                unsupported(format!(
-                                    "its source names the devices {} of mesh `{}`, which are not the devices {} \
-                                     of the mesh `{}` that the program is compiled for, {}",
-                                    render_devices(placement_mesh.devices()),
-                                    placement_mesh.logical_mesh(),
-                                    render_devices(mesh.devices()),
-                                    mesh.logical_mesh(),
-                                    source_consequence("them"),
-                                ))
-                            } else {
-                                Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
-                                    target: placement_mesh.clone(),
-                                    mesh: mesh.clone(),
-                                })
-                            });
-                        }
-                        // An unconstrained dimension is stored replicated, as at the boundary of a call.
-                        if !use_shardy_partitioner
-                            && mesh.devices().len() > 1
-                            && !entry_boundary_sharding(placement.sharding())?.is_replicated()
-                        {
-                            return Err(unsupported(if is_source {
-                                "bounded-dynamic multi-device programs currently require fully replicated placement \
-                                 sources because transposition turns them into the targets of cotangents and Shardy \
-                                 rejects dynamic tensors"
-                                    .to_string()
-                            } else {
-                                "bounded-dynamic multi-device programs currently require fully replicated placement \
-                                 targets because Shardy rejects dynamic tensors"
-                                    .to_string()
-                            }));
-                        }
+                    // An unconstrained dimension is stored replicated, as at the boundary of a call.
+                    if !use_shardy_partitioner
+                        && mesh.devices().len() > 1
+                        && !entry_boundary_sharding(placement.sharding())?.is_replicated()
+                    {
+                        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                            operation: PLACE_OPERATION_NAME.to_string(),
+                            reason: "bounded-dynamic multi-device programs currently require fully replicated \
+                                     placement targets because Shardy rejects dynamic tensors"
+                                .to_string(),
+                        }));
                     }
-                    // An in-place request leaves the value on the devices where it lives, which are those of the
-                    // program mesh, and an absent one states nothing, so neither has anything to validate.
-                    Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => {}
                 }
+                // An in-place request leaves the value on the devices where it lives, which are those of the program
+                // mesh, and an absent one states nothing, so neither has anything to validate.
+                Some(PlacementRequest::Device { .. } | PlacementRequest::InPlace { .. }) | None => {}
             }
         }
     }
@@ -1901,30 +1946,33 @@ fn with_declared_singleton_axes(physical: &Sharding, declared: &Sharding) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::cell::RefCell;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayIrValue, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArraySliceAxis, ArrayType, CaptureReference, CompilationArtifactExchange, CompilationArtifactExchangeError,
-        CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain, CompilationTracer,
-        CompiledFunction, CompositeKey, CompositeOperation, ConditionOperation, ConstantOperation, Context,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomRuleDefinition, CustomRuleRegistration,
-        DataType, Device, DeviceMesh, Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
-        DimensionOperation, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Layout, LinearCallOperation,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneOperation,
-        Operation as CoreOperation, Place, Placeholder, Placement, ProgramError, Provenance, ProvenanceScope,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshard, ScanOperation, Shape,
-        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation, StagedFunction,
-        StridedLayout, WhileOperation,
+        ArraySliceAxis, ArrayType, AttachedRegions, CaptureReference, CompilationArtifactExchange,
+        CompilationArtifactExchangeError, CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain,
+        CompilationTracer, CompiledFunction, CompositeKey, CompositeOperation, ConditionOperation, ConstantOperation,
+        Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomRuleDefinition,
+        CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionAddOperation,
+        DimensionBounds, DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType,
+        DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation,
+        EagerInterpretationDriver, Error as CoreError, Exp, ImportingContext, InterpretableOperation, Layout,
+        LinearCallOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation,
+        OneOperation, Operation as CoreOperation, Place, Placeholder, Placement, ProgramError, Provenance,
+        ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        Reshard, ScanOperation, ScanOptions, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
+        Sin, SliceOperation, StagedFunction, StridedLayout, ThroughCapture, ValueProjection, WhileOperation,
+        differentiate_at, scan,
     };
     use ryft_pjrt::protos::Precision;
-    use ryft_pjrt::{BufferSpecification, BufferType};
+    use ryft_pjrt::{BufferSpecification, BufferType, Error as PjrtError, ExecutionFence};
 
     #[cfg(feature = "mps")]
     use ryft_core::ConstrainShardingOperation;
@@ -1935,11 +1983,13 @@ mod tests {
         boolean_scalar, domain_mesh, f32_scalar, f32_vector, read_first_shard, replicated_scalar_type,
         replicated_vector_type, two_device_mesh,
     };
-    use crate::tests::{cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, execution_client, other_cpu_client, session_with_remote_devices, values_from_bytes, values_to_bytes,
+    };
     use crate::{
-        Array, CompiledFunctionDispatcher, Constant, Error, FlatProgram, FromPjrt, JitCallOperation, Operation,
-        Options, PlacementOptions, ProgramBuilder, RetainedArray, Session, StatefulCompiledFunction, Type, Value,
-        compile_statefully_with_captures, jit_with_options,
+        Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FlatProgram, FromPjrt,
+        JitCallOperation, Operation, Options, PlacementOptions, ProgramBuilder, RetainedArray, Session,
+        StatefulCompiledFunction, Type, Value, compile, compile_statefully_with_captures, jit_with_options, stage,
     };
 
     #[cfg(feature = "mps")]
@@ -2564,6 +2614,50 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_outputs_keep_requested_unconstrained_sharding_on_the_anonymous_mesh() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::I32, [4]);
+        let values = [0i32, 1, 2, 3];
+        let input = Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(&values)).unwrap();
+        let mesh = input.mesh();
+        let unconstrained =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
+        let target = Placement::new(mesh.clone(), unconstrained.clone()).unwrap();
+        let options = || Options::new(mesh.clone());
+
+        // Both an output that forwards an argument and one produced by an explicit placement retain the requested
+        // metadata. The anonymous type omits its sharding, and every executable buffer holds the full extent.
+        let identity = crate::compile_with_options::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| x,
+            r#type.clone(),
+            &session,
+            options().with_input_shardings(vec![unconstrained.clone()]),
+        )
+        .unwrap();
+        let placed = crate::compile_with_options::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| x.place(&target, None).unwrap(),
+            r#type.clone(),
+            &session,
+            options(),
+        )
+        .unwrap();
+        for function in [identity, placed] {
+            let executed = function.executable().execute(&session, input.clone()).unwrap();
+            let called = function.call(input.clone()).unwrap();
+            for output in [executed, called] {
+                assert_eq!(output.r#type().as_ref(), &r#type);
+                assert_eq!(output.mesh(), mesh);
+                assert_eq!(output.sharding(), &unconstrained);
+                assert!(output.is_committed());
+                let shard = output.addressable_shards().next().unwrap();
+                assert_eq!(shard.shape().as_slice(), &[4]);
+                assert_eq!(values_from_bytes::<i32>(&shard.copy_to_host_bytes().unwrap()), values);
+            }
+        }
+    }
+
+    #[test]
     fn test_session_lower_program_places_outputs_that_return_inputs_as_their_inputs() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -3014,7 +3108,9 @@ mod tests {
         ));
 
         // A replicated override is what every replica computes anyway.
-        assert!(lower(&replicated).is_ok());
+        let lowered = lower(&replicated).unwrap();
+        assert_eq!(lowered.output_shardings(), &[replicated]);
+        assert_eq!(lowered.open_outputs(), &[false]);
     }
 
     #[test]
@@ -3394,16 +3490,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_placements_describes_sources_of_values_that_transpose_in_place() {
-        // A source that names devices outside the mesh of the program is rejected. Transposition returns the cotangent
-        // of an ordinary value to that source, whereas the cotangent of a value that varies along a manual axis stays
-        // where the value lives, so the diagnostic of each says what is true of it.
+    fn test_validate_placements_admits_sources_off_the_program_mesh() {
+        // A source states where the caller expects the input to live, and the forward program moves nothing to it, so
+        // a source on devices outside the mesh of the program, of an ordinary value or of one that varies along a
+        // manual axis, and a split source of a bounded dynamic program are admitted. Before, all three were rejected
+        // because transposition would return the cotangent to them.
         let manual = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(manual.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
-        let elsewhere = DeviceMesh::new(manual.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
-        let program = |sharding: Sharding| {
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let program = |sharding: Sharding, source_devices: Vec<Device>| {
             let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
-            let source = Placement::new(elsewhere.clone(), sharding).unwrap();
+            let source_mesh = DeviceMesh::new(sharding.mesh().clone(), source_devices).unwrap();
+            let source = Placement::new(source_mesh, sharding).unwrap();
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.into());
             let operation = PlaceOperation::new(None, source);
@@ -3412,25 +3509,157 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let validate = |sharding: Sharding| {
-            validate_placements(&program(sharding), &mesh, true, None).map_err(|error| error.to_string())
-        };
+        let (first, second) = (vec![Device::new(0, 0), Device::new(1, 0)], vec![Device::new(2, 0), Device::new(3, 0)]);
         let replicated = Sharding::replicated(manual.clone(), 1);
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
-        assert_eq!(
-            validate(replicated),
-            Err("cannot lower `place`: its source names the devices [2, 3] of mesh `['x'=2:manual]`, which are \
-                 not the devices [0, 1] of the mesh `['x'=2:manual]` that the program is compiled for, and \
-                 transposition would return the cotangent to them"
-                .to_string()),
+        let split = Sharding::new(explicit.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        for (sharding, source_devices, logical_mesh, use_shardy_partitioner) in [
+            (replicated, second.clone(), manual.clone(), true),
+            (varying, second, manual, true),
+            (split, first.clone(), explicit.clone(), false),
+        ] {
+            let mesh = DeviceMesh::new(logical_mesh, first.clone()).unwrap();
+            let program = program(sharding, source_devices);
+            assert_eq!(
+                validate_placements(&program, &mesh, use_shardy_partitioner, None).map_err(|error| error.to_string()),
+                Ok(()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_compile_place_with_sources_off_the_program_mesh() {
+        // A targetless `place` whose source names devices outside the mesh that a function is compiled for leaves the
+        // input where it is, so the compiled function returns what the eager placement returns (devices, commitment,
+        // and values), as JAX compiles `device_put(x, src=...)` inside `jit` for sources on any devices. Before, it
+        // was rejected because transposition would return the cotangent to the source. Its reverse mode program holds
+        // the transposed placement, whose target is that source, so it is still rejected as a target outside the
+        // program mesh, and a source that does not match the input type is rejected by the type rule on both paths.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let elsewhere = DeviceMesh::new(mesh.logical_mesh().clone(), devices[2..4].to_vec()).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let bytes = values_to_bytes(&[1f32, 2., 3., 4.]);
+        let committed_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap();
+        let committed = Array::from_host_buffer(&session, committed_type, mesh.clone(), None, &bytes).unwrap();
+        let uncommitted =
+            Array::from_host_buffer(&session, ArrayType::new_static(DataType::F32, [4]), None, None, &bytes).unwrap();
+        let observe = |array: &Array| {
+            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
+            (array.mesh().devices().to_vec(), array.is_committed(), values)
+        };
+
+        // Returns the eager result and the compiled result of a placement of `input` without a target and with
+        // `source`, compiled for the mesh of `input`.
+        let options = |source: &PlacementRequest| PlacementOptions::default().with_source(source.clone());
+        let place = |input: &Array, source: &PlacementRequest| {
+            let options = || options(source);
+            let eager = session.place(input.clone(), options()).map(|output| observe(&output));
+            let error = RefCell::new(None);
+            let compiled = compile::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| {
+                    session.place(x.clone(), options()).unwrap_or_else(|failure| {
+                        error.replace(Some(failure));
+                        x
+                    })
+                },
+                input.r#type().into_owned(),
+                &session,
+                input.mesh().clone(),
+            );
+            let compiled = match (error.take(), compiled) {
+                (Some(error), _) | (None, Err(error)) => Err(error.to_string()),
+                (None, Ok(function)) => function
+                    .executable()
+                    .execute(&session, input.clone())
+                    .map(|output| observe(&output))
+                    .map_err(|error| error.to_string()),
+            };
+            (eager.map_err(|error| error.to_string()), compiled)
+        };
+
+        // Returns the error of compiling the reverse mode program of the same placement for the mesh of `input`.
+        let reverse = |input: &Array, source: &PlacementRequest| {
+            compile::<_, (ArrayType, ArrayType), ArrayType>(
+                |(x, seed): (CompileTracer, CompileTracer)| {
+                    let (_, pullback) =
+                        differentiate_at(x).vjp(|x| Ok(session.place(x, options(source)).unwrap())).unwrap();
+                    pullback.apply_materialized(seed).unwrap()
+                },
+                (input.r#type().into_owned(), input.r#type().into_owned()),
+                &session,
+                input.mesh().clone(),
+            )
+            .err()
+            .map(|error| error.to_string())
+        };
+
+        let source = PlacementRequest::from(Placement::new(elsewhere.clone(), replicated).unwrap());
+        let (eager, compiled) = place(&committed, &source);
+        assert_eq!(eager, Ok((devices[..2].to_vec(), true, vec![1., 2., 3., 4.])));
+        assert_eq!(compiled, eager);
+        let rejection = LoweringError::PlacementOutsideProgramMesh { target: elsewhere.clone(), mesh };
+        assert_eq!(reverse(&committed, &source), Some(Error::Lowering(rejection).to_string()));
+
+        let source = PlacementRequest::from(devices[3]);
+        let (eager, compiled) = place(&uncommitted, &source);
+        assert_eq!(eager, Ok((vec![devices[0]], false, vec![1., 2., 3., 4.])));
+        assert_eq!(compiled, eager);
+        // The untracked input leaves the transposed placement's source as a bare device request.
+        let rejection =
+            LoweringError::DeviceOutsideProgramMesh { device: devices[3], mesh: uncommitted.mesh().clone() };
+        assert_eq!(reverse(&uncommitted, &source), Some(Error::Lowering(rejection).to_string()));
+
+        let (eager, compiled) =
+            place(&committed, &PlacementRequest::from(Placement::new(elsewhere, split.clone()).unwrap()));
+        let mismatch = format!(
+            "`place` source sharding `{split}` does not match the input type `{}`",
+            committed.r#type().into_owned(),
         );
-        assert_eq!(
-            validate(varying),
-            Err("cannot lower `place`: its source names the devices [2, 3] of mesh `['x'=2:manual]`, which are \
-                 not the devices [0, 1] of the mesh `['x'=2:manual]` that the program is compiled for, where the \
-                 value cannot live, because the program holds it on its own devices"
-                .to_string()),
-        );
+        assert_eq!((eager, compiled), (Err(mismatch.clone()), Err(mismatch)));
+    }
+
+    #[test]
+    fn test_validate_placements_ignores_inferred_sources() {
+        // Linearizing a placement of an array on the first device infers that device as the source to which
+        // transposition returns the cotangent, which constrains nothing forward, so the pushforward compiles and runs
+        // on the second device, where its tangent lives, with and without a target there. Before, both were rejected
+        // there. A source that the caller gives constrains the forward program no more (refer to
+        // `test_validate_placements_admits_sources_off_the_program_mesh`).
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let second = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[1]]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let upload = |values: &[f32]| {
+            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(values)).unwrap()
+        };
+        let primal = upload(&[1.0, 2.0]);
+        let tangent = upload(&[3.0, 4.0]).place(&devices[1], None).unwrap();
+        for target in [None, Some(PlacementRequest::from(devices[1]))] {
+            let (_, pushforward) = session
+                .differentiate_at(Value::Array(primal.clone()))
+                .linearize(|input| {
+                    let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                    Ok(input.place(&target, None)?.into_value())
+                })
+                .unwrap();
+            let program = pushforward.program();
+            assert_eq!(validate_placements(program, &second, true, None).map_err(|error| error.to_string()), Ok(()));
+            let lowered = session.lower_program(program, 0, &Options::new(second.clone())).unwrap();
+            let compiled = session.compile_program(&lowered).unwrap();
+            let outputs = CompilationDomain::execute(&session, &compiled, vec![Value::Array(tangent.clone())]).unwrap();
+            let [Value::Array(output)] = outputs.as_slice() else {
+                panic!("expected one array output");
+            };
+            let values = output.copy_to_host().unwrap().elements::<f32>().unwrap();
+            assert_eq!((output.mesh().devices().to_vec(), values), (vec![devices[1]], vec![3.0, 4.0]));
+        }
     }
 
     #[test]
@@ -5034,7 +5263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_validate_cached_program_rejects_foreign_invocation_contracts() {
+    fn test_session_reuse_cached_program_rejects_foreign_invocation_contracts() {
         // Exchange on the follower side that answers every key with one fixed artifact. This is the reachable
         // stand-in for a colliding or corrupted persistent entry, because the disk tier keys entries by the digest of
         // the canonical key bytes and re-validates that digest inside the stored envelope, so a planted disk entry
@@ -5108,10 +5337,11 @@ mod tests {
             consumer(CompilationArtifactExchangePolicy::PreferSharing { timeout: Duration::from_secs(5) });
         let lowered = staged.lower(&fallback_consumer).unwrap();
         let compiled = lowered.compile(&fallback_consumer).unwrap();
-        assert!(matches!(
-            fallback_consumer.validate_cached_program(lowered.lowered_program(), compiled.compiled_program()),
-            Ok(()),
-        ));
+        assert!(
+            fallback_consumer
+                .reuse_cached_program(lowered.lowered_program(), Arc::new(compiled.compiled_program().clone()))
+                .is_ok()
+        );
         let statistics = fallback_consumer.compilation_cache().statistics();
         assert_eq!(statistics.exchange_hits, 0);
         assert_eq!(statistics.exchange_fallbacks, 1);
@@ -5134,7 +5364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_validate_cached_program_rejects_foreign_output_shardings() {
+    fn test_session_reuse_cached_program_rejects_foreign_output_shardings() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
@@ -5160,10 +5390,11 @@ mod tests {
         let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone()]);
         let along_x_lowered = lower(options.clone().with_output_shardings(vec![along_x.clone()]));
         let along_y_lowered = lower(options.with_output_shardings(vec![along_y]));
-        let along_x_compiled = session.compile_program(&along_x_lowered).unwrap();
-        assert!(session.validate_cached_program(&along_x_lowered, &along_x_compiled).is_ok());
+        let along_x_compiled = Arc::new(session.compile_program(&along_x_lowered).unwrap());
+        let reused = session.reuse_cached_program(&along_x_lowered, Arc::clone(&along_x_compiled)).unwrap();
+        assert!(Arc::ptr_eq(&reused, &along_x_compiled));
         assert!(matches!(
-            session.validate_cached_program(&along_y_lowered, &along_x_compiled),
+            session.reuse_cached_program(&along_y_lowered, along_x_compiled),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "cached executable has incompatible output shardings",
         ));
@@ -5173,9 +5404,10 @@ mod tests {
         let open_lowered = lower(Options::new(mesh).with_input_shardings(vec![along_x.clone()]));
         assert_eq!(open_lowered.open_outputs(), &[true]);
         assert_eq!(open_lowered.output_shardings(), &[replicated]);
-        let open_compiled = session.compile_program(&open_lowered).unwrap();
+        let open_compiled = Arc::new(session.compile_program(&open_lowered).unwrap());
         assert_eq!(open_compiled.output_shardings(), &[along_x]);
-        assert!(session.validate_cached_program(&open_lowered, &open_compiled).is_ok());
+        let reused = session.reuse_cached_program(&open_lowered, Arc::clone(&open_compiled)).unwrap();
+        assert!(Arc::ptr_eq(&reused, &open_compiled));
     }
 
     #[test]
@@ -5186,7 +5418,7 @@ mod tests {
         // executable on one of them rejects it, and every process knows its devices, so that a move to a device of
         // another process plans a transfer (which the CPU plugin cannot make) instead of returning no shards.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, [Device::new(99, 1)]);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let r#type = ArrayType::scalar(DataType::F32);
         let upload = |mesh: Option<DeviceMesh>| {
@@ -5297,6 +5529,83 @@ mod tests {
     }
 
     #[test]
+    fn test_placed_constant_validates_source_devices_independently_of_cached_placement() {
+        let client = cpu_client(1);
+        let narrow = Session::builder().client(client).build().unwrap();
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        let broad = session_with_remote_devices(client, [remote]);
+        let source = DeviceMesh::new(LogicalMesh::single_device(), vec![remote]).unwrap();
+        let target = DeviceMesh::new(LogicalMesh::single_device(), vec![local]).unwrap();
+        let r#type = ArrayType::scalar(DataType::Zero);
+
+        // A zero-space capture exercises the shared placement without requiring a remote transfer.
+        let retain = || {
+            let array = Array::from_host_buffer(&broad, r#type.clone(), source.clone(), None, []).unwrap();
+            RetainedArray::new(&array)
+        };
+        let reject = |capture: &RetainedArray| {
+            assert!(matches!(
+                placed_constant(&narrow, capture, &target),
+                Err(Error::Array(error)) if matches!(
+                    *error,
+                    ArrayError::UnknownDevice { device_id, process_index }
+                        if device_id == remote.id() && process_index == remote.process_index(),
+                ),
+            ));
+            let message =
+                ArrayError::UnknownDevice { device_id: remote.id(), process_index: remote.process_index() }.to_string();
+            let lift = narrow.with_device_mesh(target.clone()).lift(Constant::Session(capture.clone()));
+            for error in [capture.to_array(&narrow).unwrap_err(), lift.unwrap_err()] {
+                assert!(matches!(error, ProgramError::Custom(_)));
+                assert_eq!(error.to_string(), message);
+            }
+        };
+        let place = |capture: &RetainedArray| {
+            let placed = placed_constant(&broad, capture, &target).unwrap().unwrap();
+            assert_eq!(placed.mesh(), &target);
+        };
+
+        let narrow_first = retain();
+        reject(&narrow_first);
+        place(&narrow_first);
+        let broad_first = retain();
+        place(&broad_first);
+        reject(&broad_first);
+    }
+
+    #[test]
+    fn test_session_lower_staged_program_rejects_invalid_targets_before_placing_captures() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let capture_device = Device::from_pjrt(&devices[0]).unwrap();
+        let target_device = Device::from_pjrt(&devices[1]).unwrap();
+        let capture_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![capture_device]).unwrap();
+        let target_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![target_device]).unwrap();
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+        let capture = Array::from_host_buffer(&session, array_type.clone(), capture_mesh, None, bytes).unwrap();
+        let statistics = session.array_statistics();
+
+        for _ in 0..2 {
+            let attempted = crate::compile_with_captures::<_, ArrayType, ArrayType>(
+                |captures, _| captures[0].place(&capture_device, None).unwrap(),
+                vec![capture.clone()],
+                array_type.clone(),
+                &session,
+                target_mesh.clone(),
+            );
+            assert!(matches!(
+                attempted,
+                Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh }))
+                    if device == capture_device && mesh == target_mesh
+            ));
+            assert_eq!(session.array_statistics(), statistics);
+        }
+    }
+
+    #[test]
     fn test_session_lower_staged_program_rejects_used_captures_of_another_client() {
         // A capture of another client that the function uses is rejected at compilation with the error with which a
         // session constant of another client is rejected (refer to
@@ -5331,8 +5640,331 @@ mod tests {
             input_type,
             &session,
             Options::new(mesh),
+        )
+        .unwrap();
+        assert!(unused.executable().captures().is_empty());
+    }
+
+    #[test]
+    fn test_session_lower_staged_program_skips_captures_that_only_omitted_regions_read() {
+        // A split capture that only the body of a scan imports is checked when the scan admits an iteration, and not
+        // when its length is zero, because lowering then emits nothing of that body and the executable has no argument
+        // for the capture (refer to `emitted_capture_reads`). This holds for a populated capture of another client,
+        // whose admission rejects it, and for a capture of this client without buffers, which only an execution
+        // rejects. At length zero both compile and run through the executable. It holds alike for a capture of another
+        // client of the zero data type, which has no buffer either, and for a capture of this client that is split
+        // unevenly, which the executable could not receive. Every entry point agrees: an execution, a call, the replay
+        // of a call, an execution of a persisted copy, and an execution of a caller that is compiled around a call,
+        // which passes the capture on to the callee and so reads it only where the callee reads it.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let foreign_session = Session::builder().client(other_cpu_client(2)).build().unwrap();
+        let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
+        let foreign_mesh = two_device_mesh(foreign_session.client(), MeshAxisType::Explicit);
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let split = |mesh: &DeviceMesh| {
+            Some(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+        };
+        let foreign = Array::from_host_buffer(
+            &foreign_session,
+            r#type.clone(),
+            foreign_mesh.clone(),
+            split(&foreign_mesh),
+            values_to_bytes(&[0f32; 4]),
+        )
+        .unwrap();
+        let empty =
+            Array::from_addressable_buffers(&session, r#type.clone(), mesh.clone(), split(&mesh), Vec::new()).unwrap();
+        // A populated capture of this client on the devices of the function in the opposite order, which the function
+        // moves onto its mesh when it reads it, and which says nothing about where a call runs when it does not.
+        let reversed_devices = mesh.devices().iter().rev().copied().collect();
+        let reversed_mesh = DeviceMesh::new(mesh.logical_mesh().clone(), reversed_devices).unwrap();
+        let reversed = Array::from_host_buffer(
+            &session,
+            r#type,
+            reversed_mesh.clone(),
+            split(&reversed_mesh),
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]),
+        )
+        .unwrap();
+        let zero_type = ArrayType::new_static(DataType::Zero, [4]);
+        let zero = Array::from_host_buffer(&foreign_session, zero_type, foreign_mesh.clone(), split(&foreign_mesh), [])
+            .unwrap();
+        let uneven_type = ArrayType::new_static(DataType::F32, [3]);
+        let uneven = Array::from_host_buffer(
+            &session,
+            uneven_type,
+            mesh.clone(),
+            split(&mesh),
+            values_to_bytes(&[1f32, 2.0, 3.0]),
+        )
+        .unwrap();
+        let compiled = |capture: &Array, length: usize| {
+            let extent = capture.r#type().shape().dimensions()[0].value().unwrap();
+            let is_zero = capture.data_type().is_zero();
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let input_type = ArrayType::new_static(DataType::F32, [length, extent]);
+            let function = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |stack: crate::CompileTracer| {
+                    let scanned = scan(
+                        |_, (), slice| {
+                            let capture = ImportingContext::<Session, ThroughCapture>::import(
+                                slice.context(),
+                                Value::Array(capture.clone()),
+                            )?;
+                            // A capture of the zero data type is read as the output of the body.
+                            if is_zero {
+                                return Ok(((), capture));
+                            }
+                            // A capture that is split unevenly is replicated where it is read, so that only the
+                            // capture and not the output of the function is split unevenly.
+                            let capture = if extent % 2 == 1 { capture.reshard(&replicated)? } else { capture };
+                            let slice = ValueProjection::<ArrayType>::into_projected(slice)?;
+                            let capture = ValueProjection::<ArrayType>::into_projected(capture)?;
+                            Ok(((), (slice + capture).into_value()))
+                        },
+                        (),
+                        stack.into_value(),
+                        ScanOptions::new(),
+                    );
+                    ValueProjection::<ArrayType>::into_projected(scanned.unwrap().1).unwrap()
+                },
+                input_type.clone(),
+                &session,
+                Options::new(mesh.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            let bytes = values_to_bytes(&vec![0f32; extent * length]);
+            let input = Array::from_host_buffer(&session, input_type, mesh.clone(), None, bytes).unwrap();
+            Ok::<_, String>((function, input))
+        };
+        let read = |output: Array| {
+            let values = values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap());
+            (output.r#type().shape().clone(), values)
+        };
+        let executed = |capture: &Array, length: usize| {
+            let (function, input) = compiled(capture, length)?;
+            function.executable().execute(&session, input).map(read).map_err(|error| error.to_string())
+        };
+        let called = |capture: &Array, length: usize| {
+            let (function, input) = compiled(capture, length)?;
+            function.call(input).map(read).map_err(|error| error.to_string())
+        };
+        // The replay of the call, which a region interpreter runs for the call that a caller stages.
+        let replayed = |capture: &Array, length: usize| {
+            let (function, input) = compiled(capture, length)?;
+            let caller: crate::StagedFunction<ArrayType, ArrayType> =
+                crate::stage(|x| function.call(x).unwrap(), input.r#type().into_owned(), Options::new(mesh.clone()))
+                    .unwrap();
+            let program = caller.source_program().to_program_with_lifted_captures().unwrap();
+            let mut inputs = caller.source_program().captures().to_vec();
+            inputs.push(Value::Array(input));
+            let call = program
+                .instructions()
+                .iter()
+                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .unwrap();
+            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
+            let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+            operation
+                .interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs)
+                .map(|mut outputs| read(ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()))
+                .map_err(|error| error.to_string())
+        };
+        // An execution of a copy of the executable that is persisted and loaded again on its own.
+        let persisted = |capture: &Array, length: usize| {
+            let (function, input) = compiled(capture, length)?;
+            let lowered = function.staged().into_inner().lower(&session).map_err(|error| error.to_string())?;
+            let compiled = lowered.compile(&session).map_err(|error| error.to_string())?;
+            let bytes = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+            let restored = session.deserialize_program(&bytes).unwrap().unwrap();
+            let mut inputs = function.source_program().captures().to_vec();
+            inputs.push(Value::Array(input));
+            session
+                .execute(&restored, inputs)
+                .map(|mut outputs| read(ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap()))
+                .map_err(|error| error.to_string())
+        };
+        // An execution of a caller that is compiled around a call of the function, whose program passes the captures
+        // of the function on to the call.
+        let caller = |capture: &Array, length: usize| {
+            let (function, input) = compiled(capture, length)?;
+            let caller = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |x: crate::CompileTracer| function.call(x).unwrap(),
+                input.r#type().into_owned(),
+                &session,
+                Options::new(mesh.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            caller.executable().execute(&session, input).map(read).map_err(|error| error.to_string())
+        };
+        let foreign_message = format!(
+            "session constant `{}` retains an array of a different PJRT client than the client of this session",
+            RetainedArray::new(&foreign),
         );
-        assert!(unused.is_ok());
+        assert_eq!(executed(&foreign, 1), Err(foreign_message));
+        assert_eq!(executed(&empty, 1), Err("input array #0 has no addressable shard for device 0".to_string()));
+        let nothing = Ok((Shape::new(vec![Dimension::Static(0), Dimension::Static(4)]), Vec::new()));
+        // A call requires of a capture what an execution requires of it (refer to `EagerCallDecision::unread_captures`),
+        // so the two agree for every capture and length.
+        let results = [executed(&foreign, 0), called(&foreign, 0), executed(&empty, 0), called(&empty, 0)];
+        assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone(), nothing.clone()]);
+        assert_eq!([replayed(&foreign, 0), replayed(&empty, 0)], [nothing.clone(), nothing.clone()]);
+        assert_eq!(called(&foreign, 1), executed(&foreign, 1));
+        assert_eq!(called(&empty, 1), executed(&empty, 1));
+        let results = [executed(&reversed, 0), called(&reversed, 0), replayed(&reversed, 0)];
+        assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone()]);
+        let read = Ok((Shape::new(vec![Dimension::Static(1), Dimension::Static(4)]), vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!([executed(&reversed, 1), called(&reversed, 1)], [read.clone(), read.clone()]);
+        // A capture of another client of the zero data type and a capture of this client that is split unevenly are
+        // rejected like the captures above when the function reads them, and require nothing when it does not. The
+        // signature records which captures are unread rather than leaving execution to infer it from a missing buffer,
+        // which a capture of the zero data type never has (refer to `ExecutableSignature::is_unread_input`), and a
+        // capture is placed only once it is known to be read.
+        let zero_message = format!(
+            "session constant `{}` retains an array of a different PJRT client than the client of this session",
+            RetainedArray::new(&zero),
+        );
+        let uneven_message = "the sharding of capture 0 splits dimension 0 of extent 3 into 2 shards, but XLA requires \
+                              the number of shards to divide the extent";
+        for (capture, message) in [(&zero, zero_message), (&uneven, uneven_message.to_string())] {
+            assert_eq!([executed(capture, 1), called(capture, 1)], [Err(message.clone()), Err(message)]);
+        }
+        let nothing_of_three = Ok((Shape::new(vec![Dimension::Static(0), Dimension::Static(3)]), Vec::new()));
+        for (capture, nothing) in [(&zero, &nothing), (&uneven, &nothing_of_three)] {
+            let results = [executed(capture, 0), called(capture, 0), replayed(capture, 0)];
+            assert_eq!(results, [nothing.clone(), nothing.clone(), nothing.clone()]);
+        }
+        // A persisted copy keeps the record of the captures that its executable never reads.
+        let unread = [(&foreign, &nothing), (&empty, &nothing), (&zero, &nothing), (&uneven, &nothing_of_three)];
+        for (capture, nothing) in unread {
+            assert_eq!(persisted(capture, 0), *nothing);
+        }
+        // A caller that passes a capture on to a call whose callee never reads it reads it neither, so its executable
+        // has no argument for it and places nothing, and it agrees with the function at every length.
+        for (capture, nothing) in unread.into_iter().chain([(&reversed, &nothing)]) {
+            assert_eq!(caller(capture, 0), *nothing);
+        }
+        for capture in [&foreign, &empty, &zero, &uneven] {
+            assert_eq!(caller(capture, 1), executed(capture, 1));
+        }
+        assert_eq!(caller(&reversed, 1), read);
+
+        // A function that also calls a function whose own capture is numbered zero as well reads its own capture zero
+        // only where its own regions read it, and the capture of its callee only through the operand of the call
+        // (refer to `emitted_regions_entering_calls`). So a capture of another client that only a scan without
+        // iterations reads stays unread when the callee reads its own capture zero, and a capture that the function
+        // reads stays required when the callee never reads its own capture zero, at every entry point. Before, the
+        // constant of the capture of the callee was counted as a read of the capture zero of the function, which
+        // rejected the first function with the error of the second.
+        let input_type = |length: usize| ArrayType::new_static(DataType::F32, [length, 4]);
+        let scan_adding = |stack: crate::CompileTracer, capture: &Array| {
+            let scanned = scan(
+                |_, (), slice| {
+                    let capture = ImportingContext::<Session, ThroughCapture>::import(
+                        slice.context(),
+                        Value::Array(capture.clone()),
+                    )?;
+                    let slice = ValueProjection::<ArrayType>::into_projected(slice)?;
+                    let capture = ValueProjection::<ArrayType>::into_projected(capture)?;
+                    Ok(((), (slice + capture).into_value()))
+                },
+                (),
+                stack.into_value(),
+                ScanOptions::new(),
+            );
+            ValueProjection::<ArrayType>::into_projected(scanned.unwrap().1).unwrap()
+        };
+        let read_array = |output: Array| {
+            let values = values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap());
+            (output.r#type().shape().clone(), values)
+        };
+        let read_pair = |(first, second): (Array, Array)| (read_array(first), read_array(second));
+        let read_values = |mut outputs: Vec<Value>| {
+            let second = ValueProjection::<ArrayType>::into_projected(outputs.remove(1)).unwrap();
+            read_pair((ValueProjection::<ArrayType>::into_projected(outputs.remove(0)).unwrap(), second))
+        };
+        let nested = |outer: &Array, outer_length: usize, inner: &Array, inner_length: usize| {
+            let callee = crate::compile_with_options::<_, ArrayType, ArrayType>(
+                |stack: crate::CompileTracer| scan_adding(stack, inner),
+                input_type(inner_length),
+                &session,
+                Options::new(mesh.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            let types = (input_type(outer_length), input_type(inner_length));
+            let function = crate::compile_with_options::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
+                |(first, second): (crate::CompileTracer, crate::CompileTracer)| {
+                    (scan_adding(first, outer), callee.call(second).unwrap())
+                },
+                types.clone(),
+                &session,
+                Options::new(mesh.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            let input = |length: usize| {
+                let bytes = values_to_bytes(&vec![0f32; 4 * length]);
+                Array::from_host_buffer(&session, input_type(length), mesh.clone(), None, bytes).unwrap()
+            };
+            Ok::<_, String>((function, types, (input(outer_length), input(inner_length))))
+        };
+        // An execution, a call, the replay of a call, an execution of a persisted copy, and an execution of a caller.
+        let nested_results = |outer: &Array, outer_length: usize, inner: &Array, inner_length: usize| {
+            let compiled = || nested(outer, outer_length, inner, inner_length);
+            let executed = compiled().and_then(|(function, _, inputs)| {
+                function.executable().execute(&session, inputs).map(read_pair).map_err(|error| error.to_string())
+            });
+            let called = compiled().and_then(|(function, _, inputs)| {
+                function.call(inputs).map(read_pair).map_err(|error| error.to_string())
+            });
+            let replayed = compiled().and_then(|(function, types, (first, second))| {
+                let caller: crate::StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+                    crate::stage(|inputs| function.call(inputs).unwrap(), types, Options::new(mesh.clone())).unwrap();
+                let program = caller.source_program().to_program_with_lifted_captures().unwrap();
+                let mut inputs = caller.source_program().captures().to_vec();
+                inputs.extend([Value::Array(first), Value::Array(second)]);
+                let call = program
+                    .instructions()
+                    .iter()
+                    .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                    .unwrap();
+                let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+                let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
+                let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+                operation
+                    .interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs)
+                    .map(read_values)
+                    .map_err(|error| error.to_string())
+            });
+            let persisted = compiled().and_then(|(function, _, (first, second))| {
+                let lowered = function.staged().into_inner().lower(&session).map_err(|error| error.to_string())?;
+                let compiled = lowered.compile(&session).map_err(|error| error.to_string())?;
+                let bytes = session.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+                let restored = session.deserialize_program(&bytes).unwrap().unwrap();
+                let mut inputs = function.source_program().captures().to_vec();
+                inputs.extend([Value::Array(first), Value::Array(second)]);
+                session.execute(&restored, inputs).map(read_values).map_err(|error| error.to_string())
+            });
+            let caller = compiled().and_then(|(function, types, inputs)| {
+                let caller = crate::compile_with_options::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
+                    |inputs: (crate::CompileTracer, crate::CompileTracer)| function.call(inputs).unwrap(),
+                    types,
+                    &session,
+                    Options::new(mesh.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+                caller.executable().execute(&session, inputs).map(read_pair).map_err(|error| error.to_string())
+            });
+            [executed, called, replayed, persisted, caller]
+        };
+        let nothing = (Shape::new(vec![Dimension::Static(0), Dimension::Static(4)]), Vec::new());
+        let read = (Shape::new(vec![Dimension::Static(1), Dimension::Static(4)]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(nested_results(&foreign, 0, &reversed, 1), [(); 5].map(|()| Ok((nothing.clone(), read.clone()))));
+        let foreign_message = format!(
+            "session constant `{}` retains an array of a different PJRT client than the client of this session",
+            RetainedArray::new(&foreign),
+        );
+        assert_eq!(nested_results(&foreign, 1, &empty, 0), [(); 5].map(|()| Err(foreign_message.clone())));
     }
 
     #[test]
@@ -5340,44 +5972,50 @@ mod tests {
         // A replicated capture on the devices of a function that holds the buffer of only one of its two local replicas
         // (e.g., a partial import) is placed onto its own mesh and sharding once, which copies that replica, so that the
         // executable holds a fully populated capture and every execution creates only its output. Before, it was passed
-        // as it was, and every execution copied the same replica again.
+        // as it was, and every execution copied the same replica again. A capture without elements is placed once as
+        // well, as execution would otherwise create its missing empty buffer on every call.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
-        let device = client.addressable_devices().unwrap()[0].clone();
-        let bytes = values_to_bytes(&values);
-        let buffer = client.buffer(bytes.as_slice(), BufferType::F32, [8u64], None, device, None).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [8]);
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let capture =
-            Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding), vec![buffer]).unwrap();
         let input_placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0));
         let input = session.place(0f32, PlacementOptions::to(input_placement.unwrap())).unwrap();
-        let function = compile_statefully_with_captures::<_, Type, Type>(
-            |captures, _| Ok(captures[0].clone()),
-            vec![Value::Array(capture.clone())],
-            Type::Array(ArrayType::scalar(DataType::F32)),
-            &session,
-            Options::new(mesh),
-        )
-        .unwrap();
-        let [Value::Array(placed)] = function.executable().captures() else {
-            panic!("expected one captured array");
-        };
-        let held = placed.shards().iter().map(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
-        assert_eq!(held, [true, true]);
-        assert!(Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), capture.shards()[0].buffer().unwrap()));
-        let executions = (0..3)
-            .map(|_| {
-                let statistics = session.array_statistics();
-                let output = function.execute_statefully_and_wait(&session, Value::Array(input.clone())).unwrap();
-                let created = session.array_statistics().created_arrays - statistics.created_arrays;
-                let Value::Array(output) = output else { panic!("expected an array output") };
-                (created, output.copy_to_host().unwrap().elements::<f32>().unwrap())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(executions, vec![(1, values); 3]);
+        for values in [(0..8).map(|value| value as f32).collect::<Vec<_>>(), Vec::new()] {
+            let device = client.addressable_devices().unwrap()[0].clone();
+            let bytes = values_to_bytes(&values);
+            let dimensions = [values.len() as u64];
+            let buffer = client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, device, None).unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [values.len()]);
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let capture =
+                Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(sharding), vec![buffer]).unwrap();
+            let function = compile_statefully_with_captures::<_, Type, Type>(
+                |captures, _| Ok(captures[0].clone()),
+                vec![Value::Array(capture.clone())],
+                Type::Array(ArrayType::scalar(DataType::F32)),
+                &session,
+                Options::new(mesh.clone()),
+            )
+            .unwrap();
+            let [Value::Array(placed)] = function.executable().captures() else {
+                panic!("expected one captured array");
+            };
+            let held = placed.shards().iter().map(|shard| shard.buffer().is_some()).collect::<Vec<_>>();
+            assert_eq!(held, [true, true]);
+            // A held buffer with elements is kept, whereas a placement may give an empty one a new empty buffer.
+            let held_buffer = capture.shards()[0].buffer().unwrap();
+            let keeps_held_buffer = Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), held_buffer);
+            assert_eq!(keeps_held_buffer, !values.is_empty());
+            let executions = (0..3)
+                .map(|_| {
+                    let statistics = session.array_statistics();
+                    let output = function.execute_statefully_and_wait(&session, Value::Array(input.clone())).unwrap();
+                    let created = session.array_statistics().created_arrays - statistics.created_arrays;
+                    let Value::Array(output) = output else { panic!("expected an array output") };
+                    (created, output.copy_to_host().unwrap().elements::<f32>().unwrap())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(executions, vec![(1, values); 3]);
+        }
     }
 
     #[test]
@@ -5428,9 +6066,9 @@ mod tests {
         // axis names share one copy once it has completed. Before, each of eight names held a copy of its own. The
         // capture lives on the first device and the destination on the second, so that the copy is a buffer of its own.
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
         let remote = Device::new(local.id() + 1, local.process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
         let r#type = ArrayType::scalar(DataType::F32);
         let upload = Array::from_host_buffer(&session, r#type.clone(), None, None, 3f32.to_ne_bytes()).unwrap();
         assert!(upload.is_locally_assigned());
@@ -5444,12 +6082,113 @@ mod tests {
             placed.to_array(&session).unwrap()
         };
         let buffer = |array: &Array| Arc::clone(array.addressable_shards().next().unwrap().buffer().unwrap());
-        assert!(!retained.can_communicate(&mesh("n0".to_string())));
+        let target = mesh("n0".to_string());
+        assert!(!retained.can_communicate(&target, &Sharding::replicated(target.logical_mesh().clone(), 0)));
         let first = place(0);
         first.block_until_ready().unwrap();
         let buffers = (0..8).map(|index| buffer(&place(index))).collect::<Vec<_>>();
         assert!(buffers.iter().all(|placed| Arc::ptr_eq(placed, &buffer(&first))));
         assert!(!Arc::ptr_eq(&buffer(&first), &buffer(&upload)));
+    }
+
+    #[test]
+    fn test_placed_constant_preserves_replayed_capture_completion_with_shared_buffers() {
+        let client = cpu_client(3);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let device = |index: usize| Device::from_pjrt(&devices[index]).unwrap();
+        let mesh = |index| DeviceMesh::new(LogicalMesh::single_device(), vec![device(index)]).unwrap();
+        let (zero_type, scalar_type) = (ArrayType::scalar(DataType::Zero), ArrayType::scalar(DataType::F32));
+        let healthy =
+            Array::from_host_buffer(&session, scalar_type.clone(), mesh(0), None, 4f32.to_ne_bytes()).unwrap();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(PjrtError::aborted("capture producer failed"))).unwrap();
+        let failed = Array::from_host_buffer(&session, zero_type.clone(), mesh(0), None, [])
+            .unwrap()
+            .with_execution_fence(ExecutionFence::new(vec![event]));
+        let types = (zero_type, scalar_type.clone());
+        let identity: crate::CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compile(|inputs: (CompileTracer, CompileTracer)| inputs, types.clone(), &session, mesh(0)).unwrap();
+        let caller: crate::StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            stage(|inputs| identity.call(inputs).unwrap(), types, Options::new(mesh(0))).unwrap();
+        let program = caller.source_program().to_program_with_lifted_captures().unwrap();
+        let call = program
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+            .unwrap();
+        let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+        let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
+        let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
+        let inputs = [Value::Array(failed), Value::Array(healthy.clone())];
+        let outputs = operation.interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs).unwrap();
+        let Value::Array(dependent) = &outputs[1] else { panic!("expected a replayed array") };
+        let buffer = |array: &Array| Arc::clone(array.shards()[0].buffer().unwrap());
+        assert!(Arc::ptr_eq(&buffer(dependent), &buffer(&healthy)));
+
+        let healthy = RetainedArray::new(&healthy).with_declared_type(scalar_type.clone());
+        let dependent = RetainedArray::new(dependent).with_declared_type(scalar_type);
+        assert_ne!(healthy, dependent);
+        let is_failed = |result: Result<(), Error>| {
+            assert!(matches!(result, Err(Error::Pjrt(PjrtError::Aborted { message, .. }))
+                if message == "capture producer failed"));
+        };
+
+        // Region replay uses the physical placement in either request order while each lift observes its own fence.
+        let lift = |capture: &RetainedArray, target: &DeviceMesh| {
+            let Value::Array(array) =
+                session.with_device_mesh(target.clone()).lift(Constant::Session(capture.clone())).unwrap()
+            else {
+                panic!("expected a lifted capture")
+            };
+            array
+        };
+        let warm_healthy = lift(&healthy, &mesh(1));
+        warm_healthy.block_until_ready().unwrap();
+        let warm_failed = lift(&dependent, &mesh(1));
+        assert!(Arc::ptr_eq(&buffer(&warm_healthy), &buffer(&warm_failed)));
+        is_failed(warm_failed.block_until_ready());
+
+        let cold_failed = lift(&dependent, &mesh(2));
+        is_failed(cold_failed.block_until_ready());
+        let cold_healthy = lift(&healthy, &mesh(2));
+        assert!(Arc::ptr_eq(&buffer(&cold_failed), &buffer(&cold_healthy)));
+        assert_eq!(cold_healthy.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![4.0]);
+
+        // A different mesh name misses the exact key but can reuse the completed copy's buffers.
+        let renamed_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let renamed = DeviceMesh::new(renamed_mesh, vec![device(2)]).unwrap();
+        let reused = lift(&dependent, &renamed);
+        assert!(Arc::ptr_eq(&buffer(&cold_healthy), &buffer(&reused)));
+        is_failed(reused.block_until_ready());
+
+        // Compiled constants have separate hidden slots even when both captures share the same placed buffer.
+        let execute = |target: DeviceMesh, captures: &[RetainedArray]| {
+            let mut builder = ProgramBuilder::new();
+            let outputs = captures
+                .iter()
+                .map(|capture| builder.add_constant(Constant::Session(capture.clone())))
+                .collect::<Vec<_>>();
+            let program: FlatProgram = builder.build(outputs, Vec::new(), vec![Placeholder; captures.len()]).unwrap();
+            let lowered = session.lower_program(&program, 0, &Options::new(target)).unwrap();
+            assert_eq!(lowered.session_constants().len(), captures.len());
+            let (program, captures) = CompilationDomain::compile(&session, &lowered).unwrap();
+            let arguments = captures
+                .into_iter()
+                .map(|value| {
+                    let Value::Array(array) = value else { panic!("expected an executable capture") };
+                    array
+                })
+                .collect();
+            session.execute_program(&program, arguments).and_then(|arrays| {
+                arrays
+                    .into_iter()
+                    .map(|array| array.copy_to_host()?.elements::<f32>().map_err(Error::from))
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+        };
+        assert_eq!(execute(mesh(1), std::slice::from_ref(&healthy)).unwrap(), vec![vec![4.0]]);
+        is_failed(execute(mesh(1), &[healthy, dependent]).map(|_| ()));
     }
 
     #[test]
@@ -5482,12 +6221,14 @@ mod tests {
 
     #[test]
     fn test_session_lower_program_rejects_misattributed_mesh_devices() {
-        // A function compiled for a mesh that assigns the device of this process to another process, or a device that
-        // this process cannot address to this process, is rejected before anything is lowered or compiled, as a
-        // placement of a capture rejects it (refer to
-        // `test_placed_constant_rejects_misattributed_devices_before_the_placement_attempt`), so every process rejects
-        // it alike, also for a function without captures. Before, it compiled, and an execution either failed for a
-        // missing shard or returned a result on the misattributed mesh.
+        // A function compiled for a mesh that assigns the device of this process to another process, a device that
+        // this process cannot address to this process, or a device of another process that the session does not know
+        // (e.g., a mistyped identifier) is rejected before anything is lowered or compiled, as a placement of a capture
+        // rejects it (refer to `test_placed_constant_rejects_misattributed_devices_before_the_placement_attempt`), so
+        // every process rejects it alike, also for a function without captures. A session that declares that device
+        // passes this check, and a CPU client, which lists only its own devices, then cannot assign the program to that
+        // device. Before, it compiled, and an execution either failed for a missing shard or returned a
+        // result on the misattributed mesh, and a device that the session does not know compiled as well.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -5501,13 +6242,56 @@ mod tests {
         };
         let error =
             |device: Device| session.lower_program(&program, 0, &Options::new(mesh(device))).unwrap_err().to_string();
+        let unknown = Device::new(999, process_index + 1);
         assert_eq!(
-            [error(Device::new(device_id, process_index + 1)), error(Device::new(device_id + 999, process_index))],
+            [
+                error(Device::new(device_id, process_index + 1)),
+                error(Device::new(device_id + 999, process_index)),
+                error(unknown),
+            ],
             [
                 format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1),
                 format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 999),
+                format!(
+                    "device 999 of process {} is not a device of the session; declare the devices of other processes \
+                     that the PJRT client does not list with `SessionBuilder::remote_devices`",
+                    process_index + 1,
+                ),
             ],
         );
+        let declared = session_with_remote_devices(client, [unknown]);
+        assert!(matches!(
+            declared.lower_program(&program, 0, &Options::new(mesh(unknown))),
+            Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
+                if reason == "device 999 is not visible to the live client",
+        ));
+    }
+
+    #[test]
+    fn test_session_eager_dispatch_describes_remote_singleton_outputs() {
+        let client = cpu_client(1);
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let remote = Device::new(999, local.process_index() + 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh.clone(), 0);
+        let mesh = DeviceMesh::new(logical_mesh, vec![remote]).unwrap();
+        let input = Array::from_addressable_buffers(
+            &session,
+            ArrayType::scalar(DataType::F32),
+            mesh.clone(),
+            Some(sharding.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let output = input.sin().unwrap();
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.sharding(), &sharding);
+        assert_eq!(output.shards().len(), 1);
+        assert_eq!(output.addressable_shards().count(), 0);
+        assert_eq!(session.compilation_cache().statistics().compilations, 0);
     }
 
     #[test]
@@ -5518,7 +6302,7 @@ mod tests {
         // original split on that pair keeps the layout as a placement of the capture itself does, rather than dropping
         // it because it started from that copy. Before, it dropped it.
         let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
+        let session = session_with_remote_devices(client, (0..4).map(|device| Device::new(2048 + device, 1)));
         let mesh = |name: &str, devices: [usize; 2]| {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(name, 2, MeshAxisType::Auto).unwrap()]).unwrap();
             DeviceMesh::new(logical_mesh, devices.map(|device| Device::new(2048 + device, 1)).to_vec()).unwrap()

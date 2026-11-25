@@ -8,6 +8,8 @@ use libloading::Library;
 use crate::Error;
 use crate::ffi::{HipDeviceProperties, HipModuleLaunchKernel};
 
+// TODO(eaplatanios): Review this module.
+
 /// Resolved entry points whose library remains alive through all module and context ownership.
 pub(crate) struct HipDriver {
     /// Native library, absent only for deterministic injected-driver tests.

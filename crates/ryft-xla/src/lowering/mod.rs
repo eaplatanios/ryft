@@ -86,7 +86,7 @@ use crate::{
 ///
 /// Public lowering entry points return these errors through [`Error::Lowering`]. Core program and native MLIR errors
 /// retain their original types in [`Error::Core`] and [`Error::Mlir`], respectively.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum LoweringError {
     /// The caller selected an empty function symbol or one containing whitespace.
     #[error("invalid function name `{function_name}` used during XLA lowering")]
@@ -644,6 +644,26 @@ pub trait LowerableOperation: CoreOperation {
     fn composite_key(&self) -> Option<&CompositeKey> {
         None
     }
+
+    /// Returns, for each input of `callee`, the callee of a `jit_call` of this family whose first `capture_count`
+    /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
+    /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
+    /// requires no buffer in place of such a capture, and the function that makes the call reads the operand only
+    /// where the callee reads it. Only a family knows the regions of its callees, so this function is asked of the
+    /// family. It returns [`None`] unless a family overrides it, and [`Operation`] answers from the regions that its
+    /// lowering emits.
+    #[inline]
+    fn unread_captures(
+        callee: RegionRef<'_, Constant, Self>,
+        capture_count: usize,
+        target_platform: Option<&str>,
+    ) -> Option<Arc<[bool]>>
+    where
+        Self: CoreOperation<Type = Type>,
+    {
+        let _ = (callee, capture_count, target_platform);
+        None
+    }
 }
 
 /// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`Type`],
@@ -866,6 +886,15 @@ impl LowerableOperation for Operation {
             Self::LiftedComposite(operation) => operation.key(),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn unread_captures(
+        callee: RegionRef<'_, Constant, Self>,
+        capture_count: usize,
+        target_platform: Option<&str>,
+    ) -> Option<Arc<[bool]>> {
+        unread_lifted_captures(callee, capture_count, target_platform)
     }
 
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -1366,6 +1395,7 @@ where
         true,
         &[],
         &[],
+        &[],
         RaggedDotLoweringStrategy::default(),
         &[],
         false,
@@ -1414,6 +1444,7 @@ where
         true,
         &[],
         &[],
+        &[],
         RaggedDotLoweringStrategy::default(),
         open_results,
         false,
@@ -1437,10 +1468,19 @@ where
 /// public input, or none at all). Each donated input is paired with an output that it can share its buffers with and
 /// the pair is recorded as the same kind of alias, as JAX does for the donated arguments of a `jit` function. An
 /// output can share the buffers of an input when both are static device arrays of the identical type and sharding,
-/// and when the output is not open on a mesh of more than one device, because the compiler could then place it
-/// differently than the input. Without such an alias the outputs of every execution are written to new buffers,
-/// which is correct but forces backends that cache launch state per buffer address (e.g., the command buffers of
-/// the XLA GPU backend) to rebuild that state for every execution of a program that updates its inputs in a loop.
+/// or, for an input without such an output, when both have shardings under which every device holds shards of the
+/// same type (e.g., a donated input with a pending sum and an output that completes it, as in the compiled reshard of
+/// a donated array), and in both cases only when the output is not open on a mesh of more than one device, because
+/// the compiler could then place it differently than the input. Without such an alias the outputs of every execution
+/// are written to new buffers, which is correct but forces backends that cache launch state per buffer address (e.g.,
+/// the command buffers of the XLA GPU backend) to rebuild that state for every execution of a program that updates
+/// its inputs in a loop.
+///
+/// `unread_inputs` flags the public inputs that the program never reads (i.e., one flag per public input, or none at
+/// all), which the caller states because it cannot be read from `program` (e.g., an input of the program of an eager
+/// call that the call passes as a capture which its callee never reads, refer to [`unread_lifted_captures`]). Such an
+/// input with a static shape has no executable argument, like a capture that no emitted region reads (refer to
+/// [`emitted_capture_reads`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     Input,
@@ -1461,6 +1501,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
+    unread_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
 ) -> Result<LoweredModule, Error>
@@ -1484,6 +1525,7 @@ where
         supports_shardy,
         reference_states,
         donated_inputs,
+        unread_inputs,
         ragged_dot_lowering_strategy,
         open_results,
         true,
@@ -1508,6 +1550,18 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,
 ) -> impl Iterator<Item = RegionRef<'r, V, O>> {
+    emitted_regions_entering_calls(entry, target_platform, true)
+}
+
+/// Returns the regions of [`emitted_regions`], without the callees of the `jit_call`s among them and the regions below
+/// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
+/// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
+/// input `k` (refer to `lower_jit_call`), which the call receives as its operand `k`.
+fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
+    entry: RegionRef<'r, V, O>,
+    target_platform: Option<&'r str>,
+    enters_calls: bool,
+) -> impl Iterator<Item = RegionRef<'r, V, O>> {
     let mut visited = vec![false; entry.arena().len()];
     let mut pending = vec![entry.id()];
     std::iter::from_fn(move || {
@@ -1518,7 +1572,9 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
             // Every pending identifier is the entry or a region of an instruction of the same arena.
             let region = entry.with_id(id).unwrap();
             for instruction in region.instructions() {
-                if !omits_regions(region, instruction, target_platform) {
+                if !omits_regions(region, instruction, target_platform)
+                    && (enters_calls || instruction.operation().projected_payload::<JitCallOperation<Type>>().is_none())
+                {
                     pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
                         (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
                     }));
@@ -1530,6 +1586,170 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
     })
 }
 
+/// Returns, for each of the first `capture_count` captures of the program whose entry region is `entry`, whether a
+/// region that lowering emits for `target_platform` reads it (refer to [`emitted_regions`]), as an operand of one of
+/// its instructions or as one of its outputs. Every region names a capture through a constant whose
+/// [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e., when
+/// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
+/// that only the body of a scan that admits no iteration reads) is neither admitted when a function is compiled nor
+/// passed to its executable, whose signature erases it (refer to `lower_mlir_module_for_program_with_effect_boundary`),
+/// so that admission and lowering read this one decision. A capture that a region only passes on to a call as a
+/// capture which the callee never reads is not read either (refer to [`visit_emitted_reads`]). The regions of the
+/// callees of calls are not visited, because their constants name the captures of those callees, which a callee reads
+/// only through the operands of its call (refer to [`emitted_regions_entering_calls`]).
+pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
+    entry: RegionRef<'r, Constant, O>,
+    capture_count: usize,
+    lifted: bool,
+    target_platform: Option<&'r str>,
+) -> Vec<bool> {
+    let mut is_read = vec![false; capture_count];
+    let entry_id = entry.id();
+    for region in emitted_regions_entering_calls(entry, target_platform, false) {
+        let mut lifted_captures = HashMap::new();
+        if lifted && region.id() == entry_id {
+            let inputs = region.input_ids().iter().take(capture_count);
+            lifted_captures.extend(inputs.enumerate().map(|(index, id)| (*id, index)));
+        }
+        visit_emitted_reads(region, target_platform, |id, is_live| {
+            if !is_live {
+                return;
+            }
+            let index = lifted_captures.get(&id).copied().or_else(|| {
+                region.atoms().get(id.index()).and_then(|atom| atom.as_constant()).and_then(Value::capture_index)
+            });
+            if let Some(index) = index.filter(|index| *index < capture_count) {
+                is_read[index] = true;
+            }
+        });
+    }
+    is_read
+}
+
+/// Calls `visit` with every atom that `region` reads, as an operand of one of its instructions or as one of its
+/// outputs, and with whether that read is live. Every read is live except an operand that a `jit_call` passes as a
+/// lifted capture which its callee never reads (refer to [`unread_call_captures`]), which the lowering of the call
+/// replaces with a value that requires no buffer. This is the one rule by which the captures of a program (refer to
+/// [`emitted_capture_reads`]) and its session constants (refer to [`partition_session_constants`]) are read, so that
+/// the admission of a function, the signature of its executable, its session constants, and the lowering of its calls
+/// agree. A call without captures costs one comparison.
+fn visit_emitted_reads<O: LowerableOperationFamily>(
+    region: RegionRef<'_, Constant, O>,
+    target_platform: Option<&str>,
+    mut visit: impl FnMut(AtomId, bool),
+) {
+    for instruction in region.instructions() {
+        let unread = instruction
+            .operation()
+            .projected_payload::<JitCallOperation<Type>>()
+            .filter(|call| call.capture_count() != 0)
+            .and_then(|call| {
+                let callee = region.with_id(*instruction.regions().first()?).ok()?;
+                unread_call_captures(callee, call.capture_count(), target_platform)
+            });
+        for (index, id) in instruction.inputs().iter().enumerate() {
+            visit(*id, !unread.as_deref().is_some_and(|unread| unread.get(index).copied().unwrap_or(false)));
+        }
+    }
+    for id in region.output_ids() {
+        visit(*id, true);
+    }
+}
+
+/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` operands are its lifted
+/// captures, whether it is a capture that the callee never reads, as the family of the call answers it (refer to
+/// [`LowerableOperation::unread_captures`], which [`Operation`] answers with [`unread_lifted_captures`]), or [`None`]
+/// when every capture counts as read.
+pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
+    callee: RegionRef<'_, Constant, O>,
+    capture_count: usize,
+    target_platform: Option<&str>,
+) -> Option<Arc<[bool]>> {
+    O::unread_captures(callee, capture_count, target_platform)
+}
+
+/// Returns, for each logical argument of the entry function of `program`, whose types are `argument_types` and whose
+/// first `capture_count` arguments are captures that end with the arguments of its `session_count` session constants,
+/// whether the executable has no argument for it because nothing reads it. That is a capture that no region which
+/// lowering emits for `target_platform` reads (refer to [`emitted_capture_reads`]) and a public input that
+/// `unread_inputs` flags, which the caller states because it cannot be read from `program` (refer to
+/// `Options::with_unread_inputs`), of a static shape and backing no reference state (i.e., not at one of
+/// `reference_state_inputs`). This is the one liveness decision of an executable boundary: the admission and the
+/// placement of its arguments when a function is compiled, the signature of its executable, which records it (refer to
+/// [`ExecutableSignature::is_unread_input`]), and every execution and persisted copy of it read it, and none of them
+/// requires anything of such an argument.
+pub(crate) fn unread_entry_arguments<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    argument_types: &[ArrayType],
+    capture_count: usize,
+    session_count: usize,
+    unread_inputs: &[bool],
+    reference_state_inputs: &[usize],
+    target_platform: Option<&str>,
+) -> Vec<bool>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    let lifted = program.input_count() + session_count == argument_types.len();
+    let source_capture_count = capture_count.saturating_sub(session_count);
+    let capture_reads =
+        emitted_capture_reads(program.entry_region_ref(), source_capture_count, lifted, target_platform);
+    argument_types
+        .iter()
+        .enumerate()
+        .map(|(index, r#type)| {
+            let is_read = match index.checked_sub(capture_count) {
+                Some(public_index) => !unread_inputs.get(public_index).copied().unwrap_or(false),
+                None => capture_reads.get(index).copied().unwrap_or(true),
+            };
+            !is_read && r#type.static_shape().is_some() && !reference_state_inputs.contains(&index)
+        })
+        .collect()
+}
+
+/// [`Transform`] marker under which [`unread_lifted_captures`] retains its result with a callee, for the number of
+/// lifted captures and the target platform that its arguments name. The region-owned cache only retains owned
+/// arguments, so the name of the platform is held as a [`String`].
+struct UnreadLiftedCapturesAnalysis;
+
+impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis {
+    type Arguments = (usize, Option<String>);
+    type Artifact = TransformArtifact<Constant, Operation, Option<Arc<[bool]>>>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 1;
+}
+
+/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
+/// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
+/// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
+/// `lower_mlir_module_for_program_with_effect_boundary`), or [`None`] when the callee has no such capture. An eager
+/// application of the call (refer to `JitCallOperation::eager_decision`) requires nothing of such a capture, as an
+/// execution of the callee requires nothing of it. The flags depend on the callee, the number of its captures, and the
+/// platform alone, so they are derived once for each of them and retained with the callee, and repeated applications
+/// only look them up.
+pub(crate) fn unread_lifted_captures(
+    callee: RegionRef<'_, Constant, Operation>,
+    capture_count: usize,
+    target_platform: Option<&str>,
+) -> Option<Arc<[bool]>> {
+    let derive = |callee: RegionRef<'_, Constant, Operation>| -> Result<_, Infallible> {
+        let is_read = emitted_capture_reads(callee, capture_count, true, target_platform);
+        let input_types = callee.interface().input_types();
+        let mut unread = vec![false; input_types.len()];
+        for (index, is_read) in is_read.into_iter().enumerate() {
+            unread[index] = !is_read
+                && matches!(input_types.get(index), Some(Type::Array(r#type)) if r#type.static_shape().is_some());
+        }
+        let unread = unread.contains(&true).then(|| Arc::from(unread));
+        Ok(TransformArtifact::new(Vec::new(), unread))
+    };
+    let arguments = (capture_count, target_platform.map(str::to_owned));
+    let Ok(artifact) =
+        callee.transform::<UnreadLiftedCapturesAnalysis, _, Infallible>(arguments, |callee, _| derive(callee));
+    artifact.metadata().clone()
+}
+
 /// Returns the distinct [`RetainedArray`]s that `program` references in the regions that lowering emits for
 /// `target_platform` (i.e., its entry region and the executed nested regions of that region, refer to
 /// `emitted_regions`), in the order of their first occurrence in those regions. Lowering passes their arrays as hidden
@@ -1537,7 +1757,8 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
 /// arguments must use the same order and the same target as that lowering. Regions that lowering never reaches (e.g.,
 /// the rule regions of composites, the transpose region of a `linear_call`, or a body that the implementation of a
 /// named composite replaces for the target) are skipped, so that an array that only they refer to does not become an
-/// argument of the executable.
+/// argument of the executable. So is an array that the emitted regions only pass on to calls as captures which their
+/// callees never read (refer to [`partition_session_constants`]).
 pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     target_platform: Option<&str>,
@@ -1546,21 +1767,64 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
+    partition_session_constants(program.entry_region_ref(), target_platform).0
+}
+
+/// Returns the distinct [`RetainedArray`]s that the regions which lowering emits for `target_platform` below `entry`
+/// reference, in the order of their first occurrence in those regions, split into the session constants of the program
+/// (refer to [`collect_session_constants`]) and the arrays that those regions only pass on to calls as captures which
+/// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they have
+/// no executable argument, and lowering binds each of them to a value that requires no buffer (i.e., the value with
+/// which the entry function binds an erased argument), which the calls receive in its place.
+pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
+    entry: RegionRef<'_, Constant, O>,
+    target_platform: Option<&str>,
+) -> (Vec<RetainedArray>, Vec<RetainedArray>) {
+    partition_region_session_constants(emitted_regions(entry, target_platform), target_platform)
+}
+
+/// Returns the distinct [`RetainedArray`]s that `regions` reference, in the order of their first occurrence in them,
+/// split into those that they read and those that they only pass on to calls as captures which the callees never read
+/// (refer to [`partition_session_constants`] and [`entry_session_constants`]).
+fn partition_region_session_constants<'r, O: LowerableOperationFamily + 'r>(
+    regions: impl Iterator<Item = RegionRef<'r, Constant, O>>,
+    target_platform: Option<&str>,
+) -> (Vec<RetainedArray>, Vec<RetainedArray>) {
     // The set indexes the constants seen so far by their identity, so that collecting distinct constants costs one hash
     // for each occurrence rather than a comparison with every constant collected before it.
     let mut seen = HashSet::new();
     let mut session_constants = Vec::new();
-    for region in emitted_regions(program.entry_region_ref(), target_platform) {
+    let mut live = HashSet::new();
+    let mut passed_on = HashSet::new();
+    for region in regions {
+        let mut has_session_constants = false;
         for atom in region.atoms() {
-            if let Some(Constant::Session(constant)) = atom.as_constant()
-                && !seen.contains(constant)
-            {
-                seen.insert(constant.clone());
-                session_constants.push(constant.clone());
+            if let Some(constant) = atom.as_constant().and_then(|constant| session_constant(constant)) {
+                has_session_constants = true;
+                if seen.insert(constant.clone()) {
+                    session_constants.push(constant.clone());
+                }
             }
         }
+        if has_session_constants {
+            visit_emitted_reads(region, target_platform, |id, is_live| {
+                let atom = region.atoms().get(id.index());
+                if let Some(constant) = atom.and_then(|atom| atom.as_constant()).and_then(session_constant) {
+                    if is_live {
+                        live.insert(constant.clone())
+                    } else {
+                        passed_on.insert(constant.clone())
+                    };
+                }
+            });
+        }
+    }
+    if passed_on.iter().all(|constant| live.contains(constant)) {
+        return (session_constants, Vec::new());
     }
     session_constants
+        .into_iter()
+        .partition(|constant| live.contains(constant) || !passed_on.contains(constant))
 }
 
 /// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
@@ -1869,46 +2133,22 @@ where
 
 /// Returns the session constants that the program whose entry region is `entry`, which is already pruned, holds in
 /// the regions that its entry region owns and that lowering emits for `target_platform` (refer to
-/// [`owned_session_constants`]).
-fn entry_session_constants<V, O>(entry: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Vec<RetainedArray>
-where
-    V: Value<Type = Type> + 'static,
-    O: LowerableOperationFamily,
-{
-    let mut seen = HashSet::new();
-    let mut constants = Vec::new();
-    let mut visited = vec![false; entry.arena().len()];
-    let mut pending = vec![entry.id()];
-    while let Some(id) = pending.pop() {
-        if std::mem::replace(&mut visited[id.index()], true) {
-            continue;
-        }
-        let Ok(region) = entry.with_id(id) else { continue };
-        for atom in region.atoms() {
-            if let Some(constant) = atom.as_constant().and_then(|constant| session_constant(constant))
-                && seen.insert(constant.clone())
-            {
-                constants.push(constant.clone());
-            }
-        }
-        for instruction in region.instructions() {
-            if instruction.operation().projected_payload::<JitCallOperation<Type>>().is_some()
-                || omits_regions(region, instruction, target_platform)
-            {
-                continue;
-            }
-            pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
-            }));
-        }
-    }
-    constants
+/// [`owned_session_constants`]). These are the regions of the capture scope of `entry` (refer to
+/// [`emitted_regions_entering_calls`]). A constant that those regions only pass on to calls as a capture which the
+/// callees never read is not returned, as the execution of the program has no argument for it (refer to
+/// [`partition_session_constants`]).
+fn entry_session_constants<O: LowerableOperationFamily>(
+    entry: RegionRef<'_, Constant, O>,
+    target_platform: Option<&str>,
+) -> Vec<RetainedArray> {
+    let regions = emitted_regions_entering_calls(entry, target_platform, false);
+    partition_region_session_constants(regions, target_platform).0
 }
 
-/// Returns the array that `constant` retains if it is a session constant (i.e., a [`Constant::Session`]), which only
-/// the programs over the constants of this crate hold, and [`None`] for any other constant.
-fn session_constant<V: 'static>(constant: &V) -> Option<&RetainedArray> {
-    match (constant as &dyn Any).downcast_ref::<Constant>()? {
+/// Returns the array that `constant` retains if it is a session constant (i.e., a [`Constant::Session`]), and [`None`]
+/// for any other constant.
+fn session_constant(constant: &Constant) -> Option<&RetainedArray> {
+    match constant {
         Constant::Session(constant) => Some(constant),
         _ => None,
     }
@@ -2166,7 +2406,7 @@ pub(crate) fn merge_requested_placement<'r>(
 /// Placement that the entry region of a program gives one of its results, as [`entry_result_placements`] returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum EntryResultPlacement {
-    /// The result is produced by a `place` whose target has this sharding.
+    /// The program determines the result's sharding.
     Target(Sharding),
 
     /// The result is the entry argument at this index, which it returns where that argument enters the program.
@@ -2176,20 +2416,18 @@ pub(crate) enum EntryResultPlacement {
 /// Returns the placement that `program` itself gives each of its first `output_count` results, or [`None`] for a
 /// result that it gives no placement. A result that a `place` in the entry region produces has the placement of its
 /// target, which states the placement along every mesh axis, including the auto mesh axes that the result type drops.
-/// Only placements in the entry region and in the callees of its `jit_call`s count, because a placement in another
-/// nested region (e.g., a branch of a `condition` or the body of a loop) reaches a result only through the result of
-/// the operation that owns that region, which the compiler is free to place differently. A result that is an entry
-/// argument is placed where that argument enters the program, which the caller knows and which also covers arguments
-/// without buffers (i.e., of the zero data type), whose placement the compiler cannot report. A result that returns a
-/// [`RetainedArray`] is likewise placed as the hidden argument that supplies it, whose sharding
-/// `constant_sharding` returns.
+/// A bufferless result of `condition`, `scan`, or `while` uses its declared sharding or an entry output override,
+/// because the compiler has no result buffer from which to report a placement along auto axes. A result that is an
+/// entry argument is placed where that argument enters the program. A result that returns a [`RetainedArray`] is
+/// placed as the hidden argument that supplies it, whose sharding `constant_sharding` returns.
 ///
 /// Operations that return the value of an input together with its placement are followed back to that input, so that a
 /// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
 /// target, which leaves its input where it is, a `place` with a device target, which keeps the sharding of its input
 /// on the only device of the program mesh, `transfer_to_memory`, which only changes the memory of its input as a
-/// `place` with an in-place target does, and `stop_gradient` and `tag`, which only mark values for program transforms
-/// and lower to nothing. A device target that completes a pending reduction over mesh axes of size one
+/// `place` with an in-place target does, `stop_gradient` and `tag`, which only mark values for program transforms,
+/// and identity `broadcast` operations that forget a compatible global sharding on an explicit mesh. A device
+/// target that completes a pending reduction over mesh axes of size one
 /// gives its result another sharding than its input, so such a result is placed as its type states instead. A
 /// `jit_call` always runs its callee, whose results are the results of the call, so a result of a call has the
 /// placement that the callee gives the corresponding callee result, and a callee result that returns a callee input is
@@ -3621,6 +3859,50 @@ fn validate_local_output_placement(
     Ok(())
 }
 
+/// Returns whether every device holds shards of the same type of a static input of `input_type` placed with
+/// `input_sharding` and of an output of `output_type` placed with `output_sharding`, although the two shardings may
+/// differ (e.g., when the output completes a pending sum of the input along a mesh axis, or splits a dimension along
+/// another axis of the same size). The output can then take the buffers of the donated input on every device, as JAX
+/// pairs a donated argument of a `jit` function with a result of the same shard shape. That is the case when both
+/// shardings are on the same mesh, the types are identical apart from their shardings (i.e., in data type, shape,
+/// layout, and memory), and both shardings split each dimension into shards of the same static extent.
+fn has_same_shard_types(
+    input_type: &ArrayType,
+    input_sharding: Option<&Sharding>,
+    output_type: &ArrayType,
+    output_sharding: Option<&Sharding>,
+) -> bool {
+    let (Some(input_sharding), Some(output_sharding), Some(shape)) =
+        (input_sharding, output_sharding, input_type.static_shape())
+    else {
+        return false;
+    };
+    // The extent of the shards of each dimension, or `None` when a dimension is unconstrained, names an axis that the
+    // mesh does not have, or is not split evenly.
+    let shard_extents = |sharding: &Sharding| {
+        if sharding.rank() != shape.rank() {
+            return None;
+        }
+        shape
+            .dimensions()
+            .iter()
+            .zip(sharding.dimensions())
+            .map(|(&extent, dimension)| match dimension {
+                ShardingDimension::Replicated => Some(extent),
+                ShardingDimension::Sharded(axes) => {
+                    let count = axes.iter().map(|axis| sharding.mesh().axis_size(axis)).product::<Option<usize>>()?;
+                    (count != 0 && extent % count == 0).then(|| extent / count)
+                }
+                ShardingDimension::Unconstrained => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let without_sharding = |r#type: &ArrayType| r#type.clone().with_sharding(None).ok();
+    input_sharding.mesh() == output_sharding.mesh()
+        && without_sharding(input_type) == without_sharding(output_type)
+        && shard_extents(input_sharding).is_some_and(|extents| Some(extents) == shard_extents(output_sharding))
+}
+
 /// Expands optional shardings of every value of a signature with `count` values into one optional sharding per value.
 /// Provided shardings are kept as they are, so that a count mismatch is still reported when the module is lowered.
 fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<Sharding>> {
@@ -3653,6 +3935,7 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
+    unread_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
     open_results: &[bool],
     export_effects: bool,
@@ -3673,7 +3956,8 @@ where
     let function_name = normalize_function_name(function_name.as_ref())?;
     // Session constants are carried by hidden arguments that form the suffix of the capture arguments. The caller
     // declares them through the trailing `capture_types`, in the order of `collect_session_constants`.
-    let session_constants = collect_session_constants(program, target_platform);
+    let (session_constants, passed_on_constants) =
+        partition_session_constants(program.entry_region_ref(), target_platform);
     let session_count = session_constants.len();
     if session_count > 0
         && (capture_types.len() < session_count
@@ -3695,7 +3979,23 @@ where
         capture_types.iter().cloned().chain(global_input_types.iter().cloned()).collect::<Vec<_>>();
     let effects = program.effects().classes();
     let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
+    // An argument that the executable never reads (refer to `unread_entry_arguments`) has no executable argument, so
+    // that executions neither admit, require, nor wait for its buffers, and the signature records it as unread.
+    let reference_state_inputs = reference_states
+        .iter()
+        .filter_map(|state| state.source().flat_input_index(capture_types.len()).ok())
+        .collect::<Vec<_>>();
+    let unread_arguments = unread_entry_arguments(
+        program,
+        &logical_argument_types,
+        capture_types.len(),
+        session_count,
+        unread_inputs,
+        &reference_state_inputs,
+        target_platform,
+    );
     let mut signature = ExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice())
+        .with_unread_inputs(&unread_arguments)
         .with_effects(
             export_effects && ordered_io,
             effects.contains(EffectClass::UnorderedIo),
@@ -3815,36 +4115,51 @@ where
     }
     // Each donated input is paired with the first output that can share its buffers and that no earlier input was
     // paired with, as JAX pairs the donated arguments of a `jit` function with its results. The pairs are the same
-    // hints as the reference state aliases above, so an input that finds no output simply stays unpaired.
-    for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
-        let logical_input_index = capture_types.len() + input_index;
-        let input_type = &logical_argument_types[logical_input_index];
-        let Some(physical_input_index) = signature.input_mapping()[logical_input_index] else { continue };
-        if state_inputs.contains(&logical_input_index)
-            || input_type.static_shape().is_none()
-            || input_type.memory() != Memory::Device
-        {
-            continue;
-        }
-        let input_sharding = &argument_shardings[logical_input_index];
-        // The compiler places an open output itself, and only on a single device is that placement certain to be the
-        // placement of the input.
-        let has_single_device = input_sharding
-            .as_ref()
-            .is_none_or(|sharding| sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1);
-        let physical_output_index =
-            global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
-                let physical_output_index = signature.output_mapping()[logical_output_index]?;
-                let is_open = open_results.get(logical_output_index).copied().unwrap_or(false);
-                (output_type == input_type
-                    && &result_shardings[logical_output_index] == input_sharding
-                    && (has_single_device || !is_open)
-                    && !aliased_outputs.contains(&physical_output_index))
-                .then_some(physical_output_index)
-            });
-        if let Some(physical_output_index) = physical_output_index {
-            aliased_outputs.insert(physical_output_index);
-            aliases.insert(physical_input_index, physical_output_index);
+    // hints as the reference state aliases above, so an input that finds no output simply stays unpaired. Every
+    // donated input is first paired with an output of its own type and sharding, and only an input that finds none is
+    // then paired with an output whose shards have the types of its shards (refer to `has_same_shard_types`), so that
+    // the second pass only adds pairs to inputs that the first one leaves unpaired.
+    for same_sharding in [true, false] {
+        for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
+            let logical_input_index = capture_types.len() + input_index;
+            let input_type = &logical_argument_types[logical_input_index];
+            let Some(physical_input_index) = signature.input_mapping()[logical_input_index] else { continue };
+            if state_inputs.contains(&logical_input_index)
+                || aliases.contains_key(&physical_input_index)
+                || input_type.static_shape().is_none()
+                || input_type.memory() != Memory::Device
+            {
+                continue;
+            }
+            let input_sharding = &argument_shardings[logical_input_index];
+            // The compiler places an open output itself, and only on a single device is that placement certain to be
+            // the placement of the input.
+            let has_single_device = input_sharding
+                .as_ref()
+                .is_none_or(|sharding| sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1);
+            let physical_output_index =
+                global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
+                    let physical_output_index = signature.output_mapping()[logical_output_index]?;
+                    let is_open = open_results.get(logical_output_index).copied().unwrap_or(false);
+                    let output_sharding = &result_shardings[logical_output_index];
+                    let shares_buffers = match same_sharding {
+                        true => output_type == input_type && output_sharding == input_sharding,
+                        false => has_same_shard_types(
+                            input_type,
+                            input_sharding.as_ref(),
+                            output_type,
+                            output_sharding.as_ref(),
+                        ),
+                    };
+                    (shares_buffers
+                        && (has_single_device || !is_open)
+                        && !aliased_outputs.contains(&physical_output_index))
+                    .then_some(physical_output_index)
+                });
+            if let Some(physical_output_index) = physical_output_index {
+                aliased_outputs.insert(physical_output_index);
+                aliases.insert(physical_input_index, physical_output_index);
+            }
         }
     }
     let physical_argument_types = signature.physical_input_types(logical_argument_types.as_slice());
@@ -3874,12 +4189,14 @@ where
     let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
 
     // Module-scoped lowering state, shared between the entry function body and private functions below so channel ids
-    // stay unique and target, representation policy, named compositions, and provenance state reach nested bodies.
+    // stay unique and target, representation policy, named compositions, and provenance state reach nested bodies. The
+    // arrays that the program only passes on to calls that never read them follow the session constants in the table,
+    // and the entry function binds them to values that require no buffer (refer to `partition_session_constants`).
     let collective_state = CollectiveLoweringState::new()
         .with_target_platform(target_platform)
         .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
         .with_named_compositions(named_compositions.clone())
-        .with_session_constants(&session_constants);
+        .with_session_constants(&[session_constants.as_slice(), passed_on_constants.as_slice()].concat());
 
     // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
     // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
@@ -4067,16 +4384,25 @@ where
                         }
                         value
                     }
-                    None => lower_unplaced_constant_output(
-                        std::slice::from_ref(array_type),
-                        0,
-                        &mut function_block_ref,
-                        &context,
-                        location.as_ref(),
-                    )?
-                    .into_iter()
-                    .next()
-                    .unwrap(),
+                    None => {
+                        let value = lower_unplaced_constant_output(
+                            std::slice::from_ref(array_type),
+                            0,
+                            &mut function_block_ref,
+                            &context,
+                            location.as_ref(),
+                        )?
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                        // An unread argument (refer to `unread_arguments` above) is a placeholder that no emitted region
+                        // reads and that XLA removes, so its sharding is not applied either.
+                        if signature.is_unread_input(logical_index) {
+                            logical_argument_values.push(value);
+                            continue;
+                        }
+                        value
+                    }
                 };
                 debug_assert_eq!(value.r#type()?, tensor_type.as_ref());
                 // An argument that arrives with a pending reduction that its type does not record (i.e., over auto mesh
@@ -4148,13 +4474,27 @@ where
             } else {
                 public_input_values
             };
+            // The arrays that the program only passes on to calls that never read them are bound like unread arguments,
+            // after the session constants (refer to `collective_state` above).
+            let mut captured_values = Cow::Borrowed(capture_values);
+            for constant in &passed_on_constants {
+                let r#type = constant.r#type();
+                let values = lower_unplaced_constant_output(
+                    std::slice::from_ref(r#type.as_ref()),
+                    0,
+                    &mut function_block_ref,
+                    &context,
+                    location.as_ref(),
+                )?;
+                captured_values.to_mut().extend(values);
+            }
             let mut effect_tokens = EffectTokens::default();
             if let Some(index) = signature.ordered_io_input_index() {
                 effect_tokens.set(EffectClass::OrderedIo, function_block.argument(index).unwrap().as_ref());
             }
             let logical_outputs = lower_program_outputs_with_inputs(
                 program,
-                capture_values,
+                &captured_values,
                 input_values,
                 &mut function_block_ref,
                 &context,
@@ -4304,6 +4644,24 @@ fn region_result_placements<O: LowerableOperationFamily>(
                 // These operations return each of their inputs as the output at the same position, and a memory
                 // transfer keeps the devices and the sharding of its input like an in-place `place` target does.
                 output_index
+            } else if let Some(broadcast) = operation.projected_payload::<BroadcastOperation>() {
+                let source = region.atoms()[instruction.inputs().first()?.index()].r#type();
+                let Type::Array(source) = source.as_ref() else { return None };
+                let target = broadcast.output_type();
+                // A transpose can forget tracked sharding to match an untracked cotangent type. Keep the split
+                // chosen by an explicit placement. An auto mesh still leaves this choice to the partitioner.
+                let explicit_mesh = source.sharding().is_some_and(|sharding| {
+                    sharding.mesh().axes().iter().all(|axis| axis.r#type() == MeshAxisType::Explicit)
+                });
+                if !explicit_mesh
+                    || target.sharding().is_some()
+                    || source.shape() != target.shape()
+                    || !broadcast.output_axes().iter().copied().eq(0..source.rank())
+                    || !target.is_refined_by(source)
+                {
+                    return None;
+                }
+                0
             } else if let Some(call) = operation.projected_payload::<JitCallOperation<Type>>() {
                 // The inputs of the callee receive the inputs of the call positionally, and the results of the call
                 // are the results of the callee. A sharding override of the boundary of the callee places the result
@@ -4489,6 +4847,7 @@ fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::any::TypeId;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -4499,15 +4858,15 @@ pub(crate) mod tests {
         CompositeOperation, Condition, ConditionOperation, ConstantOperation, ConstrainSharding, Context, Cos,
         CustomRuleDefinition, CustomRuleRegistration, Differentiate, Dimension, DimensionBounds,
         DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot,
-        DotDimensionNumbers, EagerContext, EffectClasses, Error as CoreError, Layout, LinearCallOperation, Max,
-        MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneLike, ParallelReduce,
-        ParameterizedFamily, Place, Placeholder, Placement, PrintOperation, Program,
+        DotDimensionNumbers, EagerContext, EffectClasses, ErasedOperation, Error as CoreError, Layout,
+        LinearCallOperation, Max, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneLike,
+        ParallelReduce, ParameterizedFamily, Place, Placeholder, Placement, PrintOperation, Program,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, ProvenanceScope, Reduce, ReduceOperation,
         ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceType, ReferenceWriteOperation, Reshape, ReshapeOperation, ReverseModeDifferentiate, ScanOperation,
-        ScanOptions, ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout, Tag, TiledLayout,
-        TransferToMemory, Transpose, TypedProgram, UnreducedKind, ValueProjection, WhileOptions, ZeroLike, i1, i2, i4,
-        scan, shard_map, u1, u2, u4, r#while,
+        ReferenceType, ReferenceWriteOperation, RegionInterface, Reshape, ReshapeOperation, ReverseModeDifferentiate,
+        ScanOperation, ScanOptions, ShardMap, ShardMapOperation, ShardMapOptions, Sin, StopGradient, StridedLayout,
+        Tag, TiledLayout, TransferToMemory, Transpose, TypedProgram, UnreducedKind, ValueProjection, WhileOptions,
+        ZeroLike, i1, i2, i4, scan, shard_map, u1, u2, u4, r#while,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -4524,7 +4883,10 @@ pub(crate) mod tests {
     use crate::lowering::regions::tests::lower_plain_program_outputs;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
-    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{
+        cpu_client, peer_devices, replicated_array, session_with_remote_devices, test_compilation_options,
+        values_from_bytes, values_to_bytes,
+    };
     use crate::{
         ArrayTracer, CompileTracer, CompiledFunction, FlatProgram, FromPjrt, JitCallOperation, Options,
         PlacementOptions, ProgramBuilder as ArrayIrProgramBuilder, Session, StagedFunction, TracedProgram, compile,
@@ -7172,6 +7534,7 @@ pub(crate) mod tests {
                 supports_shardy,
                 &[],
                 &[],
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             )
@@ -7373,6 +7736,7 @@ pub(crate) mod tests {
             true,
             &states,
             &[],
+            &[],
             RaggedDotLoweringStrategy::default(),
             &[],
         )
@@ -7415,6 +7779,7 @@ pub(crate) mod tests {
                 true,
                 std::slice::from_ref(&invalid_state),
                 &[],
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             ),
@@ -7440,6 +7805,7 @@ pub(crate) mod tests {
                     true,
                     &states,
                     &[],
+                    &[],
                     RaggedDotLoweringStrategy::default(),
                     &[],
                 ),
@@ -7461,6 +7827,7 @@ pub(crate) mod tests {
                 None,
                 true,
                 &states,
+                &[],
                 &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
@@ -7494,6 +7861,7 @@ pub(crate) mod tests {
                 true,
                 std::slice::from_ref(&reference_state),
                 &[],
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 &[],
             ),
@@ -7515,26 +7883,45 @@ pub(crate) mod tests {
             builder.build(vec![second, first, third], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap();
         let input_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
         let output_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
-        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_results: &[bool]| {
+        let lower_with = |argument_shardings: Option<&[Sharding]>,
+                          result_shardings: Option<&[Sharding]>,
+                          donated_inputs: &[bool],
+                          open_results: &[bool]| {
             lower_mlir_module_for_program_with_reference_state(
                 &program,
                 &[],
                 &input_types,
                 &output_types,
                 "main",
-                shardings,
-                shardings,
+                argument_shardings,
+                result_shardings,
                 None,
                 true,
                 &[],
                 donated_inputs,
+                &[],
                 RaggedDotLoweringStrategy::default(),
                 open_results,
             )
         };
+        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_results: &[bool]| {
+            lower_with(shardings, shardings, donated_inputs, open_results)
+        };
         let signature = |lowered: LoweredModule| {
             let line = lowered.stable_hlo.lines().find(|line| line.contains("func.func @main")).unwrap();
             line.trim().to_string()
+        };
+        // Pairs of the index of each aliased argument and the index of its output.
+        let aliases = |lowered: LoweredModule| {
+            signature(lowered)
+                .split("%arg")
+                .skip(1)
+                .enumerate()
+                .filter_map(|(index, argument)| {
+                    let (_, alias) = argument.split_once("tf.aliasing_output = ")?;
+                    Some((index, alias.split(' ').next().unwrap().parse::<usize>().unwrap()))
+                })
+                .collect::<Vec<_>>()
         };
 
         // Each donated input is paired with the first unpaired output of its type, and other inputs with none.
@@ -7566,6 +7953,51 @@ pub(crate) mod tests {
         assert!(single_device.contains("tf.aliasing_output = 0 : i64"));
         let two_devices = signature(lower(Some(&shardings(2)), &[true, false, false], &open_results).unwrap());
         assert!(two_devices.contains("tf.aliasing_output = 1 : i64"));
+
+        // An input that finds no output of its own sharding is paired with an output under which every device holds
+        // shards of the same type, such as one that completes its pending sum or splits it along another axis of the
+        // same size, and only after every donated input was paired with an output of its own sharding where one is
+        // free. Before, only an output of the identical sharding was paired, so the first two cases had no alias.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let split = |axes: &[&str]| {
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]).unwrap()
+        };
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let pending = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let cases = [
+            ("completed sum", [pending, replicated.clone()], [replicated.clone(), replicated.clone()], [true, false]),
+            ("other axis", [split(&["x"]), replicated.clone()], [replicated.clone(), split(&["y"])], [true, false]),
+            (
+                "other extents",
+                [split(&["x"]), replicated.clone()],
+                [replicated.clone(), split(&["x", "y"])],
+                [true, false],
+            ),
+            ("own sharding first", [split(&["x"]), split(&["x"])], [split(&["y"]), split(&["x"])], [true, true]),
+        ];
+        let outcomes = cases
+            .into_iter()
+            .map(|(name, [first_argument, second_argument], [first_result, second_result], [first, second])| {
+                let argument_shardings = [first_argument, second_argument, replicated.clone()];
+                let result_shardings = [first_result, second_result, replicated.clone()];
+                let donated_inputs = [first, second, false];
+                let lowered = lower_with(Some(&argument_shardings), Some(&result_shardings), &donated_inputs, &[]);
+                (name, aliases(lowered.unwrap()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            [
+                ("completed sum", vec![(0, 0)]),
+                ("other axis", vec![(0, 1)]),
+                ("other extents", vec![]),
+                ("own sharding first", vec![(0, 1), (1, 0)]),
+            ],
+        );
 
         assert!(matches!(
             lower(None, &[true], &[]),
@@ -8066,7 +8498,7 @@ pub(crate) mod tests {
         });
         let first_device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
         let modules = clients.map(|client| {
-            let session = Session::builder().client(client).build().unwrap();
+            let session = session_with_remote_devices(client, peer_devices(client, &clients));
             let scalar = session.place(4f32, PlacementOptions::default()).unwrap();
             let first = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
             let second = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
@@ -8583,6 +9015,124 @@ pub(crate) mod tests {
         assert_eq!(owned(0, Some("cpu")), vec![]);
         assert_eq!(owned(1, None), vec![constant.clone()]);
         assert_eq!(owned(1, Some("cpu")), vec![constant.clone()]);
+    }
+
+    #[test]
+    fn test_owned_session_constants_skips_captures_that_calls_never_read() {
+        // A session constant that a region only passes on to a call as a capture which the callee never reads is not
+        // owned by the region, as a compiled execution of the region has no argument for it (refer to
+        // `partition_session_constants`), so the eager placement of the enclosing operation does not read it either.
+        // Before, it was owned, so that it could commit the operation to its devices or have it rejected. A capture
+        // that the callee reads is owned.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let scalar_type = Type::Array(constant.r#type().into_owned());
+        let callee = |reads_capture: bool| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let capture = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone());
+            let output = match reads_capture {
+                true => builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None),
+                false => builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None),
+            }
+            .unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
+        };
+        let program = |reads_capture: bool| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let regions = vec![builder.intern_callee(&callee(reads_capture), None).unwrap()];
+            let operation = Operation::JitCall(JitCallOperation::new(1));
+            let output = builder.add_instruction(operation, regions, vec![constant, input], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let owned = |reads_capture, target_platform| {
+            owned_session_constants(program(reads_capture).entry_region_ref(), target_platform).to_vec()
+        };
+        assert_eq!(owned(false, None), vec![]);
+        assert_eq!(owned(false, Some("cpu")), vec![]);
+        assert_eq!(owned(true, None), vec![constant.clone()]);
+        assert_eq!(owned(true, Some("cpu")), vec![constant]);
+    }
+
+    /// Operation family whose operations borrow their configuration, which lowering admits for any lifetime of the
+    /// borrow. Each operation returns the inputs at the positions that its configuration lists.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct BorrowingOperation<'p> {
+        positions: &'p [usize],
+    }
+
+    impl CoreOperation for BorrowingOperation<'_> {
+        type Type = Type;
+
+        fn name(&self) -> &'static str {
+            "borrowing"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[Type],
+            region_interfaces: &[RegionInterface<Type>],
+        ) -> Result<Vec<Type>, TypeError> {
+            let _ = region_interfaces;
+            Ok(self.positions.iter().map(|position| input_types[*position].clone()).collect())
+        }
+    }
+
+    impl OperationPayloadProjection for BorrowingOperation<'_> {
+        fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
+            let _ = payload;
+            None
+        }
+
+        fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+            Err(payload)
+        }
+    }
+
+    impl LowerableOperation for BorrowingOperation<'_> {
+        fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+            &self,
+            lowerer: &mut Lowerer<'b, 'c, 't, O>,
+            input_values: &[ValueRef<'b, 'c, 't>],
+            input_types: &[Type],
+            output_types: &[Type],
+        ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+            let _ = (lowerer, input_types, output_types);
+            Ok(self.positions.iter().map(|position| input_values[*position]).collect())
+        }
+    }
+
+    #[test]
+    fn test_lowerable_operation_family_admits_families_that_borrow() {
+        // A family whose operations borrow their configuration is a family that lowering lowers, because what lowering
+        // must know of the calls of a family it asks of that family (refer to `LowerableOperation::unread_captures`)
+        // rather than recovering it from a program that lives for as long as the whole program does.
+        let r#type = ArrayType::new_static(DataType::F32, [3]);
+        let positions = vec![1, 0];
+        let mut builder = CoreProgramBuilder::<Constant, BorrowingOperation<'_>>::new();
+        let first = builder.add_input(r#type.clone().into());
+        let second = builder.add_input(r#type.clone().into());
+        let operation = BorrowingOperation { positions: &positions };
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![first, second], None).unwrap().to_vec();
+        let program =
+            builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]);
+        let types = vec![r#type.clone(), r#type];
+        let module = to_mlir_module_for_program(&program.unwrap(), &[], &types, &types, "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<3xf32>) -> (tensor<3xf32>, tensor<3xf32>) {
+                    return %arg1, %arg0 : tensor<3xf32>, tensor<3xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]

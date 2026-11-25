@@ -43,6 +43,8 @@ use crate::memory::{
 };
 use crate::validation::KernelReferenceOperation;
 
+// TODO(eaplatanios): Review this module.
+
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
 ///
 /// Access modes, aliases, and allocated referents come exclusively from canonical operation effects and types.

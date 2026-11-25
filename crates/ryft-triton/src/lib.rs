@@ -3,4 +3,6 @@
 //! [`kernels`] owns typed TTIR lowering and the linked `ryft-xla-sys` native compiler bridge. Compilation does not
 //! create a GPU context. Concrete platform artifacts retain their existing launcher and ownership contracts.
 
+// TODO(eaplatanios): Review this module.
+
 pub mod kernels;

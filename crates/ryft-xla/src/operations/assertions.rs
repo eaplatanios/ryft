@@ -2305,6 +2305,7 @@ mod tests {
             true,
             &[],
             &[],
+            &[],
             RaggedDotLoweringStrategy::default(),
             &[],
         )

@@ -1,5 +1,14 @@
 //! PJRT device conversion and memory placement. A `ryft-core` [`Device`] records the device identifier and owning
 //! process index. Transfers use the live PJRT device to resolve a [`Memory`] placement to a native memory handle.
+//! Note that a [`Device`] is a plain value, so nothing stops a caller from naming one that does not exist. The
+//! [`Session`](crate::Session) is the authority on which devices exist: it knows the devices that its PJRT
+//! client lists and the devices of other processes that were declared through
+//! [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices). Eager placement checks its destination
+//! against that inventory. An abstract tracer's destination is checked by the compiling session. Forward source
+//! devices are advisory until a transpose uses them as a destination. Obtain devices from
+//! [`Session::devices`](crate::Session::devices) and
+//! [`Session::addressable_devices`](crate::Session::addressable_devices)
+//! rather than constructing them.
 
 use ryft_core::{Device, Memory};
 use ryft_pjrt::{Device as PjrtDevice, Memory as PjrtMemory};
@@ -23,9 +32,11 @@ impl FromPjrt<&PjrtDevice<'_>> for Device {
     // given against its own client. Converting the device of another client (e.g., device 0 of a second CPU client) and
     // placing a value through a session therefore places it on the device of the session's client with those
     // coordinates, not on the device of the other client. A session rejects a device of its own process that its client
-    // does not address (`ArrayError::NonAddressableDevice`), and the devices of other processes are resolved by the
-    // processes that own them. Arrays cannot move between PJRT clients through this frontend, where JAX's `device_put`
-    // can transfer an array to a device of another platform.
+    // does not address (using `ArrayError::NonAddressableDevice`) and a device of another process that it does not know
+    // (using `ArrayError::UnknownDevice`), and the devices of other processes are resolved by the processes that own
+    // them. An array of another PJRT client moves through a host round trip when it is placed through a session of the
+    // destination client onto a destination that names devices (refer to `Array::to_placement`), as JAX's `device_put`
+    // transfers an array to a device of another platform.
 
     type Output = Result<Self, ryft_pjrt::Error>;
 

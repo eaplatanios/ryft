@@ -1,11 +1,25 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, PLACE_OPERATION_NAME, PlaceOperation, PlacementRequest};
+use ryft_core::{
+    ArrayType, PLACE_OPERATION_NAME, PlaceDispatch, PlaceOperation, PlacementRequest, ProgramError, ValueDomainDispatch,
+};
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
+use crate::arrays::placement::place_core_operations;
 use crate::operations::manipulation::conversions::lower_layout_conversion;
 use crate::operations::manipulation::memory::lower_transfer_to_memory;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, ToMlir};
+use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, ToMlir};
+
+impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {
+    fn place_operation(input: &Array, operation: PlaceOperation) -> Result<Array, ProgramError> {
+        Self::place_operations(vec![(input.clone(), operation)]).map(|mut outputs| outputs.remove(0))
+    }
+
+    fn place_operations(bindings: Vec<(Array, PlaceOperation)>) -> Result<Vec<Array>, ProgramError> {
+        let bindings = bindings.into_iter().map(|(input, operation)| (input.session().clone(), input, operation));
+        place_core_operations(bindings.collect())
+    }
+}
 
 impl LowerableOperation for PlaceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -25,39 +39,27 @@ impl LowerableOperation for PlaceOperation {
         // that of `reshard`), a target states the placement along every mesh axis, including auto axes, so the
         // constraint is closed over the dimensions that the target specifies, like that of `constrain_sharding`.
         // The layout is constrained first, so that the conversion runs before the value leaves device memory. JAX
-        // instead lowers `device_put` inside `jit` to nothing, unless its target names a memory kind or changes the
-        // reduction state of the value, which it lowers to a sharding constraint that completes the reduction and
-        // which Ryft rejects before lowering (refer to `Session::place`).
-        // The copy policy of the operation (i.e., `PlaceOperation::may_alias`) is ignored, because a compiled program
-        // has no observable buffer identity. Its outputs are buffers that its execution allocates (or donated inputs,
-        // which no other handle can observe), so a value inside it never shares storage with any array that the caller
-        // holds, and a forced copy would only add work.
+        // 0.12.0.1 returns the inputs from its CPU primitive lowering. Its GPU and TPU lowerings can annotate
+        // sharding and memory for a requested memory kind. Ryft rejects changes of reduction state before lowering.
+        // The copy policy of the operation (i.e., `PlaceOperation::may_alias`) is ignored, so the lowering emits no copy
+        // instruction even for a forced copy, because a compiled program has no observable buffer identity. A forced
+        // copy is still honored where it can be observed. Every public output of an execution of the program is written
+        // to a new buffer that the execution allocates, unless it is paired with a donated input whose buffers the
+        // caller gave up and no other handle can observe (refer to the donation pairing of
+        // `lower_mlir_module_for_program_with_reference_state`), so no public output ever shares storage with an array
+        // that the caller holds. An eager placement is not lowered here, and it applies the copy policy to its result
+        // itself (refer to `Session::bind` and `Session::place`).
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
 
-        // Transposition turns the source of a placement into the target of the transposed placement, which moves the
-        // cotangent there, so a source that names devices (i.e., a placement or a device) inside a manual region would
-        // move a value of that region in reverse mode, which the target rule below rejects. A program whose derivative
-        // could not be compiled is rejected when it is compiled itself, so such a source is rejected here, unless the
-        // transposition leaves the cotangent where it lives (i.e., the placement moves nothing and its input varies
-        // along the manual axes of the region or carries reduction state over them, refer to
-        // `PlaceOperation::transposes_in_place`). An in-place source names only the storage of the value, so it is
-        // lowered there like anywhere else.
+        // A source only states where the input lives, and the forward program moves nothing to it, so it is lowered to
+        // nothing, also when it names devices inside a manual region or outside the program mesh, as JAX elides the
+        // source of a `device_put` inside `jit` and `shard_map`. Transposition turns such a source into the target of
+        // the transposed placement, which moves the cotangent there, so the program of reverse mode is rejected by the
+        // target rule below when that target leaves the region, and by the program mesh check when it leaves the mesh
+        // (refer to `LoweringError::PlacementOutsideProgramMesh`), when that program is compiled itself.
         let is_inside_manual_region = !lowerer.collective_state().bound_manual_axes().is_empty();
-        if is_inside_manual_region
-            && self.source().is_some_and(PlacementRequest::moves)
-            && !self.transposes_in_place(&input_types[0])
-        {
-            let reason = "the source of a value inside a manual region cannot name devices unless the placement moves \
-                          nothing and the value varies along the manual axes of the region or carries reduction state \
-                          over them, because transposition would move the cotangent of that value to them";
-            return Err(LoweringError::UnsupportedOperation {
-                operation: PLACE_OPERATION_NAME.to_string(),
-                reason: reason.to_string(),
-            }
-            .into());
-        }
 
         // A placement without a target leaves its input where it is, so it lowers to nothing, also inside a manual
         // region. Its source only matters to transposition, and its copy policy is ignored like that of any other
@@ -528,16 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn test_place_operation_lower_rejects_sources_that_name_devices_inside_manual_regions() {
+    fn test_place_operation_lower_admits_sources_that_name_devices_inside_manual_regions() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
         let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let error = format!(
-            "cannot lower `{PLACE_OPERATION_NAME}`: the source of a value inside a manual region cannot name devices \
-             unless the placement moves nothing and the value varies along the manual axes of the region or carries \
-             reduction state over them, because transposition would move the cotangent of that value to them",
-        );
         let moved_error = format!(
             "cannot lower `{PLACE_OPERATION_NAME}`: a value inside a manual region cannot be moved to another \
              placement",
@@ -611,11 +608,13 @@ mod tests {
             ]
         };
 
-        // A source that names devices (i.e., the placement of the value over the devices of the region, or the sole
-        // device of a region of one device) would become the target of the transposed placement of this invariant
-        // value, which would move its cotangent, so it is rejected forward and eagerly, whatever the target is. The
-        // program of reverse mode keeps only the transposed placement, whose target is rejected. The same sources of a
-        // value that varies along the manual axis are accepted on every path (refer to
+        // A source that names devices (i.e., the placement of the value over the devices of the region, the sole device
+        // of a region of one device, or a device outside the program mesh) moves nothing forward, so it compiles
+        // forward and executes eagerly, whatever the target is, as pinned JAX compiles and runs a `device_put` with a
+        // `src` outside a `shard_map`. The program of reverse mode keeps only the transposed placement, whose target is
+        // that source, and is rejected for it, as pinned JAX rejects the gradient. Before, the forward and eager paths
+        // rejected such a source because of that hypothetical transposition. The same sources of a value that varies
+        // along the manual axis are accepted on every path (refer to
         // `test_session_place_agrees_across_paths_for_manual_regions_and_host_values`).
         let pinned = Some(PlacementRequest::from(Memory::Host { pinned: true }));
         for count in [1, 2] {
@@ -625,12 +624,21 @@ mod tests {
             let mut sources = vec![PlacementRequest::Resolved(resolved)];
             if count == 1 {
                 sources.push(PlacementRequest::from(devices[0]));
+                sources.push(PlacementRequest::from(devices[1]));
             }
+            // The transposed placement of a source on the devices of the region is rejected for moving a value inside
+            // it, and that of a source outside the program mesh for naming devices that the program does not run on.
+            let outside_error = format!(
+                "`{PLACE_OPERATION_NAME}` cannot move a value to the devices [1] of mesh `['x'=1:manual]` inside a \
+                 program compiled for the devices [0] of mesh `['x'=1:explicit]`",
+            );
             for source in sources {
+                let reverse_error =
+                    if source == PlacementRequest::from(devices[1]) { &outside_error } else { &moved_error };
                 for target in [pinned.clone(), None] {
                     assert_eq!(
                         place(count, target.clone(), Some(source.clone())),
-                        [Err(error.clone()), Err(moved_error.clone()), Err(error.clone())],
+                        [Ok(()), Err(reverse_error.clone()), Ok(())],
                     );
                 }
             }
@@ -1212,8 +1220,8 @@ mod tests {
         assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
 
         // An array on more devices cannot keep its sharding on one device, so it is gathered onto the target device,
-        // replicated over the canonical mesh of one device. That is the type that the staged result records, so the
-        // replay of the staged program on such an array gathers it as a direct placement of the array does.
+        // replicated over the anonymous mesh of one device at runtime. The staged type carries no sharding. Replaying
+        // the staged program gathers the input as a direct placement of the array does.
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let sharded = Array::from_host_buffer(
@@ -1229,7 +1237,7 @@ mod tests {
             traced_program.program().to_string(),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] .
-                let %1:f32[4][sharding={mesh<['device'=1:auto]>, [{}]}] = place [target=device(1)] %0
+                let %1:f32[4] = place [target=device(1)] %0
                 in (%1)"
             },
         );

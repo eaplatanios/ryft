@@ -24,6 +24,8 @@ use crate::kernels::{
     lowering_sha256,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Linked native compiler and optional caller-owned cancellation signal.
 ///
 /// Compilation has the same in-process failure model as ordinary XLA compilation. Recoverable native failures

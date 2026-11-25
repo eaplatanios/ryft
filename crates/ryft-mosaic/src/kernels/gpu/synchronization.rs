@@ -51,6 +51,8 @@ use ryft_core::{
 };
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Invalid communication geometry, unsynchronized access, or incomplete CTA progress.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum SynchronizationError {

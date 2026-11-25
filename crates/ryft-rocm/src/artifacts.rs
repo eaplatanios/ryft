@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 
 use crate::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Nonzero grid and block dimensions plus additional dynamic LDS requested by the caller.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RocmKernelLaunchDimensions {

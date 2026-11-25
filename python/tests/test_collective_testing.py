@@ -134,7 +134,7 @@ class CollectiveTestingTest(unittest.TestCase):
                 if case.collectives:
                     self.assertEqual(project_collective_stablehlo(observation.stablehlo), case.collectives)
                 if case.validate is not None:
-                    self.assertEqual(case.validate(observation), ())
+                    self.assertTrue(case.validate(observation, observation).passed())
 
 
 if __name__ == "__main__":

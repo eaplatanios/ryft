@@ -598,8 +598,9 @@ pub const PLACE_OPERATION_NAME: &str = "place";
 /// the devices where the input lives, so that the placement splits the packed result as recorded, and otherwise it
 /// stays unmapped. Differentiation places the tangent with the same target, source, and copy policy as the primal but
 /// without the layouts of the target and source, which need not be valid for the element type of the tangent, so an
-/// in-place target that names only a layout leaves the tangent where it is without a target. When the operation has no
-/// source, the primal uses its concrete placement as its source, if it has one, and an in-place source is completed
+/// in-place target that names only a layout leaves the tangent where it is without a target. A saved pushforward can
+/// record the primal's resolved placement for a bare device target when the fused rule keeps the bare request. When
+/// there is no source, the primal uses its concrete placement if it has one, and an in-place source is completed
 /// with that placement (refer to [`PlacementRequest::resolve_source`]) after the request is validated as it is given,
 /// as interpretation and batching also do. A tangent is free to live elsewhere than its primal, so a concrete tangent
 /// uses its own placement instead, and a staged tangent keeps the caller's source as its forward source (refer to
@@ -1481,6 +1482,7 @@ impl PlaceOperation {
 
         Ok(extents)
     }
+
     /// Applies the placement rule while retaining the surrounding operation family's residual program.
     pub(crate) fn partially_evaluate_in_family<C: Context<Type: ArrayMemberType>, D: PartialEvaluationDriver<C>>(
         &self,
@@ -2391,12 +2393,12 @@ impl<C: Context<Value: Placed>, P: DifferentiationPolicy<C>> Placed for Differen
 /// [`Place`] takes trees of targets and sources and lets each leaf share storage with its input.
 /// This dispatch takes a [`PlaceOperation`] for each leaf, with its own target, source, and copy policy (refer to
 /// [`PlaceOperation::with_may_alias`]). Without a target, the value stays where it is (i.e., its devices, sharding,
-/// memory, and layout are unchanged), which places a value with its source recorded or, with`may_alias` set to `false`,
-/// gives it storage of its own. With `may_alias` set to `false`, implementations for concrete values must return a
-/// value whose storage no other value shares, and implementations for staged values must stage the placement with that
-/// policy, so that the copy happens when the staged placement executes on concrete values. Implementations for concrete
-/// values resolve a device or in-place target against the value that they place, and reference [`Array`]s, which have
-/// no devices, record the output type that [`PlaceOperation`] type inference computes for it.
+/// memory, and layout are unchanged), which places a value with its source recorded or, with `may_alias` set to
+/// `false`, gives it storage of its own. With `may_alias` set to `false`, implementations for concrete values must
+/// return a value whose storage no other value shares, and implementations for staged values must stage the placement
+/// with that policy, so that the copy happens when the staged placement executes on concrete values. Implementations
+/// for concrete values resolve a device or in-place target against the value that they place, and reference [`Array`]s,
+/// which have no devices, record the output type that [`PlaceOperation`] type inference computes for it.
 pub trait PlaceDispatch<T: Type, V: Value<Type = T>> {
     /// Moves `input` to `target` and records `source` as its expected placement. A [`None`] target leaves it where it
     /// is. The result may share storage with `input` only when `may_alias` is `true`. This places `input` with a new
@@ -8043,7 +8045,7 @@ mod tests {
     }
 
     #[test]
-    fn test_place_operation_transposition_admits_seeds_on_other_meshes() {
+    fn test_place_operation_transposition_admits_unsharded_seeds_and_rejects_different_explicit_shardings() {
         // An unsharded seed can be consumed by negation or accumulation before a transposed placement moves it to
         // the source. A different explicit sharding fails at the pullback boundary for any consumer.
         let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
@@ -8115,6 +8117,52 @@ mod tests {
             rematerialize(|x: Tracer<TracingContext<Array, ArrayOperation<Array>>>| x.place(&target, Some(&source)));
         let (output, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.apply_materialized(different_seed), rejection(&output));
+    }
+
+    #[test]
+    fn test_place_operation_transposition_staged_reduces_unsharded_seed() {
+        // The seed passes the pullback boundary even though the forward broadcast produced a sharded value.
+        // During replay, the sum uses the actual unsharded seed and the following placement returns the result
+        // to the primal source.
+        let source = placement(&mesh_x(), vec![ShardingDimension::sharded(["x"])]);
+        let target = placement(&mesh_y(), vec![ShardingDimension::sharded(["y"])]);
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(source.sharding().clone()).unwrap();
+        let seed_type = ArrayType::new_static(DataType::F32, [2, 4]);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, seed)| {
+                let (output, pullback) =
+                    differentiate_at(input).vjp(|x| x.place(&target, Some(&source))?.broadcast_leading([2]))?;
+                let cotangent_type = output.r#type().cotangent()?;
+                assert!(cotangent_type.accepts_cotangent_seed(seed.r#type().as_ref()));
+                assert!(!cotangent_type.is_refined_by(seed.r#type().as_ref()));
+                Ok(pullback.apply_materialized(seed)?)
+            },
+            (input_type, seed_type),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %1:f32[2, 4] .
+                let %2:f32[4][sharding={mesh<['y'=4:explicit]>, [{'y'}]}] = place [
+                    source={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                    target={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                ] %0
+                    %3:f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}] = broadcast [
+                        output_type=f32[2, 4][sharding={mesh<['y'=4:explicit]>, [{}, {'y'}]}],
+                        output_axes=[1],
+                    ] %2
+                    %4:f32[4] = reduce [kind=sum, axes=[0]] %1
+                    %5:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
+                        inferred_source={mesh<['y'=4:explicit]>, devices=[2, 3, 4, 5], \
+                            sharding={mesh<['y'=4:explicit]>, [{'y'}]}},
+                        target={mesh<['x'=2:explicit]>, devices=[0, 1], \
+                            sharding={mesh<['x'=2:explicit]>, [{'x'}]}, memory=Device},
+                        may_alias=false,
+                    ] %4
+                in (%5)"
+            },
+        );
     }
 
     #[test]

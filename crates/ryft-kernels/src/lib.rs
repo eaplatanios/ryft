@@ -287,6 +287,8 @@ pub use validation::{
     KernelReferenceSummary, KernelSwapLowering, KernelValidationError, validate_kernel_body,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Macro support re-exports used by the code that [`kernel`] generates, which are not public API. The generated code
 /// needs the core crate at a path derived from the kernel namespace, because a re-exported procedural attribute cannot
 /// see which path invoked it. Generated `definition` functions also call the checked shape metadata helpers (i.e.,

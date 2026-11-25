@@ -6,6 +6,8 @@ use std::ptr::NonNull;
 
 use crate::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Non-null device allocation borrowed from the embedding runtime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RocmDevicePointer<'o> {

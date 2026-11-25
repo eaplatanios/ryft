@@ -8,6 +8,8 @@ use std::ptr::NonNull;
 
 use crate::{CudaKernelArtifact, CudaKernelParameterType, CudaScalarType, Error};
 
+// TODO(eaplatanios): Review this module.
+
 /// Scalar value supplied in one CUDA kernel launch frame.
 ///
 /// Low-precision values carry their exact storage bits so launch packing never performs a numeric conversion or

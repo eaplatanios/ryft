@@ -31,6 +31,7 @@ use ryft_pjrt::{
 };
 
 use crate::arrays::metadata::ArrayOutputPlan;
+use crate::compilation::programs::OutputDeviceAssignment;
 use crate::devices::MemoryExtension;
 use crate::lowering::signature::ExecutableSignature;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
@@ -535,7 +536,7 @@ impl Session {
         // carry final reference states are returned verbatim.
         let mut resources = Some(self.prepare_execution_resources(program)?);
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
-        let committed = prepared.committed;
+        let output_assignment = prepared.output_assignment;
         let (arguments, input_fences, input_refinements, physical_output_count) = prepared.into_arguments()?;
         let execution =
             self.execute_pjrt_buffers(program, arguments, input_fences, physical_output_count, &mut resources, |_| {})?;
@@ -546,7 +547,7 @@ impl Session {
             &mut physical_outputs,
             fence.clone(),
             0..program.all_output_types().len(),
-            committed,
+            output_assignment,
         )?;
         // Static outputs cannot disagree with the input refinements, so only builds with debug assertions re-validate
         // them.
@@ -639,12 +640,37 @@ impl Session {
                 actual: inputs.len(),
             }));
         }
+        // An input that the executable never reads has no executable argument, and the signature records it as unread
+        // (refer to `unread_entry_arguments`), so it is neither checked, nor required to hold buffers, nor waited for,
+        // whatever its data type. An erased input of the zero data type that the executable reads is not unread, and
+        // its producer is still observed below.
+        let is_unread = |index: usize| program.signature().is_unread_input(index);
         // Check every input, captures included, before anything observes, erases, converts, or donates it. The session
         // owns the program (refer to `Self::validate_program_owner`).
-        validate_input_clients(self, inputs.iter().map(Some), program.capture_count())?;
+        let checked = inputs.iter().enumerate().map(|(index, input)| (!is_unread(index)).then_some(input));
+        validate_input_clients(self, checked, program.capture_count())?;
         // Outputs are committed when a public argument is (refer to `Self::reconstruct_compiled_outputs`), which is
-        // decided here, once, for every execution path.
-        let committed = inputs.iter().skip(program.capture_count()).any(Array::is_committed);
+        // decided here, once, for every execution path. An argument that the executable never reads (i.e., a capture
+        // that the program of an eager call passes on to a callee that never reads it, refer to
+        // `Options::with_unread_inputs`) commits nothing.
+        let public_inputs = || {
+            inputs
+                .iter()
+                .enumerate()
+                .skip(program.capture_count())
+                .filter_map(|(index, input)| (!is_unread(index)).then_some(input))
+        };
+        let committed = public_inputs().any(Array::is_committed);
+        let locally_assigned = match program.output_device_assignment() {
+            OutputDeviceAssignment::FromCaller if committed => {
+                // The committed inputs select the same devices as the executable, by admission below. Where an
+                // uncommitted input must move, it contributes nothing to the assignment of those devices.
+                let moved = public_inputs().any(|input| input.mesh().devices() != program.mesh().devices());
+                self.assigns_placement_locally(public_inputs(), &[], false, moved)
+            }
+            OutputDeviceAssignment::FromCaller => self.uses_local_default_device(program.mesh()),
+            OutputDeviceAssignment::Fixed => false,
+        };
         let plan = program.plan();
 
         // Static input types establish no refinements, so refining them reduces to comparing every component except
@@ -683,7 +709,9 @@ impl Session {
         // Validate the logical public arguments before padding, erasing, donating, or moving any buffers.
         // Captures, including hidden session constants, are placed on the executable's mesh.
         for (index, input) in inputs.iter().skip(program.capture_count()).enumerate() {
-            validate_committed_input_devices(input, index, program.mesh())?;
+            if !is_unread(program.capture_count() + index) {
+                validate_committed_input_devices(input, index, program.mesh())?;
+            }
         }
 
         // The runtime sharding of an input records a pending reduction over auto mesh axes, which its type omits, so
@@ -691,14 +719,14 @@ impl Session {
         // logical input is admitted, also one that has no executable argument (i.e., a static input of the zero data
         // type, which is erased below), because the admission concerns the logical value and not its buffers, and an
         // eager call admits the same input alike (refer to `JitCallOperation::eager_decision`). The executable receives
-        // such an input as its declared type states.
+        // such an input as its declared type states. A capture that the executable never reads is not admitted.
         for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
             match physical_index {
                 Some(physical_index) => {
                     let expected = &program.expected_argument_shardings()[*physical_index];
                     validate_input_reduction(input, expected, index, program.capture_count())?;
                 }
-                None if input.sharding().unreduced_axes().is_empty() => {}
+                None if input.sharding().unreduced_axes().is_empty() || is_unread(index) => {}
                 None => {
                     let expected = program.input_types()[index].sharding().cloned().unwrap_or_else(|| {
                         Sharding::replicated(input.sharding().mesh().clone(), input.sharding().rank())
@@ -710,8 +738,8 @@ impl Session {
 
         // Erased inputs of the zero data type have no buffers through which PJRT could order consumer work after their
         // producers. Observe completion before dropping those inputs, including before any consumer effects run.
-        for (input, physical_index) in inputs.iter().zip(program.signature().input_mapping()) {
-            if physical_index.is_none() {
+        for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
+            if physical_index.is_none() && !is_unread(index) {
                 input.block_until_ready()?;
             }
         }
@@ -856,7 +884,7 @@ impl Session {
             donation_flags,
             input_refinements,
             physical_output_count: program.signature().array_output_count(),
-            committed,
+            output_assignment: OutputAssignment { committed, locally_assigned },
         })
     }
 
@@ -1006,9 +1034,9 @@ impl Session {
             let donation_overrides =
                 reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
 
-            // The outputs are committed when a public input of the attempt that is submitted, including a reference
-            // snapshot, is committed. Captures never commit them. Each attempt sets this before it can be submitted.
-            let mut committed;
+            // Each attempt derives its output assignment from its public inputs, including reference snapshots,
+            // before it can be submitted.
+            let mut output_assignment;
             let (
                 execution,
                 input_refinements,
@@ -1049,7 +1077,7 @@ impl Session {
                     .map_err(ProgramError::from)?;
                 let prepared_execution =
                     self.prepare_compiled_execution(program, arrays, donation_overrides.as_slice())?;
-                committed = prepared_execution.committed;
+                output_assignment = prepared_execution.output_assignment;
 
                 let guards = bindings
                     .iter()
@@ -1175,7 +1203,7 @@ impl Session {
                     &mut physical_outputs,
                     fence.clone(),
                     program.output_count()..program.all_output_types().len(),
-                    committed,
+                    output_assignment,
                 )?;
                 let mut hidden_outputs = (program.output_count()..program.all_output_types().len())
                     .zip(hidden_outputs)
@@ -1256,7 +1284,7 @@ impl Session {
                     &mut physical_outputs,
                     fence,
                     0..program.output_count(),
-                    committed,
+                    output_assignment,
                 )?;
                 validate_compiled_output_refinements(
                     program,
@@ -1294,7 +1322,11 @@ impl Session {
     ///   - `input_fences`: Execution fences of the inputs that are pending or failed. The fence that this function
     ///     returns and passes to `after_submission` joins them with the completion of the execution, so that the
     ///     outputs and the reference states that it produces report a failure of the producer of an input. The session
-    ///     work and the effect scope track the completion of the execution alone.
+    ///     work and the effect scope track the completion of the execution alone. PJRT cannot order an execution after
+    ///     these fences, so a program with effects waits for them on this thread before it is submitted, and it is
+    ///     not submitted when one of them failed. An effect therefore never observes an input that failed (e.g., one
+    ///     whose value comparison across processes failed), and the failure is recorded in the effect scope, so that
+    ///     its barrier reports it. Programs without effects never wait for them.
     ///   - `array_output_count`: Number of physical array outputs that every device returns.
     ///   - `resources`: Prepared invocation resources. This function takes them at the PJRT handoff so the caller
     ///     can release any reference guards before dropping the resources after an earlier failure.
@@ -1323,7 +1355,17 @@ impl Session {
         }
         let devices = ordered.then_some(arguments.addressable_device_ids());
         let mut work = self.reserve_work();
-        let reservation = if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
+        let mut reservation =
+            if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
+        if reservation.is_some()
+            && !input_fences.is_empty()
+            && let Err(error) = ExecutionFence::join(input_fences.iter().cloned()).block_until_ready()
+        {
+            let error = Error::from(error);
+            let reservation = reservation.take().unwrap();
+            reservation.publish(Err(Arc::from(error.to_string())), &ExecutionFence::new(Vec::new()));
+            return Err(error);
+        }
         if let Some(reservation) = &reservation
             && ordered
         {
@@ -1495,7 +1537,7 @@ impl Session {
 
     /// Places `input` on `mesh` according to `expected_sharding`, unless it already matches both (refer to
     /// `Self::reshard_inputs_if_needed`).
-    fn reshard_input_if_needed(
+    pub(crate) fn reshard_input_if_needed(
         &self,
         mesh: &DeviceMesh,
         expected_sharding: &Sharding,
@@ -1695,22 +1737,24 @@ impl Session {
     }
 
     /// Reconstructs selected logical outputs from one submitted execution's physical buffers. The outputs are
-    /// [committed](Array::is_committed) to their devices when `committed` is `true`, which is the case when any public
-    /// array input of the execution is committed. The arrays that the program captures never commit them. The outputs
-    /// that [`CompiledProgram::committed_outputs`] flags (e.g., the public outputs of a program that requests a
+    /// [committed](Array::is_committed) when the assignment records a committed public input. The arrays that the
+    /// program captures never commit them. The outputs that [`CompiledProgram::committed_outputs`] flags (e.g., the
+    /// public outputs of a program that requests a
     /// placement explicitly or of a function compiled for a named mesh, or all of them when the program runs on more
     /// than one device, refer to `commits_public_outputs`) are committed in either case, which both the plain and the
-    /// stateful execution paths rely on. Eager operations and compiled reshards
-    /// replace the commitment of the arrays that this function returns with their own.
+    /// stateful execution paths rely on. Public outputs also retain whether the executable's devices were chosen by
+    /// this process. Eager operations and compiled reshards set these properties for their own outputs.
     fn reconstruct_compiled_outputs(
         &self,
         program: &CompiledProgram,
         physical_outputs: &mut [Option<Vec<Buffer<'static>>>],
         fence: ExecutionFence,
         logical_indices: impl IntoIterator<Item = usize>,
-        committed: bool,
+        assignment: OutputAssignment,
     ) -> Result<Vec<Array>, Error> {
-        let committed = |logical_index: usize| committed || program.committed_outputs()[logical_index];
+        let committed = |logical_index: usize| assignment.committed || program.committed_outputs()[logical_index];
+        let locally_assigned =
+            |logical_index| assignment.locally_assigned && logical_index < program.output_types().len();
         // Programs with only static outputs build each output directly from its plan, without querying the returned
         // buffers or re-deriving their placement.
         if let Some(output_plans) = &program.plan().output_plans {
@@ -1730,7 +1774,9 @@ impl Session {
                     };
                     let output =
                         Array::from_execution_output(self, &output_plans[logical_index], buffers, fence.clone());
-                    Ok(output.with_committed(committed(logical_index)))
+                    Ok(output
+                        .with_committed(committed(logical_index))
+                        .with_locally_assigned(locally_assigned(logical_index)))
                 })
                 .collect();
         }
@@ -1816,7 +1862,8 @@ impl Session {
                             })?,
                         )?
                         .with_execution_fence(fence.clone())
-                        .with_committed(committed(logical_index)))
+                        .with_committed(committed(logical_index))
+                        .with_locally_assigned(locally_assigned(logical_index)))
                     }
                     None => Ok(Array::zero(
                         self,
@@ -1825,7 +1872,8 @@ impl Session {
                         program.mesh().clone(),
                     )?
                     .with_execution_fence(fence.clone())
-                    .with_committed(committed(logical_index))),
+                    .with_committed(committed(logical_index))
+                    .with_locally_assigned(locally_assigned(logical_index))),
                 }
             })
             .collect()
@@ -2011,6 +2059,16 @@ impl ReferenceCompletionBackend for ReferenceCompletion {
     }
 }
 
+/// Assignment of a prepared invocation's output devices.
+#[derive(Copy, Clone)]
+struct OutputAssignment {
+    /// Whether a public argument is committed, which commits every output of the execution.
+    committed: bool,
+
+    /// Whether this process chose the devices of this invocation independently.
+    locally_assigned: bool,
+}
+
 /// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
 struct PreparedExecution {
     /// Fully materialized physical arrays in executable argument order.
@@ -2028,8 +2086,8 @@ struct PreparedExecution {
     /// Physical result count expected from every addressable device.
     physical_output_count: usize,
 
-    /// Whether a public argument is committed, which commits every output of the execution.
-    committed: bool,
+    /// Placement derived from logical inputs before preparing their buffers.
+    output_assignment: OutputAssignment,
 }
 
 impl PreparedExecution {
@@ -2098,11 +2156,11 @@ mod tests {
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
         CompiledFunction, ConstrainSharding, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh,
         Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
-        DynamicSliceOperation, Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis, MeshAxisType, Place,
-        Placeholder, Placement, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation, ReferenceType, Shape,
-        ShardMapBoundary, Sharding, ShardingDimension, ShardingError, Sin, StagedFunction, StaticShape, TiledLayout,
-        Typed,
+        DynamicSliceOperation, EffectClass, Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis,
+        MeshAxisType, Place, Placeholder, Placement, Print, PrintOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError, Sin, StagedFunction,
+        StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -2121,7 +2179,7 @@ mod tests {
         Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET,
         Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions,
         RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully, compile_statefully_with_captures,
-        compile_with_captures,
+        compile_with_captures, with_captured_prints,
     };
 
     use super::*;
@@ -4315,6 +4373,61 @@ mod tests {
     }
 
     #[test]
+    fn test_session_execute_pjrt_buffers_withholds_effects_from_failed_inputs() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), vec![], vec![input], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+
+        // The input has healthy buffers and a failed fence, as an array whose value comparison across processes
+        // failed has. No entry point prints it, each returns the failure, and the barrier of its effect scope reports
+        // it. Before, every entry point printed `value: 41.0` and the barriers succeeded.
+        let failed_input = |session: &Session| {
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(ryft_pjrt::Error::failed_precondition("values differ"))).unwrap();
+            f32_scalar(session, &mesh, 41.0).with_execution_fence(ExecutionFence::new(vec![event]))
+        };
+        let (results, lines) = with_captured_prints(|| {
+            let entry_points: [&dyn Fn(&Session) -> Result<(), String>; 4] = [
+                &|scope| {
+                    let outputs = scope.execute_program(&compiled, vec![failed_input(scope)]);
+                    outputs.map(|_| ()).map_err(|error| error.to_string())
+                },
+                &|scope| {
+                    let execution = scope.execute_compiled_async(&compiled, vec![failed_input(scope)]);
+                    execution.map(|_| ()).map_err(|error| error.to_string())
+                },
+                &|scope| failed_input(scope).print("value").map(|_| ()).map_err(|error| error.to_string()),
+                &|scope| {
+                    let printed = failed_input(scope).print_with_effect_class("value", EffectClass::UnorderedIo);
+                    printed.map(|_| ()).map_err(|error| error.to_string())
+                },
+            ];
+            entry_points
+                .iter()
+                .map(|entry_point| {
+                    let scope = session.with_new_effect_scope();
+                    let result = entry_point(&scope);
+                    (result, scope.effects_barrier().map_err(|error| error.to_string()))
+                })
+                .collect::<Vec<_>>()
+        });
+        let barrier_failure = "submission 0: values differ; call `effects_barrier()` again if more work was submitted, \
+                               then `acknowledge_effect_errors()` to recover once affected work is complete";
+        assert_eq!(lines, Vec::<String>::new());
+        assert_eq!(results, vec![(Err("values differ".to_string()), Err(barrier_failure.to_string())); 4]);
+    }
+
+    #[test]
     fn test_session_reshard_inputs_if_needed() {
         let client = cpu_client(4);
         let mesh = domain_mesh(client, "x", 4);
@@ -4911,6 +5024,46 @@ mod tests {
                 "{source:?} -> {expected_sharding:?}",
             );
         }
+
+        // A column-major `f32[4, 2]` split along `x` with the buffers of the devices at `y = 1`, for an identity that
+        // takes it replicated on a differently named mesh over the same devices, is gathered on its own mesh, which
+        // first serves the missing buffers from the local replicas of the same tiles. Before, the gather rejected them.
+        let renamed_axes = vec![
+            MeshAxis::new("q", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+        ];
+        let renamed = DeviceMesh::new(LogicalMesh::new(renamed_axes).unwrap(), mesh.devices().to_vec()).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
+        let matrix_type = ArrayType::new_static(DataType::F32, [4, 2]).with_layout(layout);
+        let replicated = Sharding::replicated(renamed.logical_mesh().clone(), 2);
+        let identity = crate::compile_with_options::<_, ArrayType, ArrayType>(
+            |x: CompileTracer| x,
+            matrix_type.clone(),
+            &session,
+            Options::new(renamed).with_input_shardings(vec![replicated]),
+        )
+        .unwrap();
+        let rows = vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated];
+        let rows = Sharding::new(mesh.logical_mesh().clone(), rows).unwrap();
+        let values = (1..=8).map(|value| value as f32).collect::<Vec<_>>();
+        let (r#type, sharding) = (matrix_type.clone(), Some(rows.clone()));
+        let original = Array::from_host_buffer(&session, r#type, mesh.clone(), sharding, values_to_bytes(&values));
+        let original = original.unwrap();
+        let buffers = [1, 3]
+            .into_iter()
+            .map(|index| {
+                let buffer = original.shards()[index].buffer().unwrap();
+                buffer.copy_to_memory(buffer.memory().unwrap()).unwrap()
+            })
+            .collect();
+        let input = Array::from_addressable_buffers(&session, matrix_type, mesh.clone(), Some(rows), buffers).unwrap();
+        let read = |output: Array| values_from_bytes::<f32>(&output.copy_to_host_bytes().unwrap());
+        let executed = identity.executable().execute(&session, input.clone()).map(read);
+        let called = identity.call(input).map(read);
+        assert_eq!(
+            (executed.map_err(|error| error.to_string()), called.map_err(|error| error.to_string())),
+            (Ok(values.clone()), Ok(values)),
+        );
     }
 
     #[test]

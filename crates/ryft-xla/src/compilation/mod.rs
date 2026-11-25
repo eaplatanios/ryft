@@ -36,7 +36,7 @@ pub use programs::{CompiledProgram, LoweredProgram};
 
 /// Represents errors produced while validating compilation [`Options`], checking or persisting an XLA executable, or
 /// interpreting compilation analysis.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum CompilationError {
     /// A requested compilation option combination is invalid.
     #[error("invalid compilation options: {reason}")]

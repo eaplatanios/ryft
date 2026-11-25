@@ -233,8 +233,8 @@ pub trait StatefulCompilationDomain: CompilationDomain {
 
 /// Optional capability for caching backend-compiled programs in a [`CompilationCache`](crate::CompilationCache).
 /// Cache identity is derived from the lowered program alone. [`CompilationDomain::lower`] folds every option, compiler,
-/// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`], so key equality
-/// always means that compiled programs are interchangeable.
+/// target, and topology property that affects compilation into [`CompilationDomain::LoweredProgram`]. Equal keys
+/// share one backend compilation. [`Self::reuse_cached_program`] can bind that result to request-specific metadata.
 ///
 /// In-memory caching and coordination of concurrent compilations for the same key require only
 /// [`Self::compilation_key`]. Persistent caching and artifact exchange additionally use the optional
@@ -242,34 +242,30 @@ pub trait StatefulCompilationDomain: CompilationDomain {
 /// [`Self::deserialize_program`]). Their availability may depend on the active runtime plugin or the
 /// particular compiled program, so implementing this trait does not guarantee serialization support.
 pub trait CompilationCacheDomain: CompilationDomain {
-    /// Exact structural cache key for interchangeable compiled programs.
+    /// Exact structural cache key for reusable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Constructs the exact compilation cache key for `program`. Equal keys must mean that compiled programs are
-    /// interchangeable, so that [`Self::validate_cached_program`] can only reject a program from the in-memory tier
-    /// when this function violates that contract.
+    /// Constructs the exact compilation cache key for `program`. Equal keys must allow [`Self::reuse_cached_program`]
+    /// to serve each request from the same backend compilation.
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error>;
 
     /// Compiles `program` without consulting any cache. [`CompilationCache::compile`](crate::CompilationCache::compile)
-    /// invokes this function only when no cached or exchanged program can serve `program`, and callers otherwise go
-    /// through that function so that every compilation shares the cache.
+    /// invokes this function only when no cached or exchanged program can serve `program`.
     fn compile_uncached(&self, program: &Self::LoweredProgram) -> Result<Self::CompiledProgram, Self::Error>;
 
-    /// Validates that `compiled`, which a [`CompilationCache`](crate::CompilationCache) resolved from its in-memory
-    /// tier, another producer, persistent storage, or the artifact exchange instead of compiling it for this request,
-    /// can serve the requesting `program`. Backends use it to guard the invocation contract that their calls trust
-    /// (e.g., signatures and donation flags) against colliding or corrupted artifacts. A rejected persistent or
-    /// exchanged artifact is an incompatible miss that falls through to the remaining sources, while a rejected
-    /// in-memory or shared in-flight program fails the compilation with the returned error. The default accepts
-    /// every program.
+    /// Validates and returns `compiled` for the requesting `program`, rebinding request-specific metadata as needed.
+    /// A backend may wrap the same executable with fresh metadata for this caller. Other requests can still hold the
+    /// cached program. The default returns the supplied shared handle. A rejected persistent or exchanged artifact is
+    /// an incompatible miss. Rejecting an in-memory or shared in-flight program fails the compilation with the returned
+    /// error.
     #[inline]
-    fn validate_cached_program(
+    fn reuse_cached_program(
         &self,
         program: &Self::LoweredProgram,
-        compiled: &Self::CompiledProgram,
-    ) -> Result<(), Self::Error> {
-        let _ = (program, compiled);
-        Ok(())
+        compiled: Arc<Self::CompiledProgram>,
+    ) -> Result<Arc<Self::CompiledProgram>, Self::Error> {
+        let _ = program;
+        Ok(compiled)
     }
 
     /// Returns canonical bytes identifying the compilation for persistent caching, or [`None`] when this domain does

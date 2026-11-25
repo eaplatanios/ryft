@@ -76,6 +76,8 @@ use ryft_core::{
 };
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Invalid mapping program, index arithmetic, or full array window.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum BlockMappingError {

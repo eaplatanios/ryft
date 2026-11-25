@@ -62,6 +62,8 @@ use ryft_core::{
 };
 use thiserror::Error;
 
+// TODO(eaplatanios): Review this module.
+
 /// Errors encountered when declaring or accessing kernel memory.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelMemoryError {

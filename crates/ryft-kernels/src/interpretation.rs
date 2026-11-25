@@ -137,6 +137,8 @@ use crate::operations::{
 };
 use crate::validation::{KernelParameterAccess, KernelReferenceOperation, KernelReferenceSummary, KernelSwapLowering};
 
+// TODO(eaplatanios): Review this module.
+
 /// Failure of the host interpreter while it replays a qualified kernel body. The replay fails when an enabled NaN
 /// check finds a NaN, when the asynchronous copy protocol is violated at runtime, or when a debug entry point exhausts
 /// its replay step limit. Qualification failures are reported separately as [`KernelInitializationError`]s. The

@@ -12,6 +12,8 @@ use ryft_kernels::{KernelCompletionProtocol, KernelExtension, KernelExtensionMem
 
 use crate::kernels::gpu::tmem::TmemOperation;
 
+// TODO(eaplatanios): Review this module.
+
 /// Operations whose instruction selection is part of the kernel contract.
 ///
 /// These operations use canonical array values and Ryft's ordinary staging machinery. Their presence requires an

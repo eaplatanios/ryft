@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
-use crate::compilation::programs::CompiledProgram;
+use crate::compilation::programs::{CompiledProgram, OutputDeviceAssignment};
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
 use crate::lowering::signature::ExecutableSignature;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
@@ -503,6 +503,7 @@ impl CompiledProgram {
             compilation_options: self.compilation_options().encode_to_vec(),
             signature: PersistentArraySignature::encode(self.input_types(), self.all_output_types()),
             input_mapping: persistent_mapping(self.signature().input_mapping())?,
+            unread_inputs: self.signature().unread_inputs().to_vec(),
             output_mapping: persistent_mapping(self.signature().output_mapping())?,
             input_dimensions: PersistentBoundaryDimension::from_input_dimensions(self.signature()),
             output_dimensions: PersistentBoundaryDimension::from_output_dimensions(self.signature()),
@@ -523,6 +524,7 @@ impl CompiledProgram {
                 .collect(),
             output_shardings: self.output_shardings().iter().map(PersistentSharding::from).collect(),
             committed_outputs: self.committed_outputs().to_vec(),
+            output_device_assignment: self.output_device_assignment(),
             mesh: PersistentDeviceMesh::from(self.mesh()),
             device_kinds: self.device_kinds().to_vec(),
             kernel_execution_facts: self.kernel_execution_facts().map(<[u8]>::to_vec),
@@ -736,12 +738,30 @@ impl Session {
                 }));
             }
         }
-        let signature = ExecutableSignature::new(input_types.as_slice(), output_types.as_slice()).with_effects(
-            metadata.ordered_io,
-            metadata.unordered_io,
-            metadata.requires_assertion_handler,
-            metadata.device_ordered_io,
-        );
+        // The inputs that the executable never reads are recorded as they were lowered (refer to
+        // `ExecutableSignature::with_unread_inputs`), never inferred from the mapping, which cannot tell such an input
+        // from a read one without a buffer. An unread input has a static shape and backs no reference state, and the
+        // signature that is rebuilt with them is then compared in full below. A record of no unread input is omitted,
+        // so that the metadata of an executable without one is what it was before unread inputs were recorded.
+        let unread_inputs = metadata.unread_inputs;
+        if !unread_inputs.is_empty()
+            && (unread_inputs.len() != input_types.len()
+                || unread_inputs.iter().zip(&input_types).enumerate().any(|(index, (is_unread, r#type))| {
+                    *is_unread && (r#type.static_shape().is_none() || reference_state_input_indices.contains(&index))
+                }))
+        {
+            return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
+                reason: "unread input metadata does not match the logical inputs".into(),
+            }));
+        }
+        let signature = ExecutableSignature::new(input_types.as_slice(), output_types.as_slice())
+            .with_unread_inputs(&unread_inputs)
+            .with_effects(
+                metadata.ordered_io,
+                metadata.unordered_io,
+                metadata.requires_assertion_handler,
+                metadata.device_ordered_io,
+            );
         if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
             || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
             || PersistentBoundaryDimension::from_input_dimensions(&signature) != metadata.input_dimensions
@@ -921,6 +941,7 @@ impl Session {
             expected_argument_shardings.into(),
             output_shardings.into(),
             metadata.committed_outputs.into(),
+            metadata.output_device_assignment,
             mesh,
             compilation_options,
             metadata.platform_name.into(),
@@ -952,6 +973,11 @@ struct PersistentExecutableMetadata {
 
     /// Physical executable argument position for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
+
+    /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
+    /// in which case it is omitted, as in the metadata written before it was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unread_inputs: Vec<bool>,
 
     /// Physical executable result position for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
@@ -1002,6 +1028,10 @@ struct PersistentExecutableMetadata {
     /// schemas do not record it, so it defaults to empty, which lets them decode and be rejected by their version.
     #[serde(default)]
     committed_outputs: Vec<bool>,
+
+    /// How a detached invocation assigns output devices. Earlier envelopes use the fixed assignment.
+    #[serde(default)]
+    output_device_assignment: OutputDeviceAssignment,
 
     /// Concrete compilation and execution mesh.
     mesh: PersistentDeviceMesh,
@@ -1477,6 +1507,54 @@ mod tests {
 
     use super::*;
 
+    /// Sessions that share native code on the same device but differ in how they select that device.
+    struct OutputAssignmentFixture {
+        device: Device,
+        local: Session,
+        shared: Session,
+    }
+
+    impl OutputAssignmentFixture {
+        fn new(session: &Session) -> Self {
+            let device = session.addressable_devices().unwrap()[1];
+            let local = session.with_default_device(device).unwrap();
+            let shared = session.with_device_mesh(local.device_mesh().unwrap().clone());
+            Self { device, local, shared }
+        }
+
+        fn stage(&self, places_on_device: bool) -> crate::StagedFunction<ArrayType, ArrayType> {
+            let device = self.device;
+            crate::stage::<_, ArrayType, ArrayType>(
+                move |input| {
+                    if places_on_device {
+                        input.place(&device, None).unwrap()
+                    } else {
+                        input.place(&Memory::Device, None).unwrap()
+                    }
+                },
+                ArrayType::scalar(DataType::F32),
+                Options::new(self.local.device_mesh().unwrap().clone()),
+            )
+            .unwrap()
+        }
+
+        fn upload(caller: &Session) -> Array {
+            Array::from_host_buffer(caller, ArrayType::scalar(DataType::F32), None, None, 4f32.to_ne_bytes()).unwrap()
+        }
+
+        fn check(&self, output: &Array, locally_assigned: bool) {
+            assert_eq!(output.mesh().devices(), &[self.device]);
+            assert!(output.is_committed());
+            assert_eq!(output.is_locally_assigned(), locally_assigned);
+            assert_eq!(output.copy_to_host_bytes().unwrap(), 4f32.to_ne_bytes());
+        }
+
+        fn execute(&self, caller: &Session, program: &CompiledProgram, locally_assigned: bool) {
+            let outputs = caller.execute(program, vec![Value::Array(Self::upload(caller))]).unwrap();
+            self.check(program_array(&outputs[0]), locally_assigned);
+        }
+    }
+
     /// Splits a serialized executable envelope into its encoded metadata and its native executable bytes.
     fn envelope_sections(bytes: &[u8]) -> (&[u8], &[u8]) {
         let header_size = PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
@@ -1526,6 +1604,18 @@ mod tests {
         );
         assert_eq!(restored_outputs[0].data_type(), output_type.data_type());
         assert_eq!(restored_inputs[0].dimension(1), restored_outputs[0].dimension(0));
+    }
+
+    #[test]
+    fn test_persistent_array_signature_decodes_legacy_anonymous_sharding() {
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let boundary = std::slice::from_ref(&plain);
+        let mut signature = PersistentArraySignature::encode(boundary, boundary);
+        let legacy = Sharding::replicated(LogicalMesh::single_device(), 1);
+        signature.input_types[0].sharding = Some(PersistentSharding::from(&legacy));
+        signature.output_types[0].sharding = Some(PersistentSharding::from(&legacy));
+
+        assert_eq!(signature.decode().unwrap(), (vec![plain.clone()], vec![plain]));
     }
 
     #[test]
@@ -1775,6 +1865,115 @@ mod tests {
             Array::from_host_buffer(&session, input_type, None, None, values_to_bytes(&[1f32, 2., 3.])).unwrap();
         let output = session.execute(&restored, vec![Value::Array(input)]).unwrap().pop().unwrap();
         assert!(!program_array(&output).is_committed());
+    }
+
+    #[test]
+    fn test_compilation_cache_reuses_native_code_across_output_device_assignments() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let fixture = OutputAssignmentFixture::new(&session);
+        let explicit = fixture.stage(true).into_inner().lower(&fixture.shared).unwrap();
+        let relative = fixture.stage(false).into_inner().lower(&fixture.local).unwrap();
+        assert_eq!(explicit.lowered_program().stable_hlo(), relative.lowered_program().stable_hlo());
+
+        let cache = session.compilation_cache();
+        let explicit = cache.compile(&fixture.shared, explicit.lowered_program()).unwrap();
+        let relative = cache.compile(&fixture.local, relative.lowered_program()).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&explicit, &relative));
+        assert!(std::ptr::eq(explicit.executable(), relative.executable()));
+        fixture.execute(&fixture.local, &explicit, false);
+        fixture.execute(&fixture.local, &relative, true);
+        assert_eq!(cache.statistics().compilations, 1);
+        assert_eq!(cache.program_count(), 1);
+    }
+
+    #[test]
+    fn test_compiled_function_call_and_execution_preserve_output_device_assignment() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let fixture = OutputAssignmentFixture::new(&session);
+        for places_on_device in [true, false] {
+            let function = fixture.shared.compile_staged_function(fixture.stage(places_on_device)).unwrap();
+            let executable = function.executable();
+            for (caller, locally_assigned) in [(&fixture.local, !places_on_device), (&fixture.shared, false)] {
+                let input = OutputAssignmentFixture::upload(caller);
+                let direct = if places_on_device {
+                    input.place(&fixture.device, None).unwrap()
+                } else {
+                    input.place(&Memory::Device, None).unwrap()
+                };
+                fixture.check(&direct, locally_assigned);
+                fixture.check(&function.call(input.clone()).unwrap(), locally_assigned);
+                fixture.check(&executable.execute(caller, input.clone()).unwrap(), locally_assigned);
+                fixture.check(&executable.execute_async(caller, input).unwrap().into_output(), locally_assigned);
+            }
+        }
+        assert_eq!(session.compilation_cache().statistics().compilations, 1);
+        assert_eq!(session.compilation_cache().program_count(), 1);
+    }
+
+    #[test]
+    fn test_compilation_cache_restores_native_code_across_output_device_assignments() {
+        let client = cpu_client(2);
+        let directory = tempdir().unwrap();
+        let session = || {
+            let disk_cache = DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0);
+            Session::builder().client(client).disk_cache(disk_cache).build().unwrap()
+        };
+        let writer = session();
+        let fixture = OutputAssignmentFixture::new(&writer);
+        fixture.shared.compile_staged_function(fixture.stage(true)).unwrap();
+
+        // The disk entry carries the explicit assignment. The new invocation follows its own caller.
+        let reader = session().with_default_device(fixture.device).unwrap();
+        let lowered = fixture.stage(false).into_inner().lower(&reader).unwrap();
+        let cache = reader.compilation_cache();
+        let relative = cache.compile(&reader, lowered.lowered_program()).unwrap();
+        let statistics = cache.statistics();
+        assert_eq!((statistics.persistent_hits, statistics.compilations), (1, 0));
+        fixture.execute(&reader, &relative, true);
+    }
+
+    #[test]
+    fn test_compiled_program_serialize_round_trips_output_device_assignments() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let fixture = OutputAssignmentFixture::new(&session);
+        let reader = Session::builder()
+            .client(session.client())
+            .build()
+            .unwrap()
+            .with_default_device(fixture.device)
+            .unwrap();
+        let explicit = fixture.stage(true).into_inner().lower(&fixture.shared).unwrap();
+        let explicit = fixture.shared.compile_program(explicit.lowered_program()).unwrap();
+        let bytes = session.serialize_program(&explicit).unwrap().unwrap();
+        let restored = reader.deserialize_program(&bytes).unwrap().unwrap();
+        fixture.execute(&reader, &restored, false);
+
+        let relative = fixture.stage(false).into_inner().lower(&fixture.local).unwrap();
+        let relative = fixture.local.compile_program(relative.lowered_program()).unwrap();
+        let bytes = session.serialize_program(&relative).unwrap().unwrap();
+        let restored = reader.deserialize_program(&bytes).unwrap().unwrap();
+        fixture.execute(&reader, &restored, true);
+        fixture.execute(&fixture.shared, &restored, false);
+    }
+
+    #[test]
+    fn test_session_deserialize_program_defaults_to_fixed_output_device_assignment() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let fixture = OutputAssignmentFixture::new(&session);
+        let relative = fixture.stage(false).into_inner().lower(&fixture.local).unwrap();
+        let relative = fixture.local.compile_program(relative.lowered_program()).unwrap();
+        let bytes = session.serialize_program(&relative).unwrap().unwrap();
+        let (metadata, native) = envelope_sections(&bytes);
+        let mut metadata: serde_json::Value = serde_json::from_slice(metadata).unwrap();
+        metadata.as_object_mut().unwrap().remove("output_device_assignment").unwrap();
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut legacy = PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+        legacy.extend((metadata.len() as u64).to_le_bytes());
+        legacy.extend_from_slice(&metadata);
+        legacy.extend_from_slice(native);
+
+        let restored = fixture.local.deserialize_program(&legacy).unwrap().unwrap();
+        fixture.execute(&fixture.local, &restored, false);
     }
 
     #[test]
@@ -2308,6 +2507,7 @@ mod tests {
             compilation_options: CompilationOptions::default().encode_to_vec(),
             signature: PersistentArraySignature::encode(&[], &[]),
             input_mapping: Vec::new(),
+            unread_inputs: Vec::new(),
             output_mapping: Vec::new(),
             input_dimensions: Vec::new(),
             output_dimensions: Vec::new(),
@@ -2324,6 +2524,7 @@ mod tests {
             expected_argument_shardings: Vec::new(),
             output_shardings: Vec::new(),
             committed_outputs: Vec::new(),
+            output_device_assignment: OutputDeviceAssignment::Fixed,
             mesh: PersistentDeviceMesh {
                 logical_mesh: PersistentLogicalMesh { axes: Vec::new() },
                 devices: Vec::new(),

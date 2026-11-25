@@ -7,6 +7,8 @@ use std::ffi::{CString, c_void};
 use crate::artifacts::CudaComputeCapability;
 use crate::{CudaArtifactFormat, CudaKernelArtifact, CudaKernelLaunchDimensions, CudaVersion, Error, ffi};
 
+// TODO(eaplatanios): Review this module.
+
 /// Unload failure retaining whether the module still needs cleanup.
 pub(super) struct CudaUnloadError {
     /// Driver or validation failure reported to the caller.

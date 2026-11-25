@@ -53,6 +53,8 @@ mod validation;
 
 pub(super) use module::serialize;
 
+// TODO(eaplatanios): Review this module.
+
 /// A value whose owning MLIR context outlives every region built by this lowering.
 type KernelValue<'c, 't> = ValueRef<'c, 'c, 't>;
 

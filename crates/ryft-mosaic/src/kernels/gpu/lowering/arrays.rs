@@ -10,6 +10,8 @@ use crate::kernels::gpu::Error;
 use crate::kernels::gpu::lowering::module::element_type;
 use crate::kernels::gpu::lowering::{Buffer, KernelValue, Lowering, append, shape};
 
+// TODO(eaplatanios): Review this module.
+
 /// Checks the exact array lowering subset before any native operations are constructed.
 pub(super) fn validate(
     operation: &ArrayOperation<Array>,

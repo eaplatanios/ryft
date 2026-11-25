@@ -36,8 +36,8 @@ pub mod values;
 
 pub use arrays::{
     Array, ArrayError, ArrayShard, ArrayShardStorage, ArrayStatistics, LiveArray, PlaceInput, Placeable,
-    PlacementOptions, RetainedArray, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready,
-    validate_parameter_options,
+    PlacementOptions, RetainedArray, SessionPlacementRequestParameter, ShardDescriptor, ShardIndex, ShardLayout,
+    block_until_ready, ready, validate_parameter_options,
 };
 pub use compilation::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
@@ -175,6 +175,40 @@ pub(crate) mod tests {
         let client: &'static Client<'static> = Box::leak(Box::new(load_cpu_plugin().unwrap().client(options).unwrap()));
         clients.push((device_count, client));
         client
+    }
+
+    /// Returns a session of `client` that declares `remote_devices` as the devices of other processes (refer to
+    /// [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)), for tests that describe arrays and
+    /// placements over devices of other processes, which a client without peers does not list. These tests simulate
+    /// ranks independently, so there is no peer making comparing calls in the same order.
+    pub(crate) fn session_with_remote_devices<D: IntoIterator<Item = Device>>(
+        client: &'static Client<'static>,
+        remote_devices: D,
+    ) -> Session {
+        Session::builder()
+            .client(client)
+            .remote_devices(remote_devices)
+            .value_comparison(false)
+            .build()
+            .unwrap()
+    }
+
+    /// Returns the addressable devices of every client of `clients` other than `client`, which stand for the
+    /// processes of one run, as the devices of other processes that a session of `client` declares (refer to
+    /// [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)).
+    pub(crate) fn peer_devices(client: &Client<'_>, clients: &[&'static Client<'static>]) -> Vec<Device> {
+        clients
+            .iter()
+            .filter(|peer| !std::ptr::addr_eq(**peer, client))
+            .flat_map(|peer| peer.addressable_devices().unwrap())
+            .map(|device| Device::from_pjrt(&device).unwrap())
+            .collect()
+    }
+
+    /// Returns one session for each of `clients`, which stand for the processes of one run, that declares the devices
+    /// of the other clients (refer to [`peer_devices`]).
+    pub(crate) fn sessions_of_processes<const N: usize>(clients: [&'static Client<'static>; N]) -> [Session; N] {
+        clients.map(|client| session_with_remote_devices(client, peer_devices(client, &clients)))
     }
 
     /// Returns the process-wide CUDA client for tests that explicitly exercise the CUDA plugin.

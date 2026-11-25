@@ -76,6 +76,8 @@ use ryft_core::{
 
 use crate::mappings::BoundaryPolicy;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`TileLoadOperation`].
 pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
 

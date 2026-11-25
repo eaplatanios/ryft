@@ -65,6 +65,8 @@ use crate::memory::{
 use crate::operations::KernelOperation;
 use crate::validation::KernelParameterAccess;
 
+// TODO(eaplatanios): Review this module.
+
 /// Functional kernel invocation capability for array values. Concrete host arrays use the qualified reference
 /// interpreter, and projected symbolic arrays bind the [`KernelCallOperation`] of the definition with its immutable
 /// body into their existing context. Backend array families may implement this capability through their own

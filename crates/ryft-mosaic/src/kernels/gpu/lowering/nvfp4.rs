@@ -7,6 +7,8 @@ use ryft_mlir::{Attribute, Block, DetachedBlock, Operation, Type, TypeRef, Unkno
 use crate::kernels::gpu::Error;
 use crate::kernels::gpu::lowering::{Buffer, KernelValue, Lowering, append, shape};
 
+// TODO(eaplatanios): Review this module.
+
 /// Exact pinned LLVM intrinsic for the native 16-by-8-by-64 E2M1 / unsigned-E4M3 instruction. Mosaic's stable
 /// dialect decoder does not reconstruct `mma.block_scale` attributes; the LLVM intrinsic retains the same typed
 /// operand/result contract without introducing an assembly-level interface or a second execution path.

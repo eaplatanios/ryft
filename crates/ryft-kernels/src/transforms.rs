@@ -59,6 +59,8 @@ use crate::mappings::{BlockMapping, BoundaryPolicy};
 use crate::operations::{KernelExtension, KernelOperation};
 use crate::validation::KernelParameterAccess;
 
+// TODO(eaplatanios): Review this module.
+
 /// A kernel transform cannot preserve the declared boundary or prove its rewritten accesses.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelTransformError {

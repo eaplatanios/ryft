@@ -353,9 +353,7 @@ impl CoreValue for Value {
         // folded static extent and the scalars later derived from it) on that array's mesh, rather than on the
         // client's default devices.
         match self {
-            Self::Array(value) if value.session().device_mesh().is_err() => {
-                value.session().with_device_mesh(value.mesh().clone())
-            }
+            Self::Array(value) if value.session().device_mesh().is_err() => value.session().with_derived_mesh(value),
             _ => self.session().clone(),
         }
     }

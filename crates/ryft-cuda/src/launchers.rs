@@ -11,6 +11,8 @@ use crate::drivers::{CudaDriver, CudaDriverApi, CudaLoadedKernel};
 use crate::launches::{CudaKernelArgumentStorage, validate_launch};
 use crate::{CudaKernelArtifact, CudaKernelLaunch, CudaStream, CudaVersion, Error};
 
+// TODO(eaplatanios): Review this module.
+
 /// Default maximum cached entries in one context/device partition.
 const DEFAULT_KERNEL_CACHE_CAPACITY_PER_CONTEXT_DEVICE: usize = 128;
 /// Default source-byte budget in one context/device partition.

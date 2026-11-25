@@ -75,6 +75,8 @@ use crate::validation::{
     KernelBoundaryContract, KernelParameterAccess, KernelReferenceSummary, KernelValidationError, validate_kernel_body,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Invalid kernel signature or body boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelError {

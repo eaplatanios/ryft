@@ -15,6 +15,8 @@ use crate::kernels::gpu::lowering::validation::checked_array;
 use crate::kernels::gpu::lowering::{KernelValue, append};
 use crate::kernels::gpu::{Error, Target};
 
+// TODO(eaplatanios): Review this module.
+
 /// Attribute identifying a native buffer argument in the pinned Mosaic lowering.
 const KERNEL_ARGUMENT_INDEX_ATTRIBUTE: &str = "mosaic_gpu.from_kernel_arg_idx";
 /// Attribute identifying the original host memref cast before native lowering.

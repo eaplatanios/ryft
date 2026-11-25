@@ -40,6 +40,8 @@ pub use artifacts::{RocmKernelArtifact, RocmKernelLaunchDimensions};
 pub use launchers::RocmKernelLauncher;
 pub use launches::{RocmDevicePointer, RocmKernelLaunch, RocmStream};
 
+// TODO(eaplatanios): Review this module.
+
 /// Destructor failures awaiting explicit observation by the application.
 static CLEANUP_ERRORS: Mutex<Vec<Error>> = Mutex::new(Vec::new());
 

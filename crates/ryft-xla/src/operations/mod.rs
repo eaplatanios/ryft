@@ -174,7 +174,13 @@ where
 
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed array IR carrier when an
     /// array operation is lifted into this family.
-    #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
+    #[ryft(
+        projected(ArrayType),
+        collective,
+        lockstep,
+        skip_from,
+        partial_evaluation = ArrayOperation::partially_evaluate_member
+    )]
     Array(ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>),
 
     /// Homogeneous first-class dimension operation.

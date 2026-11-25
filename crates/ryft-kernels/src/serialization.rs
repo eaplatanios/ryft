@@ -157,6 +157,8 @@ use crate::memory::{
 use crate::operations::{KernelExtension, KernelOperation, NoKernelExtension};
 use crate::validation::KernelParameterAccess;
 
+// TODO(eaplatanios): Review this module.
+
 /// Errors admitting or reconstructing a portable serialized kernel.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum KernelSerializationError {

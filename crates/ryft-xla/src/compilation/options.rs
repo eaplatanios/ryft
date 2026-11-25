@@ -167,6 +167,10 @@ pub struct Options {
     /// with the same role as [`Self::input_placements`] for the leading capture arguments.
     capture_placements: Option<Arc<[Option<Sharding>]>>,
 
+    /// Flat public inputs that the program never reads (refer to [`Self::with_unread_inputs`]), one flag for each
+    /// public input, or [`None`] when it reads all of them.
+    unread_inputs: Option<Arc<[bool]>>,
+
     /// Optional flat donation flags, one for each input. `None` donates nothing, and a present vector must match the
     /// program's flat public input arity exactly, which lowering validates.
     donation_flags: Option<Vec<bool>>,
@@ -197,6 +201,7 @@ impl Options {
             output_shardings: None,
             input_placements: None,
             capture_placements: None,
+            unread_inputs: None,
             donation_flags: None,
             feedback_directed_profile: None,
             input_bound_bucketing: None,
@@ -308,6 +313,16 @@ impl Options {
         self
     }
 
+    /// Records which flat public inputs the program never reads, one flag for each public input. Such an input with a
+    /// static shape has no executable argument, like a capture that no emitted region reads (refer to
+    /// `emitted_capture_reads`). The program of an eager call states its inputs that are captures which the callee
+    /// never reads, so that the call requires of them what an execution of the callee requires, which is nothing.
+    #[inline]
+    pub(crate) fn with_unread_inputs(mut self, unread_inputs: Arc<[bool]>) -> Self {
+        self.unread_inputs = Some(unread_inputs);
+        self
+    }
+
     /// Records the runtime placements of the captured arrays over all mesh axes, including the auto mesh axes that
     /// their types do not record.
     #[inline]
@@ -359,6 +374,13 @@ impl Options {
     #[inline]
     pub(crate) fn capture_placements(&self) -> Option<&[Option<Sharding>]> {
         self.capture_placements.as_deref()
+    }
+
+    /// Returns, for each flat public input, whether the program never reads it, so that it has no executable argument
+    /// (refer to [`Self::with_unread_inputs`]). `None` states that the program reads every public input.
+    #[inline]
+    pub(crate) fn unread_inputs(&self) -> Option<&[bool]> {
+        self.unread_inputs.as_deref()
     }
 
     /// Returns the optional flat donation flags, one for each input. `None` donates nothing, and a present vector must
