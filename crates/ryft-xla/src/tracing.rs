@@ -205,15 +205,12 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Stages an arbitrary traced XLA function over global array types.
-///
-/// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
-/// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
-/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s with the global types in
-/// `input_type`, and the traced program is simplified. Functions that need that context (e.g., to create values
-/// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
+/// Stages an arbitrary traced XLA function over global array types. This is the general XLA tracing entry point used
+/// when callers want to compose `shard_map` with differentiation transforms and then lower the resulting whole program
+/// to StableHLO/Shardy MLIR. `function` is traced once, in a fresh root tracing context of [`Session`] that binds no
+/// named axes, over [`ArrayTracer`]s with the global types in `input_type`, and the traced program is simplified.
+/// Functions that need that context (e.g., to create values that derive from no input) or that can fail are traced
+/// through [`trace_with_context`] instead.
 ///
 /// # Parameters
 ///
@@ -241,11 +238,11 @@ where
     trace_with_context(|_, inputs| Ok(function(inputs)), input_type)
 }
 
-/// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
-/// of [`Session`] together with its inputs. The context lets the function create values that derive from no input
-/// (e.g., through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a
-/// `shard_map` without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its
-/// tracers after returning.
+/// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context of
+/// [`Session`] together with its inputs. The context lets the function create values that derive from no input (e.g.,
+/// through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a `shard_map`
+/// without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its tracers
+/// after returning.
 ///
 /// # Parameters
 ///
@@ -298,6 +295,8 @@ where
             output_structure,
         )?)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
