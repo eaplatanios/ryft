@@ -950,8 +950,6 @@ impl TryFrom<bool> for Constant {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table, session constants
 /// refer to arrays that their handles retain, and Boolean literals preserve dimension comparison proofs without
 /// allocating device storage or introducing a capture. Projection onto [`ArrayType`] is the identity and preserves
@@ -1108,6 +1106,8 @@ impl TryFrom<bool> for ArrayConstant {
         Ok(Self::Boolean(value))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
