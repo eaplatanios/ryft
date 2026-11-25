@@ -452,8 +452,6 @@ impl DistributedRuntime {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Shared state of a [`DistributedRuntime`], retained by every clone of the runtime and by its artifact exchanges.
 struct DistributedRuntimeState {
     /// Key-value store backed by the distributed runtime client of this process.
@@ -483,8 +481,8 @@ struct DistributedRuntimeState {
     service: Option<DistributedRuntimeService>,
 }
 
-/// [`CompilationArtifactExchange`] that publishes chunked, checksummed artifacts through the key-value store of a
-/// [`DistributedRuntime`].
+/// [`CompilationArtifactExchange`] that publishes chunked, checksummed artifacts through the key-value store
+/// of a [`DistributedRuntime`].
 struct DistributedCompilationArtifactExchange {
     /// Shared runtime state that owns the key-value store and keeps the client and service alive.
     runtime: Arc<DistributedRuntimeState>,
@@ -528,7 +526,6 @@ impl DistributedCompilationArtifactExchange {
     }
 
     /// Stores `value` under `key` unless a value is already stored there, in which case the stored value is kept.
-    ///
     /// The coordination store never overwrites values, and the leader legitimately writes the same record more than
     /// once, for example when it compiles a program again after evicting it from its in-memory cache.
     fn put_if_absent(&self, key: &[u8], value: &[u8]) -> Result<(), CompilationArtifactExchangeError> {
@@ -543,6 +540,8 @@ impl DistributedCompilationArtifactExchange {
         CompilationArtifactExchangeError::Failed { message: message.into() }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CompilationArtifactExchange for DistributedCompilationArtifactExchange {
     fn process_index(&self) -> usize {
