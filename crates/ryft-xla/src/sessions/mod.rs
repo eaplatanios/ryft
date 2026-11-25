@@ -967,18 +967,18 @@ impl Session {
     /// destination that all of them share (refer to [`SessionBuilder::value_comparison`]).
     #[inline]
     pub(crate) fn compares_values_across_processes(&self) -> bool {
-        self.state.value_comparison
+        self.state.value_comparison.enabled
     }
 
     // TODO(eaplatanios): Review this.
     /// Returns the participants and transport for comparisons of values of this session, which are discovered once.
     #[inline]
     pub(crate) fn comparison_participants(&self) -> Result<Option<&ValueComparison>, Error> {
-        if let Some(comparison) = self.state.comparison_participants.get() {
+        if let Some(comparison) = self.state.value_comparison.participants.get() {
             return Ok(comparison.as_ref());
         }
         let comparison = ValueComparison::discover(self)?;
-        Ok(self.state.comparison_participants.get_or_init(|| comparison).as_ref())
+        Ok(self.state.value_comparison.participants.get_or_init(|| comparison).as_ref())
     }
 
     // TODO(eaplatanios): Review this.
@@ -987,7 +987,7 @@ impl Session {
     /// same position to the same comparison, which its contributed digest binds.
     #[inline]
     pub(crate) fn next_value_comparison(&self) -> u64 {
-        self.state.value_comparisons.fetch_add(1, Ordering::Relaxed)
+        self.state.value_comparison.count.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Moves the uncommitted arrays among `inputs` to the mesh that an eager operation runs on, given the arrays that
@@ -2554,9 +2554,8 @@ struct SessionState {
     /// is dropped and their queued uploads have run.
     host_upload_workers: HostUploadWorkers,
 
-    /// Whether placements compare the values that the processes of a run place onto a destination that all of them
-    /// share (refer to [`SessionBuilder::value_comparison`]).
-    value_comparison: bool,
+    /// State of the comparison of the values that the processes of a run place onto a destination that they share.
+    value_comparison: ValueComparisonState,
 
     /// Devices of other processes that the client does not list and that the session learned from its distributed
     /// runtime, sorted by identifier. It is non-empty exactly when the client has no native topology across the
@@ -2565,15 +2564,20 @@ struct SessionState {
 
     /// Distributed runtime of the job that the session takes part in, if it was built with one.
     distributed_runtime: Option<DistributedRuntime>,
+}
 
-    // TODO(eaplatanios): Review this.
+/// State of the comparison of the values that the processes of a run place onto a destination that all of them share,
+/// which every handle of a [`Session`] shares. Refer to [`SessionBuilder::value_comparison`] for more information.
+struct ValueComparisonState {
+    /// Whether placements compare those values.
+    enabled: bool,
+
     /// Participants and transport of value comparisons, discovered when a placement first needs them.
-    comparison_participants: OnceLock<Option<ValueComparison>>,
+    participants: OnceLock<Option<ValueComparison>>,
 
-    // TODO(eaplatanios): Review this.
     /// Number of comparisons of values across processes that placements of the session have submitted, which is the
-    /// position of the next one in their sequence (refer to [`Session::next_value_comparison`]).
-    value_comparisons: AtomicU64,
+    /// position of the next one in their sequence. Refer to [`Session::next_value_comparison`] for more information.
+    count: AtomicU64,
 }
 
 /// Tracer shape used while staging XLA programs directly from types, which is the [`DomainTracer`] of a [`Session`].
@@ -2948,11 +2952,13 @@ impl SessionBuilder {
                 work: SessionWorkTracker::default(),
                 array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
                 host_upload_workers: HostUploadWorkers::default(),
-                value_comparison: self.value_comparison,
+                value_comparison: ValueComparisonState {
+                    enabled: self.value_comparison,
+                    participants: OnceLock::new(),
+                    count: AtomicU64::new(0),
+                },
                 remote_devices: remote_devices.into_boxed_slice(),
                 distributed_runtime: runtime,
-                comparison_participants: OnceLock::new(),
-                value_comparisons: AtomicU64::new(0),
             }),
             default_mesh: DefaultMesh::None,
             effect_scope: Arc::new(EffectScope::default()),
