@@ -589,7 +589,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::tests::{test_compilation_options, values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
-    use crate::{Array, ExecutionArguments, FromPjrt, Platform, Session};
+    use crate::{Array, ExecutionArguments, FromPjrt, Platform, ProgramExtension, Session};
     use crate::{ArrayTracer, TracedProgram, trace};
 
     use super::*;

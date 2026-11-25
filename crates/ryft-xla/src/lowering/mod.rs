@@ -178,6 +178,7 @@ pub(crate) mod states;
 /// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
 pub(crate) mod types;
 
+pub use admission::DataDependentPaddingDiscipline;
 pub use modules::to_mlir_module_for_program;
 pub use types::{
     annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_array_ir_type, lower_compare_to_mlir,
@@ -557,6 +558,21 @@ pub trait LowerableOperation: CoreOperation {
     ) -> bool {
         let _ = (key, input_types, output_types, target_platform);
         false
+    }
+
+    /// Returns how this operation keeps the physical padding of bounded dynamic values unobservable when it consumes
+    /// a dimension that is derived from runtime data (refer to [`DataDependentPaddingDiscipline`]). Lowering admits a
+    /// program that derives dimensions from data only if every operation that consumes one states a supported
+    /// discipline. It returns [`DataDependentPaddingDiscipline::Unsupported`] unless a family overrides it, so that an
+    /// operation whose padding behavior nobody has stated is rejected and never assumed to be safe. Families answer
+    /// for each of their variants, and [`Operation`] does so with exhaustive matches, so that adding an operation to
+    /// it does not compile until its discipline is stated.
+    #[inline]
+    fn data_dependent_padding_discipline(&self) -> DataDependentPaddingDiscipline {
+        DataDependentPaddingDiscipline::Unsupported {
+            reason: "its operation family does not state how it keeps the padding of data-derived dimensions \
+                     unobservable",
+        }
     }
 
     /// Returns, for each input of `callee`, the callee of a `jit_call` of this family whose first `capture_count`
@@ -1324,10 +1340,15 @@ pub(crate) mod tests {
     ) -> Result<String, Error>
     where
         Input: Parameterized<ArrayType>,
-        Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
+        Input::Family: ParameterizedFamily<Constant>
+            + ParameterizedFamily<Type>
+            + ParameterizedFamily<ArrayTracer>
+            + ParameterizedFamily<Sharding>,
         Output: Parameterized<ArrayType>,
-        Output::Family:
-            ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
+        Output::Family: ParameterizedFamily<Constant>
+            + ParameterizedFamily<Type>
+            + ParameterizedFamily<ArrayTracer>
+            + ParameterizedFamily<Sharding>,
         F: FnOnce(
             &ProjectedContext<DomainTracingContext<Session>, ArrayType>,
             Input::To<ArrayTracer>,
@@ -2133,6 +2154,19 @@ pub(crate) mod tests {
                   }
                 }
             "},
+        );
+    }
+
+    #[test]
+    fn test_lowerable_operation_data_dependent_padding_discipline() {
+        // A family that does not state the padding discipline of its operations is not assumed to be safe.
+        let operation = BorrowingOperation { positions: &[0] };
+        assert_eq!(
+            operation.data_dependent_padding_discipline(),
+            DataDependentPaddingDiscipline::Unsupported {
+                reason: "its operation family does not state how it keeps the padding of data-derived dimensions \
+                         unobservable",
+            },
         );
     }
 

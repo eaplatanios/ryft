@@ -7,14 +7,13 @@
 
 use std::collections::HashSet;
 
-use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use ryft_core::{
-    ArrayOperation, DimensionVariable, FlatProgram, Operation as CoreOperation, ProgramError, ReductionKind,
-    ScatterMode, ScatterReductionKind, SortDirection, Type as CoreType, Typed,
+    DimensionFromScalarOperation, DimensionVariable, EagerContext, FlatProgram, ProgramError, Type as CoreType, Typed,
 };
 
+use crate::lowering::LowerableOperationFamily;
 use crate::lowering::emissions::emitted_regions;
-use crate::{Error, Operation, Session, Type};
+use crate::{Constant, Error, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -36,14 +35,18 @@ use crate::{Error, Operation, Session, Type};
 /// Returns an [`Error`] wrapping [`ProgramError::InvalidArgument`] when a data-derived dimension has no finite upper
 /// bound, or wrapping [`ProgramError::UnsupportedOperation`] when an operation without a supported padding discipline
 /// consumes a data-derived dimension.
-pub(crate) fn validate_data_dependent_compilation(
-    program: &FlatProgram<Session>,
+///
+/// [`XlaMasked`]: DataDependentPaddingDiscipline::XlaMasked
+/// [`XlaZeroPadded`]: DataDependentPaddingDiscipline::XlaZeroPadded
+/// [`RyftMasked`]: DataDependentPaddingDiscipline::RyftMasked
+pub(crate) fn validate_data_dependent_compilation<O: LowerableOperationFamily>(
+    program: &FlatProgram<EagerContext<Constant, O>>,
     target_platform: Option<&str>,
 ) -> Result<(), Error> {
     let mut variables = HashSet::new();
     for region in emitted_regions(program.entry_region_ref(), target_platform) {
         for instruction in region.instructions() {
-            if let Operation::DimensionFromScalar(operation) = instruction.operation() {
+            if let Some(operation) = instruction.operation().projected_payload::<DimensionFromScalarOperation>() {
                 // A static output defines no identity and is checked against its extent.
                 let Some(variable) = operation.output_type().variable() else {
                     continue;
@@ -99,7 +102,7 @@ pub(crate) fn validate_data_dependent_compilation(
             });
             if consumes_data_derived_extent
                 && let DataDependentPaddingDiscipline::Unsupported { reason } =
-                    data_dependent_padding_discipline(instruction.operation())
+                    instruction.operation().data_dependent_padding_discipline()
             {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
@@ -115,9 +118,14 @@ pub(crate) fn validate_data_dependent_compilation(
     Ok(())
 }
 
-/// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering.
+/// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering (i.e., how
+/// the operation keeps the physical padding of a bounded dynamic value unobservable when one of its dimensions is
+/// derived from runtime data). Each operation family states the discipline of its operations through the
+/// [`data_dependent_padding_discipline`] function of `LowerableOperation`.
+///
+/// [`data_dependent_padding_discipline`]: super::LowerableOperation::data_dependent_padding_discipline
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum DataDependentPaddingDiscipline {
+pub enum DataDependentPaddingDiscipline {
     /// StableHLO propagates the logical dynamic dimensions of the operation without inspecting physical padding
     /// positions.
     Propagated,
@@ -137,256 +145,6 @@ enum DataDependentPaddingDiscipline {
     Unsupported { reason: &'static str },
 }
 
-/// Returns the XLA masking contract for one reduction kind. The exhaustive match makes adding a reduction kind a
-/// compile-time update to the data-dependent inventory instead of silently inheriting another kind's padding rule.
-fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDependentPaddingDiscipline {
-    match kind {
-        ReductionKind::Sum
-        | ReductionKind::Product
-        | ReductionKind::Max
-        | ReductionKind::Min
-        | ReductionKind::Any
-        | ReductionKind::All => XlaMasked,
-        // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
-        // the masking contract of exactly those two reduction kinds. XLA masks the operand of each reduction with the
-        // identity of that reduction, which wipes the padding positions of the shifted exponentials before they are
-        // summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
-        // data-derived extent on the kept axis, which is the admission's execution evidence.
-        ReductionKind::LogSumExp => XlaMasked,
-        ReductionKind::Mean => {
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" }
-        }
-    }
-}
-
-/// Returns the XLA masking contract for one sort direction. Keeping the match exhaustive means that adding a sort
-/// direction fails to compile until the inventory covers it, because ascending and descending sorts require opposite
-/// sentinels.
-fn sort_data_dependent_padding_discipline(direction: SortDirection) -> DataDependentPaddingDiscipline {
-    match direction {
-        SortDirection::Ascending | SortDirection::Descending => XlaMasked,
-    }
-}
-
-/// Rejects every scatter combiner until its padding behavior has kind-specific execution evidence. The exhaustive
-/// match deliberately forces new combiners through the same review rather than admitting them as ordinary operations
-/// that preserve shapes.
-fn scatter_data_dependent_padding_discipline(kind: ScatterReductionKind) -> DataDependentPaddingDiscipline {
-    match kind {
-        ScatterReductionKind::Overwrite => Unsupported {
-            reason: "overwrite-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Add => {
-            Unsupported { reason: "add-scatter padding semantics have not been verified for data-derived dimensions" }
-        }
-        ScatterReductionKind::Mul => Unsupported {
-            reason: "multiply-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Min => Unsupported {
-            reason: "minimum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Max => Unsupported {
-            reason: "maximum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-    }
-}
-
-/// Classifies every homogeneous array operation by the padding discipline required for data-derived dimensions.
-/// Keeping this match exhaustive makes a newly added operation a compile-time inventory update rather than silently
-/// assuming that arbitrary padding is safe.
-fn array_data_dependent_padding_discipline(
-    operation: &ArrayOperation<crate::values::ArrayConstant>,
-) -> DataDependentPaddingDiscipline {
-    match operation {
-        ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
-        ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
-        // XLA pads every input of the variadic reduction that these lower to with that input's own initial value along
-        // a dynamic reduced axis (i.e., the extremum identity paired with index zero), which never beats a live element
-        // and ties only when every live element equals the identity, where index zero is correct. Dynamic axes that
-        // are not reduced pass through. `data_derived_padding_fixture` executes both configurations.
-        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => XlaMasked,
-        // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update positions, and
-        // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
-        // Other window shapes, modes, and combiners retain their independent admission requirements.
-        ArrayOperation::Scatter(operation)
-            if operation.kind() == ScatterReductionKind::Add
-                && operation.mode() == ScatterMode::PromiseInBounds
-                && operation.unique_indices()
-                && operation.dimensions().update_window_dimensions().is_empty() =>
-        {
-            XlaMasked
-        }
-        ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
-        // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
-        // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
-        // the same for every combining operator, and the prefix sum in `data_derived_padding_fixture` executes this arm
-        // with the data-derived extent on the unscanned axis.
-        ArrayOperation::Cumulative(_) => Propagated,
-        ArrayOperation::Dot(_) => XlaZeroPadded,
-        ArrayOperation::RaggedDot(_) => {
-            Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
-        }
-        ArrayOperation::ScaledDot(_) => RyftMasked,
-        ArrayOperation::RngBitGenerator(_) => Unsupported {
-            reason: "random generation advances state according to physical rather than logical element count",
-        },
-        ArrayOperation::Dropout(_) => {
-            Unsupported { reason: "dropout masks are drawn according to physical rather than logical extents" }
-        }
-        ArrayOperation::ParallelRaggedAllToAll(_) => {
-            Unsupported { reason: "ragged collective metadata may address physical padding positions" }
-        }
-        ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
-        // Entry guards and `cast`s narrow or widen bounded dynamic values explicitly. The physical buffer is sliced or
-        // padded, and every axis that stays dynamic gets its logical size back.
-        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
-        ArrayOperation::Assert(_)
-        | ArrayOperation::Zero(_)
-        | ArrayOperation::ZeroLike(_)
-        | ArrayOperation::One(_)
-        | ArrayOperation::OneLike(_)
-        | ArrayOperation::Constant(_)
-        | ArrayOperation::FillLike(_)
-        | ArrayOperation::Iota(_)
-        | ArrayOperation::IotaLike(_)
-        | ArrayOperation::Abs(_)
-        | ArrayOperation::Neg(_)
-        | ArrayOperation::Add(_)
-        | ArrayOperation::Sub(_)
-        | ArrayOperation::SaturatingSub(_)
-        | ArrayOperation::Mul(_)
-        | ArrayOperation::Div(_)
-        | ArrayOperation::Sin(_)
-        | ArrayOperation::Cos(_)
-        | ArrayOperation::Tan(_)
-        | ArrayOperation::Atan2(_)
-        | ArrayOperation::Exp(_)
-        | ArrayOperation::ExpM1(_)
-        | ArrayOperation::Log(_)
-        | ArrayOperation::Ln1p(_)
-        | ArrayOperation::LogAddExp(_)
-        | ArrayOperation::Sqrt(_)
-        | ArrayOperation::Rsqrt(_)
-        | ArrayOperation::Tanh(_)
-        | ArrayOperation::Logistic(_)
-        | ArrayOperation::Erf(_)
-        | ArrayOperation::Pow(_)
-        | ArrayOperation::Sign(_)
-        | ArrayOperation::Floor(_)
-        | ArrayOperation::Ceil(_)
-        | ArrayOperation::Round(_)
-        | ArrayOperation::Max(_)
-        | ArrayOperation::Min(_)
-        | ArrayOperation::Clamp(_)
-        | ArrayOperation::Rem(_)
-        | ArrayOperation::Not(_)
-        | ArrayOperation::And(_)
-        | ArrayOperation::Or(_)
-        | ArrayOperation::Xor(_)
-        | ArrayOperation::Complex(_)
-        | ArrayOperation::Conjugate(_)
-        | ArrayOperation::Real(_)
-        | ArrayOperation::Imaginary(_)
-        | ArrayOperation::ParallelReduce(_)
-        | ArrayOperation::ParallelVary(_)
-        | ArrayOperation::ParallelCast(_)
-        | ArrayOperation::ParallelAllGather(_)
-        | ArrayOperation::ParallelSumScatter(_)
-        | ArrayOperation::ParallelPermute(_)
-        | ArrayOperation::ParallelBroadcast(_)
-        | ArrayOperation::ParallelAllToAll(_)
-        | ArrayOperation::AxisIndex(_)
-        | ArrayOperation::Reverse(_)
-        | ArrayOperation::Transpose(_)
-        | ArrayOperation::Reshape(_)
-        | ArrayOperation::Broadcast(_)
-        | ArrayOperation::BroadcastLike(_)
-        | ArrayOperation::Pad(_)
-        | ArrayOperation::Concatenate(_)
-        | ArrayOperation::Gather(_)
-        | ArrayOperation::Slice(_)
-        | ArrayOperation::UpdateSlice(_)
-        | ArrayOperation::DynamicSlice(_)
-        | ArrayOperation::DynamicUpdateSlice(_)
-        | ArrayOperation::Compare(_)
-        | ArrayOperation::Select(_)
-        | ArrayOperation::Condition(_)
-        | ArrayOperation::While(_)
-        | ArrayOperation::Scan(_)
-        | ArrayOperation::ConvertElementType(_)
-        | ArrayOperation::ReducePrecision(_)
-        | ArrayOperation::TransferToMemory(_)
-        | ArrayOperation::Place(_)
-        | ArrayOperation::Reshard(_)
-        | ArrayOperation::ConstrainSharding(_)
-        | ArrayOperation::StopGradient(_)
-        | ArrayOperation::Tag(_)
-        | ArrayOperation::Rematerialize(_)
-        | ArrayOperation::Composite(_)
-        | ArrayOperation::CompositeTranspose(_)
-        | ArrayOperation::LinearCall(_) => Propagated,
-    }
-}
-
-/// Classifies every XLA operation by the bounded-dynamic padding discipline it requires.
-fn data_dependent_padding_discipline(operation: &Operation) -> DataDependentPaddingDiscipline {
-    match operation {
-        Operation::Array(operation) => array_data_dependent_padding_discipline(operation),
-        Operation::RngBitGenerator(_) => Unsupported {
-            reason: "random generation advances state according to physical rather than logical element count",
-        },
-        Operation::ParallelRaggedAllToAll(_) => {
-            Unsupported { reason: "ragged collective metadata may address physical padding positions" }
-        }
-        Operation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        Operation::ReferenceNew(_)
-        | Operation::ReferenceRead(_)
-        | Operation::ReferenceWrite(_)
-        | Operation::ReferenceSwap(_)
-        | Operation::ReferenceAddUpdate(_)
-        | Operation::ReferenceAtomicAddUpdate(_)
-        | Operation::ReferenceFreeze(_) => {
-            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
-        }
-        Operation::Kernel(_) => {
-            Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
-        }
-        // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
-        Operation::Guard(_) | Operation::Cast(_) => RyftMasked,
-        Operation::ShardMap(_) => {
-            Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
-        }
-        Operation::Zero(_)
-        | Operation::DynamicOne(_)
-        | Operation::DynamicIota(_)
-        | Operation::Dimension(_)
-        | Operation::Compare(_)
-        | Operation::Assert(_)
-        | Operation::DimensionSize(_)
-        | Operation::DimensionFromScalar(_)
-        | Operation::DimensionToScalar(_)
-        | Operation::Reshape(_)
-        | Operation::Broadcast(_)
-        | Operation::Concatenate(_)
-        | Operation::Pad(_)
-        | Operation::DynamicSlice(_)
-        | Operation::ParallelAllGather(_)
-        | Operation::ParallelSumScatter(_)
-        | Operation::ParallelAllToAll(_)
-        | Operation::Condition(_)
-        | Operation::While(_)
-        | Operation::Scan(_)
-        | Operation::Composite(_)
-        | Operation::LinearCall(_)
-        | Operation::Rematerialize(_)
-        | Operation::CompositeTranspose(_)
-        | Operation::LiftedComposite(_)
-        | Operation::LiftedCompositeTranspose(_)
-        | Operation::JitCall(_) => Propagated,
-    }
-}
-
 /// Returns whether `r#type` carries an identity derived from `dimension_from_scalar`.
 fn references_data_derived_dimension(r#type: &Type, variables: &HashSet<DimensionVariable>) -> bool {
     r#type.identities().any(|(_, identity)| variables.contains(identity))
@@ -396,7 +154,6 @@ fn references_data_derived_dimension(r#type: &Type, variables: &HashSet<Dimensio
 mod tests {
     use std::sync::Arc;
 
-    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayOperation, ArrayType,
@@ -407,10 +164,9 @@ mod tests {
         DimensionToScalarOperation, DimensionType, DimensionVariable, DomainTracingContext, DotDimensionNumbers,
         DotOperation, DynamicBroadcastOperation, Error as CoreError, IotaOperation, LinearCallOperation, MulOperation,
         NamedComposite, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramBuilder, ProgramError,
-        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation,
-        ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape,
-        SortDirection, SortOperation, StaticShape, SubOperation, Value as CoreValue,
-        differentiable_dot_product_attention,
+        RandomAlgorithm, ReduceOperation, ReductionKind, RngBitGeneratorOperation, ScaledDotOperation, ScanOperation,
+        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection, SortOperation,
+        StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
@@ -1097,90 +853,6 @@ mod tests {
         let program = program.unwrap();
         assert_eq!(validate(&program, Some("cuda")), Ok(()));
         assert_eq!(validate(&program, Some("cpu")), Err(unbounded.to_string()));
-    }
-
-    #[test]
-    fn test_data_dependent_padding_discipline() {
-        // Every reference operation shares one collapsed match arm, so one representative pins that arm.
-        assert_eq!(
-            data_dependent_padding_discipline(&Operation::ReferenceNew(ReferenceNewOperation::new())),
-            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
-        );
-
-        for kind in [
-            ReductionKind::Sum,
-            ReductionKind::Product,
-            ReductionKind::LogSumExp,
-            ReductionKind::Max,
-            ReductionKind::Min,
-            ReductionKind::Any,
-            ReductionKind::All,
-        ] {
-            assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
-        }
-        assert_eq!(
-            reduction_data_dependent_padding_discipline(ReductionKind::Mean),
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" },
-        );
-        for direction in [SortDirection::Ascending, SortDirection::Descending] {
-            assert_eq!(sort_data_dependent_padding_discipline(direction), XlaMasked);
-        }
-        for operation in [
-            ArrayOperation::ArgMax(ArgMaxOperation::new(0, DataType::I32)),
-            ArrayOperation::ArgMin(ArgMinOperation::new(0, DataType::I32)),
-        ] {
-            assert_eq!(array_data_dependent_padding_discipline(&operation), XlaMasked);
-        }
-        for (kind, combiner) in [
-            (ScatterReductionKind::Overwrite, "overwrite"),
-            (ScatterReductionKind::Add, "add"),
-            (ScatterReductionKind::Mul, "multiply"),
-            (ScatterReductionKind::Min, "minimum"),
-            (ScatterReductionKind::Max, "maximum"),
-        ] {
-            let Unsupported { reason } = scatter_data_dependent_padding_discipline(kind) else {
-                panic!("scatter combiner `{kind:?}` must be unsupported");
-            };
-            assert_eq!(
-                reason,
-                format!("{combiner}-scatter padding semantics have not been verified for data-derived dimensions"),
-            );
-        }
-
-        assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
-                DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-                DataType::F32,
-                true,
-                true,
-            ))),
-            RyftMasked,
-        );
-
-        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
-        // contract as those two reduction kinds.
-        assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
-                vec![0],
-                ReductionKind::LogSumExp,
-            ))),
-            XlaMasked,
-        );
-
-        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
-        // classification rests on type inference keeping the scanned axis static.
-        for kind in [
-            CumulativeKind::Sum,
-            CumulativeKind::Product,
-            CumulativeKind::Max,
-            CumulativeKind::Min,
-            CumulativeKind::LogSumExp,
-        ] {
-            assert_eq!(
-                array_data_dependent_padding_discipline(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
-                Propagated,
-            );
-        }
     }
 
     #[test]

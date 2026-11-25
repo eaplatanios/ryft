@@ -380,19 +380,9 @@ impl Array {
             .map(|comparison| comparison.collective(session))
             .transpose()?;
         let same_client = std::ptr::eq(self.client(), session.client());
-        let destination = (|| {
-            self.validate_placement_client(session, Some(&request))?;
-            let target = self.resolve_placement_request(request)?;
-            if same_client {
-                if collective.is_some() {
-                    validate_mesh_devices(session, target.mesh())?;
-                }
-                self.checked_placement_layout(session, &target)?;
-            } else {
-                self.validate_placement_from_other_client(session, &target)?;
-            }
-            Ok::<_, Error>(target)
-        })();
+        let destination = self
+            .validate_placement_client(session, Some(&request))
+            .and_then(|_| self.checked_destination(session, request, collective.is_some()));
         let verdict = collective
             .map(|collective| {
                 let digest = destination.as_ref().ok().and_then(|_| combined_digest([array_value_digest(&self)]));
@@ -535,7 +525,8 @@ impl Array {
 
     /// Uploads the value of this array, which this process reads back as [`Self::copy_to_host_bytes`] does, onto
     /// `mesh` according to `sharding`, in `memory` and `layout`, as an array of `session`. This is the host round trip
-    /// that the host fallback of [`Self::run_placement_dispatch`] and [`Self::place_from_other_client`] share. The
+    /// that the host fallback of [`Self::run_placement_dispatch`], [`Self::place_from_other_client`], and the upload of
+    /// [`Self::place_process_local_value`] share. The
     /// destination buffers are created up front and the readback and the upload run in the background (refer to
     /// [`Self::from_host_buffer_in_background`]), whose failures, including those of the work that produces this
     /// array, `poison` converts into the error that the destination buffers report. Only when the PJRT plugin lacks
@@ -621,22 +612,10 @@ impl Array {
         let (committed, locally_assigned) = (self.is_committed(), self.is_locally_assigned());
         let array = self.with_session(session)?;
         let resolve_layout = cross_host_layout_resolver(session.client());
-        let process_index = session.client().process_index()?;
-        let strategy = array.device_placement_strategy(&resolve_layout, mesh, sharding, process_index)?;
-        // This work has no host fallback, so a change of reduction state that only a host round trip makes exactly is
-        // an error here, whichever process could make it.
-        if let Some(cause) = strategy.host_round_trip_cause() {
-            return Err(cause.without_host_route());
-        }
-        let array = if array.moves_to_owner_view(mesh, sharding, process_index) {
-            array.moved_to_owner_view(mesh)?
-        } else {
-            array
-        };
         // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout of
         // this array as the public placement path gives a result its storage, whatever strategy placed it.
         array
-            .place_with_strategy(strategy, process_index, mesh, sharding, memory, layout.as_ref(), donate)
+            .reshard_on_devices_or_return(&resolve_layout, mesh, sharding, memory, layout.as_ref(), donate, false)
             .map_err(|(error, _)| error)
             .and_then(|output| output.place_storage(memory, layout))
             .map(|output| output.commit_if(committed).with_locally_assigned(locally_assigned))
@@ -749,6 +728,7 @@ impl Array {
             memory,
             layout.as_ref(),
             donate,
+            true,
         ) {
             Ok(array) => return Ok(placed(array.place_storage(memory, layout)?)),
             Err((error, Some(source))) => (error, source),
@@ -800,13 +780,11 @@ impl Array {
         target: Option<PlacementRequest>,
     ) -> Result<(), Error> {
         let Some(target) = target else { return Ok(()) };
-        let placement = self.resolve_placement_request(target)?;
+        let placement = self.checked_destination(session, target, true)?;
         if !std::ptr::eq(self.client(), session.client()) {
-            return self.validate_placement_from_other_client(session, &placement);
+            return Ok(());
         }
         let (mesh, sharding) = (placement.mesh(), placement.sharding());
-        validate_mesh_devices(session, mesh)?;
-        self.checked_placement_layout(session, &placement)?;
         if self.is_locally_assigned()
             || self.data_type().is_zero()
             || (self.mesh() == mesh && self.sharding() == sharding)
@@ -822,13 +800,36 @@ impl Array {
                 self.device_placement_strategy(&resolve_layout, mesh, sharding, process_index)
         {
             let replicas = LocalReplicas::new(process_index);
-            for movement in
-                plan.moves().iter().filter(|movement| movement.source_device().process_index() == process_index)
+            for movement in plan.moves.iter().filter(|movement| movement.source_device.process_index() == process_index)
             {
-                self.local_replica(&replicas, movement.source_shard_index(), movement.destination_device())?;
+                self.local_replica(&replicas, movement.source_shard_index, movement.destination_device)?;
             }
         }
         Ok(())
+    }
+
+    /// Resolves `request` into the destination of a placement of this array and checks it from metadata: a destination
+    /// of another PJRT client with [`Self::validate_placement_from_other_client`], and otherwise its devices with
+    /// [`validate_mesh_devices`] when `check_devices` is set and its layout with [`Self::checked_placement_layout`].
+    /// The admission of [`Session::place`] and a placement that compares values, which submits its comparison before
+    /// [`Self::run_placement_dispatch`] checks the devices, set `check_devices`. Any other placement leaves that check,
+    /// and the order of its errors, to [`Self::run_placement_dispatch`].
+    fn checked_destination(
+        &self,
+        session: &Session,
+        request: PlacementRequest,
+        check_devices: bool,
+    ) -> Result<Placement, Error> {
+        let target = self.resolve_placement_request(request)?;
+        if std::ptr::eq(self.client(), session.client()) {
+            if check_devices {
+                validate_mesh_devices(session, target.mesh())?;
+            }
+            self.checked_placement_layout(session, &target)?;
+        } else {
+            self.validate_placement_from_other_client(session, &target)?;
+        }
+        Ok(target)
     }
 
     /// Resolves the destination layout and checks that the plugin can create it before this placement submits any
@@ -1109,10 +1110,7 @@ impl Array {
                     run_host_uploads(
                         vec![upload],
                         |_| read_shard_to_host(&source, &shape, Event::r#await).map(HostBufferSlice::from),
-                        |error| match error {
-                            Error::Pjrt(error) => error,
-                            error => PjrtError::internal(error.to_string()),
-                        },
+                        Error::into_pjrt_error,
                     )
                 })?;
                 placed
@@ -1262,30 +1260,12 @@ impl Array {
             return Ok(output);
         }
 
-        // Read the value back and upload the shards of the devices of this process, as `Self::upload_host_readback`
-        // does for the host fallback, but for a destination that other processes share.
-        let readback_source = self.clone();
-        let uploaded = Self::from_host_buffer_in_background(
-            session,
-            host_type.clone(),
-            mesh.clone(),
-            sharding.clone(),
-            self.host_readback_fence()?,
-            move || readback_source.copy_to_host_bytes(),
-            |error| match error {
-                Error::Pjrt(error) => error,
-                error => PjrtError::internal(error.to_string()),
-            },
-        )?;
-        match uploaded {
-            Some(output) => Ok(output),
-            None => {
-                let host_bytes = self.copy_to_host_bytes()?;
-                let sharding = Some(sharding.clone());
-                Self::from_host_buffer(session, host_type, mesh.clone(), sharding, host_bytes.as_slice())?
-                    .with_upload_completion(self.execution_fence().cloned())
-            }
-        }
+        // Read the value back and upload the shards of the devices of this process. The early return of
+        // `Self::upload_host_readback` is never taken from here, because a `DataType::Zero` source is placed as
+        // `DevicePlacementStrategy::Bufferless` before `ProcessLocalValue` can be chosen (refer to
+        // `Self::device_placement_strategy`), and `destinations` holds a destination device of this process.
+        let (mesh, sharding) = (mesh.clone(), sharding.clone());
+        self.upload_host_readback(session, mesh, sharding, memory, layout.cloned(), Error::into_pjrt_error)
     }
 
     /// Places this array on `mesh` according to `sharding` and in `memory` by sharing, copying, and transferring the
@@ -1409,10 +1389,10 @@ impl Array {
         let mut transfers = Vec::new();
         let mut send_buffers = HashMap::new();
         for movement in plan.moves_with_role(process_index, MoveRole::Send) {
-            let buffer = match send_buffers.entry(movement.source_shard_index()) {
+            let buffer = match send_buffers.entry(movement.source_shard_index) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
-                    let shard = &self.shards()[movement.source_shard_index()];
+                    let shard = &self.shards()[movement.source_shard_index];
                     let device = devices.get(shard.device().id())?;
                     let buffer = self.cross_host_source_buffer(&replicas, shard.index(), device, completion)?;
                     let layout = &cross_host_layouts[&movement.shape()];
@@ -1421,20 +1401,20 @@ impl Array {
                 }
             };
             transfers.push(CrossHostTransfer::Send {
-                source: movement.source_device().id(),
-                destination: movement.destination_device().id(),
-                transfer_key: movement.transfer_key(),
+                source: movement.source_device.id(),
+                destination: movement.destination_device.id(),
+                transfer_key: movement.transfer_key,
                 buffer,
             });
         }
         for movement in plan.moves_with_role(process_index, MoveRole::Receive) {
             transfers.push(CrossHostTransfer::Receive {
-                source: movement.source_device().id(),
-                destination: movement.destination_device().id(),
-                transfer_key: movement.transfer_key(),
-                device: devices.get(movement.destination_device().id())?,
-                element_type: plan.element_type(),
-                dimensions: cross_host_shape(movement.destination_shard_index(), &movement.shape())?,
+                source: movement.source_device.id(),
+                destination: movement.destination_device.id(),
+                transfer_key: movement.transfer_key,
+                device: devices.get(movement.destination_device.id())?,
+                element_type: plan.element_type,
+                dimensions: cross_host_shape(movement.destination_shard_index, &movement.shape())?,
             });
         }
         let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, memory)?;
@@ -1451,13 +1431,13 @@ impl Array {
         let mut work = session.reserve_work();
         for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
             let (shard, buffer) =
-                self.local_replica(&replicas, movement.source_shard_index(), movement.destination_device())?;
-            let same_device = shard.device() == movement.destination_device();
+                self.local_replica(&replicas, movement.source_shard_index, movement.destination_device)?;
+            let same_device = shard.device() == movement.destination_device;
             if same_device && memory == source_memory {
                 addressable_buffers.push(Arc::clone(buffer));
                 continue;
             }
-            let destination_memory = devices.get(movement.destination_device().id())?.memory(memory)?;
+            let destination_memory = devices.get(movement.destination_device.id())?.memory(memory)?;
             if same_device && buffer.memory()? == destination_memory {
                 addressable_buffers.push(Arc::clone(buffer));
                 continue;
@@ -1699,11 +1679,11 @@ impl Array {
         let mut work = session.reserve_work();
         let mut transfers = Vec::new();
         let mut staged_buffers = HashMap::new();
-        for movement in plan.moves() {
-            let device = movement.destination_device();
+        for movement in &plan.moves {
+            let device = movement.destination_device;
             match movement.role(process_index) {
                 Some(MoveRole::Send) => {
-                    let source = &self.shards()[movement.source_shard_index()];
+                    let source = &self.shards()[movement.source_shard_index];
                     let buffer = match staged_buffers.entry(source.index()) {
                         Entry::Occupied(entry) => Arc::clone(entry.get()),
                         Entry::Vacant(entry) => {
@@ -1723,24 +1703,24 @@ impl Array {
                         data_type,
                         source,
                         buffer,
-                        movement.slice(),
+                        &movement.slice,
                         Some(&remote_layouts[&movement.shape()]),
                         &mut completion,
                     )?;
                     transfers.push(CrossHostTransfer::Send {
-                        source: movement.source_device().id(),
+                        source: movement.source_device.id(),
                         destination: device.id(),
-                        transfer_key: movement.transfer_key(),
+                        transfer_key: movement.transfer_key,
                         buffer,
                     });
                 }
                 Some(MoveRole::Receive) => transfers.push(CrossHostTransfer::Receive {
-                    source: movement.source_device().id(),
+                    source: movement.source_device.id(),
                     destination: device.id(),
-                    transfer_key: movement.transfer_key(),
+                    transfer_key: movement.transfer_key,
                     device: devices.get(device.id())?,
-                    element_type: plan.element_type(),
-                    dimensions: cross_host_shape(movement.destination_shard_index(), &movement.shape())?,
+                    element_type: plan.element_type,
+                    dimensions: cross_host_shape(movement.destination_shard_index, &movement.shape())?,
                 }),
                 Some(MoveRole::Copy) | None => {}
             }
@@ -1759,8 +1739,8 @@ impl Array {
         // shard is the shard itself or a copy of a replica of its contribution on its device, so the regions of both
         // phases share one staged buffer for each shard.
         for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
-            let device = movement.destination_device();
-            let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index(), device)?;
+            let device = movement.destination_device;
+            let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index, device)?;
             let buffer = match staged_buffers.entry(source.index()) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
@@ -1768,19 +1748,19 @@ impl Array {
                     Arc::clone(entry.insert(buffer))
                 }
             };
-            let slice = movement.slice();
+            let slice = &movement.slice;
             let buffer = Self::prepare_shard_region(session, data_type, source, buffer, slice, None, &mut completion)?;
             let buffer = if source.device() == device {
                 buffer
             } else {
                 completion.track_new(&mut work, buffer.copy_to_device(devices.get(device.id())?.clone())?)?
             };
-            destination_buffers.insert(movement.transfer_key(), buffer);
+            destination_buffers.insert(movement.transfer_key, buffer);
         }
 
         let mut regions = vec![Vec::new(); destinations.len()];
-        for movement in plan.moves() {
-            regions[movement.destination_shard_index()].push(movement);
+        for movement in &plan.moves {
+            regions[movement.destination_shard_index].push(movement);
         }
         let mut buffers = Vec::new();
         for (destination, regions) in destinations.iter().zip(regions) {
@@ -1802,8 +1782,8 @@ impl Array {
             let pieces = regions
                 .into_iter()
                 .map(|movement| {
-                    let buffer = destination_buffers.remove(&movement.transfer_key()).ok_or_else(|| missing.clone())?;
-                    Ok((movement.slice(), buffer))
+                    let buffer = destination_buffers.remove(&movement.transfer_key).ok_or_else(|| missing.clone())?;
+                    Ok((movement.slice.as_slice(), buffer))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             buffers.push(Self::assemble_shard_regions(session, data_type, destination, pieces, &mut completion)?);
@@ -1969,9 +1949,12 @@ impl Array {
     /// execution failures propagate through [`Error`] without losing their typed payloads.
     ///
     /// `layout` is the layout of each destination shard that the placement records (refer to
-    /// [`Self::placement_layout`]), which [`Self::place_process_local_value`] uploads into directly.
+    /// [`Self::placement_layout`]), which [`Self::place_process_local_value`] uploads into directly. `host_fallback`
+    /// is whether the caller falls back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a
+    /// change of reduction state that only a host round trip makes exactly is an error right after the planning,
+    /// whichever process could make it (refer to [`HostRoundTripCause::without_host_route`]).
     // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
-    #[allow(clippy::result_large_err)]
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn reshard_on_devices_or_return(
         self,
         resolve_layout: &CrossHostLayoutResolver<'_>,
@@ -1980,6 +1963,7 @@ impl Array {
         memory: Memory,
         layout: Option<&Layout>,
         donate: bool,
+        host_fallback: bool,
     ) -> Result<Self, (Error, Option<Self>)> {
         let process_index = match self.session().client().process_index() {
             Ok(process_index) => process_index,
@@ -1994,6 +1978,9 @@ impl Array {
             Ok(strategy) => strategy,
             Err(error) => return Err((error, None)),
         };
+        if let Some(cause) = strategy.host_round_trip_cause().filter(|_| !host_fallback) {
+            return Err((cause.without_host_route(), None));
+        }
         let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
             match self.moved_to_owner_view(mesh) {
                 Ok(moved) => moved,
@@ -3121,7 +3108,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         )?;
         if let Some(plan) = exact {
             let cross_host_shards =
-                plan.cross_host_moves().map(|movement| (movement.destination_shard_index(), movement.shape()));
+                plan.cross_host_moves().map(|movement| (movement.destination_shard_index, movement.shape()));
             if let Some(cross_host_layouts) = cross_host_layouts(resolve_layout, element_type, cross_host_shards)? {
                 return Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts });
             }
@@ -3233,12 +3220,11 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let mut cross_host_layouts = HashMap::new();
         if let Some(movement) = replicas.cross_host_moves().next() {
             let shape = movement.shape();
-            let layout =
-                resolve_layout(element_type, movement.destination_shard_index(), &shape)?.ok_or_else(|| {
-                    Error::Pjrt(PjrtError::unimplemented(
-                        "the PJRT plugin does not report the default layout that a cross-host receive allocates",
-                    ))
-                })?;
+            let layout = resolve_layout(element_type, movement.destination_shard_index, &shape)?.ok_or_else(|| {
+                Error::Pjrt(PjrtError::unimplemented(
+                    "the PJRT plugin does not report the default layout that a cross-host receive allocates",
+                ))
+            })?;
             cross_host_layouts.insert(shape, layout);
         }
         let reshard = ReshardProgram { mesh: mesh.clone(), input: replicated_on_destination, output: sharding.clone() };
@@ -3474,14 +3460,14 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             });
             for (source, slice) in regions {
                 let transfer_key = exact_shard_transfer_key(source.index(), destination.index(), destinations.len())?;
-                moves.push(ShardMove::new(
-                    source.index(),
-                    source.device(),
-                    destination.index(),
-                    destination.device(),
+                moves.push(ShardMove {
+                    source_shard_index: source.index(),
+                    source_device: source.device(),
+                    destination_shard_index: destination.index(),
+                    destination_device: destination.device(),
                     slice,
                     transfer_key,
-                ));
+                });
             }
         }
         // Every element of a destination member comes from the same element of the corresponding source member, so the
@@ -3512,8 +3498,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             return Ok(None);
         };
         let remote_regions =
-            plan.cross_host_moves().map(|movement| (movement.destination_shard_index(), movement.shape()));
-        let layouts = cross_host_layouts(resolve_layout, plan.element_type(), remote_regions)?;
+            plan.cross_host_moves().map(|movement| (movement.destination_shard_index, movement.shape()));
+        let layouts = cross_host_layouts(resolve_layout, plan.element_type, remote_regions)?;
         Ok(layouts.map(|layouts| (plan, layouts)))
     }
 
@@ -3785,20 +3771,10 @@ impl ShardMovePlan {
     fn new(element_type: BufferType, moves: Vec<ShardMove>) -> Result<Self, Error> {
         let plan = Self { element_type, moves };
         for movement in plan.cross_host_moves() {
-            cross_host_global_device_id(movement.source_device().id())?;
-            cross_host_global_device_id(movement.destination_device().id())?;
+            cross_host_global_device_id(movement.source_device.id())?;
+            cross_host_global_device_id(movement.destination_device.id())?;
         }
         Ok(plan)
-    }
-
-    /// Returns the element type of the buffers that this plan moves.
-    fn element_type(&self) -> BufferType {
-        self.element_type
-    }
-
-    /// Returns all the moves of this plan.
-    fn moves(&self) -> &[ShardMove] {
-        &self.moves
     }
 
     /// Returns the moves in which the process with index `process_index` takes the part `role`.
@@ -3837,51 +3813,9 @@ struct ShardMove {
 }
 
 impl ShardMove {
-    /// Creates one move of the elements of `slice` from a source shard to a destination shard.
-    fn new(
-        source_shard_index: ShardIndex,
-        source_device: Device,
-        destination_shard_index: ShardIndex,
-        destination_device: Device,
-        slice: Vec<Range<usize>>,
-        transfer_key: CrossHostTransferKey,
-    ) -> Self {
-        Self { source_shard_index, source_device, destination_shard_index, destination_device, slice, transfer_key }
-    }
-
-    /// Returns the index of the source shard in the source array.
-    fn source_shard_index(&self) -> ShardIndex {
-        self.source_shard_index
-    }
-
-    /// Returns the device of the source shard.
-    fn source_device(&self) -> Device {
-        self.source_device
-    }
-
-    /// Returns the index of the destination shard in the destination array.
-    fn destination_shard_index(&self) -> ShardIndex {
-        self.destination_shard_index
-    }
-
-    /// Returns the device of the destination shard.
-    fn destination_device(&self) -> Device {
-        self.destination_device
-    }
-
-    /// Returns the moved slice in global array coordinates.
-    fn slice(&self) -> &[Range<usize>] {
-        &self.slice
-    }
-
     /// Returns the static shape of the moved slice.
     fn shape(&self) -> StaticShape {
         StaticShape::new(self.slice.iter().map(Range::len).collect::<Vec<_>>())
-    }
-
-    /// Returns the transfer rendezvous key that the send and the receive of a cross-host move share.
-    fn transfer_key(&self) -> CrossHostTransferKey {
-        self.transfer_key
     }
 
     /// Returns whether this move crosses processes, which needs a PJRT cross-host transfer.
@@ -4164,14 +4098,18 @@ fn plan_exact_shard_put<'o>(
         };
         received.insert(key);
         let source_shard = replicas.preferred(destination_shard);
-        moves.push(ShardMove::new(
-            source_shard.index(),
-            source_shard.device(),
-            destination_shard.index(),
-            destination_shard.device(),
-            destination_shard.slice().to_vec(),
-            exact_shard_transfer_key(source_shard.index(), destination_shard.index(), destination_shard_count)?,
-        ));
+        moves.push(ShardMove {
+            source_shard_index: source_shard.index(),
+            source_device: source_shard.device(),
+            destination_shard_index: destination_shard.index(),
+            destination_device: destination_shard.device(),
+            slice: destination_shard.slice().to_vec(),
+            transfer_key: exact_shard_transfer_key(
+                source_shard.index(),
+                destination_shard.index(),
+                destination_shard_count,
+            )?,
+        });
     }
     // Every destination key names a distinct source key, so the destination keeps every source contribution exactly
     // when it receives as many distinct ones.
@@ -5112,9 +5050,9 @@ mod tests {
             moves
                 .into_iter()
                 .map(|movement| PlannedTransfer {
-                    source: movement.source_device(),
-                    destination: movement.destination_device(),
-                    key: movement.transfer_key(),
+                    source: movement.source_device,
+                    destination: movement.destination_device,
+                    key: movement.transfer_key,
                     shape: movement.shape().as_slice().to_vec(),
                 })
                 .collect()
@@ -6800,9 +6738,9 @@ mod tests {
             panic!("the slices of the split must move as whole shards");
         };
         let moves = plan
-            .moves()
+            .moves
             .iter()
-            .map(|movement| (movement.source_device(), movement.destination_device(), movement.slice().to_vec()))
+            .map(|movement| (movement.source_device, movement.destination_device, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(moves, [(devices[0], remote, vec![0..1])]);
     }
@@ -9392,12 +9330,12 @@ mod tests {
             .unwrap();
         // Each column needs two regions. Two of the eight regions are already on their destination devices.
         let copied_bytes = regions
-            .moves()
+            .moves
             .iter()
-            .filter(|movement| movement.source_device() != movement.destination_device())
+            .filter(|movement| movement.source_device != movement.destination_device)
             .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
             .sum::<usize>();
-        assert_eq!(regions.moves().len(), 8);
+        assert_eq!(regions.moves.len(), 8);
         assert_eq!(copied_bytes, 48);
 
         // The strategy keeps the regions that it derived to choose itself, which the placement then executes.
@@ -11988,7 +11926,9 @@ mod tests {
             plan_exact_shard_put(BufferType::F32, sources, source_mesh, source_sharding, &shape, &mesh, &replicated);
         let plan = plan.unwrap().unwrap();
         assert_eq!(
-            plan.moves_with_role(0, MoveRole::Send).map(ShardMove::destination_device).collect::<Vec<_>>(),
+            plan.moves_with_role(0, MoveRole::Send)
+                .map(|movement| movement.destination_device)
+                .collect::<Vec<_>>(),
             remote,
         );
         let cross_host_layouts = HashMap::from([(StaticShape::new(vec![2, 3]), row_major.to_pjrt().unwrap())]);
@@ -12429,10 +12369,17 @@ mod tests {
         let Ok(DevicePlacementStrategy::ExactShards { plan, .. }) = strategy else {
             panic!("swapping the shards of two processes must move whole shards");
         };
-        assert_eq!(plan.element_type(), BufferType::Predicate);
+        assert_eq!(plan.element_type, BufferType::Predicate);
         assert_eq!(
             plan.moves_with_role(local.process_index(), MoveRole::Receive).collect::<Vec<_>>(),
-            [&ShardMove::new(1, remote, 1, local, vec![2..4], 3)],
+            [&ShardMove {
+                source_shard_index: 1,
+                source_device: remote,
+                destination_shard_index: 1,
+                destination_device: local,
+                slice: vec![2..4],
+                transfer_key: 3
+            }],
         );
     }
 
@@ -12770,10 +12717,15 @@ mod tests {
         else {
             panic!("a replica that crosses processes must move as a whole shard");
         };
-        let sends = plan.moves_with_role(0, MoveRole::Send).map(ShardMove::destination_device).collect::<Vec<_>>();
+        let sends = plan
+            .moves_with_role(0, MoveRole::Send)
+            .map(|movement| movement.destination_device)
+            .collect::<Vec<_>>();
         assert_eq!(sends, [remote[0]]);
         assert_eq!(
-            plan.moves_with_role(1, MoveRole::Receive).map(ShardMove::source_device).collect::<Vec<_>>(),
+            plan.moves_with_role(1, MoveRole::Receive)
+                .map(|movement| movement.source_device)
+                .collect::<Vec<_>>(),
             [local[0]],
         );
         let error = views[0]
@@ -13182,11 +13134,9 @@ mod tests {
         .unwrap();
         let plan = source.placement_planning_view().plan_shard_regions(&rows_mesh, &rows).unwrap().unwrap();
         let moves = plan
-            .moves()
+            .moves
             .iter()
-            .map(|movement| {
-                (movement.source_shard_index(), movement.destination_shard_index(), movement.slice().to_vec())
-            })
+            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
             moves,
@@ -13213,11 +13163,9 @@ mod tests {
         let split = Sharding::new(rows_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
         let plan = source.placement_planning_view().plan_shard_regions(&rows_mesh, &split).unwrap().unwrap();
         let moves = plan
-            .moves()
+            .moves
             .iter()
-            .map(|movement| {
-                (movement.source_shard_index(), movement.destination_shard_index(), movement.slice().to_vec())
-            })
+            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(moves, vec![(0, 0, vec![0..2]), (1, 1, vec![2..3]), (2, 2, vec![3..4]), (3, 3, vec![4..5])]);
 
@@ -13235,11 +13183,9 @@ mod tests {
             Sharding::new(halves_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["w"])]).unwrap();
         let plan = source.placement_planning_view().plan_shard_regions(&halves_mesh, &halves).unwrap().unwrap();
         let moves = plan
-            .moves()
+            .moves
             .iter()
-            .map(|movement| {
-                (movement.source_shard_index(), movement.destination_shard_index(), movement.slice().to_vec())
-            })
+            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
             moves,
@@ -13302,8 +13248,22 @@ mod tests {
         let sources = sources.descriptors().iter();
         let plan =
             plan_exact_shard_put(BufferType::F32, sources, &source_mesh, &sharding, &shape, &target_mesh, &sharding);
-        let send = ShardMove::new(0, local, 0, remote, vec![0..2], 0);
-        let receive = ShardMove::new(1, remote, 1, local, vec![2..4], 3);
+        let send = ShardMove {
+            source_shard_index: 0,
+            source_device: local,
+            destination_shard_index: 0,
+            destination_device: remote,
+            slice: vec![0..2],
+            transfer_key: 0,
+        };
+        let receive = ShardMove {
+            source_shard_index: 1,
+            source_device: remote,
+            destination_shard_index: 1,
+            destination_device: local,
+            slice: vec![2..4],
+            transfer_key: 3,
+        };
         let plan = plan.unwrap().unwrap();
         assert_eq!(plan, ShardMovePlan::new(BufferType::F32, vec![send.clone(), receive.clone()]).unwrap());
 

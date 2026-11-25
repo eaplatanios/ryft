@@ -28,6 +28,7 @@ use crate::compilation::placements::{
     entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, pruned_program,
 };
 use crate::lowering::emissions::collect_session_constants;
+use crate::lowering::modules::lower_mlir_module_for_program_with_value_shardings;
 use crate::{Constant, Error, Operation, Session, Tracer, Type};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
@@ -73,8 +74,6 @@ pub trait ProgramExtension {
         self.to_mlir_module_with_shardings(function_name, None, None)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Same as [`Self::to_mlir_module`] but with explicitly provided `sdy.sharding` attributes for the function's
     /// inputs and/or outputs. This is what the XLA Single Program Multiple Data (SPMD) partitioner reads to drive
     /// boundary slicing of per-device output buffers, including for shapes whose dimensions are not divisible by the
@@ -85,38 +84,35 @@ pub trait ProgramExtension {
     /// sharding of their global types, as the compilation path of [`Session`] does. Like that path, arguments and
     /// results replicate the unconstrained dimensions of their shardings, which their runtime placements read as
     /// replicated, and results whose placement over auto mesh axes nothing fixes are left open over those axes, so that
-    /// the compiler chooses it (refer to `entry_open_results` for what this export can and cannot know). Unlike that
-    /// path, which places a value without either as replicated because it lowers for concrete placed arrays, such a
-    /// value is left unannotated here, so that Shardy propagates its placement from the program (as JAX does for unspecified
-    /// shardings). Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
+    /// the compiler chooses it. Unlike that path, which places a value without either as replicated because it lowers
+    /// for concrete placed arrays, such a value is left unannotated here, so that Shardy propagates its placement from
+    /// the program. Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
     /// arguments that precede the inputs and are annotated with the placements of those arrays, as compilation for a
     /// [`Session`] passes them.
     ///
-    /// The traced program is pruned before lowering, as the compilation of a [`Session`] prunes it (refer to
-    /// `pruned_program`), which drops dead outputs of instructions that carry regions together with the body
-    /// computation that only they use (e.g., the dead primal outputs of a forward mode `shard_map` whose residuals feed
-    /// a gradient), and is then simplified. A `shard_map` whose ordinary
-    /// outputs are all dead but whose body has observable effects (e.g., prints with the
-    /// [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary outputs and lowers
-    /// to a manual computation that only threads its effect token.
+    /// The traced program is pruned before lowering, as the compilation of a [`Session`] prunes it, which drops dead
+    /// outputs of instructions that carry regions together with the body computation that only they use (e.g., the
+    /// dead primal outputs of a forward mode `shard_map` whose residuals feed a gradient), and is then simplified. A
+    /// `shard_map` whose ordinary outputs are all dead but whose body has observable effects (e.g., prints with the
+    /// [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary outputs and
+    /// lowers to a manual computation that only threads its effect token.
     ///
     /// # Parameters
     ///
-    ///   - `function_name`: Symbol name to use for the outer `func.func`.
-    ///   - `argument_shardings`: Optional shardings to attach to each function argument instead of those of the global
-    ///     input types. Must have the same length as the global input types, or be `None`.
-    ///   - `result_shardings`: Optional shardings to attach to each function result instead of those that the program
-    ///     and the global output types give it. Must have the same length as the global output types, or be `None`.
+    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
+    ///   - `input_shardings`: Optional shardings to attach to each function argument instead of those of the global
+    ///     input types. Must have the same length as the global input types, or be [`None`].
+    ///   - `output_shardings`: Optional shardings to attach to each function result instead of those that the program
+    ///     and the global output types give it. Must have the same length as the global output types, or be [`None`].
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Core`] when an input or output of the program is not an array, when pruning or simplifying
-    /// the traced program fails, or when the program imports an
-    /// array whose type names a mesh of another topology than the meshes of the signature, because a plain trace keeps
-    /// the type of an array that it imports (a function compiled through a [`Session`], whose captures follow its call,
-    /// receives it where it runs instead). Lowering failures use the corresponding [`Error`] variants (e.g., for an
-    /// invalid function name, mismatched signature shardings, unresolved references or state, or operations that the
-    /// backend cannot lower).
+    /// Returns [`Error::Core`] when an input or output of the program is not an array, when pruning or simplifying the
+    /// traced program fails, or when the program imports an array whose type names a mesh of another topology than the
+    /// meshes of the signature, because a plain trace keeps the type of an array that it imports (a function compiled
+    /// through a [`Session`], whose captures follow its call, receives it where it runs instead). Lowering failures use
+    /// the corresponding [`Error`] variants (e.g., for an invalid function name, mismatched signature shardings,
+    /// unresolved references or state, or operations that the backend cannot lower).
     fn to_mlir_module_with_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
@@ -128,8 +124,8 @@ pub trait ProgramExtension {
 impl<Input: Parameterized<Constant>, Output: Parameterized<Constant>> ProgramExtension
     for Program<Constant, Operation, Input, Output>
 where
-    Input::Family: ParameterizedFamily<ArrayType>,
-    Output::Family: ParameterizedFamily<ArrayType>,
+    Input::Family: ParameterizedFamily<Type> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<Type> + ParameterizedFamily<ArrayType>,
 {
     fn to_mlir_module_with_shardings<S: AsRef<str>>(
         &self,
@@ -137,94 +133,79 @@ where
         input_shardings: Option<&[Sharding]>,
         output_shardings: Option<&[Sharding]>,
     ) -> Result<String, Error> {
-        // Project the entry signature to array types and reconstruct the program's input and output structures.
-        let signature = self.interface();
-        let input_type = Input::To::<ArrayType>::from_parameters(
-            self.input_structure().clone(),
-            signature
-                .input_types()
-                .iter()
-                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ProgramError::from)?,
-        )
-        .map_err(ProgramError::from)?;
-        let output_type = Output::To::<ArrayType>::from_parameters(
-            self.output_structure().clone(),
-            signature
-                .output_types()
-                .iter()
-                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ProgramError::from)?,
-        )
-        .map_err(ProgramError::from)?;
-        let simplified_program = pruned_program(self, None)?;
-        let argument_shardings: Vec<_> = match input_shardings {
+        // Export accepts only arrays at the program boundary. Project the types while preserving their structures.
+        let as_array_type = |r#type: Type| <&ArrayType>::try_from(&r#type).cloned().map_err(ProgramError::from);
+        let input_type = self.input_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
+        let output_type = self.output_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
+        let program = pruned_program(self, None)?;
+        let input_shardings: Vec<_> = match input_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
             None => input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
+
         // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
         // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The export
         // lowers for no target platform, so it collects them for none either.
-        let session_constants = collect_session_constants(&simplified_program, None);
+        let session_constants = collect_session_constants(&program, None);
 
-        // A plain trace preserves the types of the arrays that enter it (`CapturePlacement::Preserve`), so an array
-        // that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of another
-        // topology cannot hold it. This is reported with its cause and the way forward, rather than as the disagreement
-        // of the meshes that lowering would find.
-        let signature_mesh = argument_shardings
+        // A plain trace preserves the types of the arrays that enter it (i.e., `CapturePlacement::Preserve`), so an
+        // array that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of
+        // another topology cannot hold it. This is reported with its cause and the way forward, rather than as the
+        // disagreement of the meshes that lowering would find.
+        let mesh = input_shardings
             .iter()
             .flatten()
             .chain(output_shardings.into_iter().flatten())
             .chain(output_type.parameters().filter_map(ArrayType::sharding))
             .map(Sharding::mesh)
             .next();
-        if let Some(signature_mesh) = signature_mesh {
+        if let Some(mesh) = mesh {
             for constant in &session_constants {
                 let declared_type = constant.r#type();
                 if let Some(sharding) = declared_type.sharding()
-                    && !sharding.mesh().has_same_topology(signature_mesh)
+                    && !sharding.mesh().has_same_topology(mesh)
                 {
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
                             "the traced program imports an array of type `{declared_type}`, whose mesh does not have \
-                             the topology of the mesh `{signature_mesh}` of the signature of the module, because a \
-                             plain `trace` keeps the type of an array that it imports; stage or compile the function \
-                             for a device mesh over `{signature_mesh}` through a `Session` instead (e.g., with \
-                             `stage` or `compile`), which receives the array on that mesh",
+                             the topology of the mesh `{mesh}` of the signature of the module, because a plain `trace` \
+                             keeps the type of an array that it imports; stage or compile the function for a device \
+                             mesh over `{mesh}` through a `Session` instead (e.g., with `stage` or `compile`), \
+                             which receives the array on that mesh",
                         ),
                     }
                     .into());
                 }
             }
         }
+
         let capture_types = session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
-        let argument_annotations = session_constants
+        let input_annotations = session_constants
             .iter()
             .map(|constant| Some(constant.sharding()))
-            .chain(argument_shardings.iter().map(Option::as_ref))
+            .chain(input_shardings.iter().map(Option::as_ref))
             .map(|sharding| sharding.map(entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = output_type.parameters().cloned().collect::<Vec<_>>();
-        let placements =
-            entry_result_placements(&simplified_program, output_types.len(), |constant| constant.sharding().clone());
-        let result_annotations =
-            entry_result_shardings(&output_types, output_shardings, &placements, &argument_shardings)?;
-        let open_results = entry_open_results(&output_types, output_shardings, &placements, &result_annotations);
-        Ok(super::lowering::modules::lower_mlir_module_for_program_with_value_shardings(
-            &simplified_program,
+        let placements = entry_result_placements(&program, output_types.len(), |constant| constant.sharding().clone());
+        let output_annotations =
+            entry_result_shardings(&output_types, output_shardings, &placements, &input_shardings)?;
+        let open_results = entry_open_results(&output_types, output_shardings, &placements, &output_annotations);
+        Ok(lower_mlir_module_for_program_with_value_shardings(
+            &program,
             &capture_types,
             &input_type,
             &output_type,
             function_name,
-            &argument_annotations,
-            &result_annotations,
+            &input_annotations,
+            &output_annotations,
             &open_results,
         )?
         .into_stable_hlo())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Stages an arbitrary traced XLA function over global array types.
 ///

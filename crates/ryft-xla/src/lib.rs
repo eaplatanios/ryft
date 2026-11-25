@@ -70,8 +70,8 @@ pub use kernels::{
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
 pub use lowering::{
-    LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
-    RaggedDotLoweringStrategy, lower_projected_operation, to_mlir_module_for_program,
+    DataDependentPaddingDiscipline, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    MemberLowerableOperation, RaggedDotLoweringStrategy, lower_projected_operation, to_mlir_module_for_program,
 };
 pub use mlir::ToMlir;
 pub use operations::{
