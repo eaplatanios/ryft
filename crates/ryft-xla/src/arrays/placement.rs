@@ -849,29 +849,23 @@ fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'s
     Ok(Device::from_pjrt(device)?)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Input leaf of [`Session::place`] that holds a host value, a runtime [`Array`], or a [`CompileTracer`].
-/// A [`Parameterized`] tree has one leaf type, so use [`PlaceInput`] to mix these values in one call.
-///
-/// When `V` is [`Array`], host arrays of the reference backend and scalars of every [`ArrayElement`] type convert to
-/// [`Self::Host`] with [`From`]. Runtime arrays convert to [`Self::Runtime`] with [`From`] and are placed the same
-/// way as [`Self::Concrete`].
-///
-/// When `V` is [`CompileTracer`], [`Self::Runtime`] holds a tracer that identifies the compilation trace.
-/// The trace receives host values as uploads on the default device and concrete arrays as runtime captures.
-/// The imported leaves receive the target, source, and aliasing options of their positions in the tree. Donation
-/// and process value comparison do not apply. A tree that spans different compilation traces, or has host or
-/// concrete leaves but no tracer to import them, returns a [`ryft_pjrt::Error::InvalidArgument`]. Place host or
-/// concrete leaves separately when batching or differentiating a function. A tree of tracers alone can use
-/// [`Session::place`] directly without [`PlaceInput`].
-///
-/// A tree whose leaves are all constructed as [`Self::Host`] or [`Self::Concrete`] names no `V`, so it is written
-/// `PlaceInput::<Array>::Host(value)`, or its leaves are converted with [`From`] instead.
+/// A [`Parameterized`] tree has one leaf type, so use [`PlaceInput`] to mix these values in one call. When `V` is
+/// [`Array`], host arrays of the reference backend and scalars of every [`ArrayElement`](ryft_core::ArrayElement) type
+/// convert to [`Self::Host`] with [`From`]. Runtime arrays convert to [`Self::Runtime`] with [`From`] and are placed
+/// the same way as [`Self::Concrete`]. When `V` is [`CompileTracer`], [`Self::Runtime`] holds a tracer that identifies
+/// the compilation trace. The trace receives host values as uploads on the default device and concrete arrays as
+/// runtime captures. The imported leaves receive the target, source, and aliasing options of their positions in the
+/// tree. Donation and process value comparison do not apply. A tree that spans different compilation traces, or has
+/// host or concrete leaves but no tracer to import them, returns a [`ryft_pjrt::Error::InvalidArgument`]. Place host
+/// or concrete leaves separately when batching or differentiating a function. A tree of tracers alone can use
+/// [`Session::place`] directly without [`PlaceInput`]. A tree whose leaves are all constructed as [`Self::Host`]
+/// or [`Self::Concrete`] names no `V`, so it is written `PlaceInput::<Array>::Host(value)`, or its leaves are
+/// converted with [`From`] instead.
 ///
 /// # Example
 ///
-/// ```
+/// ```rust
 /// # use ryft_core::{ArrayType, DataType};
 /// # use ryft_xla::{Array, PlaceInput, PlacementOptions, Platform, Session};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -889,8 +883,6 @@ fn default_upload_device(session: &Session, addressable_devices: &[PjrtDevice<'s
 /// # Ok(())
 /// # }
 /// ```
-///
-/// [`ArrayElement`]: ryft_core::ArrayElement
 #[derive(Clone, Debug, Parameter)]
 pub enum PlaceInput<V = Array> {
     /// Host value, which is uploaded as a dense array (e.g., a scalar, which is a rank-0 array), or which becomes a
@@ -905,21 +897,80 @@ pub enum PlaceInput<V = Array> {
     Concrete(Array),
 }
 
-impl<T: HostValue> From<T> for PlaceInput {
-    #[inline]
-    fn from(value: T) -> Self {
-        Self::Host(value.into_host_array())
-    }
-}
+impl PlaceInput<CompileTracer> {
+    /// Checks the type rule of [`PlaceOperation`] and the destination of the placement of this leaf, for the type
+    /// that the leaf has in a trace whose captures are placed as `capture_placement` states. A host value or a concrete
+    /// array joins such a trace as a capture, which keeps its own type under [`CapturePlacement::Preserve`] and is
+    /// declared as the compiled function receives it under [`CapturePlacement::FollowCall`] (refer to
+    /// [`captured_type`]). A traced leaf already has its type.
+    fn validate_placement_in_trace(
+        &self,
+        session: &Session,
+        target: Option<&PlacementRequest>,
+        source: Option<&PlacementRequest>,
+        capture_placement: CapturePlacement,
+    ) -> Result<(), Error> {
+        let (r#type, mesh) = match self {
+            Self::Host(value) => {
+                let default_device = || default_upload_device(session, &session.client().addressable_devices()?);
+                let (r#type, placement) = host_upload_destination(&value.host_type(), None, default_device)?;
+                Array::validate_host_upload(session, r#type.clone(), placement.mesh(), placement.sharding())?;
+                (Cow::Owned(r#type), Some(Cow::Owned(placement.mesh().clone())))
+            }
+            Self::Concrete(value) => {
+                value.validate_session_placement(session)?;
+                (value.r#type(), Some(Cow::Borrowed(value.mesh())))
+            }
+            Self::Runtime(value) => (value.r#type(), None),
+        };
 
-impl From<Array> for PlaceInput {
-    #[inline]
-    fn from(value: Array) -> Self {
-        Self::Runtime(value)
+        let captured = match (self, capture_placement) {
+            (Self::Host(_) | Self::Concrete(_), CapturePlacement::FollowCall) => captured_type(&r#type),
+            _ => None,
+        };
+
+        let r#type = captured.as_ref().unwrap_or(&r#type);
+        let rank = r#type.rank();
+        let target = target.cloned().map(|request| request.padded(rank)).transpose()?;
+        let source = source.cloned().map(|request| request.padded(rank)).transpose()?;
+        let operation = PlaceOperation::new(target, source);
+
+        // Check the type before importing any mixed leaves.The compilation session checks destinations of traced
+        // leaves, while this session checks the destinations of the host values and concrete arrays it imports.
+        let output = operation.infer_output_type_requiring_even_splits(r#type, None)?;
+        if let (Some(input_mesh), Some(request)) = (mesh.as_deref(), operation.target()) {
+            // Check the inventory for destinations that name devices. An in-place request keeps the capture's
+            // devices, which were checked when validating the upload or binding the concrete array to the session.
+            let devices = match request {
+                PlacementRequest::Resolved(placement) => {
+                    validate_mesh_devices(session, placement.mesh())?;
+                    placement.mesh().devices()
+                }
+                PlacementRequest::Device { device, .. } => {
+                    let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![*device])?;
+                    validate_mesh_devices(session, &mesh)?;
+                    std::slice::from_ref(device)
+                }
+                PlacementRequest::InPlace { .. } => input_mesh.devices(),
+            };
+
+            // Check requested memory before importing the capture. Only this process can inspect its own device
+            // memories, and zero values have no buffers that need a memory space.
+            if request.explicit_memory().is_some() && !output.data_type().is_zero() {
+                let client = session.client();
+                let process_index = client.process_index()?;
+                for device in devices.iter().filter(|device| device.process_index() == process_index) {
+                    client.lookup_device(device.id())?.memory(output.memory())?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
 impl PlaceableParameter<Array> for PlaceInput {
+    #[inline]
     fn validate_placement(
         &self,
         session: &Session,
@@ -956,6 +1007,7 @@ impl PlaceableParameter<Array> for PlaceInput {
 impl Placeable for PlaceInput {
     type Output = Array;
 
+    #[inline]
     fn place_parameter(
         self,
         session: &Session,
@@ -973,82 +1025,7 @@ impl Placeable for PlaceInput {
     }
 }
 
-impl From<CompileTracer> for PlaceInput<CompileTracer> {
-    #[inline]
-    fn from(value: CompileTracer) -> Self {
-        Self::Runtime(value)
-    }
-}
-
-impl PlaceInput<CompileTracer> {
-    /// Checks the type rule of [`PlaceOperation`] and the destination of the placement of this leaf, for the type
-    /// that the leaf has in a trace whose captures are placed as `capture_placement` states. A host value or a concrete
-    /// array joins such a trace as a capture, which keeps its own type under [`CapturePlacement::Preserve`] and is
-    /// declared as the compiled function receives it under [`CapturePlacement::FollowCall`] (refer to
-    /// [`captured_type`]). A traced leaf already has its type.
-    fn validate_placement_in_trace(
-        &self,
-        session: &Session,
-        target: Option<&PlacementRequest>,
-        source: Option<&PlacementRequest>,
-        capture_placement: CapturePlacement,
-    ) -> Result<(), Error> {
-        let (r#type, mesh) = match self {
-            Self::Host(value) => {
-                let default_device = || default_upload_device(session, &session.client().addressable_devices()?);
-                let (r#type, placement) = host_upload_destination(&value.host_type(), None, default_device)?;
-                Array::validate_host_upload(session, r#type.clone(), placement.mesh(), placement.sharding())?;
-                (Cow::Owned(r#type), Some(Cow::Owned(placement.mesh().clone())))
-            }
-            Self::Concrete(value) => {
-                value.validate_session_placement(session)?;
-                (value.r#type(), Some(Cow::Borrowed(value.mesh())))
-            }
-            Self::Runtime(value) => (value.r#type(), None),
-        };
-        let captured = match (self, capture_placement) {
-            (Self::Host(_) | Self::Concrete(_), CapturePlacement::FollowCall) => captured_type(&r#type),
-            _ => None,
-        };
-        let r#type = captured.as_ref().unwrap_or(&r#type);
-        let rank = r#type.rank();
-        let target = target.cloned().map(|request| request.padded(rank)).transpose()?;
-        let source = source.cloned().map(|request| request.padded(rank)).transpose()?;
-        let operation = PlaceOperation::new(target, source);
-        // Check the type before importing any mixed leaves. The compilation session checks destinations of traced
-        // leaves, while this session checks the destinations of the host values and concrete arrays it imports.
-        let output = operation.infer_output_type_requiring_even_splits(r#type, None)?;
-        if let (Some(input_mesh), Some(request)) = (mesh.as_deref(), operation.target()) {
-            // Check the inventory for destinations that name devices. An in-place request keeps the capture's
-            // devices, which were checked when validating the upload or binding the concrete array to the session.
-            let devices = match request {
-                PlacementRequest::Resolved(placement) => {
-                    validate_mesh_devices(session, placement.mesh())?;
-                    placement.mesh().devices()
-                }
-                PlacementRequest::Device { device, .. } => {
-                    let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![*device])?;
-                    validate_mesh_devices(session, &mesh)?;
-                    std::slice::from_ref(device)
-                }
-                PlacementRequest::InPlace { .. } => input_mesh.devices(),
-            };
-
-            // Check requested memory before importing the capture. Only this process can inspect its own device
-            // memories, and zero values have no buffers that need a memory space.
-            if request.explicit_memory().is_some() && !output.data_type().is_zero() {
-                let client = session.client();
-                let process_index = client.process_index()?;
-                for device in devices.iter().filter(|device| device.process_index() == process_index) {
-                    client.lookup_device(device.id())?.memory(output.memory())?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
+impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
     fn validate_placement(
         &self,
         session: &Session,
@@ -1058,9 +1035,11 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         may_alias: Option<bool>,
     ) -> Result<(), Error> {
         validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
+
         if let Self::Runtime(value) = self {
             value.validate_placement(session, target, source, donate, may_alias)?;
         }
+
         // One leaf does not see the trace that its tree joins, so this check assumes the capture placement of a
         // compiled function. `Self::prepare_parameters` checks the leaves again for a trace that preserves it.
         self.validate_placement_in_trace(session, target, source, CapturePlacement::FollowCall)
@@ -1084,22 +1063,33 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         if parameters.is_empty() {
             return Ok(());
         }
-        // The first tracer supplies the context into which the host and concrete leaves are imported. Every
-        // other tracer must share its builder so that all leaves belong to one program.
+
+        // The first tracer supplies the context into which the host and concrete leaves are imported.
+        // Every other tracer must share its builder so that all leaves belong to one program.
         let mut traced = parameters.iter().filter_map(|parameter| match parameter {
             Self::Host(_) | Self::Concrete(_) => None,
             Self::Runtime(value) => Some(value),
         });
+
         let Some(trace) = traced.next() else {
-            let message = "cannot place a host value or a runtime array as a traced value without a traced value \
-                           in the same call";
-            return Err(with_parameter_path(PjrtError::invalid_argument(message).into(), || path(0)));
+            return Err(with_parameter_path(
+                PjrtError::invalid_argument(
+                    "cannot place a host value or a runtime array as a traced value without a traced value \
+                     in the same call",
+                )
+                .into(),
+                || path(0),
+            ));
         };
+
         if traced.any(|other| !Rc::ptr_eq(trace.value().builder(), other.value().builder())) {
-            let message = "cannot place traced values of different traces in one call";
-            return Err(PjrtError::invalid_argument(message).into());
+            return Err(
+                PjrtError::invalid_argument("cannot place traced values of different traces in one call").into()
+            );
         }
+
         let context = trace.domain();
+
         // A trace that preserves the placement of its captures gives a host value or a concrete array its own type,
         // which the check of each leaf did not assume, so a placement that this type rejects is reported before any
         // leaf is uploaded or enters the trace, where a failed placement would stay recorded.
@@ -1118,6 +1108,7 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
                 }
             }
         }
+
         // Upload each host leaf on the default device and bind concrete arrays to the session before adding
         // them as captures in the existing compilation trace.
         for (index, parameter) in parameters.iter_mut().enumerate() {
@@ -1126,6 +1117,7 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
                 Self::Concrete(value) => value.clone().place_parameter(session, None, None, false, None),
                 Self::Runtime(_) => continue,
             };
+
             *parameter = Self::Runtime(
                 array
                     .and_then(|array| {
@@ -1137,6 +1129,7 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
                     .map_err(|error| with_parameter_path(error, || path(index)))?,
             );
         }
+
         Ok(())
     }
 }
@@ -1155,16 +1148,42 @@ impl Placeable for PlaceInput<CompileTracer> {
         match self {
             Self::Host(_) | Self::Concrete(_) => {
                 validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
+
                 // Tree preparation imports these leaves through another leaf's trace. A direct call on a host
                 // value or concrete array has no tracer that can supply that context.
-                let message = "cannot place a host value or a runtime array as a traced value without a traced value \
-                               in the same call";
-                Err(PjrtError::invalid_argument(message).into())
+                Err(PjrtError::invalid_argument(
+                    "cannot place a host value or a runtime array as a traced value without a traced value \
+                     in the same call",
+                )
+                .into())
             }
             Self::Runtime(value) => value.place_parameter(session, target, source, donate, may_alias),
         }
     }
 }
+
+impl<T: HostValue> From<T> for PlaceInput {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self::Host(value.into_host_array())
+    }
+}
+
+impl From<Array> for PlaceInput {
+    #[inline]
+    fn from(value: Array) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+impl From<CompileTracer> for PlaceInput<CompileTracer> {
+    #[inline]
+    fn from(value: CompileTracer) -> Self {
+        Self::Runtime(value)
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Returns a new array (refer to the identity rules of [`RetainedArray`](crate::RetainedArray)) with the type, the
