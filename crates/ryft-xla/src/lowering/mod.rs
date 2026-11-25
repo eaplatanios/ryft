@@ -3990,7 +3990,7 @@ pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Err
 /// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries. Local
 /// operations may change manual variation through collectives, but must not manufacture a global placement, which
 /// lowered sharding constraints would otherwise silently strip (refer to
-/// [`lower_sharding_constraint`](crate::sharding::lower_sharding_constraint)).
+/// [`lower_sharding_constraint`]).
 /// First-class dimensions and references carry no placement of their own.
 pub(crate) fn validate_local_output_placement(
     operation_name: &str,

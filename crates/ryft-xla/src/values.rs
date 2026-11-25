@@ -589,7 +589,21 @@ impl From<Reference> for Value {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+impl From<Value> for ArrayIrValue<Array> {
+    #[inline]
+    fn from(value: Value) -> Self {
+        value.into_array_ir_value()
+    }
+}
+
+impl TryFrom<Value> for Constant {
+    type Error = ProgramError;
+
+    #[inline]
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        value.into_constant()
+    }
+}
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values. These implementations provide the panicking operator sugar that the array operation
@@ -598,6 +612,7 @@ impl From<Reference> for Value {
 impl std::ops::Neg for Value {
     type Output = Self;
 
+    #[inline]
     fn neg(self) -> Self {
         Neg::neg(&self).expect("`neg` operation failed")
     }
@@ -606,6 +621,7 @@ impl std::ops::Neg for Value {
 impl std::ops::Add for Value {
     type Output = Self;
 
+    #[inline]
     fn add(self, right: Self) -> Self {
         Add::add(&self, &right).expect("`add` operation failed")
     }
@@ -614,6 +630,7 @@ impl std::ops::Add for Value {
 impl std::ops::Sub for Value {
     type Output = Self;
 
+    #[inline]
     fn sub(self, right: Self) -> Self {
         Sub::sub(&self, &right).expect("`sub` operation failed")
     }
@@ -622,6 +639,7 @@ impl std::ops::Sub for Value {
 impl std::ops::Mul for Value {
     type Output = Self;
 
+    #[inline]
     fn mul(self, right: Self) -> Self {
         Mul::mul(&self, &right).expect("`mul` operation failed")
     }
@@ -630,10 +648,13 @@ impl std::ops::Mul for Value {
 impl std::ops::Div for Value {
     type Output = Self;
 
+    #[inline]
     fn div(self, right: Self) -> Self {
         Div::div(&self, &right).expect("`div` operation failed")
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Array constants retained by staged XLA programs. Captures refer to the enclosing capture table, session constants
 /// refer to arrays that their handles retain, and Boolean literals preserve dimension comparison proofs without
@@ -1256,7 +1277,7 @@ mod tests {
             Value::Dimension(Dimension::new(extent.clone(), session.clone())),
             Value::Reference(Reference::new(handle.clone(), session.clone())),
         ];
-        let converted = values.clone().map(Value::into_array_ir_value);
+        let converted = values.clone().map(ArrayIrValue::from);
         assert_eq!(
             converted,
             [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
@@ -1277,7 +1298,7 @@ mod tests {
             .unwrap();
 
         // Arrays are retained by their session and become handles to their retained storage.
-        let Ok(Constant::Session(handle)) = Value::Array(array.clone()).into_constant() else {
+        let Ok(Constant::Session(handle)) = Constant::try_from(Value::Array(array.clone())) else {
             panic!("an array was not converted into a session constant");
         };
         assert_eq!(handle.to_array(&session).unwrap(), array);
@@ -1285,11 +1306,11 @@ mod tests {
         // Dimensions become immediate constants, and references are rejected.
         let extent = DimensionValue::constant(2).unwrap();
         assert_eq!(
-            Value::Dimension(Dimension::new(extent.clone(), session.clone())).into_constant(),
+            Constant::try_from(Value::Dimension(Dimension::new(extent.clone(), session.clone()))),
             Ok(Constant::Dimension(extent)),
         );
         assert_eq!(
-            Value::Reference(Reference::new(ArrayReference::new(array), session)).into_constant(),
+            Constant::try_from(Value::Reference(Reference::new(ArrayReference::new(array), session))),
             Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
                 .into()),
         );

@@ -1137,7 +1137,7 @@ pub(crate) fn argument_type(array: &Array, array_type: &ArrayType) -> Option<Arr
 ///
 /// Returns the error of turning `value` into a constant.
 pub(crate) fn imported_constant(value: Value, capture_placement: CapturePlacement) -> Result<Constant, ProgramError> {
-    let constant = value.constant()?;
+    let constant = value.into_constant()?;
     let (Constant::Session(retained), CapturePlacement::FollowCall) = (&constant, capture_placement) else {
         return Ok(constant);
     };
@@ -3411,6 +3411,108 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_placements_rejects_device_targets_outside_the_program_mesh() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2]);
+        let place_error = |device: Device, mesh: &DeviceMesh| {
+            compile::<_, ArrayType, ArrayType>(
+                |input: CompileTracer| session.place(input, PlacementOptions::to(device)).unwrap(),
+                input_type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .err()
+            .unwrap()
+        };
+
+        // A device that is not the device of the mesh of the function is rejected.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[0]],
+        )
+        .unwrap();
+        let error = place_error(devices[1], &mesh);
+        assert!(matches!(
+            &error,
+            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
+                if device == &devices[1] && program_mesh == &mesh,
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}] of mesh \
+                 `{}`",
+                devices[1].id(),
+                devices[0].id(),
+                mesh.logical_mesh(),
+            ),
+        );
+
+        // So is a device of a mesh with more than one device, because the value is not placed on that device alone.
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let error = place_error(devices[0], &mesh);
+        assert!(matches!(
+            &error,
+            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
+                if device == &devices[0] && program_mesh == &mesh,
+        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}, {}] of \
+                 mesh `{}`",
+                devices[0].id(),
+                devices[0].id(),
+                devices[1].id(),
+                mesh.logical_mesh(),
+            ),
+        );
+
+        // Only targets are validated, so the same device as the source of a value without a tracked sharding compiles
+        // on a mesh of two devices, with or without a target, and the function returns its input on that mesh.
+        let mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let input =
+            Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
+                .unwrap();
+        let cases = [
+            (
+                Some(PlacementRequest::from(Memory::Device)),
+                indoc! {"
+                    lambda %0:f32[2] .
+                    let %1:f32[2] = place [source=device(0), target=in_place(memory=Device)] %0
+                    in (%1)"
+                },
+            ),
+            (
+                None,
+                indoc! {"
+                    lambda %0:f32[2] .
+                    let %1:f32[2] = place [source=device(0)] %0
+                    in (%1)"
+                },
+            ),
+        ];
+        for (target, rendering) in cases {
+            let source = Some(PlacementRequest::from(devices[0]));
+            let options = PlacementOptions::<PlacementRequest>::new(target, source, None, None);
+            let compiled = compile::<_, ArrayType, ArrayType>(
+                |input: CompileTracer| session.place(input, options.clone()).unwrap(),
+                input_type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            assert_eq!(compiled.source_program().program().to_string(), rendering);
+            let output = compiled.executable().execute(&session, input.clone()).unwrap();
+            assert_eq!(output.mesh(), &mesh);
+            assert!(output.is_committed());
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
+        }
+    }
+
+    #[test]
     fn test_validate_placements_skips_the_bodies_of_scans_without_iterations() {
         // A scan whose body places each slice on a device outside the mesh of the program is rejected when its length
         // admits an iteration, and accepted on every target when its length is zero, because lowering then emits
@@ -3524,6 +3626,89 @@ mod tests {
                 validate_placements(&program, &mesh, use_shardy_partitioner, None).map_err(|error| error.to_string()),
                 Ok(()),
             );
+        }
+    }
+
+    #[test]
+    fn test_session_compile_place_with_sources_on_the_program_mesh() {
+        // A device source on the sole device of the program mesh, and a resolved source over the program mesh, are
+        // accepted in the forward function and in its reverse mode derivative inside the same compiled function, whose
+        // transposed placement moves the cotangent onto those devices.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let upload = |values: &[f32]| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values)).unwrap()
+        };
+        let cases = [
+            (
+                PlacementRequest::from(devices[1]),
+                indoc! {"
+                    lambda %0:f32[4] .
+                    let %1:f32[4] = place [source=device(1), target=in_place(memory=Device)] %0
+                    in (%1)"
+                },
+                indoc! {"
+                    lambda %0:f32[4], %1:f32[4] .
+                    let %2:f32[4] = place [target=device(1, memory=Device), may_alias=false] %1
+                    in (%2)"
+                },
+            ),
+            (
+                PlacementRequest::from(Placement::new(mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap()),
+                indoc! {"
+                    lambda %0:f32[4] .
+                    let %1:f32[4] = place [
+                        source={mesh<['a'=1:auto]>, devices=[1], sharding={mesh<['a'=1:auto]>, [{}]}},
+                        target=in_place(memory=Device),
+                    ] %0
+                    in (%1)"
+                },
+                indoc! {"
+                    lambda %0:f32[4], %1:f32[4] .
+                    let %2:f32[4][sharding={mesh<['a'=1:auto]>, [{}]}] = place [
+                        target={mesh<['a'=1:auto]>, devices=[1], sharding={mesh<['a'=1:auto]>, [{}]}, memory=Device},
+                        may_alias=false,
+                    ] %1
+                        %3:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %2
+                    in (%3)"
+                },
+            ),
+        ];
+        for (source, forward_rendering, reverse_rendering) in cases {
+            let options = || PlacementOptions::to(PlacementRequest::from(Memory::Device)).with_source(source.clone());
+            let forward = compile::<_, ArrayType, ArrayType>(
+                |x: CompileTracer| session.place(x, options()).unwrap(),
+                r#type.clone(),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            assert_eq!(forward.source_program().program().to_string(), forward_rendering);
+            let output = forward.executable().execute(&session, upload(&[1., 2., 3., 4.])).unwrap();
+            assert_eq!(output.mesh(), &mesh);
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4.]);
+
+            let reverse = compile::<_, (ArrayType, ArrayType), ArrayType>(
+                |(x, seed): (CompileTracer, CompileTracer)| {
+                    let (_, pullback) = differentiate_at(x).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
+                    pullback.apply_materialized(seed).unwrap()
+                },
+                (r#type.clone(), r#type.clone()),
+                &session,
+                mesh.clone(),
+            )
+            .unwrap();
+            assert_eq!(reverse.source_program().program().to_string(), reverse_rendering);
+            let cotangent = reverse
+                .executable()
+                .execute(&session, (upload(&[1., 2., 3., 4.]), upload(&[5., 6., 7., 8.])))
+                .unwrap();
+            assert_eq!(cotangent.mesh(), &mesh);
+            assert_eq!(cotangent.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![5., 6., 7., 8.]);
         }
     }
 

@@ -144,7 +144,8 @@ mod tests {
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
-        ProgramBuilder, Session, TracedProgram, Type, Value, compile, compile_with_options, trace,
+        ProgramBuilder, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
+        compile_with_options, trace,
     };
 
     use super::*;
@@ -633,7 +634,7 @@ mod tests {
         // that source, and is rejected for it, as pinned JAX rejects the gradient. The forward and eager paths never
         // reject such a source because of that transposition. The same sources of a value that varies along the manual
         // axis are accepted on every path (refer to
-        // `test_session_place_agrees_across_paths_for_manual_regions_and_host_values`).
+        // `test_session_place_agrees_across_paths_for_sources_inside_shard_map_bodies`).
         let pinned = Some(PlacementRequest::from(Memory::Host { pinned: true }));
         for count in [1, 2] {
             let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -701,6 +702,37 @@ mod tests {
         }
         assert_eq!(shard_values(&output), vec![vec![1., 2.], vec![3., 4.]]);
         assert!(output.is_committed());
+    }
+
+    #[test]
+    fn test_place_operation_lower_executes_device_targets_of_stateful_functions() {
+        // A stateful function traces values of the array IR type universe, which `Session::place` does not accept, so
+        // it stages a device target through the `PlaceDispatch` primitive of `Place` directly, and the compiled
+        // function moves its result to the memory of that target on the device.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let (mesh, _) = single_device_meshes(client);
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let memory = Memory::Host { pinned: true };
+        let target = PlacementRequest::Device { device: mesh.devices()[0], memory: Some(memory), layout: None };
+        let compiled = compile_statefully::<_, Type, Type>(
+            |input| Ok(<StatefulCompileTracer as CoreValue>::Dispatch::place(&input, Some(&target), None, true)?),
+            Type::Array(input_type.clone()),
+            &session,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let Value::Array(output) = compiled.execute_statefully_and_wait(&session, Value::Array(input)).unwrap() else {
+            panic!("placing an array must produce an array");
+        };
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.r#type().memory(), memory);
+        assert!(output.is_committed());
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
     }
 
     #[test]
@@ -788,6 +820,20 @@ mod tests {
 
         // A replicated target is what every replica computes anyway.
         assert!(place(Sharding::replicated(mesh.logical_mesh().clone(), 1)).is_ok());
+
+        // So is a target that leaves a dimension unconstrained, which an array stores replicated, as the unconstrained
+        // sharding override of a call is.
+        let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
+        assert_eq!(
+            place(unconstrained).unwrap().source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[n] .
+                let %1:f32[n][sharding={mesh<['x'=2:auto]>, [{?}]}] = place [
+                    target={mesh<['x'=2:auto]>, devices=[0, 1], sharding={mesh<['x'=2:auto]>, [{?}]}},
+                ] %0
+                in (%1)"
+            },
+        );
     }
 
     #[test]

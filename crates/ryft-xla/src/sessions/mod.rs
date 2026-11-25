@@ -1406,7 +1406,7 @@ impl Context for Session {
 
         if let Some(outputs) = host_outputs {
             // The outputs are associated with this session, including the references that the operation created.
-            return outputs?.into_iter().map(|output| Ok(Value::from_array_ir_value(output, self)?)).collect();
+            return Ok(outputs?.into_iter().map(|output| Value::from_array_ir_value(output, self)).collect());
         }
 
         // Every other operation is lowered, and lowering cannot bind reference operands.
@@ -2026,7 +2026,7 @@ impl Context for Session {
                         .block_until_ready()
                         .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
                 }
-                return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)?]);
+                return Ok(vec![Value::from_array_ir_value(values[0].clone(), self)]);
             }
             _ => {}
         }
