@@ -109,12 +109,14 @@ use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
+use half::{bf16, f16};
 use sha2::{Digest, Sha256};
 
 use ryft_core::{
-    Add, Array as CoreArray, ArrayAddressing, ArrayType, ConvertElementType, DataType, Device, DeviceMesh, Layout,
-    LogicalMesh, Max, MeshAxis, MeshAxisType, Min, Or, Placement, PlacementRequest, ProgramError, Sharding, Typed,
-    UnreducedKind, decode_logical_bytes,
+    Add, Array as CoreArray, ArrayAddressing, ArrayElement, ArrayType, Complex, ConvertElementType, DataType, Device,
+    DeviceMesh, Layout, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, Or, Placement, PlacementRequest, ProgramError,
+    Sharding, Typed, UnreducedKind, decode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz,
+    f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
@@ -2461,6 +2463,110 @@ impl ComparisonCollective {
     }
 }
 
+/// Host value that [`Session::place`] uploads as one dense array (i.e., a host array of the reference backend, or a
+/// scalar of any [`ArrayElement`] type, which is uploaded as a rank-0 array). This trait is the single list of
+/// uploadable host values. Every host value that implements it converts into [`PlaceInput`](crate::PlaceInput), and
+/// every one that is also a [`Parameter`](ryft_core::Parameter) is a [`Placeable`](crate::Placeable) leaf on its own.
+pub(super) trait HostValue {
+    /// Validates the host element encodings without hashing the value.
+    #[inline]
+    fn validate_host_value(&self) -> Result<(), Error> {
+        // Scalars already hold a valid instance of their element type.
+        Ok(())
+    }
+
+    /// Returns the digest of the dense value of this value (refer to [`host_value_digest`]), which [`Session::place`]
+    /// compares across the processes of a run.
+    fn host_value_digest(&self) -> Option<[u32; DIGEST_WORDS]>;
+
+    /// Returns the element type and the static shape of the dense upload of this value as an [`ArrayType`] without
+    /// a sharding, a memory, or a layout, which is what the placement of this value checks before it is uploaded.
+    fn host_type(&self) -> ArrayType;
+
+    /// Returns this value as a host array of the reference backend.
+    fn into_host_array(self) -> CoreArray;
+}
+
+impl HostValue for CoreArray {
+    #[inline]
+    fn validate_host_value(&self) -> Result<(), Error> {
+        validate_host_value(self)
+    }
+
+    #[inline]
+    fn host_value_digest(&self) -> Option<[u32; DIGEST_WORDS]> {
+        host_value_digest(self)
+    }
+
+    #[inline]
+    fn host_type(&self) -> ArrayType {
+        // A host array holds materialized storage, which only a type with static extents can describe.
+        let r#type = self.r#type();
+        ArrayType::new_static(r#type.data_type(), r#type.static_shape().unwrap().as_slice().to_vec())
+    }
+
+    #[inline]
+    fn into_host_array(self) -> CoreArray {
+        self
+    }
+}
+
+macro_rules! impl_host_value {
+    // Implements `HostValue` for the scalar `ArrayElement` type `$ty` as a rank-0 host array.
+    ($ty:ty) => {
+        impl HostValue for $ty {
+            #[inline]
+            fn host_value_digest(&self) -> Option<[u32; DIGEST_WORDS]> {
+                host_value_digest(&CoreArray::scalar(*self).ok()?)
+            }
+
+            #[inline]
+            fn host_type(&self) -> ArrayType {
+                ArrayType::scalar(<$ty as ArrayElement>::data_type())
+            }
+
+            #[inline]
+            fn into_host_array(self) -> CoreArray {
+                // A rank-0 array of an element type always has a valid shape and encoding.
+                CoreArray::scalar(self).unwrap()
+            }
+        }
+    };
+}
+
+impl_host_value!(bool);
+impl_host_value!(i1);
+impl_host_value!(i2);
+impl_host_value!(i4);
+impl_host_value!(i8);
+impl_host_value!(i16);
+impl_host_value!(i32);
+impl_host_value!(i64);
+impl_host_value!(u1);
+impl_host_value!(u2);
+impl_host_value!(u4);
+impl_host_value!(u8);
+impl_host_value!(u16);
+impl_host_value!(u32);
+impl_host_value!(u64);
+impl_host_value!(f4e2m1fn);
+impl_host_value!(f6e2m3fn);
+impl_host_value!(f6e3m2fn);
+impl_host_value!(f8e3m4);
+impl_host_value!(f8e4m3);
+impl_host_value!(f8e4m3fn);
+impl_host_value!(f8e4m3fnuz);
+impl_host_value!(f8e4m3b11fnuz);
+impl_host_value!(f8e5m2);
+impl_host_value!(f8e5m2fnuz);
+impl_host_value!(f8e8m0fnu);
+impl_host_value!(bf16);
+impl_host_value!(f16);
+impl_host_value!(f32);
+impl_host_value!(f64);
+impl_host_value!(Complex<f32>);
+impl_host_value!(Complex<f64>);
+
 /// Returns the SHA-256 digest of the logical value of an array of `data_type` with the extents `dimensions` whose dense
 /// row-major elements are `bytes`, as `u32` words. The digest covers, in order, the length and the bytes of the name
 /// of the data type, the rank, every extent as a little-endian `u64`, and `bytes`, so two values have the same digest
@@ -2509,7 +2615,7 @@ pub(super) fn dense_host_value_bytes(host: &CoreArray) -> Result<Cow<'_, [u8]>, 
 }
 
 /// Checks the logical element encodings of a host value before an admitted placement uploads it.
-pub(super) fn validate_host_value(host: &CoreArray) -> Result<(), Error> {
+fn validate_host_value(host: &CoreArray) -> Result<(), Error> {
     let r#type = host.r#type();
     let bytes = host.storage_bytes();
     if r#type.layout().is_some() {
@@ -2521,7 +2627,7 @@ pub(super) fn validate_host_value(host: &CoreArray) -> Result<(), Error> {
 
 /// Returns the digest of the host value `host` (refer to [`value_digest`]), or [`None`] when its storage does not
 /// encode valid elements of its data type, which its upload then reports.
-pub(super) fn host_value_digest(host: &CoreArray) -> Option<[u32; DIGEST_WORDS]> {
+fn host_value_digest(host: &CoreArray) -> Option<[u32; DIGEST_WORDS]> {
     let r#type = host.r#type();
     let bytes = dense_host_value_bytes(host).ok()?;
     validate_host_element_encodings(r#type.data_type(), &bytes).ok()?;
