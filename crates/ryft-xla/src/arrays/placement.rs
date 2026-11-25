@@ -1495,10 +1495,10 @@ impl Session {
     {
         let structure = x.parameter_structure();
         let (target, source, donate, may_alias) = options.into_parts();
-        let target_values = broadcast_placement_option(target, &structure)?;
-        let source_values = broadcast_placement_option(source, &structure)?;
-        let donate_values = broadcast_placement_option(donate, &structure)?;
-        let may_alias_values = broadcast_placement_option(may_alias, &structure)?;
+        let target_values = PlacementOptionValues::from_prefix(target, &structure)?;
+        let source_values = PlacementOptionValues::from_prefix(source, &structure)?;
+        let donate_values = PlacementOptionValues::from_prefix(donate, &structure)?;
+        let may_alias_values = PlacementOptionValues::from_prefix(may_alias, &structure)?;
 
         // Resolve only requests that reached a leaf. Preserve the targets of the other leaves if a request fails,
         // so distributed admission can still determine whether this call would otherwise communicate.
@@ -1645,9 +1645,8 @@ impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArray
     }
 }
 
-/// Option values of the leaves of one [`Session::place`] input, which [`broadcast_placement_option`] produces. An
-/// omitted prefix and a prefix with one leaf at the root give every leaf the same value, so they hold that value once
-/// rather than one copy per leaf.
+/// Option values of the leaves of one [`Session::place`] input, produced by [`Self::from_prefix`]. An omitted
+/// prefix and a prefix with one leaf at the root give every leaf the same value, which is stored once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PlacementOptionValues<Value> {
     /// Value of every leaf, or `None` if no prefix was given.
@@ -1658,6 +1657,29 @@ enum PlacementOptionValues<Value> {
 }
 
 impl<Value> PlacementOptionValues<Value> {
+    /// Expands an optional placement prefix into its value for each input leaf. A prefix with one leaf at the root
+    /// covers the whole input, so it needs no path matching or structure cloning, and neither it nor an omitted
+    /// prefix allocates per leaf. Structured prefixes use [`Parameterized::broadcast_parameters`] to validate
+    /// every node, including empty containers.
+    fn from_prefix<P: Parameterized<Value>, S: Parameterized<Placeholder>>(
+        prefix: Option<P>,
+        structure: &S,
+    ) -> Result<Self, Error>
+    where
+        Value: Clone + Parameter,
+    {
+        let Some(prefix) = prefix else {
+            return Ok(Self::Uniform(None));
+        };
+
+        // A sole parameter below the root still belongs to a structured prefix, so it needs full tree validation.
+        if prefix.parameter_count() == 1 && prefix.named_parameters().next().is_some_and(|(path, _)| path.is_root()) {
+            return Ok(Self::Uniform(prefix.into_parameters().next()));
+        }
+
+        Ok(Self::PerParameter(prefix.broadcast_parameters(structure)?))
+    }
+
     /// Returns the supplied value of the leaf at `index`, if any.
     fn get(&self, index: usize) -> Option<&Value> {
         match self {
@@ -1970,24 +1992,6 @@ fn validate_parameter_options<P: FnOnce() -> ParameterPath>(
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Expands an optional placement prefix into its value for each input leaf. A prefix with one leaf at the root covers
-/// the whole input, so it needs no path matching or structure cloning, and neither it nor an omitted prefix allocates
-/// per leaf (refer to [`PlacementOptionValues`]). Structured prefixes use [`Parameterized::broadcast_parameters`] to
-/// validate every node, including empty containers.
-fn broadcast_placement_option<Leaf: Clone + Parameter>(
-    prefix: Option<impl Parameterized<Leaf>>,
-    structure: &impl Parameterized<Placeholder>,
-) -> Result<PlacementOptionValues<Leaf>, Error> {
-    let Some(prefix) = prefix else {
-        return Ok(PlacementOptionValues::Uniform(None));
-    };
-    // A sole parameter below the root still belongs to a structured prefix, so it needs full tree validation.
-    if prefix.parameter_count() == 1 && prefix.named_parameters().next().is_some_and(|(path, _)| path.is_root()) {
-        return Ok(PlacementOptionValues::Uniform(prefix.into_parameters().next()));
-    }
-    Ok(PlacementOptionValues::PerParameter(prefix.broadcast_parameters(structure)?))
-}
 
 #[cfg(test)]
 mod tests {
@@ -3911,9 +3915,9 @@ mod tests {
 
         // Omitted and root options are stored once even when the input has many parameters.
         let structure = input.parameter_structure();
-        let expansion = broadcast_placement_option(None::<PlacementRequest>, &structure);
+        let expansion = PlacementOptionValues::from_prefix(None::<PlacementRequest>, &structure);
         assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(None))));
-        let expansion = broadcast_placement_option(Some(false), &structure);
+        let expansion = PlacementOptionValues::from_prefix(Some(false), &structure);
         assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(false)))));
 
         // Already resident leaves without any option stay where they are.
