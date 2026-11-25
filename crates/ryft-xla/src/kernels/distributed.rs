@@ -766,14 +766,14 @@ pub(crate) fn validate_kernel_participants(client: &Client<'_>, mesh: &DeviceMes
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayType, DataType, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, ProgramError};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
+    use crate::distributed::tests::{run_cpu_processes, test_process};
     use crate::tests::{cpu_client, execution_client};
     use crate::{Platform, Session};
 
@@ -803,51 +803,46 @@ mod tests {
         i32::from_ne_bytes(bytes.as_slice().try_into().unwrap())
     }
 
-    // TODO(eaplatanios): Start these workers with the launcher that the other multi-process tests share
-    // (`crate::distributed::tests::run_test_processes`, which must become visible to this module), passing the mode
-    // in its `environment`, and delete this launcher and the `RYFT_KERNEL_*` variables.
-    // `test_distributed_kernel_process` then reads its process with `crate::distributed::tests::test_process`.
-    /// Runs real child processes with required sockets, retaining both child statuses for the qualification log.
-    fn processes(mode: &str) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        let mut children = (0..2)
-            .map(|process| {
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "kernels::distributed::tests::test_distributed_kernel_process",
-                        "--ignored",
-                        "--nocapture",
-                    ])
-                    .env("RYFT_KERNEL_PROCESS", process.to_string())
-                    .env("RYFT_KERNEL_ADDRESS", &address)
-                    .env("RYFT_KERNEL_MODE", mode)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while children.iter_mut().any(|child| child.try_wait().unwrap().is_none()) {
-            if Instant::now() >= deadline {
-                for child in &mut children {
-                    if child.try_wait().unwrap().is_none() {
-                        child.kill().unwrap();
-                    }
-                }
-                panic!("distributed kernel child timeout");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        for child in children {
-            let process = child.id();
-            let output = child.wait_with_output().unwrap();
-            eprintln!("distributed kernel {mode} child {process}: {}", output.status);
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        }
+    /// Runs `check` in one of the two CPU processes of a distributed kernel test (refer to [`run_cpu_processes`]), and
+    /// returns immediately in a process that no launcher started. `check` receives the index of its process, the
+    /// runtime of the job, a scalar identity kernel that is loaded with the compiler options of its process in
+    /// `compiler_options`, the options of its coordinators, and a scalar input that holds `10 + process`. Both
+    /// processes stay connected until each of them has finished its check, and the input must still hold its value
+    /// then.
+    fn run_as_kernel_process(
+        compiler_options: [u32; 2],
+        check: impl FnOnce(usize, &DistributedRuntime, &LoadedKernel, DistributedKernelOptions, &Array),
+    ) {
+        let Some((process, address)) = test_process() else {
+            return;
+        };
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process).unwrap();
+        let client = Platform::Cpu
+            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
+            .unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
+        )
+        .unwrap();
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let kernel = loaded(&session, &mesh, compiler_options[process]);
+        let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::scalar(DataType::I32),
+            mesh.clone(),
+            None,
+            (10 + process as i32).to_ne_bytes(),
+        )
+        .unwrap();
+        check(process, &runtime, &kernel, options, &input);
+        assert_eq!(scalar(&input), 10 + process as i32);
+        let finished = |process: usize| format!("test-kernel-finished-{process}");
+        let store = runtime.key_value_store();
+        store.put(finished(process).as_bytes(), b"done").unwrap();
+        assert_eq!(store.get(finished(1 - process).as_bytes(), Duration::from_secs(10)).unwrap(), b"done");
     }
 
     #[test]
@@ -901,265 +896,305 @@ mod tests {
             if message == "round limit must be between one and 1024"));
     }
 
+    // Worker of `test_distributed_kernel_call_async`, which returns immediately unless that test launched it as one
+    // of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_async_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options.clone()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pending = coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
+            assert!(!coordinator.previous.as_ref().unwrap().is_ready().unwrap());
+            let output = pending.r#await().unwrap();
+            assert_eq!(scalar(&output[0]), 11 - process as i32);
+            assert_eq!(scalar(input), 10 + process as i32);
+            let output = coordinator.call(vec![input.clone()], &[process], Arc::clone(&cancelled)).unwrap();
+            assert_eq!(scalar(&output[0]), 10 + process as i32);
+            let mut recreated = DistributedKernel::new(runtime, kernel, options.clone()).unwrap();
+            assert_ne!(recreated.coordination.prefix, coordinator.coordination.prefix);
+            let output = recreated.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
+            assert_eq!(scalar(&output[0]), 11 - process as i32);
+            // Constructor validation also applies to metadata decoded without its public constructors.
+            let mut malformed = options.clone();
+            malformed.chunk_bytes = 0;
+            assert!(matches!(
+                    DistributedKernel::new(runtime, kernel, malformed),
+                    Err(DistributedKernelError::Invalid { message })
+                if message == "invalid host transport chunk size"));
+        });
+    }
+
     #[test]
     fn test_distributed_kernel_call_async() {
-        processes("success");
+        run_cpu_processes("kernels::distributed::tests::test_distributed_kernel_call_async_cpu_process_helper", 2);
+    }
+
+    // Worker of `test_distributed_kernel_call_cancellation`, which returns immediately unless that test launched it
+    // as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_cancellation_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            if process == 0 {
+                cancelled.store(true, Ordering::Release);
+            }
+            let result = coordinator.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled));
+            if process == 0 {
+                assert!(matches!(result, Err(DistributedKernelError::Cancelled)));
+            } else {
+                assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
+                    if message == "distributed kernel call cancelled"));
+            }
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_cancellation() {
-        processes("cancel");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_cancellation_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_distributed_kernel_call_cancellation_after_dispatch`, which returns immediately unless that
+    // test launched it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_cancellation_after_dispatch_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pending = coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
+            runtime
+                .key_value_store()
+                .put(format!("test-dispatched-{process}").as_bytes(), b"submitted")
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .key_value_store()
+                    .get(format!("test-dispatched-{}", 1 - process).as_bytes(), Duration::from_secs(5))
+                    .unwrap(),
+                b"submitted"
+            );
+            // Both native calls have been submitted, but neither completion has published readiness.
+            assert!(matches!(
+                runtime.key_value_store().try_get(&coordinator.coordination.key(0, process, "terminal")),
+                Err(ryft_pjrt::Error::NotFound { .. })
+            ));
+            if process == 0 {
+                cancelled.store(true, Ordering::Release);
+                runtime.key_value_store().put(b"test-cancel-requested", b"cancelled").unwrap();
+            }
+            assert_eq!(
+                runtime.key_value_store().get(b"test-cancel-requested", Duration::from_secs(5)).unwrap(),
+                b"cancelled"
+            );
+            let expected = if process == 0 {
+                "distributed kernel call cancelled"
+            } else {
+                "distributed kernel participant 0 failed: distributed kernel call cancelled"
+            };
+            assert!(matches!(
+                pending.r#await(),
+                Err(DistributedKernelError::Completion { message }) if message.as_ref() == expected,
+            ));
+            let terminal = runtime
+                .key_value_store()
+                .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<KernelTerminal>(&terminal).unwrap().failure.as_deref(),
+                Some("distributed kernel call cancelled")
+            );
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_cancellation_after_dispatch() {
-        processes("cancel_dispatched");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_cancellation_after_dispatch_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_distributed_kernel_call_configuration_mismatch`, which returns immediately unless that test
+    // launched it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_configuration_mismatch_cpu_process_helper() {
+        run_as_kernel_process([1, 2], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let expected = "participant kernel, options or routing preflight mismatch";
+            let result = coordinator.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled));
+            match result {
+                Err(DistributedKernelError::Invalid { message }) => assert_eq!(message, expected),
+                Err(DistributedKernelError::Participant { process: participant, message }) => {
+                    assert_eq!(participant, 1 - process);
+                    assert_eq!(message, format!("invalid distributed kernel call: {expected}"));
+                }
+                result => panic!("unexpected configuration result: {result:?}"),
+            }
+            assert!(coordinator.previous.is_none());
+            let mut identities = Vec::new();
+            for participant in 0..2 {
+                let preflight = runtime
+                    .key_value_store()
+                    .get(&coordinator.coordination.key(0, participant, "preflight"), Duration::from_secs(5))
+                    .unwrap();
+                let preflight: KernelPreflight = serde_json::from_slice(&preflight).unwrap();
+                identities.push(serde_json::from_slice::<serde_json::Value>(&preflight.identity).unwrap());
+                assert!(matches!(
+                    runtime.key_value_store().try_get(&coordinator.coordination.key(
+                        0,
+                        participant,
+                        "input/0/manifest"
+                    )),
+                    Err(ryft_pjrt::Error::NotFound { .. })
+                ));
+            }
+            // The actual loaded source semantics agree, and only the validated compiler binding identities differ.
+            assert_eq!(identities[0][0], identities[1][0]);
+            assert_ne!(identities[0][1], identities[1][1]);
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_configuration_mismatch() {
-        processes("configuration");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_configuration_mismatch_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_distributed_kernel_call_invalid_routing`, which returns immediately unless that test launched
+    // it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_invalid_routing_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let source = if process == 0 { 2 } else { 0 };
+            let result = coordinator.call(vec![input.clone()], &[source], Arc::clone(&cancelled));
+            if process == 0 {
+                assert!(matches!(result, Err(DistributedKernelError::Invalid { message })
+                if message == "input count or source-process routing differs from the kernel boundary"));
+            } else {
+                assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
+                    if message == "invalid distributed kernel call: \
+                        input count or source-process routing differs from the kernel boundary"));
+            }
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_invalid_routing() {
-        processes("routing");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_invalid_routing_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_distributed_kernel_call_order_mismatch`, which returns immediately unless that test launched
+    // it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_order_mismatch_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            if process == 0 {
+                runtime.reserve_key_prefix(COORDINATION_PROTOCOL);
+            }
+            let mut next = DistributedKernel::new(runtime, kernel, options).unwrap();
+            assert!(matches!(
+                next.call(vec![input.clone()], &[process], Arc::clone(&cancelled)),
+                Err(DistributedKernelError::Deadline)
+            ));
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_order_mismatch() {
-        processes("order");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_order_mismatch_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_distributed_kernel_call_dropped_completion`, which returns immediately unless that test
+    // launched it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_call_dropped_completion_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pending = coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
+            if process == 0 {
+                drop(pending);
+                drop(coordinator);
+            } else {
+                assert!(matches!(
+                    pending.r#await(),
+                    Err(DistributedKernelError::Completion { message })
+                        if message.as_ref()
+                            == "distributed kernel participant 0 failed: distributed kernel call cancelled",
+                ));
+            }
+        });
     }
 
     #[test]
     fn test_distributed_kernel_call_dropped_completion() {
-        processes("drop");
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_call_dropped_completion_cpu_process_helper",
+            2,
+        );
     }
 
+    // Worker of `test_distributed_kernel_completion_readiness_is_immutable`, which returns immediately unless that
+    // test launched it as one of its two processes.
     #[test]
-    fn test_distributed_kernel_completion_readiness_is_immutable() {
-        processes("late_failure");
-    }
-
-    // Child process entry point of the multi-process tests above, which run it with `--ignored`.
-    #[test]
-    #[ignore = "child process entry point of the distributed kernel tests"]
-    fn test_distributed_kernel_process() {
-        let process = std::env::var("RYFT_KERNEL_PROCESS").unwrap().parse::<usize>().unwrap();
-        let address = std::env::var("RYFT_KERNEL_ADDRESS").unwrap();
-        let mode = std::env::var("RYFT_KERNEL_MODE").unwrap();
-        let plugin = load_cpu_plugin().unwrap();
-        let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process).unwrap();
-        let client = Platform::Cpu
-            .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
-            .unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![]).unwrap(),
-            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let compiler_options = if mode == "configuration" { 1 + process as u32 } else { 1 };
-        let kernel = loaded(&session, &mesh, compiler_options);
-        let options = DistributedKernelOptions::new(16, Duration::from_secs(5)).unwrap().with_chunk_bytes(2).unwrap();
-        let mut coordinator = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::scalar(DataType::I32),
-            mesh.clone(),
-            None,
-            (10 + process as i32).to_ne_bytes(),
-        )
-        .unwrap();
-        match mode.as_str() {
-            "success" => {
-                let pending =
-                    coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
-                assert!(!coordinator.previous.as_ref().unwrap().is_ready().unwrap());
-                let output = pending.r#await().unwrap();
-                assert_eq!(scalar(&output[0]), 11 - process as i32);
-                assert_eq!(scalar(&input), 10 + process as i32);
-                let output = coordinator.call(vec![input.clone()], &[process], Arc::clone(&cancelled)).unwrap();
-                assert_eq!(scalar(&output[0]), 10 + process as i32);
-                let mut recreated = DistributedKernel::new(&runtime, &kernel, options.clone()).unwrap();
-                assert_ne!(recreated.coordination.prefix, coordinator.coordination.prefix);
-                let output = recreated.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
-                assert_eq!(scalar(&output[0]), 11 - process as i32);
-                // Constructor validation also applies to metadata decoded without its public constructors.
-                let mut malformed = options.clone();
-                malformed.chunk_bytes = 0;
-                assert!(matches!(
-                        DistributedKernel::new(&runtime, &kernel, malformed),
-                        Err(DistributedKernelError::Invalid { message })
-                    if message == "invalid host transport chunk size"));
-            }
-            "cancel" => {
-                if process == 0 {
-                    cancelled.store(true, Ordering::Release);
-                }
-                let result = coordinator.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled));
-                if process == 0 {
-                    assert!(matches!(result, Err(DistributedKernelError::Cancelled)));
-                } else {
-                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
-                        if message == "distributed kernel call cancelled"));
-                }
-            }
-            "cancel_dispatched" => {
-                let pending =
-                    coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
-                runtime
-                    .key_value_store()
-                    .put(format!("test-dispatched-{process}").as_bytes(), b"submitted")
-                    .unwrap();
-                assert_eq!(
-                    runtime
-                        .key_value_store()
-                        .get(format!("test-dispatched-{}", 1 - process).as_bytes(), Duration::from_secs(5))
-                        .unwrap(),
-                    b"submitted"
-                );
-                // Both native calls have been submitted, but neither completion has published readiness.
-                assert!(matches!(
-                    runtime.key_value_store().try_get(&coordinator.coordination.key(0, process, "terminal")),
-                    Err(ryft_pjrt::Error::NotFound { .. })
-                ));
-                if process == 0 {
-                    cancelled.store(true, Ordering::Release);
-                    runtime.key_value_store().put(b"test-cancel-requested", b"cancelled").unwrap();
-                }
-                assert_eq!(
-                    runtime.key_value_store().get(b"test-cancel-requested", Duration::from_secs(5)).unwrap(),
-                    b"cancelled"
-                );
-                let expected = if process == 0 {
-                    "distributed kernel call cancelled"
-                } else {
-                    "distributed kernel participant 0 failed: distributed kernel call cancelled"
-                };
-                assert!(matches!(
-                    pending.r#await(),
-                    Err(DistributedKernelError::Completion { message }) if message.as_ref() == expected,
-                ));
-                let terminal = runtime
-                    .key_value_store()
-                    .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_slice::<KernelTerminal>(&terminal).unwrap().failure.as_deref(),
-                    Some("distributed kernel call cancelled")
-                );
-            }
-            "configuration" => {
-                let expected = "participant kernel, options or routing preflight mismatch";
-                let result = coordinator.call(vec![input.clone()], &[1 - process], Arc::clone(&cancelled));
-                match result {
-                    Err(DistributedKernelError::Invalid { message }) => assert_eq!(message, expected),
-                    Err(DistributedKernelError::Participant { process: participant, message }) => {
-                        assert_eq!(participant, 1 - process);
-                        assert_eq!(message, format!("invalid distributed kernel call: {expected}"));
-                    }
-                    result => panic!("unexpected configuration result: {result:?}"),
-                }
-                assert!(coordinator.previous.is_none());
-                let mut identities = Vec::new();
-                for participant in 0..2 {
-                    let preflight = runtime
-                        .key_value_store()
-                        .get(&coordinator.coordination.key(0, participant, "preflight"), Duration::from_secs(5))
-                        .unwrap();
-                    let preflight: KernelPreflight = serde_json::from_slice(&preflight).unwrap();
-                    identities.push(serde_json::from_slice::<serde_json::Value>(&preflight.identity).unwrap());
-                    assert!(matches!(
-                        runtime.key_value_store().try_get(&coordinator.coordination.key(
-                            0,
-                            participant,
-                            "input/0/manifest"
-                        )),
-                        Err(ryft_pjrt::Error::NotFound { .. })
-                    ));
-                }
-                // The actual loaded source semantics agree, and only the validated compiler binding identities differ.
-                assert_eq!(identities[0][0], identities[1][0]);
-                assert_ne!(identities[0][1], identities[1][1]);
-            }
-            "routing" => {
-                let source = if process == 0 { 2 } else { 0 };
-                let result = coordinator.call(vec![input.clone()], &[source], Arc::clone(&cancelled));
-                if process == 0 {
-                    assert!(matches!(result, Err(DistributedKernelError::Invalid { message })
-                    if message == "input count or source-process routing differs from the kernel boundary"));
-                } else {
-                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
-                        if message == "invalid distributed kernel call: \
-                            input count or source-process routing differs from the kernel boundary"));
-                }
-            }
-            "order" => {
-                if process == 0 {
-                    runtime.reserve_key_prefix(COORDINATION_PROTOCOL);
-                }
-                let mut next = DistributedKernel::new(&runtime, &kernel, options).unwrap();
-                assert!(matches!(
-                    next.call(vec![input.clone()], &[process], Arc::clone(&cancelled)),
-                    Err(DistributedKernelError::Deadline)
-                ));
-            }
-            "late_failure" => {
-                let pending =
-                    coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
-                if process == 1 {
-                    let ready = runtime
-                        .key_value_store()
-                        .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
-                        .unwrap();
-                    assert!(serde_json::from_slice::<KernelTerminal>(&ready).unwrap().failure.is_none());
-                    cancelled.store(true, Ordering::Release);
-                }
-                let expected = if process == 0 {
-                    "distributed kernel participant 1 failed: distributed kernel call cancelled"
-                } else {
-                    "distributed kernel call cancelled"
-                };
-                assert!(matches!(
-                    pending.r#await(),
-                    Err(DistributedKernelError::Completion { message }) if message.as_ref() == expected,
-                ));
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_distributed_kernel_completion_readiness_is_immutable_cpu_process_helper() {
+        run_as_kernel_process([1, 1], |process, runtime, kernel, options, input| {
+            let mut coordinator = DistributedKernel::new(runtime, kernel, options).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pending = coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
+            if process == 1 {
                 let ready = runtime
                     .key_value_store()
                     .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
                     .unwrap();
                 assert!(serde_json::from_slice::<KernelTerminal>(&ready).unwrap().failure.is_none());
+                cancelled.store(true, Ordering::Release);
             }
-            "drop" => {
-                let pending =
-                    coordinator.call_async(vec![input.clone()], &[1 - process], Arc::clone(&cancelled)).unwrap();
-                if process == 0 {
-                    drop(pending);
-                    drop(coordinator);
-                } else {
-                    assert!(matches!(
-                        pending.r#await(),
-                        Err(DistributedKernelError::Completion { message })
-                            if message.as_ref()
-                                == "distributed kernel participant 0 failed: distributed kernel call cancelled",
-                    ));
-                }
-            }
-            _ => panic!("unexpected process mode"),
-        }
-        assert_eq!(scalar(&input), 10 + process as i32);
-        runtime
-            .key_value_store()
-            .put(format!("test-kernel-finished-{process}").as_bytes(), b"done")
-            .unwrap();
-        assert_eq!(
-            runtime
+            let expected = if process == 0 {
+                "distributed kernel participant 1 failed: distributed kernel call cancelled"
+            } else {
+                "distributed kernel call cancelled"
+            };
+            assert!(matches!(
+                pending.r#await(),
+                Err(DistributedKernelError::Completion { message }) if message.as_ref() == expected,
+            ));
+            let ready = runtime
                 .key_value_store()
-                .get(format!("test-kernel-finished-{}", 1 - process).as_bytes(), Duration::from_secs(10))
-                .unwrap(),
-            b"done"
+                .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
+                .unwrap();
+            assert!(serde_json::from_slice::<KernelTerminal>(&ready).unwrap().failure.is_none());
+        });
+    }
+
+    #[test]
+    fn test_distributed_kernel_completion_readiness_is_immutable() {
+        run_cpu_processes(
+            "kernels::distributed::tests::test_distributed_kernel_completion_readiness_is_immutable_cpu_process_helper",
+            2,
         );
     }
 

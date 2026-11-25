@@ -350,7 +350,7 @@ pub(super) fn run_worker(
         // The PJRT client borrows the runtime's key-value store. Drop all executables, device buffers, and the client
         // before collectively shutting down the coordination client, keeping rank zero's service alive throughout.
         let records = {
-            let client = runtime.create_client(
+            let client = runtime.new_client(
                 &plugin,
                 ClientOptions::GPU(GpuClientOptions {
                     platform: Some(GpuPlatform::CUDA),

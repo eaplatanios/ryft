@@ -2309,15 +2309,14 @@ impl Array {
     fn digest_verdict(session: &Session, device: Device, maximum: Self) -> Result<ExecutionFence, Error> {
         let verdict = |maximum: &Self| -> Result<Vec<u8>, Error> {
             let bytes = maximum.copy_to_host_bytes()?;
-            let words = bytes.as_chunks::<4>().0;
-            let agree = words.len() == 2 * DIGEST_WORDS
-                && words[..DIGEST_WORDS]
-                    .iter()
-                    .zip(&words[DIGEST_WORDS..])
-                    .all(|(&word, &complement)| u32::from_ne_bytes(word) == !u32::from_ne_bytes(complement));
-            match agree {
-                true => Ok(vec![0]),
-                false => Err(PjrtError::failed_precondition(DIFFERENT_VALUES_MESSAGE).into()),
+
+            // A word's bitwise complement flips every bit in each of its bytes, regardless of byte order.
+            // The reduction returns two complete digests, with the complemented minima in the second half.
+            match bytes.as_chunks::<{ DIGEST_WORDS * size_of::<u32>() }>() {
+                ([maxima, complements], []) if maxima.iter().zip(complements).all(|(&byte, &other)| byte == !other) => {
+                    Ok(vec![0])
+                }
+                _ => Err(PjrtError::failed_precondition(DIFFERENT_VALUES_MESSAGE).into()),
             }
         };
 
@@ -2674,6 +2673,8 @@ mod tests {
     };
     use crate::{ExecutionError, FromPjrt, PlaceInput, Placeable, PlacementOptions};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair};
     #[cfg(feature = "cuda-13")]
     use crate::tests::cuda_client;
 
@@ -4013,6 +4014,59 @@ mod tests {
                 if matches!(error.as_ref(), ArrayError::DeviceNotInMesh { device_id } if *device_id == absent),
         ));
         assert_eq!(error.to_string(), format!("device {absent} is not present in the device mesh"));
+    }
+
+    // Worker of `test_array_from_host_shards_on_two_cuda_processes`, which returns immediately unless that test
+    // launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_array_from_host_shards_cuda_process_helper() {
+        run_as_cuda_rank(|client| {
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+            let sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+
+            // Each rank uploads only its own tile of `[1, 2, 3, 4]` with the global type and mesh of its peer, from
+            // bytes that it lends and from bytes that the upload keeps until the transfer finishes.
+            let tile = [[1f32, 2.], [3., 4.]][rank];
+            let bytes = values_to_bytes(&tile);
+            let borrowed = [(devices[rank].id(), bytes.as_slice())];
+            let borrowed = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), None, borrowed).unwrap();
+            let owned = [(devices[rank].id(), Arc::<[u8]>::from(bytes.as_slice()))];
+            let owned = Array::from_host_shards(&session, r#type, mesh, None, owned).unwrap();
+            for array in [&borrowed, &owned] {
+                array.block_until_ready().unwrap();
+                assert_eq!(read_addressable_f32s(array), [tile.to_vec()]);
+            }
+
+            // A dense readback needs every tile, so it names the shard of the other rank before it issues any copy,
+            // as JAX rejects fetching arrays whose value spans devices that the process does not address.
+            assert!(matches!(
+                borrowed.copy_to_host_bytes(),
+                Err(Error::Array(error)) if matches!(
+                    *error,
+                    ArrayError::MissingShardBuffer { shard_index, device_id }
+                        if shard_index == 1 - rank && device_id == devices[1 - rank].id(),
+                ),
+            ));
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_from_host_shards_on_two_cuda_processes() {
+        run_cuda_rank_pair("arrays::host::tests::test_array_from_host_shards_cuda_process_helper");
     }
 
     #[test]
@@ -5365,6 +5419,75 @@ mod tests {
             &mut global_bytes,
         );
         assert_eq!(values_from_bytes::<f32>(global_bytes.as_slice()), vec![0., 1., 0., 2.]);
+    }
+
+    #[test]
+    fn test_host_value_validate_host_value() {
+        // A scalar always holds a valid element, and a host array does when its storage encodes its data type.
+        assert!(matches!(true.validate_host_value(), Ok(())));
+        assert!(matches!(2.5f32.validate_host_value(), Ok(())));
+        let mut host = CoreArray::vector(vec![true, false]).unwrap();
+        assert!(matches!(host.validate_host_value(), Ok(())));
+
+        // The safe mutable view of a host array can store bytes that encode no element of its data type.
+        host.storage_bytes_mut()[1] = 2;
+        assert_eq!(
+            host.validate_host_value().unwrap_err().to_string(),
+            "array element 1 has invalid `bool` byte encoding [2]",
+        );
+    }
+
+    #[test]
+    fn test_host_value_host_value_digest() {
+        // A scalar has the digest of the rank-0 array that it is uploaded as.
+        let expected = Some(value_digest(DataType::F32, &[], &2.5f32.to_ne_bytes()));
+        assert_eq!(2.5f32.host_value_digest(), expected);
+        assert_eq!(CoreArray::scalar(2.5f32).unwrap().host_value_digest(), expected);
+
+        // A host array has the digest of its dense row-major value, whatever the layout of its storage is.
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let column_major = r#type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let expected = Some(value_digest(DataType::F32, &[2, 2], &values));
+        assert_eq!(CoreArray::from_logical_bytes(r#type, &values).unwrap().host_value_digest(), expected);
+        let host = CoreArray::from_logical_bytes(column_major, &values).unwrap();
+        assert_eq!(values_from_bytes::<f32>(host.storage_bytes()), vec![1., 3., 2., 4.]);
+        assert_eq!(host.host_value_digest(), expected);
+
+        // A host array whose storage does not encode its data type has no digest.
+        let mut host = CoreArray::vector(vec![true, false]).unwrap();
+        host.storage_bytes_mut()[1] = 2;
+        assert_eq!(host.host_value_digest(), None);
+    }
+
+    #[test]
+    fn test_host_value_host_type() {
+        // A scalar is uploaded as a rank-0 array of its element type.
+        assert_eq!(true.host_type(), ArrayType::scalar(DataType::Boolean));
+        assert_eq!(2.5f32.host_type(), ArrayType::scalar(DataType::F32));
+        assert_eq!(Complex::new(1f32, 2.).host_type(), ArrayType::scalar(DataType::C64));
+
+        // A host array is uploaded with its data type and shape, and without the layout of its storage.
+        assert_eq!(CoreArray::vector(vec![1i32, 2, 3]).unwrap().host_type(), ArrayType::new_static(DataType::I32, [3]));
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let column_major = r#type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let host = CoreArray::from_logical_bytes(column_major, &values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        assert_eq!(host.host_type(), r#type);
+    }
+
+    #[test]
+    fn test_host_value_into_host_array() {
+        // A scalar becomes a rank-0 host array that holds it.
+        let host = 2.5f32.into_host_array();
+        assert_eq!(host.r#type().into_owned(), ArrayType::scalar(DataType::F32));
+        assert_eq!(host.storage_bytes(), 2.5f32.to_ne_bytes());
+        let host = Complex::new(1f64, -2.).into_host_array();
+        assert_eq!(host.r#type().into_owned(), ArrayType::scalar(DataType::C128));
+        assert_eq!(host.storage_bytes(), values_to_bytes(&[1f64, -2.]));
+
+        // A host array is returned as it is.
+        let host = CoreArray::vector(vec![1f32, 2.]).unwrap();
+        assert_eq!(host.clone().into_host_array(), host);
     }
 
     #[test]

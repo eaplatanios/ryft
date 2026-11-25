@@ -380,11 +380,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
-    use std::pin::pin;
     use std::sync::Arc;
-    use std::task::{Context as TaskContext, Poll, Wake, Waker};
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
@@ -432,8 +428,8 @@ pub(crate) mod tests {
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayError, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt,
-        Options, PlacementOptions, Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully,
+        Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt, Options,
+        PlacementOptions, Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully,
         to_mlir_module_for_program, trace, trace_with_context,
     };
 
@@ -1040,20 +1036,12 @@ pub(crate) mod tests {
         assert_eq!(cotangents, emulated_cotangents, "`{case:?}` cotangents differ between XLA and the emulation");
     }
 
-    /// Checks `shard_map` pipelines over a mesh `x = 2` of the two global devices of `client`, reading only the shards
-    /// that the current process addresses, so that the same checks hold for one process that addresses both devices
-    /// and for two processes that address one device each, as JAX's multi-controller model requires. Every process of
-    /// a job must call this function, because each scenario executes collectives over both devices.
-    fn check_shard_map_multi_host_scenarios(client: &'static Client<'static>) {
-        /// Wakes the thread polling upload readiness when a PJRT event completes.
-        struct TransferWaker(thread::Thread);
-
-        impl Wake for TransferWaker {
-            fn wake(self: Arc<Self>) {
-                self.0.unpark();
-            }
-        }
-
+    /// Returns a session of `client`, its two global devices, and the mesh positions of the devices that the current
+    /// process addresses, which select the values that a check expects of the shards that it can read. The checks that
+    /// use them therefore hold for one process that addresses both devices and for two processes that address one
+    /// device each, as JAX's multi-controller model requires. Every process of a job must run such a check, because
+    /// each of them executes collectives over both devices.
+    fn multi_host_session(client: &'static Client<'static>) -> (Session, Vec<Device>, Vec<usize>) {
         let process_index = client.process_index().unwrap();
         let devices = client
             .devices()
@@ -1062,80 +1050,46 @@ pub(crate) mod tests {
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(devices.len(), 2);
-        // Mesh positions of the devices that this process addresses select the expected per-device values below.
         let local_positions = devices
             .iter()
             .enumerate()
             .filter(|(_, device)| device.process_index() == process_index)
             .map(|(position, _)| position)
             .collect::<Vec<_>>();
-        let session = Session::builder().client(client).build().unwrap();
+        (Session::builder().client(client).build().unwrap(), devices, local_positions)
+    }
+
+    /// Returns a CPU client with two devices that is created through the runtime of a job of one process, as the
+    /// client of a process of a distributed job is, for the single-process baselines of the multi-host checks.
+    fn single_process_client() -> &'static Client<'static> {
+        let plugin = load_cpu_plugin().unwrap();
+        // Sessions need a client that lives for the process, and so does the runtime whose key-value store it borrows.
+        let runtime: &'static DistributedRuntime =
+            Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &loopback_address(), 1, 0).unwrap()));
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
+        Box::leak(Box::new(runtime.new_client(&plugin, options).unwrap()))
+    }
+
+    /// Checks that maps over a manual mesh `x = 2` of the two global devices of `client` complete outputs that are
+    /// unreduced along `x` (refer to [`multi_host_session`]).
+    fn check_shard_map_completes_unreduced_outputs(client: &'static Client<'static>) {
+        let (session, devices, local_positions) = multi_host_session(client);
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(manual_mesh.clone(), devices.clone()).unwrap();
         let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(manual_mesh.clone(), 1);
 
-        // Each rank packs only its local tiles and uses the same global type and mesh as its peers.
+        // Each process packs only its local tiles of `[1, 2, 3, 4]` and uses the same global type and mesh as its
+        // peers.
         let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
         let tiles = [[1f32, 2.0], [3.0, 4.0]];
         let local_tiles = local_positions
             .iter()
-            .map(|&position| (devices[position].id(), Arc::<[u8]>::from(values_to_bytes(&tiles[position]))))
-            .collect::<Vec<_>>();
-        let input = Array::from_host_shards(
-            &session,
-            input_type.clone(),
-            mesh.clone(),
-            None,
-            local_tiles.iter().map(|(device, bytes)| (*device, bytes.as_ref())),
-        )
-        .unwrap();
-        input.block_until_ready().unwrap();
-        let expected_local_tiles = local_positions.iter().map(|&position| tiles[position].to_vec()).collect::<Vec<_>>();
-        assert_eq!(read_addressable_f32s(&input), expected_local_tiles);
-
-        // Dense host materialization of a sharded array needs every tile, so it succeeds only in a process that
-        // addresses both devices and otherwise names a shard of the other process before issuing any copy, as JAX
-        // rejects fetching arrays whose value spans non-addressable devices.
-        if local_positions.len() == 2 {
-            let materialized = input.copy_to_host_bytes().unwrap();
-            assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
-        } else {
-            let remote_position = 1 - local_positions[0];
-            assert!(matches!(
-                input.copy_to_host_bytes(),
-                Err(Error::Array(error)) if matches!(
-                    *error,
-                    ArrayError::MissingShardBuffer { shard_index, device_id }
-                        if shard_index == remote_position && device_id == devices[remote_position].id(),
-                ),
-            ));
-        }
-
-        // Move the host buffers into the second upload so PJRT can retain them until the transfer finishes.
-        let asynchronous_input =
-            Array::from_host_shards(&session, input_type, mesh.clone(), None, local_tiles).unwrap();
-        let mut ready = pin!(asynchronous_input.ready());
-        let waker = Waker::from(Arc::new(TransferWaker(thread::current())));
-        let mut context = TaskContext::from_waker(&waker);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match ready.as_mut().poll(&mut context) {
-                Poll::Ready(result) => {
-                    result.unwrap();
-                    break;
-                }
-                Poll::Pending => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    assert!(!remaining.is_zero(), "asynchronous host shard upload timed out");
-                    thread::park_timeout(remaining);
-                }
-            }
-        }
-        assert_eq!(read_addressable_f32s(&asynchronous_input), expected_local_tiles);
+            .map(|&position| (devices[position].id(), Arc::<[u8]>::from(values_to_bytes(&tiles[position]))));
+        let input = Array::from_host_shards(&session, input_type, mesh, None, local_tiles).unwrap();
 
         // An unchecked map returns each tile as its candidate for an output that is unreduced along `x`, and a checked
-        // map completes it with an all-reduce of the matching kind. Both uploads feed a reduction over both devices.
+        // map completes it with an all-reduce of the matching kind.
         let complete = |input: Array, kind: UnreducedKind, reduction: ReductionKind| {
             let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
             let candidates = shard_map(
@@ -1160,15 +1114,23 @@ pub(crate) mod tests {
             )
             .unwrap()
         };
-        let sum = complete(input, UnreducedKind::Sum, ReductionKind::Sum);
+        let sum = complete(input.clone(), UnreducedKind::Sum, ReductionKind::Sum);
         assert_eq!(read_addressable_f32s(&sum), vec![vec![4.0, 6.0]; local_positions.len()]);
-        let maximum = complete(asynchronous_input.clone(), UnreducedKind::Max, ReductionKind::Max);
+        let maximum = complete(input, UnreducedKind::Max, ReductionKind::Max);
         assert_eq!(read_addressable_f32s(&maximum), vec![vec![3.0, 4.0]; local_positions.len()]);
 
         // A replicated array spans every process, but each process holds its whole value, so dense host reads succeed
         // in every process, as JAX reads a value that the current process holds in full.
         let materialized = sum.copy_to_host_bytes().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![4.0, 6.0]);
+    }
+
+    /// Checks that a map over a manual mesh `x = 2` of the two global devices of `client` can be batched along its
+    /// manual axis (refer to [`multi_host_session`]).
+    fn check_shard_map_batches_along_manual_axis(client: &'static Client<'static>) {
+        let (session, devices, local_positions) = multi_host_session(client);
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(manual_mesh.clone(), 1);
 
         // Batching a map along its only manual axis for a caller over an `Explicit` copy of the mesh places one item on
         // each device, so each device holds its own item doubled.
@@ -1225,6 +1187,14 @@ pub(crate) mod tests {
             read_addressable_f32s(&doubled),
             local_positions.iter().map(|&position| doubled_items[position].clone()).collect::<Vec<_>>(),
         );
+    }
+
+    /// Checks that a stateful map over a manual mesh `x = 2` of the two global devices of `client` updates a
+    /// reference that is reduced along `x` (refer to [`multi_host_session`]).
+    fn check_shard_map_updates_reduced_reference(client: &'static Client<'static>) {
+        let (session, devices, local_positions) = multi_host_session(client);
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(manual_mesh.clone(), devices).unwrap();
 
         // An unchecked stateful map doubles every device's copy of a reference that is reduced along `x` and writes it
         // back, so each process reads `[2, 4]` from its own shards of the referent afterwards. Over a mesh that spans
@@ -6072,41 +6042,80 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_multi_host_scenarios_on_one_process_with_two_cpu_devices() {
-        // The single-process baseline of the multi-host scenarios, which reads every shard because this process
-        // addresses both devices. The client is minted through a one-node runtime, as in a distributed job.
-        let address = loopback_address();
-        let plugin = load_cpu_plugin().unwrap();
-        // Sessions need a client that lives for the process, and so does the runtime whose key-value store it borrows.
-        let runtime: &'static DistributedRuntime =
-            Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap()));
-        let client: &'static Client<'static> = Box::leak(Box::new(
-            runtime
-                .new_client(
-                    &plugin,
-                    ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
-                )
-                .unwrap(),
-        ));
-        check_shard_map_multi_host_scenarios(client);
+    fn test_shard_map_completes_unreduced_outputs_on_one_process_with_two_cpu_devices() {
+        // The single-process baseline of the check, which reads every shard because this process addresses both
+        // devices.
+        check_shard_map_completes_unreduced_outputs(single_process_client());
     }
 
-    // Worker of `test_shard_map_multi_host_scenarios_on_two_cuda_processes`, which returns immediately unless that
-    // test launched it as one of its two ranks.
+    // Worker of `test_shard_map_completes_unreduced_outputs_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
-    fn test_shard_map_multi_host_scenarios_cuda_process_helper() {
-        run_as_cuda_rank(|client| check_shard_map_multi_host_scenarios(client));
+    fn test_shard_map_completes_unreduced_outputs_cuda_process_helper() {
+        run_as_cuda_rank(check_shard_map_completes_unreduced_outputs);
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
-    fn test_shard_map_multi_host_scenarios_on_two_cuda_processes() {
-        // The multi-host scenarios run in two processes that address one device each.
+    fn test_shard_map_completes_unreduced_outputs_on_two_cuda_processes() {
+        // The check runs in two processes that address one device each.
         run_cuda_rank_pair(
-            "operations::sharding::shard_map::tests::test_shard_map_multi_host_scenarios_cuda_process_helper",
+            "operations::sharding::shard_map::tests::test_shard_map_completes_unreduced_outputs_cuda_process_helper",
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batches_along_manual_axis_on_one_process_with_two_cpu_devices() {
+        // The single-process baseline of the check, which reads every shard because this process addresses both
+        // devices.
+        check_shard_map_batches_along_manual_axis(single_process_client());
+    }
+
+    // Worker of `test_shard_map_batches_along_manual_axis_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_shard_map_batches_along_manual_axis_cuda_process_helper() {
+        run_as_cuda_rank(check_shard_map_batches_along_manual_axis);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_shard_map_batches_along_manual_axis_on_two_cuda_processes() {
+        // The check runs in two processes that address one device each.
+        run_cuda_rank_pair(
+            "operations::sharding::shard_map::tests::test_shard_map_batches_along_manual_axis_cuda_process_helper",
+        );
+    }
+
+    #[test]
+    fn test_shard_map_updates_reduced_reference_on_one_process_with_two_cpu_devices() {
+        // The single-process baseline of the check, which reads every shard because this process addresses both
+        // devices.
+        check_shard_map_updates_reduced_reference(single_process_client());
+    }
+
+    // Worker of `test_shard_map_updates_reduced_reference_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_shard_map_updates_reduced_reference_cuda_process_helper() {
+        run_as_cuda_rank(check_shard_map_updates_reduced_reference);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_shard_map_updates_reduced_reference_on_two_cuda_processes() {
+        // The check runs in two processes that address one device each.
+        run_cuda_rank_pair(
+            "operations::sharding::shard_map::tests::test_shard_map_updates_reduced_reference_cuda_process_helper",
         );
     }
 }

@@ -383,7 +383,7 @@ impl DistributedRuntime {
         if !client.key_value_store().is_some_and(|store| std::ptr::addr_eq(store, &self.state.key_value_store)) {
             return Err(ryft_pjrt::Error::failed_precondition(
                 "client does not use the key-value store of its distributed runtime; create it with \
-                 `DistributedRuntime::create_client`",
+                 `DistributedRuntime::new_client`",
             )
             .into());
         }
@@ -805,8 +805,6 @@ struct CompilationCompatibilityManifest {
     process_count: u64,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::File;
@@ -858,9 +856,6 @@ pub(crate) mod tests {
     /// Environment variable that carries the coordinator address of a launch of [`run_test_processes`].
     const PROCESS_TEST_ADDRESS: &str = "RYFT_DISTRIBUTED_TEST_ADDRESS";
 
-    /// Key under which the follower of the two-process exchange test acknowledges its artifact.
-    const PROCESS_TEST_ACKNOWLEDGEMENT: &[u8] = b"ryft/test/artifact-consumed";
-
     /// Initializes the runtime of a job of one process, which is both its coordinator and its only participant.
     fn single_process_runtime() -> DistributedRuntime {
         DistributedRuntime::initialize(&load_cpu_plugin().unwrap(), &loopback_address(), 1, 0).unwrap()
@@ -892,12 +887,6 @@ pub(crate) mod tests {
         Some((rank, env::var(PROCESS_TEST_ADDRESS).unwrap()))
     }
 
-    // TODO(eaplatanios): Split the workers that check many behaviors in one test, so that each multi-process test
-    //  checks one behavior of its owning item. The largest are `check_shard_map_multi_host_scenarios` in
-    //  `operations/sharding/shard_map.rs`, `test_session_place_cpu_process_helper` in `arrays/placement.rs`, the
-    //  step lists that `check_cuda_rank_pair_placement_steps` runs in `arrays/resharding.rs`, and the modes of
-    //  `test_distributed_kernel_process` in `kernels/distributed.rs`, whose launcher should also be replaced by
-    //  this one.
     /// Runs the worker test `helper`, given as its path within this test binary, in `process_count` processes that
     /// stand for the ranks of one job, with `environment` added to their environment, and returns their standard
     /// outputs in rank order. Each process finds its rank and a coordinator address on a free loopback port with
@@ -927,6 +916,7 @@ pub(crate) mod tests {
         let address = loopback_address();
         let directory = tempfile::tempdir().unwrap();
         let output_path = |rank: usize, stream: &str| directory.path().join(format!("rank-{rank}.{stream}"));
+
         // Each process writes its output to files rather than pipes, so verbose native logs cannot block it.
         let executable = env::current_exe().unwrap();
         let mut processes = Processes(Vec::with_capacity(process_count));
@@ -957,7 +947,7 @@ pub(crate) mod tests {
         }
         drop(processes);
 
-        // libtest prints `test <name> ... ` without a line break before a worker runs, so its output follows that
+        // `libtest` prints `test <name> ... ` without a line break before a worker runs, so its output follows that
         // prefix.
         let outputs = (0..process_count)
             .map(|rank| {
@@ -1242,20 +1232,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_distributed_runtime_new_client() {
+        // The client takes its process from the runtime and uses the key-value store of the runtime.
+        let runtime = single_process_runtime();
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() });
+        let client = runtime.new_client(&load_cpu_plugin().unwrap(), options).unwrap();
+        assert_eq!(client.process_index().unwrap(), 0);
+        assert_eq!(client.addressable_devices().unwrap().len(), 1);
+        assert!(client.key_value_store().is_some());
+    }
+    #[test]
+    fn test_distributed_runtime_new_compilation_artifact_exchange() {
+        let exchange = single_process_runtime().new_compilation_artifact_exchange();
+        assert_eq!((exchange.process_index(), exchange.process_count()), (0, 1));
+        assert_eq!(exchange.validate_compatibility(b"key", 0, Duration::from_secs(1)), Ok(()));
+        assert_eq!(exchange.publish(b"key", b"artifact"), Ok(()));
+        assert_eq!(exchange.receive(b"key", Duration::from_secs(1)), Ok(Some(b"artifact".to_vec())));
+    }
+    #[test]
+    fn test_distributed_runtime_shutdown() {
+        // Every process of the job has disconnected once its only process has, and later calls do nothing.
+        let runtime = single_process_runtime();
+        assert_eq!(runtime.shutdown(), Ok(()));
+        assert_eq!(runtime.clone().shutdown(), Ok(()));
+    }
+
+    #[test]
     fn test_distributed_runtime_is_same_runtime() {
         let runtime = single_process_runtime();
         assert!(runtime.is_same_runtime(&runtime.clone()));
         assert!(!runtime.is_same_runtime(&single_process_runtime()));
     }
-
-    #[test]
-    fn test_distributed_runtime_shutdown() {
-        // Every process of the job has disconnected once its only process has, and later calls do nothing.
-        let runtime = single_process_runtime();
-        assert!(matches!(runtime.shutdown(), Ok(())));
-        assert!(matches!(runtime.clone().shutdown(), Ok(())));
-    }
-
     #[test]
     fn test_distributed_runtime_reserve_key_prefix() {
         let runtime = single_process_runtime();
@@ -1273,43 +1280,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_distributed_runtime_compilation_artifact_exchange() {
-        let exchange = single_process_runtime().new_compilation_artifact_exchange();
-        assert_eq!((exchange.process_index(), exchange.process_count()), (0, 1));
-        assert_eq!(exchange.validate_compatibility(b"key", 0, Duration::from_secs(1)), Ok(()));
-        assert_eq!(exchange.publish(b"key", b"artifact"), Ok(()));
-        assert_eq!(exchange.receive(b"key", Duration::from_secs(1)), Ok(Some(b"artifact".to_vec())));
-    }
-
-    #[test]
-    fn test_distributed_runtime_create_client() {
-        // The client takes its process from the runtime and uses the key-value store of the runtime.
-        let runtime = single_process_runtime();
-        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() });
-        let client = runtime.new_client(&load_cpu_plugin().unwrap(), options).unwrap();
-        assert_eq!(client.process_index().unwrap(), 0);
-        assert_eq!(client.addressable_devices().unwrap().len(), 1);
-        assert!(client.key_value_store().is_some());
-    }
-
-    #[test]
     fn test_distributed_runtime_client_options() {
         let runtime = single_process_runtime();
 
         // Unset coordinates are completed, and coordinates that agree with the runtime are kept.
         for process_id in [None, Some(0)] {
             assert_eq!(
-                runtime
-                    .client_options(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), process_id }))
-                    .ok(),
-                Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), process_id: Some(0) })),
+                runtime.client_options(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), process_id })),
+                Ok(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), process_id: Some(0) })),
             );
         }
         assert_eq!(
-            runtime.client_options(ClientOptions::GPU(GpuClientOptions::default())).ok(),
-            Some(ClientOptions::GPU(GpuClientOptions { node_id: Some(0), node_count: Some(1), ..Default::default() })),
+            runtime.client_options(ClientOptions::GPU(GpuClientOptions::default())),
+            Ok(ClientOptions::GPU(GpuClientOptions { node_id: Some(0), node_count: Some(1), ..Default::default() })),
         );
-        assert_eq!(runtime.client_options(ClientOptions::default()).ok(), Some(ClientOptions::default()));
+        assert_eq!(runtime.client_options(ClientOptions::default()), Ok(ClientOptions::default()));
 
         // Coordinates of another process or of a job of another size are rejected.
         let rejected = [
@@ -1335,7 +1320,7 @@ pub(crate) mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
         let client = runtime.new_client(&plugin, options).unwrap();
-        assert!(matches!(runtime.remote_devices(&client), Ok(devices) if devices.is_empty()));
+        assert_eq!(runtime.remote_devices(&client), Ok(Vec::new()));
 
         // A client that was created without the runtime takes no part in its job.
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(1) });
@@ -1344,7 +1329,7 @@ pub(crate) mod tests {
             runtime.remote_devices(&unrelated),
             Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
                 if message == "client does not use the key-value store of its distributed runtime; create it with \
-                               `DistributedRuntime::create_client`",
+                               `DistributedRuntime::new_client`",
         ));
 
         // A client whose options name another process cannot stand for the process of the runtime.
@@ -1357,6 +1342,8 @@ pub(crate) mod tests {
         ));
     }
 
+    // Worker of `test_distributed_runtime_remote_devices_exchanges_devices_of_two_cpu_processes`, which returns
+    // immediately unless that test launched it as one of its two processes.
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_distributed_runtime_remote_devices_cpu_process_helper() {
@@ -1398,7 +1385,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(ptr::eq(later.client(), session.client()));
         assert_eq!(later.remote_devices(), [devices[1 - rank]]);
-        assert!(matches!(runtime.remote_devices(session.client()), Ok(remote) if remote == [devices[1 - rank]]));
+        assert_eq!(runtime.remote_devices(session.client()), Ok(vec![devices[1 - rank]]));
 
         // Both processes have finished before either disconnects from the coordination service, and the coordinator
         // keeps its service until the other process has disconnected, which the shutdown waits for. The session keeps
@@ -1688,6 +1675,8 @@ pub(crate) mod tests {
         );
     }
 
+    // Worker of `test_distributed_compilation_artifact_exchange_shares_artifacts_between_two_cpu_processes`, which returns
+    // immediately unless that test launched it as one of its two processes.
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_distributed_compilation_artifact_exchange_cpu_process_helper() {
@@ -1700,16 +1689,17 @@ pub(crate) mod tests {
         assert_eq!((exchange.process_index(), exchange.process_count()), (process_index, 2));
         assert_eq!(exchange.validate_compatibility(b"multi-process-key", 0, Duration::from_secs(5)), Ok(()));
 
-        // The leader keeps the coordination service alive until the follower has received the artifact.
+        // The leader keeps the coordination service alive until the follower has acknowledged the artifact.
+        let acknowledgement = b"ryft/test/artifact-consumed";
         if process_index == 0 {
             assert_eq!(exchange.publish(b"multi-process-key", b"serialized-executable"), Ok(()));
-            runtime.key_value_store().get(PROCESS_TEST_ACKNOWLEDGEMENT, Duration::from_secs(5)).unwrap();
+            runtime.key_value_store().get(acknowledgement, Duration::from_secs(5)).unwrap();
         } else {
             assert_eq!(
                 exchange.receive(b"multi-process-key", Duration::from_secs(5)),
                 Ok(Some(b"serialized-executable".to_vec())),
             );
-            runtime.key_value_store().put(PROCESS_TEST_ACKNOWLEDGEMENT, b"ready").unwrap();
+            runtime.key_value_store().put(acknowledgement, b"ready").unwrap();
         }
     }
 
@@ -1905,14 +1895,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         // scatter of the sum `[4, 6]` gives `[4]` and `[6]`, and the all-to-all gives `[1, 3]` and `[2, 4]`. XLA
         // rejects the swapping `send` and `recv`, whose pairs form a cycle, while the acyclic variant delivers `[1, 2]`
         // to rank 1 and leaves the received value of rank 0, which no pair targets, zero.
-        let outputs = run_cuda_rank_pair("distributed::tests::test_gpu_only_collectives_cuda_process_helper");
-        // libtest prints `test <name> ... ` without a line break before the helper runs, so the first probe line of
-        // each rank follows that prefix.
-        let probes = outputs
-            .iter()
-            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let probes = run_cuda_rank_pair_probes("distributed::tests::test_gpu_only_collectives_cuda_process_helper");
         assert_eq!(
             probes,
             indoc! {"

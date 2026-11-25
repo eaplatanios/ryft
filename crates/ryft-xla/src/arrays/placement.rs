@@ -564,17 +564,6 @@ mod sealed {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Conservatively identifies potential peers when the destination cannot be resolved. Every process sees the same
-/// source mesh for a shared array and the same destination request.
-fn request_spans_processes(mesh: &DeviceMesh, target: &PlacementRequest) -> bool {
-    let target_devices = match target {
-        PlacementRequest::Resolved(placement) => placement.mesh().devices(),
-        PlacementRequest::Device { device, .. } => std::slice::from_ref(device),
-        PlacementRequest::InPlace { .. } => &[],
-    };
-    devices_span_processes(mesh.devices().iter().chain(target_devices))
-}
-
 /// Validates the destination `target` of the upload of a host value whose element type and static shape `r#type`
 /// describes, and returns it with a sharding that is padded to the rank of the value. The upload of a host value onto
 /// a destination is the placement of a value that has no tracked sharding and lives in device memory without a
@@ -668,11 +657,21 @@ impl PlaceableParameter<Array> for Array {
         if self.is_locally_assigned() || !std::ptr::eq(self.client(), session.client()) {
             return false;
         }
-        let Some(target) = target.filter(|target| !matches!(target, PlacementRequest::InPlace { .. })) else {
+        let Some(target) = target else {
             return false;
         };
+        // In-place requests only change storage on the source devices. Explicit destinations may move shards.
+        let target_devices = match target {
+            PlacementRequest::Resolved(placement) => placement.mesh().devices(),
+            PlacementRequest::Device { device, .. } => std::slice::from_ref(device),
+            PlacementRequest::InPlace { .. } => return false,
+        };
         resolve_array_placement(target.clone(), self).map_or_else(
-            |_| request_spans_processes(self.mesh(), target),
+            |_| {
+                // If resolution fails, conservatively identify potential peers from the source mesh and the
+                // devices named by the request, which every process sees alike.
+                devices_span_processes(self.mesh().devices().iter().chain(target_devices))
+            },
             |placement| self.placement_communicates(placement.mesh(), placement.sharding()),
         )
     }
@@ -802,7 +801,21 @@ macro_rules! impl_traced_placeable {
                 donate: bool,
                 may_alias: Option<bool>,
             ) -> Result<Self, Error> {
-                place_traced(self, session, target, source, donate, may_alias)
+                // Dispatch uses the tracer's context, so any concrete arrays it wraps must belong to this session.
+                validate_traced(&self, session, target.as_ref(), source.as_ref(), donate, may_alias)?;
+
+                // Pad explicit shardings to the value's rank, which is the per-item rank of a batched value. Keep
+                // bare device and in-place requests in their original form so the placement rule can validate them
+                // first. It uses a wrapped array's placement to infer or complete the source that transposition
+                // uses to return the cotangent (refer to `PlacementRequest::resolve_source`).
+                let rank = self.r#type().rank();
+                let source = source.map(|source| source.padded(rank)).transpose()?;
+                let target = target.map(|target| target.padded(rank)).transpose()?;
+
+                // Record a forced copy even without a destination, so the policy applies when the operation
+                // executes on concrete arrays. Donation only applies to concrete leaves and takes precedence.
+                let may_alias = !forces_copy(donate, may_alias);
+                Ok(<Self as CoreValue>::Dispatch::place(&self, target.as_ref(), source, may_alias)?)
             }
         }
     };
@@ -1009,8 +1022,31 @@ impl PlaceInput<CompileTracer> {
         // Check the type before importing any mixed leaves. The compilation session checks destinations of traced
         // leaves, while this session checks the destinations of the host values and concrete arrays it imports.
         let output = operation.infer_output_type_requiring_even_splits(r#type, None)?;
-        if let Some(mesh) = mesh.as_deref() {
-            validate_request_destination(session, operation.target(), mesh, &output)?;
+        if let (Some(input_mesh), Some(request)) = (mesh.as_deref(), operation.target()) {
+            // Check the inventory for destinations that name devices. An in-place request keeps the capture's
+            // devices, which were checked when validating the upload or binding the concrete array to the session.
+            let devices = match request {
+                PlacementRequest::Resolved(placement) => {
+                    validate_mesh_devices(session, placement.mesh())?;
+                    placement.mesh().devices()
+                }
+                PlacementRequest::Device { device, .. } => {
+                    let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![*device])?;
+                    validate_mesh_devices(session, &mesh)?;
+                    std::slice::from_ref(device)
+                }
+                PlacementRequest::InPlace { .. } => input_mesh.devices(),
+            };
+
+            // Check requested memory before importing the capture. Only this process can inspect its own device
+            // memories, and zero values have no buffers that need a memory space.
+            if request.explicit_memory().is_some() && !output.data_type().is_zero() {
+                let client = session.client();
+                let process_index = client.process_index()?;
+                for device in devices.iter().filter(|device| device.process_index() == process_index) {
+                    client.lookup_device(device.id())?.memory(output.memory())?;
+                }
+            }
         }
         Ok(())
     }
@@ -1052,8 +1088,21 @@ impl sealed::PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         if parameters.is_empty() {
             return Ok(());
         }
-        let trace =
-            placement_trace(parameters)?.ok_or_else(|| with_parameter_path(untraced_host_value_error(), || path(0)))?;
+        // The first tracer supplies the context into which the host and concrete leaves are imported. Every
+        // other tracer must share its builder so that all leaves belong to one program.
+        let mut traced = parameters.iter().filter_map(|parameter| match parameter {
+            Self::Host(_) | Self::Concrete(_) => None,
+            Self::Runtime(value) => Some(value),
+        });
+        let Some(trace) = traced.next() else {
+            let message = "cannot place a host value or a runtime array as a traced value without a traced value \
+                           in the same call";
+            return Err(with_parameter_path(PjrtError::invalid_argument(message).into(), || path(0)));
+        };
+        if traced.any(|other| !Rc::ptr_eq(trace.value().builder(), other.value().builder())) {
+            let message = "cannot place traced values of different traces in one call";
+            return Err(PjrtError::invalid_argument(message).into());
+        }
         let context = trace.domain();
         // A trace that preserves the placement of its captures gives a host value or a concrete array its own type,
         // which the check of each leaf did not assume, so a placement that this type rejects is reported before any
@@ -1110,19 +1159,15 @@ impl Placeable for PlaceInput<CompileTracer> {
         match self {
             Self::Host(_) | Self::Concrete(_) => {
                 validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
-                Err(untraced_host_value_error())
+                // Tree preparation imports these leaves through another leaf's trace. A direct call on a host
+                // value or concrete array has no tracer that can supply that context.
+                let message = "cannot place a host value or a runtime array as a traced value without a traced value \
+                               in the same call";
+                Err(PjrtError::invalid_argument(message).into())
             }
             Self::Runtime(value) => value.place_parameter(session, target, source, donate, may_alias),
         }
     }
-}
-
-/// Returns the error of a host leaf or a runtime array of a [`PlaceInput`] over traced values that is placed without
-/// traced values of its tree, which name the trace that it would join.
-fn untraced_host_value_error() -> Error {
-    let message =
-        "cannot place a host value or a runtime array as a traced value without a traced value in the same call";
-    PjrtError::invalid_argument(message).into()
 }
 
 impl Array {
@@ -1715,57 +1760,6 @@ fn place_leaves<P: Placeable>(
         .collect()
 }
 
-/// Returns the common compilation trace that the host and concrete leaves join.
-fn placement_trace(parameters: &[PlaceInput<CompileTracer>]) -> Result<Option<&CompileTracer>, Error> {
-    let mut traced = parameters.iter().filter_map(|parameter| match parameter {
-        PlaceInput::Host(_) | PlaceInput::Concrete(_) => None,
-        PlaceInput::Runtime(value) => Some(value),
-    });
-    let Some(trace) = traced.next() else { return Ok(None) };
-    if traced.any(|other| !Rc::ptr_eq(trace.value().builder(), other.value().builder())) {
-        let message = "cannot place traced values of different traces in one call";
-        return Err(PjrtError::invalid_argument(message).into());
-    }
-    Ok(Some(trace))
-}
-
-/// Checks that the session recognizes the devices explicitly named by a request.
-fn validate_request_devices(session: &Session, request: Option<&PlacementRequest>) -> Result<(), Error> {
-    match request {
-        Some(PlacementRequest::Resolved(placement)) => validate_mesh_devices(session, placement.mesh()),
-        Some(PlacementRequest::Device { device, .. }) => {
-            let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![*device])?;
-            validate_mesh_devices(session, &mesh)
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Checks explicit destination devices and any concrete destination memory before importing a mixed tree.
-fn validate_request_destination(
-    session: &Session,
-    request: Option<&PlacementRequest>,
-    input_mesh: &DeviceMesh,
-    output: &ArrayType,
-) -> Result<(), Error> {
-    validate_request_devices(session, request)?;
-    let Some(request) = request else { return Ok(()) };
-    if request.explicit_memory().is_none() || output.data_type().is_zero() {
-        return Ok(());
-    }
-    let devices = match request {
-        PlacementRequest::Resolved(placement) => placement.mesh().devices(),
-        PlacementRequest::Device { device, .. } => std::slice::from_ref(device),
-        PlacementRequest::InPlace { .. } => input_mesh.devices(),
-    };
-    let client = session.client();
-    let process_index = client.process_index()?;
-    for device in devices.iter().filter(|device| device.process_index() == process_index) {
-        client.lookup_device(device.id())?.memory(output.memory())?;
-    }
-    Ok(())
-}
-
 /// Value that may wrap concrete [`Array`]s, through whose sessions the placement of a traced value executes. A traced
 /// value places its arrays with the contexts that it was created in, which hold the sessions of those arrays, so
 /// [`Session::place`] uses this trait to reject a traced value over the arrays of another session than the receiving
@@ -1875,7 +1869,17 @@ pub(super) fn resolve_array_placement(request: PlacementRequest, array: &Array) 
     if let Some(memory) = memory {
         placement = placement.with_memory(memory);
     }
-    validate_target_rank(&placement, &array.r#type())?;
+    // Reuse the type rule's rank diagnostic while leaving the remaining checks to the physical placement path,
+    // which supports changes to reduction state that the full type rule would reject.
+    let r#type = array.r#type();
+    if placement.sharding().rank() != r#type.rank() {
+        PlaceOperation::infer_output_type_allowing_uneven_splits(
+            &r#type,
+            None,
+            Some(&PlacementRequest::Resolved(placement.clone())),
+            None,
+        )?;
+    }
     Ok(placement)
 }
 
@@ -1954,79 +1958,7 @@ fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Er
     }
 }
 
-/// Validates that the resolved destination `placement` of the concrete array `array` has the rank of that array, with
-/// the error of the type rule of [`PlaceOperation`], which owns that check. [`Array::to_placement`] and
-/// [`Array::into_placement`] are physical primitives that the type rule does not validate otherwise, and every other
-/// placement of an array validates its whole request with the type rule before it resolves its destination. The type
-/// rule is only consulted for a mismatched rank, which is the first check that it makes for a placement target, because
-/// it also rejects placements that the physical primitives support (e.g., uneven splits).
-fn validate_target_rank(placement: &Placement, r#type: &ArrayType) -> Result<(), Error> {
-    if placement.sharding().rank() != r#type.rank() {
-        PlaceOperation::infer_output_type_allowing_uneven_splits(
-            r#type,
-            None,
-            Some(&PlacementRequest::Resolved(placement.clone())),
-            None,
-        )?;
-    }
-    Ok(())
-}
-
-/// Places the traced `value` through its [`PlaceDispatch`] primitive. This implements [`Placeable::place_parameter`]
-/// for every traced value type so they all handle placement options identically (refer to [`Session::place`]).
-///
-/// Every destination and source is staged in the form that it was given,
-/// whether or not `value` wraps a concrete array, so a bare device stays a [`PlacementRequest::Device`] and a bare
-/// memory stays a [`PlacementRequest::InPlace`], and only a destination or source that names a mesh or a sharding is
-/// resolved for the rank of the type of `value` (which is the rank of each batch item for a batched value). A device or
-/// in-place request resolves against a concrete array only when the staged placement executes on it, and the type
-/// rule of [`PlaceOperation`] owns what each request does to the
-/// type of `value`, so that the type of the result does not depend on whether `value` wraps a concrete array. Without
-/// a source, the rule of [`PlaceOperation`] that places a traced value that wraps a concrete array records the
-/// placement of that array (refer to [`Placed`](ryft_core::Placed)) as the source, so that reverse mode
-/// differentiation moves the cotangent back there. It completes a source that names only a memory or a layout with
-/// that placement rather than replacing it, and a device source of an array on one device with that placement moved
-/// onto the device (refer to [`PlacementRequest::resolve_source`]), so that such a source never loses the devices or
-/// the runtime reduction state of the value. That rule validates the requests as they are given with the type rule
-/// first, so this function does not validate them itself. Without a target, the value is placed without one, which
-/// leaves it where it is, with the source if one is provided.
-///
-/// With `may_alias` set to `Some(false)` and without donation, the placement forces a copy (refer to
-/// [`PlaceOperation::with_may_alias`] and [`forces_copy`]), also without a target and a source, so that its result
-/// shares no buffer with any other array once it executes on concrete arrays. Any other combination stages the
-/// placement with the default copy policy. Donation itself only applies to concrete [`Array`] leaves, so it decides
-/// nothing else here.
-///
-/// The placement executes through the contexts of `value` (e.g., its batching or differentiation context), which hold
-/// the session of the arrays that `value` wraps, so its results belong to that session and not to `session`. Those
-/// contexts cannot be rebuilt over another session (e.g., the partial evaluation context of reverse mode
-/// differentiation owns the residual program that the value is part of), so every array that `value` wraps (i.e., its
-/// primal, its tangent, its packed batch, and any known partial value, at every level of nesting) must belong to
-/// `session`. An array of another PJRT client is rejected with the error of [`Array::with_session`], as a concrete
-/// array of that client is, and an array of another session of the same client is rejected with a
-/// [`ryft_pjrt::Error::InvalidArgument`] error. The devices of the resolved placements cannot reveal either, because
-/// device IDs are only unique within one client. Other handles of the same session (e.g., ones with another default
-/// mesh) are accepted, and the results stay attached to the handles of the wrapped arrays.
-fn place_traced<V: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, V>>>(
-    value: V,
-    session: &Session,
-    target: Option<PlacementRequest>,
-    source: Option<PlacementRequest>,
-    donate: bool,
-    may_alias: Option<bool>,
-) -> Result<V, Error> {
-    validate_traced(&value, session, target.as_ref(), source.as_ref(), donate, may_alias)?;
-    // The requests are placed as they are given, and the rules of `PlaceOperation` validate them with its type rule
-    // before they complete the source with the placement of a value that concretely lives somewhere.
-    let rank = value.r#type().rank();
-    let source = source.map(|source| source.padded(rank)).transpose()?;
-    let target = target.map(|target| target.padded(rank)).transpose()?;
-    Ok(V::Dispatch::place(&value, target.as_ref(), source, !forces_copy(donate, may_alias))?)
-}
-
-/// Checks the placement of the traced `value` as [`place_traced`] does before it records or executes the placement,
-/// which implements [`PlaceableParameter::validate_placement`] for every traced value type. Refer to [`place_traced`] for
-/// the rules of the sessions of the arrays that `value` wraps.
+/// Checks the leaf options and session ownership of the concrete arrays that a traced value wraps.
 fn validate_traced<V: ConcreteArrays>(
     value: &V,
     session: &Session,
@@ -2038,8 +1970,9 @@ fn validate_traced<V: ConcreteArrays>(
     // Donation only applies to concrete arrays, but a donated leaf that may alias is rejected for every leaf.
     validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
     for array in value.concrete_arrays() {
-        // Only the client check of `Array::with_session` applies here, because the placement executes through the
-        // contexts of `value`, which cannot be rebound to `session`.
+        // Placement uses the contexts already attached to the tracer. Rebinding would lose state such as the
+        // residual program owned by a partial evaluation context. Check the PJRT client before the session
+        // because device IDs are scoped to a client. Other handles of the same session are accepted.
         array.validate_session_client(session)?;
         if !array.session().is_same_session(session) {
             let message = "cannot place a traced value over arrays of another session";
