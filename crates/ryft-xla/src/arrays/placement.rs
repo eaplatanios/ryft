@@ -1070,14 +1070,10 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         });
 
         let Some(trace) = traced.next() else {
-            return Err(with_parameter_path(
-                PjrtError::invalid_argument(
-                    "cannot place a host value or a runtime array as a traced value without a traced value \
-                     in the same call",
-                )
-                .into(),
-                || path(0),
-            ));
+            let error = PjrtError::invalid_argument(
+                "cannot place a host value or a runtime array as a traced value without a traced value in the same call",
+            );
+            return Err(Error::from(error).with_placement_parameter_path(|| path(0)));
         };
 
         if traced.any(|other| !Rc::ptr_eq(trace.value().builder(), other.value().builder())) {
@@ -1102,7 +1098,7 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
                             argument.source.as_ref(),
                             CapturePlacement::Preserve,
                         )
-                        .map_err(|error| with_parameter_path(error, || path(index)))?;
+                        .map_err(|error| error.with_placement_parameter_path(|| path(index)))?;
                 }
             }
         }
@@ -1124,7 +1120,7 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
                             Value::Array(array),
                         )?)
                     })
-                    .map_err(|error| with_parameter_path(error, || path(index)))?,
+                    .map_err(|error| error.with_placement_parameter_path(|| path(index)))?,
             );
         }
 
@@ -1516,7 +1512,7 @@ impl Session {
                     Ok(request) => request,
                     Err(error) => {
                         if checked.is_ok() {
-                            checked = Err(with_parameter_path(error, || path(index)));
+                            checked = Err(error.with_placement_parameter_path(|| path(index)));
                         }
                         None
                     }
@@ -1547,7 +1543,7 @@ impl Session {
                             argument.donate,
                             argument.may_alias,
                         )
-                        .map_err(|error| with_parameter_path(error, || path(index)))
+                        .map_err(|error| error.with_placement_parameter_path(|| path(index)))
                 })
             })
             .and_then(|()| P::prepare_arguments(&mut arguments, self, &path));
@@ -1566,7 +1562,7 @@ impl Session {
                     argument.may_alias,
                 )
             },
-            |index, error| with_parameter_path(error, || path(index)),
+            |index, error| error.with_placement_parameter_path(|| path(index)),
         )?;
 
         Input::To::<P::Output>::from_parameters(structure, output_parameters).map_err(Into::into)
@@ -1746,6 +1742,34 @@ impl Array {
         }
 
         Ok(placement)
+    }
+}
+
+impl Error {
+    /// Adds the parameter path to this placement error. A root path returns the original error. A nested
+    /// [`ArrayError::DonatedArrayMayAlias`] or [`ArrayError::FailedParameterPlacement`] keeps its variant and source,
+    /// with the parameter path prefixed to its existing path. Other errors are wrapped in
+    /// [`ArrayError::FailedParameterPlacement`]. Callers supply `path` lazily to resolve it only on failure.
+    fn with_placement_parameter_path(self, path: impl FnOnce() -> ParameterPath) -> Self {
+        let path = path();
+        if path.is_root() {
+            return self;
+        }
+        let prefixed = |inner: ParameterPath| inner.segments().cloned().fold(path.clone(), ParameterPath::with_segment);
+        match self {
+            Self::Array(array_error) => match *array_error {
+                ArrayError::DonatedArrayMayAlias { path: inner } => {
+                    ArrayError::DonatedArrayMayAlias { path: prefixed(inner) }.into()
+                }
+                ArrayError::FailedParameterPlacement { path: inner, source } => {
+                    ArrayError::FailedParameterPlacement { path: prefixed(inner), source }.into()
+                }
+                array_error => {
+                    ArrayError::FailedParameterPlacement { path, source: Arc::new(array_error.into()) }.into()
+                }
+            },
+            error => ArrayError::FailedParameterPlacement { path, source: Arc::new(error) }.into(),
+        }
     }
 }
 
@@ -1939,42 +1963,18 @@ fn validate_parameter_options<P: FnOnce() -> ParameterPath>(
     }
 
     // The type rule of `PlaceOperation` owns the checks of the requests that need no type of the leaf.
-    PlaceOperation::validate_requests(target, source).map_err(|error| with_parameter_path(error.into(), path))?;
+    PlaceOperation::validate_requests(target, source)
+        .map_err(|error| Error::from(error).with_placement_parameter_path(path))?;
 
     Ok(())
 }
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Wraps `error`, which concerns the parameter whose path `path` returns, in [`ArrayError::FailedParameterPlacement`],
-/// unless that path is the root. An `error` that already names a path relative to that parameter (i.e., an
-/// [`ArrayError::DonatedArrayMayAlias`] or [`ArrayError::FailedParameterPlacement`] of a leaf that places a tree of its
-/// own) keeps its variant and its source, and its path is prefixed with the path of the parameter. `path` is only
-/// called here, so that the path of a parameter is only resolved when one of its placements fails.
-fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Error {
-    let path = path();
-    if path.is_root() {
-        return error;
-    }
-    let prefixed = |inner: ParameterPath| inner.segments().cloned().fold(path.clone(), ParameterPath::with_segment);
-    match error {
-        Error::Array(array_error) => match *array_error {
-            ArrayError::DonatedArrayMayAlias { path: inner } => {
-                ArrayError::DonatedArrayMayAlias { path: prefixed(inner) }.into()
-            }
-            ArrayError::FailedParameterPlacement { path: inner, source } => {
-                ArrayError::FailedParameterPlacement { path: prefixed(inner), source }.into()
-            }
-            array_error => ArrayError::FailedParameterPlacement { path, source: Arc::new(array_error.into()) }.into(),
-        },
-        error => ArrayError::FailedParameterPlacement { path, source: Arc::new(error) }.into(),
-    }
-}
-
-/// Expands an optional placement prefix into its value for each input leaf.
-/// A prefix with one leaf at the root covers the whole input, so it needs no path matching or structure cloning, and
-/// neither it nor an omitted prefix allocates per leaf (refer to [`PlacementOptionValues`]). Structured prefixes
-/// use [`Parameterized::broadcast_parameters`] to validate every node, including empty containers.
+/// Expands an optional placement prefix into its value for each input leaf. A prefix with one leaf at the root covers
+/// the whole input, so it needs no path matching or structure cloning, and neither it nor an omitted prefix allocates
+/// per leaf (refer to [`PlacementOptionValues`]). Structured prefixes use [`Parameterized::broadcast_parameters`] to
+/// validate every node, including empty containers.
 fn broadcast_placement_option<Leaf: Clone + Parameter>(
     prefix: Option<impl Parameterized<Leaf>>,
     structure: &impl Parameterized<Placeholder>,
