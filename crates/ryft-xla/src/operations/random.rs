@@ -8,9 +8,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{annotate_output_memory, lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {

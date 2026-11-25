@@ -12,14 +12,14 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants, lower_tensor_type,
+    lower_compare_to_mlir, lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants,
+    lower_tensor_type,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND,
     ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND,
     ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND, lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for DimensionSizeOperation {

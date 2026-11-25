@@ -9,17 +9,17 @@ use ryft_mlir::{
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::operations::collectives::{collective_replica_groups, mesh_axis_replica_groups};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
 /// the device mesh axis the collective names.
 ///
-/// The replica groups are the dense global device-id groups that [`mesh_axis_replica_groups`] derives from the mesh's
-/// row-major device linearization, or, when the collective records explicit logical participant groups, those groups
-/// expanded inside every fixed coordinate of the mesh's other axes without reordering either the groups or their
-/// members. The emitted operation carries a module-unique channel id with a device-to-device channel type and
-/// `use_global_device_ids`, the standard SPMD emission for cross-partition collectives.
+/// The replica groups are the dense global device-id groups that
+/// [`CollectiveLoweringState::mesh_axis_replica_groups`] derives from the mesh's row-major device linearization, or,
+/// when the collective records explicit logical participant groups, those groups expanded inside every fixed
+/// coordinate of the mesh's other axes without reordering either the groups or their members. The emitted operation
+/// carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the standard
+/// SPMD emission for cross-partition collectives.
 ///
 /// Each kind combines with the single StableHLO operation of its reduction (i.e., `add` for `Sum` and `Mean`,
 /// `multiply` for `Product`, `maximum` and `minimum` for `Max` and `Min`, and `or` and `and` for `Any` and `All`), and
@@ -64,8 +64,7 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         .into());
     }
     let (replica_groups, effective_axis_size) = match operation.axis_index_groups() {
-        Some(axis_index_groups) => collective_replica_groups(
-            collective_state,
+        Some(axis_index_groups) => collective_state.replica_groups(
             operation.axis_name(),
             operation.axis_size().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
@@ -76,7 +75,7 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
             })?,
             Some(axis_index_groups),
         )?,
-        None => mesh_axis_replica_groups(collective_state, operation.axis_name())?,
+        None => collective_state.mesh_axis_replica_groups(operation.axis_name())?,
     };
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
 

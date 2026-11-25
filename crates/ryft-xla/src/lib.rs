@@ -71,13 +71,12 @@ pub use kernels::{
 };
 pub use lowering::{
     LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation,
-    lower_projected_operation, to_mlir_module_for_program,
+    RaggedDotLoweringStrategy, lower_projected_operation, to_mlir_module_for_program,
 };
 pub use mlir::ToMlir;
 pub use operations::{
     FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE,
-    Program, ProgramBuilder, RaggedDotLoweringStrategy, ensure_print_handler_registered, transpose_primal_jit_call,
-    with_captured_prints,
+    Program, ProgramBuilder, ensure_print_handler_registered, transpose_primal_jit_call, with_captured_prints,
 };
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use sessions::{

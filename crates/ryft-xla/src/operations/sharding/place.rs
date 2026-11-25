@@ -6,8 +6,8 @@ use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::arrays::placement::place_core_operations;
+use crate::lowering::types::lower_transfer_to_memory;
 use crate::operations::manipulation::conversions::lower_layout_conversion;
-use crate::operations::manipulation::memory::lower_transfer_to_memory;
 use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, ToMlir};
 
 impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {

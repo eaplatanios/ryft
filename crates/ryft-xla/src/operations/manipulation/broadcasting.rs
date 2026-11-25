@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension, DynamicBroadcastOperation, MeshAxisType,
-    Operation, ProgramError, Sharding, ShardingDimension,
+    ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension, DynamicBroadcastOperation, Operation,
+    ProgramError,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -9,6 +9,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::broadcast_changes_explicit_sharding;
 use crate::lowering::types::{
     dimension_extent_i64, lower_explicit_shape, lower_physical_bound_value, lower_physical_storage,
     lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
@@ -17,7 +18,7 @@ use crate::lowering::types::{
 use crate::operations::constants::{
     dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
 };
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
+use crate::sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for BroadcastOperation {
@@ -192,54 +193,6 @@ impl LowerableOperation for DynamicBroadcastOperation {
     }
 }
 
-/// Returns whether a broadcast from `input_type` to `output_type`, which maps each input axis to the corresponding
-/// entry of `output_axes`, changes the placement over explicit mesh axes and therefore requires an explicit output
-/// placement constraint.
-pub(crate) fn broadcast_changes_explicit_sharding(
-    input_type: &ArrayType,
-    output_type: &ArrayType,
-    output_axes: &[usize],
-) -> bool {
-    let Some(output_sharding) = output_type.sharding() else {
-        return false;
-    };
-    let input_sharding = input_type.sharding();
-    let uses_explicit_axis = |dimension: &ShardingDimension, sharding: &Sharding| match dimension {
-        ShardingDimension::Sharded(axis_names) => {
-            axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
-        }
-        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-    };
-    if input_sharding.is_none() {
-        return output_sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
-    }
-    if let Some(input_sharding) = input_sharding
-        && input_sharding.mesh() != output_sharding.mesh()
-    {
-        return input_sharding
-            .mesh()
-            .axes()
-            .iter()
-            .chain(output_sharding.mesh().axes())
-            .any(|axis| axis.r#type() == MeshAxisType::Explicit);
-    }
-
-    let projected_input_sharding = input_sharding
-        .map(|sharding| sharding.with_broadcasted_dimensions(output_type.rank(), output_axes).unwrap())
-        .unwrap_or_else(|| Sharding::replicated(output_sharding.mesh().clone(), output_type.rank()));
-
-    // Even when the ranked placement labels are unchanged, expanding a unit dimension that is partitioned over an
-    // explicit mesh axis changes which partitions own the replicated values and must remain visible to Shardy.
-    let expands_explicit_dimension = output_axes.iter().copied().enumerate().any(|(input_axis, output_axis)| {
-        input_type.dimension(input_axis as isize) == Dimension::Static(1)
-            && output_type.dimension(output_axis as isize) != Dimension::Static(1)
-            && (uses_explicit_axis(&projected_input_sharding.dimensions()[output_axis], &projected_input_sharding)
-                || uses_explicit_axis(&output_sharding.dimensions()[output_axis], output_sharding))
-    });
-
-    expands_explicit_dimension || projected_input_sharding.conflicts_on_explicit_axes_with(output_sharding)
-}
-
 /// Lowers a [`BroadcastOperation`] and explicitly constrains any placement transition over an explicit mesh axis.
 #[allow(clippy::too_many_arguments)]
 fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -359,9 +312,10 @@ mod tests {
     use ryft_core::{
         ADD_OPERATION_NAME, Add, Array as CoreArray, BatchAxis, Broadcast, ConvertElementType, DataType, Device,
         DeviceMesh, DifferentiableType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, Error as CoreError, Layout, LogicalMesh, Max, MeshAxis, Min,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions, StridedLayout, Tile,
-        TileDimension, TiledLayout, Typed, TypedProgram, UnreducedKind, batch, differentiate_at,
+        DimensionVariable, DynamicBroadcastOperation, Error as CoreError, Layout, LogicalMesh, Max, MeshAxis,
+        MeshAxisType, Min, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions,
+        Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, Typed, TypedProgram,
+        UnreducedKind, batch, differentiate_at,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -1765,54 +1719,5 @@ mod tests {
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "dynamic broadcast with explicit output layout needs finite allocation bounds",
         ));
-    }
-
-    #[test]
-    fn test_broadcast_changes_explicit_sharding() {
-        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(explicit_mesh.clone(), 1)).unwrap();
-        let explicitly_sharded = test_vector_type(4)
-            .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&test_vector_type(4), &replicated, &[0]));
-        assert!(broadcast_changes_explicit_sharding(&replicated, &explicitly_sharded, &[0]));
-        assert!(!broadcast_changes_explicit_sharding(&explicitly_sharded, &explicitly_sharded, &[0]));
-
-        let first_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let second_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let first_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
-        let second_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
-        assert!(broadcast_changes_explicit_sharding(&first_mesh_replicated, &second_mesh_replicated, &[0]));
-
-        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(manual_mesh.clone(), 1)).unwrap();
-        let manually_sharded = test_vector_type(4)
-            .with_sharding(
-                Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(!broadcast_changes_explicit_sharding(&replicated, &manually_sharded, &[0]));
-
-        // Expanding a partitioned singleton and changing explicit reduction state both require constraints even when
-        // the ranked sharding dimensions themselves remain unchanged.
-        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let singleton = test_vector_type(1)
-            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let expanded = test_vector_type(4)
-            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&singleton, &expanded, &[0]));
-
-        let unreduced = test_vector_type(4)
-            .with_sharding(Sharding::replicated(explicit_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let reduced = test_vector_type(4)
-            .with_sharding(Sharding::replicated(explicit_mesh, 1).with_reduced_axes(["x"]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&unreduced, &reduced, &[0]));
     }
 }

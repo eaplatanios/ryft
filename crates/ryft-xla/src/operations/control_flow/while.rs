@@ -23,10 +23,10 @@ use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Val
 use crate::lowering::EffectTokens;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{
-    lower_array_ir_type, lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, physical_bound_type,
+    lower_array_ir_type, lower_compare_to_mlir, lower_explicit_shape, lower_physical_bound_value,
+    lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_tensor_type, physical_bound_type,
 };
-use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_control_flow_region, lower_explicit_sharding_constraints,
     lower_refined_region_input, lower_refined_region_outputs, lower_region_guard, lowered_effect_classes,

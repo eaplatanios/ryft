@@ -1,11 +1,10 @@
-use ryft_core::{ArrayType, CollectiveAxes, Dimension, ProgramError, SHARD_MAP_OPERATION_NAME};
+use ryft_core::{ArrayType, Dimension, ProgramError};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
 use crate::Error;
-use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
 
 /// StableHLO lowering of `axis_index`.
@@ -28,123 +27,6 @@ pub(crate) mod parallel_reduce;
 pub(crate) mod parallel_sum_scatter;
 /// StableHLO lowering of `parallel_vary`.
 pub(crate) mod parallel_vary;
-
-/// Resolves the replica groups of the named mesh axes `axis_name` inside the enclosing `shard_map` manual regions,
-/// returning the groups together with the combined axis size. Devices are linearized row-major over the mesh axes, so
-/// the devices whose coordinates differ only along the named axes form one replica group. The group bases enumerate
-/// the coordinate combinations of the other axes, and the group members are ordered by their positions along the
-/// combined axis, which linearizes the named axes in the given order with the first name major (refer to
-/// [`CollectiveAxes`]). Returns an error outside manual regions, for axes that no enclosing region binds as manual mesh
-/// axes, and for axes whose binding regions have meshes with different topologies. The groups depend only on the names
-/// and sizes of the mesh axes in order, so regions whose meshes differ only in axis types (e.g., a nested region inside
-/// `auto_axes` or `explicit_axes`, which retype a free axis) bind axes of one collective.
-fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
-    collective_state: &CollectiveLoweringState,
-    axis_name: A,
-) -> Result<(Vec<Vec<usize>>, usize), Error> {
-    let axis_names = axis_name.into();
-    if axis_names.names().is_empty() {
-        return Err(ProgramError::MalformedProgram("collective requires at least one axis name".to_string()).into());
-    }
-    if collective_state.manual_shard_map().is_none() {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "collective over axis `{axis_names}` can only be lowered inside a `{SHARD_MAP_OPERATION_NAME}` manual \
-                 region",
-            ),
-        }
-        .into());
-    }
-    let mut mesh = None;
-    for axis_name in axis_names.names() {
-        let Some(axis_region) = collective_state.manual_axis_region(axis_name) else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "collective over axis `{axis_name}` cannot lower inside this `{SHARD_MAP_OPERATION_NAME}` manual \
-                     region because the region does not bind that axis as a manual mesh axis",
-                ),
-            }
-            .into());
-        };
-        match mesh {
-            None => mesh = Some(axis_region.mesh()),
-            Some(mesh) if mesh.has_same_topology(axis_region.mesh()) => {}
-            Some(_) => {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "collective over axes `{axis_names}` spans manual regions whose meshes have different topologies",
-                ))
-                .into());
-            }
-        }
-    }
-    let mesh = mesh.unwrap();
-    let axis_sizes: Vec<usize> = mesh.axes().iter().map(|axis| axis.size()).collect();
-    let strides = (0..axis_sizes.len()).map(|axis| axis_sizes[axis + 1..].iter().product()).collect::<Vec<usize>>();
-    let named_axes = axis_names.names().iter().map(|name| mesh.axis_index(name).unwrap()).collect::<Vec<_>>();
-    let axis_size: usize = named_axes.iter().map(|axis| axis_sizes[*axis]).product();
-    let device_count: usize = axis_sizes.iter().product();
-    let mut replica_groups: Vec<Vec<usize>> = Vec::with_capacity(device_count / axis_size);
-    for device in 0..device_count {
-        // A device is a group base exactly when its coordinates along the named axes are zero.
-        if named_axes.iter().all(|axis| (device / strides[*axis]) % axis_sizes[*axis] == 0) {
-            replica_groups.push(
-                (0..axis_size)
-                    .map(|mut position| {
-                        let mut member = device;
-                        for axis in named_axes.iter().rev() {
-                            member += (position % axis_sizes[*axis]) * strides[*axis];
-                            position /= axis_sizes[*axis];
-                        }
-                        member
-                    })
-                    .collect(),
-            );
-        }
-    }
-    Ok((replica_groups, axis_size))
-}
-
-/// Resolves the physical replica groups for one collective, expanding each logical subgroup within every fixed
-/// coordinate of the enclosing mesh's other axes.
-pub(crate) fn collective_replica_groups<A: Into<CollectiveAxes>>(
-    collective_state: &CollectiveLoweringState,
-    axis_name: A,
-    axis_size: usize,
-    axis_index_groups: Option<&[Vec<usize>]>,
-) -> Result<(Vec<Vec<usize>>, usize), Error> {
-    let axis_name = axis_name.into();
-    let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, &axis_name)?;
-    if axis_size != mesh_axis_size {
-        return Err(ProgramError::MalformedProgram(format!(
-            "collective over axis `{axis_name}` records size {axis_size}, but the enclosing mesh axis has size \
-             {mesh_axis_size}",
-        ))
-        .into());
-    }
-    let Some(axis_index_groups) = axis_index_groups else {
-        return Ok((mesh_groups, mesh_axis_size));
-    };
-    let group_size = axis_index_groups.first().map(Vec::len).unwrap_or(0);
-    let mut replica_groups = Vec::with_capacity(mesh_groups.len() * axis_index_groups.len());
-    for mesh_group in mesh_groups {
-        for axis_index_group in axis_index_groups {
-            replica_groups.push(
-                axis_index_group
-                    .iter()
-                    .map(|&index| {
-                        mesh_group.get(index).copied().ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "collective over axis `{axis_name}` has group member {index} outside axis size \
-                                 {mesh_axis_size}",
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-    }
-    Ok((replica_groups, group_size))
-}
 
 /// Removes one statically singleton tensor axis while preserving every remaining dynamic dimension.
 fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
@@ -206,6 +88,7 @@ mod tests {
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
 
+    use crate::lowering::CollectiveLoweringState;
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
@@ -241,25 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mesh_axis_replica_groups() {
-        // Devices are linearized row-major, so device `3 * x + y` has coordinates `(x, y)`.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let state = CollectiveLoweringState::new()
-            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
-        assert_eq!(mesh_axis_replica_groups(&state, "x").unwrap(), (vec![vec![0, 3], vec![1, 4], vec![2, 5]], 2));
-        assert_eq!(mesh_axis_replica_groups(&state, "y").unwrap(), (vec![vec![0, 1, 2], vec![3, 4, 5]], 3));
-
-        // The first name of a combined axis is major.
-        assert_eq!(mesh_axis_replica_groups(&state, ["x", "y"]).unwrap(), (vec![vec![0, 1, 2, 3, 4, 5]], 6));
-        assert_eq!(mesh_axis_replica_groups(&state, ["y", "x"]).unwrap(), (vec![vec![0, 3, 1, 4, 2, 5]], 6));
-    }
-
-    #[test]
-    fn test_mesh_axis_replica_groups_execute_multi_axis_collectives_on_cpu() {
+    fn test_collectives_execute_over_multiple_axes_on_cpu() {
         // Over several manual axes, the participants are positioned along the combined axis, which linearizes the axes
         // in the given order with the first axis major. Every device holds its tile of `0..n`, sharded along
         // `("x", "y")` on a 2x2 mesh, so the expected values are those of JAX's collectives with tuple axis names
@@ -314,96 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mesh_axis_replica_groups_rejects_unresolvable_axes() {
-        let outer_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let inner_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let state = CollectiveLoweringState::new()
-            .enter_manual_region(ShardMapBoundary::new(outer_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap())
-            .enter_manual_region(ShardMapBoundary::new(inner_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
-        assert!(matches!(
-            mesh_axis_replica_groups(&state, Vec::<String>::new()),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::MalformedProgram(message))
-                    if message == "collective requires at least one axis name",
-            ),
-        ));
-        assert!(matches!(
-            mesh_axis_replica_groups(&state, ["x", "y"]),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::MalformedProgram(message))
-                    if message
-                        == "collective over axes `(x, y)` spans manual regions whose meshes have different topologies",
-            ),
-        ));
-        assert!(matches!(
-            mesh_axis_replica_groups(&state, "z"),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::UnsupportedOperation { message })
-                    if message
-                        == "collective over axis `z` cannot lower inside this `shard_map` manual region because the \
-                            region does not bind that axis as a manual mesh axis",
-            ),
-        ));
-        assert!(matches!(
-            mesh_axis_replica_groups(&CollectiveLoweringState::new(), "x"),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::UnsupportedOperation { message })
-                    if message == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_collective_replica_groups() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let state = CollectiveLoweringState::new()
-            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
-        assert_eq!(
-            collective_replica_groups(&state, "y", 4, None).unwrap(),
-            (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 4),
-        );
-
-        // Logical participant groups expand within every fixed coordinate of the other axes, in order.
-        assert_eq!(
-            collective_replica_groups(&state, "y", 4, Some(&[vec![0, 2], vec![3, 1]])).unwrap(),
-            (vec![vec![0, 2], vec![3, 1], vec![4, 6], vec![7, 5]], 2),
-        );
-        assert!(matches!(
-            collective_replica_groups(&state, "y", 2, None),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::MalformedProgram(message))
-                    if message == "collective over axis `y` records size 2, but the enclosing mesh axis has size 4",
-            ),
-        ));
-        assert!(matches!(
-            collective_replica_groups(&state, "y", 4, Some(&[vec![0, 4]])),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::MalformedProgram(message))
-                    if message == "collective over axis `y` has group member 4 outside axis size 4",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_collective_replica_groups_execute_grouped_shape_changing_collectives_on_cpu() {
+    fn test_collectives_execute_grouped_shape_changing_collectives_on_cpu() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();

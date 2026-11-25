@@ -9,7 +9,6 @@ use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value 
 
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::regions::lower_nested_program_inline;
-use crate::operations::collectives::collective_replica_groups;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 impl LowerableOperation for ParallelBroadcastOperation {
@@ -121,8 +120,7 @@ fn lower_static_parallel_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         }
         .into());
     }
-    let (replica_groups, _) =
-        collective_replica_groups(collective_state, operation.axes(), operation.axis_size(), None)?;
+    let (replica_groups, _) = collective_state.replica_groups(operation.axes(), operation.axis_size(), None)?;
     let ParallelBroadcastSource::Static(source) = operation.source() else {
         unreachable!();
     };

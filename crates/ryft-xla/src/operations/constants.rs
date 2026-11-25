@@ -11,12 +11,11 @@ use ryft_mlir::{
 
 use crate::lowering::MlirLowerableValue;
 use crate::lowering::types::{
-    lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound,
+    annotate_output_memory, lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type,
+    physical_bound_type, stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::operations::manipulation::memory::annotate_output_memory;
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
+use crate::sharding::lower_sharding_constraint;
 use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
 };

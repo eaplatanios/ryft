@@ -1,7 +1,7 @@
 use ryft_core::{ArrayType, ReshardOperation};
 use ryft_mlir::ValueRef;
 
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
+use crate::sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ReshardOperation {

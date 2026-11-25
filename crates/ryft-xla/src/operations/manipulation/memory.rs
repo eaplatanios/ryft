@@ -1,47 +1,8 @@
-use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, Memory, TransferToMemoryOperation};
-use ryft_mlir::dialects::stable_hlo;
-use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
-use ryft_mlir::{
-    Attribute, Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef,
-};
+use ryft_core::{ArrayType, TransferToMemoryOperation};
+use ryft_mlir::ValueRef;
 
-use crate::devices::MemoryExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
-
-/// Validates that a program compiled for `target_platform` can take its arguments from `memory` and return its
-/// results in it.
-///
-/// XLA's CUDA compiler does not place values in unpinned host memory, although its plugin can hold buffers there. It
-/// reads an argument that is declared in that memory from device memory, and it returns a result that is declared in
-/// that memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would
-/// therefore reject its actual arguments and mislabel its results, so it is rejected here instead. Values inside a
-/// program are not affected, because the compiler treats pinned and unpinned host memory alike there.
-///
-/// # Errors
-///
-/// Returns [`LoweringError::UnsupportedBoundaryMemory`] if `memory` is unpinned host memory and `target_platform` is
-/// CUDA.
-pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
-    if memory == (Memory::Host { pinned: false }) && target_platform == Some("cuda") {
-        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: "cuda".to_string() }.into());
-    }
-    Ok(())
-}
-
-/// Applies the non-default memory placement declared by `output_type` to `value`.
-pub(crate) fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    value: ValueRef<'b, 'c, 't>,
-    output_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if output_type.memory() == Memory::Device {
-        return Ok(value);
-    }
-    Ok(lower_transfer_to_memory(output_type.memory(), &[value], block, context, location)?[0])
-}
+use crate::lowering::types::lower_transfer_to_memory;
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for TransferToMemoryOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -62,60 +23,13 @@ impl LowerableOperation for TransferToMemoryOperation {
     }
 }
 
-/// Lowers one staged [`TransferToMemoryOperation`] to the `stablehlo.custom_call @annotate_device_placement` annotation
-/// that the XLA `ConvertMemoryPlacementToInternalAnnotations` and
-/// [`HostOffloader`](https://openxla.org/xla/tools_and_passes/host_offloading) passes legalize into copies annotated
-/// with memory spaces. The annotation uses API version 1, `has_side_effect = true`, an empty `backend_config`, and
-/// the destination kind in `_xla_buffer_placement` inside `mhlo.frontend_attributes`.
-///
-/// These constraints are retained on CPU as well, because reference arrays only retag their types, but native arrays
-/// must honor the requested physical placement on every platform. The current XLA offloading pass treats pinned and
-/// unpinned host annotations alike internally, whereas function boundary attributes and PJRT memory validation retain
-/// the distinction at runtime boundaries. A plugin must expose the requested memory kind for native allocation.
-///
-/// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
-/// transfers (i.e., transfers whose destination equals the operand's current space) still lower to the annotation,
-/// because placement round trips are meaningful to `HostOffloader` and must not be optimized away here.
-pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    destination: Memory,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    let empty_backend_configuration = context.string_attribute("");
-    let mut operation = stable_hlo::custom_call(
-        input_values,
-        "annotate_device_placement",
-        true,
-        Some(empty_backend_configuration.as_ref()),
-        CustomCallApiVersion::Original,
-        &[],
-        None,
-        &[],
-        None,
-        &[input_values[0].r#type()?],
-        location,
-    )?;
-    operation.set_discardable_attribute(
-        "mhlo.frontend_attributes",
-        context.dictionary_attribute(&[context.named_attribute(
-            context.identifier("_xla_buffer_placement"),
-            context.string_attribute(destination.placement_kind()),
-        )]),
-    );
-    let operation = block.append_operation(operation)?;
-    Ok(vec![operation.result(0).unwrap().as_ref()])
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, DataType, DomainTracer, EagerContext, Placeholder,
-        ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed, ZeroOperation,
+        Array as CoreArray, ArrayOperation, DataType, DomainTracer, EagerContext, Memory, Placeholder,
+        ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed,
     };
 
     use crate::lowering::lower_mlir_module_for_program;
@@ -124,74 +38,11 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Error, Session, compile, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, Error, LoweringError, Session, compile,
+        to_mlir_module_for_program,
     };
 
     use super::*;
-
-    #[test]
-    fn test_validate_boundary_memory() {
-        // Only unpinned host memory at the boundary of a program compiled for CUDA is rejected.
-        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
-            assert!(validate_boundary_memory(memory, None).is_ok());
-            assert!(validate_boundary_memory(memory, Some("cpu")).is_ok());
-        }
-        assert!(validate_boundary_memory(Memory::Device, Some("cuda")).is_ok());
-        assert!(validate_boundary_memory(Memory::Host { pinned: true }, Some("cuda")).is_ok());
-        let error = validate_boundary_memory(Memory::Host { pinned: false }, Some("cuda")).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
-                if *memory == (Memory::Host { pinned: false }) && platform == "cuda",
-        ));
-        assert_eq!(
-            error.to_string(),
-            "programs compiled for platform `cuda` cannot take or return values in `Host[Unpinned]` memory",
-        );
-    }
-
-    #[test]
-    fn test_annotate_output_memory() {
-        // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
-        // addition to their `mhlo.memory_kind` signature attribute.
-        let zero_program = |memory| {
-            let mut builder = ProgramBuilder::new();
-            let output_type = test_vector_type(4).with_memory(memory);
-            let output =
-                builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap()
-        };
-        assert_eq!(
-            to_mlir_module_for_plain_program(&zero_program(Memory::Device), "main").unwrap(),
-            indoc! {r#"
-            module {
-              func.func @main() -> tensor<4xf32> {
-                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                return %0 : tensor<4xf32>
-              }
-            }
-        "#},
-        );
-        for (memory, kind) in
-            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
-        {
-            let expected = indoc! {r#"
-                module {
-                  func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = "KIND"}) {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "KIND"}} : (tensor<4xf32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#}
-            .replace("KIND", kind);
-            assert_eq!(to_mlir_module_for_plain_program(&zero_program(memory), "main").unwrap(), expected);
-        }
-    }
 
     #[test]
     fn test_transfer_to_memory_operation_lower() {

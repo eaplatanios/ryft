@@ -11,9 +11,7 @@ use ryft_mlir::{
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
-use crate::operations::collectives::{
-    collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
-};
+use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
@@ -121,8 +119,7 @@ fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         }
         .into());
     }
-    let (replica_groups, _) = collective_replica_groups(
-        collective_state,
+    let (replica_groups, _) = collective_state.replica_groups(
         operation.axes(),
         operation.axis_size(),
         operation.options().axis_index_groups(),

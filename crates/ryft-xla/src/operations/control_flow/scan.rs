@@ -33,12 +33,11 @@ use ryft_mlir::{
 
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{
-    lower_array_ir_type, lower_constant_output, lower_static_index_constants, lower_tensor_type,
+    lower_array_ir_type, lower_compare_to_mlir, lower_constant_output, lower_static_index_constants, lower_tensor_type,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::lowering::{CollectiveLoweringState, EffectTokens};
 use crate::operations::FlatProgram;
-use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,

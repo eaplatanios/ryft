@@ -12,24 +12,10 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_element_type, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
-    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    lower_compare_to_mlir, lower_element_type, lower_physical_bound_value, lower_restore_dynamic_dimensions,
+    lower_tensor_type, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
 };
-use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
-
-/// XLA representation used when lowering ragged dots. The selection applies to a whole compilation and is made with
-/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub enum RaggedDotLoweringStrategy {
-    /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
-    /// [`Options::new`](crate::Options::new).
-    #[default]
-    Decomposition,
-
-    /// Emit dedicated CHLO `ragged_dot` instructions.
-    Instruction,
-}
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy};
 
 impl LowerableOperation for DotOperation {
     // Lower a dot to one `stablehlo.dot_general` that carries its per-input precisions and its algorithm. An algorithm

@@ -16,7 +16,6 @@ use crate::lowering::types::{
     lower_u64_scalar_constant, physical_bound_type,
 };
 use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
-use crate::operations::collectives::collective_replica_groups;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
@@ -371,12 +370,8 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, effective_axis_size) = collective_replica_groups(
-        collective_state,
-        operation.axis_name(),
-        operation.axis_size(),
-        operation.axis_index_groups(),
-    )?;
+    let (replica_groups, effective_axis_size) =
+        collective_state.replica_groups(operation.axis_name(), operation.axis_size(), operation.axis_index_groups())?;
     if !operation.accumulates_updates() {
         return Ok(vec![emit_parallel_ragged_all_to_all_custom_call(
             collective_state,

@@ -10,14 +10,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
+    lower_compare_to_mlir, lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
     physical_bound_type,
 };
-use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
+use crate::sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ScatterOperation {

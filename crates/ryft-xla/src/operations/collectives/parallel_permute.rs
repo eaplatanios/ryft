@@ -4,7 +4,6 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::lowering::CollectiveLoweringState;
-use crate::operations::collectives::collective_replica_groups;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelPermuteOperation {
@@ -51,8 +50,7 @@ fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, _) =
-        collective_replica_groups(collective_state, operation.axes(), operation.axis_size(), None)?;
+    let (replica_groups, _) = collective_state.replica_groups(operation.axes(), operation.axis_size(), None)?;
     let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * operation.source_target_pairs().len());
     for group in &replica_groups {
         for (source, target) in operation.source_target_pairs() {

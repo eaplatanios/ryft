@@ -15,8 +15,7 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 /// along the named device mesh axis, as a scalar `u64`.
 ///
 /// Devices are linearized row-major over the mesh axes, which is the same linearization that
-/// [`mesh_axis_replica_groups`](crate::operations::collectives::mesh_axis_replica_groups) uses for the replica groups
-/// of collectives such as
+/// [`CollectiveLoweringState::mesh_axis_replica_groups`] uses for the replica groups of collectives such as
 /// [`lower_collective_to_all_reduce`](crate::operations::collectives::parallel_reduce::lower_collective_to_all_reduce).
 /// The coordinate along the named axis is therefore `(partition_id / stride) % size`, where `stride` is the product of
 /// the mesh axis sizes after the named axis and `size` is the named axis's size. `partition_id` yields the executing

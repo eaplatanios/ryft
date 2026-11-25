@@ -12,14 +12,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_constant_elements_attribute, lower_element_type, lower_f64_constant_splat,
+    lower_compare_to_mlir, lower_constant_elements_attribute, lower_element_type, lower_f64_constant_splat,
     lower_f64_scalar_elements_attribute, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir,
     lower_tensor_type, lower_unplaced_constant_output, physical_bound_type, signed_integer_width,
     unsigned_integer_width,
 };
-use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::operations::sharding::constrain_sharding::lower_replication_constraint;
+use crate::sharding::lower_replication_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return

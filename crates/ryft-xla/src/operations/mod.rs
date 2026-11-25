@@ -4,19 +4,21 @@
 //! payloads of [`ArrayIrOperation`] into one family, together with backend operations such as
 //! [`jit_call`](JitCallOperation) and portable kernel instructions, so that the regions of higher-order instructions
 //! can contain backend operations. [`Program`], [`ProgramBuilder`], and [`FlatProgram`] specialize the core program
-//! types to this family. Each submodule implements [`LowerableOperation`](crate::LowerableOperation) for one group of
+//! types to this family. Each submodule implements [`LowerableOperation`] for one group of
 //! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
 //! that those lowerings share.
+
+use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
     AbsOperation, Accuracy as CoreAccuracy, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array,
     ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, Atan2Operation,
     AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CastOperation, CeilOperation, ClampOperation,
-    CompareOperation, ComplexOperation, CompositeConversion, CompositeOperation, CompositeTransposeOperation,
-    ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation, ConstrainShardingOperation,
-    ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation, Dimension,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    CompareOperation, ComplexOperation, CompositeConversion, CompositeKey, CompositeOperation,
+    CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation,
+    ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation,
+    Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
     DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
     DivOperation, DotOperation, DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
@@ -31,7 +33,7 @@ use ryft_core::{
     ProgramError, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
     ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RemOperation, RematerializeOperation, ReshapeOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RegionRef, RemOperation, RematerializeOperation, ReshapeOperation,
     ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation,
     ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
     SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
@@ -47,8 +49,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
+use crate::lowering::{MlirLowerableValue, unread_lifted_captures, validate_local_output_placement};
 use crate::operations::constants::lower_layout_constraint;
-use crate::{Constant, Error, KernelOperation, LoweringError, Type};
+use crate::{
+    Constant, Error, KernelOperation, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type,
+    lower_operation_variants,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -126,7 +132,6 @@ pub(crate) mod trigonometric;
 pub use debugging::{
     PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
-pub use dot::RaggedDotLoweringStrategy;
 pub use jit_call::{JIT_CALL_OPERATION_NAME, JitCallOperation, transpose_primal_jit_call};
 
 /// Ordinary universe of staged operations that the XLA backend owns.
@@ -695,6 +700,131 @@ impl_array_ir_operation_conversion!(SelectOperation<Type>);
 impl_array_ir_operation_conversion!(StopGradientOperation<Type>);
 impl_array_ir_operation_conversion!(TagOperation<Type>);
 impl_array_ir_operation_conversion!(PrintOperation<Type>);
+
+impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        // This function does not validate the placement of local outputs. `Operation::lower` validates it for every
+        // variant, including this projected one, whereas downstream families that embed `ArrayOperation` must reject
+        // outputs that shard a local dimension over a bound manual mesh axis themselves (refer to
+        // `validate_local_output_placement`).
+        lower_operation_variants!(
+            self, ArrayOperation, lowerer, input_values, input_types, output_types;
+            Zero, ZeroLike, One, OneLike, Constant, FillLike, Iota, IotaLike,
+            Min, Max, Clamp, Sign, Neg, Add, Sub, SaturatingSub,
+            Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, ExpM1, Log, Ln1p, LogAddExp, Logistic, Erf,
+            Floor, Ceil, Round, Not,
+            And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
+            ScaledDot, AxisIndex, ParallelReduce, ParallelVary, ParallelCast,
+            ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelBroadcast, ParallelAllToAll,
+            ParallelRaggedAllToAll, Compare, Select, Transpose, Reverse, Reshape, Broadcast, BroadcastLike, Pad,
+            Concatenate, Gather, Scatter, Slice, UpdateSlice,
+            DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Place, Reshard,
+            ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
+            Dropout, Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
+        )
+    }
+}
+
+impl LowerableOperation for DimensionOperation<DimensionValue> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[DimensionType],
+        output_types: &[DimensionType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        lower_operation_variants!(
+            self, DimensionOperation, lowerer, input_values, input_types, output_types;
+            Constant, Max, Min, Add, Sub, SaturatingSub, Mul, Div, Rem, Pow,
+        )
+    }
+}
+
+impl LowerableOperation for Operation {
+    #[inline]
+    fn composite_key(&self) -> Option<&CompositeKey> {
+        match self {
+            Self::Composite(operation) => operation.key(),
+            Self::LiftedComposite(operation) => operation.key(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn unread_captures(
+        callee: RegionRef<'_, Constant, Self>,
+        capture_count: usize,
+        target_platform: Option<&str>,
+    ) -> Option<Arc<[bool]>> {
+        unread_lifted_captures(callee, capture_count, target_platform)
+    }
+
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[Type],
+        output_types: &[Type],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        // Every variant, including the projected array operations, has its local output placement validated here
+        // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
+        // manual axes itself, reporting the more specific `ShardMapError::ShardingNamesEnclosingManualAxis`.
+        if !matches!(self, Self::ShardMap(_)) {
+            validate_local_output_placement(self.name(), output_types, lowerer.collective_state().bound_manual_axes())?;
+        }
+        lower_operation_variants!(
+            self, Operation, lowerer, input_values, input_types, output_types;
+            Kernel,
+            Zero => member,
+            DynamicOne => member,
+            DynamicIota => member,
+            Array => projected(ArrayType),
+            Dimension => projected(DimensionType),
+            Compare,
+            Assert,
+            Guard,
+            Cast,
+            DimensionSize,
+            ReferenceNew,
+            ReferenceRead,
+            ReferenceWrite,
+            ReferenceSwap,
+            ReferenceAddUpdate,
+            ReferenceAtomicAddUpdate,
+            ReferenceFreeze,
+            DimensionFromScalar,
+            DimensionToScalar,
+            Reshape,
+            Broadcast,
+            Concatenate,
+            CustomCall => member,
+            Pad,
+            DynamicSlice,
+            RngBitGenerator,
+            ParallelAllGather => member,
+            ParallelSumScatter => member,
+            ParallelAllToAll => member,
+            ParallelRaggedAllToAll => member,
+            Condition,
+            While,
+            Scan,
+            Composite,
+            CompositeTranspose,
+            LinearCall,
+            Rematerialize,
+            LiftedComposite,
+            LiftedCompositeTranspose,
+            JitCall,
+            ShardMap => boxed,
+        )
+    }
+}
 
 /// Staged XLA program over an operation family `O`, which defaults to the universe of XLA operations that the backend
 /// owns.

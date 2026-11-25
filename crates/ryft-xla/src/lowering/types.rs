@@ -1,21 +1,137 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CaptureReference, ComparisonDirection, DataType, Dimension, DimensionError, DimensionValue, Layout,
-    ProgramError, Shape, Type as CoreType,
+    Memory, ProgramError, Shape, Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
+use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
 use ryft_mlir::{
     Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef,
     IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef,
     Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
+use crate::devices::MemoryExtension;
 use crate::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
-use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::operations::manipulation::memory::annotate_output_memory;
-use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt, Type};
+use crate::{ArrayConstant, ArrayError, Constant, Error, ToMlir, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
+
+impl ToMlir for ComparisonDirection {
+    type Output<'c, 't: 'c> = stable_hlo::ComparisonDirection;
+
+    fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(&self, location: L) -> Result<Self::Output<'c, 't>, ryft_mlir::Error> {
+        let _ = location;
+        Ok(match self {
+            ComparisonDirection::Equal => stable_hlo::ComparisonDirection::Equal,
+            ComparisonDirection::NotEqual => stable_hlo::ComparisonDirection::NotEqual,
+            ComparisonDirection::LessThan => stable_hlo::ComparisonDirection::LessThan,
+            ComparisonDirection::LessThanOrEqual => stable_hlo::ComparisonDirection::LessThanOrEqual,
+            ComparisonDirection::GreaterThan => stable_hlo::ComparisonDirection::GreaterThan,
+            ComparisonDirection::GreaterThanOrEqual => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+        })
+    }
+}
+
+/// Lowers one comparison of two values in the provided `direction` to a single `stablehlo.compare`. This serves
+/// [`CompareOperation`](ryft_core::CompareOperation) lowerings, scalar dimension comparisons, and the comparisons inside of combiner and comparator
+/// bodies. Both operands must already share one tensor type, because this function neither promotes nor broadcasts
+/// them, and the result has their shape with a Boolean element type. The comparison type (i.e., `FLOAT`, `SIGNED`, or
+/// `UNSIGNED`) follows the element type of the left-hand side input, as [`comparison_type_for_mlir_type`] describes.
+pub(crate) fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
+    direction: ComparisonDirection,
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let direction = direction.to_mlir(location)?;
+    let left_type = left.r#type()?;
+    let comparison_type = comparison_type_for_mlir_type(left_type)?;
+    let result = block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
+    Ok(result.result(0).unwrap().as_ref())
+}
+
+/// Validates that a program compiled for `target_platform` can take its arguments from `memory` and return its
+/// results in it.
+///
+/// XLA's CUDA compiler does not place values in unpinned host memory, although its plugin can hold buffers there. It
+/// reads an argument that is declared in that memory from device memory, and it returns a result that is declared in
+/// that memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would
+/// therefore reject its actual arguments and mislabel its results, so it is rejected here instead. Values inside a
+/// program are not affected, because the compiler treats pinned and unpinned host memory alike there.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedBoundaryMemory`] if `memory` is unpinned host memory and `target_platform` is
+/// CUDA.
+pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
+    if memory == (Memory::Host { pinned: false }) && target_platform == Some("cuda") {
+        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: "cuda".to_string() }.into());
+    }
+    Ok(())
+}
+
+/// Applies the non-default memory placement declared by `output_type` to `value`.
+pub(crate) fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    value: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if output_type.memory() == Memory::Device {
+        return Ok(value);
+    }
+    Ok(lower_transfer_to_memory(output_type.memory(), &[value], block, context, location)?[0])
+}
+
+/// Lowers one staged [`TransferToMemoryOperation`](ryft_core::TransferToMemoryOperation) to the `stablehlo.custom_call @annotate_device_placement` annotation
+/// that the XLA `ConvertMemoryPlacementToInternalAnnotations` and
+/// [`HostOffloader`](https://openxla.org/xla/tools_and_passes/host_offloading) passes legalize into copies annotated
+/// with memory spaces. The annotation uses API version 1, `has_side_effect = true`, an empty `backend_config`, and
+/// the destination kind in `_xla_buffer_placement` inside `mhlo.frontend_attributes`.
+///
+/// These constraints are retained on CPU as well, because reference arrays only retag their types, but native arrays
+/// must honor the requested physical placement on every platform. The current XLA offloading pass treats pinned and
+/// unpinned host annotations alike internally, whereas function boundary attributes and PJRT memory validation retain
+/// the distinction at runtime boundaries. A plugin must expose the requested memory kind for native allocation.
+///
+/// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
+/// transfers (i.e., transfers whose destination equals the operand's current space) still lower to the annotation,
+/// because placement round trips are meaningful to `HostOffloader` and must not be optimized away here.
+pub(crate) fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    destination: Memory,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    check_count!("input", input_values, 1, ProgramError);
+    let empty_backend_configuration = context.string_attribute("");
+    let mut operation = stable_hlo::custom_call(
+        input_values,
+        "annotate_device_placement",
+        true,
+        Some(empty_backend_configuration.as_ref()),
+        CustomCallApiVersion::Original,
+        &[],
+        None,
+        &[],
+        None,
+        &[input_values[0].r#type()?],
+        location,
+    )?;
+    operation.set_discardable_attribute(
+        "mhlo.frontend_attributes",
+        context.dictionary_attribute(&[context.named_attribute(
+            context.identifier("_xla_buffer_placement"),
+            context.string_attribute(destination.placement_kind()),
+        )]),
+    );
+    let operation = block.append_operation(operation)?;
+    Ok(vec![operation.result(0).unwrap().as_ref()])
+}
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub(crate) fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
@@ -891,18 +1007,124 @@ where
     Ok(broadcast.result(0).unwrap().as_ref())
 }
 
+/// Picks the right StableHLO comparison semantic based on the element type of an MLIR value.
+///
+/// Tensor values are unwrapped to their element type, while scalar types that are not tensors are inspected directly.
+/// Floating-point types route to [`stable_hlo::ComparisonType::Float`], explicitly unsigned integers and one-bit
+/// predicate carriers route to [`stable_hlo::ComparisonType::Unsigned`], and other integers route to
+/// [`stable_hlo::ComparisonType::Signed`]. Every other element type (e.g., complex) routes to
+/// [`stable_hlo::ComparisonType::Float`]. Logical signed one-bit inputs must be widened before calling this function,
+/// because their MLIR carrier alone cannot distinguish them from Boolean inputs.
+fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, Error> {
+    let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() { tensor.element_type()? } else { r#type };
+    if element_type.is::<FloatTypeRef>() {
+        return Ok(stable_hlo::ComparisonType::Float);
+    }
+    if let Some(integer) = element_type.cast::<IntegerTypeRef>() {
+        if integer.is_unsigned() || integer.bit_width() == 1 {
+            return Ok(stable_hlo::ComparisonType::Unsigned);
+        }
+        return Ok(stable_hlo::ComparisonType::Signed);
+    }
+    // Other element types compare as floating-point values, which matches StableHLO's lenient handling of numeric
+    // types that are neither integers nor floating-point types (e.g., complex types).
+    Ok(stable_hlo::ComparisonType::Float)
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ConvertElementTypeOperation, DimensionBounds, DimensionVariable, Error as CoreError, Placeholder,
-        ReferenceType, TiledLayout,
+        ReferenceType, TiledLayout, ZeroOperation,
     };
 
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program};
+    use crate::lowering::tests::{
+        ProgramBuilder, dynamic_dimension, test_vector_type, to_mlir_module_for_plain_program,
+    };
 
     use super::*;
+
+    #[test]
+    fn test_comparison_direction_to_mlir() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        for (direction, expected) in [
+            (ComparisonDirection::Equal, stable_hlo::ComparisonDirection::Equal),
+            (ComparisonDirection::NotEqual, stable_hlo::ComparisonDirection::NotEqual),
+            (ComparisonDirection::LessThan, stable_hlo::ComparisonDirection::LessThan),
+            (ComparisonDirection::LessThanOrEqual, stable_hlo::ComparisonDirection::LessThanOrEqual),
+            (ComparisonDirection::GreaterThan, stable_hlo::ComparisonDirection::GreaterThan),
+            (ComparisonDirection::GreaterThanOrEqual, stable_hlo::ComparisonDirection::GreaterThanOrEqual),
+        ] {
+            assert_eq!(direction.to_mlir(location), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_validate_boundary_memory() {
+        // Only unpinned host memory at the boundary of a program compiled for CUDA is rejected.
+        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
+            assert!(validate_boundary_memory(memory, None).is_ok());
+            assert!(validate_boundary_memory(memory, Some("cpu")).is_ok());
+        }
+        assert!(validate_boundary_memory(Memory::Device, Some("cuda")).is_ok());
+        assert!(validate_boundary_memory(Memory::Host { pinned: true }, Some("cuda")).is_ok());
+        let error = validate_boundary_memory(Memory::Host { pinned: false }, Some("cuda")).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
+                if *memory == (Memory::Host { pinned: false }) && platform == "cuda",
+        ));
+        assert_eq!(
+            error.to_string(),
+            "programs compiled for platform `cuda` cannot take or return values in `Host[Unpinned]` memory",
+        );
+    }
+
+    #[test]
+    fn test_annotate_output_memory() {
+        // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
+        // addition to their `mhlo.memory_kind` signature attribute.
+        let zero_program = |memory| {
+            let mut builder = ProgramBuilder::new();
+            let output_type = test_vector_type(4).with_memory(memory);
+            let output =
+                builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap()
+        };
+        assert_eq!(
+            to_mlir_module_for_plain_program(&zero_program(Memory::Device), "main").unwrap(),
+            indoc! {r#"
+            module {
+              func.func @main() -> tensor<4xf32> {
+                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                return %0 : tensor<4xf32>
+              }
+            }
+        "#},
+        );
+        for (memory, kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            let expected = indoc! {r#"
+                module {
+                  func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = "KIND"}) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "KIND"}} : (tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#}
+            .replace("KIND", kind);
+            assert_eq!(to_mlir_module_for_plain_program(&zero_program(memory), "main").unwrap(), expected);
+        }
+    }
 
     #[test]
     fn test_lower_signed_one_bit_to_mlir() {

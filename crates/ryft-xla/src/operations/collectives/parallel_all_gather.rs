@@ -9,7 +9,7 @@ use ryft_mlir::{
 
 use crate::lowering::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
-use crate::operations::collectives::{collective_replica_groups, refine_collective_result_dimensions};
+use crate::operations::collectives::refine_collective_result_dimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
 impl LowerableOperation for ParallelAllGatherOperation {
@@ -100,8 +100,7 @@ fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, _) = collective_replica_groups(
-        collective_state,
+    let (replica_groups, _) = collective_state.replica_groups(
         operation.axes(),
         operation.axis_size(),
         operation.options().axis_index_groups(),

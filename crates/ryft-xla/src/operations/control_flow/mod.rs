@@ -23,8 +23,8 @@ use crate::lowering::{
 };
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::operations::{FlatProgram, Program};
+use crate::sharding::lower_sharding_constraint;
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
 pub(crate) mod condition;

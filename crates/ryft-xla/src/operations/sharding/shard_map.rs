@@ -15,11 +15,10 @@ use ryft_mlir::{
 };
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::{annotate_output_memory, lower_tensor_type};
 use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::Program;
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{
     Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
 };

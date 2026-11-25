@@ -32,14 +32,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array, ArrayOperation, ArrayType, AtomId, BroadcastLikeOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CastOperation, CollectiveAxes, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh,
-    DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass,
-    EffectClasses, ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation,
-    IotaOperation, LogicalMesh, Memory, MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
-    Provenance, Region as CoreRegion, RegionId, RegionRef, RegionRole, RematerializationOptimizationBarrier,
-    ReshapeOperation, ReshardOperation, SCAN_OPERATION_NAME, ScatterOperation, Shape, ShardMapBoundary,
+    Array, ArrayType, AtomId, BroadcastLikeOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CastOperation,
+    CollectiveAxes, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh, Dimension,
+    DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
+    FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation, LogicalMesh, Memory,
+    MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection,
+    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, Provenance,
+    Region as CoreRegion, RegionId, RegionRef, RegionRole, RematerializationOptimizationBarrier, ReshapeOperation,
+    ReshardOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, ScatterOperation, Shape, ShardMapBoundary,
     ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
     Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value,
     WHILE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
@@ -63,20 +63,15 @@ use crate::lowering::regions::{lower_nested_program_inline, lower_program_output
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
-    lower_tensor_type, lower_unplaced_constant_output,
+    lower_tensor_type, lower_unplaced_constant_output, validate_boundary_memory,
 };
-use crate::operations::collectives::collective_replica_groups;
 use crate::operations::composites::{omits_operation_regions, omits_regions};
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
-use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
-use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
-use crate::operations::manipulation::memory::validate_boundary_memory;
-use crate::operations::sharding::constrain_sharding::lower_closed_sharding_constraint;
-use crate::sharding::ShardyTensorSharding;
+use crate::sharding::{ShardyTensorSharding, lower_closed_sharding_constraint};
 use crate::{
     ArrayConstant, CompilationError, Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME,
-    JitCallOperation, Operation, Program, RaggedDotLoweringStrategy, RetainedArray, RuntimeRequirement,
-    SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
+    JitCallOperation, Operation, Program, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
+    normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -173,6 +168,19 @@ pub enum LoweringError {
     /// The constructed MLIR module failed verification without returning a native error value.
     #[error("constructed MLIR module failed verification during XLA lowering")]
     VerificationFailure,
+}
+
+/// XLA representation used when lowering ragged dots. The selection applies to a whole compilation and is made with
+/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RaggedDotLoweringStrategy {
+    /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
+    /// [`Options::new`](crate::Options::new).
+    #[default]
+    Decomposition,
+
+    /// Emit dedicated CHLO `ragged_dot` instructions.
+    Instruction,
 }
 
 pub(crate) mod admission;
@@ -607,8 +615,9 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
 ///
 /// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
 /// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`Type`], and
-/// first-class dimension operations at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and
-/// [`Operation`]) implement this trait by dispatching each variant to its payload through
+/// first-class dimension operations at [`DimensionType`](ryft_core::DimensionType). Operation families (e.g.,
+/// [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`]) implement this trait by dispatching each variant
+/// to its payload through
 /// [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that a family stores as
 /// projected or mixed members. A family whose type universe is [`Type`] and that implements
 /// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`to_mlir_module_for_program`]
@@ -733,7 +742,7 @@ where
 ///
 ///   - A bare variant lowers its payload at the family's own type universe.
 ///   - `projected(U)` first projects the instruction types to the member universe `U` (e.g., an `Array` variant that
-///     stores an [`ArrayOperation`] in an [`Type`] family).
+///     stores an [`ArrayOperation`](ryft_core::ArrayOperation) in an [`Type`] family).
 ///   - `member` lowers a payload of a member universe at the family's universe through [`MemberLowerableOperation`].
 ///   - `boxed` lowers a boxed payload at the family's universe.
 ///
@@ -831,131 +840,6 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     let created = created.result(0).unwrap().as_ref();
     effect_tokens.set(effect_class, created);
     Ok(created)
-}
-
-impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // This function does not validate the placement of local outputs. `Operation::lower` validates it for every
-        // variant, including this projected one, whereas downstream families that embed `ArrayOperation` must reject
-        // outputs that shard a local dimension over a bound manual mesh axis themselves (refer to
-        // `validate_local_output_placement`).
-        lower_operation_variants!(
-            self, ArrayOperation, lowerer, input_values, input_types, output_types;
-            Zero, ZeroLike, One, OneLike, Constant, FillLike, Iota, IotaLike,
-            Min, Max, Clamp, Sign, Neg, Add, Sub, SaturatingSub,
-            Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, ExpM1, Log, Ln1p, LogAddExp, Logistic, Erf,
-            Floor, Ceil, Round, Not,
-            And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
-            ScaledDot, AxisIndex, ParallelReduce, ParallelVary, ParallelCast,
-            ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelBroadcast, ParallelAllToAll,
-            ParallelRaggedAllToAll, Compare, Select, Transpose, Reverse, Reshape, Broadcast, BroadcastLike, Pad,
-            Concatenate, Gather, Scatter, Slice, UpdateSlice,
-            DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Place, Reshard,
-            ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
-            Dropout, Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
-        )
-    }
-}
-
-impl LowerableOperation for DimensionOperation<DimensionValue> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[DimensionType],
-        output_types: &[DimensionType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_operation_variants!(
-            self, DimensionOperation, lowerer, input_values, input_types, output_types;
-            Constant, Max, Min, Add, Sub, SaturatingSub, Mul, Div, Rem, Pow,
-        )
-    }
-}
-
-impl LowerableOperation for Operation {
-    #[inline]
-    fn composite_key(&self) -> Option<&CompositeKey> {
-        match self {
-            Self::Composite(operation) => operation.key(),
-            Self::LiftedComposite(operation) => operation.key(),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn unread_captures(
-        callee: RegionRef<'_, Constant, Self>,
-        capture_count: usize,
-        target_platform: Option<&str>,
-    ) -> Option<Arc<[bool]>> {
-        unread_lifted_captures(callee, capture_count, target_platform)
-    }
-
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[Type],
-        output_types: &[Type],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // Every variant, including the projected array operations, has its local output placement validated here
-        // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
-        // manual axes itself, reporting the more specific `ShardMapError::ShardingNamesEnclosingManualAxis`.
-        if !matches!(self, Self::ShardMap(_)) {
-            validate_local_output_placement(self.name(), output_types, &lowerer.collective_state.bound_manual_axes)?;
-        }
-        lower_operation_variants!(
-            self, Operation, lowerer, input_values, input_types, output_types;
-            Kernel,
-            Zero => member,
-            DynamicOne => member,
-            DynamicIota => member,
-            Array => projected(ArrayType),
-            Dimension => projected(DimensionType),
-            Compare,
-            Assert,
-            Guard,
-            Cast,
-            DimensionSize,
-            ReferenceNew,
-            ReferenceRead,
-            ReferenceWrite,
-            ReferenceSwap,
-            ReferenceAddUpdate,
-            ReferenceAtomicAddUpdate,
-            ReferenceFreeze,
-            DimensionFromScalar,
-            DimensionToScalar,
-            Reshape,
-            Broadcast,
-            Concatenate,
-            CustomCall => member,
-            Pad,
-            DynamicSlice,
-            RngBitGenerator,
-            ParallelAllGather => member,
-            ParallelSumScatter => member,
-            ParallelAllToAll => member,
-            ParallelRaggedAllToAll => member,
-            Condition,
-            While,
-            Scan,
-            Composite,
-            CompositeTranspose,
-            LinearCall,
-            Rematerialize,
-            LiftedComposite,
-            LiftedCompositeTranspose,
-            JitCall,
-            ShardMap => boxed,
-        )
-    }
 }
 
 /// Module-scoped lowering state shared across nested regions. StableHLO collectives use the channel counter and the
@@ -1171,7 +1055,7 @@ impl CollectiveLoweringState {
         // enclosing binder when another manual region shadows the axis name. That resolution also requires every named
         // axis to be bound on one mesh.
         let axis_name = axis_name.into();
-        collective_replica_groups(self, &axis_name, axis_size, None)?;
+        self.replica_groups(&axis_name, axis_size, None)?;
         let mesh = self.manual_axis_region(&axis_name.names()[0]).unwrap().mesh();
         match payload_mesh {
             Some(payload_mesh) if payload_mesh.has_same_manual_axes(mesh) => Ok(payload_mesh),
@@ -1233,6 +1117,124 @@ impl CollectiveLoweringState {
             .into());
         }
         Ok(())
+    }
+
+    /// Resolves the replica groups of the named mesh axes `axis_name` inside the enclosing `shard_map` manual regions,
+    /// returning the groups together with the combined axis size. Devices are linearized row-major over the mesh axes,
+    /// so the devices whose coordinates differ only along the named axes form one replica group. The group bases
+    /// enumerate the coordinate combinations of the other axes, and the group members are ordered by their positions
+    /// along the combined axis, which linearizes the named axes in the given order with the first name major (refer to
+    /// [`CollectiveAxes`]). Returns an error outside manual regions, for axes that no enclosing region binds as manual
+    /// mesh axes, and for axes whose binding regions have meshes with different topologies. The groups depend only on
+    /// the names and sizes of the mesh axes in order, so regions whose meshes differ only in axis types (e.g., a nested
+    /// region inside `auto_axes` or `explicit_axes`, which retype a free axis) bind axes of one collective.
+    pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
+        &self,
+        axis_name: A,
+    ) -> Result<(Vec<Vec<usize>>, usize), Error> {
+        let axis_names = axis_name.into();
+        if axis_names.names().is_empty() {
+            return Err(ProgramError::MalformedProgram("collective requires at least one axis name".to_string()).into());
+        }
+        if self.manual_shard_map().is_none() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "collective over axis `{axis_names}` can only be lowered inside a `{SHARD_MAP_OPERATION_NAME}` \
+                     manual region",
+                ),
+            }
+            .into());
+        }
+        let mut mesh = None;
+        for axis_name in axis_names.names() {
+            let Some(axis_region) = self.manual_axis_region(axis_name) else {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "collective over axis `{axis_name}` cannot lower inside this `{SHARD_MAP_OPERATION_NAME}` \
+                         manual region because the region does not bind that axis as a manual mesh axis",
+                    ),
+                }
+                .into());
+            };
+            match mesh {
+                None => mesh = Some(axis_region.mesh()),
+                Some(mesh) if mesh.has_same_topology(axis_region.mesh()) => {}
+                Some(_) => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "collective over axes `{axis_names}` spans manual regions whose meshes have different \
+                         topologies",
+                    ))
+                    .into());
+                }
+            }
+        }
+        let mesh = mesh.unwrap();
+        let axis_sizes: Vec<usize> = mesh.axes().iter().map(|axis| axis.size()).collect();
+        let strides = (0..axis_sizes.len()).map(|axis| axis_sizes[axis + 1..].iter().product()).collect::<Vec<usize>>();
+        let named_axes = axis_names.names().iter().map(|name| mesh.axis_index(name).unwrap()).collect::<Vec<_>>();
+        let axis_size: usize = named_axes.iter().map(|axis| axis_sizes[*axis]).product();
+        let device_count: usize = axis_sizes.iter().product();
+        let mut replica_groups: Vec<Vec<usize>> = Vec::with_capacity(device_count / axis_size);
+        for device in 0..device_count {
+            // A device is a group base exactly when its coordinates along the named axes are zero.
+            if named_axes.iter().all(|axis| (device / strides[*axis]) % axis_sizes[*axis] == 0) {
+                replica_groups.push(
+                    (0..axis_size)
+                        .map(|mut position| {
+                            let mut member = device;
+                            for axis in named_axes.iter().rev() {
+                                member += (position % axis_sizes[*axis]) * strides[*axis];
+                                position /= axis_sizes[*axis];
+                            }
+                            member
+                        })
+                        .collect(),
+                );
+            }
+        }
+        Ok((replica_groups, axis_size))
+    }
+
+    /// Resolves the physical replica groups for one collective, expanding each logical subgroup within every fixed
+    /// coordinate of the enclosing mesh's other axes.
+    pub(crate) fn replica_groups<A: Into<CollectiveAxes>>(
+        &self,
+        axis_name: A,
+        axis_size: usize,
+        axis_index_groups: Option<&[Vec<usize>]>,
+    ) -> Result<(Vec<Vec<usize>>, usize), Error> {
+        let axis_name = axis_name.into();
+        let (mesh_groups, mesh_axis_size) = self.mesh_axis_replica_groups(&axis_name)?;
+        if axis_size != mesh_axis_size {
+            return Err(ProgramError::MalformedProgram(format!(
+                "collective over axis `{axis_name}` records size {axis_size}, but the enclosing mesh axis has size \
+                 {mesh_axis_size}",
+            ))
+            .into());
+        }
+        let Some(axis_index_groups) = axis_index_groups else {
+            return Ok((mesh_groups, mesh_axis_size));
+        };
+        let group_size = axis_index_groups.first().map(Vec::len).unwrap_or(0);
+        let mut replica_groups = Vec::with_capacity(mesh_groups.len() * axis_index_groups.len());
+        for mesh_group in mesh_groups {
+            for axis_index_group in axis_index_groups {
+                replica_groups.push(
+                    axis_index_group
+                        .iter()
+                        .map(|&index| {
+                            mesh_group.get(index).copied().ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "collective over axis `{axis_name}` has group member {index} outside axis size \
+                                     {mesh_axis_size}",
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+        }
+        Ok((replica_groups, group_size))
     }
 
     /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
@@ -2593,7 +2595,7 @@ pub(crate) fn has_untracked_auto_axes(sharding: &Sharding) -> bool {
 }
 
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
-/// values of [`ArrayOperation`] constants).
+/// values of [`ArrayOperation`](ryft_core::ArrayOperation) constants).
 pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
     /// Builds a dense-elements attribute containing this value.
     fn to_dense_elements_attribute<'c, 't>(
@@ -2857,6 +2859,75 @@ where
         }
     }
     Ok(mesh)
+}
+
+/// Returns whether a broadcast from `input_type` to `output_type`, which maps each input axis to the corresponding
+/// entry of `output_axes`, changes the placement over explicit mesh axes and therefore requires an explicit output
+/// placement constraint.
+pub(crate) fn broadcast_changes_explicit_sharding(
+    input_type: &ArrayType,
+    output_type: &ArrayType,
+    output_axes: &[usize],
+) -> bool {
+    let Some(output_sharding) = output_type.sharding() else {
+        return false;
+    };
+    let input_sharding = input_type.sharding();
+    let uses_explicit_axis = |dimension: &ShardingDimension, sharding: &Sharding| match dimension {
+        ShardingDimension::Sharded(axis_names) => {
+            axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+        }
+        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+    };
+    if input_sharding.is_none() {
+        return output_sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
+    }
+    if let Some(input_sharding) = input_sharding
+        && input_sharding.mesh() != output_sharding.mesh()
+    {
+        return input_sharding
+            .mesh()
+            .axes()
+            .iter()
+            .chain(output_sharding.mesh().axes())
+            .any(|axis| axis.r#type() == MeshAxisType::Explicit);
+    }
+
+    let projected_input_sharding = input_sharding
+        .map(|sharding| sharding.with_broadcasted_dimensions(output_type.rank(), output_axes).unwrap())
+        .unwrap_or_else(|| Sharding::replicated(output_sharding.mesh().clone(), output_type.rank()));
+
+    // Even when the ranked placement labels are unchanged, expanding a unit dimension that is partitioned over an
+    // explicit mesh axis changes which partitions own the replicated values and must remain visible to Shardy.
+    let expands_explicit_dimension = output_axes.iter().copied().enumerate().any(|(input_axis, output_axis)| {
+        input_type.dimension(input_axis as isize) == Dimension::Static(1)
+            && output_type.dimension(output_axis as isize) != Dimension::Static(1)
+            && (uses_explicit_axis(&projected_input_sharding.dimensions()[output_axis], &projected_input_sharding)
+                || uses_explicit_axis(&output_sharding.dimensions()[output_axis], output_sharding))
+    });
+
+    expands_explicit_dimension || projected_input_sharding.conflicts_on_explicit_axes_with(output_sharding)
+}
+
+/// Returns whether a cast from `input_type` to `output_type` changes the placement that the type system tracks over
+/// explicit mesh axes and therefore emits a sharding constraint carrying its complete output sharding, like
+/// [`ReshardOperation`]. Carrying an existing sharding forward requests no
+/// redistribution, and an output without a sharding is untracked rather than replicated. Type inference guarantees
+/// that the placement over auto and manual axes is unchanged, as documented on [`CastOperation`], so the emitted
+/// constraint never contradicts the type the program was checked against.
+pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_type: &ArrayType) -> bool {
+    let Some(output_sharding) = output_type.sharding() else {
+        return false;
+    };
+    let has_explicit_axis =
+        |sharding: &Sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
+    match input_type.sharding() {
+        None => has_explicit_axis(output_sharding),
+        Some(input_sharding) if input_sharding.mesh() != output_sharding.mesh() => {
+            has_explicit_axis(input_sharding) || has_explicit_axis(output_sharding)
+        }
+        Some(input_sharding) => input_sharding.conflicts_on_explicit_axes_with(output_sharding),
+    }
 }
 
 /// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
@@ -3833,9 +3904,9 @@ pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Err
 /// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries. Local
 /// operations may change manual variation through collectives, but must not manufacture a global placement, which
 /// lowered sharding constraints would otherwise silently strip (refer to
-/// [`lower_sharding_constraint`](crate::operations::sharding::constrain_sharding::lower_sharding_constraint)).
+/// [`lower_sharding_constraint`](crate::sharding::lower_sharding_constraint)).
 /// First-class dimensions and references carry no placement of their own.
-fn validate_local_output_placement(
+pub(crate) fn validate_local_output_placement(
     operation_name: &str,
     output_types: &[Type],
     bound_manual_axes: &[String],
@@ -4854,8 +4925,8 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayOperations, AtomId, CaptureReference, CastOperation, Compare, Complex,
-        CompositeOperation, Condition, ConditionOperation, ConstantOperation, ConstrainSharding, Context, Cos,
+        AddOperation, Array, ArrayOperation, ArrayOperations, AtomId, CaptureReference, CastOperation, Compare,
+        Complex, CompositeOperation, Condition, ConditionOperation, ConstantOperation, ConstrainSharding, Context, Cos,
         CustomRuleDefinition, CustomRuleRegistration, Differentiate, Dimension, DimensionBounds,
         DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot,
         DotDimensionNumbers, EagerContext, EffectClasses, ErasedOperation, Error as CoreError, Layout,
@@ -5887,6 +5958,110 @@ pub(crate) mod tests {
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message == "`parallel_permute` output types do not match the enclosing manual mesh contract",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_collective_lowering_state_mesh_axis_replica_groups() {
+        // Devices are linearized row-major, so device `3 * x + y` has coordinates `(x, y)`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert_eq!(state.mesh_axis_replica_groups("x").unwrap(), (vec![vec![0, 3], vec![1, 4], vec![2, 5]], 2));
+        assert_eq!(state.mesh_axis_replica_groups("y").unwrap(), (vec![vec![0, 1, 2], vec![3, 4, 5]], 3));
+
+        // The first name of a combined axis is major.
+        assert_eq!(state.mesh_axis_replica_groups(["x", "y"]).unwrap(), (vec![vec![0, 1, 2, 3, 4, 5]], 6));
+        assert_eq!(state.mesh_axis_replica_groups(["y", "x"]).unwrap(), (vec![vec![0, 3, 1, 4, 2, 5]], 6));
+    }
+
+    #[test]
+    fn test_collective_lowering_state_mesh_axis_replica_groups_rejects_unresolvable_axes() {
+        let outer_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let inner_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(outer_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap())
+            .enter_manual_region(ShardMapBoundary::new(inner_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert!(matches!(
+            state.mesh_axis_replica_groups(Vec::<String>::new()),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective requires at least one axis name",
+            ),
+        ));
+        assert!(matches!(
+            state.mesh_axis_replica_groups(["x", "y"]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::MalformedProgram(message))
+                    if message
+                        == "collective over axes `(x, y)` spans manual regions whose meshes have different topologies",
+            ),
+        ));
+        assert!(matches!(
+            state.mesh_axis_replica_groups("z"),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if message
+                        == "collective over axis `z` cannot lower inside this `shard_map` manual region because the \
+                            region does not bind that axis as a manual mesh axis",
+            ),
+        ));
+        assert!(matches!(
+            CollectiveLoweringState::new().mesh_axis_replica_groups("x"),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if message == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_collective_lowering_state_replica_groups() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert_eq!(state.replica_groups("y", 4, None).unwrap(), (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 4),);
+
+        // Logical participant groups expand within every fixed coordinate of the other axes, in order.
+        assert_eq!(
+            state.replica_groups("y", 4, Some(&[vec![0, 2], vec![3, 1]])).unwrap(),
+            (vec![vec![0, 2], vec![3, 1], vec![4, 6], vec![7, 5]], 2),
+        );
+        assert!(matches!(
+            state.replica_groups("y", 2, None),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective over axis `y` records size 2, but the enclosing mesh axis has size 4",
+            ),
+        ));
+        assert!(matches!(
+            state.replica_groups("y", 4, Some(&[vec![0, 4]])),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective over axis `y` has group member 4 outside axis size 4",
             ),
         ));
     }
@@ -8911,6 +9086,123 @@ pub(crate) mod tests {
         let mesh = |target_platform| collect_nested_sharding_mesh(&program, None, target_platform).unwrap();
         assert_eq!(mesh(Some("cuda")), None);
         assert_eq!(mesh(Some("cpu")), Some(other));
+    }
+
+    #[test]
+    fn test_broadcast_changes_explicit_sharding() {
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(explicit_mesh.clone(), 1)).unwrap();
+        let explicitly_sharded = test_vector_type(4)
+            .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert!(broadcast_changes_explicit_sharding(&test_vector_type(4), &replicated, &[0]));
+        assert!(broadcast_changes_explicit_sharding(&replicated, &explicitly_sharded, &[0]));
+        assert!(!broadcast_changes_explicit_sharding(&explicitly_sharded, &explicitly_sharded, &[0]));
+
+        let first_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let second_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let first_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
+        let second_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
+        assert!(broadcast_changes_explicit_sharding(&first_mesh_replicated, &second_mesh_replicated, &[0]));
+
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(manual_mesh.clone(), 1)).unwrap();
+        let manually_sharded = test_vector_type(4)
+            .with_sharding(
+                Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(!broadcast_changes_explicit_sharding(&replicated, &manually_sharded, &[0]));
+
+        // Expanding a partitioned singleton and changing explicit reduction state both require constraints even when
+        // the ranked sharding dimensions themselves remain unchanged.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let singleton = test_vector_type(1)
+            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let expanded = test_vector_type(4)
+            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert!(broadcast_changes_explicit_sharding(&singleton, &expanded, &[0]));
+
+        let unreduced = test_vector_type(4)
+            .with_sharding(Sharding::replicated(explicit_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced = test_vector_type(4)
+            .with_sharding(Sharding::replicated(explicit_mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert!(broadcast_changes_explicit_sharding(&unreduced, &reduced, &[0]));
+    }
+
+    #[test]
+    fn test_cast_changes_explicit_placement() {
+        let explicit_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let resized_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let extended_auto_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let unsharded = ArrayType::new_static(DataType::F64, [4, 4]);
+        let placed = |mesh: &LogicalMesh, first: ShardingDimension| {
+            unsharded
+                .clone()
+                .with_sharding(Sharding::new(mesh.clone(), vec![first, ShardingDimension::replicated()]).unwrap())
+                .unwrap()
+        };
+        let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
+        let replicated = ShardingDimension::replicated;
+
+        // An output without a sharding stays untracked, whatever the input placement.
+        assert!(!cast_changes_explicit_placement(&unsharded, &unsharded));
+        assert!(!cast_changes_explicit_placement(&placed(&explicit_mesh, sharded(&["x"])), &unsharded));
+
+        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes. Types record no
+        // placement over auto mesh axes, so the placements below are replicated over them.
+        assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
+        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, replicated())));
+
+        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
+        assert!(!cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["x"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["y"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&explicit_mesh, sharded(&["x"])),
+        ));
+
+        // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&resized_mesh, replicated()),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&auto_mesh, replicated()),
+        ));
+        assert!(!cast_changes_explicit_placement(
+            &placed(&auto_mesh, replicated()),
+            &placed(&extended_auto_mesh, replicated()),
+        ));
     }
 
     #[test]

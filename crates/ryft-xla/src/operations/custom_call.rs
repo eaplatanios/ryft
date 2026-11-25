@@ -13,10 +13,11 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output};
+use crate::lowering::types::{
+    annotate_output_memory, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
+};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::operations::manipulation::memory::annotate_output_memory;
 use crate::{
     CustomCallOperationExtension, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE, Type,
