@@ -1991,12 +1991,10 @@ fn validate_parameter_options<P: FnOnce() -> ParameterPath>(
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2008,13 +2006,11 @@ mod tests {
     use indoc::formatdoc;
 
     use ryft_core::{
-        Add, ArrayIrType, ArrayIrValue, BatchAxis, Complex, DataType, DeviceMesh, DifferentiableType, Differentiate,
-        DifferentiationDual, DifferentiationError, Dimension, DimensionBounds, DimensionVariable, DomainTracingContext,
-        EmptyRegionDriver, Error as CoreError, Exp, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Neg, Operation as CoreOperation, PLACE_OPERATION_NAME, ParameterError, Place, PlaceOperation,
-        Placed, ProgramError, Shape, ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin, StridedLayout,
-        Tile, TileDimension, TiledLayout, TypeError, Typed, ValueProjection, batch, differentiate_at, f8e4m3fn,
-        shard_map,
+        Add, BatchAxis, Complex, DataType, DeviceMesh, DifferentiableType, Dimension, DomainTracingContext,
+        Error as CoreError, Exp, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Operation as CoreOperation,
+        PLACE_OPERATION_NAME, ParameterError, Place, PlaceOperation, Placed, ProgramError, Shape, ShardMapOptions,
+        Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, TypeError, Typed,
+        ValueProjection, batch, differentiate_at, f8e4m3fn, shard_map,
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionFence, KeyValueStore, load_cpu_plugin,
@@ -2024,13 +2020,13 @@ mod tests {
     use crate::distributed::tests::{run_cpu_processes, test_process};
     use crate::sessions::tests::{DeclareRemoteDevices, domain_mesh, two_device_mesh};
     use crate::tests::{
-        cpu_client, device_mesh_2x2, execution_client, other_cpu_client, session_with_remote_devices,
-        values_from_bytes, values_to_bytes,
+        cpu_client, execution_client, native_buffer_addresses, other_cpu_client, session_with_remote_devices,
+        shard_values, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        ArrayTracer, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, DistributedRuntime, LoweringError,
-        Options, SessionError, StagedFunction, StatefulCompileTracer, ToPjrt, TracedProgram, Type, Value, compile,
-        compile_statefully, compile_with_options, jit, stage, trace,
+        ArrayTracer, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, DistributedRuntime, Options,
+        SessionError, StagedFunction, StatefulCompileTracer, ToPjrt, TracedProgram, Type, Value, compile,
+        compile_with_options, jit, stage, trace,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -2042,29 +2038,8 @@ mod tests {
 
     use super::*;
 
-    /// Uploads an uncommitted two-element vector for a placement derivative test.
-    fn upload_place_jvp_vector(session: &Session, values: &[f32; 2]) -> Array {
-        Array::from_host_buffer(session, ArrayType::new_static(DataType::F32, [2]), None, None, values_to_bytes(values))
-            .unwrap()
-    }
-
-    /// Uploads a named singleton placement primal and a tangent on the session's default device.
-    fn place_jvp_inputs(session: &Session, device: Device) -> (Array, Array) {
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let placement = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let primal = upload_place_jvp_vector(session, &[1., 2.]).place(&placement, None).unwrap();
-        (primal, upload_place_jvp_vector(session, &[3., 4.]))
-    }
-
-    /// Reads the value of a single-device derivative result alongside its placement.
-    fn observe_place_jvp(array: &Array) -> (Device, bool, Vec<f32>) {
-        let [device] = array.mesh().devices() else { panic!("expected one device") };
-        (*device, array.is_committed(), array.copy_to_host().unwrap().elements::<f32>().unwrap())
-    }
-
-    // Returns the path and the underlying error of an `ArrayError::FailedParameterPlacement`, and `None` for any other
-    // error.
+    /// Returns the path and the underlying error of an `ArrayError::FailedParameterPlacement`, and `None` for any other
+    /// error.
     fn failed_parameter(error: &Error) -> Option<(String, &Error)> {
         match error {
             Error::Array(error) => match error.as_ref() {
@@ -2075,7 +2050,7 @@ mod tests {
         }
     }
 
-    // Saves the original placement diagnostic for tests whose transform can defer or wrap it.
+    /// Saves the original placement diagnostic for tests whose transform can defer or wrap it.
     fn record_placement_error<T>(error: &RefCell<Option<String>>, result: Result<T, Error>) -> Result<T, ProgramError> {
         result.map_err(|placement_error| {
             let message = placement_error.to_string();
@@ -2084,78 +2059,64 @@ mod tests {
         })
     }
 
-    // Returns the `f32` values that the devices of `array` hold, in the device order of its mesh.
-    fn shard_values(array: &Array) -> Vec<Vec<f32>> {
-        array
-            .shards()
-            .iter()
-            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host_bytes().unwrap()))
-            .collect()
-    }
-
-    // Returns the native addresses of the buffers that the devices of `array` hold, in the device order of its mesh,
-    // once they are ready. Two arrays that are both alive share storage exactly when they share such an address, which
-    // the identity of the handles of their buffers does not show.
-    fn native_buffer_addresses(array: &Array) -> Vec<usize> {
-        array
-            .shards()
-            .iter()
-            .map(|shard| {
-                let buffer = shard.buffer().unwrap();
-                buffer.ready().unwrap().r#await().unwrap();
-
-                // The buffer is ready and stays alive while `array` does, and its address is only compared and never
-                // dereferenced.
-                unsafe { buffer.unsafe_pointer().unwrap() }
-            })
-            .collect()
-    }
-
-    // Returns the physical dimensions of the buffer that each device of `array` holds, in the device order of its mesh.
+    /// Returns the physical dimensions of the buffer that each device of `array` holds, in the device order of its
+    /// mesh.
     fn shard_buffer_dimensions(array: &Array) -> Vec<Vec<u64>> {
         array.shards().iter().map(|shard| shard.buffer().unwrap().dimensions().unwrap().to_vec()).collect()
     }
 
-    // Leaf that places a pair of copies of `array` of its own through `Session::place`, which fails at the second
-    // element of that pair, because that element is donated while it may alias when `donate` is `true`, and because it
-    // has an in-place target that names nothing otherwise.
-    struct PairPlacingLeaf {
-        array: Array,
-        donate: bool,
+    /// Returns the mesh of `device` alone, with the explicit axis `x` of size 1.
+    fn single_device_mesh(device: Device) -> DeviceMesh {
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        DeviceMesh::new(logical_mesh, vec![device]).unwrap()
     }
 
-    impl Parameter for PairPlacingLeaf {}
+    /// Every observable fact of one placed array, so that the arrays that different paths produce can be compared.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Observed {
+        devices: Vec<Device>,
+        logical_mesh: LogicalMesh,
+        sharding: Sharding,
+        r#type: ArrayType,
+        memory_kinds: Vec<String>,
+        values: Vec<f32>,
+        committed: bool,
+    }
 
-    impl PlaceableParameter<Array> for PairPlacingLeaf {}
+    /// Returns the [`Observed`] facts of `array`.
+    fn observe(array: &Array) -> Observed {
+        Observed {
+            devices: array.mesh().devices().to_vec(),
+            logical_mesh: array.mesh().logical_mesh().clone(),
+            sharding: array.sharding().clone(),
+            r#type: array.r#type().into_owned(),
+            memory_kinds: array
+                .addressable_shards()
+                .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned())
+                .collect(),
+            values: array.copy_to_host().unwrap().elements::<f32>().unwrap(),
+            committed: array.is_committed(),
+        }
+    }
 
-    impl Placeable for PairPlacingLeaf {
-        type Output = Array;
-
-        fn place_parameter(
-            self,
-            session: &Session,
-            target: Option<PlacementRequest>,
-            source: Option<PlacementRequest>,
-            donate: bool,
-            may_alias: Option<bool>,
-        ) -> Result<Array, Error> {
-            validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
-            let pair = (self.array.clone(), self.array);
-            let (first, _) = if self.donate {
-                let options = PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(
-                    None,
-                    None,
-                    Some((false, true)),
-                    Some(Some(true)),
-                );
-                session.place(pair, options)?
-            } else {
-                let empty = PlacementRequest::InPlace { memory: None, layout: None };
-                let target = Some((None, Some(empty)));
-                let options = PlacementOptions::<_, PlacementRequest, bool, bool>::new(target, None, None, None);
-                session.place(pair, options)?
-            };
-            Ok(first)
+    /// Traces a function that places a traced leaf of the type of `input` on `session` with `options`, and replays
+    /// the traced program on `session` with `input`, which is the staged path of a placement. Returns the placed
+    /// array, the error of the placement when it fails while tracing (from which the traced function recovers, refer
+    /// to [`record_placement_error`]), and otherwise the error of the trace or of the replay.
+    fn replay_placement(session: &Session, input: &Array, options: PlacementOptions) -> Result<Array, String> {
+        let error = RefCell::new(None);
+        let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
+            |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options.clone())).unwrap_or(x),
+            input.r#type().into_owned(),
+        );
+        match (error.take(), traced) {
+            (Some(message), _) => Err(message),
+            (None, Err(error)) => Err(error.to_string()),
+            (None, Ok(traced)) => match traced.program().interpret_in_context(session, Value::Array(input.clone())) {
+                Ok(Value::Array(output)) => Ok(output),
+                Ok(_) => Err("placing an array must produce an array".to_string()),
+                Err(error) => Err(error.to_string()),
+            },
         }
     }
 
@@ -2212,132 +2173,6 @@ mod tests {
         report("cross-host placement", source.to_placement(&session, target));
     }
 
-    /// Places on every rank of the job of `client` a tree of two `bool[2]` host values with [`Session::place`] onto a
-    /// split over the two global devices, whose first leaf on rank 0 holds a byte that does not encode a `bool`, and
-    /// then places an array of rank 0 replicated onto both devices. Prints one `probe:` line for the tree, with
-    /// `invalid value` when the call returns the error of that leaf and otherwise `different values` for each leaf
-    /// whose readiness reports the failed comparison, and one for the cross-host placement, as
-    /// [`probe_value_comparison`] does.
-    #[cfg(feature = "cuda-13")]
-    fn probe_value_comparison_with_invalid_leaf(client: &'static Client<'static>) {
-        let rank = client.process_index().unwrap();
-        let devices = client
-            .devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let session = Session::builder().client(client).build().unwrap();
-        let axis = |size: usize| MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap();
-        let forward_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(2)]).unwrap(), devices.clone()).unwrap();
-        let process_0_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(1)]).unwrap(), vec![devices[0]]).unwrap();
-        let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
-        let split = Placement::new(forward_mesh.clone(), split.unwrap()).unwrap();
-        let bools = ArrayType::new_static(DataType::Boolean, [2]);
-        let mut first = CoreArray::new(bools.clone(), vec![1, 0]).unwrap();
-        if rank == 0 {
-            first.storage_bytes_mut()[0] = 2;
-        }
-        let tree = vec![first, CoreArray::new(bools, vec![0, 1]).unwrap()];
-        let outcome = match session.place(tree, PlacementOptions::to(PlacementRequest::from(split))) {
-            Ok(placed) => placed
-                .iter()
-                .map(|placed| match placed.block_until_ready() {
-                    Ok(()) => "ready".to_string(),
-                    Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
-                        if message == DIFFERENT_VALUES_MESSAGE =>
-                    {
-                        "different values".to_string()
-                    }
-                    Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-            Err(Error::Array(error))
-                if matches!(error.as_ref(), ArrayError::FailedParameterPlacement { source, .. }
-                    if source.to_string() == "array element 0 has invalid `bool` byte encoding [2]") =>
-            {
-                "invalid value".to_string()
-            }
-            Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-        };
-        println!("probe: rank {rank} tree: {outcome}");
-
-        // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
-        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(&process_0_mesh)).unwrap();
-        let values = values_to_bytes(&[17f32, 18., 19., 20.]);
-        let source = Array::from_host_buffer(&session, r#type, process_0_mesh.clone(), None, values).unwrap();
-        let target = Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap();
-        let placed = source.to_placement(&session, target);
-        let placed = placed.and_then(|placed| placed.block_until_ready().map(|()| placed));
-        match placed {
-            Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
-            Err(error) => {
-                let error = error.to_string();
-                println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
-            }
-        }
-    }
-
-    /// Places on every rank of the job of `client`, with one call of [`Session::place`], a host value split over the
-    /// two global devices, which is a scalar on rank 0 (so that only rank 0 rejects it) and a vector on rank 1, and an
-    /// array of rank 0 replicated onto both devices, which rank 1 can only receive from rank 0. Then places that array
-    /// once more on its own. Prints one `probe:` line for the call, with `different values` when it returns the error
-    /// of the failed comparison or otherwise the first line of its error or the elements of the shards of this rank,
-    /// and one for the placement that follows it.
-    #[cfg(feature = "cuda-13")]
-    fn probe_call_admission_with_invalid_leaf(client: &'static Client<'static>) {
-        let rank = client.process_index().unwrap();
-        let devices = client
-            .devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let session = Session::builder().client(client).build().unwrap();
-        let axis = |size: usize| MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap();
-        let forward_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(2)]).unwrap(), devices.clone()).unwrap();
-        let process_0_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(1)]).unwrap(), vec![devices[0]]).unwrap();
-        let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
-        let split = PlacementRequest::from(Placement::new(forward_mesh.clone(), split.unwrap()).unwrap());
-        let replicated = Sharding::replicated(forward_mesh.logical_mesh().clone(), 1);
-        let replicated = PlacementRequest::from(Placement::new(forward_mesh.clone(), replicated).unwrap());
-        let r#type = ArrayType::new_static(DataType::F32, [4]);
-        let values = values_to_bytes(&[17f32, 18., 19., 20.]);
-        let source = Array::from_host_buffer(&session, r#type, process_0_mesh, None, values).unwrap();
-        let host = match rank {
-            0 => CoreArray::scalar(1f32).unwrap(),
-            _ => CoreArray::vector(vec![1f32, 2.]).unwrap(),
-        };
-        let tree = vec![PlaceInput::Host(host), PlaceInput::Runtime(source.clone())];
-        let options = PlacementOptions::to(vec![split, replicated.clone()]);
-        let placed = session.place(tree, options).and_then(|placed| {
-            placed.iter().try_for_each(Array::block_until_ready)?;
-            Ok(placed)
-        });
-        let outcome = match placed {
-            Ok(placed) => format!("{:?}", placed.iter().map(read_addressable_f32s).collect::<Vec<_>>()),
-            Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
-                if message == DIFFERENT_VALUES_MESSAGE =>
-            {
-                "different values".to_string()
-            }
-            Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-        };
-        println!("probe: rank {rank} tree: {outcome}");
-
-        // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
-        let placed = source.to_placement(&session, replicated);
-        match placed.and_then(|placed| placed.block_until_ready().map(|()| placed)) {
-            Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
-            Err(error) => {
-                let error = error.to_string();
-                println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
-            }
-        }
-    }
-
     /// Runs `check` in one of the two CPU processes of a placement test (refer to [`run_cpu_processes`]), and returns
     /// immediately in a process that no launcher started. `check` receives the client of its process, which lists only
     /// the device of its own process, and the devices of the two processes in process order. Both processes stay
@@ -2368,179 +2203,6 @@ mod tests {
     }
 
     #[test]
-    fn test_session_placement() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let mesh = device_mesh_2x2();
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert!(matches!(session.placement(sharding.clone()), Err(Error::Session(SessionError::MissingMesh))));
-        let configured = session.with_device_mesh(mesh.clone());
-        assert_eq!(configured.placement(sharding.clone()).unwrap(), Placement::new(mesh.clone(), sharding).unwrap());
-
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Auto).unwrap()]).unwrap();
-        let error = configured.placement(Sharding::replicated(other_mesh.clone(), 1)).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Core(error) if matches!(
-                error.as_ref(),
-                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
-                    if expected == mesh.logical_mesh() && actual == &other_mesh,
-            ),
-        ));
-        assert_eq!(
-            error.to_string(),
-            format!("mesh mismatch; expected `{:?}` but got `{other_mesh:?}`", mesh.logical_mesh()),
-        );
-    }
-
-    #[test]
-    fn test_array_resolve_placement_request() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![devices[0]],
-        )
-        .unwrap();
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]),
-            mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-
-        // A device target on the device that the array lives on keeps the mesh of the array, even though that mesh
-        // names its axis differently from the mesh that a device target resolves to, and its sharding without the
-        // pending reduction along its axis of size one, which one device completes.
-        let memory = Memory::Host { pinned: true };
-        let destination = |device| PlacementRequest::Device { device, memory: Some(memory), layout: None };
-        let replicated = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
-        assert_eq!(
-            array.resolve_placement_request(destination(devices[0])).unwrap(),
-            replicated.clone().with_memory(memory),
-        );
-        let unreduced = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        let unreduced_array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced).unwrap(),
-            mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        assert_eq!(
-            unreduced_array.resolve_placement_request(destination(devices[0])).unwrap(),
-            replicated.clone().with_memory(memory),
-        );
-
-        // Any other device keeps the logical mesh and the sharding of an array on a mesh of one device, laid over
-        // that device, so that the array keeps how its dimensions are sharded.
-        let other_mesh = DeviceMesh::new(mesh.logical_mesh().clone(), vec![devices[1]]).unwrap();
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let sharded_array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap(),
-            mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        assert_eq!(
-            sharded_array.resolve_placement_request(destination(devices[1])).unwrap(),
-            Placement::new(other_mesh.clone(), sharding).unwrap().with_memory(memory),
-        );
-
-        // An array on more devices resolves like a value of its rank, which gathers it onto the device.
-        let two_device_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            devices.clone(),
-        )
-        .unwrap();
-        let split_array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]),
-            two_device_mesh,
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        assert_eq!(
-            split_array.resolve_placement_request(destination(devices[1])).unwrap(),
-            Placement::single_device(devices[1], 1).with_memory(memory),
-        );
-
-        // A device target without a memory selects the default memory of its device, as JAX's `device_put` does,
-        // whereas a sharding target without a memory selects none, so the array keeps its own memory.
-        assert_eq!(
-            array.resolve_placement_request(devices[0].into()).unwrap(),
-            replicated.clone().with_memory(Memory::Device),
-        );
-        assert_eq!(
-            array.resolve_placement_request(devices[1].into()).unwrap(),
-            Placement::new(other_mesh, Sharding::replicated(mesh.logical_mesh().clone(), 1))
-                .unwrap()
-                .with_memory(Memory::Device),
-        );
-        let configured = session.with_device_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        assert_eq!(
-            array.resolve_placement_request(configured.placement(sharding).unwrap().into()).unwrap(),
-            replicated
-        );
-    }
-
-    #[test]
-    fn test_array_resolve_placement_request_in_place() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            mesh.clone(),
-            Some(sharding.clone()),
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-
-        // An in-place target resolves to the mesh and the sharding of the array, with the memory and the layout that
-        // it names, and without them the array keeps its own.
-        let memory = Memory::Host { pinned: true };
-        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
-        let placement = Placement::new(mesh.clone(), sharding).unwrap();
-        assert_eq!(
-            array
-                .resolve_placement_request(PlacementRequest::InPlace {
-                    memory: Some(memory),
-                    layout: Some(layout.clone()),
-                })
-                .unwrap(),
-            placement.clone().with_memory(memory).with_layout(layout.clone()),
-        );
-        assert_eq!(
-            array
-                .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) })
-                .unwrap(),
-            placement.with_layout(layout),
-        );
-
-        // An in-place target that names neither a memory nor a layout changes nothing, so it is rejected.
-        let error = array
-            .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: None })
-            .unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), "`place` in-place target must name a memory or a layout");
-    }
-
-    #[test]
     fn test_placement_options_new() {
         let target = PlacementRequest::from(Device::new(3, 0));
         let options: PlacementOptions = PlacementOptions::new(Some(target.clone()), None, Some(true), Some(false));
@@ -2549,27 +2211,8 @@ mod tests {
         assert_eq!(options.donate(), Some(&true));
         assert_eq!(options.may_alias(), Some(&false));
         assert_eq!(options.into_parts(), (Some(target), None, Some(true), Some(false)));
-    }
 
-    #[test]
-    fn test_placement_options_default() {
-        assert_eq!(PlacementOptions::default().into_parts(), (None, None, None, None));
-
-        // The default has the standard prefix types, so a call site needs no annotation, and a builder function then
-        // replaces the prefix type of the option that it sets.
-        let options = PlacementOptions::default().with_target(Device::new(1, 0));
-        assert_eq!(options.into_parts(), (Some(Device::new(1, 0)), None, None, None));
-
-        // Both ordinary downstream spellings of the default compile without generic arguments and place a value.
-        let session = Session::builder().client(execution_client()).build().unwrap();
-        let placed = session.place(3f32, PlacementOptions::default()).unwrap();
-        assert_eq!(placed.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.]);
-        assert!(!placed.is_committed());
-        let options: PlacementOptions = Default::default();
-        let placed = session.place(3f32, options).unwrap();
-        assert_eq!(placed.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.]);
-
-        // Unset options with another prefix type come from the constructor, as the default has the standard types.
+        // Unset options with another prefix type than the standard ones come from the constructor.
         let options = PlacementOptions::<Device>::new(None, None, None, None);
         assert_eq!(options.into_parts(), (None, None, None, None));
     }
@@ -2578,12 +2221,7 @@ mod tests {
     fn test_placement_options_with_target() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let devices = session.addressable_devices().unwrap();
 
         // The destination changes its type, and the other options keep theirs.
         let options = PlacementOptions::default().with_may_alias(Some(false)).with_target((Some(devices[1]), None));
@@ -2599,12 +2237,7 @@ mod tests {
     fn test_placement_options_with_source() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let devices = session.addressable_devices().unwrap();
         let array = session.place(2.5f32, PlacementOptions::to(devices[0])).unwrap();
 
         // The source changes its type, and it is validated against the type of the array leaf, whereas the devices that
@@ -2652,14 +2285,11 @@ mod tests {
         let shares_buffer =
             |placed: &Array| Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap());
 
-        // A forced copy needs no destination, and the copy shares no buffer with the input.
+        // A forced copy needs no target, and the copy shares no buffer with the input.
         let options = PlacementOptions::default().with_may_alias(Some(false));
         assert_eq!(options.clone().into_parts(), (None, None, None, Some(Some(false))));
         let copied = session.place(array.clone(), options).unwrap();
         assert!(!shares_buffer(&copied));
-        assert_eq!(copied.mesh(), array.mesh());
-        assert_eq!(copied.r#type(), array.r#type());
-        assert_eq!(shard_values(&copied), vec![vec![2.5]]);
         let kept = session.place(array.clone(), PlacementOptions::default().with_may_alias(Some(true))).unwrap();
         assert!(shares_buffer(&kept));
 
@@ -2668,8 +2298,6 @@ mod tests {
         assert_eq!(options.clone().into_parts(), (None, None, None, Some(false)));
         let copied = session.place(array.clone(), options).unwrap();
         assert!(!shares_buffer(&copied));
-        assert_eq!(copied.mesh(), array.mesh());
-        assert_eq!(shard_values(&copied), vec![vec![2.5]]);
         let kept = session.place(array.clone(), PlacementOptions::default().with_may_alias(true)).unwrap();
         assert!(shares_buffer(&kept));
 
@@ -2677,7 +2305,6 @@ mod tests {
         let options = PlacementOptions::default().with_may_alias((false, true));
         let (copied, kept) = session.place((array.clone(), array.clone()), options).unwrap();
         assert!(!shares_buffer(&copied));
-        assert_eq!(shard_values(&copied), vec![vec![2.5]]);
         assert!(shares_buffer(&kept));
 
         // An optional leaf can leave its branch unspecified while the other branch requests a copy.
@@ -2691,2216 +2318,39 @@ mod tests {
     fn test_placement_options_to() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let devices = session.addressable_devices().unwrap();
         assert_eq!(PlacementOptions::to(devices[1]).into_parts(), (Some(devices[1]), None, None, None));
 
-        // The destination alone fixes the types of the other options, whether it is a raw device, a placement request,
-        // or a tuple prefix.
+        // The target alone fixes the types of the other options, whether it is a raw device or a placement request.
         let scalar = session.place(2.5f32, PlacementOptions::to(devices[1])).unwrap();
         assert_eq!(scalar.mesh().devices(), [devices[1]]);
         assert!(scalar.is_committed());
         let moved = session.place(scalar, PlacementOptions::to(PlacementRequest::from(devices[0]))).unwrap();
         assert_eq!(moved.mesh().devices(), [devices[0]]);
         assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
-        let (placed, uploaded) = session.place((1f32, 2f32), PlacementOptions::to((Some(devices[1]), None))).unwrap();
-        assert_eq!(placed.mesh().devices(), [devices[1]]);
-        assert!(placed.is_committed());
-        assert_eq!(uploaded.mesh().devices(), [devices[0]]);
-        assert!(!uploaded.is_committed());
     }
 
     #[test]
-    fn test_place_input_from() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let array = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
-        let complex = Complex::new(1.5f32, -2.);
-        let low_precision = f8e4m3fn::from_f32(0.5).unwrap();
+    fn test_placement_options_default() {
+        assert_eq!(PlacementOptions::default().into_parts(), (None, None, None, None));
 
-        // Every scalar that a host array can hold converts into a host value, including complex and low precision
-        // scalars, which are not leaves on their own, so one tree can place them together with arrays.
-        assert!(matches!(
-            PlaceInput::from(complex),
-            PlaceInput::Host(host) if host == CoreArray::scalar(complex).unwrap(),
-        ));
-        let (complex_array, low_precision_array, array) = session
-            .place(
-                (PlaceInput::from(complex), PlaceInput::from(low_precision), PlaceInput::from(array)),
-                PlacementOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(complex_array.data_type(), DataType::C64);
-        assert_eq!(complex_array.copy_to_host().unwrap().elements::<Complex<f32>>().unwrap(), vec![complex]);
-        assert_eq!(low_precision_array.data_type(), DataType::F8E4M3FN);
-        assert_eq!(low_precision_array.copy_to_host().unwrap().elements::<f8e4m3fn>().unwrap(), vec![low_precision]);
-        assert_eq!(shard_values(&array), vec![vec![1., 2.]]);
+        // The default has the standard prefix types, so a call site needs no annotation, and a builder function then
+        // replaces the prefix type of the option that it sets.
+        let options = PlacementOptions::default().with_target(Device::new(1, 0));
+        assert_eq!(options.into_parts(), (Some(Device::new(1, 0)), None, None, None));
+
+        // Both ordinary downstream spellings of the default compile without generic arguments and place a value.
+        let session = Session::builder().client(execution_client()).build().unwrap();
+        let placed = session.place(3f32, PlacementOptions::default()).unwrap();
+        assert_eq!(placed.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.]);
+        assert!(!placed.is_committed());
+        let options: PlacementOptions = Default::default();
+        let placed = session.place(3f32, options).unwrap();
+        assert_eq!(placed.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.]);
     }
 
     #[test]
-    fn test_place_input_place_parameter() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let upload = || {
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        assert!(matches!(PlaceInput::from(true), PlaceInput::Host(host) if host == CoreArray::scalar(true).unwrap()));
-        assert!(matches!(PlaceInput::from(upload()), PlaceInput::Runtime(_)));
-
-        // One tree mixes host values and arrays, and the destination prefix broadcasts over both kinds of leaves.
-        let array = upload();
-        let buffer = Arc::downgrade(array.shards()[0].buffer().unwrap());
-        let options = PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(
-            Some(PlacementRequest::from(devices[1])),
-            None,
-            None,
-            Some(Some(false)),
-        );
-        let (scalar, vector, placed) = session
-            .place(
-                (
-                    PlaceInput::from(2.5f32),
-                    PlaceInput::from(CoreArray::vector(vec![3i32, 4]).unwrap()),
-                    PlaceInput::from(array),
-                ),
-                options,
-            )
-            .unwrap();
-        assert_eq!(scalar.mesh().devices(), [devices[1]]);
-        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
-        assert_eq!(vector.mesh().devices(), [devices[1]]);
-        assert_eq!(vector.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![3, 4]);
-        assert_eq!(placed.mesh().devices(), [devices[1]]);
-        assert_eq!(shard_values(&placed), vec![vec![1., 2.]]);
-        assert!(buffer.upgrade().is_none());
-
-        // The source prefix also broadcasts over both kinds of leaves, and only the array leaf validates it.
-        let options = |source: PlacementRequest| {
-            PlacementOptions::<PlacementRequest, PlacementRequest>::new(None, Some(source), None, None)
-        };
-        let (scalar, kept) = session
-            .place((PlaceInput::from(1u8), PlaceInput::from(upload())), options(PlacementRequest::from(devices[0])))
-            .unwrap();
-        assert_eq!(scalar.mesh().devices(), [devices[0]]);
-        assert_eq!(scalar.copy_to_host_bytes().unwrap(), vec![1u8]);
-        assert_eq!(kept.mesh().devices(), [devices[0]]);
-        let pinned = PlacementRequest::from(Memory::Host { pinned: true });
-        let error = session.place((PlaceInput::from(1u8), PlaceInput::from(upload())), options(pinned)).unwrap_err();
-        let (path, error) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$.1");
-        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-    }
-
-    #[test]
-    fn test_array_into_unaliased() {
-        let client = cpu_client(2);
-        let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
-        let upload = || {
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        let buffer_addresses =
-            |array: &Array| array.shards().iter().map(|shard| Arc::as_ptr(shard.buffer().unwrap())).collect::<Vec<_>>();
-
-        // An array that is the only handle of its buffers is returned as it is.
-        let array = upload();
-        let addresses = buffer_addresses(&array);
-        let unaliased = array.into_unaliased().unwrap();
-        assert_eq!(buffer_addresses(&unaliased), addresses);
-
-        // Only the buffers that another handle shares are copied, and the others are kept.
-        let array = upload();
-        let addresses = buffer_addresses(&array);
-        let native_addresses = native_buffer_addresses(&array);
-        let held = Arc::clone(array.shards()[0].buffer().unwrap());
-        let unaliased = array.into_unaliased().unwrap();
-        assert!(!Arc::ptr_eq(unaliased.shards()[0].buffer().unwrap(), &held));
-        assert_ne!(native_buffer_addresses(&unaliased)[0], native_addresses[0]);
-        assert_eq!(buffer_addresses(&unaliased)[1], addresses[1]);
-        assert_eq!(native_buffer_addresses(&unaliased)[1], native_addresses[1]);
-        assert_eq!(shard_values(&unaliased), vec![vec![1., 2.]; 2]);
-
-        // A clone shares every buffer, so all of them are copied.
-        let array = upload();
-        let unaliased = array.clone().into_unaliased().unwrap();
-        for (unaliased_shard, shard) in unaliased.shards().iter().zip(array.shards()) {
-            assert!(!Arc::ptr_eq(unaliased_shard.buffer().unwrap(), shard.buffer().unwrap()));
-        }
-        for (unaliased_address, address) in
-            native_buffer_addresses(&unaliased).into_iter().zip(native_buffer_addresses(&array))
-        {
-            assert_ne!(unaliased_address, address);
-        }
-        assert_eq!(unaliased.r#type(), array.r#type());
-        assert_eq!(unaliased.mesh(), array.mesh());
-        assert_eq!(unaliased.sharding(), array.sharding());
-        assert_eq!(shard_values(&unaliased), vec![vec![1., 2.]; 2]);
-
-        // The copies keep the commitment of the array.
-        let array = upload().with_committed(false);
-        let unaliased = array.clone().into_unaliased().unwrap();
-        assert!(!unaliased.is_committed());
-        assert!(array.into_unaliased().unwrap().with_committed(true).is_committed());
-    }
-
-    #[test]
-    fn test_array_relocatable_type_matches_value_array() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let (named_primal, movable) = place_jvp_inputs(&session, devices[1]);
-        let named_tangent = movable.place(&named_primal.placement().unwrap(), None).unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]);
-        let committed = primal.place(&devices[1], None).unwrap();
-
-        // The saved identity keeps whichever tangent its declaration admits. A movable primal leaves its
-        // declaration open, while a committed anonymous primal requires an anonymous or relocatable tangent.
-        let check = |primal: Array, tangent: Array, expected| {
-            let (_, pushforward) = differentiate_at(primal.clone()).linearize(Ok).unwrap();
-            let through_array = pushforward.apply(tangent.clone()).map(|array| observe_place_jvp(&array));
-
-            let (_, pushforward) = session.differentiate_at(Value::Array(primal)).linearize(Ok).unwrap();
-            let through_value = pushforward.apply(Value::Array(tangent)).and_then(|output| {
-                let array = ValueProjection::<ArrayType>::into_projected(output)?;
-                Ok(observe_place_jvp(&array))
-            });
-            assert_eq!(through_array, expected);
-            assert_eq!(through_value, expected);
-        };
-        check(primal, named_tangent.clone(), Ok((devices[1], true, vec![3., 4.])));
-        check(committed.clone(), movable, Ok((devices[0], false, vec![3., 4.])));
-        check(
-            committed,
-            named_tangent,
-            Err(ProgramError::MalformedProgram(
-                "pushforward tangent 0 has type f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}] \
-                 but its primal boundary requires tangent type f32[2]"
-                    .into(),
-            )),
-        );
-    }
-
-    #[test]
-    fn test_array_relocatable_type_survives_generic_array_ir_wrapping() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let second = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 1);
-        let mesh = DeviceMesh::new(mesh, vec![second]).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let upload = |mesh, sharding| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh, sharding, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        let named = upload(Some(mesh), Some(sharding));
-        let anonymous = upload(None, None);
-        for movable in [anonymous.clone(), named.clone().with_committed(false)] {
-            let declaration = CoreValue::relocatable_type(&movable).unwrap();
-            let movable = ArrayIrValue::Array(movable);
-            assert_eq!(CoreValue::relocatable_type(&movable), Some(ArrayIrType::Array(declaration)));
-            let primal = ArrayIrValue::Array(named.clone());
-            let dual = DifferentiationDual::new(primal, movable.clone()).unwrap();
-            assert_eq!(dual.tangent(), &ryft_core::MaybeZero::Value(movable));
-        }
-
-        let committed = ArrayIrValue::Array(anonymous.place(&second, None).unwrap());
-        let named = ArrayIrValue::Array(named);
-        for (primal, tangent, message) in [
-            (
-                named.clone(),
-                committed.clone(),
-                "tangent type f32[2] does not match type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] \
-                 required by primal type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}]",
-            ),
-            (
-                committed,
-                named,
-                "tangent type f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] does not match type f32[2] \
-                 required by primal type f32[2]",
-            ),
-        ] {
-            assert!(matches!(
-                DifferentiationDual::new(primal, tangent),
-                Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message: actual })))
-                    if actual == message,
-            ));
-        }
-    }
-
-    #[test]
-    fn test_place_operation_vjp_accepts_relocatable_seeds() {
-        // The VJP of placing an uncommitted upload on the first device onto a named mesh of the second device accepts
-        // an uncommitted seed on the first device, which may be placed as the cotangent type states, as well as a seed
-        // on that mesh, through an `Array` and through its `Value::Array` representation, and returns the cotangent
-        // to the first device, as JAX does. A seed committed to the first device has the same anonymous abstract
-        // sharding. The pullback accepts it and replays the transposed placement on its actual devices (refer to
-        // `test_array_place_pullback_uses_the_seed_on_its_own_devices`).
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let target = Placement::new(mesh.clone(), Sharding::replicated(logical_mesh.clone(), 1)).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let upload = |values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(values)).unwrap()
-        };
-        let seeds = [
-            upload(&[5., 6.]),
-            Array::from_host_buffer(
-                &session,
-                r#type.clone(),
-                mesh,
-                Some(Sharding::replicated(logical_mesh, 1)),
-                values_to_bytes(&[5f32, 6.]),
-            )
-            .unwrap(),
-            upload(&[5., 6.]).to_placement(&session, devices[0]).unwrap(),
-        ];
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let mut outcomes = Vec::new();
-        for seed in seeds {
-            let through_array = differentiate_at(upload(&[1., 2.]))
-                .vjp(|x| x.place(&target, None))
-                .map_err(|error| error.to_string())
-                .and_then(|(_, pullback)| pullback.apply_materialized(seed.clone()).map_err(|error| error.to_string()))
-                .map(observe);
-            let through_value = session
-                .differentiate_at(Value::Array(upload(&[1., 2.])))
-                .vjp(|x| x.place(&target, None))
-                .map_err(|error| error.to_string())
-                .and_then(|(_, pullback)| {
-                    let cotangent =
-                        pullback.apply_materialized(Value::Array(seed)).map_err(|error| error.to_string())?;
-                    ValueProjection::<ArrayType>::into_projected(cotangent).map_err(|error| error.to_string())
-                })
-                .map(observe);
-            outcomes.push(vec![through_array, through_value]);
-        }
-        // The transposed placement has a target (where the primal lived), so its result is committed to it.
-        let accepted = Ok((vec![devices[0].id()], vec![5., 6.], true));
-        assert_eq!(outcomes, vec![vec![accepted.clone(), accepted.clone()]; 3]);
-
-        // `Session::place` admits a source on that mesh for the uncommitted upload by the same rule and leaves it where
-        // it lives, while it still rejects that source for the committed array.
-        let source = PlacementRequest::from(target);
-        let options = || PlacementOptions::default().with_source(source.clone());
-        assert_eq!(
-            session.place(upload(&[1., 2.]), options()).map(observe).ok(),
-            Some((vec![devices[0].id()], vec![1., 2.], false)),
-        );
-        let committed = upload(&[1., 2.]).to_placement(&session, devices[0]).unwrap();
-        assert_eq!(
-            session.place(committed, options()).unwrap_err().to_string(),
-            "`place` source sharding `{mesh<['q'=1:explicit]>, [{}]}` does not match the input sharding \
-             `{mesh<['device'=1:auto]>, [{}]}`",
-        );
-    }
-
-    #[test]
-    fn test_place_operation_keeps_reduction_state_checks_for_relocatable_sources() {
-        // An uncommitted upload with a pending minimum (and a pending sum) over the auto axis of its anonymous mesh,
-        // which its type omits, is relocatable. A replicated target on the other device would complete that reduction,
-        // which a placement cannot do, and a source that names only a memory must not change that through
-        // `Session::place` or `Place::place`, because the relocatable type relaxes only the match of the source.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let logical_mesh = LogicalMesh::single_device();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![second_device]).unwrap();
-        let replicated = Sharding::replicated(logical_mesh, 1);
-        let target = Placement::new(mesh, replicated.clone()).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let rejection =
-            "`place` cannot change reduction state; use a reduction (or the corresponding collective) instead";
-        for kind in [UnreducedKind::Min, UnreducedKind::Sum] {
-            let sharding =
-                replicated.clone().with_unreduced_axes(["device"]).unwrap().with_unreduced_kind(kind).unwrap();
-            let bytes = values_to_bytes(&[1f32, 2.]);
-            let input = Array::from_host_buffer(&session, r#type.clone(), None, Some(sharding), bytes).unwrap();
-            assert_eq!(CoreValue::relocatable_type(&input), Some(r#type.clone()));
-            let outcomes = vec![
-                session
-                    .place(input.clone(), PlacementOptions::to(target.clone()))
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                session
-                    .place(input.clone(), PlacementOptions::to(target.clone()).with_source(Memory::Device))
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
-                input.place(&target, &Memory::Device).map(|_| ()).map_err(|error| error.to_string()),
-            ];
-            assert_eq!(outcomes, vec![Err(rejection.to_string()); 3]);
-        }
-    }
-
-    #[test]
-    fn test_place_operation_admits_relocatable_sources_on_every_path() {
-        // A targetless placement of an uncommitted upload on the first device with a source on a named mesh of the
-        // second device is admitted, because the upload may be placed there first, and leaves the upload where it is,
-        // uncommitted. Eager placement, linearization, the fused JVP, batching, and the direct interpretation of the
-        // operation all admit it by the same rule, as pinned JAX admits `device_put` with such a source eagerly, under
-        // `jvp`, and under `vmap`.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let first = devices[0].id();
-
-        let options = PlacementOptions::default().with_source(source.clone());
-        assert_eq!(
-            session.place(upload(&[2], &[3., 4.]), options).map(observe).map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4.], false)),
-        );
-        assert_eq!(
-            upload(&[2], &[3., 4.])
-                .place(&Option::<Placement>::None, &source)
-                .map(observe)
-                .map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4.], false)),
-        );
-        let (primal, pushforward) = differentiate_at(upload(&[2], &[3., 4.]))
-            .linearize(|x| x.place(&Option::<Placement>::None, &source))
-            .unwrap();
-        assert_eq!(observe(primal), (vec![first], vec![3., 4.], false));
-        assert_eq!(observe(pushforward.apply(upload(&[2], &[5., 6.])).unwrap()), (vec![first], vec![5., 6.], false));
-        let (primal, tangent) = differentiate_at(upload(&[2], &[3., 4.]))
-            .jvp(upload(&[2], &[5., 6.]), |x| x.place(&Option::<Placement>::None, &source))
-            .unwrap();
-        assert_eq!(
-            (observe(primal), observe(tangent)),
-            ((vec![first], vec![3., 4.], false), (vec![first], vec![5., 6.], false)),
-        );
-        let batched = batch(
-            |x| x.place(&Option::<Placement>::None, &source),
-            upload(&[2, 2], &[3., 4., 5., 6.]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        );
-        assert_eq!(
-            batched.map(observe).map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4., 5., 6.], false)),
-        );
-        let input = upload(&[2], &[3., 4.]);
-        let operation = PlaceOperation::new(None, source.clone());
-        let interpreted = InterpretableOperation::interpret(&operation, &input.domain(), &EmptyRegionDriver, &[input])
-            .map(|outputs| outputs.into_iter().map(observe).collect::<Vec<_>>())
-            .map_err(|error| error.to_string());
-        assert_eq!(interpreted, Ok(vec![(vec![first], vec![3., 4.], false)]));
-
-        let committed = upload(&[2], &[3., 4.]).to_placement(&session, devices[0]).unwrap();
-        let rejection = format!(
-            "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input sharding `{}`",
-            source.sharding(),
-            committed.sharding(),
-        );
-        assert_eq!(
-            differentiate_at(committed.clone())
-                .linearize(|x| x.place(&Option::<Placement>::None, &source))
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(rejection.clone()),
-        );
-        assert_eq!(
-            committed.place(&Option::<Placement>::None, &source).map(|_| ()).map_err(|error| error.to_string()),
-            Err(rejection),
-        );
-    }
-
-    #[test]
-    fn test_session_place_uploads_host_leaves() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-
-        // Without a destination, a host leaf is uploaded to the first local device without being committed to it, also
-        // when the session has a mesh.
-        let scalar = session.place(2.5f32, PlacementOptions::default()).unwrap();
-        let flag = session.place(true, PlacementOptions::default()).unwrap();
-        assert_eq!(scalar.r#type().into_owned().with_sharding(None).unwrap(), ArrayType::scalar(DataType::F32));
-        assert_eq!(scalar.mesh().devices(), [Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()]);
-        assert!(!scalar.is_committed());
-        let meshed_session = session.with_device_mesh(domain_mesh(client, "x", 2));
-        assert!(!meshed_session.place(2.5f32, PlacementOptions::default()).unwrap().is_committed());
-        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
-        assert_eq!(flag.data_type(), DataType::Boolean);
-        assert_eq!(flag.copy_to_host_bytes().unwrap(), vec![1u8]);
-
-        // A destination device places the leaf on that device.
-        let placed = session
-            .place(
-                bf16::from_f32(1.5),
-                PlacementOptions::new(
-                    Some(PlacementRequest::from(device)),
-                    Option::<PlacementRequest>::None,
-                    Option::<bool>::None,
-                    Option::<Option<bool>>::None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(placed.mesh().devices(), [device]);
-        assert!(placed.is_committed());
-        assert_eq!(placed.copy_to_host_bytes().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
-    }
-
-    #[test]
-    fn test_session_place_uploads_reference_backend_arrays() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let matrix = CoreArray::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap();
-        let array = session.place(matrix, PlacementOptions::default()).unwrap();
-        assert_eq!(
-            array.r#type().into_owned().with_sharding(None).unwrap(),
-            ArrayType::new_static(DataType::F32, [2, 3]),
-        );
-        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
-
-        // A token is a valid value of the reference backend, but effect tokens are not arrays, so its upload is
-        // rejected before anything is allocated or uploaded, also when it is given as a `PlaceInput`.
-        let token = || CoreArray::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap();
-        let message =
-            "tokens are created by effectful operations and cannot be constructed, uploaded, or placed as arrays";
-        assert_eq!(
-            session.place(token(), PlacementOptions::default()).map(|_| ()).map_err(|error| error.to_string()),
-            Err(message.to_string()),
-        );
-        assert_eq!(
-            session
-                .place(PlaceInput::<Array>::Host(token()), PlacementOptions::default())
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(message.to_string()),
-        );
-    }
-
-    #[test]
-    fn test_session_place_validates_host_storage() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-
-        // The storage of a host array can be mutated safely, so its upload validates the encoding of its elements
-        // rather than trusting it, with and without an explicit layout, and reports an invalid Boolean byte.
-        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
-        for r#type in [
-            ArrayType::new_static(DataType::Boolean, [1]),
-            ArrayType::new_static(DataType::Boolean, [1]).with_layout(layout),
-        ] {
-            let mut host = CoreArray::new(r#type, vec![1]).unwrap();
-            host.storage_bytes_mut()[0] = 2;
-            let error = session.place(host, PlacementOptions::default()).unwrap_err();
-            assert_eq!(error.to_string(), "array element 0 has invalid `bool` byte encoding [2]");
-        }
-    }
-
-    #[test]
-    fn test_session_place_tracks_local_assignment() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = session.target().unwrap().devices()[1].device();
-        let pinned = Memory::Host { pinned: true };
-
-        // A host value uploaded without a destination, or with one that names only its storage, lives on a device that
-        // this process chose on its own, and a destination that names a device does not.
-        let local = session.place(1f32, PlacementOptions::default()).unwrap();
-        assert!(local.is_locally_assigned());
-        assert!(session.place(1f32, PlacementOptions::to(pinned)).unwrap().is_locally_assigned());
-        assert!(!session.place(1f32, PlacementOptions::to(device)).unwrap().is_locally_assigned());
-
-        // An array keeps the fact without a destination and with an in-place one, eagerly and when a staged in-place
-        // placement executes on it, and a destination that names a device clears it.
-        assert!(session.place(local.clone(), PlacementOptions::default()).unwrap().is_locally_assigned());
-        assert!(session.place(local.clone(), PlacementOptions::to(pinned)).unwrap().is_locally_assigned());
-        let staged =
-            session.bind(PlaceOperation::new(pinned, None), Vec::new(), &[Value::Array(local.clone())]).unwrap();
-        let [Value::Array(staged)] = staged.as_slice() else { panic!("placing an array must produce an array") };
-        assert!(staged.is_locally_assigned());
-        assert!(!session.place(local, PlacementOptions::to(device)).unwrap().is_locally_assigned());
-    }
-
-    #[test]
-    fn test_session_place_uploads_host_values_without_target_to_first_device_of_client() {
-        // A host value that `Session::place` uploads without a destination (or with one that names only its storage)
-        // goes to the first addressable device of the client, whether or not the session has a default mesh, and is a
-        // choice of this process alone (i.e., locally assigned), uncommitted without a destination. The default mesh of
-        // a session is the analogue of `jax.set_mesh`, under which JAX 0.12.0.1 keeps such a value on its default
-        // device, uncommitted, for a mesh of one device and of two (`(Explicit,) device_put:
-        // SingleDeviceSharding(device=CpuDevice(id=0)) False`), while eager results without array inputs go to the
-        // mesh, committed, as `Array::from_host_buffer` without a mesh does here. Uploading onto the default mesh would
-        // treat the value of each process (e.g., its own data batch) as one global value that every process supplied.
-        let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let single = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let session = Session::builder().client(client).build().unwrap();
-        let describe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
-            assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
-            let (committed, locally_assigned) = (array.is_committed(), array.is_locally_assigned());
-            format!("devices {devices:?}, committed {committed}, locally assigned {locally_assigned}")
-        };
-        let mut outcomes = Vec::new();
-        for (name, session) in [
-            ("no default mesh", session.clone()),
-            ("default mesh on CPU 1", session.with_device_mesh(DeviceMesh::new(single, vec![devices[1]]).unwrap())),
-            ("default mesh on both CPUs", session.with_device_mesh(domain_mesh(client, "x", 2))),
-        ] {
-            let placed = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default());
-            let pinned = PlacementOptions::to(Memory::Host { pinned: true });
-            let in_place = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), pinned);
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            let uploaded = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.]));
-            outcomes.push(format!("{name}: place {}", describe(placed.unwrap())));
-            outcomes.push(format!("{name}: place in place {}", describe(in_place.unwrap())));
-            outcomes.push(format!("{name}: from_host_buffer {}", describe(uploaded.unwrap())));
-        }
-        assert_eq!(
-            outcomes.join("\n"),
-            indoc! {"
-                no default mesh: place devices [0], committed false, locally assigned true
-                no default mesh: place in place devices [0], committed true, locally assigned true
-                no default mesh: from_host_buffer devices [0], committed false, locally assigned true
-                default mesh on CPU 1: place devices [0], committed false, locally assigned true
-                default mesh on CPU 1: place in place devices [0], committed true, locally assigned true
-                default mesh on CPU 1: from_host_buffer devices [1], committed true, locally assigned false
-                default mesh on both CPUs: place devices [0], committed false, locally assigned true
-                default mesh on both CPUs: place in place devices [0], committed true, locally assigned true
-                default mesh on both CPUs: from_host_buffer devices [0, 1], committed true, locally assigned false"},
-        );
-    }
-
-    #[test]
-    fn test_session_place_applies_memory_and_layout() {
-        let client = cpu_client(2);
-        let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let sharding = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let memory = Memory::Host { pinned: true };
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let values = vec![1f32, 2., 3., 4., 5., 6., 7., 8.];
-        let placement = Placement::new(mesh.clone(), sharding.clone())
-            .unwrap()
-            .with_layout(layout.clone())
-            .with_memory(memory);
-        let uploaded = session
-            .place(
-                CoreArray::matrix(4, 2, values.clone()).unwrap(),
-                PlacementOptions::<Placement>::new(Some(placement.clone()), None, None, None),
-            )
-            .unwrap();
-
-        assert_eq!(uploaded.mesh(), &mesh);
-        assert_eq!(uploaded.sharding(), &sharding);
-        assert_eq!(uploaded.r#type().memory(), memory);
-        assert_eq!(uploaded.layout(), Some(&layout));
-        for shard in uploaded.addressable_shards() {
-            let buffer = shard.buffer().unwrap();
-            assert_eq!(buffer.memory().unwrap().kind().unwrap(), "pinned_host");
-            assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
-        }
-        assert_eq!(uploaded.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
-
-        // An existing leaf can change both options without changing its mesh or shard slices.
-        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
-        let target = PlacementRequest::from(
-            session.placement(sharding.clone()).unwrap().with_memory(Memory::Device).with_layout(layout.clone()),
-        );
-        let moved = session
-            .place(uploaded, PlacementOptions::<_, _>::new(Some(target), Some(placement), None, None))
-            .unwrap();
-        assert_eq!(moved.mesh(), &mesh);
-        assert_eq!(moved.sharding(), &sharding);
-        assert_eq!(moved.r#type().memory(), Memory::Device);
-        assert_eq!(moved.layout(), Some(&layout));
-        for shard in moved.addressable_shards() {
-            let buffer = shard.buffer().unwrap();
-            assert_eq!(buffer.memory().unwrap(), buffer.device().unwrap().default_memory().unwrap());
-            assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
-        }
-        assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
-    }
-
-    #[test]
-    fn test_placement_pads_short_shardings_with_replicated_dimensions() {
-        let client = cpu_client(2);
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let logical_mesh = mesh.logical_mesh().clone();
-        let split = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let placement = session.placement(split.clone()).unwrap();
-        let split_matrix = Sharding::new(
-            logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let vector = CoreArray::vector(vec![1i32, 2, 3, 4]).unwrap();
-        let matrix = CoreArray::matrix(4, 3, (0..12).collect::<Vec<i32>>()).unwrap();
-        let shard_elements = |array: &Array| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| values_from_bytes::<i32>(&shard.copy_to_host_bytes().unwrap()))
-                .collect::<Vec<_>>()
-        };
-
-        // One sharding shorter than the rank of a leaf leaves the omitted trailing dimensions replicated, so one
-        // destination splits a vector and a matrix along their first dimension, and a rank zero sharding replicates
-        // both. The resolved shardings have the rank of each leaf.
-        let (placed_vector, placed_matrix) =
-            session.place((vector.clone(), matrix.clone()), PlacementOptions::to(placement.clone())).unwrap();
-        assert_eq!(placed_vector.sharding(), &split);
-        assert_eq!(shard_buffer_dimensions(&placed_vector), vec![vec![2], vec![2]]);
-        assert_eq!(shard_elements(&placed_vector), vec![vec![1, 2], vec![3, 4]]);
-        assert!(placed_vector.is_committed());
-        assert_eq!(placed_matrix.sharding(), &split_matrix);
-        assert_eq!(shard_buffer_dimensions(&placed_matrix), vec![vec![2, 3], vec![2, 3]]);
-        assert_eq!(shard_elements(&placed_matrix), vec![(0..6).collect::<Vec<_>>(), (6..12).collect()]);
-        assert!(placed_matrix.is_committed());
-        let replicated = Sharding::replicated(logical_mesh.clone(), 0);
-        let (replicated_vector, replicated_matrix) = session
-            .place((vector.clone(), matrix.clone()), PlacementOptions::to(session.placement(replicated).unwrap()))
-            .unwrap();
-        assert_eq!(replicated_vector.sharding(), &Sharding::replicated(logical_mesh.clone(), 1));
-        assert_eq!(shard_buffer_dimensions(&replicated_vector), vec![vec![4], vec![4]]);
-        assert_eq!(replicated_matrix.sharding(), &Sharding::replicated(logical_mesh.clone(), 2));
-        assert_eq!(shard_buffer_dimensions(&replicated_matrix), vec![vec![4, 3], vec![4, 3]]);
-        assert_eq!(shard_elements(&replicated_matrix), vec![(0..12).collect::<Vec<_>>(); 2]);
-
-        // Arrays resolve short destinations and sources in the same way, also from a resolved placement.
-        let resplit = session
-            .place(
-                replicated_matrix.clone(),
-                PlacementOptions::<Placement, Placement>::new(
-                    Some(placement.clone()),
-                    Some(session.placement(Sharding::replicated(logical_mesh.clone(), 1)).unwrap()),
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(resplit.mesh(), &mesh);
-        assert_eq!(resplit.sharding(), &split_matrix);
-        assert_eq!(shard_buffer_dimensions(&resplit), vec![vec![2, 3], vec![2, 3]]);
-        assert_eq!(shard_elements(&resplit), vec![(0..6).collect::<Vec<_>>(), (6..12).collect()]);
-        assert!(resplit.is_committed());
-        let checked = session
-            .place(
-                resplit.clone(),
-                PlacementOptions::<PlacementRequest, Placement>::new(None, Some(placement.clone()), None, None),
-            )
-            .unwrap();
-        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), resplit.shards()[0].buffer().unwrap()));
-
-        // Direct placement also pads a short request when borrowing or consuming an array.
-        let request = PlacementRequest::from(placement.clone());
-        let borrowed = replicated_matrix.to_placement(&session, request.clone()).unwrap();
-        let consumed = replicated_matrix.clone().into_placement(&session, request).unwrap();
-        for output in [borrowed, consumed] {
-            assert_eq!(output.sharding(), &split_matrix);
-            assert_eq!(shard_buffer_dimensions(&output), vec![vec![2, 3], vec![2, 3]]);
-            assert_eq!(shard_elements(&output), shard_elements(&resplit));
-        }
-
-        // A traced leaf resolves a short destination for its rank.
-        let input_type = ArrayType::new_static(DataType::I32, [4, 3])
-            .with_sharding(Sharding::replicated(logical_mesh.clone(), 2))
-            .unwrap();
-        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-            |input: CompileTracer| session.place(input, PlacementOptions::to(placement)).unwrap(),
-            input_type,
-            &session,
-            mesh.clone(),
-        )
-        .unwrap();
-        let output = compiled.executable().execute(&session, replicated_matrix).unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(output.sharding(), &split_matrix);
-        assert_eq!(shard_buffer_dimensions(&output), vec![vec![2, 3], vec![2, 3]]);
-        assert_eq!(shard_elements(&output), vec![(0..6).collect::<Vec<_>>(), (6..12).collect()]);
-
-        // A sharding with more dimensions than a leaf is still rejected, with the error of the type rule of `place`
-        // (refer to `test_session_place_reports_type_rule_error_for_destinations_of_higher_rank`).
-        let error = session.place(vector, PlacementOptions::to(session.placement(split_matrix).unwrap())).unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), "`place` target sharding rank (2) does not match the input rank (1)");
-    }
-
-    #[test]
-    fn test_session_place_reports_type_rule_error_for_destinations_of_higher_rank() {
-        // A destination whose sharding has more dimensions than a leaf is rejected with the error of the type rule of
-        // `place` for every kind of leaf, which a source reports as the error of a source.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let placement = || {
-            Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 3))
-                .map(PlacementRequest::from)
-        };
-        let target = || PlacementOptions::to(placement().unwrap());
-        let r#type = ArrayType::new_static(DataType::F32, [4]);
-        let values = [1f32, 2., 3., 4.];
-        let message = format!("`{PLACE_OPERATION_NAME}` target sharding rank (3) does not match the input rank (1)");
-
-        let host = CoreArray::from_elements(r#type.clone(), &values).unwrap();
-        assert_eq!(session.place(host, target()).map(|_| ()).map_err(|error| error.to_string()), Err(message.clone()));
-        let array = Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(&values)).unwrap();
-        let error = session.place(array.clone(), target()).unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), message);
-        let traced = RefCell::new(None);
-        let _: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-            |x: ArrayTracer| {
-                traced.replace(Some(session.place(x.clone(), target()).map(|_| ()).map_err(|error| error.to_string())));
-                x
-            },
-            r#type,
-        );
-        assert_eq!(traced.take(), Some(Err(message)));
-
-        let source =
-            PlacementOptions::<PlacementRequest, PlacementRequest>::new(None, Some(placement().unwrap()), None, None);
-        assert_eq!(
-            session.place(array, source).map(|_| ()).map_err(|error| error.to_string()),
-            Err(format!("`{PLACE_OPERATION_NAME}` source sharding rank (3) does not match the input rank (1)")),
-        );
-    }
-
-    #[test]
-    fn test_session_place_selects_default_memory_for_device_destinations() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]).with_memory(pinned),
-            source_mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        assert_eq!(array.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
-        let is_in_default_memory = |array: &Array| {
-            let buffer = array.shards()[0].buffer().unwrap();
-            buffer.memory().unwrap() == buffer.device().unwrap().default_memory().unwrap()
-        };
-
-        // A bare device destination selects the default memory of that device, both on another device and on the
-        // device that the array already lives on. JAX 0.12.0.1 on CPU does so for another device, and for the same
-        // device only with `may_alias=False`, whereas under default options it raises "Memory kind mismatch with
-        // xla::PjRtBuffers" for the pinned host buffer.
-        for device in [devices[1], devices[0]] {
-            let moved = session.place(array.clone(), PlacementOptions::to(device)).unwrap();
-            assert_eq!(moved.mesh().devices(), [device]);
-            assert_eq!(moved.r#type().memory(), Memory::Device);
-            assert!(is_in_default_memory(&moved));
-            assert_eq!(shard_values(&moved), vec![vec![1., 2.]]);
-            let moved = array.to_placement(&session, device).unwrap();
-            assert_eq!(moved.r#type().memory(), Memory::Device);
-            assert!(is_in_default_memory(&moved));
-        }
-
-        // An explicit memory still applies, and a mesh destination without a memory keeps the memory of the array.
-        let moved = session
-            .place(
-                array.clone(),
-                PlacementOptions::to(PlacementRequest::Device {
-                    device: devices[1],
-                    memory: Some(pinned),
-                    layout: None,
-                }),
-            )
-            .unwrap();
-        assert_eq!(moved.r#type().memory(), pinned);
-        assert_eq!(moved.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
-        let target_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let target =
-            PlacementRequest::from(Placement::new(target_mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap());
-        let moved = session.place(array.clone(), PlacementOptions::to(target)).unwrap();
-        assert_eq!(moved.mesh(), &target_mesh);
-        assert_eq!(moved.r#type().memory(), pinned);
-
-        // A host value placed on a bare device is uploaded to the default memory of that device.
-        let uploaded = session.place(3f32, PlacementOptions::to(devices[1])).unwrap();
-        assert_eq!(uploaded.r#type().memory(), Memory::Device);
-        assert!(is_in_default_memory(&uploaded));
-
-        // A traced value placed on a bare device also selects the default memory of that device.
-        let (value, _) = differentiate_at(array.clone())
-            .vjp(|x| Ok(session.place(x, PlacementOptions::to(devices[1])).unwrap()))
-            .unwrap();
-        assert_eq!(value.mesh().devices(), [devices[1]]);
-        assert_eq!(value.r#type().memory(), Memory::Device);
-        assert!(is_in_default_memory(&value));
-
-        // The core `Place` capability follows the same contract, eagerly and traced, because the type rule of a bare
-        // device request selects that memory for every path.
-        let moved = array.place(&devices[1], None).unwrap();
-        assert_eq!(moved.r#type().memory(), Memory::Device);
-        assert!(is_in_default_memory(&moved));
-        let (value, _) = differentiate_at(array.clone()).vjp(|x| x.place(&devices[1], None)).unwrap();
-        assert_eq!(value.r#type().memory(), Memory::Device);
-        assert!(is_in_default_memory(&value));
-
-        // A bare device source accepts the memory of an array on that device.
-        let checked = session
-            .place(
-                array.clone(),
-                PlacementOptions::<PlacementRequest, PlacementRequest>::new(
-                    None,
-                    Some(PlacementRequest::from(devices[0])),
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
-        assert_eq!(checked.r#type().memory(), pinned);
-    }
-
-    #[test]
-    fn test_session_place_moves_arrays_to_memory_destinations() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let memory_kinds = |array: &Array| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().to_string())
-                .collect::<Vec<_>>()
-        };
-        let is_in_default_memory = |array: &Array| {
-            array.shards().iter().all(|shard| {
-                let buffer = shard.buffer().unwrap();
-                buffer.memory().unwrap() == buffer.device().unwrap().default_memory().unwrap()
-            })
-        };
-
-        // A bare memory leaves an array that is split over two devices on its mesh with its sharding and its values,
-        // and moves its buffers to that memory. The result is committed, as JAX commits the result of `device_put`
-        // onto a memory space.
-        let sharded = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            mesh.clone(),
-            Some(sharding.clone()),
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        let moved = session.place(sharded, PlacementOptions::to(pinned)).unwrap();
-        assert_eq!(moved.mesh(), &mesh);
-        assert_eq!(moved.sharding(), &sharding);
-        assert_eq!(moved.r#type().memory(), pinned);
-        assert_eq!(memory_kinds(&moved), vec!["pinned_host"; 2]);
-        assert_eq!(shard_buffer_dimensions(&moved), vec![vec![2], vec![2]]);
-        assert_eq!(shard_values(&moved), vec![vec![1., 2.], vec![3., 4.]]);
-        assert!(moved.is_committed());
-
-        // The default memory moves it back.
-        let restored = session.place(moved, PlacementOptions::to(Memory::Device)).unwrap();
-        assert_eq!(restored.mesh(), &mesh);
-        assert_eq!(restored.sharding(), &sharding);
-        assert_eq!(restored.r#type().memory(), Memory::Device);
-        assert!(is_in_default_memory(&restored));
-        assert_eq!(shard_values(&restored), vec![vec![1., 2.], vec![3., 4.]]);
-        assert!(restored.is_committed());
-
-        // An uncommitted array on one device stays on that device and is committed, and `Array::to_placement` accepts
-        // a bare memory as well.
-        let single = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
-        assert!(!single.is_committed());
-        for moved in [
-            session.place(single.clone(), PlacementOptions::to(pinned)).unwrap(),
-            single.to_placement(&session, pinned).unwrap(),
-        ] {
-            assert_eq!(moved.mesh(), single.mesh());
-            assert_eq!(moved.sharding(), single.sharding());
-            assert_eq!(moved.r#type().memory(), pinned);
-            assert_eq!(memory_kinds(&moved), vec!["pinned_host"]);
-            assert_eq!(shard_values(&moved), vec![vec![1., 2.]]);
-            assert!(moved.is_committed());
-        }
-    }
-
-    #[test]
-    fn test_session_place_uploads_host_values_to_memory_destinations() {
-        // A bare memory names no devices, so a host value is uploaded to the first addressable device, as without a
-        // destination, in that memory, and the result is committed like the result of every destination.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let uploaded = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::to(pinned)).unwrap();
-        assert_eq!(uploaded.mesh().devices(), [Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()]);
-        assert_eq!(uploaded.r#type().memory(), pinned);
-        assert_eq!(uploaded.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
-        assert_eq!(uploaded.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
-        assert!(uploaded.is_committed());
-    }
-
-    #[test]
-    fn test_session_place_combines_memory_destinations_with_other_destinations() {
-        // One branch of a tree can change only the memory of its leaves while another moves its leaves to a device.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            mesh.clone(),
-            Some(sharding.clone()),
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        let options = PlacementOptions::to((PlacementRequest::from(pinned), PlacementRequest::from(mesh.devices()[1])));
-        let (in_place, on_device) = session.place((array.clone(), array), options).unwrap();
-        assert_eq!(in_place.mesh(), &mesh);
-        assert_eq!(in_place.sharding(), &sharding);
-        assert_eq!(in_place.r#type().memory(), pinned);
-        assert_eq!(shard_values(&in_place), vec![vec![1., 2.], vec![3., 4.]]);
-        assert_eq!(on_device.mesh().devices(), [mesh.devices()[1]]);
-        assert_eq!(on_device.r#type().memory(), Memory::Device);
-        assert_eq!(shard_values(&on_device), vec![vec![1., 2., 3., 4.]]);
-    }
-
-    #[test]
-    fn test_session_place_validates_source_storage_on_every_path() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let array = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
-        let device = array.mesh().devices()[0];
-        let pinned = Memory::Host { pinned: true };
-        let options = |source: &PlacementRequest| {
-            PlacementOptions::<PlacementRequest>::new(None, Some(source.clone()), None, None)
-        };
-
-        // A source states the storage in which a value is expected, whatever its form, so a source in another memory
-        // than the memory of the array is rejected with the error of the type rule of `place` for an array leaf, for a
-        // traced leaf of a staged function, and for a traced leaf of a differentiated function that wraps the array.
-        let error = format!(
-            "`{PLACE_OPERATION_NAME}` source memory `Host[Pinned]` does not match the input type `{}`",
-            array.r#type(),
-        );
-        for source in [
-            PlacementRequest::from(array.placement().unwrap().with_memory(pinned)),
-            PlacementRequest::Device { device, memory: Some(pinned), layout: None },
-            PlacementRequest::from(pinned),
-        ] {
-            let eager = session.place(array.clone(), options(&source));
-            assert_eq!(eager.map(|_| ()).map_err(|error| error.to_string()), Err(error.clone()));
-            // A staging context reports the error of the placement that it stages when tracing completes.
-            let staged = RefCell::new(None);
-            let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-                |x: ArrayTracer| {
-                    staged.replace(session.place(x.clone(), options(&source)).err().map(|error| error.to_string()));
-                    x
-                },
-                array.r#type().into_owned(),
-            );
-            assert_eq!(staged.take().or(traced.err().map(|error| error.to_string())), Some(error.clone()));
-            let differentiated = RefCell::new(None);
-            differentiate_at(array.clone())
-                .jvp(array.clone(), |x| {
-                    let result = session.place(x.clone(), options(&source));
-                    differentiated.replace(result.err().map(|error| error.to_string()));
-                    Ok(x)
-                })
-                .unwrap();
-            assert_eq!(differentiated.take(), Some(error.clone()));
-        }
-
-        // A source in the memory of the array is accepted, and a host leaf ignores its source.
-        let placed = session.place(array.clone(), options(&PlacementRequest::from(Memory::Device))).unwrap();
-        assert!(Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
-        let uploaded = session.place(3f32, options(&PlacementRequest::from(pinned))).unwrap();
-        assert_eq!(uploaded.r#type().memory(), Memory::Device);
-
-        // An in-place source or destination that names neither a memory nor a layout says nothing, so it is rejected
-        // for every kind of leaf before any leaf is placed.
-        let error = session
-            .place(array.clone(), options(&PlacementRequest::InPlace { memory: None, layout: None }))
-            .unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), "`place` in-place source must name a memory or a layout");
-        let host_error =
-            session.place(3f32, options(&PlacementRequest::InPlace { memory: None, layout: None })).unwrap_err();
-        assert_eq!(host_error.to_string(), error.to_string());
-        let error = session
-            .place(array, PlacementOptions::to(PlacementRequest::InPlace { memory: None, layout: None }))
-            .unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), "`place` in-place target must name a memory or a layout");
-    }
-
-    #[test]
-    fn test_session_place_broadcasts_root_placement_over_array_tuple() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let client_devices = client.addressable_devices().unwrap();
-        let source_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![Device::new(client_devices[0].id().unwrap(), client_devices[0].process_index().unwrap())],
-        )
-        .unwrap();
-        let source_sharding = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
-        let first_source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_sharding(source_sharding.clone())
-            .unwrap();
-        let first_source_array = Array::from_host_buffer(
-            &session,
-            first_source_type,
-            source_mesh.clone(),
-            None,
-            values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0]).as_slice(),
-        )
-        .unwrap();
-        let second_source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_sharding(source_sharding)
-            .unwrap();
-        let second_source_array = Array::from_host_buffer(
-            &session,
-            second_source_type,
-            source_mesh,
-            None,
-            values_to_bytes::<f32>(&[10.0, 11.0, 12.0, 13.0]).as_slice(),
-        )
-        .unwrap();
-
-        let target_mesh = domain_mesh(client, "x", 2);
-        let target_sharding =
-            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        let moved_arrays = session
-            .place(
-                (first_source_array, second_source_array),
-                PlacementOptions::new(
-                    Some(PlacementRequest::from(Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap())),
-                    Option::<PlacementRequest>::None,
-                    Option::<bool>::None,
-                    Option::<Option<bool>>::None,
-                ),
-            )
-            .unwrap();
-
-        assert_eq!(
-            moved_arrays.0.sharding().visualize().unwrap().render(false),
-            indoc! {"
-                    ┌─────┬─────┐
-                    │  0  │  1  │
-                    └─────┴─────┘
-                "}
-            .trim_end()
-            .to_string()
-        );
-        assert_eq!(
-            moved_arrays.1.sharding().visualize().unwrap().render(false),
-            indoc! {"
-                    ┌─────┬─────┐
-                    │  0  │  1  │
-                    └─────┴─────┘
-                "}
-            .trim_end()
-            .to_string()
-        );
-        assert_eq!(shard_values(&moved_arrays.0), vec![vec![0.0, 1.0], vec![2.0, 3.0]]);
-        assert_eq!(shard_values(&moved_arrays.1), vec![vec![10.0, 11.0], vec![12.0, 13.0]]);
-    }
-
-    #[test]
-    fn test_session_place_repeats_root_options_over_large_inputs() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let array = session.place(2.5f32, PlacementOptions::to(devices[0])).unwrap();
-        let array_count = 1_000;
-        let input = vec![array.clone(); array_count];
-
-        // Options at the root give every leaf what options that repeat them for every leaf give it.
-        let root_options = PlacementOptions::new(Some(devices[1]), Some(devices[0]), Some(false), Some(Some(false)));
-        let repeated_options = PlacementOptions::new(
-            Some(vec![devices[1]; array_count]),
-            Some(vec![devices[0]; array_count]),
-            Some(vec![false; array_count]),
-            Some(vec![Some(false); array_count]),
-        );
-        let placed = session.place(input.clone(), root_options).unwrap();
-        let expected = session.place(input.clone(), repeated_options).unwrap();
-        assert_eq!(placed.len(), array_count);
-        for (placed, expected) in placed.iter().zip(&expected) {
-            assert_eq!(placed.mesh().devices(), [devices[1]]);
-            assert_eq!(placed.mesh(), expected.mesh());
-            assert_eq!(placed.sharding(), expected.sharding());
-            assert_eq!(placed.r#type(), expected.r#type());
-            assert!(placed.is_committed());
-            assert_eq!(shard_values(placed), vec![vec![2.5]]);
-        }
-
-        // The checks of root options that do not depend on paths still run, before and while each leaf is placed.
-        let options =
-            PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(None, None, Some(true), Some(Some(true)));
-        assert_eq!(
-            session.place(input.clone(), options).map(|_| ()).map_err(|error| error.to_string()),
-            Err("array `$[0]` cannot be donated while `may_alias` is `Some(true)`".to_string()),
-        );
-        let error = session.place(input, PlacementOptions::default().with_source(Memory::Host { pinned: true }));
-        let error = error.map(|_| ()).unwrap_err();
-        let (path, error) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$[0]");
-        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-    }
-
-    #[test]
-    fn test_session_place_keeps_omitted_options_uniform_over_large_inputs() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let array = session.place(2.5f32, PlacementOptions::to(device)).unwrap();
-        let array_count = 4_000;
-        let input = vec![array.clone(); array_count];
-
-        // Omitted and root options are stored once even when the input has many parameters.
-        let structure = input.parameter_structure();
-        let expansion = PlacementOptionValues::from_prefix(None::<PlacementRequest>, &structure);
-        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(None))));
-        let expansion = PlacementOptionValues::from_prefix(Some(false), &structure);
-        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(false)))));
-
-        // Already resident leaves without any option stay where they are.
-        let placed = session.place(input.clone(), PlacementOptions::default()).unwrap();
-        assert_eq!(placed.len(), array_count);
-        for placed in &placed {
-            assert_eq!(placed.mesh(), array.mesh());
-            assert_eq!(placed.sharding(), array.sharding());
-            assert!(placed.is_committed());
-        }
-        assert_eq!(shard_values(&placed[array_count - 1]), vec![vec![2.5]]);
-
-        // The path of a leaf is still reported when one of its options is invalid.
-        let mut donate = vec![false; array_count];
-        donate[array_count - 1] = true;
-        let options = PlacementOptions::default().with_donate(donate).with_may_alias(Some(true));
-        assert_eq!(
-            session.place(input, options).map(|_| ()).map_err(|error| error.to_string()),
-            Err("array `$[3999]` cannot be donated while `may_alias` is `Some(true)`".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_session_place_prepares_the_existing_leaves() {
-        struct Leaf(u8);
-
-        impl Parameter for Leaf {}
-
-        impl Placeable for Leaf {
-            type Output = u8;
-
-            fn place_parameter(
-                self,
-                session: &Session,
-                target: Option<PlacementRequest>,
-                source: Option<PlacementRequest>,
-                donate: bool,
-                may_alias: Option<bool>,
-            ) -> Result<u8, Error> {
-                let _ = (session, target, source, donate, may_alias);
-                Ok(self.0)
-            }
-        }
-
-        impl PlaceableParameter<u8> for Leaf {
-            fn prepare_arguments(
-                arguments: &mut [PlacementArgument<Self>],
-                session: &Session,
-                path: &dyn Fn(usize) -> ParameterPath,
-            ) -> Result<(), Error> {
-                let _ = (session, path);
-                for argument in arguments {
-                    argument.parameter.0 += 1;
-                }
-                Ok(())
-            }
-        }
-
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        assert_eq!(session.place((Leaf(0), Leaf(2)), PlacementOptions::default()).unwrap(), (1, 3));
-    }
-
-    #[test]
-    fn test_session_place_resolves_bare_sharding_prefixes() {
-        let client = cpu_client(2);
-        let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert!(matches!(
-            session.place(1f32, PlacementOptions::to(sharding.clone())),
-            Err(Error::Session(SessionError::MissingMesh)),
-        ));
-
-        let session = session.with_device_mesh(mesh.clone());
-        let input = CoreArray::vector(vec![1f32, 2., 3., 4.]).unwrap();
-        let (placed, default) = session
-            .place((input, CoreArray::scalar(5f32).unwrap()), PlacementOptions::to((Some(sharding.clone()), None)))
-            .unwrap();
-        assert_eq!(placed.mesh(), &mesh);
-        assert_eq!(placed.sharding(), &sharding);
-        assert_eq!(shard_values(&placed), vec![vec![1., 2.], vec![3., 4.]]);
-        assert!(!default.is_committed());
-
-        let uploaded = session.place(5f32, PlacementOptions::default().with_source(sharding.clone())).unwrap();
-        assert_eq!(shard_values(&uploaded), vec![vec![5.]]);
-
-        let checked = session.place(placed, PlacementOptions::default().with_source(sharding)).unwrap();
-        assert_eq!(shard_values(&checked), vec![vec![1., 2.], vec![3., 4.]]);
-    }
-
-    #[test]
-    fn test_session_place_resolves_only_consumed_bare_shardings() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let device = session.devices().unwrap()[1];
-        let sharding = Sharding::replicated(LogicalMesh::single_device(), 0);
-
-        let empty = BTreeMap::<&str, f32>::new();
-        let options = PlacementOptions::to(sharding.clone()).with_source(sharding.clone());
-        assert!(session.place(empty.clone(), options).unwrap().is_empty());
-
-        let options = PlacementOptions::to(BTreeMap::from([("absent", sharding.clone())]));
-        assert!(matches!(
-            session.place(empty.clone(), options),
-            Err(Error::Core(error)) if matches!(
-                error.as_ref(),
-                CoreError::Parameter(ParameterError::UnusedParameters { paths: Some(paths) })
-                    if paths == &[r#"$["absent"]"#.to_string()],
-            ),
-        ));
-
-        let options = PlacementOptions::to((Some(sharding.clone()), None)).with_source((Some(sharding.clone()), None));
-        let (empty, host) = session.place((empty, 2f32), options).unwrap();
-        assert!(empty.is_empty());
-        assert_eq!(shard_values(&host), vec![vec![2.]]);
-
-        let options = PlacementOptions::to(device).with_source(sharding.clone());
-        assert!(matches!(session.place(2f32, options), Err(Error::Session(SessionError::MissingMesh))));
-
-        let input = (PlaceInput::from(3f32), PlaceInput::from(host));
-        let options = PlacementOptions::default().with_source((None, Some(sharding)));
-        let error = session.place(input, options).unwrap_err();
-        let (path, source) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$.1");
-        assert!(matches!(source, Error::Session(SessionError::MissingMesh)));
-    }
-
-    #[test]
-    fn test_session_and_core_place_match_borrowed_map_keys() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.devices().unwrap();
-        let left = String::from("left");
-        let right = String::from("right");
-        let input = BTreeMap::from([
-            (left.as_str(), session.place(3f32, PlacementOptions::default()).unwrap()),
-            (right.as_str(), session.place(7f32, PlacementOptions::default()).unwrap()),
-        ]);
-        let targets = BTreeMap::from([(left.as_str(), devices[1]), (right.as_str(), devices[0])]);
-        let exact = input.place(&targets, None).unwrap();
-        let owned_targets = BTreeMap::from([(left.clone(), devices[1]), (right.clone(), devices[0])]);
-        let prefix = session.place(input, PlacementOptions::to(owned_targets)).unwrap();
-        for output in [exact, prefix] {
-            for (key, device, value) in [(left.as_str(), devices[1], 3f32), (right.as_str(), devices[0], 7f32)] {
-                let array = &output[key];
-                assert_eq!(array.mesh().devices(), &[device]);
-                assert!(array.is_committed());
-                assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), [value]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_session_place_broadcasts_optional_placement_prefixes() {
-        let client = cpu_client(2);
-        let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let values = vec![1f32, 2., 3., 4.];
-        let host = CoreArray::vector(values.clone()).unwrap();
-
-        // An explicit sharding uses the session mesh. The None prefix sends both leaves to the first local device.
-        let (partitioned, [local, other_local]) = session
-            .place(
-                (host.clone(), [host.clone(), host]),
-                PlacementOptions::<_, PlacementRequest>::new(
-                    Some((Some(PlacementRequest::from(session.placement(sharded.clone()).unwrap())), None)),
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(partitioned.mesh(), &mesh);
-        assert_eq!(partitioned.sharding(), &sharded);
-        assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
-        for array in [&local, &other_local] {
-            assert_eq!(array.mesh().devices(), &mesh.devices()[..1]);
-            assert_eq!(shard_values(array), vec![values.clone()]);
-        }
-
-        // For existing arrays, None leaves preserve their destination or omit their source check independently.
-        let (moved, kept) = session
-            .place(
-                (local, partitioned.clone()),
-                PlacementOptions::<_, _>::new(
-                    Some((Some(Placement::new(mesh.clone(), replicated.clone()).unwrap()), None)),
-                    Some((None, Some(Placement::new(mesh.clone(), sharded.clone()).unwrap()))),
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(moved.mesh(), &mesh);
-        assert_eq!(moved.sharding(), &replicated);
-        assert_eq!(shard_values(&moved), vec![values.clone(); 2]);
-        assert_eq!(kept.mesh(), partitioned.mesh());
-        assert_eq!(kept.sharding(), partitioned.sharding());
-        for (kept_shard, source_shard) in kept.shards().iter().zip(partitioned.shards()) {
-            assert!(Arc::ptr_eq(kept_shard.buffer().unwrap(), source_shard.buffer().unwrap()));
-        }
-
-        // A placement on the session mesh also works as an optional prefix leaf.
-        let partitioned = session
-            .place(
-                CoreArray::vector(values.clone()).unwrap(),
-                PlacementOptions::<_, PlacementRequest>::new(
-                    Some(Some(session.placement(sharded.clone()).unwrap())),
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(partitioned.mesh(), &mesh);
-        assert_eq!(partitioned.sharding(), &sharded);
-        assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
-
-        // A bare device is a placement on that device, also as a prefix leaf.
-        let device = mesh.devices()[1];
-        let placed = session
-            .place(
-                CoreArray::vector(values.clone()).unwrap(),
-                PlacementOptions::<_, PlacementRequest>::new(Some(Some(device)), None, None, None),
-            )
-            .unwrap();
-        assert_eq!(placed.mesh().devices(), &[device]);
-        assert_eq!(shard_values(&placed), vec![values]);
-    }
-
-    #[test]
-    fn test_session_place_validates_option_prefixes_of_empty_input() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = PlacementRequest::from(Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap());
-
-        // Root option prefixes cover the input without leaves, which is returned as it is.
-        let options = PlacementOptions::new(Some(device.clone()), Some(device.clone()), Some(true), Some(Some(false)));
-        assert_eq!(session.place(Vec::<Array>::new(), options).unwrap().len(), 0);
-        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::default()).unwrap().len(), 0);
-        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::to(device.clone())).unwrap().len(), 0);
-
-        // An option prefix with an element for an input without elements matches no node of that input.
-        let options = PlacementOptions::<Vec<PlacementRequest>>::new(Some(vec![device]), None, None, None);
-        assert!(matches!(
-            session.place(Vec::<f32>::new(), options),
-            Err(Error::Core(error)) if matches!(
-                error.as_ref(),
-                CoreError::Parameter(ParameterError::UnusedParameters { paths: Some(paths) })
-                    if paths == &vec!["$[0]".to_string()],
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_session_place_broadcasts_option_prefixes_over_empty_subtrees() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-
-        // The first destination covers the empty vector, which places nothing, and the second one places the scalar.
-        let (empty, scalar) = session
-            .place(
-                (Vec::<f32>::new(), 1f32),
-                PlacementOptions::<_, PlacementRequest>::new(
-                    Some((PlacementRequest::from(devices[0]), PlacementRequest::from(devices[1]))),
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
-        assert_eq!(empty.len(), 0);
-        assert_eq!(scalar.mesh().devices(), [devices[1]]);
-        assert!(scalar.is_committed());
-        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.]);
-    }
-
-    #[test]
-    fn test_session_place_validates_empty_nodes_of_option_prefixes() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let parameter_error = |result: Result<Vec<Vec<Array>>, Error>| match result {
-            Err(Error::Core(error)) => match error.as_ref() {
-                CoreError::Parameter(error) => error.clone(),
-                error => panic!("expected a parameter error, got `{error}`"),
-            },
-            result => panic!("expected a parameter error, got `{result:?}`"),
-        };
-        let missing =
-            |path: &str| ParameterError::MissingParameters { expected_count: 1, paths: Some(vec![path.to_string()]) };
-        let unused = |path: &str| ParameterError::UnusedParameters { paths: Some(vec![path.to_string()]) };
-
-        // An empty node of the input must be covered by an option leaf or matched by an empty option node.
-        assert_eq!(
-            parameter_error(session.place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]]]))),
-            missing("$[1]"),
-        );
-
-        // An empty option node must match an empty node of the input at the same path. This holds for every option.
-        let options = PlacementOptions::to(vec![vec![devices[1]], Vec::new()]);
-        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::default().with_source(vec![vec![devices[0]], Vec::new()]);
-        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::default().with_donate(vec![vec![false], Vec::new()]);
-        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-        let options = PlacementOptions::default().with_may_alias(vec![vec![None], Vec::new()]);
-        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
-
-        // An empty option node does not match an input without that node, even when neither has leaves.
-        assert_eq!(
-            parameter_error(session.place(Vec::<Vec<f32>>::new(), PlacementOptions::to(vec![Vec::<Device>::new()]))),
-            unused("$[0]"),
-        );
-
-        // Matching empty nodes on both sides are valid, and so is an option leaf over an empty node of the input.
-        let placed = session
-            .place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]], Vec::new()]))
-            .unwrap();
-        assert_eq!(placed[0][0].mesh().devices(), [devices[1]]);
-        assert_eq!(placed[1].len(), 0);
-        let placed = session
-            .place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![devices[1], devices[0]]))
-            .unwrap();
-        assert_eq!(placed[0][0].mesh().devices(), [devices[1]]);
-        assert_eq!(placed[1].len(), 0);
-        assert_eq!(session.place(Vec::<Vec<f32>>::new(), PlacementOptions::to(Vec::<Device>::new())).unwrap().len(), 0);
-
-        // Nodes match by path, so an option tree of another container type with the same paths matches.
-        let [placed, empty] = session
-            .place([vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]], Vec::new()]))
-            .unwrap();
-        assert_eq!(placed[0].mesh().devices(), [devices[1]]);
-        assert_eq!(empty.len(), 0);
-    }
-
-    #[test]
-    fn test_session_place_donation_and_aliasing() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let source_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![devices[0]],
-        )
-        .unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            devices,
-        )
-        .unwrap();
-        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let source = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            source_mesh,
-            None,
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        let shares_source_buffer = |array: &Array| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| Arc::ptr_eq(shard.buffer().unwrap(), source.shards()[0].buffer().unwrap()))
-                .collect::<Vec<_>>()
-        };
-        let options = |target: Option<PlacementRequest>, donate: bool, may_alias: Option<bool>| {
-            PlacementOptions::new(target, Option::<PlacementRequest>::None, Some(donate), Some(may_alias))
-        };
-
-        // Without a new placement, the result is the leaf itself unless aliasing is forbidden.
-        let unchanged = session.place(source.clone(), options(None, false, None)).unwrap();
-        assert_eq!(shares_source_buffer(&unchanged), vec![true]);
-        let copied = session.place(source.clone(), options(None, false, Some(false))).unwrap();
-        assert_eq!(copied.r#type(), source.r#type());
-        assert_eq!(copied.mesh(), source.mesh());
-        assert_eq!(shares_source_buffer(&copied), vec![false]);
-        assert_ne!(native_buffer_addresses(&copied), native_buffer_addresses(&source));
-        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
-
-        // A forbidden alias copies every shard within its own memory, so an array in host memory stays there.
-        let host = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]).with_memory(Memory::Host { pinned: true }),
-            source.mesh().clone(),
-            None,
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        let copied = session.place(host.clone(), options(None, false, Some(false))).unwrap();
-        assert_eq!(copied.r#type(), host.r#type());
-        assert!(!Arc::ptr_eq(copied.shards()[0].buffer().unwrap(), host.shards()[0].buffer().unwrap()));
-        assert_ne!(native_buffer_addresses(&copied), native_buffer_addresses(&host));
-        assert_eq!(copied.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
-        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
-
-        // A shard that stays on its device shares its buffer unless aliasing is forbidden.
-        let target = PlacementRequest::from(Placement::new(mesh.clone(), replicated).unwrap());
-        let placed = session.place(source.clone(), options(Some(target.clone()), false, None)).unwrap();
-        assert_eq!(shares_source_buffer(&placed), vec![true, false]);
-        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
-        let placed = session.place(source.clone(), options(Some(target), false, Some(false))).unwrap();
-        assert_eq!(shares_source_buffer(&placed), vec![false, false]);
-        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
-
-        // A donated leaf is consumed. This one shares its buffers with `source`, so the donation does not take effect
-        // and `source` stays readable.
-        let target = PlacementRequest::from(Placement::new(mesh, sharded.clone()).unwrap());
-        let donated = session.place(source.clone(), options(Some(target), true, None)).unwrap();
-        assert_eq!(donated.sharding(), &sharded);
-        assert_eq!(shard_values(&donated), vec![vec![1., 2.], vec![3., 4.]]);
-        assert_eq!(shard_values(&source), vec![vec![1., 2., 3., 4.]]);
-
-        // Donation decides over a forbidden alias, as in JAX, where `donate=True` with `may_alias=False` selects
-        // `DONATE_INPUT` and returns the buffer of an array that already lives at its destination. A donated leaf is
-        // therefore placed as without an aliasing option, whether or not another handle shares its buffers, and only
-        // the leaf without donation above is copied. Before, the forbidden alias won and both results were copies.
-        let shared = session.place(source.clone(), options(None, true, Some(false))).unwrap();
-        assert_eq!(shares_source_buffer(&shared), vec![true]);
-        let exclusive = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            source.mesh().clone(),
-            None,
-            values_to_bytes(&[5f32, 6., 7., 8.]),
-        )
-        .unwrap();
-        let addresses = native_buffer_addresses(&exclusive);
-        let donated = session.place(exclusive, options(None, true, Some(false))).unwrap();
-        assert_eq!(native_buffer_addresses(&donated), addresses);
-        assert_eq!(shard_values(&donated), vec![vec![5., 6., 7., 8.]]);
-    }
-
-    #[test]
-    fn test_session_place_commits_array_leaves_with_a_destination() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let uncommitted = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
-        let options = |target: Option<PlacementRequest>, may_alias: Option<bool>| {
-            PlacementOptions::new(target, Option::<PlacementRequest>::None, Option::<bool>::None, Some(may_alias))
-        };
-        assert!(!uncommitted.is_committed());
-
-        // Without a destination, an array leaf keeps its commitment, also when it is copied.
-        assert!(!session.place(uncommitted.clone(), options(None, None)).unwrap().is_committed());
-        assert!(!session.place(uncommitted.clone(), options(None, Some(false))).unwrap().is_committed());
-        let committed = uncommitted.clone().with_committed(true);
-        assert!(session.place(committed, options(None, Some(false))).unwrap().is_committed());
-
-        // A destination commits the result, even one that leaves the leaf where it is.
-        let device = uncommitted.mesh().devices()[0];
-        let placed = session.place(uncommitted.clone(), options(Some(PlacementRequest::from(device)), None)).unwrap();
-        assert_eq!(placed.mesh(), uncommitted.mesh());
-        assert!(placed.is_committed());
-        let other_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let placed = session.place(uncommitted, options(Some(PlacementRequest::from(other_device)), None)).unwrap();
-        assert_eq!(placed.mesh().devices(), [other_device]);
-        assert!(placed.is_committed());
-    }
-
-    #[test]
-    fn test_session_place_replicates_array_leaf_on_its_own_device() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![device],
-        )
-        .unwrap();
-        let unreduced = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced).unwrap();
-        let array =
-            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap();
-
-        // A device names neither a mesh nor a sharding, so an array that already lives on that device keeps its mesh
-        // but becomes an ordinary replicated array, without the pending reduction along its unreduced axis.
-        let target = PlacementRequest::from(device);
-        let placed = session
-            .place(array, PlacementOptions::<PlacementRequest>::new(Some(target), None, None, None))
-            .unwrap();
-        assert_eq!(placed.mesh(), &mesh);
-        assert_eq!(placed.sharding(), &Sharding::replicated(mesh.logical_mesh().clone(), 1));
-        assert_eq!(shard_values(&placed.exp().unwrap()), vec![vec![1f32.exp(), 2f32.exp()]]);
-    }
-
-    #[test]
-    fn test_session_place_moves_array_on_single_device_mesh_onto_device() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-        let target_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let replicated = Sharding::replicated(logical_mesh, 1);
-        let r#type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let array =
-            Array::from_host_buffer(&session, r#type.clone(), source_mesh, None, values_to_bytes(&[1f32, 2.])).unwrap();
-
-        // The array keeps its logical mesh over the device, and its pending reduction along `x`, which has size one,
-        // is complete there, so `exp` applies to the result. That is the type that the type rule of a staged device
-        // target records.
-        let placed = session.place(array, PlacementOptions::to(devices[1])).unwrap();
-        assert_eq!(placed.mesh(), &target_mesh);
-        assert_eq!(placed.sharding(), &replicated);
-        assert_eq!(
-            placed.r#type().into_owned(),
-            CoreOperation::infer_output_types(&PlaceOperation::new(devices[1], None), &[r#type], &[])
-                .unwrap()
-                .remove(0),
-        );
-        assert_eq!(
-            placed.r#type().as_ref(),
-            &ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated).unwrap()
-        );
-        assert!(placed.is_committed());
-        assert_eq!(shard_values(&placed.exp().unwrap()), vec![vec![1f32.exp(), 2f32.exp()]]);
-
-        // An ordinary array on one device keeps its logical mesh as well, whatever its axes are named (e.g., that of
-        // the mesh that an upload without a mesh creates).
-        let uploaded = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        let placed = session.place(uploaded.clone(), PlacementOptions::to(devices[1])).unwrap();
-        assert_eq!(placed.mesh(), &DeviceMesh::new(uploaded.mesh().logical_mesh().clone(), vec![devices[1]]).unwrap());
-        assert_eq!(placed.sharding(), uploaded.sharding());
-        assert_eq!(placed.r#type(), uploaded.r#type());
-        assert_eq!(shard_values(&placed), vec![vec![1., 2.]]);
-    }
-
-    #[test]
-    fn test_session_place_copies_only_handle_of_leaf_that_may_not_alias() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 2);
-        let upload = || {
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        let options = |target: Option<PlacementRequest>| {
-            PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(target, None, None, Some(Some(false)))
-        };
-
-        // The leaf is the only handle of its buffer, which a forced copy still must not return, whether the placement
-        // leaves the leaf where it is or keeps its shard on its device while adding a replica on another device.
-        let replicated = PlacementRequest::from(
-            Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap(),
-        );
-        for (target, values) in [(None, vec![vec![1f32, 2.]]), (Some(replicated), vec![vec![1., 2.]; 2])] {
-            let array = upload();
-            let buffer = Arc::downgrade(array.shards()[0].buffer().unwrap());
-            let placed = session.place(array, options(target)).unwrap();
-            assert!(buffer.upgrade().is_none());
-            assert_eq!(shard_values(&placed), values);
-        }
-    }
-
-    #[test]
-    fn test_session_place_rejects_donated_leaf_that_may_alias() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-
-        // The donation and aliasing options of every leaf are checked before any leaf is placed, and the error names
-        // the first leaf that is donated while it may alias.
-        let error = session
-            .place(
-                (array.clone(), array.clone()),
-                PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(
-                    None,
-                    None,
-                    Some((false, true)),
-                    Some(Some(true)),
-                ),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Array(error) if matches!(
-                error.as_ref(),
-                ArrayError::DonatedArrayMayAlias { path } if path.to_string() == "$.1",
-            ),
-        ));
-        assert_eq!(error.to_string(), "array `$.1` cannot be donated while `may_alias` is `Some(true)`");
-
-        // Host leaves are rejected in the same way, even though they ignore both options otherwise.
-        let error = session
-            .place(
-                1f32,
-                PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(
-                    None,
-                    None,
-                    Some(true),
-                    Some(Some(true)),
-                ),
-            )
-            .unwrap_err();
-        assert_eq!(error.to_string(), "array `$` cannot be donated while `may_alias` is `Some(true)`");
-    }
-
-    #[test]
-    fn test_session_place_names_failed_parameter() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let upload = |shape: &[usize]| {
-            let count = shape.iter().product::<usize>();
-            Array::from_host_buffer(
-                &session,
-                ArrayType::new_static(DataType::F32, shape.to_vec()),
-                None,
-                None,
-                values_to_bytes(&vec![1f32; count]),
-            )
-            .unwrap()
-        };
-        let (matrix, vector) = (upload(&[2, 2]), upload(&[2]));
-        let matrix_placement = Placement::single_device(vector.mesh().devices()[0], 2);
-        let empty = PlacementRequest::InPlace { memory: None, layout: None };
-        let target_message = "`place` in-place target must name a memory or a layout";
-        let rank_message = "`place` target sharding rank (2) does not match the input rank (1)";
-        let path_of = |error: &Error| failed_parameter(error).map(|(path, source)| (path, source.to_string()));
-
-        // An option that the validation pass rejects for the second leaf names that leaf.
-        let error = session
-            .place(
-                (matrix.clone(), vector.clone()),
-                PlacementOptions::<_, PlacementRequest, bool, bool>::new(
-                    Some((None, Some(empty.clone()))),
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            .unwrap_err();
-        assert_eq!(path_of(&error), Some(("$.1".to_string(), target_message.to_string())));
-        assert_eq!(error.to_string(), format!("failed to place the parameter at `$.1`: {target_message}"));
-
-        // An error of the type rule for the second leaf names that leaf, and it is reported before any leaf is placed.
-        let options = PlacementOptions::to(matrix_placement.clone());
-        let error = session.place((matrix, vector.clone()), options).unwrap_err();
-        assert_eq!(path_of(&error), Some(("$.1".to_string(), rank_message.to_string())));
-        assert_eq!(error.to_string(), format!("failed to place the parameter at `$.1`: {rank_message}"));
-
-        // The same failures of a lone value at the root keep their own errors.
-        let error = session.place(vector.clone(), PlacementOptions::to(empty)).unwrap_err();
-        assert_eq!((path_of(&error), error.to_string()), (None, target_message.to_string()));
-        let error = session.place(vector, PlacementOptions::to(matrix_placement)).unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(error.to_string(), rank_message);
-    }
-
-    #[test]
-    fn test_session_place_validates_every_leaf_before_placing_any() {
-        // The first leaf is donated and moves to the second device, and the second leaf fails a check that needs no
-        // work to be submitted. Every such check runs for every leaf before any leaf is placed, so the call creates no
-        // array and the first leaf keeps its value and its device. Before, the first leaf was placed (i.e., the session
-        // created one array and could consume the donated leaf) before the second leaf was rejected.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let other_session = Session::builder().client(other_cpu_client(1)).build().unwrap();
-        let upload = |session: &Session| {
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            Array::from_host_buffer(session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        let first = upload(&session);
-        let devices = client.addressable_devices().unwrap();
-        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let process_index = devices[0].process_index();
-        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
-        let rank_two = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2)).unwrap();
-        let unknown = PlacementRequest::from(Device::new(999, process_index));
-        let pinned = PlacementRequest::from(Memory::Host { pinned: true });
-        let cases = [
-            ("type rule of a host leaf", PlaceInput::from(2u8), Some(PlacementRequest::from(rank_two)), None),
-            ("unknown device of a host leaf", PlaceInput::from(2u8), Some(unknown.clone()), None),
-            ("unknown device of an array leaf", PlaceInput::from(upload(&session)), Some(unknown), None),
-            ("source of an array leaf", PlaceInput::from(upload(&session)), None, Some(pinned.clone())),
-            ("client of an array leaf", PlaceInput::from(upload(&other_session)), None, None),
-            ("in-place target of a foreign array leaf", PlaceInput::from(upload(&other_session)), Some(pinned), None),
-        ];
-        let mut outcomes = Vec::new();
-        for (name, second, target, source) in cases {
-            let direct = second.clone().place_parameter(&session, target.clone(), source.clone(), false, None);
-            let expected = format!("failed to place the parameter at `$.1`: {}", direct.unwrap_err());
-            let statistics = session.array_statistics();
-            let options = PlacementOptions::new(
-                Some((Some(PlacementRequest::from(devices[1])), target)),
-                Some((None, source)),
-                Some((true, false)),
-                None::<bool>,
-            );
-            let error = session.place((PlaceInput::from(first.clone()), second), options).unwrap_err();
-            let created = session.array_statistics().created_arrays - statistics.created_arrays;
-            outcomes.push((name, error.to_string() == expected, created));
-        }
-        assert_eq!(
-            outcomes,
-            [
-                ("type rule of a host leaf", true, 0),
-                ("unknown device of a host leaf", true, 0),
-                ("unknown device of an array leaf", true, 0),
-                ("source of an array leaf", true, 0),
-                ("client of an array leaf", true, 0),
-                ("in-place target of a foreign array leaf", true, 0),
-            ],
-        );
-
-        // The case of the review reports the error of the type rule for the scalar at its path.
-        let rank_two = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2)).unwrap();
-        let options = PlacementOptions::new(
-            Some((Some(PlacementRequest::from(devices[1])), Some(PlacementRequest::from(rank_two)))),
-            None::<PlacementRequest>,
-            Some((true, false)),
-            None::<bool>,
-        );
-        let error = session.place((PlaceInput::from(first.clone()), PlaceInput::from(2u8)), options).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "failed to place the parameter at `$.1`: \
-             `place` target sharding rank (2) does not match the input rank (0)",
-        );
-        assert_eq!(first.mesh().devices(), [devices[0]]);
-        assert_eq!(first.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
-    }
-
-    #[test]
-    fn test_session_place_admits_a_tree_of_leaves_that_can_communicate() {
-        struct Wrapper(Array);
-        impl Parameter for Wrapper {}
-        impl PlaceableParameter<Array> for Wrapper {
-            fn validate_placement(
-                &self,
-                session: &Session,
-                target: Option<&PlacementRequest>,
-                source: Option<&PlacementRequest>,
-                donate: bool,
-                may_alias: Option<bool>,
-            ) -> Result<(), Error> {
-                self.0.validate_placement(session, target, source, donate, may_alias)
-            }
-        }
-        impl Placeable for Wrapper {
-            type Output = Array;
-
-            fn place_parameter(
-                self,
-                session: &Session,
-                target: Option<PlacementRequest>,
-                source: Option<PlacementRequest>,
-                donate: bool,
-                may_alias: Option<bool>,
-            ) -> Result<Array, Error> {
-                self.0.place_parameter(session, target, source, donate, may_alias)
-            }
-        }
-
-        let client = cpu_client(1);
-        let remote = Device::new(1000, 1);
-        let session = Session::builder().client(client).remote_devices([remote]).build().unwrap();
-        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let committed = session.place(7u8, PlacementOptions::to(local)).unwrap();
-        let scalar = session.place(9u8, PlacementOptions::default()).unwrap();
-        let vector =
-            Array::from_host_buffer(&session, ArrayType::new_static(DataType::U8, [2]), None, None, [8, 9]).unwrap();
-        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![local]).unwrap();
-        let placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
-        let options = PlacementOptions::to((PlacementRequest::from(remote), PlacementRequest::from(placement)));
-
-        // One rank would encounter the invalid second leaf. A rank with a valid second leaf must attempt admission
-        // before it can submit the cross-host transfer in the first wrapper.
-        let error = session.place((Wrapper(committed.clone()), Wrapper(scalar)), options.clone()).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "failed to place the parameter at `$.1`: `place` target sharding rank (1) does not match the input rank (0)",
-        );
-        let error = session.place((Wrapper(committed), Wrapper(vector)), options).unwrap_err();
-        assert!(matches!(error, Error::Session(SessionError::PlacementComparisonUnavailable)));
-    }
-
-    #[test]
-    fn test_core_placement_error_preserves_backend_array_errors() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let input = session.place(1u8, PlacementOptions::default()).unwrap();
-        let device = Device::new(2048, input.mesh().devices()[0].process_index() + 1);
-        let error = input.place(&device, None).unwrap_err();
-        let expected = ArrayError::UnknownDevice { device_id: device.id(), process_index: device.process_index() };
-        assert_eq!(error.to_string(), expected.to_string());
-        assert!(std::error::Error::source(&error).is_none());
-        assert!(HashSet::from([error.clone()]).contains(&error));
-    }
-
-    #[test]
-    fn test_session_place_admission_checks_only_data_needed_by_an_unshared_leaf() {
-        let client = cpu_client(2);
-        let remote = Device::new(1000, 1);
-        let session = session_with_remote_devices(client, [remote]);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let comparison = ValueComparison::new(participant_mesh_of(devices.clone()).unwrap(), devices.clone());
-        let committed = session.place(7u8, PlacementOptions::to(devices[0])).unwrap();
-        let (event, promise) = client.event(()).unwrap();
-        promise.set(Some(PjrtError::invalid_argument("unshared producer failed"))).unwrap();
-        let fence = ExecutionFence::new(vec![event]);
-        assert_eq!(fence.block_until_ready().unwrap_err().to_string(), "unshared producer failed");
-        let unshared = session.place(9u8, PlacementOptions::default()).unwrap().with_execution_fence(fence);
-        assert!(unshared.is_locally_assigned());
-
-        let run = |parameter: PlaceInput<Array>, target, may_alias| {
-            let arguments = vec![
-                PlacementArgument { parameter, context: (), target, source: None, donate: false, may_alias },
-                PlacementArgument {
-                    parameter: PlaceInput::from(committed.clone()),
-                    context: (),
-                    target: Some(PlacementRequest::from(remote)),
-                    source: None,
-                    donate: false,
-                    may_alias: None,
-                },
-            ];
-            admit_and_place_arguments(
-                &session,
-                Some(&comparison),
-                arguments,
-                Ok(()),
-                // The declared peer cannot receive native sends in this test. Stop at dispatch of its argument.
-                |index, argument| match index {
-                    0 => argument.parameter.place_parameter(&session, argument.target, None, false, argument.may_alias),
-                    _ => Ok(committed.clone()),
-                },
-                |_, error| error,
-            )
-        };
-
-        let position = session.next_value_comparison();
-        let placed = run(PlaceInput::from(unshared.clone()), None, None).unwrap();
-        assert_eq!(session.next_value_comparison(), position + 2);
-        assert_eq!(placed[0].block_until_ready().unwrap_err().to_string(), "unshared producer failed");
-        assert_eq!(placed[1].copy_to_host_bytes().unwrap(), [7]);
-        assert_eq!(
-            run(PlaceInput::from(unshared), None, Some(false)).unwrap_err().to_string(),
-            "unshared producer failed",
-        );
-
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
-        let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["x"]).unwrap();
-        let varying = Array::from_host_shards(
-            &session,
-            ArrayType::new_static(DataType::U8, [1]),
-            mesh,
-            Some(sharding),
-            [(devices[0].id(), [7u8].as_slice()), (devices[1].id(), [9u8].as_slice())],
-        )
-        .unwrap()
-        .with_locally_assigned(true);
-        let direct = session.place(varying.clone(), PlacementOptions::default().with_may_alias(false)).unwrap();
-        let grouped = run(PlaceInput::from(varying), None, Some(false)).unwrap();
-        for output in [&direct, &grouped[0]] {
-            output.block_until_ready().unwrap();
-            let bytes = output.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
-            assert_eq!(bytes, [vec![7], vec![9]]);
-        }
-
-        let mut host = CoreArray::scalar(true).unwrap();
-        host.storage_bytes_mut()[0] = 2;
-        assert_eq!(
-            run(PlaceInput::from(host), None, None).unwrap_err().to_string(),
-            "array element 0 has invalid `bool` byte encoding [2]",
-        );
-    }
-
-    #[test]
-    fn test_session_place_preflights_missing_whole_shard_sources() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client.addressable_devices().unwrap();
-        let devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
-        let missing =
-            Array::from_addressable_buffers(&session, ArrayType::scalar(DataType::U8), mesh, None, vec![]).unwrap();
-        let device_id = devices[0].id();
-        let direct = missing.to_placement(&session, devices[1]).unwrap_err();
-        assert!(matches!(
-            direct,
-            Error::Array(error) if matches!(*error, ArrayError::MissingShardBuffer { shard_index: 0, device_id: id } if id == device_id),
-        ));
-
-        let created = session.array_statistics().created_arrays;
-        let error = session
-            .place((PlaceInput::from(3u8), PlaceInput::from(missing)), PlacementOptions::to(devices[1]))
-            .unwrap_err();
-        let (path, source) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$.1");
-        assert!(matches!(
-            source,
-            Error::Array(error) if matches!(**error, ArrayError::MissingShardBuffer { shard_index: 0, device_id: id } if id == device_id),
-        ));
-        assert_eq!(session.array_statistics().created_arrays, created);
-    }
-
-    #[test]
-    fn test_session_place_prefixes_paths_of_nested_placements() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let array = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2.]),
-        )
-        .unwrap();
-        let place = |donate| {
-            let input = BTreeMap::from([("weights", PairPlacingLeaf { array: array.clone(), donate })]);
-            session.place(input, PlacementOptions::default()).unwrap_err()
-        };
-
-        // A failure of a placement that a leaf makes of a tree of its own keeps its typed error, and its path names
-        // the leaf followed by the element of that tree.
-        let error = place(false);
-        let target_message = "`place` in-place target must name a memory or a layout";
-        let (path, source) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$[\"weights\"].1");
-        assert!(matches!(source, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(source.to_string(), target_message);
-        assert_eq!(error.to_string(), format!("failed to place the parameter at `$[\"weights\"].1`: {target_message}"));
-
-        let error = place(true);
-        assert!(matches!(
-            &error,
-            Error::Array(error) if matches!(
-                error.as_ref(),
-                ArrayError::DonatedArrayMayAlias { path } if path.to_string() == "$[\"weights\"].1",
-            ),
-        ));
-        assert_eq!(error.to_string(), "array `$[\"weights\"].1` cannot be donated while `may_alias` is `Some(true)`");
-    }
-
-    #[test]
-    fn test_placeable_place_parameter_rejects_options_that_session_place_rejects() {
+    fn test_placeable_place_parameter_rejects_options_that_no_leaf_accepts() {
         let session = Session::builder().client(execution_client()).build().unwrap();
         let array = Array::from_host_buffer(
             &session,
@@ -4977,11 +2427,744 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_validates_in_place_targets_before_placing_any_input() {
+    fn test_place_input_place_parameter() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let upload = || {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
+        };
+
+        // One tree mixes host values and arrays, and the target prefix broadcasts over both kinds of leaves.
+        let array = upload();
+        let buffer = Arc::downgrade(array.shards()[0].buffer().unwrap());
+        let options = PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(
+            Some(PlacementRequest::from(devices[1])),
+            None,
+            None,
+            Some(Some(false)),
+        );
+        let (scalar, vector, placed) = session
+            .place(
+                (
+                    PlaceInput::from(2.5f32),
+                    PlaceInput::from(CoreArray::vector(vec![3i32, 4]).unwrap()),
+                    PlaceInput::from(array),
+                ),
+                options,
+            )
+            .unwrap();
+        assert_eq!(scalar.mesh().devices(), [devices[1]]);
+        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
+        assert_eq!(vector.mesh().devices(), [devices[1]]);
+        assert_eq!(vector.copy_to_host().unwrap().elements::<i32>().unwrap(), vec![3, 4]);
+        assert_eq!(placed.mesh().devices(), [devices[1]]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2.]]);
+        assert!(buffer.upgrade().is_none());
+
+        // The source prefix also broadcasts over both kinds of leaves, and only the array leaf validates it.
+        let options = |source: PlacementRequest| {
+            PlacementOptions::<PlacementRequest, PlacementRequest>::new(None, Some(source), None, None)
+        };
+        let (scalar, kept) = session
+            .place((PlaceInput::from(1u8), PlaceInput::from(upload())), options(PlacementRequest::from(devices[0])))
+            .unwrap();
+        assert_eq!(scalar.mesh().devices(), [devices[0]]);
+        assert_eq!(scalar.copy_to_host_bytes().unwrap(), vec![1u8]);
+        assert_eq!(kept.mesh().devices(), [devices[0]]);
+        let pinned = PlacementRequest::from(Memory::Host { pinned: true });
+        let array = upload();
+        let message =
+            format!("`place` source memory `Host[Pinned]` does not match the input type `{}`", array.r#type());
+        let error = session.place((PlaceInput::from(1u8), PlaceInput::from(array)), options(pinned)).unwrap_err();
+        let (path, error) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$.1");
+        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn test_place_input_from() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let array = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let complex = Complex::new(1.5f32, -2.);
+        let low_precision = f8e4m3fn::from_f32(0.5).unwrap();
+
+        // A host value converts into a host input and an array into a runtime input.
+        assert!(matches!(PlaceInput::from(true), PlaceInput::Host(host) if host == CoreArray::scalar(true).unwrap()));
+        assert!(matches!(PlaceInput::from(array.clone()), PlaceInput::Runtime(_)));
+
+        // Every scalar that a host array can hold converts into a host value, including complex and low precision
+        // scalars, which are not leaves on their own, so one tree can place them together with arrays.
+        assert!(matches!(
+            PlaceInput::from(complex),
+            PlaceInput::Host(host) if host == CoreArray::scalar(complex).unwrap(),
+        ));
+        let (complex_array, low_precision_array, array) = session
+            .place(
+                (PlaceInput::from(complex), PlaceInput::from(low_precision), PlaceInput::from(array)),
+                PlacementOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(complex_array.data_type(), DataType::C64);
+        assert_eq!(complex_array.copy_to_host().unwrap().elements::<Complex<f32>>().unwrap(), vec![complex]);
+        assert_eq!(low_precision_array.data_type(), DataType::F8E4M3FN);
+        assert_eq!(low_precision_array.copy_to_host().unwrap().elements::<f8e4m3fn>().unwrap(), vec![low_precision]);
+        assert_eq!(shard_values(&array), vec![vec![1., 2.]]);
+    }
+
+    #[test]
+    fn test_array_into_unaliased() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap();
+        let upload = || {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            Array::from_host_buffer(&session, r#type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap()
+        };
+        let buffer_addresses =
+            |array: &Array| array.shards().iter().map(|shard| Arc::as_ptr(shard.buffer().unwrap())).collect::<Vec<_>>();
+
+        // An array that is the only handle of its buffers is returned as it is.
+        let array = upload();
+        let addresses = buffer_addresses(&array);
+        let unaliased = array.into_unaliased().unwrap();
+        assert_eq!(buffer_addresses(&unaliased), addresses);
+
+        // Only the buffers that another handle shares are copied, and the others are kept.
+        let array = upload();
+        let addresses = buffer_addresses(&array);
+        let native_addresses = native_buffer_addresses(&array);
+        let held = Arc::clone(array.shards()[0].buffer().unwrap());
+        let unaliased = array.into_unaliased().unwrap();
+        assert!(!Arc::ptr_eq(unaliased.shards()[0].buffer().unwrap(), &held));
+        assert_ne!(native_buffer_addresses(&unaliased)[0], native_addresses[0]);
+        assert_eq!(buffer_addresses(&unaliased)[1], addresses[1]);
+        assert_eq!(native_buffer_addresses(&unaliased)[1], native_addresses[1]);
+        assert_eq!(shard_values(&unaliased), vec![vec![1., 2.]; 2]);
+
+        // A clone shares every buffer, so all of them are copied.
+        let array = upload();
+        let unaliased = array.clone().into_unaliased().unwrap();
+        let shares_buffers = unaliased
+            .shards()
+            .iter()
+            .zip(array.shards())
+            .map(|(unaliased_shard, shard)| Arc::ptr_eq(unaliased_shard.buffer().unwrap(), shard.buffer().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(shares_buffers, vec![false, false]);
+        let (unaliased_addresses, addresses) = (native_buffer_addresses(&unaliased), native_buffer_addresses(&array));
+        let shares_addresses = unaliased_addresses.iter().zip(&addresses).map(|(a, b)| a == b).collect::<Vec<_>>();
+        assert_eq!(shares_addresses, vec![false, false]);
+        assert_eq!(unaliased.r#type(), array.r#type());
+        assert_eq!(unaliased.mesh(), array.mesh());
+        assert_eq!(unaliased.sharding(), array.sharding());
+        assert_eq!(shard_values(&unaliased), vec![vec![1., 2.]; 2]);
+
+        // The copies keep the commitment of the array.
+        let array = upload().with_committed(false);
+        assert!(!array.clone().into_unaliased().unwrap().is_committed());
+        let array = upload().with_committed(true);
+        assert!(array.clone().into_unaliased().unwrap().is_committed());
+    }
+
+    #[test]
+    fn test_session_place() {
+        // A host value that `Session::place` uploads without a target (or with one that names only its storage) goes
+        // to the first addressable device of the client, whether or not the session has a default mesh, and is a
+        // choice of this process alone (i.e., locally assigned). It is uncommitted without a target, and committed in
+        // the memory that a target names. The default mesh of a session is the analogue of `jax.set_mesh`,
+        // under which JAX 0.12.0.1 keeps such a value on its default device, uncommitted, for a mesh of one device and
+        // of two (`(Explicit,) device_put: SingleDeviceSharding(device=CpuDevice(id=0)) False`), while eager results
+        // without array inputs go to the mesh, committed, as `Array::from_host_buffer` without a mesh does here.
+        // Uploading onto the default mesh would treat the value of each process (e.g., its own data batch) as one
+        // global value that every process supplied.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let single = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let describe = |array: Array| {
+            let devices = array.mesh().devices().iter().map(Device::id).collect::<Vec<_>>();
+            assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
+            let memory = array.r#type().memory();
+            let kind = array.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap().to_string();
+            let (committed, locally_assigned) = (array.is_committed(), array.is_locally_assigned());
+            let committed = if committed { "committed" } else { "uncommitted" };
+            let locally_assigned = if locally_assigned { "locally assigned" } else { "not locally assigned" };
+            format!("devices {devices:?}, {memory} ({kind}), {committed}, {locally_assigned}")
+        };
+        let mut outcomes = Vec::new();
+        for (name, session) in [
+            ("no mesh", session.clone()),
+            ("mesh on CPU 1", session.with_device_mesh(DeviceMesh::new(single, vec![devices[1]]).unwrap())),
+            ("mesh on both CPUs", session.with_device_mesh(domain_mesh(client, "x", 2))),
+        ] {
+            let placed = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default());
+            let pinned = PlacementOptions::to(Memory::Host { pinned: true });
+            let in_place = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), pinned);
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            let uploaded = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.]));
+            outcomes.push(format!("{name}: place {}", describe(placed.unwrap())));
+            outcomes.push(format!("{name}: place in place {}", describe(in_place.unwrap())));
+            outcomes.push(format!("{name}: from_host_buffer {}", describe(uploaded.unwrap())));
+        }
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                no mesh: place devices [0], Device (device), uncommitted, locally assigned
+                no mesh: place in place devices [0], Host[Pinned] (pinned_host), committed, locally assigned
+                no mesh: from_host_buffer devices [0], Device (device), uncommitted, locally assigned
+                mesh on CPU 1: place devices [0], Device (device), uncommitted, locally assigned
+                mesh on CPU 1: place in place devices [0], Host[Pinned] (pinned_host), committed, locally assigned
+                mesh on CPU 1: from_host_buffer devices [1], Device (device), committed, not locally assigned
+                mesh on both CPUs: place devices [0], Device (device), uncommitted, locally assigned
+                mesh on both CPUs: place in place devices [0], Host[Pinned] (pinned_host), committed, locally assigned
+                mesh on both CPUs: from_host_buffer devices [0, 1], Device (device), committed, not locally assigned"},
+        );
+
+        // A host scalar keeps its data type, and a target device places it on that device, committed.
+        let scalar = session.place(2.5f32, PlacementOptions::default()).unwrap();
+        assert_eq!(scalar.r#type().into_owned().with_sharding(None).unwrap(), ArrayType::scalar(DataType::F32));
+        assert_eq!(scalar.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![2.5]);
+        let flag = session.place(true, PlacementOptions::default()).unwrap();
+        assert_eq!(flag.data_type(), DataType::Boolean);
+        assert_eq!(flag.copy_to_host_bytes().unwrap(), vec![1u8]);
+        let placed = session.place(bf16::from_f32(1.5), PlacementOptions::to(devices[1])).unwrap();
+        assert_eq!(placed.mesh().devices(), [devices[1]]);
+        assert!(placed.is_committed());
+        assert_eq!(placed.copy_to_host_bytes().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_session_place_uploads_reference_backend_arrays() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let matrix = CoreArray::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap();
+        let array = session.place(matrix, PlacementOptions::default()).unwrap();
+        assert_eq!(
+            array.r#type().into_owned().with_sharding(None).unwrap(),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4., 5., 6.]);
+
+        // A token is a valid value of the reference backend, but effect tokens are not arrays, so its upload is
+        // rejected before anything is allocated or uploaded, also when it is given as a `PlaceInput`.
+        let token = || CoreArray::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap();
+        let message =
+            "tokens are created by effectful operations and cannot be constructed, uploaded, or placed as arrays";
+        assert_eq!(
+            session.place(token(), PlacementOptions::default()).map(|_| ()).map_err(|error| error.to_string()),
+            Err(message.to_string()),
+        );
+        assert_eq!(
+            session
+                .place(PlaceInput::<Array>::Host(token()), PlacementOptions::default())
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(message.to_string()),
+        );
+    }
+
+    #[test]
+    fn test_session_place_validates_host_storage() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+
+        // The storage of a host array can be mutated safely, so its upload validates the encoding of its elements
+        // rather than trusting it, with and without an explicit layout, and reports an invalid Boolean byte.
+        let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+        for r#type in [
+            ArrayType::new_static(DataType::Boolean, [1]),
+            ArrayType::new_static(DataType::Boolean, [1]).with_layout(layout),
+        ] {
+            let mut host = CoreArray::new(r#type, vec![1]).unwrap();
+            host.storage_bytes_mut()[0] = 2;
+            let error = session.place(host, PlacementOptions::default()).unwrap_err();
+            assert_eq!(error.to_string(), "array element 0 has invalid `bool` byte encoding [2]");
+        }
+    }
+
+    #[test]
+    fn test_session_place_tracks_local_assignment() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = session.target().unwrap().devices()[1].device();
+        let pinned = Memory::Host { pinned: true };
+
+        // A host value uploaded with a target that names a device lives on a device that this process did not choose
+        // on its own (refer to `test_session_place` for the uploads that it chooses).
+        assert!(!session.place(1f32, PlacementOptions::to(device)).unwrap().is_locally_assigned());
+
+        // An array keeps the fact without a target and with an in-place one, eagerly and when a staged in-place
+        // placement executes on it, and a target that names a device clears it.
+        let local = session.place(1f32, PlacementOptions::default()).unwrap();
+        assert!(session.place(local.clone(), PlacementOptions::default()).unwrap().is_locally_assigned());
+        assert!(session.place(local.clone(), PlacementOptions::to(pinned)).unwrap().is_locally_assigned());
+        let staged =
+            session.bind(PlaceOperation::new(pinned, None), Vec::new(), &[Value::Array(local.clone())]).unwrap();
+        let [Value::Array(staged)] = staged.as_slice() else { panic!("placing an array must produce an array") };
+        assert!(staged.is_locally_assigned());
+        assert!(!session.place(local, PlacementOptions::to(device)).unwrap().is_locally_assigned());
+    }
+
+    #[test]
+    fn test_session_place_applies_memory_and_layout() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let memory = Memory::Host { pinned: true };
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let values = vec![1f32, 2., 3., 4., 5., 6., 7., 8.];
+        let placement = Placement::new(mesh.clone(), sharding.clone())
+            .unwrap()
+            .with_layout(layout.clone())
+            .with_memory(memory);
+        let uploaded = session
+            .place(CoreArray::matrix(4, 2, values.clone()).unwrap(), PlacementOptions::to(placement.clone()))
+            .unwrap();
+
+        assert_eq!(uploaded.mesh(), &mesh);
+        assert_eq!(uploaded.sharding(), &sharding);
+        assert_eq!(uploaded.r#type().memory(), memory);
+        assert_eq!(uploaded.layout(), Some(&layout));
+        for shard in uploaded.addressable_shards() {
+            let buffer = shard.buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap().kind().unwrap(), "pinned_host");
+            assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
+        }
+        assert_eq!(uploaded.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+
+        // An existing leaf can change both options without changing its mesh or shard slices.
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let target = PlacementRequest::from(
+            session.placement(sharding.clone()).unwrap().with_memory(Memory::Device).with_layout(layout.clone()),
+        );
+        let moved = session
+            .place(uploaded, PlacementOptions::<_, _>::new(Some(target), Some(placement), None, None))
+            .unwrap();
+        assert_eq!(moved.mesh(), &mesh);
+        assert_eq!(moved.sharding(), &sharding);
+        assert_eq!(moved.r#type().memory(), Memory::Device);
+        assert_eq!(moved.layout(), Some(&layout));
+        for shard in moved.addressable_shards() {
+            let buffer = shard.buffer().unwrap();
+            assert_eq!(buffer.memory().unwrap(), buffer.device().unwrap().default_memory().unwrap());
+            assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
+        }
+        assert_eq!(moved.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+    }
+
+    #[test]
+    fn test_session_place_pads_short_shardings() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let logical_mesh = mesh.logical_mesh().clone();
+        let split = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let placement = session.placement(split.clone()).unwrap();
+        let split_matrix = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let vector = CoreArray::vector(vec![1f32, 2., 3., 4.]).unwrap();
+        let matrix = CoreArray::matrix(4, 3, (0..12).map(|value| value as f32).collect()).unwrap();
+        let halves = vec![vec![0f32, 1., 2., 3., 4., 5.], vec![6., 7., 8., 9., 10., 11.]];
+
+        // One sharding shorter than the rank of a leaf leaves the omitted trailing dimensions replicated, so one
+        // destination splits a vector and a matrix along their first dimension, and a rank zero sharding replicates
+        // both. The resolved shardings have the rank of each leaf.
+        let (placed_vector, placed_matrix) =
+            session.place((vector.clone(), matrix.clone()), PlacementOptions::to(placement.clone())).unwrap();
+        assert_eq!(placed_vector.sharding(), &split);
+        assert_eq!(shard_buffer_dimensions(&placed_vector), vec![vec![2], vec![2]]);
+        assert_eq!(shard_values(&placed_vector), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(placed_vector.is_committed());
+        assert_eq!(placed_matrix.sharding(), &split_matrix);
+        assert_eq!(shard_buffer_dimensions(&placed_matrix), vec![vec![2, 3], vec![2, 3]]);
+        assert_eq!(shard_values(&placed_matrix), halves);
+        assert!(placed_matrix.is_committed());
+        let replicated = Sharding::replicated(logical_mesh.clone(), 0);
+        let (replicated_vector, replicated_matrix) = session
+            .place((vector.clone(), matrix.clone()), PlacementOptions::to(session.placement(replicated).unwrap()))
+            .unwrap();
+        assert_eq!(replicated_vector.sharding(), &Sharding::replicated(logical_mesh.clone(), 1));
+        assert_eq!(shard_buffer_dimensions(&replicated_vector), vec![vec![4], vec![4]]);
+        assert_eq!(replicated_matrix.sharding(), &Sharding::replicated(logical_mesh.clone(), 2));
+        assert_eq!(shard_buffer_dimensions(&replicated_matrix), vec![vec![4, 3], vec![4, 3]]);
+        assert_eq!(shard_values(&replicated_matrix), vec![halves.concat(); 2]);
+
+        // Arrays resolve short destinations and sources in the same way, also from a resolved placement.
+        let resplit = session
+            .place(
+                replicated_matrix.clone(),
+                PlacementOptions::<Placement, Placement>::new(
+                    Some(placement.clone()),
+                    Some(session.placement(Sharding::replicated(logical_mesh.clone(), 1)).unwrap()),
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(resplit.mesh(), &mesh);
+        assert_eq!(resplit.sharding(), &split_matrix);
+        assert_eq!(shard_buffer_dimensions(&resplit), vec![vec![2, 3], vec![2, 3]]);
+        assert_eq!(shard_values(&resplit), halves);
+        assert!(resplit.is_committed());
+        let checked = session
+            .place(
+                resplit.clone(),
+                PlacementOptions::<PlacementRequest, Placement>::new(None, Some(placement.clone()), None, None),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), resplit.shards()[0].buffer().unwrap()));
+
+        // Direct placement also pads a short request when borrowing or consuming an array.
+        let request = PlacementRequest::from(placement.clone());
+        let borrowed = replicated_matrix.to_placement(&session, request.clone()).unwrap();
+        let consumed = replicated_matrix.clone().into_placement(&session, request).unwrap();
+        for output in [borrowed, consumed] {
+            assert_eq!(output.sharding(), &split_matrix);
+            assert_eq!(shard_buffer_dimensions(&output), vec![vec![2, 3], vec![2, 3]]);
+            assert_eq!(shard_values(&output), halves);
+        }
+
+        // A traced leaf resolves a short destination for its rank.
+        let input_type = ArrayType::new_static(DataType::F32, [4, 3])
+            .with_sharding(Sharding::replicated(logical_mesh.clone(), 2))
+            .unwrap();
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
+            |input: CompileTracer| session.place(input, PlacementOptions::to(placement)).unwrap(),
+            input_type,
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        let output = compiled.executable().execute(&session, replicated_matrix).unwrap();
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.sharding(), &split_matrix);
+        assert_eq!(shard_buffer_dimensions(&output), vec![vec![2, 3], vec![2, 3]]);
+        assert_eq!(shard_values(&output), halves);
+
+        // A sharding with more dimensions than a leaf is still rejected, with the error of the type rule of `place`.
+        let error = session.place(vector, PlacementOptions::to(session.placement(split_matrix).unwrap())).unwrap_err();
+        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(error.to_string(), "`place` target sharding rank (2) does not match the input rank (1)");
+    }
+
+    #[test]
+    fn test_session_place_selects_default_memory_for_device_targets() {
+        let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+        let pinned = Memory::Host { pinned: true };
         let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]).with_memory(pinned),
+            source_mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        assert_eq!(array.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        let is_in_default_memory = |array: &Array| {
+            let buffer = array.shards()[0].buffer().unwrap();
+            buffer.memory().unwrap() == buffer.device().unwrap().default_memory().unwrap()
+        };
+
+        // A bare device destination selects the default memory of that device, both on another device and on the
+        // device that the array already lives on. JAX 0.12.0.1 on CPU does so for another device, and for the same
+        // device only with `may_alias=False`, whereas under default options it raises "Memory kind mismatch with
+        // xla::PjRtBuffers" for the pinned host buffer.
+        for device in [devices[1], devices[0]] {
+            let moved = session.place(array.clone(), PlacementOptions::to(device)).unwrap();
+            assert_eq!(moved.mesh().devices(), [device]);
+            assert_eq!(moved.r#type().memory(), Memory::Device);
+            assert!(is_in_default_memory(&moved));
+            assert_eq!(shard_values(&moved), vec![vec![1., 2.]]);
+            let moved = array.to_placement(&session, device).unwrap();
+            assert_eq!(moved.r#type().memory(), Memory::Device);
+            assert!(is_in_default_memory(&moved));
+        }
+
+        // An explicit memory still applies, and a mesh destination without a memory keeps the memory of the array.
+        let moved = session
+            .place(
+                array.clone(),
+                PlacementOptions::to(PlacementRequest::Device {
+                    device: devices[1],
+                    memory: Some(pinned),
+                    layout: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(moved.r#type().memory(), pinned);
+        assert_eq!(moved.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        let target_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
+        let target =
+            PlacementRequest::from(Placement::new(target_mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap());
+        let moved = session.place(array.clone(), PlacementOptions::to(target)).unwrap();
+        assert_eq!(moved.mesh(), &target_mesh);
+        assert_eq!(moved.r#type().memory(), pinned);
+
+        // A host value placed on a bare device is uploaded to the default memory of that device.
+        let uploaded = session.place(3f32, PlacementOptions::to(devices[1])).unwrap();
+        assert_eq!(uploaded.r#type().memory(), Memory::Device);
+        assert!(is_in_default_memory(&uploaded));
+
+        // A traced value placed on a bare device also selects the default memory of that device.
+        let (value, _) = differentiate_at(array.clone())
+            .vjp(|x| Ok(session.place(x, PlacementOptions::to(devices[1])).unwrap()))
+            .unwrap();
+        assert_eq!(value.mesh().devices(), [devices[1]]);
+        assert_eq!(value.r#type().memory(), Memory::Device);
+        assert!(is_in_default_memory(&value));
+
+        // The core `Place` capability follows the same contract, eagerly and traced, because the type rule of a bare
+        // device request selects that memory for every path.
+        let moved = array.place(&devices[1], None).unwrap();
+        assert_eq!(moved.r#type().memory(), Memory::Device);
+        assert!(is_in_default_memory(&moved));
+        let (value, _) = differentiate_at(array.clone()).vjp(|x| x.place(&devices[1], None)).unwrap();
+        assert_eq!(value.r#type().memory(), Memory::Device);
+        assert!(is_in_default_memory(&value));
+    }
+
+    #[test]
+    fn test_session_place_moves_arrays_to_memory_targets() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let memory_kinds = |array: &Array| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let is_in_default_memory = |array: &Array| {
+            array.shards().iter().all(|shard| {
+                let buffer = shard.buffer().unwrap();
+                buffer.memory().unwrap() == buffer.device().unwrap().default_memory().unwrap()
+            })
+        };
+
+        // A bare memory leaves an array that is split over two devices on its mesh with its sharding and its values,
+        // and moves its buffers to that memory. The result is committed, as JAX commits the result of `device_put`
+        // onto a memory space.
+        let sharded = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let moved = session.place(sharded, PlacementOptions::to(pinned)).unwrap();
+        assert_eq!(moved.mesh(), &mesh);
+        assert_eq!(moved.sharding(), &sharding);
+        assert_eq!(moved.r#type().memory(), pinned);
+        assert_eq!(memory_kinds(&moved), vec!["pinned_host"; 2]);
+        assert_eq!(shard_buffer_dimensions(&moved), vec![vec![2], vec![2]]);
+        assert_eq!(shard_values(&moved), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(moved.is_committed());
+
+        // The default memory moves it back.
+        let restored = session.place(moved, PlacementOptions::to(Memory::Device)).unwrap();
+        assert_eq!(restored.mesh(), &mesh);
+        assert_eq!(restored.sharding(), &sharding);
+        assert_eq!(restored.r#type().memory(), Memory::Device);
+        assert!(is_in_default_memory(&restored));
+        assert_eq!(shard_values(&restored), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(restored.is_committed());
+
+        // An uncommitted array on one device stays on that device and is committed, and `Array::to_placement` accepts
+        // a bare memory as well.
+        let single = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
+        assert!(!single.is_committed());
+        for moved in [
+            session.place(single.clone(), PlacementOptions::to(pinned)).unwrap(),
+            single.to_placement(&session, pinned).unwrap(),
+        ] {
+            assert_eq!(moved.mesh(), single.mesh());
+            assert_eq!(moved.sharding(), single.sharding());
+            assert_eq!(moved.r#type().memory(), pinned);
+            assert_eq!(memory_kinds(&moved), vec!["pinned_host"]);
+            assert_eq!(shard_values(&moved), vec![vec![1., 2.]]);
+            assert!(moved.is_committed());
+        }
+    }
+
+    #[test]
+    fn test_session_place_combines_memory_targets_with_other_targets() {
+        // One branch of a tree can change only the memory of its leaves while another moves its leaves to a device.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let options = PlacementOptions::to((PlacementRequest::from(pinned), PlacementRequest::from(mesh.devices()[1])));
+        let (in_place, on_device) = session.place((array.clone(), array), options).unwrap();
+        assert_eq!(in_place.mesh(), &mesh);
+        assert_eq!(in_place.sharding(), &sharding);
+        assert_eq!(in_place.r#type().memory(), pinned);
+        assert_eq!(shard_values(&in_place), vec![vec![1., 2.], vec![3., 4.]]);
+        assert_eq!(on_device.mesh().devices(), [mesh.devices()[1]]);
+        assert_eq!(on_device.r#type().memory(), Memory::Device);
+        assert_eq!(shard_values(&on_device), vec![vec![1., 2., 3., 4.]]);
+    }
+
+    #[test]
+    fn test_session_place_resolves_bare_sharding_prefixes() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert!(matches!(
+            session.place(1f32, PlacementOptions::to(sharding.clone())),
+            Err(Error::Session(SessionError::MissingMesh)),
+        ));
+
+        let session = session.with_device_mesh(mesh.clone());
+        let input = CoreArray::vector(vec![1f32, 2., 3., 4.]).unwrap();
+        let (placed, default) = session
+            .place((input, CoreArray::scalar(5f32).unwrap()), PlacementOptions::to((Some(sharding.clone()), None)))
+            .unwrap();
+        assert_eq!(placed.mesh(), &mesh);
+        assert_eq!(placed.sharding(), &sharding);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(!default.is_committed());
+
+        let uploaded = session.place(5f32, PlacementOptions::default().with_source(sharding.clone())).unwrap();
+        assert_eq!(shard_values(&uploaded), vec![vec![5.]]);
+
+        let checked = session.place(placed, PlacementOptions::default().with_source(sharding)).unwrap();
+        assert_eq!(shard_values(&checked), vec![vec![1., 2.], vec![3., 4.]]);
+    }
+
+    #[test]
+    fn test_session_place_resolves_only_consumed_bare_shardings() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let device = session.devices().unwrap()[1];
+        let sharding = Sharding::replicated(LogicalMesh::single_device(), 0);
+
+        let empty = BTreeMap::<&str, f32>::new();
+        let options = PlacementOptions::to(sharding.clone()).with_source(sharding.clone());
+        assert!(session.place(empty.clone(), options).unwrap().is_empty());
+
+        let options = PlacementOptions::to(BTreeMap::from([("absent", sharding.clone())]));
+        assert!(matches!(
+            session.place(empty.clone(), options),
+            Err(Error::Core(error)) if matches!(
+                error.as_ref(),
+                CoreError::Parameter(ParameterError::UnusedParameters { paths: Some(paths) })
+                    if paths == &[r#"$["absent"]"#.to_string()],
+            ),
+        ));
+
+        let options = PlacementOptions::to((Some(sharding.clone()), None)).with_source((Some(sharding.clone()), None));
+        let (empty, host) = session.place((empty, 2f32), options).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(shard_values(&host), vec![vec![2.]]);
+
+        let options = PlacementOptions::to(device).with_source(sharding.clone());
+        assert!(matches!(session.place(2f32, options), Err(Error::Session(SessionError::MissingMesh))));
+
+        let input = (PlaceInput::from(3f32), PlaceInput::from(host));
+        let options = PlacementOptions::default().with_source((None, Some(sharding)));
+        let error = session.place(input, options).unwrap_err();
+        let (path, source) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$.1");
+        assert!(matches!(source, Error::Session(SessionError::MissingMesh)));
+    }
+
+    #[test]
+    fn test_session_place_commits_array_leaves_with_a_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let uncommitted = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let options = |target: Option<PlacementRequest>, may_alias: Option<bool>| {
+            PlacementOptions::new(target, Option::<PlacementRequest>::None, Option::<bool>::None, Some(may_alias))
+        };
+        assert!(!uncommitted.is_committed());
+
+        // Without a destination, an array leaf keeps its commitment, also when it is copied.
+        assert!(!session.place(uncommitted.clone(), options(None, None)).unwrap().is_committed());
+        assert!(!session.place(uncommitted.clone(), options(None, Some(false))).unwrap().is_committed());
+        let committed = uncommitted.clone().with_committed(true);
+        assert!(session.place(committed, options(None, Some(false))).unwrap().is_committed());
+
+        // A destination commits the result, even one that leaves the leaf where it is.
+        let device = uncommitted.mesh().devices()[0];
+        let placed = session.place(uncommitted.clone(), options(Some(PlacementRequest::from(device)), None)).unwrap();
+        assert_eq!(placed.mesh(), uncommitted.mesh());
+        assert!(placed.is_committed());
+        let other_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let placed = session.place(uncommitted, options(Some(PlacementRequest::from(other_device)), None)).unwrap();
+        assert_eq!(placed.mesh().devices(), [other_device]);
+        assert!(placed.is_committed());
+    }
+
+    #[test]
+    fn test_session_place_completes_pending_reduction_on_single_device_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let array =
+            Array::from_host_buffer(&session, r#type.clone(), source_mesh, None, values_to_bytes(&[1f32, 2.])).unwrap();
+
+        // A device names neither a mesh nor a sharding, so the array keeps its logical mesh over the target device,
+        // whether it already lives on that device or not. Its pending reduction along `x`, which has size one, is
+        // complete there, so the result is an ordinary replicated array to which `exp` applies. That is the type that
+        // the type rule of a staged device target records.
+        for device in [devices[0], devices[1]] {
+            let placed = session.place(array.clone(), PlacementOptions::to(device)).unwrap();
+            assert_eq!(placed.mesh(), &DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap());
+            assert_eq!(placed.sharding(), &replicated);
+            assert_eq!(
+                placed.r#type().into_owned(),
+                CoreOperation::infer_output_types(&PlaceOperation::new(device, None), &[r#type.clone()], &[])
+                    .unwrap()
+                    .remove(0),
+            );
+            assert_eq!(
+                placed.r#type().as_ref(),
+                &ArrayType::new_static(DataType::F32, [2]).with_sharding(replicated.clone()).unwrap(),
+            );
+            assert!(placed.is_committed());
+            assert_eq!(shard_values(&placed.exp().unwrap()), vec![vec![1f32.exp(), 2f32.exp()]]);
+        }
+
+        // An ordinary array on one device keeps its logical mesh as well, whatever its axes are named (e.g., that of
+        // the mesh that an upload without a mesh creates).
+        let uploaded = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [2]),
             None,
@@ -4989,29 +3172,70 @@ mod tests {
             values_to_bytes(&[1f32, 2.]),
         )
         .unwrap();
-        let options = |target: PlacementRequest| {
-            PlacementOptions::<_, _>::new(
-                Some((None, Some(target))),
-                Some((Some(PlacementRequest::from(Memory::Host { pinned: true })), None)),
-                None,
-                None,
-            )
-        };
+        let placed = session.place(uploaded.clone(), PlacementOptions::to(devices[1])).unwrap();
+        assert_eq!(placed.mesh(), &DeviceMesh::new(uploaded.mesh().logical_mesh().clone(), vec![devices[1]]).unwrap());
+        assert_eq!(placed.sharding(), uploaded.sharding());
+        assert_eq!(placed.r#type(), uploaded.r#type());
+        assert_eq!(shard_values(&placed), vec![vec![1., 2.]]);
+    }
 
-        // The first leaf has the wrong source memory, which is only found when it is placed. The invalid target of the
-        // second leaf is rejected first, before any leaf is placed.
-        let target = PlacementRequest::InPlace { memory: None, layout: None };
-        let error = session.place((array.clone(), array.clone()), options(target)).unwrap_err();
+    #[test]
+    fn test_session_place_combines_gathered_values_with_uploads_on_their_device() {
+        // A value that a device target gathers lives on the canonical logical mesh of one device, which is also
+        // the mesh of an upload without a mesh, so the two combine on that device eagerly and in a staged program
+        // that is replayed on arrays, as values with `SingleDeviceSharding`s on one device do in JAX.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let device = mesh.devices()[0];
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let split =
+            Array::from_host_buffer(&session, split_type.clone(), mesh, None, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
+        let upload = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 1., 1., 1.]),
+        )
+        .unwrap();
+        let canonical_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        assert_eq!(upload.mesh(), &canonical_mesh);
+
+        let gathered = session.place(split.clone(), PlacementOptions::to(device)).unwrap();
+        assert_eq!(gathered.mesh(), &canonical_mesh);
+        let sum = gathered.add(&upload).unwrap();
+        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
+        let placed_upload = session.place(upload.clone(), PlacementOptions::to(device)).unwrap();
+        let sum = gathered.add(&placed_upload).unwrap();
+        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
+
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| {
+                let x = session.place(x, PlacementOptions::to(device)).unwrap();
+                let y = session.place(y, PlacementOptions::to(device)).unwrap();
+                x.add(&y).unwrap()
+            },
+            (split_type, upload.r#type().into_owned()),
+        )
+        .unwrap();
         assert_eq!(
-            error.to_string(),
-            "failed to place the parameter at `$.1`: `place` in-place target must name a memory or a layout",
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}], %1:f32[4] .
+                let %2:f32[4] = place [target=device(0)] %0
+                    %3:f32[4] = place [target=device(0)] %1
+                    %4:f32[4] = add %2 %3
+                in (%4)"
+            },
         );
-
-        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
-        let error = session.place((array.clone(), array), options(target.into())).unwrap_err();
-        let (path, error) = failed_parameter(&error).unwrap();
-        assert_eq!(path, "$.0");
-        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        let inputs = (Value::Array(split), Value::Array(upload));
+        let Value::Array(sum) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+            panic!("adding two arrays must produce an array");
+        };
+        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
     }
 
     #[test]
@@ -5040,132 +3264,111 @@ mod tests {
         )
         .unwrap();
 
-        let copied_array = session.place(source_array, PlacementOptions::default()).unwrap();
-        let expected_visualization =
-            format!("┌─────┬─────┐\n│{:^5}│{:^5}│\n└─────┴─────┘", local_device_id, remote_device_id);
-
-        assert_eq!(copied_array.addressable_shards().count(), 1);
-        assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
-        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host_bytes().unwrap();
-        assert_eq!(values_from_bytes::<f32>(copied_shard_bytes.as_slice()), vec![0.0, 1.0]);
-        assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
-    }
-
-    #[test]
-    fn test_session_place_treats_source_devices_as_informative_on_every_path() {
-        // The devices that a source names are informative, as in JAX, which never compares them with where a value
-        // lives. An array on the first device that is placed on the second one with a source on the third one is
-        // therefore placed alike eagerly, by the replay of a staged program, and under forward and reverse mode
-        // differentiation, and reverse mode sends the cotangent to the devices that the source names.
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        assert_eq!(input.mesh().devices(), [devices[0]]);
-        let options = || {
-            PlacementOptions::new(
-                Some(PlacementRequest::from(devices[1])),
-                Some(PlacementRequest::from(devices[2])),
-                Option::<bool>::None,
-                Option::<Option<bool>>::None,
-            )
-        };
-        let observe =
-            |array: &Array| (array.mesh().devices().to_vec(), array.r#type().into_owned(), shard_values(array));
-        let expected = (vec![devices[1]], input.r#type().into_owned(), vec![vec![1., 2., 3., 4.]]);
-
-        let eager = session.place(input.clone(), options()).unwrap();
-        assert_eq!(observe(&eager), expected);
-
-        let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(|x: ArrayTracer| session.place(x, options()).unwrap(), input.r#type().into_owned()).unwrap();
-        let Value::Array(staged) =
-            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
-        else {
-            panic!("placing an array must produce an array");
-        };
-        assert_eq!(observe(&staged), expected);
-
-        let (primal, tangent) = differentiate_at(input.clone())
-            .jvp(input.clone(), |x| Ok(session.place(x, options()).unwrap()))
-            .unwrap();
-        assert_eq!(observe(&primal), expected);
-        assert_eq!(observe(&tangent), expected);
-
-        let (primal, pullback) =
-            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
-        assert_eq!(observe(&primal), expected);
-        let seed = Array::from_host_buffer(
-            &session,
-            primal.r#type().into_owned(),
-            primal.mesh().clone(),
-            None,
-            values_to_bytes(&[5f32, 6., 7., 8.]),
-        )
-        .unwrap();
-        let cotangent = pullback.apply_materialized(seed).unwrap();
+        // Without a target, an array that this process addresses only in part is kept as it is, with its local shard
+        // and its sharding over the remote device.
+        let placed = session.place(source_array.clone(), PlacementOptions::default()).unwrap();
+        assert_eq!(placed.addressable_shards().count(), 1);
         assert_eq!(
-            observe(&cotangent),
-            (vec![devices[2]], input.r#type().cotangent().unwrap(), vec![vec![5., 6., 7., 8.]]),
+            placed.sharding().visualize().unwrap().render(false),
+            format!("┌─────┬─────┐\n│{local_device_id:^5}│{remote_device_id:^5}│\n└─────┴─────┘"),
         );
+        let local_shard = placed.device_shard(local_device_id).unwrap();
+        let source_shard = source_array.device_shard(local_device_id).unwrap();
+        assert!(Arc::ptr_eq(local_shard.buffer().unwrap(), source_shard.buffer().unwrap()));
+        assert_eq!(values_from_bytes::<f32>(&local_shard.copy_to_host_bytes().unwrap()), vec![0.0, 1.0]);
+        assert!(placed.device_shard(remote_device_id).unwrap().buffer().is_none());
     }
 
     #[test]
-    fn test_session_place_validates_source_storage() {
+    fn test_session_place_returns_arrays_of_receiving_session() {
         let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let r#type = ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout.clone());
-        let source = Placement::new(mesh.clone(), sharding).unwrap();
-        let array =
-            Array::from_host_buffer(&session, r#type, mesh, None, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
-        let place = |source| {
-            session.place(
-                array.clone(),
-                PlacementOptions::<PlacementRequest, Placement>::new(None, Some(source), None, None),
-            )
+        let meshed_session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let upload = |session: &Session| {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            Array::from_host_buffer(session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
         };
-        let checked = place(source.clone().with_memory(Memory::Device).with_layout(layout.clone())).unwrap();
-        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
+        let options =
+            |target: Option<PlacementRequest>| PlacementOptions::<PlacementRequest>::new(target, None, None, None);
 
-        // The memory and the layout that the array declares are those of its type, so they are checked by the type
-        // rule of `place`, as they are on every other path (refer to
-        // `test_session_place_validates_source_storage_on_every_path`).
-        let memory = Memory::Host { pinned: true };
-        let error = place(source.clone().with_memory(memory)).unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "`{PLACE_OPERATION_NAME}` source memory `Host[Pinned]` does not match the input type `{}`",
-                array.r#type(),
-            ),
-        );
+        // An array of another session of the same client comes back owned by the receiving session, which has a
+        // default mesh that the session of the input lacks, whether the placement keeps the array where it is or not.
+        let array = upload(&session);
+        for target in [None, Some(PlacementRequest::from(device))] {
+            let placed = meshed_session.place(array.clone(), options(target)).unwrap();
+            assert!(placed.session().is_same_session(&meshed_session));
+            assert_eq!(placed.session().device_mesh().unwrap(), &mesh);
+        }
 
-        let other_layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
-        let error = place(source.with_layout(other_layout.clone())).unwrap_err();
-        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "`{PLACE_OPERATION_NAME}` source layout `{other_layout}` does not match the input type `{}`",
-                array.r#type(),
-            ),
+        // An array of another client that lives on a device with the same ID is rejected without a destination, and
+        // transferred onto a device destination as a committed array of the receiving session.
+        let other_array = upload(&Session::builder().client(other_cpu_client(1)).build().unwrap());
+        assert_eq!(other_array.mesh().devices(), [device]);
+        assert!(matches!(
+            session.place(other_array.clone(), options(None)),
+            Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
+                if message == "cannot associate an array with a session of a different PJRT client",
+        ));
+        let placed = meshed_session.place(other_array, options(Some(PlacementRequest::from(device)))).unwrap();
+        assert!(placed.session().is_same_session(&meshed_session));
+        assert!(std::ptr::eq(placed.client(), client));
+        assert_eq!((placed.mesh().devices(), placed.is_committed()), ([device].as_slice(), true));
+        assert_eq!(values_from_bytes::<f32>(&placed.copy_to_host_bytes().unwrap()), vec![1f32, 2.]);
+    }
+
+    #[test]
+    fn test_session_place_validates_source_storage_on_every_path() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let array = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
+        let device = array.mesh().devices()[0];
+        let pinned = Memory::Host { pinned: true };
+        let options = |source: &PlacementRequest| {
+            PlacementOptions::<PlacementRequest>::new(None, Some(source.clone()), None, None)
+        };
+
+        // A source states the storage in which a value is expected, whatever its form, so a source in another memory
+        // than the memory of the array is rejected with the error of the type rule of `place` for an array leaf, for a
+        // traced leaf of a staged function, and for a traced leaf of a differentiated function that wraps the array.
+        let error = format!(
+            "`{PLACE_OPERATION_NAME}` source memory `Host[Pinned]` does not match the input type `{}`",
+            array.r#type(),
         );
+        for source in [
+            PlacementRequest::from(array.placement().unwrap().with_memory(pinned)),
+            PlacementRequest::Device { device, memory: Some(pinned), layout: None },
+            PlacementRequest::from(pinned),
+        ] {
+            let eager = session.place(array.clone(), options(&source));
+            assert_eq!(eager.map(|_| ()).map_err(|error| error.to_string()), Err(error.clone()));
+            // A staging context reports the error of the placement that it stages when tracing completes.
+            let staged = RefCell::new(None);
+            let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
+                |x: ArrayTracer| {
+                    staged.replace(session.place(x.clone(), options(&source)).err().map(|error| error.to_string()));
+                    x
+                },
+                array.r#type().into_owned(),
+            );
+            assert_eq!(staged.take().or(traced.err().map(|error| error.to_string())), Some(error.clone()));
+            let differentiated = RefCell::new(None);
+            differentiate_at(array.clone())
+                .jvp(array.clone(), |x| {
+                    let result = session.place(x.clone(), options(&source));
+                    differentiated.replace(result.err().map(|error| error.to_string()));
+                    Ok(x)
+                })
+                .unwrap();
+            assert_eq!(differentiated.take(), Some(error.clone()));
+        }
+
+        // A source in the memory of the array is accepted, and a host leaf ignores its source.
+        let placed = session.place(array.clone(), options(&PlacementRequest::from(Memory::Device))).unwrap();
+        assert!(Arc::ptr_eq(placed.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
+        let uploaded = session.place(3f32, options(&PlacementRequest::from(pinned))).unwrap();
+        assert_eq!(uploaded.r#type().memory(), Memory::Device);
     }
 
     #[test]
@@ -5311,6 +3514,11 @@ mod tests {
                 Ok(values.to_vec())
             ]
         );
+
+        // An expected layout that matches the layout that the type of an array declares is accepted, and the array
+        // keeps its buffers.
+        let checked = session.place(declared.clone(), options(&column_major)).unwrap();
+        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), declared.shards()[0].buffer().unwrap()));
     }
 
     #[test]
@@ -5362,57 +3570,383 @@ mod tests {
         )
         .unwrap();
         assert_eq!(array.mesh().devices(), [device]);
-        let checked = session
-            .place(
-                array.clone(),
-                PlacementOptions::<PlacementRequest, PlacementRequest>::new(
-                    None,
-                    Some(PlacementRequest::from(device)),
-                    None,
-                    None,
-                ),
-            )
-            .unwrap();
+        let checked = session.place(array.clone(), PlacementOptions::default().with_source(device)).unwrap();
         assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
+
+        // A bare device source names no memory, so it also accepts an array in another memory of that device.
+        let pinned = Memory::Host { pinned: true };
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]).with_memory(pinned),
+            domain_mesh(client, "x", 1),
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        let checked = session.place(array.clone(), PlacementOptions::default().with_source(device)).unwrap();
+        assert!(Arc::ptr_eq(checked.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
+        assert_eq!(checked.r#type().memory(), pinned);
     }
 
     #[test]
-    fn test_session_place_returns_arrays_of_receiving_session() {
+    fn test_session_place_treats_source_devices_as_informative_on_every_path() {
+        // The devices that a source names are informative, as in JAX, which never compares them with where a value
+        // lives. An array on the first device that is placed on the second one with a source on the third one is
+        // therefore placed alike eagerly, by the replay of a staged program, and under forward and reverse mode
+        // differentiation, and reverse mode sends the cotangent to the devices that the source names.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        assert_eq!(input.mesh().devices(), [devices[0]]);
+        let options = || {
+            PlacementOptions::new(
+                Some(PlacementRequest::from(devices[1])),
+                Some(PlacementRequest::from(devices[2])),
+                Option::<bool>::None,
+                Option::<Option<bool>>::None,
+            )
+        };
+        let observe =
+            |array: &Array| (array.mesh().devices().to_vec(), array.r#type().into_owned(), shard_values(array));
+        let expected = (vec![devices[1]], input.r#type().into_owned(), vec![vec![1., 2., 3., 4.]]);
+
+        let eager = session.place(input.clone(), options()).unwrap();
+        assert_eq!(observe(&eager), expected);
+
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(|x: ArrayTracer| session.place(x, options()).unwrap(), input.r#type().into_owned()).unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4] = place [source=device(2), target=device(1)] %0
+                in (%1)"},
+        );
+        let Value::Array(staged) =
+            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
+        else {
+            panic!("placing an array must produce an array");
+        };
+        assert_eq!(observe(&staged), expected);
+
+        let (primal, tangent) = differentiate_at(input.clone())
+            .jvp(input.clone(), |x| Ok(session.place(x, options()).unwrap()))
+            .unwrap();
+        assert_eq!(observe(&primal), expected);
+        assert_eq!(observe(&tangent), expected);
+
+        let (primal, pullback) =
+            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
+        assert_eq!(observe(&primal), expected);
+        let seed = Array::from_host_buffer(
+            &session,
+            primal.r#type().into_owned(),
+            primal.mesh().clone(),
+            None,
+            values_to_bytes(&[5f32, 6., 7., 8.]),
+        )
+        .unwrap();
+        let cotangent = pullback.apply_materialized(seed).unwrap();
+        assert_eq!(
+            observe(&cotangent),
+            (vec![devices[2]], input.r#type().cotangent().unwrap(), vec![vec![5., 6., 7., 8.]]),
+        );
+    }
+
+    #[test]
+    fn test_session_place_rejects_reduction_state_changes_of_relocatable_sources() {
+        // An uncommitted upload with a pending minimum (and a pending sum) over the auto axis of its anonymous mesh,
+        // which its type omits, is relocatable. A replicated target on the other device would complete that reduction,
+        // which a placement cannot do, and a source that names only a memory must not change that through
+        // `Session::place` or `Place::place`, because the relocatable type relaxes only the match of the source.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let second_device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+        let logical_mesh = LogicalMesh::single_device();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![second_device]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh, 1);
+        let target = Placement::new(mesh, replicated.clone()).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let rejection =
+            "`place` cannot change reduction state; use a reduction (or the corresponding collective) instead";
+        for kind in [UnreducedKind::Min, UnreducedKind::Sum] {
+            let sharding =
+                replicated.clone().with_unreduced_axes(["device"]).unwrap().with_unreduced_kind(kind).unwrap();
+            let bytes = values_to_bytes(&[1f32, 2.]);
+            let input = Array::from_host_buffer(&session, r#type.clone(), None, Some(sharding), bytes).unwrap();
+            assert_eq!(CoreValue::relocatable_type(&input), Some(r#type.clone()));
+            let outcomes = vec![
+                session
+                    .place(input.clone(), PlacementOptions::to(target.clone()))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                session
+                    .place(input.clone(), PlacementOptions::to(target.clone()).with_source(Memory::Device))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                input.place(&target, &Memory::Device).map(|_| ()).map_err(|error| error.to_string()),
+            ];
+            assert_eq!(outcomes, vec![Err(rejection.to_string()); 3]);
+        }
+    }
+
+    #[test]
+    fn test_session_place_preflights_missing_whole_shard_sources() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
+        let missing =
+            Array::from_addressable_buffers(&session, ArrayType::scalar(DataType::U8), mesh, None, vec![]).unwrap();
+        let device_id = devices[0].id();
+        let direct = missing.to_placement(&session, devices[1]).unwrap_err();
+        assert!(matches!(
+            direct,
+            Error::Array(error) if matches!(
+                *error,
+                ArrayError::MissingShardBuffer { shard_index: 0, device_id: id } if id == device_id,
+            ),
+        ));
+
+        let created = session.array_statistics().created_arrays;
+        let error = session
+            .place((PlaceInput::from(3u8), PlaceInput::from(missing)), PlacementOptions::to(devices[1]))
+            .unwrap_err();
+        let (path, source) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$.1");
+        assert!(matches!(
+            source,
+            Error::Array(error) if matches!(
+                **error,
+                ArrayError::MissingShardBuffer { shard_index: 0, device_id: id } if id == device_id,
+            ),
+        ));
+        assert_eq!(session.array_statistics().created_arrays, created);
+    }
+
+    #[test]
+    fn test_session_place_applies_donation_and_aliasing_options() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[0]],
+        )
+        .unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let source = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            source_mesh,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let shares_source_buffer = |array: &Array| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| Arc::ptr_eq(shard.buffer().unwrap(), source.shards()[0].buffer().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let options = |target: Option<PlacementRequest>, donate: bool, may_alias: Option<bool>| {
+            PlacementOptions::new(target, Option::<PlacementRequest>::None, Some(donate), Some(may_alias))
+        };
+
+        // Without a new placement, the result is the leaf itself unless aliasing is forbidden.
+        let unchanged = session.place(source.clone(), options(None, false, None)).unwrap();
+        assert_eq!(shares_source_buffer(&unchanged), vec![true]);
+        let copied = session.place(source.clone(), options(None, false, Some(false))).unwrap();
+        assert_eq!(copied.r#type(), source.r#type());
+        assert_eq!(copied.mesh(), source.mesh());
+        assert_eq!(shares_source_buffer(&copied), vec![false]);
+        assert_ne!(native_buffer_addresses(&copied), native_buffer_addresses(&source));
+        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
+
+        // A forbidden alias copies every shard within its own memory, so an array in host memory stays there.
+        let host = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]).with_memory(Memory::Host { pinned: true }),
+            source.mesh().clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let copied = session.place(host.clone(), options(None, false, Some(false))).unwrap();
+        assert_eq!(copied.r#type(), host.r#type());
+        assert!(!Arc::ptr_eq(copied.shards()[0].buffer().unwrap(), host.shards()[0].buffer().unwrap()));
+        assert_ne!(native_buffer_addresses(&copied), native_buffer_addresses(&host));
+        assert_eq!(copied.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
+
+        // A shard that stays on its device shares its buffer unless aliasing is forbidden.
+        let target = PlacementRequest::from(Placement::new(mesh.clone(), replicated).unwrap());
+        let placed = session.place(source.clone(), options(Some(target.clone()), false, None)).unwrap();
+        assert_eq!(shares_source_buffer(&placed), vec![true, false]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
+        let placed = session.place(source.clone(), options(Some(target), false, Some(false))).unwrap();
+        assert_eq!(shares_source_buffer(&placed), vec![false, false]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
+
+        // A donated leaf is consumed. This one shares its buffers with `source`, so the donation does not take effect
+        // and `source` stays readable.
+        let target = PlacementRequest::from(Placement::new(mesh, sharded.clone()).unwrap());
+        let donated = session.place(source.clone(), options(Some(target), true, None)).unwrap();
+        assert_eq!(donated.sharding(), &sharded);
+        assert_eq!(shard_values(&donated), vec![vec![1., 2.], vec![3., 4.]]);
+        assert_eq!(shard_values(&source), vec![vec![1., 2., 3., 4.]]);
+
+        // Donation decides over a forbidden alias, as in JAX, where `donate=True` with `may_alias=False` selects
+        // `DONATE_INPUT` and returns the buffer of an array that already lives at its destination. A donated leaf is
+        // therefore placed as without an aliasing option, whether or not another handle shares its buffers, and only
+        // the leaf without donation above is copied.
+        let shared = session.place(source.clone(), options(None, true, Some(false))).unwrap();
+        assert_eq!(shares_source_buffer(&shared), vec![true]);
+        let exclusive = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            source.mesh().clone(),
+            None,
+            values_to_bytes(&[5f32, 6., 7., 8.]),
+        )
+        .unwrap();
+        let addresses = native_buffer_addresses(&exclusive);
+        let donated = session.place(exclusive, options(None, true, Some(false))).unwrap();
+        assert_eq!(native_buffer_addresses(&donated), addresses);
+        assert_eq!(shard_values(&donated), vec![vec![5., 6., 7., 8.]]);
+    }
+
+    #[test]
+    fn test_session_place_copies_only_handle_of_leaf_that_may_not_alias() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+        let upload = || {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
+        };
+        let options = |target: Option<PlacementRequest>| {
+            PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(target, None, None, Some(Some(false)))
+        };
+
+        // The leaf is the only handle of its buffer, which a forced copy still must not return, whether the placement
+        // leaves the leaf where it is or keeps its shard on its device while adding a replica on another device.
+        let replicated = PlacementRequest::from(
+            Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap(),
+        );
+        for (target, values) in [(None, vec![vec![1f32, 2.]]), (Some(replicated), vec![vec![1., 2.]; 2])] {
+            let array = upload();
+            let buffer = Arc::downgrade(array.shards()[0].buffer().unwrap());
+            let placed = session.place(array, options(target)).unwrap();
+            assert!(buffer.upgrade().is_none());
+            assert_eq!(shard_values(&placed), values);
+        }
+    }
+
+    #[test]
+    fn test_session_place_rejects_donated_leaf_that_may_alias() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = domain_mesh(client, "x", 1);
-        let meshed_session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let upload = |session: &Session| {
-            let r#type = ArrayType::new_static(DataType::F32, [2]);
-            Array::from_host_buffer(session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
-        };
-        let options =
-            |target: Option<PlacementRequest>| PlacementOptions::<PlacementRequest>::new(target, None, None, None);
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
 
-        // An array of another session of the same client comes back owned by the receiving session, which has a
-        // default mesh that the session of the input lacks, whether the placement keeps the array where it is or not.
-        let array = upload(&session);
-        for target in [None, Some(PlacementRequest::from(device))] {
-            let placed = meshed_session.place(array.clone(), options(target)).unwrap();
-            assert!(placed.session().is_same_session(&meshed_session));
-            assert_eq!(placed.session().device_mesh().unwrap(), &mesh);
+        // The donation and aliasing options of every leaf are checked before any leaf is placed, and the error names
+        // the first leaf that is donated while it may alias.
+        let error = session
+            .place(
+                (array.clone(), array.clone()),
+                PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(
+                    None,
+                    None,
+                    Some((false, true)),
+                    Some(Some(true)),
+                ),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::DonatedArrayMayAlias { path } if path.to_string() == "$.1",
+            ),
+        ));
+        assert_eq!(error.to_string(), "array `$.1` cannot be donated while `may_alias` is `Some(true)`");
+    }
+
+    #[test]
+    fn test_session_place_admits_a_tree_of_leaves_that_can_communicate() {
+        struct Wrapper(Array);
+        impl Parameter for Wrapper {}
+        impl PlaceableParameter<Array> for Wrapper {
+            fn validate_placement(
+                &self,
+                session: &Session,
+                target: Option<&PlacementRequest>,
+                source: Option<&PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<(), Error> {
+                self.0.validate_placement(session, target, source, donate, may_alias)
+            }
+        }
+        impl Placeable for Wrapper {
+            type Output = Array;
+
+            fn place_parameter(
+                self,
+                session: &Session,
+                target: Option<PlacementRequest>,
+                source: Option<PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<Array, Error> {
+                self.0.place_parameter(session, target, source, donate, may_alias)
+            }
         }
 
-        // An array of another client that lives on a device with the same ID is rejected without a destination, and
-        // transferred onto a device destination as a committed array of the receiving session.
-        let other_array = upload(&Session::builder().client(other_cpu_client(1)).build().unwrap());
-        assert_eq!(other_array.mesh().devices(), [device]);
-        assert!(matches!(
-            session.place(other_array.clone(), options(None)),
-            Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
-                if message == "cannot associate an array with a session of a different PJRT client",
-        ));
-        let placed = meshed_session.place(other_array, options(Some(PlacementRequest::from(device)))).unwrap();
-        assert!(placed.session().is_same_session(&meshed_session));
-        assert!(std::ptr::eq(placed.client(), client));
-        assert_eq!((placed.mesh().devices(), placed.is_committed()), ([device].as_slice(), true));
-        assert_eq!(values_from_bytes::<f32>(&placed.copy_to_host_bytes().unwrap()), vec![1f32, 2.]);
+        let client = cpu_client(1);
+        let remote = Device::new(1000, 1);
+        let session = Session::builder().client(client).remote_devices([remote]).build().unwrap();
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let committed = session.place(7u8, PlacementOptions::to(local)).unwrap();
+        let scalar = session.place(9u8, PlacementOptions::default()).unwrap();
+        let vector =
+            Array::from_host_buffer(&session, ArrayType::new_static(DataType::U8, [2]), None, None, [8, 9]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![local]).unwrap();
+        let placement = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let options = PlacementOptions::to((PlacementRequest::from(remote), PlacementRequest::from(placement)));
+
+        // One rank would encounter the invalid second leaf. A rank with a valid second leaf must attempt admission
+        // before it can submit the cross-host transfer in the first wrapper.
+        let error = session.place((Wrapper(committed.clone()), Wrapper(scalar)), options.clone()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to place the parameter at `$.1`: \
+             `place` target sharding rank (1) does not match the input rank (0)",
+        );
+        let error = session.place((Wrapper(committed), Wrapper(vector)), options).unwrap_err();
+        assert!(matches!(error, Error::Session(SessionError::PlacementComparisonUnavailable)));
     }
 
     #[test]
@@ -5421,7 +3955,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let other_client = other_cpu_client(2);
         let other_session = Session::builder().client(other_client).build().unwrap();
-        let other_device = Device::from_pjrt(&other_client.addressable_devices().unwrap()[1]).unwrap();
+        let other_device = other_session.addressable_devices().unwrap()[1];
         let input = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [2, 2]),
@@ -5438,71 +3972,50 @@ mod tests {
             values_to_bytes(&[5f32, 6., 7., 8.]),
         )
         .unwrap();
-        let is_rejected = |error: &Option<Error>| {
-            matches!(
-                error,
-                Some(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
-                    if message == "cannot associate an array with a session of a different PJRT client",
-            )
-        };
+        let rejection = Some("cannot associate an array with a session of a different PJRT client".to_string());
 
         // A traced leaf over arrays of another client is rejected like those arrays are, with or without a target,
         // because the devices of the receiving session that a target names are not the devices of those arrays.
         for target in [None, Some(PlacementRequest::from(other_device))] {
             let options = || PlacementOptions::<PlacementRequest>::new(target.clone(), None, None, None);
+            let error = RefCell::new(None);
 
             // A batched leaf wraps the packed array.
-            let mut error = None;
-            let _: Array = batch(
-                |x| match other_session.place(x.clone(), options()) {
-                    Ok(output) => Ok(output),
-                    Err(place_error) => {
-                        error = Some(place_error);
-                        Ok(x)
-                    }
-                },
+            let _: Result<Array, _> = batch(
+                |x| record_placement_error(&error, other_session.place(x, options())),
                 input.clone(),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
-            )
-            .unwrap();
-            assert!(is_rejected(&error));
+            );
+            assert_eq!(error.take(), rejection);
 
             // A differentiated leaf wraps the primal array through a partially evaluated value.
-            let mut error = None;
             let _ = differentiate_at(input.clone())
-                .vjp(|x| match other_session.place(x.clone(), options()) {
-                    Ok(output) => Ok(output),
-                    Err(place_error) => {
-                        error = Some(place_error);
-                        Ok(x)
-                    }
-                })
-                .unwrap();
-            assert!(is_rejected(&error));
+                .vjp(|x| record_placement_error(&error, other_session.place(x, options())));
+            assert_eq!(error.take(), rejection);
 
             // A differentiated leaf also wraps its tangent, which is checked like its primal, so a tangent of another
             // client is rejected even when the primal is an array of the receiving session.
-            let mut error = None;
-            let _: (Array, Array) = differentiate_at(input.clone())
-                .jvp(other_tangent.clone(), |x| match session.place(x.clone(), options()) {
-                    Ok(output) => Ok(output),
-                    Err(place_error) => {
-                        error = Some(place_error);
-                        Ok(x)
-                    }
-                })
-                .unwrap();
-            assert!(is_rejected(&error));
+            let _: Result<(Array, Array), _> = differentiate_at(input.clone())
+                .jvp(other_tangent.clone(), |x| record_placement_error(&error, session.place(x, options())));
+            assert_eq!(error.take(), rejection);
         }
 
         // A staged leaf wraps no arrays, so any session can place it.
-        let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
             |input: ArrayTracer| other_session.place(input, PlacementOptions::default()).unwrap(),
             ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = place %0
+                in (%1)"
+            },
         );
-        assert!(traced.is_ok());
     }
 
     #[test]
@@ -5518,47 +4031,25 @@ mod tests {
         };
         let options =
             |target: Option<PlacementRequest>| PlacementOptions::<PlacementRequest>::new(target, None, None, None);
-        let is_rejected = |error: &Option<Error>| {
-            matches!(
-                error,
-                Some(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
-                    if message == "cannot place a traced value over arrays of another session",
-            )
-        };
+        let rejection = Some("cannot place a traced value over arrays of another session".to_string());
 
         // A traced leaf places its arrays with the session that they belong to, which cannot become the receiving
         // session, so a traced leaf over arrays of another session of the same client is rejected, with or without
         // a target.
         let input = upload(&other_session);
         for target in [None, Some(PlacementRequest::from(device))] {
-            let mut error = None;
-            let _: Array = batch(
-                |x| match session.place(x.clone(), options(target.clone())) {
-                    Ok(output) => Ok(output),
-                    Err(place_error) => {
-                        error = Some(place_error);
-                        Ok(x)
-                    }
-                },
+            let error = RefCell::new(None);
+            let _: Result<Array, _> = batch(
+                |x| record_placement_error(&error, session.place(x, options(target.clone()))),
                 input.clone(),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
-            )
-            .unwrap();
-            assert!(is_rejected(&error));
-
-            let mut error = None;
+            );
+            assert_eq!(error.take(), rejection);
             let _ = differentiate_at(input.clone())
-                .vjp(|x| match session.place(x.clone(), options(target.clone())) {
-                    Ok(output) => Ok(output),
-                    Err(place_error) => {
-                        error = Some(place_error);
-                        Ok(x)
-                    }
-                })
-                .unwrap();
-            assert!(is_rejected(&error));
+                .vjp(|x| record_placement_error(&error, session.place(x, options(target.clone()))));
+            assert_eq!(error.take(), rejection);
         }
 
         // Another handle of the session of the arrays (e.g., one with a default mesh) places the leaf, whose result
@@ -5574,7 +4065,7 @@ mod tests {
         )
         .unwrap();
         assert!(output.session().is_same_session(&session));
-        assert!(output.session().device_mesh().is_err());
+        assert!(matches!(output.session().device_mesh(), Err(Error::Session(SessionError::MissingMesh))));
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
     }
 
@@ -5591,27 +4082,39 @@ mod tests {
         // The traced input stays traced, and its placement on the mesh of the compiled function is staged in it.
         let target = PlacementRequest::from(session.placement(sharding.clone()).unwrap());
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-            |input: CompileTracer| {
-                session
-                    .place(input, PlacementOptions::<PlacementRequest>::new(Some(target), None, None, None))
-                    .unwrap()
-            },
+            |input: CompileTracer| session.place(input, PlacementOptions::to(target)).unwrap(),
             input_type.clone(),
             &session,
             mesh.clone(),
         )
         .unwrap();
-        let input =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
-                .unwrap();
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}] = place [
+                    target={mesh<['x'=2:explicit]>, devices=[0, 1], sharding={mesh<['x'=2:explicit]>, [{'x'}]}},
+                ] %0
+                in (%1)"
+            },
+        );
+        let input = Array::from_host_buffer(
+            &session,
+            input_type.clone(),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
         let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type.with_sharding(sharding.clone()).unwrap());
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(output.sharding(), &sharding);
         assert_eq!(shard_values(&output), vec![vec![1., 2.], vec![3., 4.]]);
     }
 
     #[test]
-    fn test_session_place_places_traced_values_in_place_in_compiled_functions() {
+    fn test_session_place_places_traced_leaves_in_place_in_compiled_functions() {
         // A traced input of a function that is compiled for a mesh of two devices has no concrete placement, and its
         // type does not say how it is split along the auto axis `x`, which only the boundary of the compiled function
         // states, so the traced function cannot name its placement, and a bare memory stages an in-place target. The
@@ -5658,19 +4161,13 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_places_traced_leaves_on_sole_device_of_compiled_mesh() {
+    fn test_session_place_places_traced_leaves_on_sole_device_of_program_mesh() {
         let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let sharding = Sharding::replicated(logical_mesh, 1);
-        let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
         let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = single_device_mesh(devices[1]);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
 
         // The devices of a traced input are not known while it is traced, so a bare device stages a device target whose
         // type rule selects the default memory of the device, which keeps the sharding of the input on the mesh of the
@@ -5707,21 +4204,45 @@ mod tests {
             assert_eq!(buffer.memory().unwrap(), buffer.device().unwrap().default_memory().unwrap());
             assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
         }
+
+        // The placed value keeps the sharding that the input is tracked with over the mesh of the function, so it can
+        // be added to another input of that function.
+        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
+            |(x, y): (CompileTracer, CompileTracer)| {
+                session.place(x, PlacementOptions::to(devices[1])).unwrap().add(&y).unwrap()
+            },
+            (input_type.clone(), input_type.clone()),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [target=device(1)] %0
+                    %3:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = add %2 %1
+                in (%3)"
+            },
+        );
+        let x = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
+            .unwrap();
+        let y =
+            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[3f32, 4.])).unwrap();
+        let output = compiled.executable().execute(&session, (x, y)).unwrap();
+        assert_eq!(output.mesh(), &mesh);
+        assert!(output.is_committed());
+        assert_eq!(shard_values(&output), vec![vec![4., 6.]]);
     }
 
     #[test]
-    fn test_session_place_completes_pending_reduction_of_traced_values_on_sole_device_of_compiled_mesh() {
+    fn test_session_place_completes_pending_reduction_of_traced_leaves_on_sole_device_of_program_mesh() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let replicated = Sharding::replicated(logical_mesh, 1);
+        let devices = session.addressable_devices().unwrap();
+        let mesh = single_device_mesh(devices[1]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
@@ -5759,106 +4280,13 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_combines_traced_values_on_sole_device_with_other_values() {
-        let client = cpu_client(1);
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+    fn test_session_place_places_traced_leaves_in_staged_and_jit_functions() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let mesh = single_device_mesh(device);
         let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(logical_mesh, 1))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
-
-        // The placed value keeps the sharding that the input is tracked with over the mesh of the function, so it can
-        // be added to another input of that function.
-        let compiled: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
-            |(x, y): (CompileTracer, CompileTracer)| {
-                session.place(x, PlacementOptions::to(device)).unwrap().add(&y).unwrap()
-            },
-            (input_type.clone(), input_type.clone()),
-            &session,
-            mesh.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            compiled.source_program().program().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
-                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [target=device(0)] %0
-                    %3:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = add %2 %1
-                in (%3)"
-            },
-        );
-        let x = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
-            .unwrap();
-        let y =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[3f32, 4.])).unwrap();
-        let output = compiled.executable().execute(&session, (x, y)).unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert!(output.is_committed());
-        assert_eq!(shard_values(&output), vec![vec![4., 6.]]);
-    }
-
-    #[test]
-    fn test_session_place_combines_gathered_values_with_uploads_on_their_device() {
-        // A value that a device destination gathers lives on the canonical logical mesh of one device, which is also
-        // the mesh of an upload without a mesh, so the two combine on that device eagerly and in a staged program
-        // that is replayed on arrays, as values with `SingleDeviceSharding`s on one device do in JAX.
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let device = mesh.devices()[0];
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let split_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
-        let split =
-            Array::from_host_buffer(&session, split_type.clone(), mesh, None, values_to_bytes(&[1f32, 2., 3., 4.]))
-                .unwrap();
-        let upload = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 1., 1., 1.]),
-        )
-        .unwrap();
-        let canonical_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
-        assert_eq!(upload.mesh(), &canonical_mesh);
-
-        let gathered = session.place(split.clone(), PlacementOptions::to(device)).unwrap();
-        assert_eq!(gathered.mesh(), &canonical_mesh);
-        let sum = gathered.add(&upload).unwrap();
-        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
-        let placed_upload = session.place(upload.clone(), PlacementOptions::to(device)).unwrap();
-        let sum = gathered.add(&placed_upload).unwrap();
-        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
-
-        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(x, y): (ArrayTracer, ArrayTracer)| {
-                let x = session.place(x, PlacementOptions::to(device)).unwrap();
-                let y = session.place(y, PlacementOptions::to(device)).unwrap();
-                x.add(&y).unwrap()
-            },
-            (split_type, upload.r#type().into_owned()),
-        )
-        .unwrap();
-        let inputs = (Value::Array(split), Value::Array(upload));
-        let Value::Array(sum) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
-            panic!("adding two arrays must produce an array");
-        };
-        assert_eq!((sum.mesh(), shard_values(&sum)), (&canonical_mesh, vec![vec![2., 3., 4., 5.]]));
-    }
-
-    #[test]
-    fn test_session_place_places_traced_values_on_sole_device_through_every_staging_entry_point() {
-        let client = cpu_client(1);
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(logical_mesh, 1))
-            .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
         let input =
             Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
                 .unwrap();
@@ -5872,6 +4300,15 @@ mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}]@Host[Pinned] = place [\
+                    target=device(0, memory=Host[Pinned])] %0
+                in (%1)"
+            },
+        );
         let output = session.compile_staged_function(staged).unwrap().executable().execute(&session, input.clone());
         let output = output.unwrap();
         assert_eq!(output.mesh(), &mesh);
@@ -5885,27 +4322,7 @@ mod tests {
             &session,
             mesh.clone(),
         );
-        let output = function.execute((), input.clone()).unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(output.r#type().memory(), memory);
-        assert!(output.is_committed());
-        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
-
-        // A stateful function traces values of the array IR type universe, which `Session::place` does not accept,
-        // so it stages the device target through the `PlaceDispatch` primitive of `Place` directly.
-        let device_target = PlacementRequest::Device { device, memory: Some(memory), layout: None };
-        let compiled = compile_statefully::<_, Type, Type>(
-            |input| {
-                Ok(<StatefulCompileTracer as CoreValue>::Dispatch::place(&input, Some(&device_target), None, true)?)
-            },
-            Type::Array(input_type),
-            &session,
-            Options::new(mesh.clone()),
-        )
-        .unwrap();
-        let Value::Array(output) = compiled.execute_statefully_and_wait(&session, Value::Array(input)).unwrap() else {
-            panic!("placing an array must produce an array");
-        };
+        let output = function.execute((), input).unwrap();
         assert_eq!(output.mesh(), &mesh);
         assert_eq!(output.r#type().memory(), memory);
         assert!(output.is_committed());
@@ -5913,24 +4330,608 @@ mod tests {
     }
 
     #[test]
+    fn test_session_place_defers_device_checks_of_traced_leaves_to_compilation() {
+        // A traced leaf, bare or wrapped in a `PlaceInput`, stages its requests without checking their devices against
+        // the session that stages it, and the session that compiles the function resolves them. A target can name a
+        // device that only the compiling session has.
+        let staging_session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let compilation_session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let device = compilation_session.devices().unwrap()[1];
+        assert!(!staging_session.devices().unwrap().contains(&device));
+        let input = compilation_session
+            .place(CoreArray::vector(vec![3f32]).unwrap(), PlacementOptions::to(device))
+            .unwrap();
+        let staged: StagedFunction<ArrayType, (ArrayType, ArrayType)> = stage(
+            |input: CompileTracer| {
+                let direct = staging_session.place(input.clone(), PlacementOptions::to(device)).unwrap();
+                let wrapped = staging_session.place(PlaceInput::from(input), PlacementOptions::to(device)).unwrap();
+                (direct, wrapped)
+            },
+            input.r#type().into_owned(),
+            Options::new(input.mesh().clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[1] .
+                let %1:f32[1] = place [target=device(1)] %0
+                    %2:f32[1] = place [target=device(1)] %0
+                in (%1, %2)"
+            },
+        );
+        let compiled = compilation_session.compile_staged_function(staged).unwrap();
+        let (direct, wrapped) = compiled.executable().execute(&compilation_session, input).unwrap();
+        for output in [direct, wrapped] {
+            assert_eq!(output.mesh().devices(), [device]);
+            assert_eq!(shard_values(&output), vec![vec![3.]]);
+        }
+
+        // The devices of a source are informative, so an eager placement accepts a source device that no session
+        // knows, and a traced leaf stages it, which the compiled function then ignores.
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let unknown = Device::new(999, 0);
+        let input = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
+        let options = || PlacementOptions::default().with_source(unknown);
+        let eager = session.place(input.clone(), options()).unwrap();
+        assert_eq!(shard_values(&eager), vec![vec![1., 2.]]);
+        let compiled: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
+            |input: CompileTracer| {
+                let direct = session.place(input.clone(), options()).unwrap();
+                let wrapped = session.place(PlaceInput::from(input), options()).unwrap();
+                (direct, wrapped)
+            },
+            input.r#type().into_owned(),
+            &session,
+            input.mesh().clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = place [source=device(999)] %0
+                    %2:f32[2] = place [source=device(999)] %0
+                in (%1, %2)"
+            },
+        );
+        let (direct, wrapped) = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(shard_values(&direct), vec![vec![1., 2.]]);
+        assert_eq!(shard_values(&wrapped), vec![vec![1., 2.]]);
+    }
+
+    #[test]
+    fn test_session_place_applies_memory_and_layout_of_devices_to_traced_leaves_in_compiled_functions() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let mesh = single_device_mesh(device);
+        let input_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let memory = Memory::Host { pinned: true };
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let target = PlacementRequest::Device { device, memory: Some(memory), layout: Some(layout.clone()) };
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
+            |input: CompileTracer| session.place(input, PlacementOptions::to(target)).unwrap(),
+            input_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2] .
+                let %1:f32[2, 2][layout=tiled{0,1}]@Host[Pinned] = place [\
+                    target=device(0, memory=Host[Pinned], layout=tiled{0,1})] %0
+                in (%1)"
+            },
+        );
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
+                .unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.r#type().memory(), memory);
+        assert_eq!(output.layout(), Some(&layout));
+        let buffer = output.shards()[0].buffer().unwrap().clone();
+        assert_eq!(buffer.memory().unwrap().kind().unwrap(), "pinned_host");
+        assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
+        assert!(output.is_committed());
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4.]);
+    }
+
+    #[test]
+    fn test_session_place_places_traced_leaves_in_differentiation() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let source_mesh = single_device_mesh(devices[0]);
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [3]),
+            source_mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2., 3.]),
+        )
+        .unwrap();
+        let cotangent = |value: &Array| {
+            let r#type = value.r#type().into_owned();
+            Array::from_host_buffer(&session, r#type, value.mesh().clone(), None, values_to_bytes(&[4f32, 5., 6.]))
+                .unwrap()
+        };
+
+        // The primal moves to the target device, and the pullback moves the cotangent back to the source mesh. The
+        // donation option does not apply to the traced leaf, so the input stays readable.
+        let options = PlacementOptions::to(devices[1]).with_donate(true).with_may_alias(Some(false));
+        let (value, pullback) =
+            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
+        assert_eq!(value.mesh().devices(), [devices[1]]);
+        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
+        assert_eq!(shard_values(&input), vec![vec![1., 2., 3.]]);
+        let input_cotangent = pullback.apply_materialized(cotangent(&value)).unwrap();
+        assert_eq!(input_cotangent.mesh(), &source_mesh);
+        assert_eq!(input_cotangent.r#type(), input.r#type());
+        assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
+
+        // A device names a device and not a mesh, so a traced leaf over an array on that device resolves the device
+        // to the mesh of the array, both as a source, to which the pullback returns the cotangent, and as a target
+        // that keeps the leaf where it is.
+        let options = PlacementOptions::to(devices[1]).with_source(devices[0]);
+        let (value, pullback) =
+            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
+        assert_eq!(value.mesh().devices(), [devices[1]]);
+        let input_cotangent = pullback.apply_materialized(cotangent(&value)).unwrap();
+        assert_eq!(input_cotangent.mesh(), &source_mesh);
+        assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
+        let (value, _) = differentiate_at(input.clone())
+            .vjp(|x| Ok(session.place(x, PlacementOptions::to(devices[0])).unwrap()))
+            .unwrap();
+        assert_eq!(value.mesh(), &source_mesh);
+        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
+    }
+
+    #[test]
+    fn test_session_place_places_traced_leaves_in_place_in_differentiation() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values)).unwrap()
+        };
+
+        // The primal and the tangent both move to the memory on the devices where they live.
+        let (primal, tangent) = differentiate_at(array(&[1., 2., 3., 4.]))
+            .jvp(array(&[5., 6., 7., 8.]), |x| Ok(session.place(x, PlacementOptions::to(pinned)).unwrap()))
+            .unwrap();
+        for (output, values) in
+            [(&primal, vec![vec![1., 2.], vec![3., 4.]]), (&tangent, vec![vec![5., 6.], vec![7., 8.]])]
+        {
+            assert_eq!(output.mesh(), &mesh);
+            assert_eq!(output.sharding(), &sharding);
+            assert_eq!(output.r#type().memory(), pinned);
+            assert_eq!(output.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
+            assert_eq!(shard_values(output), values);
+        }
+
+        // The cotangent returns to the memory of the input, on the same devices.
+        let (value, pullback) = differentiate_at(array(&[1., 2., 3., 4.]))
+            .vjp(|x| Ok(session.place(x, PlacementOptions::to(pinned)).unwrap()))
+            .unwrap();
+        assert_eq!(value.r#type().memory(), pinned);
+        let cotangent = pullback.apply_materialized(value).unwrap();
+        assert_eq!(cotangent.mesh(), &mesh);
+        assert_eq!(cotangent.sharding(), &sharding);
+        assert_eq!(cotangent.r#type().memory(), Memory::Device);
+        let buffer = cotangent.shards()[0].buffer().unwrap();
+        assert_eq!(buffer.memory().unwrap(), buffer.device().unwrap().default_memory().unwrap());
+        assert_eq!(shard_values(&cotangent), vec![vec![1., 2.], vec![3., 4.]]);
+    }
+
+    #[test]
+    fn test_session_place_completes_pending_reduction_of_traced_leaves_in_differentiation() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let (source_mesh, target_mesh) = (single_device_mesh(devices[0]), single_device_mesh(devices[1]));
+        let replicated = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let upload = |values: &[f32]| {
+            Array::from_host_buffer(&session, r#type.clone(), source_mesh.clone(), None, values_to_bytes(values))
+                .unwrap()
+        };
+        let (primal, tangent) = (upload(&[1., 2.]), upload(&[3., 4.]));
+
+        // The primal and the tangent of a traced leaf on a mesh of one device move to another device as a direct
+        // placement of an array moves them, with their logical mesh over that device and without their pending
+        // reduction along `x`, which has size one, so `exp` applies to them.
+        let (value, tangent): (Array, Array) = differentiate_at(primal.clone())
+            .jvp(tangent, |x| session.place(x, PlacementOptions::to(devices[1])).unwrap().exp())
+            .unwrap();
+        let direct = session.place(primal, PlacementOptions::to(devices[1])).unwrap().exp().unwrap();
+        assert_eq!(
+            (value.mesh(), value.sharding(), value.r#type()),
+            (direct.mesh(), direct.sharding(), direct.r#type())
+        );
+        assert_eq!((value.mesh(), value.sharding()), (&target_mesh, &replicated));
+        assert_eq!(
+            (tangent.mesh(), tangent.sharding(), tangent.r#type()),
+            (direct.mesh(), direct.sharding(), direct.r#type())
+        );
+        assert_eq!(shard_values(&value), vec![vec![1f32.exp(), 2f32.exp()]]);
+        assert_eq!(shard_values(&tangent), vec![vec![3. * 1f32.exp(), 4. * 2f32.exp()]]);
+    }
+
+    #[test]
+    fn test_session_place_without_target_in_differentiation() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let (first_mesh, second_mesh) = (single_device_mesh(devices[0]), single_device_mesh(devices[1]));
+        let sharding = Sharding::replicated(first_mesh.logical_mesh().clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding.clone()).unwrap();
+        let input =
+            Array::from_host_buffer(&session, r#type, first_mesh.clone(), None, values_to_bytes(&[1f32, 2., 3.]))
+                .unwrap();
+        let source = Placement::new(second_mesh.clone(), sharding).unwrap();
+
+        // Without a target, the primal stays where it lives, and the pullback moves the cotangent to the source, which
+        // is inferred from the primal when it is absent and can name another device than the one of the primal.
+        let cases = [(None, &second_mesh, &first_mesh), (Some(source), &first_mesh, &second_mesh)];
+        for (source, cotangent_mesh, input_cotangent_mesh) in cases {
+            let options = PlacementOptions::<PlacementRequest, Placement>::new(None, source, None, None);
+            let (value, pullback) =
+                differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
+            assert_eq!(value.mesh(), &first_mesh);
+            assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
+            let cotangent = Array::from_host_buffer(
+                &session,
+                value.r#type().into_owned(),
+                cotangent_mesh.clone(),
+                None,
+                values_to_bytes(&[4f32, 5., 6.]),
+            )
+            .unwrap();
+            let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
+            assert_eq!(input_cotangent.mesh(), input_cotangent_mesh);
+            assert_eq!(input_cotangent.r#type(), input.r#type());
+            assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
+        }
+    }
+
+    #[test]
+    fn test_session_place_stages_traced_leaves_without_target() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let (first_mesh, second_mesh) = (single_device_mesh(devices[0]), single_device_mesh(devices[1]));
+        let sharding = Sharding::replicated(first_mesh.logical_mesh().clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
+        let source = Placement::new(second_mesh, sharding).unwrap();
+        let options = || PlacementOptions::<PlacementRequest, Placement>::new(None, Some(source.clone()), None, None);
+
+        // Without a target, the placement is staged without one and with the source, which only the transposition of
+        // the placement uses, so replaying it on an array that lives on the first device leaves the array there, even
+        // though the source names the second device.
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(|input: ArrayTracer| session.place(input, options()).unwrap(), r#type.clone()).unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
+                    source={mesh<['x'=1:explicit]>, devices=[1], sharding={mesh<['x'=1:explicit]>, [{}]}},
+                ] %0
+                in (%1)"
+            },
+        );
+        let input =
+            Array::from_host_buffer(&session, r#type.clone(), first_mesh.clone(), None, values_to_bytes(&[1f32, 2.]))
+                .unwrap();
+        let Value::Array(output) = traced.program().interpret_in_context(&session, Value::Array(input)).unwrap() else {
+            panic!("placing an array must produce an array");
+        };
+        assert_eq!(output.mesh(), &first_mesh);
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
+
+        // The pullback places the cotangent on the source, with the memory of the primal and without a source of its
+        // own, because the forward placement has no target.
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
+                let (_, pullback) = differentiate_at(input).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
+                pullback.apply_materialized(cotangent).unwrap()
+            },
+            (r#type.clone(), r#type),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
+                    target={mesh<['x'=1:explicit]>, devices=[1], \
+                        sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
+                    may_alias=false,
+                ] %1
+                in (%2)"
+            },
+        );
+    }
+
+    #[test]
+    fn test_session_place_stages_device_source_of_traced_leaves_for_pullback() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let (first_mesh, second_mesh) = (single_device_mesh(devices[0]), single_device_mesh(devices[1]));
+        let r#type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(first_mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let options = || PlacementOptions::to(devices[1]).with_source(devices[0]);
+        let upload = |values: &[f32], mesh: &DeviceMesh| {
+            let array = Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values));
+            Value::Array(array.unwrap())
+        };
+
+        // The devices of a traced input are not known, so a bare device source stays a device, and the pullback moves
+        // the cotangent from the target back onto it over the logical mesh of the input, as JAX's transposition of
+        // `device_put` returns it to that device. Interpreting the pullback on an input on the first device and a
+        // cotangent on the second one returns the gradient on the first device.
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
+                let (_, pullback) = differentiate_at(input).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
+                pullback.apply_materialized(cotangent).unwrap()
+            },
+            (r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
+                    inferred_source=device(1),
+                    target={mesh<['x'=1:explicit]>, devices=[0], \
+                        sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
+                    may_alias=false,
+                ] %1
+                in (%2)"
+            },
+        );
+        let inputs = (upload(&[1., 2.], &first_mesh), upload(&[3., 4.], &second_mesh));
+        let Value::Array(gradient) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+            panic!("placing an array must produce an array");
+        };
+        assert_eq!(gradient.mesh(), &first_mesh);
+        assert_eq!(gradient.r#type().as_ref(), &r#type);
+        assert_eq!(shard_values(&gradient), vec![vec![3., 4.]]);
+
+        // Transposing the pullback again swaps the two devices back, so the cotangent of the gradient moves onto the
+        // second device, which is the target of the forward placement.
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
+            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
+                let (_, pullback) = differentiate_at((input, cotangent.clone()))
+                    .vjp(|(x, cotangent)| {
+                        let (_, pullback) = differentiate_at(x).vjp(|x| Ok(session.place(x, options()).unwrap()))?;
+                        pullback.apply_materialized(cotangent)
+                    })
+                    .unwrap();
+                pullback.apply_materialized(cotangent).unwrap().1
+            },
+            (r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], \
+                    %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
+                    inferred_source={mesh<['x'=1:explicit]>, devices=[0], \
+                        sharding={mesh<['x'=1:explicit]>, [{}]}},
+                    target={mesh<['x'=1:explicit]>, devices=[1], \
+                        sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
+                    may_alias=false,
+                ] %1
+                in (%2)"
+            },
+        );
+        let inputs = (upload(&[1., 2.], &first_mesh), upload(&[5., 6.], &first_mesh));
+        let Value::Array(cotangent) = traced.program().interpret_in_context(&session, inputs).unwrap() else {
+            panic!("placing an array must produce an array");
+        };
+        assert_eq!(cotangent.mesh(), &second_mesh);
+        assert_eq!(cotangent.r#type().as_ref(), &r#type);
+        assert_eq!(shard_values(&cotangent), vec![vec![5., 6.]]);
+    }
+
+    #[test]
+    fn test_session_place_compiles_traced_leaves_without_target() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let mesh = single_device_mesh(device);
+        let input_type = ArrayType::new_static(DataType::F32, [2]);
+
+        // A bare device does not determine a placement for a traced leaf whose devices are not known, so the source
+        // stays a device, which only transposition uses, and the placement without a target compiles and leaves the
+        // value where it is.
+        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
+            |input: CompileTracer| session.place(input, PlacementOptions::default().with_source(device)).unwrap(),
+            input_type.clone(),
+            &session,
+            mesh.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = place [source=device(0)] %0
+                in (%1)"
+            },
+        );
+        let input =
+            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap();
+        let output = compiled.executable().execute(&session, input).unwrap();
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
+    }
+
+    #[test]
+    fn test_session_place_places_traced_leaves_in_batching() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let device = session.addressable_devices().unwrap()[1];
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+
+        // The target resolves for the rank of each batch item, and the packed result lives on the target device,
+        // committed to it, with the type of the input.
+        let output: Array = batch(
+            |x| Ok(session.place(x, PlacementOptions::to(device)).unwrap()),
+            input.clone(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output.mesh().devices(), [device]);
+        assert!(output.is_committed());
+        assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4., 5., 6.]]);
+    }
+
+    #[test]
+    fn test_session_place_places_traced_leaves_in_batching_on_their_own_placement() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 3]),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+
+        // Each device holds one batch item, which the placement of a batch item records as the sharding of its batch,
+        // so placing every batch item on its own placement leaves each of them on its device.
+        let output: Array = batch(
+            |x| {
+                let placement = x.placement().unwrap();
+                assert_eq!(placement.batch_shardings(), [ShardingDimension::sharded(["x"])]);
+                Ok(session.place(x, PlacementOptions::<Placement>::new(Some(placement), None, None, None)).unwrap())
+            },
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(output.sharding(), &sharding);
+        assert_eq!(shard_values(&output), vec![vec![1., 2., 3.], vec![4., 5., 6.]]);
+    }
+
+    #[test]
+    fn test_session_place_copies_traced_leaves_that_may_not_alias() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2, 2]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        let shares_input_buffer =
+            |array: &Array| Arc::ptr_eq(array.shards()[0].buffer().unwrap(), input.shards()[0].buffer().unwrap());
+        let options = |may_alias: Option<bool>| {
+            PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(None, None, None, Some(may_alias))
+        };
+
+        // A placement without a target and a source that must not alias its input is still staged, so replaying it
+        // while the caller holds the input returns a copy of the buffer of the input.
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            |input: ArrayTracer| session.place(input, options(Some(false))).unwrap(),
+            input.r#type().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2] .
+                let %1:f32[2, 2] = place [may_alias=false] %0
+                in (%1)"
+            },
+        );
+        let Value::Array(output) =
+            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
+        else {
+            panic!("placing an array must produce an array");
+        };
+        assert!(!shares_input_buffer(&output));
+        assert_ne!(native_buffer_addresses(&output), native_buffer_addresses(&input));
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
+
+        // The caller keeps a live handle of the input, so a placement that leaves each batch item where it is returns
+        // the buffer of the input by default and a copy of it when the result must not alias the input.
+        for (may_alias, shares_buffer) in [(None, true), (Some(false), false)] {
+            let output: Array = batch(
+                |x| Ok(session.place(x, options(may_alias)).unwrap()),
+                input.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(shares_input_buffer(&output), shares_buffer);
+            assert_eq!(output.r#type(), input.r#type());
+            assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
+        }
+
+        // The primal of a differentiated placement follows the same rule.
+        for (may_alias, shares_buffer) in [(None, true), (Some(false), false)] {
+            let (value, _) =
+                differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options(may_alias)).unwrap())).unwrap();
+            assert_eq!(shares_input_buffer(&value), shares_buffer);
+            assert_eq!(value.r#type(), input.r#type());
+            assert_eq!(shard_values(&value), vec![vec![1., 2., 3., 4.]]);
+        }
+    }
+
+    #[test]
     fn test_session_place_lifts_host_leaves_and_arrays_of_traced_trees() {
         // `jax.jit(lambda x: jax.device_put((x, 2.0, np.ones(3), a), jax.devices()[1]))` stages its host leaves and the
         // concrete array `a` that it closes over as values that its `device_put` places like `x` (JAX 0.12.0.1 accepts
-        // the tree in one call), and a tree of `PlaceInput`s over traced values does the same in a compiled and in a
+        // the tree in one call), and a tree of `PlaceInput`s over traced leaves does the same in a compiled and in a
         // staged function. The same tree over runtime arrays uploads its host leaves.
         let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [])
-            .with_sharding(Sharding::replicated(logical_mesh, 0))
-            .unwrap();
         let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = single_device_mesh(devices[1]);
+        let input_type = ArrayType::new_static(DataType::F32, [])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
         let scalar = || CoreArray::scalar(2f32).unwrap();
         let vector = || CoreArray::vector(vec![1f32; 3]).unwrap();
         let captured_type = ArrayType::new_static(DataType::F32, [2]);
@@ -5996,14 +4997,16 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_rejects_invalid_mixed_trace_before_uploading_host_leaves() {
+    fn test_session_place_validates_traced_leaves_before_uploading_host_leaves() {
+        // The rank one sharding of the target of the traced leaf does not match its rank, so the call fails before it
+        // uploads the host leaf of the same tree, and the staged function holds no placement.
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let rank_one = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let error = RefCell::new(None);
         let before = session.array_statistics();
-        let _: StagedFunction<ArrayType, ArrayType> = stage(
+        let staged: StagedFunction<ArrayType, ArrayType> = stage(
             |scalar: CompileTracer| {
                 let tree = (PlaceInput::Host(CoreArray::scalar(2f32).unwrap()), PlaceInput::from(scalar.clone()));
                 let options = PlacementOptions::to((None, Some(rank_one.clone())));
@@ -6014,30 +5017,32 @@ mod tests {
             Options::new(mesh),
         )
         .unwrap();
+        assert_eq!(
+            staged.source_program().program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                in (%0)"
+            },
+        );
         let error = error.into_inner().unwrap();
         let (path, source) = failed_parameter(&error).unwrap();
         assert_eq!(path, "$.1");
         assert!(matches!(source, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(source.to_string(), "`place` target sharding rank (1) does not match the input rank (0)");
         assert_eq!(session.array_statistics(), before);
     }
 
     #[test]
     fn test_session_place_broadcasts_options_over_host_leaves_of_traced_trees() {
-        // Each host leaf of a tree of traced values is placed with the options of its position in the option trees, as
+        // Each host leaf of a tree of traced leaves is placed with the options of its position in the option trees, as
         // `jax.device_put((x, 2.0, np.ones(3)), (None, device, None))` gives each leaf its own device inside `jit`.
         let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [])
-            .with_sharding(Sharding::replicated(logical_mesh, 0))
-            .unwrap();
         let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = single_device_mesh(devices[1]);
+        let input_type = ArrayType::new_static(DataType::F32, [])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
         let unset = None::<bool>;
         let options =
             PlacementOptions::to((None, Some(devices[1]), None)).with_may_alias((unset, unset, (Some(false), unset)));
@@ -6087,14 +5092,12 @@ mod tests {
 
     #[test]
     fn test_session_place_rejects_host_leaves_of_traced_trees_without_one_trace() {
-        let client = cpu_client(1);
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[0];
+        let mesh = single_device_mesh(device);
         let input_type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(logical_mesh, 1))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
         let message = |error: Option<Error>| match error {
             Some(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. })) => message,
             error => panic!("expected an invalid argument error, got {error:?}"),
@@ -6103,9 +5106,10 @@ mod tests {
         // A host leaf joins the trace of the traced leaves of its tree, so they must belong to one trace, whereas JAX
         // lifts the input of an enclosing function into the trace of a nested one.
         let error = RefCell::new(None);
-        let _: CompiledFunction<ArrayType, ArrayType> = compile(
+        let inner_rendering = RefCell::new(None);
+        let outer: CompiledFunction<ArrayType, ArrayType> = compile(
             |x: CompileTracer| {
-                let _: CompiledFunction<ArrayType, ArrayType> = compile(
+                let inner: CompiledFunction<ArrayType, ArrayType> = compile(
                     |y: CompileTracer| {
                         let host = PlaceInput::Host(CoreArray::scalar(2f32).unwrap());
                         let tree = (PlaceInput::from(x.clone()), PlaceInput::from(y.clone()), host);
@@ -6117,6 +5121,7 @@ mod tests {
                     mesh.clone(),
                 )
                 .unwrap();
+                inner_rendering.replace(Some(inner.source_program().program().to_string()));
                 x
             },
             input_type.clone(),
@@ -6125,6 +5130,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message(error.take()), "cannot place traced values of different traces in one call");
+        let rendering = indoc! {"
+            lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
+            in (%0)"
+        };
+        assert_eq!(inner_rendering.take().unwrap(), rendering);
+        assert_eq!(outer.source_program().program().to_string(), rendering);
 
         // A host leaf without traced leaves in its tree has no trace to join.
         let host = PlaceInput::<CompileTracer>::Host(CoreArray::scalar(2f32).unwrap());
@@ -6132,77 +5143,6 @@ mod tests {
             message(session.place(host, PlacementOptions::to(device)).err()),
             "cannot place a host value or a runtime array as a traced value without a traced value in the same call",
         );
-    }
-
-    #[test]
-    fn test_session_place_checks_wrapped_tracer_destinations_in_the_compilation_session() {
-        let staging_session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let compilation_session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let device = compilation_session.devices().unwrap()[1];
-        assert!(!staging_session.devices().unwrap().contains(&device));
-
-        let input = compilation_session
-            .place(CoreArray::vector(vec![3f32]).unwrap(), PlacementOptions::to(device))
-            .unwrap();
-        let staged: StagedFunction<ArrayType, (ArrayType, ArrayType)> = stage(
-            |input: CompileTracer| {
-                let direct = staging_session.place(input.clone(), PlacementOptions::to(device)).unwrap();
-                let wrapped = staging_session.place(PlaceInput::from(input), PlacementOptions::to(device)).unwrap();
-                (direct, wrapped)
-            },
-            input.r#type().into_owned(),
-            Options::new(input.mesh().clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            staged.source_program().program().to_string(),
-            indoc! {"
-                lambda %0:f32[1] .
-                let %1:f32[1] = place [target=device(1)] %0
-                    %2:f32[1] = place [target=device(1)] %0
-                in (%1, %2)"
-            },
-        );
-        let compiled = compilation_session.compile_staged_function(staged).unwrap();
-        let (direct, wrapped) = compiled.executable().execute(&compilation_session, input).unwrap();
-        for output in [direct, wrapped] {
-            assert_eq!(output.mesh().devices(), [device]);
-            assert_eq!(shard_values(&output), vec![vec![3.]]);
-        }
-    }
-
-    #[test]
-    fn test_session_place_accepts_unregistered_source_devices_for_compile_tracers() {
-        let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let unknown = Device::new(999, 0);
-        let input = session.place(CoreArray::vector(vec![1f32, 2.]).unwrap(), PlacementOptions::default()).unwrap();
-        let options = || PlacementOptions::default().with_source(unknown);
-        let eager = session.place(input.clone(), options()).unwrap();
-        assert_eq!(shard_values(&eager), vec![vec![1., 2.]]);
-
-        let compiled: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
-            |input: CompileTracer| {
-                let direct = session.place(input.clone(), options()).unwrap();
-                let wrapped = session.place(PlaceInput::from(input), options()).unwrap();
-                (direct, wrapped)
-            },
-            input.r#type().into_owned(),
-            &session,
-            input.mesh().clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            compiled.source_program().program().to_string(),
-            indoc! {"
-                lambda %0:f32[2] .
-                let %1:f32[2] = place [source=device(999)] %0
-                    %2:f32[2] = place [source=device(999)] %0
-                in (%1, %2)"
-            },
-        );
-        let (direct, wrapped) = compiled.executable().execute(&session, input).unwrap();
-        assert_eq!(shard_values(&direct), vec![vec![1., 2.]]);
-        assert_eq!(shard_values(&wrapped), vec![vec![1., 2.]]);
     }
 
     #[test]
@@ -6248,928 +5188,461 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_rejects_traced_targets_outside_compiled_mesh_and_admits_sources_there() {
-        let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let session = Session::builder().client(client).build().unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2]);
-        let place_error = |device: Device, mesh: &DeviceMesh| {
-            let compiled: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
-                |input: CompileTracer| session.place(input, PlacementOptions::to(device)).unwrap(),
-                input_type.clone(),
-                &session,
-                mesh.clone(),
-            );
-            compiled.err().unwrap()
-        };
-
-        // A device that is not the device of the mesh of the function is rejected.
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![devices[0]],
-        )
-        .unwrap();
-        let error = place_error(devices[1], &mesh);
-        assert!(matches!(
-            &error,
-            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
-                if device == &devices[1] && program_mesh == &mesh,
-        ));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}] of mesh \
-                 `{}`",
-                devices[1].id(),
-                devices[0].id(),
-                mesh.logical_mesh(),
-            ),
-        );
-
-        // So is a device of a mesh with more than one device, because the value is not placed on that device alone.
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let error = place_error(devices[0], &mesh);
-        assert!(matches!(
-            &error,
-            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
-                if device == &devices[0] && program_mesh == &mesh,
-        ));
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}, {}] of \
-                 mesh `{}`",
-                devices[0].id(),
-                devices[0].id(),
-                devices[1].id(),
-                mesh.logical_mesh(),
-            ),
-        );
-
-        // A source only states where the input lives, and the forward function moves nothing to it, so a device source
-        // of a value without a tracked sharding that is not the only device of the program mesh compiles, with or
-        // without a target, and the function returns its input on the program mesh. Before, it was rejected because
-        // transposition would return the cotangent to that device.
-        let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let observe = |array: &Array| {
-            let values = array.copy_to_host().unwrap().elements::<f32>().unwrap();
-            (array.mesh().devices().to_vec(), array.is_committed(), values)
-        };
-        let bytes = values_to_bytes(&[1f32, 2.]);
-        let input = Array::from_host_buffer(&session, input_type.clone(), mesh.clone(), None, &bytes).unwrap();
-        for target in [Some(PlacementRequest::from(Memory::Device)), None] {
-            let options = || {
-                PlacementOptions::new(
-                    target.clone(),
-                    Some(PlacementRequest::from(devices[0])),
-                    Option::<bool>::None,
-                    Option::<Option<bool>>::None,
-                )
-            };
-            let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-                |input: CompileTracer| session.place(input, options()).unwrap(),
-                input_type.clone(),
-                &session,
-                mesh.clone(),
-            )
-            .unwrap();
-            let output = compiled.executable().execute(&session, input.clone()).unwrap();
-            assert_eq!(observe(&output), (devices[..2].to_vec(), true, vec![1., 2.]));
-        }
-
-        // So does a resolved source on devices outside the program mesh, and the function returns what the eager
-        // placement returns. Its reverse mode derivative inside the same compiled function holds only the transposed
-        // placement, whose target is that source, so it is still rejected as a target outside the program mesh.
-        let first_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![devices[0]],
-        )
-        .unwrap();
-        let second_mesh = DeviceMesh::new(first_mesh.logical_mesh().clone(), vec![devices[1]]).unwrap();
-        let source = PlacementRequest::from(
-            Placement::new(second_mesh.clone(), Sharding::replicated(second_mesh.logical_mesh().clone(), 1)).unwrap(),
-        );
-        let options = || {
-            PlacementOptions::new(
-                Some(PlacementRequest::from(Memory::Device)),
-                Some(source.clone()),
-                Option::<bool>::None,
-                Option::<Option<bool>>::None,
-            )
-        };
-        let reverse: Result<CompiledFunction<(ArrayType, ArrayType), ArrayType>, _> = compile(
-            |(x, seed): (CompileTracer, CompileTracer)| {
-                let (_, pullback) = differentiate_at(x).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
-                pullback.apply_materialized(seed).unwrap()
-            },
-            (input_type.clone(), input_type.clone()),
-            &session,
-            first_mesh.clone(),
-        );
-        let forward: CompiledFunction<ArrayType, ArrayType> = compile(
-            |input: CompileTracer| session.place(input, options()).unwrap(),
-            input_type.clone(),
-            &session,
-            first_mesh.clone(),
-        )
-        .unwrap();
-        let input_type = input_type.with_sharding(Sharding::replicated(first_mesh.logical_mesh().clone(), 1)).unwrap();
-        let input = Array::from_host_buffer(&session, input_type, first_mesh.clone(), None, &bytes).unwrap();
-        let compiled = observe(&forward.executable().execute(&session, input.clone()).unwrap());
-        let eager = observe(&session.place(input, options()).unwrap());
-        assert_eq!((compiled, eager.clone()), (eager, (vec![devices[0]], true, vec![1., 2.])));
-        let error = reverse.err().unwrap();
-        assert!(matches!(
-            &error,
-            Error::Lowering(LoweringError::PlacementOutsideProgramMesh { target, mesh: program_mesh })
-                if target == &second_mesh && program_mesh == &first_mesh,
-        ));
-    }
-
-    #[test]
-    fn test_session_place_admits_split_sources_of_traced_values_in_bounded_dynamic_compiled_functions() {
+    fn test_session_place_broadcasts_root_placement_over_array_tuple() {
+        // One placement at the root moves both arrays of a tuple from a mesh of one device to a split over two.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
-        let place_onto = |target: PlacementRequest, source: Option<PlacementRequest>| {
-            let options =
-                PlacementOptions::new(Some(target), source, Option::<bool>::None, Option::<Option<bool>>::None);
-            compile::<_, ArrayType, ArrayType>(
-                |input: CompileTracer| session.place(input, options.clone()).unwrap(),
-                input_type.clone(),
-                &session,
-                mesh.clone(),
-            )
-        };
-        let place = |sharding: Sharding| {
-            place_onto(
-                PlacementRequest::from(Memory::Device),
-                Some(PlacementRequest::from(Placement::new(mesh.clone(), sharding).unwrap())),
-            )
-        };
-
-        // Bounded dynamic programs run one fully replicated replica per device, so a split target would be ignored and
-        // is rejected (refer to `test_place_operation_lower_rejects_splits_in_bounded_dynamic_programs`), but a
-        // source only states where the input lives and the program moves nothing to it, so a split source compiles.
-        // Before, it was rejected because transposition would turn it into the target of the cotangent.
-        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(place(split).map(|_| ()).map_err(|error| error.to_string()), Ok(()));
-
-        // A replicated source is what every replica holds anyway, and so is a source or a target that leaves a
-        // dimension unconstrained, which an array stores replicated, as the unconstrained sharding override of a call
-        // is.
-        assert!(place(Sharding::replicated(mesh.logical_mesh().clone(), 1)).is_ok());
-        let unconstrained = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::Unconstrained]).unwrap();
-        assert!(place(unconstrained.clone()).is_ok());
-        assert!(place_onto(PlacementRequest::from(Placement::new(mesh.clone(), unconstrained).unwrap()), None).is_ok());
-    }
-
-    #[test]
-    fn test_session_place_places_traced_values_with_sources_in_compiled_mesh() {
-        let client = cpu_client(2);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let session = Session::builder().client(client).build().unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [4]);
-        let upload = |values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values)).unwrap()
-        };
-
-        // A device source on the sole device of the program mesh, and a resolved source over the program mesh, are
-        // accepted in the forward function and in its reverse mode derivative inside the same compiled function, whose
-        // transposed placement moves the cotangent onto those devices.
-        let sources = [
-            PlacementRequest::from(devices[1]),
-            PlacementRequest::from(Placement::new(mesh.clone(), Sharding::replicated(logical_mesh, 1)).unwrap()),
-        ];
-        for source in sources {
-            let options = || {
-                PlacementOptions::new(
-                    Some(PlacementRequest::from(Memory::Device)),
-                    Some(source.clone()),
-                    Option::<bool>::None,
-                    Option::<Option<bool>>::None,
-                )
-            };
-            let forward: CompiledFunction<ArrayType, ArrayType> = compile(
-                |x: CompileTracer| session.place(x, options()).unwrap(),
-                r#type.clone(),
-                &session,
-                mesh.clone(),
-            )
-            .unwrap();
-            let output = forward.executable().execute(&session, upload(&[1., 2., 3., 4.])).unwrap();
-            assert_eq!(output.mesh(), &mesh);
-            assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
-
-            let reverse: CompiledFunction<(ArrayType, ArrayType), ArrayType> = compile(
-                |(x, seed): (CompileTracer, CompileTracer)| {
-                    let (_, pullback) = differentiate_at(x).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
-                    pullback.apply_materialized(seed).unwrap()
-                },
-                (r#type.clone(), r#type.clone()),
-                &session,
-                mesh.clone(),
-            )
-            .unwrap();
-            let cotangent = reverse
-                .executable()
-                .execute(&session, (upload(&[1., 2., 3., 4.]), upload(&[5., 6., 7., 8.])))
-                .unwrap();
-            assert_eq!(cotangent.mesh(), &mesh);
-            assert_eq!(shard_values(&cotangent), vec![vec![5., 6., 7., 8.]]);
-        }
-    }
-
-    #[test]
-    fn test_session_place_applies_memory_and_layout_of_devices_to_traced_values_in_compiled_functions() {
-        let client = cpu_client(1);
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![device],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2, 2]);
-        let memory = Memory::Host { pinned: true };
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let target = PlacementRequest::Device { device, memory: Some(memory), layout: Some(layout.clone()) };
-        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-            |input: CompileTracer| session.place(input, PlacementOptions::to(target)).unwrap(),
-            input_type.clone(),
-            &session,
-            mesh.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            compiled.source_program().program().to_string(),
-            indoc! {"
-                lambda %0:f32[2, 2] .
-                let %1:f32[2, 2][layout=tiled{0,1}]@Host[Pinned] = place [\
-                    target=device(0, memory=Host[Pinned], layout=tiled{0,1})] %0
-                in (%1)"
-            },
-        );
-        let input =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2., 3., 4.]))
-                .unwrap();
-        let output = compiled.executable().execute(&session, input).unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(output.r#type().memory(), memory);
-        assert_eq!(output.layout(), Some(&layout));
-        let buffer = output.shards()[0].buffer().unwrap().clone();
-        assert_eq!(buffer.memory().unwrap().kind().unwrap(), "pinned_host");
-        assert_eq!(buffer.specification().unwrap().layout, layout.to_pjrt().unwrap());
-        assert!(output.is_committed());
-        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2., 3., 4.]);
-    }
-
-    #[test]
-    fn test_session_place_places_traced_leaves_in_differentiation() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let devices = session.addressable_devices().unwrap();
         let source_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![devices[0]],
         )
         .unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [3]),
-            source_mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2., 3.]),
-        )
-        .unwrap();
-
-        // The primal moves to the target device, and the pullback moves the cotangent back to the source mesh. The
-        // donation option does not apply to the traced leaf, and a forced copy of a moved primal is that move itself.
-        let options = PlacementOptions::new(
-            Some(PlacementRequest::from(devices[1])),
-            Option::<PlacementRequest>::None,
-            Some(true),
-            Some(Some(false)),
-        );
-        let (value, pullback) =
-            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
-        assert_eq!(value.mesh().devices(), [devices[1]]);
-        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
-        let cotangent = Array::from_host_buffer(
-            &session,
-            value.r#type().into_owned(),
-            value.mesh().clone(),
-            None,
-            values_to_bytes(&[4f32, 5., 6.]),
-        )
-        .unwrap();
-        let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
-        assert_eq!(input_cotangent.mesh(), &source_mesh);
-        assert_eq!(input_cotangent.r#type(), input.r#type());
-        assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
-
-        // A device names a device and not a mesh, so a traced leaf over an array on that device resolves the device
-        // to the mesh of the array, both as a source and as a destination that keeps the leaf where it is.
-        let options = PlacementOptions::new(
-            Some(PlacementRequest::from(devices[1])),
-            Some(PlacementRequest::from(devices[0])),
-            Option::<bool>::None,
-            Option::<Option<bool>>::None,
-        );
-        let (value, _) = differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
-        assert_eq!(value.mesh().devices(), [devices[1]]);
-        let options = PlacementOptions::new(
-            Some(PlacementRequest::from(devices[0])),
-            Option::<PlacementRequest>::None,
-            Option::<bool>::None,
-            Option::<Option<bool>>::None,
-        );
-        let (value, _) = differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
-        assert_eq!(value.mesh(), &source_mesh);
-        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
-    }
-
-    #[test]
-    fn test_session_place_places_traced_values_in_place_in_differentiation() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
-        let array = |values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), None, values_to_bytes(values)).unwrap()
-        };
-
-        // The primal and the tangent both move to the memory on the devices where they live.
-        let (primal, tangent) = differentiate_at(array(&[1., 2., 3., 4.]))
-            .jvp(array(&[5., 6., 7., 8.]), |x| Ok(session.place(x, PlacementOptions::to(pinned)).unwrap()))
-            .unwrap();
-        for (output, values) in
-            [(&primal, vec![vec![1., 2.], vec![3., 4.]]), (&tangent, vec![vec![5., 6.], vec![7., 8.]])]
-        {
-            assert_eq!(output.mesh(), &mesh);
-            assert_eq!(output.sharding(), &sharding);
-            assert_eq!(output.r#type().memory(), pinned);
-            assert_eq!(output.shards()[0].buffer().unwrap().memory().unwrap().kind().unwrap(), "pinned_host");
-            assert_eq!(shard_values(output), values);
-        }
-
-        // The cotangent returns to the memory of the input, on the same devices.
-        let (value, pullback) = differentiate_at(array(&[1., 2., 3., 4.]))
-            .vjp(|x| Ok(session.place(x, PlacementOptions::to(pinned)).unwrap()))
-            .unwrap();
-        assert_eq!(value.r#type().memory(), pinned);
-        let cotangent = pullback.apply_materialized(value).unwrap();
-        assert_eq!(cotangent.mesh(), &mesh);
-        assert_eq!(cotangent.sharding(), &sharding);
-        assert_eq!(cotangent.r#type().memory(), Memory::Device);
-        let buffer = cotangent.shards()[0].buffer().unwrap();
-        assert_eq!(buffer.memory().unwrap(), buffer.device().unwrap().default_memory().unwrap());
-        assert_eq!(shard_values(&cotangent), vec![vec![1., 2.], vec![3., 4.]]);
-    }
-
-    #[test]
-    fn test_session_place_completes_pending_reduction_of_traced_values_in_differentiation() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-        let target_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let replicated = Sharding::replicated(logical_mesh, 1);
-        let r#type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap())
+        let source_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(source_mesh.logical_mesh().clone(), 1))
             .unwrap();
         let upload = |values: &[f32]| {
-            Array::from_host_buffer(&session, r#type.clone(), source_mesh.clone(), None, values_to_bytes(values))
+            Array::from_host_buffer(&session, source_type.clone(), source_mesh.clone(), None, values_to_bytes(values))
                 .unwrap()
         };
-        let (primal, tangent) = (upload(&[1., 2.]), upload(&[3., 4.]));
-
-        // The primal and the tangent of a traced leaf on a mesh of one device move to another device as a direct
-        // placement of an array moves them, with their logical mesh over that device and without their pending
-        // reduction along `x`, which has size one, so `exp` applies to them.
-        let (value, tangent): (Array, Array) = differentiate_at(primal.clone())
-            .jvp(tangent, |x| session.place(x, PlacementOptions::to(devices[1])).unwrap().exp())
+        let target_mesh = domain_mesh(client, "x", 2);
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = PlacementRequest::from(Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap());
+        let (first, second) = session
+            .place((upload(&[0., 1., 2., 3.]), upload(&[10., 11., 12., 13.])), PlacementOptions::to(target))
             .unwrap();
-        let direct = session.place(primal, PlacementOptions::to(devices[1])).unwrap().exp().unwrap();
-        assert_eq!(
-            (value.mesh(), value.sharding(), value.r#type()),
-            (direct.mesh(), direct.sharding(), direct.r#type())
-        );
-        assert_eq!((value.mesh(), value.sharding()), (&target_mesh, &replicated));
-        assert_eq!(
-            (tangent.mesh(), tangent.sharding(), tangent.r#type()),
-            (direct.mesh(), direct.sharding(), direct.r#type())
-        );
-        assert_eq!(shard_values(&value), vec![vec![1f32.exp(), 2f32.exp()]]);
-        assert_eq!(shard_values(&tangent), vec![vec![3. * 1f32.exp(), 4. * 2f32.exp()]]);
+        assert_eq!((first.mesh(), first.sharding()), (&target_mesh, &target_sharding));
+        assert_eq!((second.mesh(), second.sharding()), (&target_mesh, &target_sharding));
+        assert_eq!(shard_values(&first), vec![vec![0., 1.], vec![2., 3.]]);
+        assert_eq!(shard_values(&second), vec![vec![10., 11.], vec![12., 13.]]);
     }
 
     #[test]
-    fn test_session_place_places_traced_leaves_in_differentiation_without_destination() {
+    fn test_session_place_repeats_root_options_over_large_inputs() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-        let cotangent_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [3]),
-            source_mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2., 3.]),
-        )
-        .unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let array = session.place(2.5f32, PlacementOptions::to(devices[0])).unwrap();
+        let array_count = 1_000;
+        let input = vec![array.clone(); array_count];
 
-        // Without a destination, the primal stays where it lives, and the pullback moves a cotangent that lives on
-        // another device back to the primal, both with the inferred source and with an explicit one.
-        for source in [None, Some(PlacementRequest::from(devices[0]))] {
-            let options = PlacementOptions::<PlacementRequest>::new(None, source, None, None);
-            let (value, pullback) =
-                differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
-            assert_eq!(value.mesh(), &source_mesh);
-            assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
-            let cotangent = Array::from_host_buffer(
-                &session,
-                value.r#type().into_owned(),
-                cotangent_mesh.clone(),
-                None,
-                values_to_bytes(&[4f32, 5., 6.]),
-            )
-            .unwrap();
-            let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
-            assert_eq!(input_cotangent.mesh(), &source_mesh);
-            assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
+        // Options at the root give every leaf what options that repeat them for every leaf give it.
+        let root_options = PlacementOptions::new(Some(devices[1]), Some(devices[0]), Some(false), Some(Some(false)));
+        let repeated_options = PlacementOptions::new(
+            Some(vec![devices[1]; array_count]),
+            Some(vec![devices[0]; array_count]),
+            Some(vec![false; array_count]),
+            Some(vec![Some(false); array_count]),
+        );
+        let placed = session.place(input.clone(), root_options).unwrap();
+        let expected = session.place(input.clone(), repeated_options).unwrap();
+        assert_eq!(placed.len(), array_count);
+        for (placed, expected) in placed.iter().zip(&expected) {
+            assert_eq!(placed.mesh().devices(), [devices[1]]);
+            assert_eq!(placed.mesh(), expected.mesh());
+            assert_eq!(placed.sharding(), expected.sharding());
+            assert_eq!(placed.r#type(), expected.r#type());
+            assert!(placed.is_committed());
+            assert_eq!(shard_values(placed), vec![vec![2.5]]);
+        }
+
+        // The checks of root options that do not depend on paths still run, before and while each leaf is placed.
+        let options =
+            PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(None, None, Some(true), Some(Some(true)));
+        assert_eq!(
+            session.place(input.clone(), options).map(|_| ()).map_err(|error| error.to_string()),
+            Err("array `$[0]` cannot be donated while `may_alias` is `Some(true)`".to_string()),
+        );
+        let error = session.place(input, PlacementOptions::default().with_source(Memory::Host { pinned: true }));
+        let error = error.map(|_| ()).unwrap_err();
+        let (path, error) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$[0]");
+        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+    }
+
+    #[test]
+    fn test_session_place_keeps_omitted_options_uniform_over_large_inputs() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let device = session.addressable_devices().unwrap()[1];
+        let array = session.place(2.5f32, PlacementOptions::to(device)).unwrap();
+        let array_count = 4_000;
+        let input = vec![array.clone(); array_count];
+
+        // Already resident leaves without any option stay where they are.
+        let placed = session.place(input.clone(), PlacementOptions::default()).unwrap();
+        assert_eq!(placed.len(), array_count);
+        for placed in &placed {
+            assert_eq!(placed.mesh(), array.mesh());
+            assert_eq!(placed.sharding(), array.sharding());
+            assert!(placed.is_committed());
+        }
+        assert_eq!(shard_values(&placed[array_count - 1]), vec![vec![2.5]]);
+
+        // The path of a leaf is still reported when one of its options is invalid.
+        let mut donate = vec![false; array_count];
+        donate[array_count - 1] = true;
+        let options = PlacementOptions::default().with_donate(donate).with_may_alias(Some(true));
+        assert_eq!(
+            session.place(input, options).map(|_| ()).map_err(|error| error.to_string()),
+            Err("array `$[3999]` cannot be donated while `may_alias` is `Some(true)`".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_session_place_matches_core_place_over_borrowed_map_keys() {
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.devices().unwrap();
+        let left = String::from("left");
+        let right = String::from("right");
+        let input = BTreeMap::from([
+            (left.as_str(), session.place(3f32, PlacementOptions::default()).unwrap()),
+            (right.as_str(), session.place(7f32, PlacementOptions::default()).unwrap()),
+        ]);
+        let targets = BTreeMap::from([(left.as_str(), devices[1]), (right.as_str(), devices[0])]);
+        let exact = input.place(&targets, None).unwrap();
+        let owned_targets = BTreeMap::from([(left.clone(), devices[1]), (right.clone(), devices[0])]);
+        let prefix = session.place(input, PlacementOptions::to(owned_targets)).unwrap();
+        for output in [exact, prefix] {
+            for (key, device, value) in [(left.as_str(), devices[1], 3f32), (right.as_str(), devices[0], 7f32)] {
+                let array = &output[key];
+                assert_eq!(array.mesh().devices(), &[device]);
+                assert!(array.is_committed());
+                assert_eq!(array.copy_to_host().unwrap().elements::<f32>().unwrap(), [value]);
+            }
         }
     }
 
     #[test]
-    fn test_session_place_stages_explicit_source_of_traced_leaves_without_destination() {
-        let client = cpu_client(1);
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
-        let source = PlacementRequest::from(session.placement(sharding).unwrap());
-
-        // Without a destination, the placement is staged without a target, so the value stays where it is, and with
-        // the source, which only the transposition of the placement uses.
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            |input: ArrayTracer| {
-                let options = PlacementOptions::<PlacementRequest>::new(None, Some(source.clone()), None, None);
-                session.place(input, options).unwrap()
-            },
-            r#type,
-        )
-        .unwrap();
-        assert_eq!(
-            traced.program().to_string(),
-            indoc! {r#"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    source={mesh<['x'=1:explicit]>, devices=[0], sharding={mesh<['x'=1:explicit]>, [{}]}},
-                ] %0
-                in (%1)
-            "#}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_session_place_stages_explicit_source_of_traced_leaves_without_destination_for_pullback() {
-        let client = cpu_client(1);
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let r#type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
-        let source = PlacementRequest::from(session.placement(sharding).unwrap());
-
-        // The pullback places the cotangent on the source, with the memory of the primal and without a source of its
-        // own, because the forward placement has no target.
-        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
-                let options = PlacementOptions::<PlacementRequest>::new(None, Some(source.clone()), None, None);
-                let (_, pullback) = differentiate_at(input).vjp(|x| Ok(session.place(x, options).unwrap())).unwrap();
-                pullback.apply_materialized(cotangent).unwrap()
-            },
-            (r#type.clone(), r#type),
-        )
-        .unwrap();
-        assert_eq!(
-            traced.program().to_string(),
-            indoc! {r#"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    target={mesh<['x'=1:explicit]>, devices=[0], sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
-                    may_alias=false,
-                ] %1
-                in (%2)
-            "#}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_session_place_stages_device_source_of_traced_values_for_pullback() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let meshes = devices
-            .iter()
-            .map(|&device| DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap())
-            .collect::<Vec<_>>();
-        let r#type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(logical_mesh.clone(), 1))
-            .unwrap();
-        let options =
-            || PlacementOptions::to(PlacementRequest::from(devices[1])).with_source(PlacementRequest::from(devices[0]));
-        let interpret = |traced: &TracedProgram<(ArrayType, ArrayType), ArrayType>, values: [(&[f32], usize); 2]| {
-            let [first, second] = values.map(|(values, mesh): (&[f32], usize)| {
-                Value::Array(
-                    Array::from_host_buffer(
-                        &session,
-                        r#type.clone(),
-                        meshes[mesh].clone(),
-                        None,
-                        values_to_bytes(values),
-                    )
-                    .unwrap(),
-                )
-            });
-            let Value::Array(output) = traced.program().interpret_in_context(&session, (first, second)).unwrap() else {
-                panic!("placing an array must produce an array");
-            };
-            output
-        };
-
-        // The devices of a traced input are not known, so a bare device source stays a device, and the pullback moves
-        // the cotangent from the destination back onto it over the logical mesh of the input, as JAX's transposition of
-        // `device_put` returns it to that device. Interpreting
-        // the pullback on an input on the first device and a cotangent on the second one returns the gradient on the
-        // first device.
-        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
-                let (_, pullback) = differentiate_at(input).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
-                pullback.apply_materialized(cotangent).unwrap()
-            },
-            (r#type.clone(), r#type.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            traced.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    inferred_source=device(1),
-                    target={mesh<['x'=1:explicit]>, devices=[0], \
-                        sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
-                    may_alias=false,
-                ] %1
-                in (%2)"
-            },
-        );
-        let gradient = interpret(&traced, [(&[1., 2.], 0), (&[3., 4.], 1)]);
-        assert_eq!(gradient.mesh(), &meshes[0]);
-        assert_eq!(gradient.r#type().as_ref(), &r#type);
-        assert_eq!(shard_values(&gradient), vec![vec![3., 4.]]);
-
-        // Transposing the pullback again swaps the two devices back, so the cotangent of the gradient moves onto the
-        // second device, which is the destination of the forward placement.
-        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
-            |(input, cotangent): (ArrayTracer, ArrayTracer)| {
-                let (_, pullback) = differentiate_at((input, cotangent.clone()))
-                    .vjp(|(x, cotangent)| {
-                        let (_, pullback) = differentiate_at(x).vjp(|x| Ok(session.place(x, options()).unwrap()))?;
-                        pullback.apply_materialized(cotangent)
-                    })
-                    .unwrap();
-                pullback.apply_materialized(cotangent).unwrap().1
-            },
-            (r#type.clone(), r#type.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            traced.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}], %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %2:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [
-                    inferred_source={mesh<['x'=1:explicit]>, devices=[0], \
-                        sharding={mesh<['x'=1:explicit]>, [{}]}},
-                    target={mesh<['x'=1:explicit]>, devices=[1], \
-                        sharding={mesh<['x'=1:explicit]>, [{}]}, memory=Device},
-                    may_alias=false,
-                ] %1
-                in (%2)"
-            },
-        );
-        let cotangent = interpret(&traced, [(&[1., 2.], 0), (&[5., 6.], 0)]);
-        assert_eq!(cotangent.mesh(), &meshes[1]);
-        assert_eq!(cotangent.r#type().as_ref(), &r#type);
-        assert_eq!(shard_values(&cotangent), vec![vec![5., 6.]]);
-    }
-
-    #[test]
-    fn test_session_place_keeps_traced_leaves_without_destination_where_they_live() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let first_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-        let second_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let sharding = Sharding::replicated(logical_mesh, 1);
-        let r#type = ArrayType::new_static(DataType::F32, [3]).with_sharding(sharding.clone()).unwrap();
-        let source = Placement::new(second_mesh.clone(), sharding).unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            r#type.clone(),
-            first_mesh.clone(),
-            None,
-            values_to_bytes(&[1f32, 2., 3.]),
-        )
-        .unwrap();
-        let options = || PlacementOptions::<PlacementRequest, Placement>::new(None, Some(source.clone()), None, None);
-
-        // A placement with only a source is staged without a target, so replaying it on an array that lives on the
-        // first device leaves the array there, even though the source names the second device.
-        let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(|input: ArrayTracer| session.place(input, options()).unwrap(), r#type).unwrap();
-        let Value::Array(output) =
-            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
-        else {
-            panic!("placing an array must produce an array");
-        };
-        assert_eq!(output.mesh(), &first_mesh);
-        assert_eq!(shard_values(&output), vec![vec![1., 2., 3.]]);
-
-        // Its pullback moves the cotangent to the source.
-        let (value, pullback) =
-            differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options()).unwrap())).unwrap();
-        assert_eq!(value.mesh(), &first_mesh);
-        assert_eq!(shard_values(&value), vec![vec![1., 2., 3.]]);
-        let cotangent = Array::from_host_buffer(
-            &session,
-            value.r#type().into_owned(),
-            first_mesh,
-            None,
-            values_to_bytes(&[4f32, 5., 6.]),
-        )
-        .unwrap();
-        let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
-        assert_eq!(input_cotangent.mesh(), &second_mesh);
-        assert_eq!(input_cotangent.r#type(), input.r#type());
-        assert_eq!(shard_values(&input_cotangent), vec![vec![4., 5., 6.]]);
-    }
-
-    #[test]
-    fn test_session_place_compiles_traced_leaves_with_only_a_source() {
-        let client = cpu_client(1);
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![device],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
-        let input_type = ArrayType::new_static(DataType::F32, [2]);
-
-        // A bare device does not determine a placement for a traced value whose devices are not known, so the source
-        // stays a device, which only transposition uses, and the placement without a target compiles and leaves the
-        // value where it is.
-        let source = PlacementRequest::from(device);
-        let compiled: CompiledFunction<ArrayType, ArrayType> = compile(
-            |input: CompileTracer| {
-                session
-                    .place(input, PlacementOptions::<PlacementRequest>::new(None, Some(source), None, None))
-                    .unwrap()
-            },
-            input_type.clone(),
-            &session,
-            mesh.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            compiled.source_program().program().to_string(),
-            indoc! {"
-                lambda %0:f32[2] .
-                let %1:f32[2] = place [source=device(0)] %0
-                in (%1)"
-            },
-        );
-        let input =
-            Array::from_host_buffer(&session, input_type, mesh.clone(), None, values_to_bytes(&[1f32, 2.])).unwrap();
-        let output = compiled.executable().execute(&session, input).unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
-    }
-
-    #[test]
-    fn test_session_place_copies_traced_leaves_without_destination_and_source() {
-        let client = cpu_client(1);
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
-            vec![Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()],
-        )
-        .unwrap();
-        let session = Session::builder().client(client).build().unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2])
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let input =
-            Array::from_host_buffer(&session, r#type.clone(), mesh, None, values_to_bytes(&[1f32, 2.])).unwrap();
-
-        // A placement without a destination and a source that must not alias its input is still staged, so replaying
-        // it while the caller holds the input returns a copy of the buffer of the input.
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            |input: ArrayTracer| {
-                let options = PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(
-                    None,
-                    None,
-                    None,
-                    Some(Some(false)),
-                );
-                session.place(input, options).unwrap()
-            },
-            r#type,
-        )
-        .unwrap();
-        assert_eq!(
-            traced.program().to_string(),
-            indoc! {r#"
-                lambda %0:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] .
-                let %1:f32[2][sharding={mesh<['x'=1:explicit]>, [{}]}] = place [may_alias=false] %0
-                in (%1)
-            "#}
-            .trim_end(),
-        );
-        let Value::Array(output) =
-            traced.program().interpret_in_context(&session, Value::Array(input.clone())).unwrap()
-        else {
-            panic!("placing an array must produce an array");
-        };
-        assert!(!Arc::ptr_eq(output.shards()[0].buffer().unwrap(), input.shards()[0].buffer().unwrap()));
-        assert_ne!(native_buffer_addresses(&output), native_buffer_addresses(&input));
-        assert_eq!(output.r#type(), input.r#type());
-        assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
-    }
-
-    #[test]
-    fn test_session_place_places_traced_leaves_in_batching() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
-        )
-        .unwrap();
-
-        // The target resolves for the rank of each batch item, and the packed result lives on the target device.
-        let options = PlacementOptions::<PlacementRequest>::new(Some(PlacementRequest::from(device)), None, None, None);
-        let output: Array =
-            batch(|x| Ok(session.place(x, options).unwrap()), input, BatchAxis::new(0), BatchAxis::new(0), None)
-                .unwrap();
-        assert_eq!(output.mesh().devices(), [device]);
-        assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4., 5., 6.]]);
-    }
-
-    #[test]
-    fn test_session_place_places_traced_leaves_in_batching_on_their_own_placement() {
+    fn test_session_place_broadcasts_optional_placement_prefixes() {
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
-        let session = Session::builder().client(client).build().unwrap();
-        let sharding = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2, 3]),
-            mesh.clone(),
-            Some(sharding.clone()),
-            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
-        )
-        .unwrap();
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let values = vec![1f32, 2., 3., 4.];
+        let host = CoreArray::vector(values.clone()).unwrap();
 
-        // Each device holds one batch item, which the placement of a batch item records as the sharding of its batch,
-        // so placing every batch item on its own placement leaves each of them on its device.
-        let output: Array = batch(
-            |x| {
-                let placement = x.placement().unwrap();
-                assert_eq!(placement.batch_shardings(), [ShardingDimension::sharded(["x"])]);
-                Ok(session.place(x, PlacementOptions::<Placement>::new(Some(placement), None, None, None)).unwrap())
-            },
-            input,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(output.sharding(), &sharding);
-        assert_eq!(shard_values(&output), vec![vec![1., 2., 3.], vec![4., 5., 6.]]);
-    }
-
-    #[test]
-    fn test_session_place_copies_traced_leaves_that_may_not_alias() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [2, 2]),
-            None,
-            None,
-            values_to_bytes(&[1f32, 2., 3., 4.]),
-        )
-        .unwrap();
-        let shares_input_buffer =
-            |array: &Array| Arc::ptr_eq(array.shards()[0].buffer().unwrap(), input.shards()[0].buffer().unwrap());
-        let options = |may_alias: Option<bool>| {
-            PlacementOptions::<PlacementRequest, PlacementRequest, bool, _>::new(None, None, None, Some(may_alias))
-        };
-
-        // The caller keeps a live handle of the input, so a placement that leaves each batch item where it is returns
-        // the buffer of the input by default and a copy of it when the result must not alias the input.
-        for (may_alias, shares_buffer) in [(None, true), (Some(false), false)] {
-            let output: Array = batch(
-                |x| Ok(session.place(x, options(may_alias)).unwrap()),
-                input.clone(),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
+        // An explicit sharding uses the session mesh. The None prefix sends both leaves to the first local device.
+        let (partitioned, [local, other_local]) = session
+            .place(
+                (host.clone(), [host.clone(), host]),
+                PlacementOptions::<_, PlacementRequest>::new(
+                    Some((Some(PlacementRequest::from(session.placement(sharded.clone()).unwrap())), None)),
+                    None,
+                    None,
+                    None,
+                ),
             )
             .unwrap();
-            assert_eq!(shares_input_buffer(&output), shares_buffer);
-            assert_eq!(output.r#type(), input.r#type());
-            assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
+        assert_eq!(partitioned.mesh(), &mesh);
+        assert_eq!(partitioned.sharding(), &sharded);
+        assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
+        for array in [&local, &other_local] {
+            assert_eq!(array.mesh().devices(), &mesh.devices()[..1]);
+            assert_eq!(shard_values(array), vec![values.clone()]);
         }
 
-        // The primal of a differentiated placement follows the same rule.
-        for (may_alias, shares_buffer) in [(None, true), (Some(false), false)] {
-            let (value, _) =
-                differentiate_at(input.clone()).vjp(|x| Ok(session.place(x, options(may_alias)).unwrap())).unwrap();
-            assert_eq!(shares_input_buffer(&value), shares_buffer);
-            assert_eq!(value.r#type(), input.r#type());
-            assert_eq!(shard_values(&value), vec![vec![1., 2., 3., 4.]]);
+        // For existing arrays, None leaves preserve their target or omit their source check independently.
+        let (moved, kept) = session
+            .place(
+                (local, partitioned.clone()),
+                PlacementOptions::<_, _>::new(
+                    Some((Some(Placement::new(mesh.clone(), replicated.clone()).unwrap()), None)),
+                    Some((None, Some(Placement::new(mesh.clone(), sharded.clone()).unwrap()))),
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(moved.mesh(), &mesh);
+        assert_eq!(moved.sharding(), &replicated);
+        assert_eq!(shard_values(&moved), vec![values.clone(); 2]);
+        assert_eq!(kept.mesh(), partitioned.mesh());
+        assert_eq!(kept.sharding(), partitioned.sharding());
+        for (kept_shard, source_shard) in kept.shards().iter().zip(partitioned.shards()) {
+            assert!(Arc::ptr_eq(kept_shard.buffer().unwrap(), source_shard.buffer().unwrap()));
         }
+
+        // A placement on the session mesh also works as an optional prefix leaf.
+        let partitioned = session
+            .place(
+                CoreArray::vector(values.clone()).unwrap(),
+                PlacementOptions::<_, PlacementRequest>::new(
+                    Some(Some(session.placement(sharded.clone()).unwrap())),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(partitioned.mesh(), &mesh);
+        assert_eq!(partitioned.sharding(), &sharded);
+        assert_eq!(shard_values(&partitioned), vec![vec![1., 2.], vec![3., 4.]]);
+
+        // A bare device is a placement on that device, also as a prefix leaf.
+        let device = mesh.devices()[1];
+        let placed = session
+            .place(
+                CoreArray::vector(values.clone()).unwrap(),
+                PlacementOptions::<_, PlacementRequest>::new(Some(Some(device)), None, None, None),
+            )
+            .unwrap();
+        assert_eq!(placed.mesh().devices(), &[device]);
+        assert_eq!(shard_values(&placed), vec![values]);
     }
 
     #[test]
-    fn test_session_place_reports_errors_of_arrays_in_the_order_of_the_type_rule() {
+    fn test_session_place_validates_option_prefixes_of_empty_input() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let device = PlacementRequest::from(session.addressable_devices().unwrap()[0]);
+
+        // Root option prefixes cover the input without leaves, which is returned as it is.
+        let options = PlacementOptions::new(Some(device.clone()), Some(device.clone()), Some(true), Some(Some(false)));
+        assert_eq!(session.place(Vec::<Array>::new(), options).unwrap().len(), 0);
+        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::default()).unwrap().len(), 0);
+        assert_eq!(session.place(Vec::<f32>::new(), PlacementOptions::to(device.clone())).unwrap().len(), 0);
+
+        // An option prefix with an element for an input without elements matches no node of that input.
+        let options = PlacementOptions::<Vec<PlacementRequest>>::new(Some(vec![device]), None, None, None);
+        assert!(matches!(
+            session.place(Vec::<f32>::new(), options),
+            Err(Error::Core(error)) if matches!(
+                error.as_ref(),
+                CoreError::Parameter(ParameterError::UnusedParameters { paths: Some(paths) })
+                    if paths == &vec!["$[0]".to_string()],
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_session_place_validates_empty_nodes_of_option_prefixes() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let parameter_error = |result: Result<Vec<Vec<Array>>, Error>| match result {
+            Err(Error::Core(error)) => match error.as_ref() {
+                CoreError::Parameter(error) => error.clone(),
+                error => panic!("expected a parameter error, got `{error}`"),
+            },
+            result => panic!("expected a parameter error, got `{result:?}`"),
+        };
+        let missing =
+            |path: &str| ParameterError::MissingParameters { expected_count: 1, paths: Some(vec![path.to_string()]) };
+        let unused = |path: &str| ParameterError::UnusedParameters { paths: Some(vec![path.to_string()]) };
+
+        // An empty node of the input must be covered by an option leaf or matched by an empty option node.
+        assert_eq!(
+            parameter_error(session.place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]]]))),
+            missing("$[1]"),
+        );
+
+        // An empty option node must match an empty node of the input at the same path. This holds for every option.
+        let options = PlacementOptions::to(vec![vec![devices[1]], Vec::new()]);
+        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
+        let options = PlacementOptions::default().with_source(vec![vec![devices[0]], Vec::new()]);
+        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
+        let options = PlacementOptions::default().with_donate(vec![vec![false], Vec::new()]);
+        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
+        let options = PlacementOptions::default().with_may_alias(vec![vec![None], Vec::new()]);
+        assert_eq!(parameter_error(session.place(vec![vec![1f32]], options)), unused("$[1]"));
+
+        // An empty option node does not match an input without that node, even when neither has leaves.
+        assert_eq!(
+            parameter_error(session.place(Vec::<Vec<f32>>::new(), PlacementOptions::to(vec![Vec::<Device>::new()]))),
+            unused("$[0]"),
+        );
+
+        // Matching empty nodes on both sides are valid, and so is an option leaf over an empty node of the input.
+        let placed = session
+            .place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]], Vec::new()]))
+            .unwrap();
+        assert_eq!(placed[0][0].mesh().devices(), [devices[1]]);
+        assert_eq!(placed[1].len(), 0);
+        let placed = session
+            .place(vec![vec![1f32], Vec::new()], PlacementOptions::to(vec![devices[1], devices[0]]))
+            .unwrap();
+        assert_eq!(placed[0][0].mesh().devices(), [devices[1]]);
+        assert!(placed[0][0].is_committed());
+        assert_eq!(placed[0][0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1.]);
+        assert_eq!(placed[1].len(), 0);
+        assert_eq!(session.place(Vec::<Vec<f32>>::new(), PlacementOptions::to(Vec::<Device>::new())).unwrap().len(), 0);
+
+        // Nodes match by path, so an option tree of another container type with the same paths matches.
+        let [placed, empty] = session
+            .place([vec![1f32], Vec::new()], PlacementOptions::to(vec![vec![devices[1]], Vec::new()]))
+            .unwrap();
+        assert_eq!(placed[0].mesh().devices(), [devices[1]]);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_session_place_prepares_arguments_before_placing_leaves() {
+        struct Leaf(u8);
+
+        impl Parameter for Leaf {}
+
+        impl Placeable for Leaf {
+            type Output = u8;
+
+            fn place_parameter(
+                self,
+                session: &Session,
+                target: Option<PlacementRequest>,
+                source: Option<PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<u8, Error> {
+                let _ = (session, target, source, donate, may_alias);
+                Ok(self.0)
+            }
+        }
+
+        impl PlaceableParameter<u8> for Leaf {
+            fn prepare_arguments(
+                arguments: &mut [PlacementArgument<Self>],
+                session: &Session,
+                path: &dyn Fn(usize) -> ParameterPath,
+            ) -> Result<(), Error> {
+                let _ = (session, path);
+                for argument in arguments {
+                    argument.parameter.0 += 1;
+                }
+                Ok(())
+            }
+        }
+
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        assert_eq!(session.place((Leaf(0), Leaf(2)), PlacementOptions::default()).unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn test_session_place_validates_every_leaf_before_placing_any() {
+        // The first leaf is donated and moves to the second device, and the second leaf fails a check that needs no
+        // work to be submitted. Every such check runs for every leaf before any leaf is placed, so the call creates no
+        // array and the first leaf keeps its value and its device.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let other_session = Session::builder().client(other_cpu_client(1)).build().unwrap();
+        let upload = |session: &Session| {
+            let r#type = ArrayType::new_static(DataType::F32, [2]);
+            Array::from_host_buffer(session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap()
+        };
+        let first = upload(&session);
+        let devices = session.addressable_devices().unwrap();
+        let process_index = devices[0].process_index();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
+        let rank_two = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 2)).unwrap();
+        let unknown = PlacementRequest::from(Device::new(999, process_index));
+        let pinned = PlacementRequest::from(Memory::Host { pinned: true });
+        let cases = [
+            ("type rule of a host leaf", PlaceInput::from(2u8), Some(PlacementRequest::from(rank_two)), None),
+            ("unknown device of a host leaf", PlaceInput::from(2u8), Some(unknown.clone()), None),
+            ("unknown device of an array leaf", PlaceInput::from(upload(&session)), Some(unknown), None),
+            ("source of an array leaf", PlaceInput::from(upload(&session)), None, Some(pinned.clone())),
+            ("client of an array leaf", PlaceInput::from(upload(&other_session)), None, None),
+            ("in-place target of a foreign array leaf", PlaceInput::from(upload(&other_session)), Some(pinned), None),
+        ];
+        let mut outcomes = Vec::new();
+        for (name, second, target, source) in cases {
+            let statistics = session.array_statistics();
+            let options = PlacementOptions::new(
+                Some((Some(PlacementRequest::from(devices[1])), target)),
+                Some((None, source)),
+                Some((true, false)),
+                None::<bool>,
+            );
+            let error = session.place((PlaceInput::from(first.clone()), second), options).unwrap_err();
+            let created = session.array_statistics().created_arrays - statistics.created_arrays;
+            outcomes.push((name, error.to_string(), created));
+        }
+        let failed = |message: &str| format!("failed to place the parameter at `$.1`: {message}");
+        assert_eq!(
+            outcomes,
+            [
+                (
+                    "type rule of a host leaf",
+                    failed("`place` target sharding rank (2) does not match the input rank (0)"),
+                    0,
+                ),
+                (
+                    "unknown device of a host leaf",
+                    failed("device 999 is not addressable by the PJRT client in process 0"),
+                    0
+                ),
+                (
+                    "unknown device of an array leaf",
+                    failed("device 999 is not addressable by the PJRT client in process 0"),
+                    0
+                ),
+                (
+                    "source of an array leaf",
+                    failed("`place` source memory `Host[Pinned]` does not match the input type `f32[2]`"),
+                    0
+                ),
+                (
+                    "client of an array leaf",
+                    failed("cannot associate an array with a session of a different PJRT client"),
+                    0
+                ),
+                (
+                    "in-place target of a foreign array leaf",
+                    failed(
+                        "cannot place an array of another PJRT client without naming the devices of the destination, \
+                         because the result must live on devices of the client of the session",
+                    ),
+                    0,
+                ),
+            ],
+        );
+        assert_eq!(first.mesh().devices(), [devices[0]]);
+        assert_eq!(first.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![1., 2.]);
+    }
+
+    #[test]
+    fn test_session_place_checks_options_of_every_leaf_before_values() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let session = Session::builder().client(client).build().unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        let options = |target: PlacementRequest| {
+            PlacementOptions::<_, _>::new(
+                Some((None, Some(target))),
+                Some((Some(PlacementRequest::from(Memory::Host { pinned: true })), None)),
+                None,
+                None,
+            )
+        };
+
+        // The first leaf has a source memory that does not match its value, and the second leaf has a target that names
+        // nothing. The options of every leaf are checked before any value is, so the error names the second leaf.
+        let target = PlacementRequest::InPlace { memory: None, layout: None };
+        let error = session.place((array.clone(), array.clone()), options(target)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "failed to place the parameter at `$.1`: `place` in-place target must name a memory or a layout",
+        );
+
+        // With valid options, the source memory of the first leaf is reported at its path.
+        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        let message =
+            format!("`place` source memory `Host[Pinned]` does not match the input type `{}`", array.r#type());
+        let error = session.place((array.clone(), array), options(target.into())).unwrap_err();
+        let (path, error) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$.0");
+        assert!(matches!(error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn test_session_place_reports_the_first_type_rule_error() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
@@ -7209,12 +5682,7 @@ mod tests {
             (target, PlacementRequest::from(Memory::Host { pinned: true }), reduction_error),
         ];
         for (target, source, expected_error) in cases {
-            let options = PlacementOptions::new(
-                Some(target.clone()),
-                Some(source.clone()),
-                Option::<bool>::None,
-                Option::<Option<bool>>::None,
-            );
+            let options = PlacementOptions::to(target.clone()).with_source(source.clone());
             let eager = session.place(input.clone(), options).err().unwrap().to_string();
             let operation = PlaceOperation::new(target.padded(1).unwrap(), source.padded(1).unwrap());
             let inferred = operation.infer_output_types(&[input.r#type().into_owned()], &[]).err().unwrap();
@@ -7223,8 +5691,9 @@ mod tests {
         }
 
         // A host value is uploaded as the placement of a value without a tracked sharding in device memory, so its
-        // destination is rejected with the first error of the type rule for such a value, as the destination of an
-        // upload of the same value without a mesh is, and as the destination of a traced value of that type is.
+        // target is rejected with the first error of the type rule for such a value, as the target of an upload of the
+        // same value without a mesh is, and as the target of a traced leaf of that type is, whose trace then fails
+        // with the same error even though the traced function recovers from the failed placement.
         let manual_mesh = two_device_mesh(client, MeshAxisType::Manual);
         let host = CoreArray::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.]).unwrap();
         let replicated = || Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -7279,57 +5748,34 @@ mod tests {
             let host = session.place(host.clone(), options()).err().unwrap().to_string();
             let array = session.place(uploaded, options()).err().unwrap().to_string();
             let error = RefCell::new(None);
-            let _: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-                |x: ArrayTracer| {
-                    session.place(x.clone(), options()).unwrap_or_else(|placement_error| {
-                        error.replace(Some(placement_error.to_string()));
-                        x
-                    })
-                },
+            let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
+                |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x),
                 ArrayType::new_static(DataType::F32, [2]),
             );
-            let traced = error.take().unwrap();
-            assert_eq!((host, array, traced), (expected_error.clone(), expected_error.clone(), expected_error));
+            let traced = traced.map(|traced| traced.program().to_string()).map_err(|error| error.to_string());
+            assert_eq!(traced, Err(expected_error.clone()));
+            let recorded = error.take().unwrap();
+            assert_eq!((host, array, recorded), (expected_error.clone(), expected_error.clone(), expected_error));
         }
     }
 
     #[test]
-    fn test_session_place_agrees_across_eager_staged_compiled_and_transformed_paths() {
-        // Every observable fact of one placed array, so that the arrays that different paths produce can be compared.
-        #[derive(Clone, Debug, PartialEq)]
-        struct Observed {
-            devices: Vec<Device>,
-            logical_mesh: LogicalMesh,
-            sharding: Sharding,
-            r#type: ArrayType,
-            memory_kinds: Vec<String>,
-            values: Vec<f32>,
-            committed: bool,
+    fn test_session_place_agrees_across_paths_for_targets_and_sources() {
+        /// Input state of the matrix, which is uploaded onto `mesh` with `sharding` and then placed in `memory`, or
+        /// uploaded without a mesh when `sharding` is `None`.
+        struct InputState {
+            name: &'static str,
+            mesh: DeviceMesh,
+            sharding: Option<Sharding>,
+            memory: Memory,
         }
 
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
+        let devices = session.addressable_devices().unwrap();
         let pinned = Memory::Host { pinned: true };
         let single_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let double_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let observe = |array: &Array| Observed {
-            devices: array.mesh().devices().to_vec(),
-            logical_mesh: array.mesh().logical_mesh().clone(),
-            sharding: array.sharding().clone(),
-            r#type: array.r#type().into_owned(),
-            memory_kinds: array
-                .addressable_shards()
-                .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned())
-                .collect(),
-            values: array.copy_to_host().unwrap().elements::<f32>().unwrap(),
-            committed: array.is_committed(),
-        };
         // Uploads `values` with the shape `shape`, the sharding `sharding` over the logical mesh of `mesh`, and in
         // `memory`, which a placement onto that memory selects after the upload. Without a sharding, the values are
         // uploaded without a mesh, so the array is uncommitted on the canonical mesh of the first device.
@@ -7350,8 +5796,8 @@ mod tests {
             };
 
         // The input states, each with the meshes of its own devices and of the devices that the other paths use.
-        let single = (DeviceMesh::new(single_mesh.clone(), vec![devices[0]]).unwrap(), single_mesh.clone());
-        let double = (DeviceMesh::new(double_mesh.clone(), devices[..2].to_vec()).unwrap(), double_mesh.clone());
+        let single = DeviceMesh::new(single_mesh.clone(), vec![devices[0]]).unwrap();
+        let double = DeviceMesh::new(double_mesh.clone(), devices[..2].to_vec()).unwrap();
         let other_mesh = |mesh: &DeviceMesh| {
             let other_devices = devices[2..2 + mesh.devices().len()].to_vec();
             DeviceMesh::new(mesh.logical_mesh().clone(), other_devices).unwrap()
@@ -7361,39 +5807,59 @@ mod tests {
             |mesh: &LogicalMesh| Sharding::new(mesh.clone(), vec![ShardingDimension::Unconstrained]).unwrap();
         let canonical = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
         let inputs = [
-            ("single device", single.0.clone(), Some(replicated(&single.1)), Memory::Device),
-            ("uncommitted on the canonical mesh", canonical, None, Memory::Device),
-            (
-                "sharded over two devices",
-                double.0.clone(),
-                Some(Sharding::new(double.1.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
-                Memory::Device,
-            ),
-            ("replicated over two devices", double.0.clone(), Some(replicated(&double.1)), Memory::Device),
-            (
-                "reduced over an axis of size two",
-                double.0.clone(),
-                Some(replicated(&double.1).with_reduced_axes(["x"]).unwrap()),
-                Memory::Device,
-            ),
-            (
-                "unreduced over an axis of size one",
-                single.0.clone(),
-                Some(replicated(&single.1).with_unreduced_axes(["x"]).unwrap()),
-                Memory::Device,
-            ),
-            (
-                "unreduced over an axis of size two",
-                double.0.clone(),
-                Some(replicated(&double.1).with_unreduced_axes(["x"]).unwrap()),
-                Memory::Device,
-            ),
-            ("pinned host memory", single.0.clone(), Some(replicated(&single.1)), pinned),
+            InputState {
+                name: "single device",
+                mesh: single.clone(),
+                sharding: Some(replicated(&single_mesh)),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "uncommitted on the canonical mesh",
+                mesh: canonical,
+                sharding: None,
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "sharded over two devices",
+                mesh: double.clone(),
+                sharding: Some(Sharding::new(double_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "replicated over two devices",
+                mesh: double.clone(),
+                sharding: Some(replicated(&double_mesh)),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "reduced over an axis of size two",
+                mesh: double.clone(),
+                sharding: Some(replicated(&double_mesh).with_reduced_axes(["x"]).unwrap()),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "unreduced over an axis of size one",
+                mesh: single.clone(),
+                sharding: Some(replicated(&single_mesh).with_unreduced_axes(["x"]).unwrap()),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "unreduced over an axis of size two",
+                mesh: double.clone(),
+                sharding: Some(replicated(&double_mesh).with_unreduced_axes(["x"]).unwrap()),
+                memory: Memory::Device,
+            },
+            InputState {
+                name: "pinned host memory",
+                mesh: single.clone(),
+                sharding: Some(replicated(&single_mesh)),
+                memory: pinned,
+            },
         ];
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
 
         let mut disagreements = Vec::new();
-        for (input_name, mesh, sharding, memory) in inputs {
+        for InputState { name: input_name, mesh, sharding, memory } in inputs {
             let input = upload(&[4], sharding.as_ref(), &mesh, memory, &[1., 2., 3., 4.]);
             assert_eq!(input.mesh(), &mesh);
             let other_memory = if memory == Memory::Device { pinned } else { Memory::Device };
@@ -7483,14 +5949,7 @@ mod tests {
                 let session = if *target_name == "sharding" { &meshed_session } else { &session };
                 for (source_name, source) in &sources {
                     let cell = format!("{input_name}, target {target_name}, source {source_name}");
-                    let options = || {
-                        PlacementOptions::new(
-                            target.clone(),
-                            source.clone(),
-                            Option::<bool>::None,
-                            Option::<Option<bool>>::None,
-                        )
-                    };
+                    let options = || PlacementOptions::new(target.clone(), source.clone(), None::<bool>, None::<bool>);
                     let error = RefCell::new(None::<String>);
                     let failure = |other: String| error.take().unwrap_or(other);
 
@@ -7555,24 +6014,7 @@ mod tests {
                         }
                     }
 
-                    // A traced function interpreted on the session (i.e., the replay of a staged program).
-                    let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-                        |x: ArrayTracer| {
-                            record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x)
-                        },
-                        input.r#type().into_owned(),
-                    );
-                    let staged = match (error.take(), traced) {
-                        (Some(message), _) => Err(message),
-                        (None, Err(error)) => Err(error.to_string()),
-                        (None, Ok(traced)) => {
-                            match traced.program().interpret_in_context(session, Value::Array(input.clone())) {
-                                Ok(Value::Array(output)) => Ok(observe(&output)),
-                                Ok(_) => Err("placing an array must produce an array".to_string()),
-                                Err(error) => Err(error.to_string()),
-                            }
-                        }
-                    };
+                    let staged = replay_placement(session, &input, options()).map(|output| observe(&output));
                     if staged != eager {
                         disagreements.push(format!("{cell}, staged: {staged:?} != eager: {eager:?}"));
                     }
@@ -7620,21 +6062,21 @@ mod tests {
                         disagreements.push(format!("{cell}, jvp tangent: {tangent:?} != eager: {eager:?}"));
                     }
 
-                    // Reverse mode rejects one combination by design. The cotangent of a device target onto a value
-                    // that is reduced over a larger axis is unreduced over it, which a placement cannot produce. A
-                    // memory source of a concrete value is completed with where the value lives, so the cotangent of
-                    // a value that a device target gathers returns to its devices with every source.
+                    // Reverse mode, batched or not, rejects one combination by design. The cotangent of a device
+                    // target onto a value that is reduced over a larger axis is unreduced over it, which a placement
+                    // cannot produce. A memory source of a concrete value is completed with where the value lives, so
+                    // the cotangent of a value that a device target gathers returns to its devices with every source.
                     let is_gathered = mesh.devices().len() > 1 && matches!(*target_name, "device" | "own device");
-                    let rejected_in_reverse_mode = match () {
-                        _ if eager.is_err() || !is_gathered => None,
-                        _ if input_name == "reduced over an axis of size two" => Some(format!(
-                            "cannot transpose `{PLACE_OPERATION_NAME}` onto a single device for a value that is \
-                             reduced over mesh axes larger than one (i.e., `x`), because its cotangent is unreduced \
-                             over them",
-                        )),
-                        _ => None,
-                    };
-                    let rejected_in_batched_reverse_mode = rejected_in_reverse_mode.clone();
+                    let rejected_in_reverse_mode =
+                        if eager.is_ok() && is_gathered && input_name == "reduced over an axis of size two" {
+                            Some(format!(
+                                "cannot transpose `{PLACE_OPERATION_NAME}` onto a single device for a value that is \
+                                 reduced over mesh axes larger than one (i.e., `x`), because its cotangent is \
+                                 unreduced over them",
+                            ))
+                        } else {
+                            None
+                        };
 
                     // Returns the disagreement of the result of a reverse mode path with the rejection `expected`, if
                     // there is one. A result that is rejected as expected agrees.
@@ -7743,9 +6185,9 @@ mod tests {
                     );
                     let batched = batched.map_err(|error| failure(error.to_string()));
                     let result = batched.as_ref().map(|_| ()).map_err(Clone::clone);
-                    match (check_rejection("batched vjp", &rejected_in_batched_reverse_mode, &result), batched) {
+                    match (check_rejection("batched vjp", &rejected_in_reverse_mode, &result), batched) {
                         (Some(disagreement), _) => disagreements.push(disagreement),
-                        (None, _) if rejected_in_batched_reverse_mode.is_some() => {}
+                        (None, _) if rejected_in_reverse_mode.is_some() => {}
                         (None, Ok((value, cotangent))) => {
                             let value = observe(&value);
                             let replicated = ShardingDimension::Replicated;
@@ -7770,45 +6212,12 @@ mod tests {
                 }
             }
         }
-        // A host value is uploaded where a destination says, which is where the same destination places an upload of
-        // that value without a mesh, so both kinds of leaves agree (a host value ignores sources, so none is given).
-        let host = CoreArray::from_elements(ArrayType::new_static(DataType::F32, [4]), &[1f32, 2., 3., 4.]).unwrap();
-        let meshed_session = session.clone().with_device_mesh(other_mesh(&single.0));
-        for (target_name, target) in [
-            (
-                "mesh",
-                Some(PlacementRequest::from(Placement::new(other_mesh(&single.0), replicated(&single.1)).unwrap())),
-            ),
-            ("sharding", Some(PlacementRequest::from(meshed_session.placement(replicated(&single.1)).unwrap()))),
-            ("device", Some(PlacementRequest::from(devices[2]))),
-            ("memory", Some(PlacementRequest::from(pinned))),
-            ("none", None),
-        ] {
-            let session = if target_name == "sharding" { &meshed_session } else { &session };
-            let options = || {
-                PlacementOptions::new(
-                    target.clone(),
-                    Option::<PlacementRequest>::None,
-                    Option::<bool>::None,
-                    Option::<Option<bool>>::None,
-                )
-            };
-            let uploaded = Array::from_host_buffer(
-                session,
-                ArrayType::new_static(DataType::F32, [4]),
-                None,
-                None,
-                values_to_bytes(&[1f32, 2., 3., 4.]),
-            )
-            .unwrap();
-            let host = session.place(host.clone(), options()).map(|output| observe(&output));
-            let array = session.place(uploaded, options()).map(|output| observe(&output));
-            let (host, array) = (host.map_err(|error| error.to_string()), array.map_err(|error| error.to_string()));
-            if host != array {
-                disagreements.push(format!("host value, target {target_name}: {host:?} != array: {array:?}"));
-            }
-        }
 
+        assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
+    }
+
+    #[test]
+    fn test_session_place_agrees_across_paths_for_runtime_reduction_state_over_auto_axes() {
         // The type of an array omits its reduction state over auto mesh axes, which its runtime sharding records (e.g.,
         // a scalar that is imported as the contributions 1 and 2 of a pending sum over `'x'=2:auto`, or that is reduced
         // over that axis), so the eager placement, the core `Place` capability, and forward mode validate a concrete
@@ -7821,6 +6230,10 @@ mod tests {
         // has a packed counterpart of type `f32[2]` with the same state, whose batch items are such scalars, so that an
         // eager `batch` of the placement of each item validates the item against its runtime sharding too, and accepts
         // the identity target while it rejects a target that drops the state with the same error.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let pinned = Memory::Host { pinned: true };
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto = DeviceMesh::new(auto_mesh.clone(), devices[..2].to_vec()).unwrap();
         let other_auto = DeviceMesh::new(auto_mesh.clone(), devices[2..].to_vec()).unwrap();
@@ -7879,6 +6292,7 @@ mod tests {
                 .unwrap(),
             ),
         ];
+        let mut disagreements = Vec::new();
         for (input_name, input, packed) in auto_inputs {
             assert_eq!(
                 (observe(&input).values, input.r#type().into_owned()),
@@ -7951,21 +6365,7 @@ mod tests {
                     .jvp(input.clone(), |x| record_placement_error(&error, session.place(x, options())))
                     .map(|(primal, _)| observe(&primal))
                     .map_err(|other| error.take().unwrap_or(other.to_string()));
-                let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-                    |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x),
-                    input.r#type().into_owned(),
-                );
-                let staged = match (error.take(), traced) {
-                    (Some(message), _) => Err(message),
-                    (None, Err(error)) => Err(error.to_string()),
-                    (None, Ok(traced)) => {
-                        match traced.program().interpret_in_context(&session, Value::Array(input.clone())) {
-                            Ok(Value::Array(output)) => Ok(observe(&output)),
-                            Ok(_) => Err("placing an array must produce an array".to_string()),
-                            Err(error) => Err(error.to_string()),
-                        }
-                    }
-                };
+                let staged = replay_placement(&session, &input, options()).map(|output| observe(&output));
                 let expected_staged = match target_name {
                     "identity" | "other devices" => Err(changed.clone()),
                     _ => eager.clone(),
@@ -8001,14 +6401,26 @@ mod tests {
             }
         }
 
+        assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
+    }
+
+    #[test]
+    fn test_session_place_agrees_across_paths_for_shard_layouts() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mut disagreements = Vec::new();
+
         // The runtime sharding of an array replicated along an auto axis determines its shards, which its type does
         // not, so an expected source layout that overlaps them is rejected by the eager placement as forward mode
         // rejects it after it completes the source with that runtime placement, with the error of the type rule.
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let auto = DeviceMesh::new(auto_mesh.clone(), devices[..2].to_vec()).unwrap();
         let auto_matrix = Array::from_host_buffer(
             &session,
             ArrayType::new_static(DataType::F32, [4, 4]),
-            auto.clone(),
-            Some(Sharding::replicated(auto_mesh.clone(), 2)),
+            auto,
+            Some(Sharding::replicated(auto_mesh, 2)),
             values_to_bytes(&[42f32; 16]),
         )
         .unwrap();
@@ -8061,36 +6473,27 @@ mod tests {
         // type, and each says why: the CPU plugin cannot create strided buffers, which every path that places the array
         // reports alike, and the reference backend stores a whole value in one buffer, which it reports as a shard
         // layout that it cannot materialize.
+        let double_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let columns =
             Sharding::new(double_mesh.clone(), vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])])
                 .unwrap();
-        let input = upload(
-            &[4, 4],
-            Some(&columns),
-            &double.0,
-            Memory::Device,
-            &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
-        );
+        let values = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
+        let input = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4, 4]).with_sharding(columns).unwrap(),
+            DeviceMesh::new(double_mesh, devices[..2].to_vec()).unwrap(),
+            None,
+            values_to_bytes(&values),
+        )
+        .unwrap();
         let layout = Layout::Strided(StridedLayout::new(vec![8, 4]));
         let options = || PlacementOptions::to(PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) });
         let eager = session
             .place(input.clone(), options())
             .map(|output| observe(&output))
             .map_err(|error| error.to_string());
+        let staged = replay_placement(&session, &input, options()).map(|output| observe(&output));
         let error = RefCell::new(None::<String>);
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x),
-            input.r#type().into_owned(),
-        )
-        .unwrap();
-        let staged = match error.take() {
-            Some(message) => Err(message),
-            None => match traced.program().interpret_in_context(&session, Value::Array(input.clone())) {
-                Ok(Value::Array(output)) => Ok(observe(&output)),
-                Ok(_) => Err("placing an array must produce an array".to_string()),
-                Err(error) => Err(error.to_string()),
-            },
-        };
         let jvp = differentiate_at(input.clone())
             .jvp(input.clone(), |x| record_placement_error(&error, session.place(x, options())))
             .map(|(primal, _)| observe(&primal))
@@ -8112,7 +6515,6 @@ mod tests {
                 disagreements.push(format!("per-shard layout, {path}: {result:?} != {unsupported:?}"));
             }
         }
-        let values = (1..=16).map(|value| value as f32).collect::<Vec<_>>();
         let reference = CoreArray::from_elements(input.r#type().into_owned(), &values).unwrap();
         let reference = reference.place(&request, None).map_err(|error| error.to_string());
         let whole_value = Err(format!(
@@ -8124,10 +6526,10 @@ mod tests {
             disagreements.push(format!("per-shard layout, reference: {reference:?} != {whole_value:?}"));
         }
 
-        // Without a layout, a destination keeps the layout of a value while it still describes each destination shard,
-        // and the type rule says the same. The CPU plugin cannot create the strided layouts above, so the case of a
-        // layout that does not describe the gathered shard is covered by the type rule and the reference backend, and
-        // here a tiled layout, which describes every shard, is gathered from the column shards onto one device.
+        // Without a layout, a target keeps the layout of a value while it still describes each target shard, and the
+        // type rule says the same. The CPU plugin cannot create the strided layouts above, so the case of a layout
+        // that does not describe the gathered shard is covered by the type rule and the reference backend, and here a
+        // tiled layout, which describes every shard, is gathered from the column shards onto one device.
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let tiled = PlacementOptions::to(PlacementRequest::InPlace { memory: None, layout: Some(column_major) });
         let tiled = session.place(input.clone(), tiled).unwrap();
@@ -8138,13 +6540,7 @@ mod tests {
         let eager = eager.map_err(|error| error.to_string());
         let core = tiled.place(&devices[2], None).map(|output| observe(&output));
         let core = core.map_err(|error| Error::from(error).to_string());
-        let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(|x: ArrayTracer| session.place(x, gather()).unwrap(), tiled.r#type().into_owned()).unwrap();
-        let staged = match traced.program().interpret_in_context(&session, Value::Array(tiled.clone())) {
-            Ok(Value::Array(output)) => Ok(observe(&output)),
-            Ok(_) => Err("placing an array must produce an array".to_string()),
-            Err(error) => Err(error.to_string()),
-        };
+        let staged = replay_placement(&session, &tiled, gather()).map(|output| observe(&output));
         for (path, result) in [("core", &core), ("staged", &staged)] {
             if result != &eager {
                 disagreements.push(format!("gathered layout, {path}: {result:?} != eager: {eager:?}"));
@@ -8158,28 +6554,18 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_agrees_across_paths_for_manual_regions_and_host_values() {
-        // The matrix of `test_session_place_agrees_across_eager_staged_compiled_and_transformed_paths` covers values
-        // outside manual regions on every path, including reverse mode and batching. The values of this matrix (i.e.,
-        // values inside a manual region, values that are moved into one, host values, and the values of a `shard_map`
-        // body) are rejected wherever they would move, and reverse mode and batching of an eager value do not apply to
-        // them, so they are compared on the paths that do (i.e., eager, core, staged, forward mode, and compiled).
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let pinned = Memory::Host { pinned: true };
-        let observe =
-            |array: &Array| (array.mesh().devices().to_vec(), array.r#type().into_owned(), shard_values(array));
-        let mut disagreements = Vec::new();
-
+    fn test_session_place_agrees_across_paths_for_values_inside_manual_regions() {
         // Values inside a manual region (i.e., that vary along the manual axis `m`, or that are reduced over it) can
         // only stay on their devices, and nothing can be moved into such a region, so every target that moves a value
         // is rejected on every path with the error of the type rule, even a target that is the placement of the value.
+        // Reverse mode and batching of an eager value do not apply to these values, so they are compared on the eager,
+        // core, staged, and forward mode paths.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let observe_shards =
+            |array: &Array| (array.mesh().devices().to_vec(), array.r#type().into_owned(), shard_values(array));
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual = DeviceMesh::new(manual_mesh.clone(), devices[..2].to_vec()).unwrap();
         let other_manual = DeviceMesh::new(manual_mesh.clone(), devices[2..].to_vec()).unwrap();
@@ -8237,13 +6623,14 @@ mod tests {
                 )],
             ),
         ];
+        let mut disagreements = Vec::new();
         for (input_name, input, targets) in inputs {
             for (target_name, target, rejection) in targets {
                 let cell = format!("{input_name}, target {target_name}");
                 let options =
                     || PlacementOptions::new(target.clone(), None::<PlacementRequest>, None::<bool>, None::<bool>);
                 let error = RefCell::new(None::<String>);
-                let eager = session.place(input.clone(), options()).map(|output| observe(&output));
+                let eager = session.place(input.clone(), options()).map(|output| observe_shards(&output));
                 let eager = eager.map_err(|error| error.to_string());
                 if let Some(rejection) = &rejection
                     && eager.as_ref().err() != Some(rejection)
@@ -8254,26 +6641,12 @@ mod tests {
                     disagreements.push(format!("{cell}, eager: {eager:?}"));
                 }
                 let request = target.clone().map(|target| target.padded(1)).transpose().unwrap();
-                let core = input.place(&request, None).map(|output| observe(&output));
+                let core = input.place(&request, None).map(|output| observe_shards(&output));
                 let core = core.map_err(|error| Error::from(error).to_string());
-                let traced: Result<TracedProgram<ArrayType, ArrayType>, _> = trace(
-                    |x: ArrayTracer| record_placement_error(&error, session.place(x.clone(), options())).unwrap_or(x),
-                    input.r#type().into_owned(),
-                );
-                let staged = match (error.take(), traced) {
-                    (Some(message), _) => Err(message),
-                    (None, Err(error)) => Err(error.to_string()),
-                    (None, Ok(traced)) => {
-                        match traced.program().interpret_in_context(&session, Value::Array(input.clone())) {
-                            Ok(Value::Array(output)) => Ok(observe(&output)),
-                            Ok(_) => Err("placing an array must produce an array".to_string()),
-                            Err(error) => Err(error.to_string()),
-                        }
-                    }
-                };
+                let staged = replay_placement(&session, &input, options()).map(|output| observe_shards(&output));
                 let jvp = differentiate_at(input.clone())
                     .jvp(input.clone(), |x| record_placement_error(&error, session.place(x, options())))
-                    .map(|(primal, _)| observe(&primal))
+                    .map(|(primal, _)| observe_shards(&primal))
                     .map_err(|other| error.take().unwrap_or(other.to_string()));
                 for (path, result) in [("core", core), ("staged", staged), ("jvp", jvp)] {
                     if result != eager {
@@ -8283,92 +6656,117 @@ mod tests {
             }
         }
 
-        // A host value is uploaded onto a destination as the placement of a value without a tracked sharding in device
+        assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
+    }
+
+    #[test]
+    fn test_session_place_agrees_across_paths_for_host_values() {
+        // A host value is uploaded onto a target as the placement of a value without a tracked sharding in device
         // memory, so it is rejected or placed as an upload of the same value without a mesh is (a host value ignores
         // sources, so none is given), with the first error of the type rule for such a value, except that both split a
-        // dimension unevenly. A traced value of that type follows the type rule with the even split included.
+        // dimension unevenly. A traced leaf of that type follows the type rule with the even split included. A
+        // sharding target resolves over the default mesh of the session handle that places the value.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let pinned = Memory::Host { pinned: true };
+        let observe_shards =
+            |array: &Array| (array.mesh().devices().to_vec(), array.r#type().into_owned(), shard_values(array));
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual = DeviceMesh::new(manual_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let varying = Sharding::replicated(manual_mesh, 1).with_varying_manual_axes(["m"]).unwrap();
         let explicit = two_device_mesh(client, MeshAxisType::Explicit);
         let explicit_sharding =
             |dimensions: Vec<ShardingDimension>| Sharding::new(explicit.logical_mesh().clone(), dimensions).unwrap();
+        let other_device_mesh = single_device_mesh(devices[2]);
+        let other_replicated = Sharding::replicated(other_device_mesh.logical_mesh().clone(), 1);
+        let meshed_session = session.clone().with_device_mesh(other_device_mesh.clone());
         let rank_2 = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
-        let host_targets = [
+        let targets = [
             (
                 "unreduced",
-                PlacementRequest::from(
+                Some(PlacementRequest::from(
                     Placement::new(
                         explicit.clone(),
                         explicit_sharding(vec![ShardingDimension::Replicated]).with_unreduced_axes(["x"]).unwrap(),
                     )
                     .unwrap(),
-                ),
+                )),
             ),
             (
                 "reduced",
-                PlacementRequest::from(
+                Some(PlacementRequest::from(
                     Placement::new(
                         explicit.clone(),
                         explicit_sharding(vec![ShardingDimension::Replicated]).with_reduced_axes(["x"]).unwrap(),
                     )
                     .unwrap(),
-                ),
+                )),
             ),
             (
                 "varying along a manual axis",
-                PlacementRequest::from(Placement::new(manual.clone(), varying.clone()).unwrap()),
+                Some(PlacementRequest::from(Placement::new(manual.clone(), varying.clone()).unwrap())),
             ),
             (
                 "device with a layout of rank 2",
-                PlacementRequest::Device { device: devices[1], memory: None, layout: Some(rank_2.clone()) },
+                Some(PlacementRequest::Device { device: devices[1], memory: None, layout: Some(rank_2.clone()) }),
             ),
             (
                 "rank 2",
-                PlacementRequest::from(
+                Some(PlacementRequest::from(
                     Placement::new(explicit.clone(), explicit_sharding(vec![ShardingDimension::Replicated; 2]))
                         .unwrap(),
-                ),
+                )),
             ),
             (
                 "unconstrained",
-                PlacementRequest::from(
+                Some(PlacementRequest::from(
                     Placement::new(explicit.clone(), explicit_sharding(vec![ShardingDimension::Unconstrained]))
                         .unwrap(),
-                ),
+                )),
             ),
             (
                 "uneven split",
-                PlacementRequest::from(
+                Some(PlacementRequest::from(
                     Placement::new(explicit.clone(), explicit_sharding(vec![ShardingDimension::sharded(["x"])]))
                         .unwrap(),
-                ),
+                )),
             ),
-            ("device", PlacementRequest::from(devices[1])),
-            ("memory", PlacementRequest::from(pinned)),
+            ("device", Some(PlacementRequest::from(devices[1]))),
+            ("memory", Some(PlacementRequest::from(pinned))),
+            (
+                "mesh",
+                Some(PlacementRequest::from(Placement::new(other_device_mesh, other_replicated.clone()).unwrap())),
+            ),
+            ("sharding", Some(PlacementRequest::from(meshed_session.placement(other_replicated).unwrap()))),
+            ("none", None),
         ];
         let host_type = ArrayType::new_static(DataType::F32, [3]);
         let host = CoreArray::from_elements(host_type.clone(), &[1f32, 2., 3.]).unwrap();
-        for (target_name, target) in host_targets {
+        let mut disagreements = Vec::new();
+        for (target_name, target) in targets {
             let cell = format!("host value, target {target_name}");
-            let options = || PlacementOptions::to(target.clone());
+            let session = if target_name == "sharding" { &meshed_session } else { &session };
+            let options =
+                || PlacementOptions::new(target.clone(), None::<PlacementRequest>, None::<bool>, None::<bool>);
             let uploaded =
-                Array::from_host_buffer(&session, host_type.clone(), None, None, values_to_bytes(&[1f32, 2., 3.]))
+                Array::from_host_buffer(session, host_type.clone(), None, None, values_to_bytes(&[1f32, 2., 3.]))
                     .unwrap();
-            let host = session.place(host.clone(), options()).map(|output| (observe(&output), output.is_committed()));
+            let host = session
+                .place(host.clone(), options())
+                .map(|output| (observe_shards(&output), output.is_committed()));
             let host = host.map_err(|error| error.to_string());
-            let array = session.place(uploaded, options()).map(|output| (observe(&output), output.is_committed()));
+            let array =
+                session.place(uploaded, options()).map(|output| (observe_shards(&output), output.is_committed()));
             let array = array.map_err(|error| error.to_string());
             if host != array {
                 disagreements.push(format!("{cell}: {host:?} != array: {array:?}"));
             }
-            let request = target.clone().padded(1).unwrap();
+            let request = target.clone().map(|target| target.padded(1)).transpose().unwrap();
             let inferred =
-                PlaceOperation::infer_output_type_allowing_uneven_splits(&host_type, None, Some(&request), None);
+                PlaceOperation::infer_output_type_allowing_uneven_splits(&host_type, None, request.as_ref(), None);
             let inferred = inferred.map_err(|error| Error::from(error).to_string());
-            if let (Err(host), Err(inferred)) = (&host, &inferred)
-                && host != inferred
-            {
-                disagreements.push(format!("{cell}: {host:?} != type rule: {inferred:?}"));
-            }
-            if host.is_ok() != inferred.is_ok() {
+            if host.as_ref().map(|_| ()) != inferred.as_ref().map(|_| ()) {
                 disagreements.push(format!("{cell}: {host:?} != type rule: {inferred:?}"));
             }
             let error = RefCell::new(None::<String>);
@@ -8391,6 +6789,11 @@ mod tests {
             }
         }
 
+        assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
+    }
+
+    #[test]
+    fn test_session_place_agrees_across_paths_for_sources_inside_shard_map_bodies() {
         // Inside a `shard_map` body, a source that names devices (i.e., the placement of the local value over the
         // devices of the region, or the sole device of a region of one device) would become the target of the
         // transposed placement of an invariant local value (i.e., one that does not vary along the manual axis), which
@@ -8398,11 +6801,16 @@ mod tests {
         // and the program of reverse mode, which keeps only the transposed placement, is rejected for its target. The
         // cotangent of a varying local value stays where it lives (refer to `PlaceOperation::transposes_in_place`), so
         // every source compiles and executes on every path for it, as does every other source for an invariant value.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let pinned = Memory::Host { pinned: true };
         let pinned_seed = |r#type: &ArrayType| r#type.clone().with_memory(pinned);
         let moved_error = format!(
             "cannot lower `{PLACE_OPERATION_NAME}`: a value inside a manual region cannot be moved to another \
              placement",
         );
+        let mut disagreements = Vec::new();
         for count in [1usize, 2] {
             let program_logical_mesh =
                 LogicalMesh::new(vec![MeshAxis::new("x", count, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -8455,17 +6863,17 @@ mod tests {
                         );
                         let options =
                             || PlacementOptions::new(target.clone(), source.clone(), None::<bool>, None::<bool>);
-                        let body = |local| record_placement_error(&RefCell::new(None), session.place(local, options()));
                         let forward: Result<CompiledFunction<ArrayType, ArrayType>, _> = compile(
                             |x: CompileTracer| {
-                                let options = ShardMapOptions::new();
                                 shard_map(
-                                    body,
+                                    |local| {
+                                        record_placement_error(&RefCell::new(None), session.place(local, options()))
+                                    },
                                     x,
                                     region_mesh.clone(),
                                     specification.clone(),
                                     specification.clone(),
-                                    options,
+                                    ShardMapOptions::new(),
                                 )
                                 .unwrap()
                             },
@@ -8527,11 +6935,8 @@ mod tests {
                             ("eager", eager.map(|_| ()).map_err(|error| error.to_string())),
                         ];
                         for (path, result) in results {
-                            let expected = match (is_rejected, path) {
-                                (false, _) => Ok(()),
-                                (true, "reverse") => Err(moved_error.clone()),
-                                (true, _) => Ok(()),
-                            };
+                            let expected =
+                                if is_rejected && path == "reverse" { Err(moved_error.clone()) } else { Ok(()) };
                             if result != expected {
                                 disagreements.push(format!("{cell}, {path}: {result:?} != {expected:?}"));
                             }
@@ -8678,14 +7083,15 @@ mod tests {
                     .unwrap_err();
                 assert_leaf_error(error, "$.1");
 
-                // Direct storage conversion and host constructors share the format check for empty upload lists too.
+                // `Array::to_placement`, `Array::place_storage`, and the host constructors reject the same layouts with
+                // the same errors, also on the rank that uploads no shard, and create no array. They share this worker
+                // so that the job needs no second pair of processes.
                 let source_mesh = committed.mesh().clone();
                 let bytes = [7u8, 9];
-                let destination_type = r#type.clone().with_layout(layout.clone());
-                let dense =
-                    Array::from_host_buffer(&unchecked, destination_type.clone(), source_mesh.clone(), None, &bytes);
+                let target_type = r#type.clone().with_layout(layout.clone());
+                let dense = Array::from_host_buffer(&unchecked, target_type.clone(), source_mesh.clone(), None, &bytes);
                 let shard = (rank == 0).then_some((devices[0].id(), &bytes));
-                let sharded = Array::from_host_shards(&unchecked, destination_type, source_mesh.clone(), None, shard);
+                let sharded = Array::from_host_shards(&unchecked, target_type, source_mesh.clone(), None, shard);
                 let directly_placed = committed.to_placement(&unchecked, relayout.clone());
                 let converted = committed.clone().place_storage(Memory::Device, Some(layout.clone()));
                 for rejected in [dense, sharded, directly_placed, converted] {
@@ -8786,7 +7192,71 @@ mod tests {
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_session_place_reports_an_invalid_leaf_cuda_process_helper() {
-        run_as_cuda_rank(probe_value_comparison_with_invalid_leaf);
+        run_as_cuda_rank(|client| {
+            // Places a tree of two `bool[2]` host values with `Session::place` onto a split over the two global
+            // devices, whose first leaf on rank 0 holds a byte that does not encode a `bool`, and then places an array
+            // of rank 0 replicated onto both devices. Prints one `probe:` line for the tree, with `invalid value` when
+            // the call returns the error of that leaf and otherwise `different values` for each leaf whose readiness
+            // reports the failed comparison, and one for the cross-host placement, as `probe_value_comparison` does.
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let axis = |size: usize| MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap();
+            let forward_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(2)]).unwrap(), devices.clone()).unwrap();
+            let process_0_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(1)]).unwrap(), vec![devices[0]]).unwrap();
+            let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
+            let split = Placement::new(forward_mesh.clone(), split.unwrap()).unwrap();
+            let bools = ArrayType::new_static(DataType::Boolean, [2]);
+            let mut first = CoreArray::new(bools.clone(), vec![1, 0]).unwrap();
+            if rank == 0 {
+                first.storage_bytes_mut()[0] = 2;
+            }
+            let tree = vec![first, CoreArray::new(bools, vec![0, 1]).unwrap()];
+            let outcome = match session.place(tree, PlacementOptions::to(PlacementRequest::from(split))) {
+                Ok(placed) => placed
+                    .iter()
+                    .map(|placed| match placed.block_until_ready() {
+                        Ok(()) => "ready".to_string(),
+                        Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
+                            if message == DIFFERENT_VALUES_MESSAGE =>
+                        {
+                            "different values".to_string()
+                        }
+                        Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Err(Error::Array(error))
+                    if matches!(error.as_ref(), ArrayError::FailedParameterPlacement { source, .. }
+                        if source.to_string() == "array element 0 has invalid `bool` byte encoding [2]") =>
+                {
+                    "invalid value".to_string()
+                }
+                Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+            };
+            println!("probe: rank {rank} tree: {outcome}");
+
+            // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
+            let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(&process_0_mesh)).unwrap();
+            let values = values_to_bytes(&[17f32, 18., 19., 20.]);
+            let source = Array::from_host_buffer(&session, r#type, process_0_mesh.clone(), None, values).unwrap();
+            let target = Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap();
+            let placed = source.to_placement(&session, target);
+            let placed = placed.and_then(|placed| placed.block_until_ready().map(|()| placed));
+            match placed {
+                Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
+                Err(error) => {
+                    let error = error.to_string();
+                    println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
+                }
+            }
+        });
     }
 
     #[cfg(feature = "cuda-13")]
@@ -8807,24 +7277,79 @@ mod tests {
         );
     }
 
-    // Worker of `test_session_place_admits_a_call_with_an_invalid_leaf_on_two_cuda_processes`, which returns
+    // Worker of `test_session_place_rejects_a_call_with_an_invalid_leaf_on_two_cuda_processes`, which returns
     // immediately unless that test launched it as one of its two ranks.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
-    fn test_session_place_admits_a_call_with_an_invalid_leaf_cuda_process_helper() {
-        run_as_cuda_rank(probe_call_admission_with_invalid_leaf);
+    fn test_session_place_rejects_a_call_with_an_invalid_leaf_cuda_process_helper() {
+        run_as_cuda_rank(|client| {
+            // Places with one call of `Session::place` a host value split over the two global devices, which is a
+            // scalar on rank 0 (so that only rank 0 rejects it) and a vector on rank 1, and an array of rank 0
+            // replicated onto both devices, which rank 1 can only receive from rank 0. Then places that array once
+            // more on its own. Prints one `probe:` line for the call, with `different values` when it returns the
+            // error of the failed comparison or otherwise the first line of its error or the elements of the shards
+            // of this rank, and one for the placement that follows it.
+            let rank = client.process_index().unwrap();
+            let devices = client
+                .devices()
+                .unwrap()
+                .iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect::<Vec<_>>();
+            let session = Session::builder().client(client).build().unwrap();
+            let axis = |size: usize| MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap();
+            let forward_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(2)]).unwrap(), devices.clone()).unwrap();
+            let process_0_mesh = DeviceMesh::new(LogicalMesh::new(vec![axis(1)]).unwrap(), vec![devices[0]]).unwrap();
+            let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
+            let split = PlacementRequest::from(Placement::new(forward_mesh.clone(), split.unwrap()).unwrap());
+            let replicated = Sharding::replicated(forward_mesh.logical_mesh().clone(), 1);
+            let replicated = PlacementRequest::from(Placement::new(forward_mesh.clone(), replicated).unwrap());
+            let r#type = ArrayType::new_static(DataType::F32, [4]);
+            let values = values_to_bytes(&[17f32, 18., 19., 20.]);
+            let source = Array::from_host_buffer(&session, r#type, process_0_mesh, None, values).unwrap();
+            let host = match rank {
+                0 => CoreArray::scalar(1f32).unwrap(),
+                _ => CoreArray::vector(vec![1f32, 2.]).unwrap(),
+            };
+            let tree = vec![PlaceInput::Host(host), PlaceInput::Runtime(source.clone())];
+            let options = PlacementOptions::to(vec![split, replicated.clone()]);
+            let placed = session.place(tree, options).and_then(|placed| {
+                placed.iter().try_for_each(Array::block_until_ready)?;
+                Ok(placed)
+            });
+            let outcome = match placed {
+                Ok(placed) => format!("{:?}", placed.iter().map(read_addressable_f32s).collect::<Vec<_>>()),
+                Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
+                    if message == DIFFERENT_VALUES_MESSAGE =>
+                {
+                    "different values".to_string()
+                }
+                Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+            };
+            println!("probe: rank {rank} tree: {outcome}");
+
+            // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
+            let placed = source.to_placement(&session, replicated);
+            match placed.and_then(|placed| placed.block_until_ready().map(|()| placed)) {
+                Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
+                Err(error) => {
+                    let error = error.to_string();
+                    println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
+                }
+            }
+        });
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
-    fn test_session_place_admits_a_call_with_an_invalid_leaf_on_two_cuda_processes() {
+    fn test_session_place_rejects_a_call_with_an_invalid_leaf_on_two_cuda_processes() {
         // The first leaf is invalid on rank 0 only, and the second leaf of the same call is a cross-host move that rank
         // 1 could only complete with rank 0. Both ranks return without placing either leaf, rank 0 with its own error
         // and rank 1 with the mismatch, and both stay in step for the placement that follows.
         let helper =
-            "arrays::placement::tests::test_session_place_admits_a_call_with_an_invalid_leaf_cuda_process_helper";
+            "arrays::placement::tests::test_session_place_rejects_a_call_with_an_invalid_leaf_cuda_process_helper";
         let probes = run_cuda_rank_pair_probes(helper);
         let leaf = "failed to place the parameter at `$[0]`";
         let error = "`place` target sharding rank (1) does not match the input rank (0)";
@@ -8838,560 +7363,164 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cuda-13")]
     #[test]
-    #[ignore = "entry point of a process of a multi-process test"]
-    fn test_place_core_operations_cuda_process_helper() {
-        run_as_cuda_rank(|client| {
-            let rank = client.process_index().unwrap();
-            let session = Session::builder().client(client).build().unwrap();
-            let mesh = session.mesh([MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-            let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-            let target = Placement::new(mesh, sharding).unwrap();
-            let different_values = |output: Array| {
-                assert!(matches!(
-                    output.block_until_ready(),
-                    Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
-                        if message == DIFFERENT_VALUES_MESSAGE,
-                ));
-            };
+    fn test_placement_option_values_from_prefix() {
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let array = session.place(2.5f32, PlacementOptions::default()).unwrap();
+        let structure = vec![array; 4_000].parameter_structure();
 
-            // Both ranks reach concrete dispatch. The rank with an invalid leaf still takes part in admission.
-            let shape = if rank == 0 { vec![] } else { vec![2] };
-            let input = Array::from_host_buffer(
-                &session,
-                ArrayType::new_static(DataType::U8, shape),
-                None,
-                None,
-                vec![1u8; 1 + rank],
-            )
-            .unwrap();
-            assert!(input.is_locally_assigned());
-            let before = session.next_value_comparison();
-            let result = input.place(&target, None);
-            if rank == 0 {
-                assert_eq!(
-                    result.unwrap_err(),
-                    ProgramError::Type(TypeError::invalid(
-                        "`place` target sharding rank (1) does not match the input rank (0)",
-                    )),
-                );
-            } else {
-                different_values(result.unwrap());
-            }
-            assert_eq!(session.next_value_comparison(), before + 2);
-
-            let input =
-                Array::from_host_buffer(&session, ArrayType::new_static(DataType::U8, [4]), None, None, [2u8; 4])
-                    .unwrap();
-            let before = session.next_value_comparison();
-            let output = input.place(&target, None).unwrap();
-            output.block_until_ready().unwrap();
-            let shards = output.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap());
-            assert_eq!(shards.collect::<Vec<_>>(), [vec![2, 2]]);
-            assert_eq!(session.next_value_comparison(), before + 2);
-        });
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
-    fn test_place_core_operations_on_two_cuda_processes() {
-        run_cuda_rank_pair("arrays::placement::tests::test_place_core_operations_cuda_process_helper");
+        // Omitted and root options are stored once even when the input has many parameters.
+        let expansion = PlacementOptionValues::from_prefix(None::<PlacementRequest>, &structure);
+        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(None))));
+        let expansion = PlacementOptionValues::from_prefix(Some(false), &structure);
+        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(false)))));
     }
 
     #[test]
-    fn test_place_operation_differentiation_keeps_saved_return_placement() {
-        // A saved linearization of a placement from the first device onto the third records the first device as its
-        // return placement. Rebinding that linear map at a tangent on the second device (i.e., pulling it back or
-        // linearizing it again) keeps that return placement, so every cotangent goes back to the first device, as
-        // pinned JAX returns it there in all three cases.
-        let client = cpu_client(3);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let upload = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2.])).unwrap();
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let x = upload.to_placement(&session, devices[0]).unwrap();
-        let t = upload.to_placement(&session, devices[1]).unwrap();
-        let (primal, linear) = differentiate_at(x).linearize(|x| x.place(&devices[2], None)).unwrap();
-        let returned = (vec![devices[0].id()], vec![1., 2.], true);
-        let transposed = linear.program().transpose().unwrap();
-        let direct = transposed.interpret_in_context(&upload.domain(), vec![primal.clone()]).unwrap();
-        assert_eq!(direct.into_iter().map(observe).collect::<Vec<_>>(), vec![returned.clone()]);
-
-        let (_, pullback) = differentiate_at(t.clone()).vjp(|z| linear.apply_in_context(&z.domain(), z)).unwrap();
-        assert_eq!(observe(pullback.apply_materialized(primal).unwrap()), returned);
-
-        let (result, second) = differentiate_at(t).linearize(|z| linear.apply_in_context(&z.domain(), z)).unwrap();
-        assert_eq!(observe(result), (vec![devices[2].id()], vec![1., 2.], true));
-        assert_eq!(
-            second.program().to_string(),
-            indoc! {"
-                lambda %0:f32[2] .
-                let %1:f32[2] = place [
-                    inferred_source={mesh<['device'=1:auto]>, devices=[0], \
-                        sharding={mesh<['device'=1:auto]>, [{}]}, memory=Device},
-                    target=device(2),
-                ] %0
-                in (%1)"
-            },
-        );
-    }
-
-    #[test]
-    fn test_place_operation_admits_relocatable_sources_under_nested_transforms() {
-        // A targetless placement of an uncommitted upload on the first device with a source on a named mesh of the
-        // second device is admitted under two nested batching levels, batching around a JVP, and a JVP around
-        // batching, as it is eagerly (refer to `test_place_operation_admits_relocatable_sources_on_every_path`),
-        // because every transform value projects the relocatable type of the value that it wraps. Each leaves the
-        // upload where it is, uncommitted, as pinned JAX does.
+    fn test_array_resolve_placement_request() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let first = devices[0].id();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![devices[0]],
+        )
+        .unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            mesh.clone(),
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
 
-        let nested = batch(
-            |outer| {
-                Ok(batch(
-                    |item| item.place(&Option::<Placement>::None, &source),
-                    outer,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )?)
-            },
-            upload(&[2, 1, 2], &[3., 4., 5., 6.]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
+        // A device target on the device that the array lives on keeps the mesh of the array, even though that mesh
+        // names its axis differently from the mesh that a device target resolves to, and its sharding without the
+        // pending reduction along its axis of size one, which one device completes.
+        let memory = Memory::Host { pinned: true };
+        let destination = |device| PlacementRequest::Device { device, memory: Some(memory), layout: None };
+        let replicated = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        assert_eq!(
+            array.resolve_placement_request(destination(devices[0])).unwrap(),
+            replicated.clone().with_memory(memory),
+        );
+        let unreduced = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let unreduced_array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced).unwrap(),
+            mesh.clone(),
             None,
-        );
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
         assert_eq!(
-            nested.map(observe).map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4., 5., 6.], false)),
-        );
-        let batched_jvp = batch(
-            |outer| {
-                let (_, tangent) = differentiate_at(outer.clone())
-                    .jvp(outer, |item| item.place(&Option::<Placement>::None, &source))?;
-                Ok(tangent)
-            },
-            upload(&[2, 2], &[3., 4., 5., 6.]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        );
-        assert_eq!(
-            batched_jvp.map(observe).map_err(|error| error.to_string()),
-            Ok((vec![first], vec![3., 4., 5., 6.], false)),
-        );
-        let jvp_of_batch = differentiate_at(upload(&[2, 2], &[1., 2., 3., 4.]))
-            .jvp(upload(&[2, 2], &[5., 6., 7., 8.]), |x| {
-                Ok(batch(
-                    |item| item.place(&Option::<Placement>::None, &source),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )?)
-            })
-            .map(|(primal, tangent)| (observe(primal), observe(tangent)))
-            .map_err(|error| error.to_string());
-        assert_eq!(
-            jvp_of_batch,
-            Ok(((vec![first], vec![1., 2., 3., 4.], false), (vec![first], vec![5., 6., 7., 8.], false))),
+            unreduced_array.resolve_placement_request(destination(devices[0])).unwrap(),
+            replicated.clone().with_memory(memory),
         );
 
-        // The same three compositions through the `Value::Array` representation of the uploads, whose batching levels
-        // (refer to `ArrayIrBatchingPolicy`) and array views (i.e., `ProjectedValue`s) project the relocatable type of
-        // an array member, give the same results.
-        let observe_value = |value: Value| observe(ValueProjection::<ArrayType>::into_projected(value).unwrap());
-        let nested = batch(
-            |outer| {
-                Ok(batch(
-                    |item| item.place(&Option::<Placement>::None, &source),
-                    outer,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )?)
-            },
-            Value::Array(upload(&[2, 1, 2], &[3., 4., 5., 6.])),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
+        // Any other device keeps the logical mesh and the sharding of an array on a mesh of one device, laid over
+        // that device, so that the array keeps how its dimensions are sharded.
+        let other_mesh = DeviceMesh::new(mesh.logical_mesh().clone(), vec![devices[1]]).unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharded_array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap(),
+            mesh.clone(),
             None,
-        );
-        let batched_jvp = batch(
-            |outer| {
-                let (_, tangent) = differentiate_at(outer.clone())
-                    .jvp(outer, |item| item.place(&Option::<Placement>::None, &source))?;
-                Ok(tangent)
-            },
-            Value::Array(upload(&[2, 2], &[3., 4., 5., 6.])),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        );
-        let jvp_of_batch = differentiate_at(Value::Array(upload(&[2, 2], &[1., 2., 3., 4.]))).jvp(
-            Value::Array(upload(&[2, 2], &[5., 6., 7., 8.])),
-            |x| {
-                Ok(batch(
-                    |item| item.place(&Option::<Placement>::None, &source),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )?)
-            },
-        );
-        let outcomes = vec![
-            nested.map(|value| vec![observe_value(value)]).map_err(|error| error.to_string()),
-            batched_jvp.map(|value| vec![observe_value(value)]).map_err(|error| error.to_string()),
-            jvp_of_batch
-                .map(|(primal, tangent)| vec![observe_value(primal), observe_value(tangent)])
-                .map_err(|error| error.to_string()),
-        ];
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
         assert_eq!(
-            outcomes,
-            vec![
-                Ok(vec![(vec![first], vec![3., 4., 5., 6.], false)]),
-                Ok(vec![(vec![first], vec![3., 4., 5., 6.], false)]),
-                Ok(vec![(vec![first], vec![1., 2., 3., 4.], false), (vec![first], vec![5., 6., 7., 8.], false)]),
-            ],
+            sharded_array.resolve_placement_request(destination(devices[1])).unwrap(),
+            Placement::new(other_mesh.clone(), sharding).unwrap().with_memory(memory),
+        );
+
+        // An array on more devices resolves like a value of its rank, which gathers it onto the device.
+        let two_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            devices.clone(),
+        )
+        .unwrap();
+        let split_array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            two_device_mesh,
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        assert_eq!(
+            split_array.resolve_placement_request(destination(devices[1])).unwrap(),
+            Placement::single_device(devices[1], 1).with_memory(memory),
+        );
+
+        // A device target without a memory selects the default memory of its device, as JAX's `device_put` does,
+        // whereas a sharding target without a memory selects none, so the array keeps its own memory.
+        assert_eq!(
+            array.resolve_placement_request(devices[0].into()).unwrap(),
+            replicated.clone().with_memory(Memory::Device),
+        );
+        assert_eq!(
+            array.resolve_placement_request(devices[1].into()).unwrap(),
+            Placement::new(other_mesh, Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap()
+                .with_memory(Memory::Device),
+        );
+        let configured = session.with_device_mesh(mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        assert_eq!(
+            array.resolve_placement_request(configured.placement(sharding).unwrap().into()).unwrap(),
+            replicated
         );
     }
 
     #[test]
-    fn test_place_pads_short_shardings() {
-        // The core `Place` capability pads a sharding with fewer dimensions than an array with trailing replicated
-        // dimensions, as `Session::place` and `Array::to_placement` do and as pinned JAX pads a short partition
-        // specification, so a split of the first dimension applies to a matrix.
+    fn test_array_resolve_placement_request_in_place() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
-        let logical_mesh = mesh.logical_mesh().clone();
-        let split = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let split_matrix =
-            Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                .unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
-        let matrix =
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
-        let placed = matrix.place(&Placement::new(mesh.clone(), split).unwrap(), None).unwrap();
-        assert_eq!(placed.mesh(), &mesh);
-        assert_eq!(placed.sharding(), &split_matrix);
-        assert_eq!(shard_values(&placed), vec![vec![1., 2.], vec![3., 4.]]);
-        assert!(placed.is_committed());
-    }
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4]),
+            mesh.clone(),
+            Some(sharding.clone()),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
 
-    #[test]
-    fn test_array_place_pullback_uses_the_seed_on_its_own_devices() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let split = |name: &str, mesh_devices: &[Device]| {
-            let axis = MeshAxis::new(name, mesh_devices.len(), MeshAxisType::Explicit).unwrap();
-            let logical_mesh = LogicalMesh::new(vec![axis]).unwrap();
-            let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded([name])]).unwrap();
-            Placement::new(DeviceMesh::new(logical_mesh, mesh_devices.to_vec()).unwrap(), sharding).unwrap()
-        };
-        let target = split("q", &devices[..2]);
-        let upload = |shape: &[usize], values: &[f32], placement: PlacementRequest| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            let array = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap();
-            array.to_placement(&session, placement).unwrap()
-        };
-        let observe = |array: Array| {
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let x = upload(&[4], &[1., 2., 3., 4.], devices[0].into());
-        let [bare_seed, matching_seed, mismatched_seed] = [
-            upload(&[4], &[5., 6., 7., 8.], devices[2].into()),
-            upload(&[4], &[5., 6., 7., 8.], split("q", &devices[2..]).into()),
-            upload(&[4], &[5., 6., 7., 8.], split("r", &devices[2..]).into()),
-        ];
-        let source = devices[0];
-
-        // Exercise both the array operation family and its wrapper in the session operation family.
-        macro_rules! check_pullbacks {
-            ($differentiate:expr, $lift:expr, $into_array:expr) => {{
-                let differentiate = $differentiate;
-                let lift = $lift;
-                let into_array = $into_array;
-                let (output, pullback) = differentiate().vjp(|x| x.place(&target, &source)).unwrap();
-                let output = into_array(output);
-                assert_eq!(output.mesh().devices(), &devices[..2]);
-                assert_eq!(output.sharding(), target.sharding());
-
-                // An anonymous seed and the same logical sharding on other devices both pass the boundary.
-                for seed in [&bare_seed, &matching_seed] {
-                    let gradient = pullback.apply_materialized(lift(seed.clone())).map(into_array).map(observe);
-                    assert_eq!(gradient, Ok((vec![source.id()], vec![5., 6., 7., 8.], true)));
-                }
-                let gradient = pullback.apply_materialized(lift(mismatched_seed.clone())).map(into_array).map(observe);
-                assert_eq!(
-                    gradient,
-                    Err(ProgramError::MalformedProgram(format!(
-                        "pullback cotangent 0 has type {} but its primal boundary requires cotangent type {}",
-                        mismatched_seed.r#type(),
-                        output.r#type().cotangent().unwrap(),
-                    ))),
-                );
-
-                // Negation runs where the anonymous seed lives and the placement sends the result to the source.
-                let (_, pullback) = differentiate().vjp(|x| x.place(&target, &source)?.neg()).unwrap();
-                let gradient = pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe);
-                assert_eq!(gradient, Ok((vec![source.id()], vec![-5., -6., -7., -8.], true)));
-
-                // Sine's transpose multiplies the seed by the cosine evaluated on the forward output devices.
-                let (_, pullback) = differentiate().vjp(|x| x.place(&target, &source)?.sin()).unwrap();
-                let gradient = pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe);
-                assert_eq!(
-                    gradient,
-                    Err(ProgramError::InvalidArgument {
-                        message: "received incompatible devices for eager XLA execution: input #1 is placed on \
-                                  devices [2] but input #0 is placed on devices [0, 1]"
-                            .to_string(),
-                    }),
-                );
-            }};
-        }
-        check_pullbacks!(|| differentiate_at(x.clone()), std::convert::identity, std::convert::identity);
-        check_pullbacks!(|| session.differentiate_at(Value::Array(x.clone())), Value::Array, |value| {
-            ValueProjection::<ArrayType>::into_projected(value).unwrap()
-        });
-
-        // Under `vmap`, the seed is the same for every batch item, and the gradient of every item returns to the first
-        // device.
-        let packed = upload(&[2, 4], &[1., 2., 3., 4., 5., 6., 7., 8.], devices[0].into());
-        let batched: Result<Array, _> = batch(
-            |(x, seed)| {
-                let (_, pullback) = differentiate_at(x).vjp(|x| x.place(&target, None))?;
-                pullback.apply_materialized(seed)
-            },
-            (packed, bare_seed.clone()),
-            (BatchAxis::new(0), BatchAxis::replicated()),
-            BatchAxis::new(0),
-            None,
-        );
-        assert_eq!(
-            batched.map(observe).map_err(|error| error.to_string()),
-            Ok((vec![devices[0].id()], vec![5., 6., 7., 8., 5., 6., 7., 8.], true)),
-        );
-
-        // Transposing the pullback again places the cotangent of the inner seed on the forward destination,
-        // including when that seed lived on a single device outside the mesh.
-        let cotangents = [&matching_seed, &bare_seed].map(|inner_seed| -> Result<_, String> {
-            let (_, pullback) = differentiate_at((x.clone(), inner_seed.clone()))
-                .vjp(|(x, cotangent)| {
-                    let (_, pullback) = differentiate_at(x).vjp(|x| x.place(&target, None))?;
-                    pullback.apply_materialized(cotangent)
-                })
-                .map_err(|error| error.to_string())?;
-            let seed = upload(&[4], &[9., 10., 11., 12.], devices[3].into());
-            let cotangents = pullback.apply_materialized(seed).map_err(|error| error.to_string())?;
-            assert_eq!(cotangents.1.sharding(), target.sharding());
-            assert_eq!(shard_values(&cotangents.1), vec![vec![9., 10.], vec![11., 12.]]);
-            Ok(observe(cotangents.1))
-        });
-        assert_eq!(
-            cotangents,
-            [
-                Ok((vec![devices[0].id(), devices[1].id()], vec![9., 10., 11., 12.], true)),
-                Ok((vec![devices[0].id(), devices[1].id()], vec![9., 10., 11., 12.], true)),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_place_operation_jvp_admits_relocatable_tangents() {
-        let session = Session::builder().client(cpu_client(3)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
-        let aligned = tangent.place(&primal.placement().unwrap(), None).unwrap();
+        // An in-place target resolves to the mesh and the sharding of the array, with the memory and the layout that
+        // it names, and without them the array keeps its own.
+        let memory = Memory::Host { pinned: true };
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
-        let laid_out = aligned
-            .place(&PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) }, None)
-            .unwrap();
-        assert_eq!(laid_out.r#type().layout(), Some(&layout));
+        let placement = Placement::new(mesh.clone(), sharding).unwrap();
+        assert_eq!(
+            array
+                .resolve_placement_request(PlacementRequest::InPlace {
+                    memory: Some(memory),
+                    layout: Some(layout.clone()),
+                })
+                .unwrap(),
+            placement.clone().with_memory(memory).with_layout(layout.clone()),
+        );
+        assert_eq!(
+            array
+                .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) })
+                .unwrap(),
+            placement.with_layout(layout),
+        );
 
-        let target = devices[2];
-        let (_, pushforward) = differentiate_at(primal.clone()).linearize(|x| x.place(&target, None)).unwrap();
-        for tangent in [tangent, aligned, laid_out] {
-            let (value, derivative) =
-                differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&target, None)).unwrap();
-            assert_eq!(observe_place_jvp(&value), (target, true, vec![1., 2.]));
-            assert_eq!(observe_place_jvp(&derivative), (target, true, vec![3., 4.]));
-            assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (target, true, vec![3., 4.]));
-        }
+        // An in-place target that names neither a memory nor a layout changes nothing, so it is rejected.
+        let error = array
+            .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: None })
+            .unwrap_err();
+        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(error.to_string(), "`place` in-place target must name a memory or a layout");
     }
 
     #[test]
-    fn test_place_operation_jvp_moves_committed_inputs_to_an_explicit_device() {
-        let session = Session::builder().client(cpu_client(3)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]).place(&devices[0], None).unwrap();
-        let target = devices[2];
-        let (value, derivative) =
-            differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&target, None)).unwrap();
-        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&target, None)).unwrap();
-        assert_eq!(observe_place_jvp(&value), (target, true, vec![1., 2.]));
-        assert_eq!(observe_place_jvp(&derivative), (target, true, vec![3., 4.]));
-        assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (target, true, vec![3., 4.]));
-    }
-
-    #[test]
-    fn test_place_operation_jvp_on_explicit_device_feeds_elementwise_arithmetic() {
-        let session = Session::builder().client(cpu_client(3)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
-        let target = devices[2];
-        let (value, derivative) = differentiate_at(primal)
-            .jvp(tangent, |x| {
-                let placed = x.place(&target, None)?;
-                placed.add(&placed)
-            })
-            .unwrap();
-        assert_eq!(observe_place_jvp(&value), (target, true, vec![2., 4.]));
-        assert_eq!(observe_place_jvp(&derivative), (target, true, vec![6., 8.]));
-    }
-
-    #[test]
-    fn test_place_operation_jvp_preserves_devices_for_memory_targets() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
-        let committed = tangent.place(&devices[0], None).unwrap();
-        let pinned = Memory::Host { pinned: true };
-        let (_, pushforward) = differentiate_at(primal.clone()).linearize(|x| x.place(&pinned, None)).unwrap();
-
-        for tangent in [tangent, committed] {
-            let (value, derivative) =
-                differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&pinned, None)).unwrap();
-            let saved = pushforward.apply(tangent).unwrap();
-            assert_eq!(value.r#type().memory(), pinned);
-            assert_eq!(observe_place_jvp(&value), (devices[1], true, vec![1., 2.]));
-            for result in [derivative, saved] {
-                assert_eq!(result.r#type().memory(), pinned);
-                assert_eq!(observe_place_jvp(&result), (devices[0], true, vec![3., 4.]));
-            }
-        }
-    }
-
-    #[test]
-    fn test_place_operation_jvp_keeps_memory_placements_for_independent_arithmetic() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
-        let (value, derivative) = differentiate_at(primal.clone())
-            .jvp(tangent.clone(), |x| {
-                let placed = x.place(&Memory::Device, None)?;
-                placed.add(&placed)
-            })
-            .unwrap();
-        assert_eq!(observe_place_jvp(&value), (devices[1], true, vec![2., 4.]));
-        assert_eq!(observe_place_jvp(&derivative), (devices[0], true, vec![6., 8.]));
-        let (_, pushforward) = differentiate_at(primal)
-            .linearize(|x| {
-                let placed = x.place(&Memory::Device, None)?;
-                placed.add(&placed)
-            })
-            .unwrap();
-        assert_eq!(observe_place_jvp(&pushforward.apply(tangent).unwrap()), (devices[0], true, vec![6., 8.]));
-    }
-
-    #[test]
-    fn test_place_operation_pushforward_rejects_incompatible_devices_after_memory_placement() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
-        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&Memory::Device, None)?.sin()).unwrap();
-        assert!(matches!(
-            pushforward.apply(tangent),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "received incompatible devices for eager XLA execution: input #1 is placed on \
-                               devices [0] but input #0 is placed on devices [1]",
-        ));
-    }
-
-    #[test]
-    fn test_place_operation_jvp_rejects_anonymous_tangent_outputs_for_named_memory_placement() {
-        let session = Session::builder().client(cpu_client(2)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let (primal, tangent) = place_jvp_inputs(&session, devices[1]);
-        let pinned = Memory::Host { pinned: true };
-        let (_, pushforward) = differentiate_at(primal.clone()).linearize(|x| x.place(&pinned, None)).unwrap();
-        assert!(matches!(
-            differentiate_at(primal).jvp(tangent.clone(), |x| x.place(&pinned, None)),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "tangent type f32[2]@Host[Pinned] does not match type \
-                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned] required by primal type \
-                               f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned]",
-        ));
-        assert!(matches!(
-            pushforward.apply(tangent),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "encountered output type f32[2]@Host[Pinned] which is incompatible with the region's \
-                               declared type f32[2][sharding={mesh<['other'=1:explicit]>, [{}]}]@Host[Pinned]",
-        ));
-    }
-
-    #[test]
-    fn test_place_operation_jvp_bare_device_target_uses_default_memory() {
-        let session = Session::builder().client(cpu_client(3)).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let primal = upload_place_jvp_vector(&session, &[1., 2.]).place(&devices[1], None).unwrap();
-        let tangent = upload_place_jvp_vector(&session, &[3., 4.]);
-        let pinned = Memory::Host { pinned: true };
-        let primal = primal.place(&pinned, None).unwrap();
-        let tangent = tangent.place(&pinned, None).unwrap();
-        let target = devices[2];
-        let (value, derivative) =
-            differentiate_at(primal.clone()).jvp(tangent.clone(), |x| x.place(&target, None)).unwrap();
-        let (_, pushforward) = differentiate_at(primal).linearize(|x| x.place(&target, None)).unwrap();
-        let saved = pushforward.apply(tangent).unwrap();
-        for output in [value, derivative, saved] {
-            assert_eq!(output.r#type().memory(), Memory::Device);
-            assert_eq!(output.mesh().devices(), &[target]);
-            assert!(output.is_committed());
-        }
-    }
-
-    #[test]
-    fn test_array_place_jvp_bare_device_target_completes_reduction_state() {
+    fn test_array_resolve_placement_request_completes_reduction_state_of_device_targets() {
         let session = Session::builder().client(cpu_client(1)).build().unwrap();
         let device = session.addressable_devices().unwrap()[0];
         let upload = |session: &Session, sharding, value: f32| {
@@ -9468,196 +7597,309 @@ mod tests {
     }
 
     #[test]
-    fn test_array_place_partial_evaluation_uses_declared_reduction_state() {
+    fn test_session_place_names_failed_parameter() {
         let session = Session::builder().client(cpu_client(1)).build().unwrap();
-        let device = session.addressable_devices().unwrap()[0];
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let session = session.with_device_mesh(mesh);
-        let sharding = Sharding::replicated(logical_mesh, 0).with_reduced_axes(["x"]).unwrap();
-        let input = Array::from_host_buffer(
-            &session,
-            ArrayType::scalar(DataType::F32),
-            None,
-            Some(sharding.clone()),
-            values_to_bytes(&[2.0f32]),
-        )
-        .unwrap();
-        assert_eq!(input.sharding(), &sharding);
-        assert_eq!(input.r#type().sharding(), Some(&sharding.without_auto_axes()));
-        let target = input.placement().unwrap();
-        let eager = input.place(&target, None).unwrap();
-        assert_eq!(eager.placement(), Some(target.clone()));
-        assert_eq!(shard_values(&eager), vec![vec![2.0f32]]);
+        let upload = |shape: &[usize]| {
+            let count = shape.iter().product::<usize>();
+            Array::from_host_buffer(
+                &session,
+                ArrayType::new_static(DataType::F32, shape.to_vec()),
+                None,
+                None,
+                values_to_bytes(&vec![1f32; count]),
+            )
+            .unwrap()
+        };
+        let (matrix, vector) = (upload(&[2, 2]), upload(&[2]));
+        let matrix_placement = Placement::single_device(vector.mesh().devices()[0], 2);
+        let empty = PlacementRequest::InPlace { memory: None, layout: None };
+        let target_message = "`place` in-place target must name a memory or a layout";
+        let rank_message = "`place` target sharding rank (2) does not match the input rank (1)";
+        let path_of = |error: &Error| failed_parameter(error).map(|(path, source)| (path, source.to_string()));
 
-        // The shared fold validates the staged type before it can execute a known placement. That type omits the
-        // physical reduction over the automatic axis, so the resolved target cannot restate that reduction here.
-        let error = ProgramError::Type(TypeError::invalid(
-            "`place` cannot change reduction state; use a reduction (or the corresponding collective) instead",
-        ));
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&input));
-        let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-        assert_eq!(known.place(&target, None).unwrap_err(), error);
+        // An option that the validation pass rejects for the second leaf names that leaf.
+        let error = session
+            .place(
+                (matrix.clone(), vector.clone()),
+                PlacementOptions::<_, PlacementRequest, bool, bool>::new(
+                    Some((None, Some(empty.clone()))),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(path_of(&error), Some(("$.1".to_string(), target_message.to_string())));
+        assert_eq!(error.to_string(), format!("failed to place the parameter at `$.1`: {target_message}"));
 
-        let context = ryft_core::PartialEvaluationContext::new(session);
-        let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input)));
-        assert_eq!(known.place(&target, None).unwrap_err(), error);
+        // An error of the type rule for the second leaf names that leaf, and it is reported before any leaf is placed.
+        let options = PlacementOptions::to(matrix_placement.clone());
+        let error = session.place((matrix, vector.clone()), options).unwrap_err();
+        assert_eq!(path_of(&error), Some(("$.1".to_string(), rank_message.to_string())));
+        assert_eq!(error.to_string(), format!("failed to place the parameter at `$.1`: {rank_message}"));
+
+        // The same failures of a lone value at the root keep their own errors.
+        let error = session.place(vector.clone(), PlacementOptions::to(empty)).unwrap_err();
+        assert_eq!((path_of(&error), error.to_string()), (None, target_message.to_string()));
+        let error = session.place(vector, PlacementOptions::to(matrix_placement)).unwrap_err();
+        assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(error.to_string(), rank_message);
     }
 
     #[test]
-    fn test_place_operation_admits_relocatable_known_partial_values() {
-        // A known partial value keeps the relocatability of the uncommitted upload that it carries, so a targetless
-        // placement with a source on a named mesh of the second device admits it through `Place`, direct
-        // interpretation, and batching, and leaves it where it is, uncommitted, as it does for the upload itself. An
-        // unknown partial value with a declared sharding names a residual program variable, which is staged,
-        // so it is validated strictly against that declaration.
+    fn test_session_place_prefixes_paths_of_nested_placements() {
+        /// Leaf that places a pair of copies of `array` of its own through `Session::place`, which fails at the
+        /// second element of that pair. When `donate` is `true`, that element is donated while it may alias.
+        /// Otherwise, it has an in-place target that names nothing.
+        struct PairPlacingLeaf {
+            array: Array,
+            donate: bool,
+        }
+
+        impl Parameter for PairPlacingLeaf {}
+
+        impl PlaceableParameter<Array> for PairPlacingLeaf {}
+
+        impl Placeable for PairPlacingLeaf {
+            type Output = Array;
+
+            fn place_parameter(
+                self,
+                session: &Session,
+                target: Option<PlacementRequest>,
+                source: Option<PlacementRequest>,
+                donate: bool,
+                may_alias: Option<bool>,
+            ) -> Result<Array, Error> {
+                validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
+                let pair = (self.array.clone(), self.array);
+                let (first, _) = if self.donate {
+                    let options = PlacementOptions::<PlacementRequest, PlacementRequest, _, _>::new(
+                        None,
+                        None,
+                        Some((false, true)),
+                        Some(Some(true)),
+                    );
+                    session.place(pair, options)?
+                } else {
+                    let empty = PlacementRequest::InPlace { memory: None, layout: None };
+                    let target = Some((None, Some(empty)));
+                    let options = PlacementOptions::<_, PlacementRequest, bool, bool>::new(target, None, None, None);
+                    session.place(pair, options)?
+                };
+                Ok(first)
+            }
+        }
+
+        let session = Session::builder().client(cpu_client(1)).build().unwrap();
+        let array = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [2]),
+            None,
+            None,
+            values_to_bytes(&[1f32, 2.]),
+        )
+        .unwrap();
+        let place = |donate| {
+            let input = BTreeMap::from([("weights", PairPlacingLeaf { array: array.clone(), donate })]);
+            session.place(input, PlacementOptions::default()).unwrap_err()
+        };
+
+        // A failure of a placement that a leaf makes of a tree of its own keeps its typed error, and its path names
+        // the leaf followed by the element of that tree.
+        let error = place(false);
+        let target_message = "`place` in-place target must name a memory or a layout";
+        let (path, source) = failed_parameter(&error).unwrap();
+        assert_eq!(path, "$[\"weights\"].1");
+        assert!(matches!(source, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
+        assert_eq!(source.to_string(), target_message);
+        assert_eq!(error.to_string(), format!("failed to place the parameter at `$[\"weights\"].1`: {target_message}"));
+
+        let error = place(true);
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::DonatedArrayMayAlias { path } if path.to_string() == "$[\"weights\"].1",
+            ),
+        ));
+        assert_eq!(error.to_string(), "array `$[\"weights\"].1` cannot be donated while `may_alias` is `Some(true)`");
+    }
+
+    #[test]
+    fn test_place_operation_bindings_pads_short_shardings() {
+        // The core `Place` capability pads a sharding with fewer dimensions than an array with trailing replicated
+        // dimensions, as `Session::place` and `Array::to_placement` do and as pinned JAX pads a short partition
+        // specification, so a split of the first dimension applies to a matrix.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[1]]).unwrap();
-        let source = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let upload = |shape: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, shape.to_vec());
-            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(values)).unwrap()
-        };
-        let observe = |value: PartialTracer<ryft_core::ProjectedContext<Session, ArrayType>>| {
-            let array = value.value().unwrap().as_known().unwrap().clone();
-            let devices = array.mesh().devices().iter().map(|device| device.id()).collect::<Vec<_>>();
-            (devices, array.copy_to_host().unwrap().elements::<f32>().unwrap(), array.is_committed())
-        };
-        let array = upload(&[2], &[1., 2.]);
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
-        let known = PartialTracer::new(context.clone(), context.known_value(array.clone()));
-        let packed = PartialTracer::new(context.clone(), context.known_value(upload(&[1, 2], &[1., 2.])));
-        let operation = PlaceOperation::new(None, source.clone());
-        let outcomes = vec![
-            known.place(&Option::<Placement>::None, &source).map(observe).map_err(|error| error.to_string()),
-            InterpretableOperation::interpret(&operation, &context, &EmptyRegionDriver, &[known.clone()])
-                .map(|mut outputs| observe(outputs.remove(0)))
-                .map_err(|error| error.to_string()),
-            batch(
-                |item| item.place(&Option::<Placement>::None, &source),
-                packed,
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                None,
-            )
-            .map(observe)
-            .map_err(|error| error.to_string()),
-        ];
-        let accepted = Ok((vec![devices[0].id()], vec![1., 2.], false));
-        assert_eq!(outcomes, vec![accepted.clone(), accepted.clone(), accepted]);
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let split = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split_matrix =
+            Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let matrix =
+            Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
+        let placed = matrix.place(&Placement::new(mesh.clone(), split).unwrap(), None).unwrap();
+        assert_eq!(placed.mesh(), &mesh);
+        assert_eq!(placed.sharding(), &split_matrix);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(placed.is_committed());
+    }
 
-        let context = ryft_core::PartialEvaluationContext::new(CoreValue::domain(&array));
-        let initial = LogicalMesh::new(vec![MeshAxis::new("initial", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let declaration = array.r#type().into_owned().with_sharding(Sharding::replicated(initial, 1)).unwrap();
-        let unknown = PartialTracer::new(context.clone(), context.unknown_input(declaration.clone(), 0));
-        let placed = unknown
-            .place(&Option::<Placement>::None, &source)
-            .map_err(|error| error.to_string())
-            .and_then(|value| value.value().map(|_| ()).map_err(|error| error.to_string()));
-        assert_eq!(
-            placed,
-            Err(format!(
-                "`{PLACE_OPERATION_NAME}` source sharding `{}` does not match the input type `{}`",
-                source.sharding(),
-                declaration,
-            )),
+    // Worker of `test_place_operation_bindings_admits_an_invalid_leaf_on_two_cuda_processes`, which returns
+    // immediately unless that test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_place_operation_bindings_admits_an_invalid_leaf_cuda_process_helper() {
+        run_as_cuda_rank(|client| {
+            let rank = client.process_index().unwrap();
+            let session = Session::builder().client(client).build().unwrap();
+            let mesh = session.mesh([MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let target = Placement::new(mesh, sharding).unwrap();
+            let different_values = |output: Array| {
+                assert!(matches!(
+                    output.block_until_ready(),
+                    Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
+                        if message == DIFFERENT_VALUES_MESSAGE,
+                ));
+            };
+
+            // The core `Place` of an array whose shape differs between the ranks reaches concrete dispatch on both.
+            // Rank 0 rejects its scalar for the split target, but it still takes part in the two value comparisons of
+            // admission before it returns its error, so rank 1 sees the mismatch when its result is ready.
+            let shape = if rank == 0 { vec![] } else { vec![2] };
+            let input = Array::from_host_buffer(
+                &session,
+                ArrayType::new_static(DataType::U8, shape),
+                None,
+                None,
+                vec![1u8; 1 + rank],
+            )
+            .unwrap();
+            assert!(input.is_locally_assigned());
+            let before = session.next_value_comparison();
+            let result = input.place(&target, None);
+            if rank == 0 {
+                assert_eq!(
+                    result.unwrap_err(),
+                    ProgramError::Type(TypeError::invalid(
+                        "`place` target sharding rank (1) does not match the input rank (0)",
+                    )),
+                );
+            } else {
+                different_values(result.unwrap());
+            }
+            assert_eq!(session.next_value_comparison(), before + 2);
+
+            // A placement of equal values afterwards takes two comparisons too and places the shard of each rank.
+            let input =
+                Array::from_host_buffer(&session, ArrayType::new_static(DataType::U8, [4]), None, None, [2u8; 4])
+                    .unwrap();
+            let before = session.next_value_comparison();
+            let output = input.place(&target, None).unwrap();
+            output.block_until_ready().unwrap();
+            let shards = output.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap());
+            assert_eq!(shards.collect::<Vec<_>>(), [vec![2, 2]]);
+            assert_eq!(session.next_value_comparison(), before + 2);
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_place_operation_bindings_admits_an_invalid_leaf_on_two_cuda_processes() {
+        run_cuda_rank_pair(
+            "arrays::placement::tests::test_place_operation_bindings_admits_an_invalid_leaf_cuda_process_helper",
         );
     }
 
     #[test]
-    fn test_array_place_folds_and_residualizes_relocatable_values() {
+    fn test_admit_and_place_arguments_checks_only_data_needed_by_an_unshared_leaf() {
         let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let second = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
-        let named_mesh =
-            |axis| LogicalMesh::new(vec![MeshAxis::new(axis, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let initial = Sharding::replicated(named_mesh("first"), 1);
-        let source_mesh = named_mesh("second");
-        let source = Placement::new(
-            DeviceMesh::new(source_mesh.clone(), vec![second]).unwrap(),
-            Sharding::replicated(source_mesh, 1),
-        )
-        .unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2]);
-        let values = [1f32, 2.];
-        let anonymous =
-            Array::from_host_buffer(&session, r#type.clone(), None, None, values_to_bytes(&values)).unwrap();
-        let named =
-            Array::from_host_buffer(&session, r#type.clone(), None, Some(initial), values_to_bytes(&values)).unwrap();
-        let copy = PlaceOperation::new(None, source).with_may_alias(false);
-        assert!(!named.is_committed());
-        assert!(copy.infer_output_types(&[named.r#type().into_owned()], &[]).is_err());
+        let remote = Device::new(1000, 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let devices = session.addressable_devices().unwrap();
+        let comparison = ValueComparison::new(participant_mesh_of(devices.clone()).unwrap(), devices.clone());
+        let committed = session.place(7u8, PlacementOptions::to(devices[0])).unwrap();
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(PjrtError::invalid_argument("unshared producer failed"))).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        assert_eq!(fence.block_until_ready().unwrap_err().to_string(), "unshared producer failed");
+        let unshared = session.place(9u8, PlacementOptions::default()).unwrap().with_execution_fence(fence);
+        assert!(unshared.is_locally_assigned());
 
-        for input in [anonymous, named] {
-            let domain = CoreValue::domain(&input);
-            let context = ryft_core::PartialEvaluationContext::new(domain.clone());
-            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-            let [output] = InterpretableOperation::interpret(
-                &copy.clone().with_may_alias(true),
-                &context,
-                &EmptyRegionDriver,
-                &[known],
+        let run = |parameter: PlaceInput<Array>, target, may_alias| {
+            let arguments = vec![
+                PlacementArgument { parameter, context: (), target, source: None, donate: false, may_alias },
+                PlacementArgument {
+                    parameter: PlaceInput::from(committed.clone()),
+                    context: (),
+                    target: Some(PlacementRequest::from(remote)),
+                    source: None,
+                    donate: false,
+                    may_alias: None,
+                },
+            ];
+            admit_and_place_arguments(
+                &session,
+                Some(&comparison),
+                arguments,
+                Ok(()),
+                // The declared peer cannot receive native sends in this test. Stop at dispatch of its argument.
+                |index, argument| match index {
+                    0 => argument.parameter.place_parameter(&session, argument.target, None, false, argument.may_alias),
+                    _ => Ok(committed.clone()),
+                },
+                |_, error| error,
             )
-            .unwrap()
-            .try_into()
-            .unwrap();
-            assert_eq!(output.value().unwrap().declared_type(), None);
-            assert_eq!(output.r#type(), input.r#type());
-            assert_eq!(output.value().unwrap().as_known().unwrap().placement(), input.placement());
+        };
 
-            let context = ryft_core::PartialEvaluationContext::new(domain.clone()).with_allow_copy_folding(false);
-            let known = PartialTracer::new(context.clone(), context.known_value(input.clone()));
-            let [output] = InterpretableOperation::interpret(&copy, &context, &EmptyRegionDriver, &[known])
-                .unwrap()
-                .try_into()
-                .unwrap();
-            let residual = output.value().unwrap().clone();
-            assert!(residual.is_unknown());
-            drop(output);
-            let evaluation = context.into_evaluation(vec![residual]).unwrap();
-            assert_eq!(
-                evaluation.program().to_string(),
-                format!("lambda %0:{0} .\nlet %1:{0} = {copy} %0\nin (%1)", r#type),
-            );
+        // A leaf that this process placed on its own and that stays where it is needs none of its data, so the
+        // failure of its producer does not stop admission, which takes its two value comparisons, and surfaces only
+        // when the result is ready. A copy of that leaf needs its data, so the failure is the error of the call.
+        let position = session.next_value_comparison();
+        let placed = run(PlaceInput::from(unshared.clone()), None, None).unwrap();
+        assert_eq!(session.next_value_comparison(), position + 2);
+        assert_eq!(placed[0].block_until_ready().unwrap_err().to_string(), "unshared producer failed");
+        assert_eq!(placed[1].copy_to_host_bytes().unwrap(), [7]);
+        assert_eq!(
+            run(PlaceInput::from(unshared), None, Some(false)).unwrap_err().to_string(),
+            "unshared producer failed",
+        );
 
-            let first_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
-            let second_copy = evaluation.interpret(&domain, &[]).unwrap().remove(0);
-            assert_eq!(first_copy.mesh(), input.mesh());
-            assert_eq!(second_copy.mesh(), input.mesh());
-            assert_eq!(shard_values(&first_copy), vec![values.to_vec()]);
-            assert_eq!(shard_values(&second_copy), vec![values.to_vec()]);
-            let input_addresses = native_buffer_addresses(&input);
-            let first_addresses = native_buffer_addresses(&first_copy);
-            let second_addresses = native_buffer_addresses(&second_copy);
-            assert_ne!(first_addresses, input_addresses);
-            assert_ne!(second_addresses, input_addresses);
-            assert_ne!(first_addresses, second_addresses);
-
-            // The same rule runs through the projected array member of the full session family.
-            let context = ryft_core::PartialEvaluationContext::new(session.clone()).with_allow_copy_folding(false);
-            let known = PartialTracer::new(context.clone(), context.known_value(Value::Array(input.clone())));
-            let [output] = context.bind(copy.clone(), Vec::new(), &[known]).unwrap().try_into().unwrap();
-            let residual = output.value().unwrap().clone();
-            assert!(residual.is_unknown());
-            drop(output);
-            let evaluation = context.into_evaluation(vec![residual]).unwrap();
-            assert_eq!(
-                evaluation.program().to_string(),
-                format!("lambda %0:{0} .\nlet %1:{0} = {copy} %0\nin (%1)", r#type),
-            );
-            let output = evaluation.interpret(&session, &[]).unwrap().remove(0);
-            let output = ValueProjection::<ArrayType>::into_projected(output).unwrap();
-            assert_eq!(output.mesh(), input.mesh());
-            assert_eq!(shard_values(&output), vec![values.to_vec()]);
-            assert_ne!(native_buffer_addresses(&output), input_addresses);
+        // A copy of an array that varies along a manual axis keeps the values of each of its devices, as when it is
+        // placed on its own.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["x"]).unwrap();
+        let varying = Array::from_host_shards(
+            &session,
+            ArrayType::new_static(DataType::U8, [1]),
+            mesh,
+            Some(sharding),
+            [(devices[0].id(), [7u8].as_slice()), (devices[1].id(), [9u8].as_slice())],
+        )
+        .unwrap()
+        .with_locally_assigned(true);
+        let direct = session.place(varying.clone(), PlacementOptions::default().with_may_alias(false)).unwrap();
+        let grouped = run(PlaceInput::from(varying), None, Some(false)).unwrap();
+        for output in [&direct, &grouped[0]] {
+            output.block_until_ready().unwrap();
+            let bytes = output.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+            assert_eq!(bytes, [vec![7], vec![9]]);
         }
+
+        // The upload of a host leaf needs its data, so an invalid encoding is the error of the call.
+        let mut host = CoreArray::scalar(true).unwrap();
+        host.storage_bytes_mut()[0] = 2;
+        assert_eq!(
+            run(PlaceInput::from(host), None, None).unwrap_err().to_string(),
+            "array element 0 has invalid `bool` byte encoding [2]",
+        );
     }
 }
