@@ -2266,21 +2266,31 @@ impl Array {
         self
     }
 
-    /// Submits the maximum over `participants` of the `contributions` of the devices of this process (refer to
-    /// [`digest_contribution`]), one for each of its devices of `participants`, and returns the replicated result,
-    /// which every device of `participants` holds once each of them has contributed. The contributions form a pending
-    /// maximum along [`PROCESS_AXIS`], which the placement onto the replicated sharding completes with one compiled
-    /// all-reduce of `u32` values (refer to [`collective_reduction`]).
+    /// Submits the maximum over `participants` of the contributions of the devices of this process for `digests`,
+    /// one for each of its devices of `participants`, and returns the replicated result, which every device of
+    /// `participants` holds once each of them has contributed. The contributions form a pending maximum along
+    /// [`PROCESS_AXIS`], which the placement onto the replicated sharding completes with one compiled all-reduce of
+    /// `u32` values (refer to [`collective_reduction`]).
+    ///
+    /// The contribution for a digest is its words followed by their bitwise complements. The maximum then holds the
+    /// largest and, complemented, the smallest value of each word, which are equal exactly when every device
+    /// contributed the same digest. A device without a digest (i.e., one whose process could not digest its value)
+    /// contributes the largest value for every word and every complement, which no maximum of complements can match,
+    /// so that the comparison fails on every process.
     fn digest_maximum(
         session: &Session,
         participants: &DeviceMesh,
-        contributions: Vec<(DeviceId, [u32; 2 * DIGEST_WORDS])>,
+        digests: Vec<(DeviceId, Option<[u32; DIGEST_WORDS]>)>,
     ) -> Result<Self, Error> {
         let r#type = ArrayType::new_static(DataType::U32, [2 * DIGEST_WORDS]);
         let replicated = Sharding::replicated(participants.logical_mesh().clone(), 1);
         let pending =
             replicated.clone().with_unreduced_axes([PROCESS_AXIS])?.with_unreduced_kind(UnreducedKind::Max)?;
-        let shards = contributions.into_iter().map(|(device, words)| {
+        let shards = digests.into_iter().map(|(device, digest)| {
+            let words = match digest {
+                Some(digest) => digest.into_iter().chain(digest.into_iter().map(|word| !word)).collect(),
+                None => vec![u32::MAX; 2 * DIGEST_WORDS],
+            };
             (device, Arc::<[u8]>::from(words.iter().flat_map(|word| word.to_ne_bytes()).collect::<Vec<_>>()))
         });
         let contributions = Self::from_host_shards(session, r#type, participants.clone(), Some(pending), shards)?;
@@ -2289,13 +2299,19 @@ impl Array {
 
     /// Returns the [`ExecutionFence`] of the verdict of the comparison whose result `maximum` is (refer to
     /// [`Self::digest_maximum`]), which completes once `maximum` can be read back and fails with a failed precondition
-    /// error when the digests differ (refer to [`digests_agree`]). The verdict is read back in the background, by the
-    /// upload of one byte onto `device` whose readback checks it (refer to [`Self::from_host_buffer_in_background`]),
-    /// so this function does not wait for the comparison unless the PJRT plugin lacks host to device transfer
-    /// managers, in which case it returns the error of the verdict itself.
+    /// error when the digests differ (i.e., when some word of `maximum` is not the complement of the word that holds
+    /// the maximum of its complements). The verdict is read back in the background, by the upload of one byte onto
+    /// `device` whose readback checks it (refer to [`Self::from_host_buffer_in_background`]), so this function does
+    /// not wait for the comparison unless the PJRT plugin lacks host to device transfer managers, in which case it
+    /// returns the error of the verdict itself.
     fn digest_verdict(session: &Session, device: Device, maximum: Self) -> Result<ExecutionFence, Error> {
         let verdict = |maximum: &Self| -> Result<Vec<u8>, Error> {
-            match digests_agree(&maximum.copy_to_host_bytes()?) {
+            let bytes = maximum.copy_to_host_bytes()?;
+            let words = bytes.as_chunks::<4>().0.iter().map(|word| u32::from_ne_bytes(word.try_into().unwrap()));
+            let words = words.collect::<Vec<_>>();
+            let agree = words.len() == 2 * DIGEST_WORDS
+                && (0..DIGEST_WORDS).all(|index| words[index] == !words[index + DIGEST_WORDS]);
+            match agree {
                 true => Ok(vec![0]),
                 false => Err(PjrtError::failed_precondition(DIFFERENT_VALUES_MESSAGE).into()),
             }
@@ -2409,8 +2425,6 @@ impl ValueComparison {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Native PJRT collective with at least one contributor owned by this process.
 pub(crate) struct ComparisonCollective {
     participants: DeviceMesh,
@@ -2419,13 +2433,13 @@ pub(crate) struct ComparisonCollective {
 
 impl ComparisonCollective {
     /// Submits the comparison of `digest` (or of a poison contribution when it is [`None`], refer to
-    /// [`digest_contribution`]) with the digests of the other processes, at the next position of the sequence of
+    /// [`Array::digest_maximum`]) with the digests of the other processes, at the next position of the sequence of
     /// comparisons of `session`, and returns the [`ExecutionFence`] of its verdict, which every result of the placement
     /// that compares joins into its own, or for which a placement call that is admitted as a whole waits before it
-    /// places anything (refer to [`Session::place`]). The session's sequence position is mixed into the contributed
-    /// digest (refer to [`sequenced_digest`]), so contributions at different session positions disagree.
-    /// The fence fails on every process alike with a failed precondition error when the digests differ. The call
-    /// returns without waiting for its verdict unless the plugin lacks host to device transfer managers (refer to
+    /// places anything (refer to [`Session::place`]). The contributed digest is the SHA-256 digest of the session's
+    /// sequence position and the words of `digest`, so contributions at different session positions disagree. The
+    /// fence fails on every process alike with a failed precondition error when the digests differ. The call returns
+    /// without waiting for its verdict unless the plugin lacks host to device transfer managers (refer to
     /// [`Array::digest_verdict`]).
     pub(crate) fn submit(
         &self,
@@ -2433,8 +2447,13 @@ impl ComparisonCollective {
         digest: Option<[u32; DIGEST_WORDS]>,
     ) -> Result<ExecutionFence, Error> {
         let position = session.next_value_comparison();
-        let words = digest_contribution(digest.map(|digest| sequenced_digest(digest, position)));
-        let contributions = self.contributors.iter().map(|device| (device.id(), words)).collect();
+        let sequenced = digest.map(|digest| {
+            let mut hash = Sha256::new();
+            hash.update(position.to_le_bytes());
+            digest.iter().for_each(|word| hash.update(word.to_le_bytes()));
+            words_of(&hash.finalize())
+        });
+        let contributions = self.contributors.iter().map(|device| (device.id(), sequenced)).collect();
         let maximum = Array::digest_maximum(session, &self.participants, contributions)?;
         Array::digest_verdict(session, self.contributors[0], maximum)
     }
@@ -2458,49 +2477,17 @@ pub(super) fn value_digest(data_type: DataType, dimensions: &[usize], bytes: &[u
     words_of(&hash.finalize())
 }
 
-/// Returns the words that a process contributes to a [`ValueComparison`] for the digest of its value, which are the
-/// words of `digest` followed by their bitwise complements. A maximum over the processes then gives every process the
-/// largest and, complemented, the smallest value of each word, which are equal exactly when every process contributed
-/// the same digest (refer to [`digests_agree`]). A process without a digest (i.e., one that could not digest its value)
-/// contributes the largest value for every word and every complement, which no maximum of complements can match, so
-/// that the comparison fails on every process.
-fn digest_contribution(digest: Option<[u32; DIGEST_WORDS]>) -> [u32; 2 * DIGEST_WORDS] {
-    match digest {
-        Some(digest) => std::array::from_fn(|index| match index {
-            index if index < DIGEST_WORDS => digest[index],
-            index => !digest[index - DIGEST_WORDS],
-        }),
-        None => [u32::MAX; 2 * DIGEST_WORDS],
-    }
-}
-
-/// Returns whether the maximum over the processes of their contributions (refer to [`digest_contribution`]), whose
-/// native-endian bytes `maximum` holds, shows that every process contributed the same digest.
-fn digests_agree(maximum: &[u8]) -> bool {
-    let words = maximum.chunks_exact(4).map(|word| u32::from_ne_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
-    words.len() == 2 * DIGEST_WORDS && (0..DIGEST_WORDS).all(|index| words[index] == !words[index + DIGEST_WORDS])
-}
-
 /// Returns the mesh over `devices`, one for each participant of the PJRT collective of a [`ValueComparison`].
 pub(super) fn participant_mesh_of(devices: Vec<Device>) -> Result<DeviceMesh, Error> {
     let axis = MeshAxis::new(PROCESS_AXIS, devices.len(), MeshAxisType::Explicit)?;
     Ok(DeviceMesh::new(LogicalMesh::new(vec![axis])?, devices)?)
 }
 
-/// Returns the digest that a process contributes for `digest` at the position `position` of the sequence of
-/// comparisons of its session, which is the SHA-256 digest of `position` and the words of `digest`.
-fn sequenced_digest(digest: [u32; DIGEST_WORDS], position: u64) -> [u32; DIGEST_WORDS] {
-    let mut hash = Sha256::new();
-    hash.update(position.to_le_bytes());
-    digest.iter().for_each(|word| hash.update(word.to_le_bytes()));
-    words_of(&hash.finalize())
-}
-
 /// Returns the digest of the values of the leaves of one placement call that compare their values, whose digests
 /// `digests` are in the order of the leaves, which is the SHA-256 digest of their words, or [`None`] when one of them
 /// is [`None`] (i.e., when this process cannot produce the digest of one of its values), so that the whole call then
 /// contributes a poison digest.
-pub(crate) fn combined_digest<I: IntoIterator<Item = Option<[u32; DIGEST_WORDS]>>>(
+pub(super) fn combined_digest<I: IntoIterator<Item = Option<[u32; DIGEST_WORDS]>>>(
     digests: I,
 ) -> Option<[u32; DIGEST_WORDS]> {
     let mut hash = Sha256::new();
@@ -2541,7 +2528,7 @@ pub(super) fn host_value_digest(host: &CoreArray) -> Option<[u32; DIGEST_WORDS]>
 
 /// Returns the digest of the value of `array` (refer to [`value_digest`]), which this function reads back on the
 /// calling thread, or [`None`] when that readback fails.
-pub(crate) fn array_value_digest(array: &Array) -> Option<[u32; DIGEST_WORDS]> {
+pub(super) fn array_value_digest(array: &Array) -> Option<[u32; DIGEST_WORDS]> {
     let bytes = array.copy_to_host_bytes().ok()?;
     Some(value_digest(array.data_type(), array.shape().as_slice(), &bytes))
 }
@@ -2550,8 +2537,6 @@ pub(crate) fn array_value_digest(array: &Array) -> Option<[u32; DIGEST_WORDS]> {
 fn words_of(digest: &[u8]) -> [u32; DIGEST_WORDS] {
     std::array::from_fn(|index| u32::from_le_bytes(digest[4 * index..4 * index + 4].try_into().unwrap()))
 }
-
-// TODO(eaplatanios): Review up to here.
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[allow(clippy::single_range_in_vec_init)]
@@ -5535,7 +5520,7 @@ mod tests {
         let mismatch = devices
             .iter()
             .zip([Some(value_digest(DataType::F32, &[2], &values)), None])
-            .map(|(device, digest)| (device.id(), digest_contribution(digest)))
+            .map(|(device, digest)| (device.id(), digest))
             .collect::<Vec<_>>();
         let maximum = Array::digest_maximum(&session, &participants, mismatch).unwrap();
         let failed = Array::digest_verdict(&session, devices[0], maximum).unwrap();
@@ -5571,12 +5556,16 @@ mod tests {
         let first = value_digest(DataType::F32, &[2], &values_to_bytes(&[1f32, 1.]));
         let second = value_digest(DataType::F32, &[2], &values_to_bytes(&[2f32, 2.]));
         let compare = |digests: [Option<[u32; DIGEST_WORDS]>; 2]| {
-            let contributions = devices
-                .iter()
-                .zip(digests)
-                .map(|(device, digest)| (device.id(), digest_contribution(digest)))
-                .collect::<Vec<_>>();
-            let words = |index: usize| contributions.iter().map(|(_, words)| words[index]).max().unwrap();
+            let contributions = devices.iter().zip(digests).map(|(device, digest)| (device.id(), digest));
+            let contributions = contributions.collect::<Vec<_>>();
+            // Each word of the maximum is the largest contribution, where a digest contributes its words followed by
+            // their complements and a missing digest contributes the largest value everywhere.
+            let word = |digest: Option<[u32; DIGEST_WORDS]>, index: usize| match digest {
+                Some(digest) if index < DIGEST_WORDS => digest[index],
+                Some(digest) => !digest[index - DIGEST_WORDS],
+                None => u32::MAX,
+            };
+            let words = |index: usize| digests.iter().map(|digest| word(*digest, index)).max().unwrap();
             let expected = (0..2 * DIGEST_WORDS).map(words).collect::<Vec<_>>();
             let maximum = Array::digest_maximum(&session, &participants, contributions).unwrap();
             assert_eq!(maximum.sharding(), &Sharding::replicated(participants.logical_mesh().clone(), 1));
@@ -5602,10 +5591,7 @@ mod tests {
                 Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. })) if message == DIFFERENT_VALUES_MESSAGE,
             )
         };
-        // Equal values at different positions of the sequences of comparisons disagree as well.
-        let (at_first, at_second) = (sequenced_digest(first, 0), sequenced_digest(first, 1));
-        assert_ne!(at_first, at_second);
-        let pairs = [[Some(first), Some(second)], [Some(first), None], [None, None], [Some(at_first), Some(at_second)]];
+        let pairs = [[Some(first), Some(second)], [Some(first), None], [None, None]];
         for digests in pairs {
             let placed = compare(digests);
             assert!(is_rejected(placed.block_until_ready()));

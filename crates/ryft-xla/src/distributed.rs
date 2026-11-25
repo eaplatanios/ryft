@@ -278,6 +278,7 @@ impl DistributedRuntime {
             .kernel_sequence
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
             .map_err(|_| ryft_pjrt::Error::invalid_argument("kernel coordinator sequence overflow"))?;
+
         // The coordinates were converted from `u32` values when the runtime was initialized.
         Ok((self.state.launch_id, sequence, self.state.process_index as u32, self.state.process_count as u32))
     }

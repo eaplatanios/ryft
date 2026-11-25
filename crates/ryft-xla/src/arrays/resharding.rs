@@ -533,7 +533,11 @@ impl Array {
 
         // Only the owner of the target reads this array back. All participants check the source shards using the
         // common process numbering before the owner checks its buffers.
-        self.validate_one_value_per_contribution()?;
+        validate_one_value_per_contribution(
+            self.mesh(),
+            self.sharding(),
+            self.shards().iter().map(ArrayShard::descriptor),
+        )?;
         if let Some(shard) = self.placement_planning_view().contribution_missing_from(owner) {
             return Err(PjrtError::invalid_argument(format!(
                 "cannot place an array of another PJRT client onto the devices of process {owner}, which holds no \
@@ -1258,14 +1262,18 @@ impl Array {
         // process slices whenever some destination shard covers a part of the value), so a process that does not
         // upload itself (e.g., one without destination devices) checks, in the same order, what the readback and the
         // upload of another process check from metadata before they submit anything (refer to
-        // `Self::validate_one_value_per_contribution` and `Self::validate_host_upload`), and every process returns the
+        // `validate_one_value_per_contribution` and `Self::validate_host_upload`), and every process returns the
         // same error. What depends on the buffers or the devices of one process (e.g., a missing local buffer) remains
         // an error of that process.
         let uploads_here = !destinations.is_empty() && !on_devices_with(slices);
         if !uploads_here && !on_devices_with(destination_layout.descriptors().iter().any(|shard| !whole(shard.slice())))
         {
             if !shape.as_slice().contains(&0) {
-                self.validate_one_value_per_contribution()?;
+                validate_one_value_per_contribution(
+                    self.mesh(),
+                    self.sharding(),
+                    self.shards().iter().map(ArrayShard::descriptor),
+                )?;
             }
             Self::validate_host_upload(session, host_type.clone(), mesh, sharding)?;
         }
