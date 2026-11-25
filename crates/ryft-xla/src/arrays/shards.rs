@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -9,16 +9,17 @@ use ryft_core::{
 };
 use ryft_pjrt::{Buffer, Client, Error as PjrtError, Event};
 
-use crate::arrays::ArrayError;
+use crate::arrays::{Array, ArrayError};
 use crate::devices::MemoryExtension;
 use crate::types::DataTypeExtension;
 use crate::{Error, FromPjrt};
 
-/// Shard of an [`Array`](crate::Array). [`ArrayShard`]s always carry global shard metadata through
-/// [`ArrayShard::descriptor`]. They also carry either a PJRT [`Buffer`] when ordinary data is addressable from the
-/// current process, a bufferless marker for the unique value of [`DataType::Zero`], or metadata only when the shard
-/// belongs to another process. This lets an array describe its full global layout without allocating meaningless
-/// zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so that cloned arrays can share them.
+/// Shard of an [`Array`]. [`ArrayShard`]s always carry global shard metadata through [`ArrayShard::descriptor`]. They
+/// also carry either a PJRT [`Buffer`] when ordinary data is addressable from the current process, a bufferless marker
+/// for the unique value of [`DataType::Zero`], or metadata only when the current process holds no buffer for the shard
+/// (refer to [`ArrayShardStorage::Remote`]). This lets an array describe its full global layout without allocating
+/// meaningless zero-space buffers. Ordinary addressable buffers remain stored inside [`Arc`]s so that cloned
+/// arrays can share them.
 #[derive(Clone)]
 pub struct ArrayShard {
     /// Refer to the documentation of [`Self::descriptor`] for information on this field.
@@ -32,18 +33,20 @@ impl ArrayShard {
     /// Creates a new [`ArrayShard`] described by `descriptor`. `buffer` holds the shard's storage when the shard is
     /// addressable from the current process, and [`None`] creates a metadata-only remote shard. Nothing checks that
     /// `buffer` lives on the device of `descriptor` and holds its shape and data type, so only the constructors of
-    /// [`Array`](crate::Array), which validate every buffer against the descriptor of its shard first (refer to
-    /// [`Array::from_addressable_buffers`](crate::Array::from_addressable_buffers)), create shards. A public caller
-    /// imports buffers through those constructors and reads the shards of the resulting array.
+    /// [`Array`], which validate every buffer against the descriptor of its shard first (refer to
+    /// [`Array::from_addressable_buffers`]), create shards. A public caller imports buffers
+    /// through those constructors and reads the shards of the resulting array.
     #[inline]
     pub(crate) fn new(descriptor: ShardDescriptor, buffer: Option<Arc<Buffer<'static>>>) -> Self {
         let storage = buffer.map_or(ArrayShardStorage::Remote, ArrayShardStorage::Buffer);
         Self { descriptor, storage }
     }
 
-    /// Creates a process-local bufferless [`DataType::Zero`]-valued [`ArrayShard`].
+    /// Creates a process-local bufferless [`DataType::Zero`]-valued [`ArrayShard`]. Note that nothing checks that the
+    /// device of `descriptor` belongs to the current process, so only the constructors of [`Array`], which do, create
+    /// such shards.
     #[inline]
-    pub fn zero(descriptor: ShardDescriptor) -> Self {
+    pub(crate) fn zero(descriptor: ShardDescriptor) -> Self {
         Self { descriptor, storage: ArrayShardStorage::Zero }
     }
 
@@ -97,7 +100,11 @@ impl ArrayShard {
         self.descriptor.shape()
     }
 
-    /// Returns `true` if this shard is addressable from the current process.
+    /// Returns `true` if the current process holds the storage of this shard (i.e., a [`Buffer`] or the bufferless
+    /// [`DataType::Zero`] value). This reports storage presence, not device ownership. A shard on a device of the
+    /// current process whose buffer was not supplied (e.g., by a sparse import through
+    /// [`Array::from_addressable_buffers`]) is not addressable either, while [`Device::process_index`]
+    /// of [`Self::device`] reports which process owns the device.
     #[inline]
     pub fn is_addressable(&self) -> bool {
         !matches!(self.storage, ArrayShardStorage::Remote)
@@ -110,11 +117,10 @@ impl ArrayShard {
     /// produced that buffer (e.g., a failed host to device transfer) surfaces here as it does for the readback of
     /// the whole array.
     ///
-    /// These bytes are a tile of the [`Array`](crate::Array) that this shard belongs to, unless the [`Sharding`] of
-    /// that array has unreduced axes, in which case they are the separate value that this device holds for that tile
-    /// (e.g., a summand). This function also observes only this shard's buffer. Use
-    /// [`Array::copy_to_host`](crate::Array::copy_to_host) to read the whole value
-    /// of an array and to surface the errors of the whole execution that produced it.
+    /// These bytes are a tile of the [`Array`] that this shard belongs to, unless the [`Sharding`] of that array
+    /// has unreduced axes, in which case they are the separate value that this device holds for that tile (e.g., a
+    /// summand). This function also observes only this shard's buffer. Use [`Array::copy_to_host`] to read the whole
+    /// value of an array and to surface the errors of the whole execution that produced it.
     ///
     /// Note that a shard belongs to no session, so the copy is not registered with one. It is complete when this
     /// function returns, and [`Session::synchronize`](crate::Session::synchronize) neither waits for it nor reports
@@ -163,10 +169,16 @@ impl Debug for ArrayShard {
     }
 }
 
-/// Physical storage state of an [`ArrayShard`], which [`ArrayShard::storage`] returns.
+/// Physical storage state of an [`ArrayShard`], which [`ArrayShard::storage`] returns. It describes what the current
+/// process holds for the shard, not which process owns the device of the shard, which [`Device::process_index`] of
+/// [`ShardDescriptor::device`] states. In particular, a shard on a device of the current process can still have no
+/// storage here.
 #[derive(Clone)]
 pub enum ArrayShardStorage {
-    /// The shard belongs to another process and has no process-local storage.
+    /// The current process holds no buffer for the shard. Despite its name, this variant describes the absence of
+    /// storage rather than a device of another process. It is the case for every shard on a device of another process,
+    /// and also for a shard on a device of the current process whose buffer was not supplied (e.g., an array imported
+    /// from the buffers of some of the local devices only, whose other local replicas make it readable).
     Remote,
 
     /// The shard is process-local but represents the unique value of [`DataType::Zero`] without an underlying buffer.
@@ -183,7 +195,7 @@ pub type ShardIndex = usize;
 
 /// Device ownership and slice metadata for an [`ArrayShard`]. A [`ShardDescriptor`] is intentionally independent
 /// of any local [`Buffer`]. It describes which [`Device`] owns the [`ArrayShard`] and which slice of the underlying
-/// [`Array`](crate::Array) that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
+/// [`Array`] that shard represents. [`ArrayShard`]s pair this metadata with optional addressable buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardDescriptor {
     /// Refer to the documentation of [`Self::index`] for information on this field.
@@ -193,7 +205,7 @@ pub struct ShardDescriptor {
     device: Device,
 
     /// Refer to the documentation of [`Self::slice`] for information on this field. It is shared, so cloning
-    /// a descriptor (e.g., into every output [`Array`](crate::Array) of a compiled program) does not allocate.
+    /// a descriptor (e.g., into every output [`Array`] of a compiled program) does not allocate.
     slice: Arc<[Range<usize>]>,
 }
 
@@ -245,14 +257,12 @@ impl ShardDescriptor {
     ///   - `element_count` is the number of elements in each such block, which is the product of the slice lengths
     ///     over the dimensions `d..rank`.
     ///
-    /// Trailing dimensions whose slice fully covers the corresponding `shape` extent are absorbed into the contiguous
-    /// block. The innermost dimension is always part of the block since its element span at fixed outer indices is
-    /// already contiguous in row-major order. Replicated layouts and layouts sharded only along the outermost axis
-    /// therefore collapse to a single block, while layouts sharded along an inner axis stop the collapse early. Rank-0
-    /// shards trivially return `(0, 1)` since their singular element is its own contiguous block. A returned dimension
-    /// of `0` therefore means that the whole shard is one contiguous span, which lets
-    /// [`Array::from_host_buffer`](crate::Array::from_host_buffer) upload such a shard from the dense host buffer
-    /// without byte strides. Otherwise, each block can be copied with one [`Vec::extend_from_slice`] call.
+    /// A dimension whose inner slices cover their full extents is part of the block. A dimension that selects one
+    /// index can also join the block, since it adds no gaps between elements. An empty slice returns `(0, 0)`.
+    /// Rank-0 shards return `(0, 1)` since their single element is its own contiguous block. A returned dimension
+    /// of `0` therefore means that the whole shard is one contiguous span. Host uploads can read such a shard from
+    /// the dense host buffer without byte strides, and host readback can write one contribution of such a tile
+    /// directly to the dense destination. Otherwise, each block can be copied with one [`Vec::extend_from_slice`] call.
     ///
     /// Consider the following two shard slices over the same `shape = [4, 6]`:
     ///
@@ -276,7 +286,7 @@ impl ShardDescriptor {
     /// # Parameters
     ///
     ///   - `shape`: [`StaticShape`] of the contiguous buffer that this [`ShardDescriptor`]'s [`Self::slice`] refers to.
-    ///     Must have the same rank as [`Self::slice`].
+    ///     Its rank must match [`Self::slice`], and each slice range must lie within its corresponding extent.
     ///
     /// # Errors
     ///
@@ -289,25 +299,31 @@ impl ShardDescriptor {
             return Err(Error::from(ArrayError::ShardSliceRankMismatch { shape_rank: shape.rank(), slice_rank: rank }));
         }
 
-        if rank == 0 {
-            return Ok((0, 1));
+        if self.slice.iter().any(Range::is_empty) {
+            return Ok((0, 0));
         }
 
-        let mut dimension = rank - 1;
-        let mut element_count = self.slice[dimension].len();
-        while dimension > 0 && self.slice[dimension].len() == shape[dimension] {
+        let mut dimension = rank;
+        let mut element_count = 1usize;
+        let mut covers_inner_extents = true;
+        for (slice, &extent) in self.slice.iter().zip(shape.as_slice()).rev() {
+            let length = slice.len();
+            if length > 1 && !covers_inner_extents {
+                break;
+            }
             dimension -= 1;
-            element_count =
-                element_count.checked_mul(self.slice[dimension].len()).ok_or_else(|| Error::SizeLimitExceeded {
-                    message: format!(
-                        "contiguous shard block element count for shard slice `{:?}` and shape `{}` exceeds the \
-                         maximum allowed size of {}",
-                        self.slice,
-                        shape,
-                        usize::MAX,
-                    ),
-                })?;
+            covers_inner_extents &= length == extent;
+            element_count = element_count.checked_mul(length).ok_or_else(|| Error::SizeLimitExceeded {
+                message: format!(
+                    "contiguous shard block element count for shard slice `{:?}` and shape `{}` exceeds the \
+                     maximum allowed size of {}",
+                    self.slice,
+                    shape,
+                    usize::MAX,
+                ),
+            })?;
         }
+
         Ok((dimension, element_count))
     }
 }
@@ -335,7 +351,7 @@ impl ShardLayout {
     ///
     /// # Parameters
     ///
-    ///   - `shape`: [`StaticShape`] of the [`Array`](crate::Array) being sharded.
+    ///   - `shape`: [`StaticShape`] of the [`Array`] being sharded.
     ///   - `mesh`: [`DeviceMesh`] whose row-major device order determines shard indices.
     ///   - `sharding`: Logical [`Sharding`] specification to apply to `shape`.
     pub fn new(shape: &StaticShape, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Self, Error> {
@@ -430,8 +446,8 @@ impl ShardLayout {
     }
 
     /// Returns the lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es. This is used when a
-    /// [`Buffer`] reports a [`DeviceId`] and the [`Array`](crate::Array) constructor needs to find the global shard
-    /// metadata that buffer should satisfy.
+    /// [`Buffer`] reports a [`DeviceId`] and the [`Array`] constructor needs to find the global shard metadata that
+    /// buffer should satisfy.
     #[inline]
     pub fn shard_index_by_device(&self) -> &HashMap<DeviceId, ShardIndex> {
         &self.shard_index_by_device
@@ -441,6 +457,102 @@ impl ShardLayout {
     #[inline]
     pub fn into_parts(self) -> (Vec<ShardDescriptor>, HashMap<DeviceId, ShardIndex>) {
         (self.descriptors, self.shard_index_by_device)
+    }
+}
+
+/// Identity of the contribution held by a shard. Replicas of a contribution share this identity and must hold the
+/// same bytes. This definition is shared by the functions that substitute one shard for another or decide that an
+/// array holds the same bytes along a mesh axis. Host readback reads one replica per contribution (refer to
+/// [`Array::copy_to_host_bytes`]), and partial imports require equal bytes for a contribution's replicas (refer to
+/// [`Array::from_addressable_buffers`] and [`Array::from_host_shards`]). Placements in [`crate::arrays::resharding`]
+/// use the same rules to find a local replica for a missing buffer, move shards or regions by slice (refer to
+/// [`Sharding::holds_one_value_per_slice`]) or by contribution, restrict an array to coordinate zero along the axes
+/// of an introduced sum (refer to [`Sharding::distinguishes_shards_along`]), and choose the process of a host round
+/// trip. A sharding makes the shards of one array differ in these ways:
+///
+///   - **Slice:** A dimension that is split along some mesh axes gives the devices at different coordinates along those
+///     axes different slices.
+///   - **Pending Reduction:** The devices at different coordinates along an unreduced axis hold different contributions
+///     to the pending reduction of one slice, such as different summands.
+///   - **Manual Variation:** The devices at different coordinates along a varying manual axis (refer to
+///     [`Sharding::varying_manual_axes`]) can hold different values of one slice. Along a varying axis that also splits
+///     a dimension, the slices already tell those devices apart, so the variation is only between tiles, while along
+///     any other varying axis it is within a tile.
+///
+/// Nothing else that a sharding records makes the shards differ: the devices along a reduced axis all hold the result
+/// of the completed reduction, the devices along an axis that neither splits a dimension nor carries reduction state or
+/// variation hold replicas, an unconstrained dimension is stored replicated, and the memory, the layout, and the data
+/// type are those of the whole array.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ShardContribution {
+    /// Slice of the shard in global array coordinates.
+    slice: Vec<Range<usize>>,
+
+    /// Ordinal of the contribution of the shard to the pending reduction of its slice, which is the row-major index
+    /// of the coordinates of its device along the unreduced axes of the sharding in mesh order (i.e., a mixed-radix
+    /// number whose digits are those coordinates), and zero without unreduced axes. The host readback combines the
+    /// contributions of one tile in ascending lexicographic order of those coordinates, which is the order of these
+    /// ordinals, so two placements with the same unreduced kind and the same number of contributions correspond by
+    /// ordinal, whatever the names, sizes, and order of their unreduced axes.
+    unreduced_ordinal: usize,
+
+    /// Coordinates of the device of the shard along the varying manual axes of the sharding, in mesh order unless
+    /// [`ShardContribution::ordered`] supplies other axes or another order.
+    varying_manual_coordinates: Vec<usize>,
+}
+
+impl ShardContribution {
+    /// Returns the contribution that `shard`, a shard of a placement on `mesh` with `sharding`, holds.
+    pub(super) fn new(mesh: &DeviceMesh, sharding: &Sharding, shard: &ShardDescriptor) -> Self {
+        let axes = mesh.logical_mesh().axes();
+        let along = |selected: &BTreeSet<String>| {
+            axes.iter().map(|axis| axis.name()).filter(|name| selected.contains(*name)).collect::<Vec<_>>()
+        };
+        Self::ordered(mesh, sharding, shard, &along(sharding.varying_manual_axes()))
+    }
+
+    /// Returns the contribution that `shard`, a shard of a placement on `mesh` with `sharding`, holds, with its
+    /// coordinates along the mesh axes named `varying_manual_axes` in the order of that list rather than in mesh order.
+    /// This lets the contributions of placements on two meshes whose varying manual axes correspond in another order
+    /// be compared.
+    pub(super) fn ordered<S: AsRef<str>>(
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        shard: &ShardDescriptor,
+        varying_manual_axes: &[S],
+    ) -> Self {
+        let coordinates = mesh.device_coordinates(shard.index()).unwrap_or_default();
+        let axes = mesh.logical_mesh().axes();
+        let unreduced_ordinal = axes
+            .iter()
+            .zip(&coordinates)
+            .filter(|(axis, _)| sharding.unreduced_axes().contains(axis.name()))
+            .fold(0, |ordinal, (axis, coordinate)| ordinal * axis.size() + coordinate);
+        let varying_manual_coordinates = varying_manual_axes
+            .iter()
+            .filter_map(|name| axes.iter().position(|axis| axis.name() == name.as_ref()))
+            .filter_map(|index| coordinates.get(index).copied())
+            .collect();
+        Self { slice: shard.slice().to_vec(), unreduced_ordinal, varying_manual_coordinates }
+    }
+
+    /// Returns which array of the sequence of arrays that the contributions of a placement form the shard belongs to
+    /// (i.e., its unreduced ordinal and its coordinates along the varying manual axes), which the shards with other
+    /// slices of the same array share.
+    pub(super) fn member(&self) -> (usize, &[usize]) {
+        (self.unreduced_ordinal, self.varying_manual_coordinates.as_slice())
+    }
+
+    /// Consumes this contribution and returns its slice, unreduced ordinal, and varying manual coordinates.
+    pub(super) fn into_parts(self) -> (Vec<Range<usize>>, usize, Vec<usize>) {
+        (self.slice, self.unreduced_ordinal, self.varying_manual_coordinates)
+    }
+}
+
+impl Array {
+    /// Returns the [`ShardContribution`] that identifies the contribution held by `shard` of this array.
+    pub(super) fn shard_contribution(&self, shard: &ShardDescriptor) -> ShardContribution {
+        ShardContribution::new(self.mesh(), self.sharding(), shard)
     }
 }
 
@@ -506,6 +618,19 @@ pub(super) fn validate_addressable_buffer(
         }));
     }
 
+    // The element kind of the buffer is validated before any query of its storage or dimensions, which only a
+    // buffer that holds an array can answer (the CPU plugin aborts when asked for the dimensions of a token buffer).
+    // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting a carrier back
+    // to a `DataType` would incorrectly relabel those logical arrays as Boolean. A buffer type without a `DataType`
+    // is rejected by that conversion, and a token buffer is rejected here, because effect tokens are not arrays.
+    let buffer_type = buffer.element_type()?;
+    let expected_buffer_type = r#type.data_type().executable_buffer_type();
+    let data_type =
+        if buffer_type == expected_buffer_type { r#type.data_type() } else { DataType::from_pjrt(buffer_type)? };
+    if data_type == DataType::Token {
+        return Err(Error::from(ArrayError::TokenArray));
+    }
+
     // A type's placement must describe the actual buffer, not merely relabel its storage. Device placement
     // means the plugin's default memory, whose kind is platform-dependent (e.g., CPU uses host memory).
     let buffer_memory = buffer.memory()?;
@@ -544,13 +669,7 @@ pub(super) fn validate_addressable_buffer(
         }
     }
 
-    // Validate the concrete buffer type against the physical representation of the logical shard type.
-    // Zero-space values and one-bit integers use predicate carriers in this execution path. Converting
-    // a carrier back to a `DataType` would incorrectly relabel those logical arrays as Boolean.
-    let buffer_type = buffer.element_type()?;
-    let expected_buffer_type = r#type.data_type().executable_buffer_type();
-    let data_type =
-        if buffer_type == expected_buffer_type { r#type.data_type() } else { DataType::from_pjrt(buffer_type)? };
+    // Validate the concrete buffer type and shape against the physical representation of the logical shard type.
     let shape = StaticShape::new(
         buffer
             .unpadded_dimensions()?
@@ -836,6 +955,16 @@ mod tests {
         // `slice[0].len() * slice[1].len()` elements.
         assert_eq!(descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4])).unwrap(), (0, 12));
 
+        let shape = StaticShape::new(vec![4, 6]);
+        let single_row = ShardDescriptor::new(0, device, vec![1..2, 2..5]);
+        assert_eq!(single_row.contiguous_inner_block(&shape).unwrap(), (0, 3));
+        let empty = ShardDescriptor::new(0, device, vec![1..1, 2..5]);
+        assert_eq!(empty.contiguous_inner_block(&shape).unwrap(), (0, 0));
+
+        // The singleton dimension joins the block without closing the gap between consecutive rows.
+        let separated = ShardDescriptor::new(0, device, vec![1..3, 0..1, 2..5]);
+        assert_eq!(separated.contiguous_inner_block(&StaticShape::new(vec![4, 1, 6])).unwrap(), (1, 3));
+
         // A shape whose rank does not match the descriptor's slice rank reports a rank mismatch error.
         let error = descriptor.contiguous_inner_block(&StaticShape::new(vec![8, 4, 2])).unwrap_err();
         assert!(matches!(
@@ -1104,6 +1233,17 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!("device {device_id} reports process index {process_index}, but expected {other_process_index}"),
+        );
+
+        // A token buffer holds no array, so it is rejected by its element type before anything asks for its
+        // dimensions, which the CPU plugin answers by aborting.
+        let descriptors = [ShardDescriptor::new(0, device, Vec::new())];
+        let token = client.buffer([0u8; 0].as_slice(), BufferType::Token, [], None, pjrt_device.clone(), None).unwrap();
+        assert_eq!(
+            validate_addressable_buffer(client, &r#type, &descriptors, &shard_index_by_device, &token, true)
+                .map_err(|error| error.to_string()),
+            Err("tokens are created by effectful operations and cannot be constructed, uploaded, or placed as arrays"
+                .to_string()),
         );
     }
 

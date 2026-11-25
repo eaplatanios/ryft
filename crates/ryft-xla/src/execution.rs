@@ -45,7 +45,7 @@ use crate::{
 
 /// Represents errors produced while invoking a [`CompiledProgram`], waiting for submitted work to finish, or
 /// recovering an effect scope.
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum ExecutionError {
     /// The executable belongs to a different live PJRT client.
     #[error("XLA executable belongs to a different PJRT client")]

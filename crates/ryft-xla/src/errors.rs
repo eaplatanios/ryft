@@ -2,6 +2,7 @@
 //! groups conditions owned by this crate (e.g., [`LoweringError`] and [`CompilationError`]), keeps foreign `ryft-core`,
 //! PJRT, and MLIR errors in their canonical carriers, and carries errors of typed extensions in [`Error::Custom`].
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use ryft_core::{
@@ -18,6 +19,10 @@ use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, Runtime
 /// Batching and differentiation errors first convert through [`ProgramError`], preserving the normalized core error.
 /// Core and array errors are boxed to keep this type compact. Converting either error allocates one box, and cloning
 /// the error clones its boxed value.
+///
+/// Note that errors compare and hash by value, except for [`Self::Io`] and [`Self::Custom`], whose payloads have no
+/// value equality and are compared by identity instead (i.e., two such errors are equal when they share one payload,
+/// as the clones of one error do).
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -73,6 +78,52 @@ impl Error {
             // Downcast the payload rather than the `Arc` that shares it.
             Self::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
             _ => None,
+        }
+    }
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Core(left), Self::Core(right)) => left == right,
+            (Self::Pjrt(left), Self::Pjrt(right)) => left == right,
+            (Self::Mlir(left), Self::Mlir(right)) => left == right,
+            (Self::Array(left), Self::Array(right)) => left == right,
+            (Self::Lowering(left), Self::Lowering(right)) => left == right,
+            (Self::Compilation(left), Self::Compilation(right)) => left == right,
+            (Self::Execution(left), Self::Execution(right)) => left == right,
+            (Self::Runtime(left), Self::Runtime(right)) => left == right,
+            (Self::Session(left), Self::Session(right)) => left == right,
+            (Self::Io(left), Self::Io(right)) => Arc::ptr_eq(left, right),
+            (Self::SizeLimitExceeded { message: left }, Self::SizeLimitExceeded { message: right }) => left == right,
+            (Self::Custom(left), Self::Custom(right)) => {
+                // Only the addresses are compared, because the same payload can be reached through
+                // different virtual tables.
+                std::ptr::addr_eq(Arc::as_ptr(left), Arc::as_ptr(right))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Error {}
+
+impl Hash for Error {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Core(error) => error.hash(state),
+            Self::Pjrt(error) => error.hash(state),
+            Self::Mlir(error) => error.hash(state),
+            Self::Array(error) => error.hash(state),
+            Self::Lowering(error) => error.hash(state),
+            Self::Compilation(error) => error.hash(state),
+            Self::Execution(error) => error.hash(state),
+            Self::Runtime(error) => error.hash(state),
+            Self::Session(error) => error.hash(state),
+            Self::Io(error) => Arc::as_ptr(error).hash(state),
+            Self::SizeLimitExceeded { message } => message.hash(state),
+            Self::Custom(error) => Arc::as_ptr(error).cast::<()>().hash(state),
         }
     }
 }
@@ -182,9 +233,50 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<Error> for ProgramError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Core(error) => match *error {
+                CoreError::Parameter(error) => error.into(),
+                CoreError::DataType(error) => Self::custom(error),
+                CoreError::Layout(error) => Self::custom(error),
+                CoreError::Broadcasting(error) => Self::custom(error),
+                CoreError::Sharding(error) => TypeError::from(error).into(),
+                CoreError::Axis(error) => error.into(),
+                CoreError::Type(error) => error.into(),
+                CoreError::Reference(error) => error.into(),
+                CoreError::Program(error) => error,
+                CoreError::Custom(error) => Self::Custom(error),
+            },
+            Error::Pjrt(error) => Self::custom(error),
+            Error::Mlir(error) => Self::custom(error),
+            Error::Array(error) => Self::custom(*error),
+            Error::Lowering(error) => Self::custom(error),
+            Error::Compilation(error) => Self::custom(error),
+            Error::Execution(error) => Self::custom(error),
+            Error::Runtime(error) => Self::custom(error),
+            Error::Session(error) => Self::custom(error),
+            error @ (Error::Io(_) | Error::Custom(_)) => {
+                // The payloads of these errors have no value equality, so they travel as the errors themselves,
+                // which compare by the identity of their payloads.
+                Self::custom(error)
+            }
+            Error::SizeLimitExceeded { message } => Self::custom(SizeLimitExceeded { message }),
+        }
+    }
+}
+
+/// Size-limit failure carried by [`ProgramError`].
+#[derive(Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[error("{message}")]
+struct SizeLimitExceeded {
+    message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StandardError;
+    use std::hash::DefaultHasher;
     use std::io;
 
     use pretty_assertions::assert_eq;
@@ -195,6 +287,44 @@ mod tests {
     fn test_error_size() {
         // Keep the shared carrier below Clippy's default large-error threshold.
         assert!(size_of::<Error>() < 128, "XLA error occupies {} bytes", size_of::<Error>());
+    }
+
+    #[test]
+    fn test_error_eq() {
+        fn hash(error: &Error) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            error.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // Errors with value equality compare and hash by value.
+        let array = Error::from(ArrayError::MissingDefaultDevice);
+        let execution = Error::from(ExecutionError::ClientMismatch);
+        assert_eq!(array, Error::from(ArrayError::MissingDefaultDevice));
+        assert_eq!(hash(&array), hash(&Error::from(ArrayError::MissingDefaultDevice)));
+        assert_eq!(execution, Error::from(ExecutionError::ClientMismatch));
+        assert_eq!(hash(&execution), hash(&Error::from(ExecutionError::ClientMismatch)));
+        assert_ne!(array, execution);
+        assert_ne!(
+            Error::from(ExecutionError::DonationFlagCountMismatch { expected_count: 1, actual_count: 2 }),
+            Error::from(ExecutionError::DonationFlagCountMismatch { expected_count: 1, actual_count: 3 }),
+        );
+        assert_eq!(
+            Error::SizeLimitExceeded { message: "too large".into() },
+            Error::SizeLimitExceeded { message: "too large".into() },
+        );
+
+        // I/O and custom payloads have no value equality, so those errors compare and hash by the identity of their
+        // payloads, which the clones of one error share.
+        let io = Error::from(io::Error::other("I/O failure"));
+        assert_eq!(io, io.clone());
+        assert_eq!(hash(&io), hash(&io.clone()));
+        assert_ne!(io, Error::from(io::Error::other("I/O failure")));
+        let custom = Error::custom(io::Error::other("extension failure"));
+        assert_eq!(custom, custom.clone());
+        assert_eq!(hash(&custom), hash(&custom.clone()));
+        assert_ne!(custom, Error::custom(io::Error::other("extension failure")));
+        assert_ne!(io, custom);
     }
 
     #[test]
@@ -316,6 +446,36 @@ mod tests {
                 ),
             ));
         }
+    }
+
+    #[test]
+    fn test_program_error_from_backend_errors() {
+        let compilation = CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 };
+        let error = ProgramError::from(Error::from(compilation.clone()));
+        assert_eq!(error.downcast_custom::<CompilationError>(), Some(&compilation));
+        assert_eq!(error, ProgramError::from(Error::from(compilation)));
+        assert_eq!(ProgramError::from(Error::from(ProgramError::PoisonedValue)), ProgramError::PoisonedValue);
+
+        let source = DimensionError::ExtentExceedsBackendWidth { value: 8, maximum: 7 };
+        let backend = ArrayError::InvalidShardDimension { shard_index: 3, dimension: 1, source: source.clone() };
+        let error = ProgramError::from(Error::from(backend.clone()));
+        assert_eq!(error.downcast_custom::<ArrayError>(), Some(&backend));
+        assert_eq!(error, ProgramError::from(Error::from(backend.clone())));
+        assert_eq!(error.to_string(), backend.to_string());
+        assert_eq!(error.source().unwrap().downcast_ref::<DimensionError>(), Some(&source));
+
+        let backend = ExecutionError::DonationFlagCountMismatch { expected_count: 1, actual_count: 2 };
+        let error = ProgramError::from(Error::from(backend.clone()));
+        assert_eq!(error.downcast_custom::<ExecutionError>(), Some(&backend));
+        assert_eq!(error, ProgramError::from(Error::from(backend.clone())));
+        assert_eq!(error.to_string(), backend.to_string());
+
+        let backend = Error::from(io::Error::other("I/O failure"));
+        let error = ProgramError::from(backend.clone());
+        assert_eq!(error.downcast_custom::<Error>(), Some(&backend));
+        assert_eq!(error.to_string(), "I/O failure");
+        assert_eq!(error, ProgramError::from(backend));
+        assert_ne!(error, ProgramError::from(Error::from(io::Error::other("I/O failure"))));
     }
 
     #[test]
