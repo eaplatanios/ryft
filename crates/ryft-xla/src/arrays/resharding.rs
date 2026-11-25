@@ -12315,7 +12315,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let runtime: &'static DistributedRuntime =
             Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 2, rank).unwrap()));
-        // One of the two clients names another process than the runtime has, which `DistributedRuntime::create_client`
+        // One of the two clients names another process than the runtime has, which `DistributedRuntime::new_client`
         // rejects, so both are created from the key-value store of the runtime directly.
         let client = |process_id| {
             let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(process_id) });

@@ -26,22 +26,18 @@ use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use half::{bf16, f16};
-
 use ryft_core::{
-    Array as CoreArray, ArrayElement, ArrayType, BatchingPolicy, BatchingTracer, CapturePlacement,
-    CapturePlacementContext, Complex, Context, Device, DeviceMesh, DifferentiationPolicy, DifferentiationTracer,
-    ImportingContext, LogicalMesh, Parameter, ParameterPath, Parameterized, ParameterizedFamily, PartialTracer,
-    PlaceDispatch, PlaceOperation, Placement, PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture,
-    ThroughParent, Tracer, Typed, UnreducedKind, Value as CoreValue, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
-    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
+    Array as CoreArray, ArrayType, BatchingPolicy, BatchingTracer, CapturePlacement, CapturePlacementContext, Context,
+    Device, DeviceMesh, DifferentiationPolicy, DifferentiationTracer, ImportingContext, LogicalMesh, Parameter,
+    ParameterPath, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placement,
+    PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture, ThroughParent, Tracer, Typed,
+    UnreducedKind, Value as CoreValue, f8e4m3fn,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Device as PjrtDevice, Error as PjrtError};
 
 use crate::arrays::host::{
-    ValueComparison, array_value_digest, combined_digest, dense_host_value_bytes, host_value_digest,
-    validate_host_value, validate_mesh_devices,
+    HostValue, ValueComparison, array_value_digest, combined_digest, dense_host_value_bytes, validate_mesh_devices,
 };
 use crate::arrays::resharding::devices_span_processes;
 use crate::arrays::shards::ArrayShard;
@@ -1707,109 +1703,6 @@ fn place_leaves<P: Placeable>(
         })
         .collect()
 }
-
-/// Host value that [`Session::place`] uploads as one dense array (i.e., a host array of the reference backend, or a
-/// scalar of any [`ArrayElement`] type, which is uploaded as a rank-0 array). This trait is the single list of
-/// uploadable host values. Every host value that implements it converts into [`PlaceInput`], and every one that is
-/// also a [`Parameter`] is a [`Placeable`] leaf on its own.
-trait HostValue {
-    /// Returns the element type and the static shape of the dense upload of this value as an [`ArrayType`] without a
-    /// sharding, a memory, or a layout, which is what the placement of this value checks before it is uploaded.
-    fn host_type(&self) -> ArrayType;
-
-    /// Returns this value as a host array of the reference backend.
-    fn into_host_array(self) -> CoreArray;
-
-    /// Returns the digest of the dense value of this value (refer to [`PlaceableParameter::process_value`]).
-    fn host_value_digest(&self) -> Option<[u32; 8]>;
-
-    /// Validates the host element encodings without hashing the value.
-    #[inline]
-    fn validate_host_value(&self) -> Result<(), Error> {
-        // Scalars already hold a valid instance of their element type.
-        Ok(())
-    }
-}
-
-impl HostValue for CoreArray {
-    #[inline]
-    fn host_type(&self) -> ArrayType {
-        // A host array holds materialized storage, which only a type with static extents can describe.
-        let r#type = self.r#type();
-        ArrayType::new_static(r#type.data_type(), r#type.static_shape().unwrap().as_slice().to_vec())
-    }
-
-    #[inline]
-    fn into_host_array(self) -> CoreArray {
-        self
-    }
-
-    #[inline]
-    fn host_value_digest(&self) -> Option<[u32; 8]> {
-        host_value_digest(self)
-    }
-
-    #[inline]
-    fn validate_host_value(&self) -> Result<(), Error> {
-        validate_host_value(self)
-    }
-}
-
-macro_rules! impl_host_value {
-    // Implements `HostValue` for the scalar `ArrayElement` type `$ty` as a rank-0 host array.
-    ($ty:ty) => {
-        impl HostValue for $ty {
-            #[inline]
-            fn host_type(&self) -> ArrayType {
-                ArrayType::scalar(<$ty as ArrayElement>::data_type())
-            }
-
-            #[inline]
-            fn into_host_array(self) -> CoreArray {
-                // A rank-0 array of an element type always has a valid shape and encoding.
-                CoreArray::scalar(self).unwrap()
-            }
-
-            #[inline]
-            fn host_value_digest(&self) -> Option<[u32; 8]> {
-                host_value_digest(&CoreArray::scalar(*self).ok()?)
-            }
-        }
-    };
-}
-
-impl_host_value!(bool);
-impl_host_value!(i1);
-impl_host_value!(i2);
-impl_host_value!(i4);
-impl_host_value!(i8);
-impl_host_value!(i16);
-impl_host_value!(i32);
-impl_host_value!(i64);
-impl_host_value!(u1);
-impl_host_value!(u2);
-impl_host_value!(u4);
-impl_host_value!(u8);
-impl_host_value!(u16);
-impl_host_value!(u32);
-impl_host_value!(u64);
-impl_host_value!(f4e2m1fn);
-impl_host_value!(f6e2m3fn);
-impl_host_value!(f6e3m2fn);
-impl_host_value!(f8e3m4);
-impl_host_value!(f8e4m3);
-impl_host_value!(f8e4m3fn);
-impl_host_value!(f8e4m3fnuz);
-impl_host_value!(f8e4m3b11fnuz);
-impl_host_value!(f8e5m2);
-impl_host_value!(f8e5m2fnuz);
-impl_host_value!(f8e8m0fnu);
-impl_host_value!(bf16);
-impl_host_value!(f16);
-impl_host_value!(f32);
-impl_host_value!(f64);
-impl_host_value!(Complex<f32>);
-impl_host_value!(Complex<f64>);
 
 /// Returns the common compilation trace that the host and concrete leaves join.
 fn placement_trace(parameters: &[PlaceInput<CompileTracer>]) -> Result<Option<&CompileTracer>, Error> {
