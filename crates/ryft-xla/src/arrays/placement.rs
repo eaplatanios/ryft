@@ -8724,7 +8724,7 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let runtime = Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 2, rank).unwrap()));
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(rank) });
-        let client: &'static Client<'static> = Box::leak(Box::new(runtime.create_client(&plugin, options).unwrap()));
+        let client: &'static Client<'static> = Box::leak(Box::new(runtime.new_client(&plugin, options).unwrap()));
         assert_eq!(client.devices().unwrap().len(), 1);
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let key = |rank| format!("ryft/test/placement/device/{rank}");

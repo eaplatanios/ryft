@@ -237,8 +237,8 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// warm, and [`SessionBuilder::disk_cache_from_env`] adds the one that the [`DiskCache::ENV_VAR`] environment variable
 /// configures, which sessions never read otherwise. [`SessionBuilder::compilation_cache`] supplies a whole context
 /// (e.g., one with a bounded in-memory tier or, for multi-process programs, one with an exchange from
-/// [`DistributedRuntime::compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange)).
-/// Refer to the documentation of [`CompilationCache`] for more information.
+/// [`DistributedRuntime::new_compilation_artifact_exchange`]). Refer to the documentation of [`CompilationCache`]
+/// for more information.
 ///
 /// # Effects and Completion
 ///
@@ -2677,9 +2677,8 @@ impl SessionBuilder {
 
     /// Supplies a [`Client`] that the caller created, which must live for the rest of the process (e.g., a leaked
     /// client or one that is stored in a static) and which several sessions may share. This is the extension point
-    /// for clients that the Ryft XLA backend cannot create (e.g., a client of a
-    /// [`DistributedRuntime`](crate::DistributedRuntime), whose runtime must
-    /// then live for the rest of the process as well).
+    /// for clients that the Ryft XLA backend cannot create (e.g., a client of a [`DistributedRuntime`], whose runtime
+    /// must then live for the rest of the process as well).
     #[inline]
     pub fn client(mut self, client: &'static Client<'static>) -> Self {
         self.client_source = ClientSource::Client(client);
@@ -2696,7 +2695,7 @@ impl SessionBuilder {
     ///     runtime, plugin, and options share it. A platform is required, because [`Platform::Auto`] can select
     ///     different platforms on different processes.
     ///   - **Client Options:** The options of that client name the process of `runtime` and, where they have one, its
-    ///     process count (refer to [`DistributedRuntime::create_client`]), so [`Self::client_options`] need not repeat
+    ///     process count (refer to [`DistributedRuntime::new_client`]), so [`Self::client_options`] need not repeat
     ///     them and must not contradict them.
     ///   - **Devices:** When the client does not list a device of every process (e.g., a CPU client, which lists only
     ///     its own devices), every process publishes its devices through `runtime` and the session learns those of
@@ -2708,7 +2707,7 @@ impl SessionBuilder {
     /// With [`Self::client`], the session uses the client of the caller, which must have been created through
     /// `runtime` for its process, and only the devices are taken from `runtime`. Sharing compiled programs between the
     /// processes remains a choice of [`Self::compilation_cache`], which takes the exchange of `runtime` (refer to
-    /// [`DistributedRuntime::compilation_artifact_exchange`]).
+    /// [`DistributedRuntime::new_compilation_artifact_exchange`]).
     ///
     /// # Errors
     ///

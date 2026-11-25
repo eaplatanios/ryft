@@ -14,8 +14,8 @@
 //!      [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime). The session then creates
 //!      its PJRT [`Client`] through the key-value store of the runtime, with the process coordinates of the runtime in
 //!      its client options, and it declares the devices of the other processes when the client does not list them.
-//!      [`DistributedRuntime::create_client`] creates such a client without a session.
-//!   3. **Shared Resources:** [`DistributedRuntime::compilation_artifact_exchange`] lets the processes share
+//!      [`DistributedRuntime::new_client`] creates such a client without a session.
+//!   3. **Shared Resources:** [`DistributedRuntime::new_compilation_artifact_exchange`] lets the processes share
 //!      compiled artifacts, so that one process compiles each program and the others receive its result.
 //!      [`DistributedRuntime::key_value_store`] serves other coordination protocols (e.g., the
 //!      kernel coordination of [`crate::kernels`]).
@@ -78,7 +78,7 @@ const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
 /// [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient) of its process, wrapped in a
 /// [`DistributedKeyValueStore`], and, on the coordinator only, the [`DistributedRuntimeService`] that hosts the
 /// coordination state of every process. Clones share that state, which is released when the last of them is dropped.
-/// A PJRT [`Client`] that [`Self::create_client`] returns borrows the key-value store of the handle, so the handle
+/// A PJRT [`Client`] that [`Self::new_client`] returns borrows the key-value store of the handle, so the handle
 /// must outlive it. [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime) takes care
 /// of that for the client of a [`Session`](crate::Session), which lives for the rest of the process.
 #[derive(Clone)]
@@ -239,6 +239,52 @@ impl DistributedRuntime {
         &self.state.key_value_store
     }
 
+    /// Creates a PJRT [`Client`] for `plugin` that uses the key-value store of this runtime, so that it takes part in
+    /// the cross-host transfers and collectives of the job. The client borrows this handle, which must outlive it.
+    /// `options` are completed with the process coordinates of this runtime where they leave them unset (i.e., the
+    /// `process_id` of [`ClientOptions::CPU`], and the `node_id` and `node_count` of [`ClientOptions::GPU`]). A
+    /// [`Session`](crate::Session) creates its client this way when it is built with
+    /// [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] with an invalid argument error if `options` name another process index or process
+    /// count than this runtime has, and with the error of the plugin if the client cannot be created.
+    #[inline]
+    pub fn new_client(&self, plugin: &Plugin, options: ClientOptions) -> Result<Client<'_>, Error> {
+        Ok(plugin.client_with_key_value_store(self.client_options(options)?, &self.state.key_value_store)?)
+    }
+
+    /// Creates a chunked, checksummed compilation artifact exchange over the key-value store of this runtime, for
+    /// [`CompilationCache::with_artifact_exchange`](ryft_core::CompilationCache::with_artifact_exchange). The exchange
+    /// takes its process index and process count from this runtime. The returned exchange keeps both the distributed
+    /// client and coordinator service alive. A manifest is published only after every bounded chunk, so followers never
+    /// accept a partially published artifact. Every record is addressed by the persistent compilation key, so processes
+    /// may compile programs in different orders, skip programs that their in-memory caches already hold, or compile
+    /// programs that no other process compiles (e.g., eager operations that only process zero runs). The records stay
+    /// in the memory of the coordinator for the rest of the launch.
+    ///
+    /// The leader of each compilation is the process that the compilation names, which for a
+    /// [`Session`](crate::Session) is the lowest index of the processes that own a device of the mesh of the program.
+    /// Before the leader compiles a program, [`CompilationArtifactExchange::validate_compatibility`] announces the
+    /// persistent compilation key and the process count without waiting for any other process. A follower that misses
+    /// its in-memory cache waits for that announcement before it waits for the artifact, and rejects a process count
+    /// that disagrees with its own. The XLA persistent key includes platform and plugin versions, compiler identity,
+    /// and logical topology, so a follower whose compatibility properties differ from those of its leader never
+    /// observes an announcement for its key. Its compatibility validation then times out, and the configured
+    /// exchange policy decides whether it compiles locally.
+    #[inline]
+    pub fn new_compilation_artifact_exchange(&self) -> Arc<dyn CompilationArtifactExchange> {
+        Arc::new(DistributedCompilationArtifactExchange {
+            runtime: Arc::clone(&self.state),
+            process_index: self.state.process_index,
+            process_count: self.state.process_count,
+            chunk_size: DEFAULT_ARTIFACT_CHUNK_SIZE,
+            maximum_artifact_size: DEFAULT_MAXIMUM_ARTIFACT_SIZE,
+            maximum_compatibility_key_size: DEFAULT_MAXIMUM_COMPATIBILITY_KEY_SIZE,
+        })
+    }
+
     /// Disconnects this process from the coordination service and, on the coordinator, stops the service. Disconnecting
     /// waits until every process of the job disconnects, for the shutdown timeout of the client options. Later calls on
     /// any handle of this runtime do nothing. Dropping the last handle shuts the runtime down as well, so this function
@@ -268,8 +314,6 @@ impl DistributedRuntime {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Reserves a key prefix in the key-value store of this runtime for one instance of the coordination protocol
     /// `protocol` (e.g., one coordinator of a protocol that keeps a round counter per coordinator). The prefix consists
     /// of `protocol`, the launch identity, and the number of prefixes that any handle of this runtime reserved for
@@ -286,56 +330,9 @@ impl DistributedRuntime {
         prefix
     }
 
-    /// Creates a chunked, checksummed compilation artifact exchange over the key-value store of this runtime, for
-    /// [`CompilationCache::with_artifact_exchange`](ryft_core::CompilationCache::with_artifact_exchange). The exchange
-    /// takes its process index and process count from this runtime.
-    ///
-    /// The returned exchange keeps both the distributed client and coordinator service alive. A manifest is published
-    /// only after every bounded chunk, so followers never accept a partially published artifact. Every record is
-    /// addressed by the persistent compilation key, so processes may compile programs in different orders, skip
-    /// programs that their in-memory caches already hold, or compile programs that no other process compiles (e.g.,
-    /// eager operations that only process zero runs). The records stay in the memory of the coordinator for the rest
-    /// of the launch.
-    ///
-    /// The leader of each compilation is the process that the compilation names (refer to
-    /// [`CompilationCacheDomain::artifact_exchange_leader`](ryft_core::CompilationCacheDomain::artifact_exchange_leader)),
-    /// which for a [`Session`](crate::Session) is the lowest index of the processes that own a device of the mesh of
-    /// the program. Before the leader compiles a program, [`CompilationArtifactExchange::validate_compatibility`]
-    /// announces the persistent compilation key and the process count without waiting for any other process. A
-    /// follower that misses its in-memory cache waits for that announcement before it waits for the artifact, and
-    /// rejects a process count that disagrees with its own. The XLA persistent key includes platform and plugin
-    /// versions, compiler identity, and logical topology, so a follower whose compatibility properties differ from
-    /// those of its leader never observes an announcement for its key. Its compatibility validation then times out,
-    /// and the configured exchange policy decides whether it compiles locally.
-    pub fn compilation_artifact_exchange(&self) -> Arc<dyn CompilationArtifactExchange> {
-        Arc::new(DistributedCompilationArtifactExchange {
-            runtime: Arc::clone(&self.state),
-            process_index: self.state.process_index,
-            process_count: self.state.process_count,
-            chunk_size: DEFAULT_ARTIFACT_CHUNK_SIZE,
-            maximum_artifact_size: DEFAULT_MAXIMUM_ARTIFACT_SIZE,
-            maximum_compatibility_key_size: DEFAULT_MAXIMUM_COMPATIBILITY_KEY_SIZE,
-        })
-    }
-
-    /// Creates a PJRT [`Client`] of `plugin` that uses the key-value store of this runtime, so that it takes part in
-    /// the cross-host transfers and collectives of the job. The client borrows this handle, which must outlive it.
-    /// `options` are completed with the process coordinates of this runtime where they leave them unset (i.e., the
-    /// `process_id` of [`ClientOptions::CPU`], and the `node_id` and `node_count` of [`ClientOptions::GPU`]). A
-    /// [`Session`](crate::Session) creates its client this way when it is built with
-    /// [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Pjrt`] with an invalid argument error if `options` name another process index or process
-    /// count than this runtime has, and with the error of the plugin if the client cannot be created.
-    pub fn create_client<'s>(&'s self, plugin: &Plugin, options: ClientOptions) -> Result<Client<'s>, Error> {
-        Ok(plugin.client_with_key_value_store(self.client_options(options)?, &self.state.key_value_store)?)
-    }
-
     /// Returns `options` with the process coordinates of this runtime, which are the `process_id` of
-    /// [`ClientOptions::CPU`] and the `node_id` and `node_count` of [`ClientOptions::GPU`], where `options` leave them
-    /// unset. A client that is created without them reports process 0 on every process. The unstructured
+    /// [`ClientOptions::CPU`] and the `node_id` and `node_count` of [`ClientOptions::GPU`], where `options` leave
+    /// them unset. A client that is created without them reports process 0 on every process. The unstructured
     /// [`ClientOptions::Other`] are returned as they are, because their keys belong to their plugin.
     ///
     /// # Errors
@@ -352,6 +349,7 @@ impl DistributedRuntime {
                 Ok(())
             }
         };
+
         match &mut options {
             ClientOptions::CPU(options) => complete("process_id", &mut options.process_id, self.process_index())?,
             ClientOptions::GPU(options) => {
@@ -360,6 +358,7 @@ impl DistributedRuntime {
             }
             ClientOptions::Other(_) => {}
         }
+
         Ok(options)
     }
 
@@ -376,9 +375,9 @@ impl DistributedRuntime {
     /// # Errors
     ///
     /// Returns [`Error::Pjrt`] with a failed precondition error if `client` does not use the key-value store of this
-    /// runtime, if it reports another process index than this runtime has (i.e., its options did not name its
-    /// process), or if this process already published other devices for this runtime, and with the error of the store
-    /// if another process does not publish its devices in time.
+    /// runtime, if it reports another process index than this runtime has (i.e., its options did not name its process),
+    /// or if this process already published other devices for this runtime, and with the error of the store if another
+    /// process does not publish its devices in time.
     pub(crate) fn remote_devices(&self, client: &Client<'_>) -> Result<Vec<Device>, Error> {
         let (process_index, process_count) = (self.process_index(), self.process_count());
         if !client.key_value_store().is_some_and(|store| std::ptr::addr_eq(store, &self.state.key_value_store)) {
@@ -388,6 +387,7 @@ impl DistributedRuntime {
             )
             .into());
         }
+
         let client_process_index = client.process_index()?;
         if client_process_index != process_index {
             return Err(ryft_pjrt::Error::failed_precondition(format!(
@@ -396,6 +396,7 @@ impl DistributedRuntime {
             ))
             .into());
         }
+
         let devices = client.devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
         let listed_processes = devices.iter().map(Device::process_index).collect::<BTreeSet<_>>();
         if (0..process_count).all(|process| listed_processes.contains(&process)) {
@@ -408,17 +409,20 @@ impl DistributedRuntime {
             key.extend_from_slice(format!("/{process}").as_bytes());
             key
         };
+
         let decode = |record: &[u8]| {
             serde_json::from_slice::<Vec<DeviceId>>(record).map_err(|error| {
                 ryft_pjrt::Error::invalid_argument(format!("failed to decode a published device inventory: {error}"))
             })
         };
+
         let store = &self.state.key_value_store;
         let local_devices = devices
             .iter()
             .filter(|device| device.process_index() == process_index)
             .map(Device::id)
             .collect::<Vec<_>>();
+
         // The store never overwrites a record, so a later session of this process finds the record of the first one.
         let record = serde_json::to_vec(&local_devices).unwrap();
         match store.put(&key(process_index), &record) {
@@ -443,9 +447,12 @@ impl DistributedRuntime {
             let record = store.get(&key(process), remaining)?;
             remote_devices.extend(decode(&record)?.into_iter().map(|device_id| Device::new(device_id, process)));
         }
+
         Ok(remote_devices)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Shared state of a [`DistributedRuntime`], retained by every clone of the runtime and by its artifact exchanges.
 struct DistributedRuntimeState {
@@ -981,7 +988,7 @@ pub(crate) mod tests {
         // keeps the coordination service alive.
         {
             let client = runtime
-                .create_client(
+                .new_client(
                     &plugin,
                     ClientOptions::GPU(GpuClientOptions {
                         platform: Some(GpuPlatform::CUDA),
@@ -1217,7 +1224,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_distributed_runtime_compilation_artifact_exchange() {
-        let exchange = single_process_runtime().compilation_artifact_exchange();
+        let exchange = single_process_runtime().new_compilation_artifact_exchange();
         assert_eq!((exchange.process_index(), exchange.process_count()), (0, 1));
         assert_eq!(exchange.validate_compatibility(b"key", 0, Duration::from_secs(1)), Ok(()));
         assert_eq!(exchange.publish(b"key", b"artifact"), Ok(()));
@@ -1229,7 +1236,7 @@ pub(crate) mod tests {
         // The client takes its process from the runtime and uses the key-value store of the runtime.
         let runtime = single_process_runtime();
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() });
-        let client = runtime.create_client(&load_cpu_plugin().unwrap(), options).unwrap();
+        let client = runtime.new_client(&load_cpu_plugin().unwrap(), options).unwrap();
         assert_eq!(client.process_index().unwrap(), 0);
         assert_eq!(client.addressable_devices().unwrap().len(), 1);
         assert!(client.key_value_store().is_some());
@@ -1277,7 +1284,7 @@ pub(crate) mod tests {
         let runtime = single_process_runtime();
         let plugin = load_cpu_plugin().unwrap();
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
-        let client = runtime.create_client(&plugin, options).unwrap();
+        let client = runtime.new_client(&plugin, options).unwrap();
         assert!(matches!(runtime.remote_devices(&client), Ok(devices) if devices.is_empty()));
 
         // A client that was created without the runtime takes no part in its job.
@@ -1639,7 +1646,7 @@ pub(crate) mod tests {
         };
         let plugin = load_cpu_plugin().unwrap();
         let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process_index).unwrap();
-        let exchange = runtime.compilation_artifact_exchange();
+        let exchange = runtime.new_compilation_artifact_exchange();
         assert_eq!((exchange.process_index(), exchange.process_count()), (process_index, 2));
         assert_eq!(exchange.validate_compatibility(b"multi-process-key", 0, Duration::from_secs(5)), Ok(()));
 

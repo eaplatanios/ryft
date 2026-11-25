@@ -262,7 +262,7 @@ pub(super) fn client_for_plugin(
             // The client borrows the key-value store of the runtime for the rest of the process, so a handle of the
             // runtime is never dropped, also when creating the client fails.
             let runtime: &'static DistributedRuntime = Box::leak(Box::new(runtime.clone()));
-            (Some(runtime), runtime.create_client(plugin, options.clone())?)
+            (Some(runtime), runtime.new_client(plugin, options.clone())?)
         }
         None => (None, plugin.client(options.clone())?),
     };

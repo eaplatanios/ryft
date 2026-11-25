@@ -6082,7 +6082,7 @@ pub(crate) mod tests {
             Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap()));
         let client: &'static Client<'static> = Box::leak(Box::new(
             runtime
-                .create_client(
+                .new_client(
                     &plugin,
                     ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
                 )

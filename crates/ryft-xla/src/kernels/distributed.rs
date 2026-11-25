@@ -6,7 +6,7 @@
 //! resharding, donation, or device submission, including restored executables and stateful calls.
 //!
 //! Compilation agreement already belongs to [`DistributedRuntime`]. Its
-//! [`compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange) compares ordered rounds,
+//! [`compilation_artifact_exchange`](crate::DistributedRuntime::new_compilation_artifact_exchange) compares ordered rounds,
 //! process counts, launch identity, and exact persistent compilation keys before exchanging checksummed artifacts.
 //! Kernel compiler, target, plugin, and topology identities participate in those keys. Artifact agreement does not
 //! establish collective completion and cannot authorize a cross-process launch.
