@@ -30,35 +30,55 @@ use crate::compilation::placements::{
 use crate::lowering::emissions::collect_session_constants;
 use crate::{Constant, Error, Program, Session, Tracer, Type};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
-/// traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the same
-/// values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
+/// traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the
+/// same values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 
-/// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`].
+/// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`]. The global input
+/// and output type trees describe the whole logical arrays at the function boundary. For example, a global array of
+/// shape `[8]` split evenly across two devices has shape `[4]` on each device.
 pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
     Input::Family: ParameterizedFamily<Constant>,
     Output::Family: ParameterizedFamily<Constant>,
 {
-    /// Global input types supplied to the traced function.
-    global_input_types: Input,
+    /// Global input type tree supplied to the traced function.
+    input_type: Input,
 
-    /// Global output types inferred by tracing the function.
-    global_output_types: Output,
+    /// Global output type tree inferred by tracing the function.
+    output_type: Output,
 
     /// Staged traced XLA program specialized to abstract array leaves.
     program: Program<Input::To<Constant>, Output::To<Constant>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedProgram<Input, Output>
 where
     Input::Family: ParameterizedFamily<Constant>,
     Output::Family: ParameterizedFamily<Constant>,
 {
+    /// Returns the global input type tree used to trace the function.
+    #[inline]
+    pub fn input_type(&self) -> &Input {
+        &self.input_type
+    }
+
+    /// Returns the global output type tree inferred by tracing the function.
+    #[inline]
+    pub fn output_type(&self) -> &Output {
+        &self.output_type
+    }
+
+    /// Returns the staged program that backs this handle.
+    #[inline]
+    pub fn program(&self) -> &Program<Input::To<Constant>, Output::To<Constant>> {
+        &self.program
+    }
+
     /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle. The
     /// statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
     /// [`Program::into_simplified`](ryft_core::Program::into_simplified)). Instructions that reach no program output
@@ -66,24 +86,9 @@ where
     /// regions (refer to [`Program::into_pruned`](ryft_core::Program::into_pruned)), which lowering applies, is not
     /// reflected in the counts. Refer to the documentation of [`Program::statistics`](ryft_core::Program::statistics)
     /// for the precise semantics of the reported statistics.
+    #[inline]
     pub fn statistics(&self) -> ProgramStatistics {
         self.program.statistics()
-    }
-
-    /// Returns the traced global input types.
-    pub fn global_input_types(&self) -> &Input {
-        &self.global_input_types
-    }
-
-    /// Returns the traced global output types.
-    pub fn global_output_types(&self) -> &Output {
-        &self.global_output_types
-    }
-
-    /// Returns the staged program that backs this handle.
-    #[cfg(test)]
-    pub(crate) fn program(&self) -> &Program<Input::To<Constant>, Output::To<Constant>> {
-        &self.program
     }
 
     /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature carries the
@@ -97,6 +102,7 @@ where
     /// # Errors
     ///
     /// Returns the errors of [`Self::to_mlir_module_with_signature_shardings`].
+    #[inline]
     pub fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
         self.to_mlir_module_with_signature_shardings(function_name, None, None)
     }
@@ -151,7 +157,7 @@ where
         let simplified_program = pruned_program(&self.program, None)?;
         let argument_shardings: Vec<_> = match argument_shardings {
             Some(shardings) => shardings.iter().cloned().map(Some).collect(),
-            None => self.global_input_types.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
+            None => self.input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
         };
         // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
         // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The export
@@ -166,7 +172,7 @@ where
             .iter()
             .flatten()
             .chain(result_shardings.into_iter().flatten())
-            .chain(self.global_output_types.parameters().filter_map(ArrayType::sharding))
+            .chain(self.output_type.parameters().filter_map(ArrayType::sharding))
             .map(Sharding::mesh)
             .next();
         if let Some(signature_mesh) = signature_mesh {
@@ -195,7 +201,7 @@ where
             .chain(argument_shardings.iter().map(Option::as_ref))
             .map(|sharding| sharding.map(entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
-        let output_types = self.global_output_types.parameters().cloned().collect::<Vec<_>>();
+        let output_types = self.output_type.parameters().cloned().collect::<Vec<_>>();
         let placements =
             entry_result_placements(&simplified_program, output_types.len(), |constant| constant.sharding().clone());
         let result_annotations =
@@ -204,8 +210,8 @@ where
         Ok(super::lowering::modules::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &capture_types,
-            &self.global_input_types,
-            &self.global_output_types,
+            &self.input_type,
+            &self.output_type,
             function_name,
             &argument_annotations,
             &result_annotations,
@@ -219,19 +225,20 @@ where
 ///
 /// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
 /// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
-/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s of
-/// `global_input_types`, and the traced program is simplified. Functions that need that context (e.g., to create values
+/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s with the global types in
+/// `input_type`, and the traced program is simplified. Functions that need that context (e.g., to create values
 /// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
 ///
 /// # Parameters
 ///
 ///   - `function`: Function to trace over global XLA values.
-///   - `global_input_types`: Global input array types passed to the traced function.
+///   - `input_type`: Global input type tree passed to the traced function.
 ///
 /// # Errors
 ///
 /// Returns the errors of [`trace_with_context`].
-pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedProgram<Input, Output>, Error>
+#[inline]
+pub fn trace<F, Input, Output>(function: F, input_type: Input) -> Result<TracedProgram<Input, Output>, Error>
 where
     Input: Parameterized<ArrayType>,
     Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
@@ -239,7 +246,7 @@ where
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     F: FnOnce(Input::To<ArrayTracer>) -> Output::To<ArrayTracer>,
 {
-    trace_with_context(|_, inputs| Ok(function(inputs)), global_input_types)
+    trace_with_context(|_, inputs| Ok(function(inputs)), input_type)
 }
 
 /// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
@@ -251,7 +258,7 @@ where
 /// # Parameters
 ///
 ///   - `function`: Function to trace over the tracing context and global XLA values.
-///   - `global_input_types`: Global input array types passed to the traced function. Use `()` for no inputs.
+///   - `input_type`: Global input type tree passed to the traced function. Use `()` for no inputs.
 ///
 /// # Errors
 ///
@@ -261,7 +268,7 @@ where
 /// restructured into `Input` or `Output`.
 pub fn trace_with_context<F, Input, Output>(
     function: F,
-    global_input_types: Input,
+    input_type: Input,
 ) -> Result<TracedProgram<Input, Output>, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -270,7 +277,7 @@ where
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
     F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
-    let input_structure = global_input_types.parameter_structure();
+    let input_structure = input_type.parameter_structure();
     let output_structure = RefCell::new(None);
     let (output_types, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
         |context, inputs: Vec<Tracer>| {
@@ -283,13 +290,13 @@ where
             output_structure.replace(Some(outputs.parameter_structure()));
             Ok(outputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
         },
-        global_input_types.parameters().cloned().map(Type::Array).collect::<Vec<_>>(),
+        input_type.parameters().cloned().map(Type::Array).collect::<Vec<_>>(),
         Vec::new(),
     )?;
     let output_structure = output_structure.into_inner().ok_or_else(|| {
         ProgramError::MalformedProgram("XLA tracing completed without recording its output structure".to_string())
     })?;
-    let global_output_types = Output::from_parameters(
+    let output_type = Output::from_parameters(
         output_structure.clone(),
         output_types
             .iter()
@@ -300,7 +307,7 @@ where
     let program = program
         .into_simplified()?
         .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
-    Ok(TracedProgram { global_input_types, global_output_types, program })
+    Ok(TracedProgram { input_type, output_type, program })
 }
 
 #[cfg(test)]
@@ -359,10 +366,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.global_input_types(),
+            traced.input_type(),
             &(ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [4])),
         );
-        assert_eq!(traced.global_output_types(), &ArrayType::new_static(DataType::F32, [4]));
+        assert_eq!(traced.output_type(), &ArrayType::new_static(DataType::F32, [4]));
         assert_eq!(
             traced.program.to_string(),
             indoc! {"
