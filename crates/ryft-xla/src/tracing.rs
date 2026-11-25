@@ -37,50 +37,48 @@ use crate::{Constant, Error, Program, Session, Tracer, Type};
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 
 /// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`]. The global input
-/// and output type trees describe the whole logical arrays at the function boundary. For example, a global array of
-/// shape `[8]` split evenly across two devices has shape `[4]` on each device.
+/// and output types describe the whole logical arrays at the function boundary. For example, a global array of shape
+/// `[8]` split evenly across two devices has shape `[4]` on each device.
 pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
     Input::Family: ParameterizedFamily<Constant>,
     Output::Family: ParameterizedFamily<Constant>,
 {
-    /// Global input type tree supplied to the traced function.
+    /// Global input types used to trace the function.
     input_type: Input,
 
-    /// Global output type tree inferred by tracing the function.
+    /// Global output types inferred by tracing the function.
     output_type: Output,
 
     /// Staged traced XLA program specialized to abstract array leaves.
     program: Program<Input::To<Constant>, Output::To<Constant>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedProgram<Input, Output>
 where
     Input::Family: ParameterizedFamily<Constant>,
     Output::Family: ParameterizedFamily<Constant>,
 {
-    /// Returns the global input type tree used to trace the function.
+    /// Returns the global input types used to trace the function.
     #[inline]
     pub fn input_type(&self) -> &Input {
         &self.input_type
     }
 
-    /// Returns the global output type tree inferred by tracing the function.
+    /// Returns the global output types inferred by tracing the function.
     #[inline]
     pub fn output_type(&self) -> &Output {
         &self.output_type
     }
 
-    /// Returns the staged program that backs this handle.
+    /// Returns the staged program that backs this [`TracedProgram`].
     #[inline]
     pub fn program(&self) -> &Program<Input::To<Constant>, Output::To<Constant>> {
         &self.program
     }
 
-    /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle. The
-    /// statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
+    /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle.
+    /// The statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
     /// [`Program::into_simplified`](ryft_core::Program::into_simplified)). Instructions that reach no program output
     /// are not counted unless they have observable effects, while the boundary pruning of operations with attached
     /// regions (refer to [`Program::into_pruned`](ryft_core::Program::into_pruned)), which lowering applies, is not
@@ -90,6 +88,8 @@ where
     pub fn statistics(&self) -> ProgramStatistics {
         self.program.statistics()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature carries the
     /// shardings of the global input and output types that have one (refer to
@@ -232,7 +232,7 @@ where
 /// # Parameters
 ///
 ///   - `function`: Function to trace over global XLA values.
-///   - `input_type`: Global input type tree passed to the traced function.
+///   - `input_type`: Global input types for the traced function.
 ///
 /// # Errors
 ///
@@ -258,7 +258,7 @@ where
 /// # Parameters
 ///
 ///   - `function`: Function to trace over the tracing context and global XLA values.
-///   - `input_type`: Global input type tree passed to the traced function. Use `()` for no inputs.
+///   - `input_type`: Global input types for the traced function. Use `()` for no inputs.
 ///
 /// # Errors
 ///
