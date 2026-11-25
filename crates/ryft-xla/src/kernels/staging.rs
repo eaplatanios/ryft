@@ -10,9 +10,9 @@ use ryft_core::{
     BatchableOperation, BatchingContext, BatchingDriver, BatchingError, CompositeJvpRule, CompositeOperation,
     ConstantOperation, Context, CotangentAccumulator, CustomCallOperation, CustomRuleSource, DeviceMesh,
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, DimensionVariable, Domain, EffectClass, Effects, GuardOperation, InputRegionProvenance,
-    Instruction, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-    MeshContext, NamedAxis, Operation as CoreOperation, OperationBoundaryPruning, OperationFoldOutput,
+    DifferentiationPolicy, DimensionVariable, Domain, EffectClass, Effects, FlatProgram, GuardOperation,
+    InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, MeshAxis,
+    MeshAxisType, MeshContext, NamedAxis, Operation as CoreOperation, OperationBoundaryPruning, OperationFoldOutput,
     OperationProvider, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder,
     ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
@@ -33,10 +33,10 @@ use crate::kernels::{
     CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, placed_custom_call, unbound_kernel_axis_message,
     validate_kernel_sharding,
 };
-use crate::lowering::emitted_regions;
+use crate::lowering::emissions::emitted_regions;
 use crate::{
-    Constant, Error, FlatProgram, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation,
-    Target, Type,
+    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation, Session, Target,
+    Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -872,7 +872,7 @@ where
 pub fn stage_kernel_with_jvp<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
-    jvp: &FlatProgram,
+    jvp: &FlatProgram<Session>,
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
@@ -894,8 +894,8 @@ where
 pub fn stage_kernel_with_vjp<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
-    forward: &FlatProgram,
-    backward: &FlatProgram,
+    forward: &FlatProgram<Session>,
+    backward: &FlatProgram<Session>,
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
@@ -943,7 +943,7 @@ where
 pub fn stage_kernel_with_fallback<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
-    fallback: &FlatProgram,
+    fallback: &FlatProgram<Session>,
     inputs: &[C::Value],
 ) -> Result<Vec<C::Value>, ProgramError>
 where
@@ -1356,10 +1356,10 @@ impl std::hash::Hash for KernelCompilerBinding {
 /// operation outside a selected call is rejected only in a region that lowering emits for the platform of the
 /// execution facts (refer to `emitted_regions`).
 pub(crate) fn select_kernels(
-    program: &FlatProgram,
+    program: &FlatProgram<Session>,
     binding: Option<&KernelCompilerBinding>,
     execution_facts: impl FnOnce() -> Result<KernelExecutionFacts, KernelEmbeddingError>,
-) -> Result<Option<FlatProgram>, KernelEmbeddingError> {
+) -> Result<Option<FlatProgram<Session>>, KernelEmbeddingError> {
     // A selected call owns its entire body. Do not separately select descendants that its compiler consumes.
     // Ordinary computation edges remain visible, and dormant rule edges are retained without being compiled.
     let mut executable_regions = HashMap::<_, BTreeMap<String, MeshAxis>>::new();
@@ -1506,7 +1506,7 @@ pub(crate) fn select_kernels(
 /// instructions at the region entrance. No runtime buffers, captures, or references become literal XLA values.
 fn stage_body<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
-) -> Result<FlatProgram, ProgramError> {
+) -> Result<FlatProgram<Session>, ProgramError> {
     let body = definition.body();
     let regions = body
         .regions()
@@ -1566,7 +1566,7 @@ fn input_types<V: Value<Type = Type>>(inputs: &[V]) -> Vec<Type> {
 fn kernel_program<Extension: PortableKernelExtension + Into<KernelExtension>>(
     definition: &KernelDefinition<Extension>,
     input_types: Vec<Type>,
-) -> Result<FlatProgram, ProgramError> {
+) -> Result<FlatProgram<Session>, ProgramError> {
     let mut builder = ProgramBuilder::new();
     let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
     let body = stage_body(definition)?;
@@ -1688,7 +1688,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::{Array, ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, ProgramBuilder, Session, Value};
+    use crate::{Array, ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, Session, Value};
 
     use super::*;
 
@@ -1820,15 +1820,15 @@ pub(crate) mod tests {
     }
 
     /// Builds the primal program of `definition` over its declared input types.
-    fn kernel_primal(definition: &KernelDefinition) -> Result<FlatProgram, ProgramError> {
+    fn kernel_primal(definition: &KernelDefinition) -> Result<FlatProgram<Session>, ProgramError> {
         kernel_program(definition, definition.operation().input_types())
     }
 
     /// Compiles scalar derivative programs through the existing XLA session and waits for concrete results.
-    fn execute_derivative(program: &FlatProgram, inputs: &[f32]) -> Vec<f32> {
+    fn execute_derivative(program: &FlatProgram<Session>, inputs: &[f32]) -> Vec<f32> {
         /// Keeps the traced input and output value lifetimes tied to the same execution client.
         fn replay(
-            program: &FlatProgram,
+            program: &FlatProgram<Session>,
             inputs: Vec<CompilationTracer<Session>>,
         ) -> Result<Vec<CompilationTracer<Session>>, crate::Error> {
             let context = inputs[0].context().clone();
@@ -1884,7 +1884,7 @@ pub(crate) mod tests {
     }
 
     /// Creates an ordinary XLA graph with a real attached scalar kernel body.
-    fn program() -> FlatProgram {
+    fn program() -> FlatProgram<Session> {
         let definition = crate::kernels::tests::definition();
         TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
@@ -1998,7 +1998,7 @@ pub(crate) mod tests {
     fn test_kernel_operation_partially_evaluate_inputs() {
         /// Region driver that exposes the staged body of one kernel call and supports no recursive partial evaluation.
         struct CallBodyDriver<'o> {
-            body: &'o FlatProgram,
+            body: &'o FlatProgram<Session>,
         }
 
         impl RegionDriver<Constant, Operation> for CallBodyDriver<'_> {
@@ -2260,7 +2260,7 @@ pub(crate) mod tests {
         definition: &KernelDefinition,
         sharding: Sharding,
         bound_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+    ) -> Result<(FlatProgram<Session>, Vec<Option<usize>>), BatchingError> {
         let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_sharding(sharding).unwrap();
         batch_packed(definition, packed, bound_axes)
     }
@@ -2271,7 +2271,7 @@ pub(crate) mod tests {
         definition: &KernelDefinition,
         sharding: Sharding,
         memory: Memory,
-    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+    ) -> Result<(FlatProgram<Session>, Vec<Option<usize>>), BatchingError> {
         let packed = ArrayType::new_static(DataType::F32, [3, 4]).with_memory(memory).with_sharding(sharding).unwrap();
         batch_packed(definition, packed, Vec::new())
     }
@@ -2283,7 +2283,7 @@ pub(crate) mod tests {
         definition: &KernelDefinition,
         packed: ArrayType,
         bound_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<(FlatProgram, Vec<Option<usize>>), BatchingError> {
+    ) -> Result<(FlatProgram<Session>, Vec<Option<usize>>), BatchingError> {
         let callees = [Arc::new(stage_body(definition).unwrap())];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
@@ -2868,7 +2868,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_jvp() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let primal = builder.add_input(scalar.clone());
         let tangent = builder.add_input(scalar.clone());
         let doubled = builder
@@ -2930,12 +2930,12 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_vjp() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut forward = ProgramBuilder::new();
+        let mut forward = ProgramBuilder::<Constant, Operation>::new();
         let input = forward.add_input(scalar.clone());
         let forward = forward
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut backward = ProgramBuilder::new();
+        let mut backward = ProgramBuilder::<Constant, Operation>::new();
         let cotangent = backward.add_input(scalar.clone());
         let doubled = backward
             .add_instruction(
@@ -3093,7 +3093,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_fallback() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar.clone());
         let fallback = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3147,7 +3147,7 @@ pub(crate) mod tests {
         // stages the fallback and its derivative rule for the placed type. The result has the type of the input.
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar);
         let fallback = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3176,7 +3176,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_fallback_rejects_changed_signature() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut fallback = ProgramBuilder::new();
+        let mut fallback = ProgramBuilder::<Constant, Operation>::new();
         let input = fallback.add_input(ArrayType::scalar(DataType::F64).into());
         let fallback = fallback
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3198,7 +3198,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_fallback_rejects_effectful_fallback() {
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
-        let mut fallback = ProgramBuilder::new();
+        let mut fallback = ProgramBuilder::<Constant, Operation>::new();
         let input = fallback.add_input(scalar.clone());
         let predicate = fallback
             .add_instruction(ConstantOperation::new(CoreArray::scalar(true).unwrap()), vec![], vec![], None)
@@ -3254,7 +3254,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(definition.effects().has_explicit_ordered_state());
-        let mut fallback = ProgramBuilder::new();
+        let mut fallback = ProgramBuilder::<Constant, Operation>::new();
         let input = fallback.add_input(scalar.clone());
         let fallback = fallback
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3303,7 +3303,7 @@ pub(crate) mod tests {
             body.add_instruction(operation, vec![], vec![reference, start, other], None).unwrap();
             let definition: KernelDefinition =
                 KernelDefinition::new(call, body.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
-            let mut fallback = ProgramBuilder::new();
+            let mut fallback = ProgramBuilder::<Constant, Operation>::new();
             let input = fallback.add_input(Type::Array(vector.clone()));
             let fallback = fallback
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3351,7 +3351,7 @@ pub(crate) mod tests {
             body.build(vec![], vec![Placeholder], vec![]).unwrap(),
         )
         .unwrap();
-        let mut fallback = ProgramBuilder::new();
+        let mut fallback = ProgramBuilder::<Constant, Operation>::new();
         let input = fallback.add_input(scalar.clone());
         let fallback = fallback
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3375,7 +3375,7 @@ pub(crate) mod tests {
     fn test_stage_kernel_with_fallback_rejects_mapping_assertions() {
         let definition = crate::kernels::tests::mapping_assertion_definition();
         let vector = definition.operation().input_types()[0].clone();
-        let mut fallback = ProgramBuilder::new();
+        let mut fallback = ProgramBuilder::<Constant, Operation>::new();
         let input = fallback.add_input(vector.clone());
         let fallback = fallback
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3432,7 +3432,7 @@ pub(crate) mod tests {
         .unwrap();
         let session = Session::builder().client(client).build().unwrap();
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut body = ProgramBuilder::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar.clone().into());
         let kernel = CustomCallOperation::new("ryft.test.kernel", vec![scalar.clone()])
@@ -3442,7 +3442,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let embeds_kernels = |length: usize| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let carry = builder.add_input(scalar.clone().into());
             let region = builder.import_region(body.entry_region_ref());
             let outputs = builder
@@ -3868,7 +3868,7 @@ pub(crate) mod tests {
                 ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], vec!["device".to_owned()]).unwrap(),
             )
             .unwrap();
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(global.into());
             let region = builder.import_region(body.entry_region_ref());
             let outputs = builder
@@ -3977,7 +3977,7 @@ pub(crate) mod tests {
                 "},
             ),
         ] {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar.clone());
             let body = builder.import_region(body.entry_region_ref());
             let outputs = builder.add_instruction(operation.clone(), vec![body], vec![input], None).unwrap().to_vec();
@@ -3993,7 +3993,7 @@ pub(crate) mod tests {
     fn test_select_kernels_preserves_condition_and_while_regions() {
         let body = kernel_primal(&differentiable_definition()).unwrap();
         let scalar = body.input_types()[0].clone();
-        let mut predicate = ProgramBuilder::new();
+        let mut predicate = ProgramBuilder::<Constant, Operation>::new();
         predicate.add_input(scalar.clone());
         let result = predicate
             .add_instruction(ConstantOperation::new(CoreArray::scalar(true).unwrap()), vec![], vec![], None)
@@ -4051,7 +4051,7 @@ pub(crate) mod tests {
                 "},
             ),
         ] {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar.clone());
             let body_region = builder.import_region(body.entry_region_ref());
             let (regions, inputs) = if operation.name() == "condition" {
@@ -4076,14 +4076,14 @@ pub(crate) mod tests {
     fn test_select_kernels_preserves_scan_region() {
         let primal = kernel_primal(&differentiable_definition()).unwrap();
         let scalar = primal.input_types()[0].clone();
-        let mut body = ProgramBuilder::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar.clone());
         let outputs = body.splice_program(&primal, &[carry]).unwrap();
         let body = body
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let carry = builder.add_input(scalar);
         let region = builder.import_region(body.entry_region_ref());
         let outputs = builder
@@ -4125,7 +4125,7 @@ pub(crate) mod tests {
             panic!("expected an array");
         };
         let reference_type = Type::Reference(ReferenceType::new(scalar));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(reference_type);
         let value = builder
             .add_instruction(
@@ -4176,7 +4176,7 @@ pub(crate) mod tests {
             panic!("expected an array");
         };
         let host = scalar.with_memory(Memory::Host { pinned: true });
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(Type::Array(host));
         let device = builder
             .add_instruction(TransferToMemoryOperation::new(Memory::Device), vec![], vec![input], None)
@@ -4219,7 +4219,7 @@ pub(crate) mod tests {
     fn test_select_kernels_rejects_unselected_kernel_operation() {
         let body = kernel_primal(&differentiable_definition()).unwrap();
         let scalar = body.input_types()[0].clone();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar.clone());
         let outputs = builder.splice_program(&body, &[input]).unwrap();
         let doubled = builder
@@ -4243,7 +4243,7 @@ pub(crate) mod tests {
 
         // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so the same
         // operation there remains, while it is rejected in the body of a scan that iterates.
-        let mut body = ProgramBuilder::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar.clone());
         let outputs = body.splice_program(&program, &[carry]).unwrap();
@@ -4251,7 +4251,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let scan = |length: usize| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let carry = builder.add_input(scalar.clone());
             let region = builder.import_region(body.entry_region_ref());
             let outputs = builder
@@ -4430,7 +4430,7 @@ pub(crate) mod tests {
     #[test]
     fn test_definition_from_body_rejects_unreconstructible_operations() {
         let definition = crate::kernels::tests::definition();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let output = builder
             .add_instruction(ArrayOperation::Add(AddOperation::<ArrayType>::new()), vec![], vec![input, input], None)

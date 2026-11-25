@@ -368,15 +368,16 @@ mod tests {
 
     use ryft_core::{
         ArrayType, CustomCallOperation, DataType, Device, DeviceMesh, EffectClass, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, Print, PrintOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Typed,
+        Placeholder, Print, PrintOperation, ProgramBuilder, ShardMapBoundary, ShardMapOperation, Sharding,
+        ShardingDimension, Typed,
     };
     use ryft_pjrt::{Buffer, BufferSpecification, BufferType, Client, EventPromise, ExecutionFence};
 
     use crate::sessions::tests::{f64_vector, two_device_mesh};
     use crate::tests::{cpu_client, values_to_bytes};
     use crate::{
-        Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, ProgramBuilder,
-        Session, ensure_print_handler_registered, with_captured_prints,
+        Array, Constant, Error, ExecutionError, FromPjrt, Operation, Options, PRINT_CUSTOM_CALL_TARGET, Session,
+        ensure_print_handler_registered, with_captured_prints,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -495,7 +496,7 @@ mod tests {
         let mesh = single_device_mesh(client);
         let session = Session::builder().client(client).build().unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
             .add_instruction(
@@ -762,7 +763,7 @@ mod tests {
         )
         .unwrap();
         let local_type = boundary.local_input_type(0, &r#type).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(local_type.clone().into());
         builder
             .add_instruction(
@@ -776,7 +777,7 @@ mod tests {
             .unwrap();
         let body = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let operation = ShardMapOperation::from_program(&body, vec![r#type.clone().into()], boundary).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(r#type.into());
         let body = builder.import_program(body);
         builder

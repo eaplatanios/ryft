@@ -21,8 +21,8 @@ use crate::compilation::domains::declared_input_sharding;
 use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::{ExecutionPlan, validate_input_reduction};
-use crate::lowering::LoweredModule;
-use crate::lowering::signature::ExecutableSignature;
+use crate::lowering::modules::LoweredModule;
+use crate::lowering::signatures::ExecutableSignature;
 use crate::{Array, Error, RetainedArray, RuntimeRequirement, Session, Target, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -1089,7 +1089,7 @@ mod tests {
     };
 
     use crate::compilation::functions::stage;
-    use crate::lowering::signature::ExecutableSignature;
+    use crate::lowering::signatures::ExecutableSignature;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{device_mesh_2x2, execution_client};
     use crate::{Error, Options, Session};

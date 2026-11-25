@@ -790,9 +790,9 @@ mod tests {
         CompilationTracer, Compile, CompiledFunction, CompiledFunctionDispatcher, Context, CustomCallOperation,
         DataType, Device, Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionType,
         DimensionValue, DimensionVariable, DynamicBroadcastOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        PartialEvaluationContext, PartialEvaluationValue, PartialTracer, Place, Placeholder, ReduceOperation,
-        ReductionKind, ReferenceType, Shape, Sharding, ShardingDimension, Sin, StaticShape, ValueProjection,
-        batch_in_parent, differentiate_in_parent_at,
+        PartialEvaluationContext, PartialEvaluationValue, PartialTracer, Place, Placeholder, ProgramBuilder,
+        ReduceOperation, ReductionKind, ReferenceType, Shape, Sharding, ShardingDimension, Sin, StaticShape,
+        ValueProjection, batch_in_parent, differentiate_in_parent_at,
     };
     use ryft_pjrt::protos::{CompilationOptions, DebugOptions, ExecutableCompilationOptions, OptionOverride};
     #[cfg(feature = "cuda-13")]
@@ -809,7 +809,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, hash_of, values_to_bytes};
     use crate::{
         Array, CompileTracer, Constant, CustomCallOperationExtension, Dimension, Error, FromPjrt, Operation,
-        ProgramBuilder, RuntimeRequirement, Session, Type, Value, compile, jit,
+        RuntimeRequirement, Session, Type, Value, compile, jit,
     };
 
     use super::*;
@@ -1229,7 +1229,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let lower = |requirements| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
                 .with_runtime_requirements(requirements)

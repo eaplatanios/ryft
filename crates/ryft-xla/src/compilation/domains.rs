@@ -13,10 +13,10 @@ use std::time::Instant;
 
 use ryft_core::{
     ArrayOperation, ArrayType, CapturePlacement, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh,
-    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram as CoreFlatProgram, LogicalMesh, Memory,
-    MeshAxisType, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized,
-    PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME,
-    Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
+    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, MeshAxisType,
+    Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation,
+    PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME, Sharding,
+    ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -27,20 +27,23 @@ use crate::arrays::host::validate_mesh_devices;
 use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
 use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
+use crate::compilation::placements::{
+    EntryResultPlacement, entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings,
+    has_placement_requests, pruned_program,
+};
 use crate::compilation::programs::{
     CompiledProgram, EagerDispatchProgram, LoweredProgram, OutputDeviceAssignment, ProgramLowering, RemoteEagerProgram,
     SessionConstantBinding,
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::admission::validate_data_dependent_compilation;
-use crate::lowering::signature::ExecutableSignature;
-use crate::lowering::{
-    EntryResultPlacement, collect_session_constants, contains_unresolved_references, contains_unresolved_state,
-    emitted_capture_reads, emitted_regions, entry_boundary_sharding, entry_open_results, entry_result_placements,
-    entry_result_shardings, has_placement_requests, omits_regions, pruned_program, unread_entry_arguments,
+use crate::lowering::emissions::{
+    collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
+use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
+use crate::lowering::signatures::ExecutableSignature;
 use crate::{
-    Array, Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
+    Array, Constant, Error, ExecutionError, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
     OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
 };
 
@@ -90,7 +93,12 @@ impl CompilationDomain for Session {
     // application of the call by a session reads, to run there (refer to `JitCallOperation::with_function_mesh`), and
     // which a call nested in a compiled caller never reads. Core constructs the call operation once for each staged
     // function.
-    fn call_operation(operation: Operation, callee: &FlatProgram, options: &Options, dispatched: bool) -> Operation {
+    fn call_operation(
+        operation: Operation,
+        callee: &FlatProgram<Session>,
+        options: &Options,
+        dispatched: bool,
+    ) -> Operation {
         match operation {
             Operation::JitCall(call) => {
                 // The lifted capture prefix of the callee precedes its inputs and has no overrides.
@@ -238,7 +246,7 @@ impl Session {
     /// (refer to [`commits_public_outputs`] and `lower_function_program`).
     pub(crate) fn lower_program(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         capture_count: usize,
         options: &Options,
     ) -> Result<LoweredProgram, Error> {
@@ -249,7 +257,7 @@ impl Session {
     /// outputs (refer to [`commits_public_outputs`]).
     fn lower_function_program(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         capture_count: usize,
         options: &Options,
         function: bool,
@@ -261,7 +269,7 @@ impl Session {
     /// Prepares the executable or remote result metadata for an eager application, deriving both from the same lowering.
     pub(crate) fn prepare_eager_program(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         options: &Options,
         session_constants: &[RetainedArray],
     ) -> Result<(EagerDispatchProgram, Vec<usize>), ProgramError> {
@@ -302,7 +310,7 @@ impl Session {
     /// is unavailable to the local client.
     fn lower_program_invocation(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         capture_count: usize,
         options: &Options,
         function: bool,
@@ -317,7 +325,7 @@ impl Session {
     /// Lowers `program` after dead instruction pruning.
     fn lower_pruned_program(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         capture_count: usize,
         options: &Options,
         function: bool,
@@ -391,7 +399,7 @@ impl Session {
     /// `lower_function_program` for `function`).
     fn lower_verified_reference_free_program(
         &self,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         capture_count: usize,
         output_count: usize,
         reference_states: &[ExternalReferenceBinding],
@@ -820,7 +828,7 @@ impl Session {
         let open_outputs = (0..output_shardings.len())
             .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
             .collect::<Vec<_>>();
-        let lowered_module = crate::lowering::lower_mlir_module_for_program_with_reference_state(
+        let lowered_module = crate::lowering::modules::lower_mlir_module_for_program_with_reference_state(
             program,
             effective_capture_types.as_slice(),
             &effective_public_input_types,
@@ -1444,7 +1452,7 @@ pub(crate) fn is_named_mesh(mesh: &LogicalMesh) -> bool {
 /// committed or not, as JAX ignores where the arrays that a `jit` function closes over live (refer to
 /// `JitCallOperation`).
 fn requests_placement(
-    program: &FlatProgram,
+    program: &FlatProgram<Session>,
     options: &Options,
     target_platform: Option<&str>,
     includes_memory_requests: bool,
@@ -1512,7 +1520,7 @@ fn validate_output_shardings(output_types: &[Type], options: &Options) -> Result
 /// allocation from the forwarded external reference. References returned by nested calls inside a program never cross
 /// that ABI, so only the outputs of the lowered program itself are checked.
 fn validate_reference_outputs(
-    program: &CoreFlatProgram<Session>,
+    program: &FlatProgram<Session>,
     capture_count: usize,
     output_types: &[Type],
 ) -> Result<(), Error> {
@@ -1662,7 +1670,7 @@ fn validate_even_sharding(
 /// a backend implementation of a named composite replaces for the target) are skipped, so that they cannot change how
 /// the rest of the program is compiled. First-class atoms of dimension type are ignored because they lower to ordinary
 /// scalars. Only dynamically shaped *array* types make the lowered module unacceptable to the Shardy partitioner.
-fn has_only_static_array_types(program: &FlatProgram, target_platform: Option<&str>) -> bool {
+fn has_only_static_array_types(program: &FlatProgram<Session>, target_platform: Option<&str>) -> bool {
     emitted_regions(program.entry_region_ref(), target_platform).all(|region| {
         region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
             Type::Array(array_type) => array_type.static_shape().is_some(),
@@ -1679,7 +1687,7 @@ fn has_only_static_array_types(program: &FlatProgram, target_platform: Option<&s
 /// not inside regions that lowering never reaches (refer to [`emitted_regions`]). The documentation of
 /// [`ShardMapOperation`](ryft_core::ShardMapOperation) requires `shard_map` boundaries to be static, so a `shard_map`
 /// can still appear in a program that is bounded dynamic elsewhere, which this predicate detects.
-fn contains_shard_map(program: &FlatProgram, target_platform: Option<&str>) -> bool {
+fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&str>) -> bool {
     emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
         region
             .instructions()
@@ -1742,7 +1750,7 @@ fn contains_shard_map(program: &FlatProgram, target_platform: Option<&str>) -> b
 /// [`Sharding::is_replicated`]), once its unconstrained dimensions are read as replicated (refer to
 /// [`entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has more than one device.
 fn validate_placements(
-    program: &FlatProgram,
+    program: &FlatProgram<Session>,
     mesh: &DeviceMesh,
     use_shardy_partitioner: bool,
     target_platform: Option<&str>,
@@ -1962,8 +1970,8 @@ mod tests {
         DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation,
         EagerInterpretationDriver, Error as CoreError, Exp, ImportingContext, InterpretableOperation, Layout,
         LinearCallOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation,
-        OneOperation, Operation as CoreOperation, Place, Placeholder, Placement, ProgramError, Provenance,
-        ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        OneOperation, Operation as CoreOperation, Place, Placeholder, Placement, ProgramBuilder, ProgramError,
+        Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
         ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
         Reshard, ScanOperation, ScanOptions, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
@@ -1986,9 +1994,9 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FlatProgram, FromPjrt,
-        JitCallOperation, Operation, Options, PlacementOptions, ProgramBuilder, RetainedArray, Session,
-        StatefulCompiledFunction, Type, Value, compile, compile_statefully_with_captures, jit_with_options,
+        Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FromPjrt, JitCallOperation,
+        Operation, Options, PlacementOptions, RetainedArray, Session, StatefulCompiledFunction, Type, Value, compile,
+        compile_statefully_with_captures, jit_with_options,
     };
 
     #[cfg(feature = "mps")]
@@ -2358,11 +2366,11 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let operation = CumulativeOperation::new(0, CumulativeKind::Sum);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
         let lowered = session.lower_program(&program, 0, &options).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
@@ -2411,11 +2419,11 @@ mod tests {
             Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()])
                 .unwrap();
         let target = Placement::new(mesh.clone(), open_sharding.clone()).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let output =
             builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // An output override with an unconstrained dimension is closed at the function boundary like the target of the
         // `place` that produces the output, because the runtime placement of the output reads that dimension as
@@ -2488,12 +2496,12 @@ mod tests {
             Sharding::new(logical_mesh, vec![ShardingDimension::replicated(), ShardingDimension::unconstrained()])
                 .unwrap();
         let target = Placement::new(mesh.clone(), open_sharding).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let placed =
             builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // The output type inherits the unconstrained dimension of the `place` target, but the output is not the result
         // of that `place`. Its annotation closes that dimension like the target of a `place` that produces an output,
@@ -2555,12 +2563,12 @@ mod tests {
             Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["r"])])
                 .unwrap();
         let target = Placement::new(mesh.clone(), target_sharding).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let placed =
             builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // An array placed with an unconstrained dimension stores that dimension replicated, so the argument that it
         // enters as is annotated with that dimension closed, whether its placement is an input override or the observed
@@ -2663,11 +2671,11 @@ mod tests {
         let mesh = domain_mesh(client, "x", 2);
         let input_type = ArrayType::new_static(DataType::Zero, [4]);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let output =
             builder.add_instruction(PlaceOperation::new(None, None), Vec::new(), vec![input], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // A `place` without a target returns its input where it is. A result of the zero data type has no buffer whose
         // placement the compiler could report, so it takes the placement that the input enters with.
@@ -2692,7 +2700,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let placing_callee = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
             let output =
@@ -2702,18 +2710,18 @@ mod tests {
                 .unwrap()
         };
         let forwarding_callee = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let placing_callee = builder.import_region(placing_callee.entry_region_ref());
         let forwarding_callee = builder.import_region(forwarding_callee.entry_region_ref());
         let replicated_input = builder.add_input(input_type.clone().into());
         let sharded_input = builder.add_input(input_type.clone().into());
-        let call = |builder: &mut ProgramBuilder, callee, input| {
+        let call = |builder: &mut ProgramBuilder<Constant, Operation>, callee, input| {
             builder
                 .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
                 .unwrap()[0]
@@ -2756,12 +2764,12 @@ mod tests {
         let replicated = Sharding::replicated(logical_mesh, 1);
         let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(unreduced).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(PlaceOperation::new(PlacementRequest::from(device), None), Vec::new(), vec![input], None)
             .unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // A device target completes the pending reduction of its input along `x`, which has one device, so its result
         // is placed and annotated as its type states rather than as the argument that it is computed from, and `exp`
@@ -2802,11 +2810,11 @@ mod tests {
             Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), Some(sharded.clone()), []).unwrap();
         let retained = RetainedArray::new(&array).with_declared_type(zero_type.clone());
         let callee = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let output = builder.add_constant(Constant::Session(retained.clone()));
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap()
         };
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let returned = builder.add_constant(Constant::Session(retained));
         let called = builder
@@ -2856,10 +2864,11 @@ mod tests {
         let array = Array::from_host_buffer(&session, r#type.clone(), None, None, 3f32.to_ne_bytes()).unwrap();
         let uncommitted = RetainedArray::new(&array).with_declared_type(r#type.clone());
         let committed = RetainedArray::new(&array.clone().with_committed(true)).with_declared_type(r#type);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_constant(Constant::Session(uncommitted.clone()));
         let second = builder.add_constant(Constant::Session(committed.clone()));
-        let program: FlatProgram = builder.build(vec![first, second], Vec::new(), vec![Placeholder; 2]).unwrap();
+        let program: FlatProgram<Session> =
+            builder.build(vec![first, second], Vec::new(), vec![Placeholder; 2]).unwrap();
 
         let lowered = session.lower_program(&program, 0, &Options::new(array.mesh().clone())).unwrap();
         let [first, second] = lowered.session_constants() else { panic!("expected two hidden arguments") };
@@ -2901,7 +2910,7 @@ mod tests {
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let build_program = |vector_type: &ArrayType, increment: usize| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let vector = builder.add_input(vector_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let size_operation = DimensionSizeOperation::new(vector_type, 0).unwrap();
@@ -3034,7 +3043,7 @@ mod tests {
 
         // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
         // beside it. Here the gateway makes the program bounded dynamic while the `shard_map` stays fully static.
-        let mut body_builder = ProgramBuilder::new();
+        let mut body_builder = ProgramBuilder::<Constant, Operation>::new();
         let local = body_builder.add_input(local_type.into());
         let doubled =
             body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![local, local], None).unwrap()[0];
@@ -3042,7 +3051,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let size = builder.add_input(size_type.into());
         let value = builder.add_input(value_type.into());
@@ -3087,9 +3096,9 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.into());
-        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let lower = |output_sharding: &Sharding| {
             let options = Options::new(mesh.clone())
                 .with_input_shardings(vec![replicated.clone()])
@@ -3134,13 +3143,13 @@ mod tests {
         // `callee_mesh`.
         let program = |callee_mesh: &DeviceMesh, sharding: &Sharding, extra_type: &ArrayType| {
             let callee = {
-                let mut builder = ProgramBuilder::new();
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                 let input = builder.add_input(vector_type.clone().into());
                 let callee =
                     builder.build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder]);
                 Arc::new(callee.unwrap())
             };
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let extra = builder.add_input(extra_type.clone().into());
             let callee_region = builder.intern_callee(&callee, None).unwrap();
@@ -3331,7 +3340,7 @@ mod tests {
         // the devices and the topology of another mesh neither fails the validation of placements nor contributes its
         // mesh to the module.
         let build_region = |place: bool| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let linear = builder.add_input(vector_type.clone().into());
             let output =
@@ -3346,7 +3355,7 @@ mod tests {
                 .unwrap()
         };
         let (forward, transpose) = (build_region(false), build_region(true));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let residual = builder.add_input(vector_type.clone().into());
@@ -3359,7 +3368,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program: FlatProgram =
+        let program: FlatProgram<Session> =
             builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
@@ -3381,7 +3390,7 @@ mod tests {
         let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
         let elsewhere = Device::new(1, 0);
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let target = PlacementRequest::from(elsewhere);
             let output =
@@ -3391,7 +3400,7 @@ mod tests {
         let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
         let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("placing").with_named_composite(named));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(vector_type.into());
         let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
         let regions = vec![builder.intern_callee(&body, None).unwrap()];
@@ -3520,14 +3529,14 @@ mod tests {
         let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
         let elsewhere = Device::new(1, 0);
         let program = |length: usize| {
-            let mut body = ProgramBuilder::new();
+            let mut body = ProgramBuilder::<Constant, Operation>::new();
             body.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = body.add_input(ArrayType::new_static(DataType::F32, [4]).into());
             let target = PlacementRequest::from(elsewhere);
             let placed =
                 body.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![slice], None).unwrap()[0];
-            let body: FlatProgram = body.build(vec![placed], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-            let mut builder = ProgramBuilder::new();
+            let body: FlatProgram<Session> = body.build(vec![placed], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let body = builder.import_program(body);
             let stack = builder.add_input(ArrayType::new_static(DataType::F32, [length, 4]).into());
             let scan = ScanOperation::<Type>::new(0, length);
@@ -3559,7 +3568,7 @@ mod tests {
         let value_type = ArrayType::scalar(DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let size = builder.add_input(size_type.clone().into());
             let value = builder.add_input(value_type.clone().into());
             let dimension = builder
@@ -3577,7 +3586,7 @@ mod tests {
         let named =
             NamedComposite::new(key, |types: &[Type]| Ok(vec![types[1].clone()]), |inputs| Ok(vec![inputs[1].clone()]));
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("broadcasting").with_named_composite(named));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.into());
         let value = builder.add_input(value_type.into());
         let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
@@ -3603,7 +3612,7 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
             let source_mesh = DeviceMesh::new(sharding.mesh().clone(), source_devices).unwrap();
             let source = Placement::new(source_mesh, sharding).unwrap();
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.into());
             let operation = PlaceOperation::new(None, source);
             let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -3866,7 +3875,7 @@ mod tests {
         // an output that the program does not use. It neither fails the validation of placements onto another device
         // nor commits the results, and the program agrees with the analysis of its placement requests.
         for returns_placement in [false, true] {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let placed = builder
                 .add_instruction(
@@ -3882,7 +3891,7 @@ mod tests {
             let branch = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; output_count])
                 .unwrap();
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let predicate = builder.add_input(predicate_type.clone().into());
             let true_region = builder.import_region(branch.entry_region_ref());
@@ -3895,7 +3904,8 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let program: FlatProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+            let program: FlatProgram<Session> =
+                builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
             assert!(!has_placement_requests(&program, None, true));
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             assert_eq!(lowered.committed_outputs(), [false]);
@@ -3923,7 +3933,7 @@ mod tests {
         // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so a bounded dynamic
         // broadcast and sum there leaves the Shardy partitioner enabled for the static split of the primal.
         let build_region = |dynamic: bool| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let linear = builder.add_input(vector_type.clone().into());
             let output =
@@ -3960,7 +3970,7 @@ mod tests {
                 .unwrap()
         };
         for dynamic in [false, true] {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let forward = builder.import_region(build_region(false).entry_region_ref());
             let transpose = builder.import_region(build_region(dynamic).entry_region_ref());
             let residual = builder.add_input(vector_type.clone().into());
@@ -3976,7 +3986,7 @@ mod tests {
             let output = builder
                 .add_instruction(PlaceOperation::new(target.clone(), None), Vec::new(), vec![output], None)
                 .unwrap()[0];
-            let program: FlatProgram =
+            let program: FlatProgram<Session> =
                 builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
@@ -4004,7 +4014,7 @@ mod tests {
 
         // The boundary of this program is fully static, but its interior derives a dynamic extent from a runtime
         // scalar, broadcasts to it, and reduces back to a scalar.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
         let dimension = builder
@@ -4047,7 +4057,7 @@ mod tests {
         // for Shardy and compiling it with the Shardy partitioner enabled fails on the internal dynamic tensor, even
         // though every boundary type is static.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let annotated = crate::lowering::lower_mlir_module_for_program(
+        let annotated = crate::lowering::modules::lower_mlir_module_for_program(
             &program,
             &[],
             &vec![size_type, value_type.clone()],
@@ -4080,7 +4090,7 @@ mod tests {
         // constraint, nor the mesh, nor the shardings of the signature, and it is compiled without the Shardy
         // partitioner. The plugin does not report the layouts of its executables either, so the input is passed to
         // the execution as it is.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(vector_type.clone().into());
         let constrained = builder
             .add_instruction(
@@ -4091,7 +4101,7 @@ mod tests {
             )
             .unwrap()[0];
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![constrained], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
         assert_eq!(executable_options.replica_count, 1);
@@ -4240,7 +4250,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.clone().into());
         let replacement = builder.add_input(scalar_type.clone().into());
         let reference =
@@ -4255,7 +4265,7 @@ mod tests {
             .unwrap();
         let final_value =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(
                 vec![snapshot, final_value],
                 vec![Placeholder; 2],
@@ -4327,7 +4337,7 @@ mod tests {
         .unwrap();
         let local_type = boundary.local_input_type(1, &device_type).unwrap();
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(ReferenceType::new(local_type.clone()).into());
             let update = builder.add_input(local_type.into());
             builder
@@ -4346,7 +4356,7 @@ mod tests {
         )
         .unwrap();
         let program = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let initial = builder.add_input(host_type.clone().into());
             let update = builder.add_input(device_type.clone().into());
             let reference =
@@ -4408,7 +4418,7 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
         let output = builder
             .add_instruction(SliceOperation::new(vec![1], vec![3]), Vec::new(), vec![input], None)
@@ -4441,7 +4451,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
@@ -4558,7 +4568,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = replicated_vector_type(&mesh, 4);
         let pair_type = replicated_vector_type(&mesh, 2);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(pair_type.into());
         let reference =
@@ -4574,7 +4584,7 @@ mod tests {
             .unwrap();
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
@@ -4596,7 +4606,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = replicated_vector_type(&mesh, 3);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
@@ -4693,14 +4703,14 @@ mod tests {
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
 
         let branch = || {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let capture =
                 builder.add_constant(Constant::Captured(CaptureReference::new(0, scalar_type.clone().into())));
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![capture], Vec::new(), vec![Placeholder]).unwrap()
         };
         let true_branch = branch();
         let false_branch = branch();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         builder.add_input(scalar_type.clone().into());
         let predicate = builder.add_input(predicate_type.into());
         let true_region = builder.import_region(true_branch.entry_region_ref());
@@ -4726,7 +4736,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.into());
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -4815,7 +4825,7 @@ mod tests {
         )
         .unwrap();
         let retained = RetainedArray::new(&array);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let output = builder.add_constant(Constant::Session(retained.clone()));
         let program =
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
@@ -4848,7 +4858,7 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type.clone());
 
         let true_branch = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone().into());
             let replacement = builder.add_input(scalar_type.clone().into());
             let snapshot = builder
@@ -4859,7 +4869,7 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.into());
             builder.add_input(scalar_type.clone().into());
             let snapshot =
@@ -4869,7 +4879,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let true_branch = builder.import_region(true_branch.entry_region_ref());
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
@@ -4957,7 +4967,7 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type.clone());
 
         let condition = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone().into());
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
             let predicate =
@@ -4969,7 +4979,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.into());
             let update = builder
                 .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
@@ -4982,7 +4992,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
@@ -5014,7 +5024,7 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type.clone());
 
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let reference = builder.add_input(reference_type.into());
             let update = builder
@@ -5034,7 +5044,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let reference =
@@ -5076,7 +5086,7 @@ mod tests {
         let length = DimensionValue::new(DimensionType::from(length_variable.clone()), 3).unwrap();
 
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let reference = builder.add_input(reference_type.into());
             let update = builder
@@ -5094,7 +5104,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let reference =
@@ -5144,7 +5154,7 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type.clone());
 
         let callee = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.into());
             let update = builder.add_input(scalar_type.clone().into());
             builder
@@ -5155,7 +5165,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
@@ -5191,10 +5201,10 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
@@ -5223,11 +5233,8 @@ mod tests {
         let input_type = replicated_scalar_type(&mesh, DataType::F64);
 
         // Builds `-(x * x)` with the multiplication carrying the provided provenance.
-        fn build_program(
-            input_type: &ArrayType,
-            provenance: Provenance,
-        ) -> crate::operations::Program<Vec<Constant>, Vec<Constant>> {
-            let mut builder = ProgramBuilder::new();
+        fn build_program(input_type: &ArrayType, provenance: Provenance) -> FlatProgram<Session> {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let product = builder
                 .add_instruction(MulOperation::new(), Vec::new(), vec![input, input], Some(provenance))
@@ -5309,7 +5316,7 @@ mod tests {
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let reference_type = ReferenceType::new(vector_type.clone());
         let true_branch = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone().into());
             let update =
                 builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new(), None).unwrap()[0];
@@ -5329,14 +5336,14 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.into());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let true_branch = builder.import_region(true_branch.entry_region_ref());
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
@@ -5421,12 +5428,12 @@ mod tests {
         let target_sharding = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["e"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::I32, [4]).with_sharding(replicated.clone()).unwrap();
         let target = Placement::new(mesh.clone(), target_sharding).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let placed =
             builder.add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![input], None).unwrap()[0];
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
         // The output is left open over the auto axis `a`, and the compiler reports its placement without the explicit
         // axis `e` of size one that the output type records, because that axis does not change how the output is
@@ -5563,10 +5570,10 @@ mod tests {
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let along_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let along_y = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let lower = |options: Options| session.lower_program(&program, 0, &options).unwrap();
 
         // Output types do not record placements along auto axes, so executables that place an output along `x` and
@@ -6334,12 +6341,13 @@ mod tests {
 
         // Compiled constants have separate hidden slots even when both captures share the same placed buffer.
         let execute = |target: DeviceMesh, captures: &[RetainedArray]| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let outputs = captures
                 .iter()
                 .map(|capture| builder.add_constant(Constant::Session(capture.clone())))
                 .collect::<Vec<_>>();
-            let program: FlatProgram = builder.build(outputs, Vec::new(), vec![Placeholder; captures.len()]).unwrap();
+            let program: FlatProgram<Session> =
+                builder.build(outputs, Vec::new(), vec![Placeholder; captures.len()]).unwrap();
             let lowered = session.lower_program(&program, 0, &Options::new(target)).unwrap();
             assert_eq!(lowered.session_constants().len(), captures.len());
             let (program, captures) = CompilationDomain::compile(&session, &lowered).unwrap();
@@ -6403,9 +6411,9 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let (device_id, process_index) = (local.id(), local.process_index());
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let mesh = |device: Device| {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("q", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
             DeviceMesh::new(logical_mesh, vec![device]).unwrap()

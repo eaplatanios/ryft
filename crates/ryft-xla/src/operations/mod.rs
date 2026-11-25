@@ -3,11 +3,11 @@
 //! [`Operation`] is the universe of staged operations that the XLA backend owns. It flattens the core array operation
 //! payloads of [`ArrayIrOperation`] into one family, together with backend operations such as
 //! [`jit_call`](JitCallOperation) and portable kernel instructions, so that the regions of higher-order instructions
-//! can contain backend operations. [`Program`], [`ProgramBuilder`], and [`FlatProgram`] specialize the core program
-//! types to this family. Each submodule implements [`LowerableOperation`] for one group of
-//! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
-//! that those lowerings share.
+//! can contain backend operations. Each submodule implements [`LowerableOperation`] for one group of operations, and
+//! this module also provides the elementwise operand normalization and the result accuracy conversion that those
+//! lowerings share.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use ryft_core::macros::check_count;
@@ -29,16 +29,16 @@ use ryft_core::{
     Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    PlaceOperation, PowOperation, PrintOperation, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder,
-    ProgramError, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
-    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    PlaceOperation, PowOperation, PrintOperation, ProgramError, RaggedDotOperation, RealOperation, ReduceOperation,
+    ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionRef, RemOperation, RematerializeOperation, ReshapeOperation,
-    ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardMapOperation, SignOperation,
-    SinOperation, SliceOperation, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, UnavailableCustomRules,
-    UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, Region as CoreRegion, RegionRef, RemOperation,
+    RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
+    RsqrtOperation, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation,
+    ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortOperation, SqrtOperation,
+    StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation,
+    Transform, TransformArtifact, TransposeOperation, UnavailableCustomRules, UpdateSliceOperation, Value,
+    ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_mlir::dialects::stable_hlo;
@@ -48,8 +48,9 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::emissions::emitted_capture_reads;
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
-use crate::lowering::{MlirLowerableValue, unread_lifted_captures, validate_local_output_placement};
+use crate::lowering::{MlirLowerableValue, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::lower_layout_constraint;
 use crate::{
@@ -837,16 +838,47 @@ impl LowerableOperation for Operation {
     }
 }
 
-/// Staged XLA program over an operation family `O`, which defaults to the universe of XLA operations that the backend
-/// owns.
-pub type Program<Input, Output, O = Operation> = CoreProgram<Constant, O, Input, Output>;
+/// [`Transform`] marker under which [`unread_lifted_captures`] retains its result with a callee, for the number of
+/// lifted captures and the target platform that its arguments name. The region-owned cache only retains owned
+/// arguments, so the name of the platform is held as a [`String`].
+struct UnreadLiftedCapturesAnalysis;
 
-/// Program builder specialized to the universe of XLA operations that the backend owns.
-pub type ProgramBuilder = CoreProgramBuilder<Constant, Operation>;
+impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis {
+    type Arguments = (usize, Option<String>);
+    type Artifact = TransformArtifact<Constant, Operation, Option<Arc<[bool]>>>;
 
-/// Flat XLA program over an operation family `O`, which defaults to the universe of XLA operations that the backend
-/// owns, used for materialized regions and shared callees.
-pub type FlatProgram<O = Operation> = Program<Vec<Constant>, Vec<Constant>, O>;
+    const DEFAULT_CACHE_CAPACITY: usize = 1;
+}
+
+/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
+/// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
+/// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
+/// `lower_mlir_module_for_program_with_effect_boundary`), or [`None`] when the callee has no such capture. An eager
+/// application of the call (refer to `JitCallOperation::eager_decision`) requires nothing of such a capture, as an
+/// execution of the callee requires nothing of it. The flags depend on the callee, the number of its captures, and the
+/// platform alone, so they are derived once for each of them and retained with the callee, and repeated applications
+/// only look them up.
+pub(crate) fn unread_lifted_captures(
+    callee: RegionRef<'_, Constant, Operation>,
+    capture_count: usize,
+    target_platform: Option<&str>,
+) -> Option<Arc<[bool]>> {
+    let derive = |callee: RegionRef<'_, Constant, Operation>| -> Result<_, Infallible> {
+        let is_read = emitted_capture_reads(callee, capture_count, true, target_platform);
+        let input_types = callee.interface().input_types();
+        let mut unread = vec![false; input_types.len()];
+        for (index, is_read) in is_read.into_iter().enumerate() {
+            unread[index] = !is_read
+                && matches!(input_types.get(index), Some(Type::Array(r#type)) if r#type.static_shape().is_some());
+        }
+        let unread = unread.contains(&true).then(|| Arc::from(unread));
+        Ok(TransformArtifact::new(Vec::new(), unread))
+    };
+    let arguments = (capture_count, target_platform.map(str::to_owned));
+    let Ok(artifact) =
+        callee.transform::<UnreadLiftedCapturesAnalysis, _, Infallible>(arguments, |callee, _| derive(callee));
+    artifact.metadata().clone()
+}
 
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
 pub(crate) fn normalize_elementwise_operand<'b, 'c: 'b, 't: 'c, B, L>(
@@ -996,8 +1028,8 @@ mod tests {
         DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionOperations, DimensionType,
         DimensionValue, DimensionVariable, DivOperation, DomainTracingContext, DotsSavable,
         DotsWithNoBatchDimensionsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver,
-        ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, LiftedCustomRules, Log, MaybeZero, Memory,
-        MulOperation, NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation,
+        ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, FlatProgram, LiftedCustomRules, Log,
+        MaybeZero, Memory, MulOperation, NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation,
         OperationPayloadProjection, OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder,
         ProgramError, ReductionKind, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
         ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
@@ -1174,7 +1206,7 @@ mod tests {
         ));
 
         let context = TracingContext::<Constant, Operation>::new();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(dimension_type.clone().into());
         let predicate = builder
             .add_instruction(
@@ -1283,7 +1315,7 @@ mod tests {
         // dispatcher, so a flat backend program rewrites into explicit immutable state with its external root
         // entering at its own boundary position and publishing its final state as one hidden output.
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let external = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let initial = builder.add_input(Type::Array(scalar_type.clone()));
         let update = builder.add_input(Type::Array(scalar_type));
@@ -1309,7 +1341,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let source: Program<Vec<Constant>, Vec<Constant>> =
+        let source: FlatProgram<Session> =
             builder.build(vec![previous], vec![Placeholder; 3], vec![Placeholder]).unwrap();
 
         let discharged = source.discharge_references(0).unwrap();
@@ -1488,12 +1520,12 @@ mod tests {
             Operation::LiftedComposite(operation)
                 if matches!(operation.rules(), Some(LiftedCustomRules::Unavailable(_))),
         ));
-        let mut primal = ProgramBuilder::new();
+        let mut primal = CoreProgramBuilder::<Constant, Operation>::new();
         let input = primal.add_input(scalar_type.clone().into());
         let primal = primal
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let primal = builder.import_program(primal);
         let input = builder.add_input(scalar_type.into());
         let output = builder.add_instruction(promoted, vec![primal], vec![input], None).unwrap()[0];
@@ -1515,7 +1547,7 @@ mod tests {
         // recompute the multiplication.
         let scalar_type = Type::from(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
             let squared =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -1602,7 +1634,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         builder.add_input(dynamic_type.into());
         let scalar = builder.add_input(scalar_type.into());
         let program = builder
@@ -1699,7 +1731,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let branch = || {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let extent = builder.add_input(extent_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let output = builder
@@ -1712,7 +1744,7 @@ mod tests {
 
         let integer_type = ArrayType::scalar(DataType::I32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let mut source_builder = ProgramBuilder::new();
+        let mut source_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let true_region = source_builder.import_region(branch().entry_region_ref());
         let false_region = source_builder.import_region(branch().entry_region_ref());
         let integer = source_builder.add_input(integer_type.clone().into());
@@ -1743,7 +1775,7 @@ mod tests {
             std::slice::from_ref(extent_type.variable().unwrap())
         );
 
-        let mut destination = ProgramBuilder::new();
+        let mut destination = CoreProgramBuilder::<Constant, Operation>::new();
         let integer = destination.add_input(integer_type.into());
         let predicate = destination.add_input(predicate_type.into());
         let scalar = destination.add_input(scalar_type.into());

@@ -7,7 +7,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::CollectiveLoweringState;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -242,14 +242,14 @@ pub(crate) mod tests {
     use ryft_core::{
         Batch, BatchAxis, BatchAxisSpecification, ConditionOperation, Context, DataType, Device, DeviceMesh,
         Differentiate, Dimension, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation,
-        ParallelReduce, Placeholder, Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
-        StagingContext, Typed, Value, ValueProjection, shard_map,
+        ParallelReduce, Placeholder, ProgramBuilder, Reduce, Shape, ShardMapBoundary, ShardMapOptions, Sharding,
+        ShardingDimension, StagingContext, Typed, Value, ValueProjection, shard_map,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, Program};
 
     use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh, test_vector_type};
-    use crate::operations::{Operation, ProgramBuilder};
+    use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, Session, TracedProgram, Type, trace};
 
@@ -753,7 +753,7 @@ pub(crate) mod tests {
                         |local_x: ArrayTracer| {
                             let local_type = local_x.r#type().into_owned();
                             let parallel_sum_branch = {
-                                let mut builder = ProgramBuilder::new();
+                                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                                 let input = builder.add_input(Type::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
@@ -766,7 +766,7 @@ pub(crate) mod tests {
                                 builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
                             let identity_branch = {
-                                let mut builder = ProgramBuilder::new();
+                                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                                 let input = builder.add_input(Type::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };

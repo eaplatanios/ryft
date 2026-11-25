@@ -2156,11 +2156,11 @@ mod tests {
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation, CompilationCacheDomain,
         CompiledFunction, ConstrainSharding, Context, ConvertElementTypeOperation, DataType, Device, DeviceMesh,
         Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable,
-        DynamicSliceOperation, EffectClass, Error as CoreError, LogicalMesh, LoweredFunction, Memory, MeshAxis,
-        MeshAxisType, Place, Placeholder, Placement, Print, PrintOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError, Sin, StagedFunction,
-        StaticShape, TiledLayout, Typed,
+        DynamicSliceOperation, EffectClass, Error as CoreError, FlatProgram, LogicalMesh, LoweredFunction, Memory,
+        MeshAxis, MeshAxisType, Place, Placeholder, Placement, Print, PrintOperation, ProgramBuilder, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
+        Sin, StagedFunction, StaticShape, TiledLayout, Typed,
     };
     use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::Shape as ShapeProto;
@@ -2176,10 +2176,9 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, CompileTracer, Constant, Error, ExecutionError, FlatProgram, Options, PRINT_CUSTOM_CALL_TARGET,
-        Platform, ProgramBuilder, Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions,
-        RuntimeProvider, Session, ToMlir, Type, Value, compile_statefully, compile_statefully_with_captures,
-        compile_with_captures, with_captured_prints,
+        Array, CompileTracer, Constant, Error, ExecutionError, Operation, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
+        Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
+        Type, Value, compile_statefully, compile_statefully_with_captures, compile_with_captures, with_captured_prints,
     };
 
     use super::*;
@@ -2326,7 +2325,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
@@ -2403,7 +2402,7 @@ mod tests {
         let device_type = ArrayType::new_static(DataType::F64, [2]);
         let host_type = device_type.clone().with_memory(Memory::Host { pinned: true });
         let lower = |r#type: &ArrayType| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(r#type.clone().into());
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -2970,7 +2969,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("test value"), vec![], vec![input], None)
@@ -3497,7 +3496,7 @@ mod tests {
 
         // The mask determines a count on the device, the checked gateway turns that count into a bounded dimension, and
         // the slice returns that many leading values without a host readback.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let mask = builder.add_input(mask_type.into());
         let values = builder.add_input(values_type.into());
         let mask = builder
@@ -3555,7 +3554,7 @@ mod tests {
         // copy that leaves its runtime size trailer at zero, while CUDA preserves the trailer. The program returns the
         // same prefix slice twice and then an equal slice built separately, which covers duplicate entry results and
         // results merged by XLA's CSE.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let mask = builder.add_input(mask_type.into());
         let values = builder.add_input(values_type.into());
         let mask = builder
@@ -3620,7 +3619,7 @@ mod tests {
         let mesh = domain_mesh(client, "device", 1);
         let session = Session::builder().client(client).build().unwrap();
         let input = f32_vector(&session, &mesh, &[2.0, 5.0]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         let source = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
@@ -3670,7 +3669,7 @@ mod tests {
         for value_type in
             [ArrayType::new_static(DataType::F32, [2]), ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))]
         {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let zero_input = builder.add_input(zero_type.clone().into());
             let value_input = builder.add_input(value_type.into());
             let program = builder
@@ -3724,7 +3723,7 @@ mod tests {
 
         // A program with one capture and one public argument, which both enter it as hidden and public arguments.
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let capture = builder.add_input(scalar_type.clone().into());
         let argument = builder.add_input(scalar_type.clone().into());
         let program = builder
@@ -3781,13 +3780,13 @@ mod tests {
 
         // A stateful execution rejects a public argument of the other client before it binds its references, which
         // keep their state.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let update = builder.add_input(Type::Array(scalar_type));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
-        let program: FlatProgram =
+        let program: FlatProgram<Session> =
             builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
@@ -3816,7 +3815,7 @@ mod tests {
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
         let shape = [2, 2];
         let input_type = ArrayType::new_static(DataType::F32, shape).with_sharding(sharding.clone()).unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3870,7 +3869,7 @@ mod tests {
         )
         .unwrap();
         let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -3947,7 +3946,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let update = builder.add_input(Type::Array(scalar_type.clone()));
         builder
@@ -3955,7 +3954,7 @@ mod tests {
             .unwrap();
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
@@ -4084,7 +4083,7 @@ mod tests {
 
             // The input override states the pending sum with which the argument arrives, which the executable admits,
             // and the argument declares a layout that differs from the one that the executable expects.
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let argument = builder.add_input(input_type.into());
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
@@ -4192,7 +4191,7 @@ mod tests {
         )
         .unwrap();
         let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -4278,7 +4277,7 @@ mod tests {
         )
         .unwrap();
         let input_type = ArrayType::new_static(DataType::U8, [4, 4]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -4343,7 +4342,7 @@ mod tests {
 
         // The stateful path reports it through the completion of the invocation and the state of its references.
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let update = builder.add_input(Type::Array(scalar_type));
         builder
@@ -4351,7 +4350,7 @@ mod tests {
             .unwrap();
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
@@ -4377,7 +4376,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("value"), vec![], vec![input], None)
@@ -5237,7 +5236,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let update = builder.add_input(Type::Array(scalar_type));
         builder
@@ -5245,7 +5244,7 @@ mod tests {
             .unwrap();
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();

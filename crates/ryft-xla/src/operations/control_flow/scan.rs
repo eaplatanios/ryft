@@ -22,8 +22,8 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, Dimension, EffectClasses, Operation, ProgramError,
-    RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
+    ArrayType, ComparisonDirection, DataType, Dimension, EagerContext, EffectClasses, FlatProgram, Operation,
+    ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -31,20 +31,21 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::EffectTokens;
+use crate::lowering::emissions::admits_iterations;
 use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
     lower_array_ir_type, lower_compare_to_mlir, lower_constant_output, lower_static_index_constants, lower_tensor_type,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
-use crate::lowering::{CollectiveLoweringState, EffectTokens, admits_iterations};
-use crate::operations::FlatProgram;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -304,9 +305,9 @@ enum ScanLoopLength<'b, 'c: 'b, 't: 'c> {
 }
 
 /// Inputs of the lowering of one scan that its accumulators, its straight-line iterations, and its loops share.
-struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O> {
+struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
     /// Lowered body program over `[index, carries..., stacked_input_slices...]`.
-    body: &'o FlatProgram<O>,
+    body: &'o FlatProgram<EagerContext<Constant, O>>,
 
     /// Number of state leaves that the loop carries.
     carry_count: usize,
@@ -665,19 +666,20 @@ mod tests {
         ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
         DimensionVariable, EffectClass, Error as CoreError, LogicalMesh, Memory, MeshAxis, MeshAxisType, Mul,
         MulOperation, NegOperation, OneLikeOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy,
-        RandomAlgorithm, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RngBitGeneratorOperation,
-        ScanOptions, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, TracingContext,
-        TransposedProgramCotangent, TypeError, TypedProgram, WhileOperation, ZeroOperation, batch, scan,
+        ProgramBuilder, RandomAlgorithm, ReferenceNewOperation, ReferenceReadOperation, ReferenceType,
+        RngBitGeneratorOperation, ScanOptions, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
+        TracingContext, TransposedProgramCotangent, TypeError, TypedProgram, WhileOperation, ZeroOperation, batch,
+        scan,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
     use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program, test_vector_type};
+    use crate::operations::Operation;
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
@@ -690,15 +692,15 @@ mod tests {
     use super::*;
 
     /// Returns a scan whose body negates each slice at an unsharded declaration of its type.
-    fn unsharded_negation_scan_program(stack_type: ArrayType) -> FlatProgram {
+    fn unsharded_negation_scan_program(stack_type: ArrayType) -> FlatProgram<Session> {
         let (slice_type, iteration_count) = stack_type.without_dimension(0).unwrap();
-        let mut body = ArrayIrProgramBuilder::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let slice = body.add_input(slice_type.with_sharding(None).unwrap().into());
         let negated = body.add_instruction(NegOperation::new(), Vec::new(), vec![slice], None).unwrap()[0];
-        let body: FlatProgram = body.build(vec![negated], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let body: FlatProgram<Session> = body.build(vec![negated], vec![Placeholder; 2], vec![Placeholder]).unwrap();
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_program(body);
         let stack = builder.add_input(stack_type.into());
         let output = builder
@@ -711,7 +713,7 @@ mod tests {
     fn assert_transposed_scan_cotangent(
         session: &Session,
         mesh: &DeviceMesh,
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         seed_values: &[f32],
         expected_shards: [&[f32]; 2],
     ) {
@@ -747,9 +749,9 @@ mod tests {
 
     /// Returns the scan body `(i, c, x) -> (c + x)` over `f64` scalars, which prints each item `x` with the label
     /// `item` before adding it to the sum `c`.
-    fn printing_sum_body() -> FlatProgram {
+    fn printing_sum_body() -> FlatProgram<Session> {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
         let sum = builder.add_input(scalar_type.clone().into());
         let item = builder.add_input(scalar_type.into());
@@ -764,10 +766,10 @@ mod tests {
 
     /// Returns a scan of the static `length` and `unroll` factor over the `f32` body `(i, c, x) -> (c * x, c * x)`,
     /// which takes its initial carry and its stacked items as inputs.
-    fn product_scan_program(length: usize, unroll: usize) -> FlatProgram {
+    fn product_scan_program(length: usize, unroll: usize) -> FlatProgram<Session> {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -780,7 +782,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(test_vector_type(length).into());
@@ -798,10 +800,10 @@ mod tests {
     /// to its carry as a binary digit and stacks the carry that it received, so that both of its results depend on the
     /// order in which its iterations visit the items. The scan takes its initial carry and its stacked items as inputs,
     /// followed by its runtime length when its length is dynamic.
-    fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatProgram {
+    fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatProgram<Session> {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -812,7 +814,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![length.clone()])).into());
@@ -875,7 +877,7 @@ mod tests {
         let block = context.block_with_no_arguments();
         let scalar_type = ArrayType::scalar(DataType::F32);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
@@ -897,7 +899,8 @@ mod tests {
         ));
 
         // An array IR scan needs exactly one body region.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -953,14 +956,14 @@ mod tests {
         let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let scan_program = |length: usize| {
             let body = {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
                 let slice = builder.add_input(slice_type.clone().into());
                 builder
                     .build::<Vec<Constant>, Vec<Constant>>(vec![slice], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap()
             };
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let body = builder.import_region(body.entry_region_ref());
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]);
             let stack = builder.add_input(stacked_type.clone().into());
@@ -1014,7 +1017,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let stack_type = ArrayType::new_static(DataType::F64, [3]);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(scalar_type.clone().into());
             let slice = builder
@@ -1087,7 +1090,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let first = builder.add_input(carry_type.clone().into());
             let second = builder.add_input(carry_type.clone().into());
@@ -1102,7 +1105,7 @@ mod tests {
         for (length, unroll, expected) in
             [(0, 1, vec![10.0, 20.0, 30.0]), (2, 1, vec![12.0, 24.0, 36.0]), (2, 2, vec![12.0, 24.0, 36.0])]
         {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let region = builder.import_region(body.entry_region_ref());
             let dynamic_input = builder.add_input(carry_type.clone().into());
             let static_input = builder.add_input(static_type.clone().into());
@@ -1149,7 +1152,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())]));
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.into());
             let doubled =
@@ -1158,7 +1161,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![doubled], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let runtime_length = builder.add_input(DimensionType::from(length.clone()).into());
@@ -1250,7 +1253,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -1259,7 +1262,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum, carry], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -1370,7 +1373,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let related = builder
                 .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(length.clone())])).into());
@@ -1380,7 +1383,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![related, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let related = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let sum = builder.add_input(scalar_type.into());
@@ -1492,7 +1495,7 @@ mod tests {
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
-        let mut body_builder = ArrayIrProgramBuilder::new();
+        let mut body_builder = ProgramBuilder::<Constant, Operation>::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
@@ -1503,7 +1506,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.into());
@@ -1798,7 +1801,7 @@ mod tests {
         // condition, adding two to its counter, which is `i64::MAX - 1`, would wrap and incorrectly continue the loop.
         // The body has only a scalar carry, so lowering this boundary case requires no enormous array allocations.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = ArrayIrProgramBuilder::new();
+        let mut body_builder = ProgramBuilder::<Constant, Operation>::new();
         let index = body_builder.add_input(scalar_type.clone().into());
         body_builder.add_input(scalar_type.clone().into());
         let body = body_builder
@@ -1806,7 +1809,7 @@ mod tests {
             .unwrap();
         let scan = ScanOperation::new(1, i64::MAX as usize).with_unroll(3).unwrap();
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let outputs = builder
@@ -1864,7 +1867,7 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length.clone())]));
 
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
@@ -1875,7 +1878,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.clone().into());
         let runtime_length = builder.add_input(length_type.clone().into());
@@ -1953,7 +1956,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let empty_type = ArrayType::new_static(DataType::F32, [0]);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let root = builder.add_input(ReferenceType::new(empty_type.clone()).into());
@@ -1967,7 +1970,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum, root], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.clone().into());
         let elements = builder.add_input(empty_type.clone().into());
@@ -2163,7 +2166,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let slice = builder.add_input(scalar_type.clone().into());
@@ -2174,7 +2177,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(scalar_type.into());
         let stack = builder.add_input(ArrayType::new_static(DataType::F64, [4]).into());
@@ -2213,7 +2216,7 @@ mod tests {
         let dynamic_vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
 
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let extent = builder.add_input(extent_type.into());
             let value = builder.add_input(dynamic_vector_type.clone().into());
@@ -2226,7 +2229,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let values = builder.add_input(dynamic_vector_type.clone().into());
         let extent = builder
@@ -2313,7 +2316,7 @@ mod tests {
             ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
 
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let state = builder.add_input(state_type.into());
             let outputs = builder
@@ -2333,7 +2336,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let states = builder.add_input(stacked_state_type.clone().into());
         let runtime_batch = builder.add_input(batch_type.into());
@@ -2495,7 +2498,7 @@ mod tests {
         // The scan body uses both ordered classes, because the scalar check contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut body_builder = ArrayIrProgramBuilder::new();
+        let mut body_builder = ProgramBuilder::<Constant, Operation>::new();
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let value = body_builder.add_input(scalar_type.clone().into());
@@ -2524,7 +2527,7 @@ mod tests {
         let scan = ScanOperation::new(1, 3);
 
         let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let stacked = builder.add_input(stacked_type.clone().into());
@@ -2592,7 +2595,7 @@ mod tests {
         // chain, which is unused here because the program ends right after the scan. Each iteration prints its item,
         // in iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(printing_sum_body().entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -2656,7 +2659,7 @@ mod tests {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -2674,7 +2677,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder
@@ -2773,7 +2776,7 @@ mod tests {
         let memory = Memory::Host { pinned: true };
         let slice_type = ArrayType::new_static(DataType::F64, [3]).with_memory(memory);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
@@ -2834,7 +2837,7 @@ mod tests {
             ),
         ] {
             let stacked_type = ArrayType::new_static(DataType::F64, [length, 3]).with_memory(memory);
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
@@ -2865,7 +2868,7 @@ mod tests {
         let stacked_sharding = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let slice_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let slice = builder.add_input(slice_type.clone().into());
             builder
@@ -2923,7 +2926,7 @@ mod tests {
             let stacked_type = ArrayType::new_static(DataType::F64, [length])
                 .with_sharding(Sharding::replicated(mesh.clone(), 1))
                 .unwrap();
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let region = builder.import_region(body.entry_region_ref());
             let stack = builder.add_input(stacked_type.clone().into());
             let outputs = builder
@@ -2970,7 +2973,7 @@ mod tests {
                 .unwrap();
         let stack_type = ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(stack_sharding.clone()).unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let row = builder.add_input(slice_type.into());
             let row = builder.add_instruction(NegOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
@@ -2978,7 +2981,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![row], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let rows = builder.add_input(stack_type.clone().into());
         let rows = builder
@@ -3093,7 +3096,7 @@ mod tests {
             .with_sharding(Sharding::replicated(logical_mesh, 2))
             .unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(carry_type.clone().into());
             let row = builder.add_input(slice_type.into());
@@ -3102,7 +3105,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![carry, row], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let carry = builder.add_input(carry_type.clone().into());
         let rows = builder.add_input(stack_type.clone().into());
@@ -3222,7 +3225,7 @@ mod tests {
             .with_sharding(items_sharding.local_sharding(&manual_axes).unwrap())
             .unwrap();
         let scan_body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(local_sum_type.clone().into());
             let item = builder.add_input(local_sum_type.clone().into());
@@ -3232,7 +3235,7 @@ mod tests {
                 .unwrap()
         };
         let shard_map_body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let scan_body_region = builder.import_region(scan_body.entry_region_ref());
             let sum = builder.add_input(local_sum_type.into());
             let items = builder.add_input(local_items_type.into());
@@ -3256,7 +3259,7 @@ mod tests {
             ShardMapBoundary::new(logical_mesh, shardings.clone(), shardings.clone(), manual_axes).unwrap(),
         )
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let shard_map_body_region = builder.import_program(shard_map_body);
         let sum = builder.add_input(sum_type.clone().into());
         let items = builder.add_input(items_type.clone().into());
@@ -3371,7 +3374,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let items_type = ArrayType::new_static(DataType::F64, [3]);
         let true_branch = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let sum = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
@@ -3383,14 +3386,14 @@ mod tests {
                 .unwrap()
         };
         let false_branch = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let sum = builder.add_input(scalar_type.clone().into());
             builder.add_input(items_type.clone().into());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone().into());
@@ -3506,7 +3509,7 @@ mod tests {
         let items_type = ArrayType::new_static(DataType::F64, [2]);
         let state_types = [scalar_type.clone(), scalar_type.clone(), scalar_type.clone(), items_type.clone()];
         let loop_condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
@@ -3516,7 +3519,7 @@ mod tests {
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let scan_body_region = builder.import_region(printing_sum_body().entry_region_ref());
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, sum, items) = (inputs[0], inputs[1], inputs[2], inputs[3]);
@@ -3540,7 +3543,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
@@ -3645,7 +3648,7 @@ mod tests {
         // The body `(i, c, x) -> (c + x, c)` sums the items and stacks the running sums that it received.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let sum = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3654,7 +3657,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![next, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let sum = builder.add_input(scalar_type.into());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
@@ -3769,7 +3772,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3782,7 +3785,7 @@ mod tests {
                 .unwrap()
         };
         let value_and_gradient = |scan: ScanOperation<Type>, items_type: ArrayType| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let body_region = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone().into());
             let items = builder.add_input(items_type.clone().into());
@@ -3797,7 +3800,7 @@ mod tests {
                 .unwrap();
             let linearization = program.linearize_with_respect_to(&[1]).unwrap();
             let pullback = linearization.pullback().unwrap().into_program();
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = program
                 .input_types()
                 .into_owned()
@@ -3950,7 +3953,7 @@ mod tests {
         // zero, so the transposed scan has no cotangent outputs and only its printing effect is observable.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let seed = builder.add_input(scalar_type.clone().into());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
@@ -3963,7 +3966,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let backward = builder.import_region(backward.entry_region_ref());
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let item = builder.add_input(scalar_type.clone().into());
@@ -3983,7 +3986,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let items = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let outputs = builder
@@ -4053,7 +4056,7 @@ mod tests {
 
         // The outer carry is replicated. The body accepts an unsharded carry and returns it scaled by a replicated
         // constant, so the forward scan joins its carry output at the unsharded body input declaration.
-        let mut body = ArrayIrProgramBuilder::new();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(scalar_type.into());
         let factor = CoreArray::from_elements(replicated_type.clone(), &[2f32]).unwrap();
@@ -4061,18 +4064,18 @@ mod tests {
         let output = body
             .add_instruction(MulOperation::<ArrayType>::new(), Vec::new(), vec![carry, factor], None)
             .unwrap()[0];
-        let body: FlatProgram = body.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let body: FlatProgram<Session> = body.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let replicated_type = Type::from(replicated_type);
         assert_eq!(body.output_types().as_ref(), std::slice::from_ref(&replicated_type));
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_program(body);
         let carry = builder.add_input(replicated_type.clone());
         let outputs = builder
             .add_instruction(ScanOperation::<Type>::new(1, 2), vec![body], vec![carry], None)
             .unwrap()
             .to_vec();
-        let program: FlatProgram = builder.build(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
         assert_transposed_scan_cotangent(&session, &mesh, &program, &[1.0], [&[4.0], &[4.0]]);
     }
 

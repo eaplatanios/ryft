@@ -7,8 +7,8 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::CollectiveLoweringState;
 use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 impl LowerableOperation for ParallelBroadcastOperation {
@@ -159,7 +159,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair};
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::{execute_inputs_on_cpu_devices, test_logical_mesh_2x2};
     #[cfg(feature = "cuda-13")]

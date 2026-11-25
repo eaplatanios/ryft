@@ -88,7 +88,7 @@ mod tests {
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::CollectiveLoweringState;
+    use crate::lowering::states::CollectiveLoweringState;
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;

@@ -24,11 +24,11 @@ impl LowerableOperation for TagOperation<ArrayType> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{DataType, Error as CoreError};
+    use ryft_core::{DataType, Error as CoreError, FlatProgram};
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
+    use crate::Session;
     use crate::lowering::types::lower_tensor_type;
-    use crate::operations::FlatProgram;
 
     use super::*;
 
@@ -41,7 +41,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let block = context.block(&[(lower_tensor_type(&scalar_type, &context, location).unwrap(), location)]);
         let input = block.as_ref().argument(0).unwrap().as_ref();
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         let tag = TagOperation::<ArrayType>::new("residual");
         let types = [scalar_type];
         assert_eq!(tag.lower(&mut lowerer, &[input], &types, &types).unwrap(), vec![input]);

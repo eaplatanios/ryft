@@ -579,7 +579,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::lowering::modules::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, f64_vector, read_first_shard};
     use crate::tests::{

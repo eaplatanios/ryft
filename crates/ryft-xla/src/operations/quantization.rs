@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver,
+    ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver, FlatProgram,
     MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -12,12 +12,11 @@ use ryft_mlir::{
     Type as MlirType, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::CollectiveLoweringState;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,
 };
-use crate::operations::FlatProgram;
 use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
 use crate::operations::jit_call::lower_shared_function_call;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
@@ -26,7 +25,7 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Sessio
 pub(crate) fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
-) -> Result<FlatProgram, Error> {
+) -> Result<FlatProgram<Session>, Error> {
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
     let (_, program) = DomainTracingContext::<Session>::trace(
         |inputs: Vec<Tracer>| {
@@ -543,16 +542,16 @@ mod tests {
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayOperation, BlockQuantize, BlockQuantizedValue,
         BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
-        DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
-        RandomAlgorithm, ScaledDot, ScaledDotOperation, Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn,
-        f8e4m3fn,
+        DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
+        ProgramBuilder as ArrayIrProgramBuilder, ProjectedContext, RandomAlgorithm, ScaledDot, ScaledDotOperation,
+        Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
-    use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
@@ -564,7 +563,7 @@ mod tests {
 
     /// Builds the NVFP4 scaled dot program shared by the platform-gated lowering fixtures below, with
     /// `f4e2m1fn [2, 16]` operands and `f8e4m3fn [2, 1]` scales over blocks of 16.
-    fn scaled_dot_fixture_program() -> (Program<Vec<Constant>, Vec<Constant>>, Vec<ArrayType>, Vec<ArrayType>) {
+    fn scaled_dot_fixture_program() -> (FlatProgram<Session>, Vec<ArrayType>, Vec<ArrayType>) {
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
         let scale_type =
@@ -1081,7 +1080,7 @@ mod tests {
             callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
         ));
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let inputs = vec![
             builder.add_input(element_type.clone().into()),
             builder.add_input(element_type.clone().into()),

@@ -10,7 +10,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::CollectiveLoweringState;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
     lower_constant_elements_attribute, lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type,
     lower_u64_scalar_constant, physical_bound_type,
@@ -1414,11 +1414,11 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            crate::lowering::lower_mlir_module_for_program(
+            crate::lowering::modules::lower_mlir_module_for_program(
                 traced.program(),
                 &[],
-                traced.global_input_types(),
-                traced.global_output_types(),
+                traced.input_type(),
+                traced.output_type(),
                 "main",
                 None,
                 None,

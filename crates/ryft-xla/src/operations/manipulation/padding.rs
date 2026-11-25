@@ -334,7 +334,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ConstantOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, Error as CoreError,
-        Placeholder, SliceOperation, TypedProgram,
+        Placeholder, ProgramBuilder as ArrayIrProgramBuilder, SliceOperation, TypedProgram,
     };
     use ryft_mlir::{Operation as MlirOperation, Type as MlirType, Value as MlirValue};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -343,7 +343,7 @@ mod tests {
         ProgramBuilder, dynamic_dimension, test_vector_type, to_mlir_module_for_plain_program,
     };
     use crate::lowering::types::lower_static_index_constants;
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Constant, ToPjrt, to_mlir_module_for_program};
 
@@ -673,7 +673,7 @@ mod tests {
                     };
                     let input_type = ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("input", Some(5))]));
                     let padding_type = ArrayType::scalar(data_type);
-                    let mut builder = ArrayIrProgramBuilder::new();
+                    let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
                     let array = builder.add_input(input_type.clone().into());
                     let scalar = builder.add_input(padding_type.clone().into());
                     let extent = builder

@@ -599,18 +599,18 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayOperation, Complex, Dimension, DimensionBounds, DimensionVariable, Dot, DotAlgorithm,
         DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep, EinsumPathStrategy,
-        EinsumSpecification, MeshAxisType, Operation, Placeholder, ProjectedContext, RaggedDot,
-        RaggedDotDimensionNumbers, Sharding, ShardingDimension, Typed, bf16, differentiate_at, einsum, f8e4m3fn,
-        f8e5m2, f16,
+        EinsumSpecification, MeshAxisType, Operation as CoreOperation, Placeholder,
+        ProgramBuilder as ArrayIrProgramBuilder, ProjectedContext, RaggedDot, RaggedDotDimensionNumbers, Sharding,
+        ShardingDimension, Typed, bf16, differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
         unproject_plain_program,
     };
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, two_device_mesh};
     use crate::tests::{
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
@@ -1436,7 +1436,7 @@ mod tests {
         let left_type = ArrayType::new_static(DataType::F32, [5, 2]);
         let right_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
         let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(Type::Array(left_type));
         let right = builder.add_input(Type::Array(right_type));
         let group_sizes = builder.add_input(Type::Array(group_sizes_type));

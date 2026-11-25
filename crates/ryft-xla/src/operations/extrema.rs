@@ -350,13 +350,13 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Clamp, Device, DeviceMesh, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, Placeholder, ScanOptions, Shape,
-        Sharding, Typed, UnreducedKind, ValueProjection, scan,
+        Clamp, Device, DeviceMesh, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, Placeholder, ProgramBuilder,
+        ScanOptions, Shape, Sharding, Typed, UnreducedKind, ValueProjection, scan,
     };
     use ryft_pjrt::BufferType;
 
     use crate::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
     use crate::{Array, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, Session, compile};
@@ -557,7 +557,7 @@ mod tests {
     fn test_min_and_max_operations_lower_dynamic_differentiation() {
         let client = execution_client();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(input_type.clone().into());
         let right = builder.add_input(input_type.into());
         let minimum = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -599,7 +599,7 @@ mod tests {
     fn test_max_and_min_operations_lower_unreduced_values() {
         // Lowers the extremum of two vectors of type `type` for `mesh`.
         fn module(session: &Session, mesh: &DeviceMesh, maximum: bool, r#type: &ArrayType) -> String {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let left = builder.add_input(r#type.clone().into());
             let right = builder.add_input(r#type.clone().into());
             let output = if maximum {

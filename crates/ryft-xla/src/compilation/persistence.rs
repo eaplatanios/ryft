@@ -31,7 +31,7 @@ use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::{CompiledProgram, OutputDeviceAssignment};
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
-use crate::lowering::signature::ExecutableSignature;
+use crate::lowering::signatures::ExecutableSignature;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
@@ -1484,10 +1484,10 @@ mod tests {
     use ryft_core::{
         AddOperation, AnalyzableCompilationDomain, ArrayReference, ArrayType, AssertOperation, CompilationCacheDomain,
         CompilationDomain, CompilationTracer, CompiledFunction, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionVariable, DiskCache, Error as CoreError, ExternalReferenceBinding, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Place, Placeholder, Placement, PrintOperation, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource, ReferenceType, Shape, Sharding,
-        ShardingDimension, Sin, StagedFunction, StatefulCompilationDomain, Typed, ValueProjection,
+        DimensionBounds, DimensionVariable, DiskCache, Error as CoreError, ExternalReferenceBinding, FlatProgram,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Place, Placeholder, Placement, PrintOperation, ProgramBuilder,
+        ProgramError, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSource, ReferenceType, Shape,
+        Sharding, ShardingDimension, Sin, StagedFunction, StatefulCompilationDomain, Typed, ValueProjection,
     };
     use ryft_pjrt::protos::CompilationOptions;
 
@@ -1501,9 +1501,7 @@ mod tests {
         replicated_vector_type,
     };
     use crate::tests::{cpu_client, values_to_bytes};
-    use crate::{
-        Array, Constant, Error, FlatProgram, FromPjrt, ProgramBuilder, Session, Type, Value, with_captured_prints,
-    };
+    use crate::{Array, Constant, Error, FromPjrt, Operation, Session, Type, Value, with_captured_prints};
 
     use super::*;
 
@@ -2031,7 +2029,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
         let read_only = builder.add_input(Type::Reference(ReferenceType::new(scalar_type)));
         let read_only_output =
@@ -2044,7 +2042,7 @@ mod tests {
         let output = builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![left, read_only_output], None)
             .unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
@@ -2315,7 +2313,7 @@ mod tests {
         let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(state_sharding.clone())
             .unwrap();
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(state_type.clone())));
         let update = builder.add_input(Type::Array(state_type.clone()));
         builder
@@ -2323,7 +2321,7 @@ mod tests {
             .unwrap();
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program: FlatProgram = builder
+        let program: FlatProgram<Session> = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
@@ -2363,7 +2361,7 @@ mod tests {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let value = builder.add_input(replicated_scalar_type(&mesh, DataType::F32).into());
         builder
@@ -2421,7 +2419,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let argument = builder.add_input(input.r#type().into_owned().into());
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)

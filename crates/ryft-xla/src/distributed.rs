@@ -1654,8 +1654,8 @@ pub(crate) mod tests {
         );
     }
 
-    // Worker of `test_distributed_compilation_artifact_exchange_shares_artifacts_between_two_cpu_processes`, which returns
-    // immediately unless that test launched it as one of its two processes.
+    // Worker of `test_distributed_compilation_artifact_exchange_shares_artifacts_between_two_cpu_processes`,
+    // which returns immediately unless that test launched it as one of its two processes.
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_distributed_compilation_artifact_exchange_cpu_process_helper() {

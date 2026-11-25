@@ -132,16 +132,16 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, CaptureReference, Context, CosOperation, DataType, DomainTracingContext,
-        Error as CoreError, EverythingSavable, Memory, MulOperation, NothingSavable, Placeholder, PrintOperation,
-        ProgramError, ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation,
-        TypedProgram, Value, differentiate_at, rematerialize,
+        Error as CoreError, EverythingSavable, FlatProgram, Memory, MulOperation, NothingSavable, Placeholder,
+        PrintOperation, ProgramBuilder, ProgramError, ResidualPolicyReference, SaveAndOffloadOnlyTheseNames,
+        SinOperation, StopGradient, TagOperation, TypedProgram, Value, differentiate_at, rematerialize,
     };
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::lower_tensor_type;
-    use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, CompiledFunction, Constant, Session, Tracer, compile, to_mlir_module_for_program};
@@ -157,7 +157,8 @@ mod tests {
         let tensor_type = lower_tensor_type(&scalar_type, &context, location).unwrap();
         let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
         let inputs = [0, 1].map(|index| block.as_ref().argument(index).unwrap().as_ref());
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         let types = [scalar_type.clone(), scalar_type];
         assert_eq!(
             StopGradientOperation::<ArrayType>::new().lower(&mut lowerer, &inputs, &types, &types).unwrap(),
@@ -232,7 +233,8 @@ mod tests {
         let operation = RematerializeOperation::<Type>::new(ResidualPolicyReference::new(NothingSavable));
 
         // The plain array family cannot carry the body region.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             RematerializeOperation::<ArrayType>::new(ResidualPolicyReference::new(NothingSavable))
                 .lower(&mut lowerer, &[], &[], &[]),
@@ -258,7 +260,7 @@ mod tests {
         // immediately before, inside, and after the call must form one ordered I/O token chain.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
@@ -267,7 +269,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let before = builder
@@ -314,7 +316,7 @@ mod tests {
         // value happens to occupy the referenced slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let captured =
                 builder.add_constant(Constant::Captured(CaptureReference::new(0, Type::Array(scalar_type.clone()))));
@@ -324,7 +326,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
@@ -359,7 +361,7 @@ mod tests {
         // XLA from merging the recomputation with the original computation.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -367,7 +369,7 @@ mod tests {
                 .unwrap()
         };
         let lower = |operation: RematerializeOperation<Type>| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let body = builder.import_region(body.entry_region_ref());
             let input = builder.add_input(scalar_type.clone().into());
             let output =
@@ -509,7 +511,7 @@ mod tests {
         )
         .unwrap();
         let gradient = gradient.into_flat_program();
-        let lower = |program: &Program<Vec<Constant>, Vec<Constant>>| {
+        let lower = |program: &FlatProgram<Session>| {
             let array_types = |types: Vec<Type>| {
                 types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
             };
@@ -671,7 +673,7 @@ mod tests {
     fn test_linear_call_operation_lower_inlines_only_the_forward_program() {
         let vector_type = test_vector_type(4);
         let forward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let tangent = builder.add_input(vector_type.clone().into());
             let residual = builder.add_input(vector_type.clone().into());
             let output =
@@ -681,7 +683,7 @@ mod tests {
                 .unwrap()
         };
         let transpose = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
@@ -690,7 +692,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());
@@ -736,7 +738,8 @@ mod tests {
         let block = context.block_with_no_arguments();
 
         // The plain array family cannot carry the forward and transpose regions.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         let expected_message =
             "higher-order operation `linear_call` must be stored directly in the enclosing backend operation family";
         assert!(matches!(

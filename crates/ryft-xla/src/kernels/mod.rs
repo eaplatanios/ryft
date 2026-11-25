@@ -531,8 +531,8 @@ pub(crate) mod tests {
         KernelOperation as PortableKernelOperation, KernelParameter, KernelParameterAccess,
     };
 
-    use crate::lowering::lower_mlir_module_for_program;
-    use crate::{Constant, Operation, ProgramBuilder};
+    use crate::lowering::modules::lower_mlir_module_for_program;
+    use crate::{Constant, Operation};
 
     use super::*;
 
@@ -921,7 +921,7 @@ pub(crate) mod tests {
 
         // The emitted custom call is ordered through the assertion token chain.
         let vector = ArrayType::new_static(DataType::I32, vec![2]);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(vector.clone().into());
         builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap();
         let program = builder
@@ -1078,7 +1078,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
         let program = builder

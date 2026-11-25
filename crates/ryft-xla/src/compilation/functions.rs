@@ -2338,7 +2338,7 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
-    use crate::lowering::collect_session_constants;
+    use crate::lowering::emissions::collect_session_constants;
     use crate::sessions::tests::{
         domain_mesh, read_first_shard, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
@@ -5181,7 +5181,7 @@ mod tests {
             input_type.clone(),
         )
         .unwrap();
-        assert_eq!(traced.global_output_types(), &capture_type);
+        assert_eq!(traced.output_type(), &capture_type);
     }
 
     #[test]

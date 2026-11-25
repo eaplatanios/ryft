@@ -688,9 +688,9 @@ mod tests {
         DataType, Dimension, DimensionBounds, DimensionConstant, DimensionFromScalar, DimensionFromScalarOperation,
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Div, DynamicBroadcastOperation,
         DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EagerContext, Error as CoreError, Linearization, Pad, Placeholder,
-        ReverseModeDifferentiate, Shape, Slice, StagingContext, TracingContext, Typed, TypedProgram, UpdateSlice,
-        UpdateSliceOperation, ValueProjection,
+        DynamicUpdateSliceOperation, EagerContext, Error as CoreError, FlatProgram, Linearization, Pad, Placeholder,
+        ProgramBuilder as ArrayIrProgramBuilder, ReverseModeDifferentiate, Shape, Slice, StagingContext,
+        TracingContext, Typed, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -698,7 +698,7 @@ mod tests {
     use crate::lowering::tests::{
         ProgramBuilder, test_matrix_type, to_mlir_module_for_plain_program, unproject_plain_program,
     };
-    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::Operation;
     use crate::sessions::tests::{
         domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type, replicated_vector_type,
     };
@@ -1150,7 +1150,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_reference_pullback_without_dense_zero() {
         // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
         // only the selected block addition, without constructing a full size zero cotangent first.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(Type::Array(ArrayType::new_static(DataType::F64, [5])));
         let start = builder.add_input(Type::Array(ArrayType::scalar(DataType::I32)));
         let output = builder
@@ -1161,7 +1161,8 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> =
+            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let discharged = pullback.discharge_references(0).unwrap();
         let stablehlo = to_mlir_module_for_program(
@@ -1277,7 +1278,7 @@ mod tests {
         // all-ones cotangent with an all-100 update and the given row start, runs it on the client, and returns the
         // primal output and the single requested gradient, whose shape is checked against `gradient_shape`.
         let execute = |linearization: &Linearization<Constant, Operation>,
-                       pullback: &FlatProgram,
+                       pullback: &FlatProgram<Session>,
                        size: usize,
                        values: &[f64],
                        row: i32,
@@ -1457,7 +1458,7 @@ mod tests {
         crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         let input_type = ArrayType::new_static(DataType::I64, [4]);
         let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let mut bounds = Vec::new();
         for name in ["start", "size"] {
@@ -1574,7 +1575,7 @@ mod tests {
             (DynamicSliceBounds::Clamp, DataType::I64, vec![((-1i64) as u64, Ok(0)), (3, Ok(2))]),
             (DynamicSliceBounds::Clamp, DataType::U64, vec![(u64::MAX, Ok(2)), (1, Ok(1))]),
         ] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let start = builder.add_input(ArrayType::scalar(start_type).into());
             let size = builder.add_input(size_type.clone().into());
@@ -1661,7 +1662,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let start = builder
             .add_instruction(
@@ -1738,7 +1739,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let size = builder.add_input(size_type.clone().into());
         let size = builder
@@ -1929,7 +1930,7 @@ mod tests {
         // The result extent is independent of the input extent at the type level. Lowering uses their finite physical
         // bounds for one specialization and preserves the eager `result_extent <= input_extent` contract with an
         // ordered runtime assertion.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input_size = builder.add_input(size_type.clone().into());
         let result_size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());

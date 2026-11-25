@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use ryft_core::{
     ArrayType, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
-    Parameterized, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapError, ShardMapOperation,
+    Parameterized, Program, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapError, ShardMapOperation,
     ShardMapValueKind, Sharding, ShardingDimension, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::shardy;
@@ -15,9 +15,9 @@ use ryft_mlir::{
 };
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{annotate_output_memory, lower_tensor_type};
-use crate::lowering::{CollectiveLoweringState, EffectTokens, current_or_new_token, token_threaded_effects};
-use crate::operations::Program;
+use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::{
     Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
@@ -79,7 +79,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: 
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     boundary: &ShardMapBoundary,
-    program: &Program<ProgramInput, ProgramOutput, O>,
+    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
@@ -392,7 +392,7 @@ pub(crate) mod tests {
         ConvertElementTypeOperation, Cos, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionValue, DomainTracer,
         DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClass, Error as CoreError, Exp, Fill,
-        Gather, GatherMode, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedAxis,
+        FlatProgram, Gather, GatherMode, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedAxis,
         Operation as CoreOperation, OperationPayloadProjection, ParallelAllGather, ParallelAllToAllOperation,
         ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermuteOperation,
         ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation, Place, Placeholder,
@@ -421,9 +421,7 @@ pub(crate) mod tests {
     use crate::operations::debugging::{
         PRINT_CUSTOM_CALL_TARGET, ensure_print_handler_registered, with_captured_prints,
     };
-    use crate::operations::{
-        FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
-    };
+    use crate::operations::{Operation, Operation as ArrayIrOperation};
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
@@ -1016,7 +1014,7 @@ pub(crate) mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let execute = |program: &FlatProgram, inputs: Vec<_>| {
+        let execute = |program: &FlatProgram<Session>, inputs: Vec<_>| {
             let lowered = session.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = session.compile_program(&lowered).unwrap();
             session.execute_program(&compiled, inputs).unwrap()
@@ -1421,10 +1419,10 @@ pub(crate) mod tests {
                 .with_scope(scope)
                 .with_batching_support(),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(local_type.clone().into());
         let primal = builder.build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(local_type.into());
         let primal = builder.import_program(primal.unwrap());
         let call = CompositeOperation::<Constant, ArrayIrOperation>::new(rules.reference());
@@ -1433,7 +1431,7 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let map = ShardMapOperation::from_program(&body, vec![Type::Array(global_type.clone())], boundary).unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(global_type.into());
         let body = builder.import_program(body);
         let outputs = builder.add_instruction(map, vec![body], vec![input], None).unwrap().to_vec();
@@ -4937,7 +4935,7 @@ pub(crate) mod tests {
                                     let limit_type =
                                         ArrayType::scalar(DataType::F32).with_sharding(limit_sharding).unwrap();
                                     let condition = {
-                                        let mut builder = ProgramBuilder::new();
+                                        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
                                         let state = builder.add_input(Type::Array(local_type.clone()));
                                         let state = builder
                                             .add_instruction(
@@ -4969,7 +4967,7 @@ pub(crate) mod tests {
                                         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
                                     };
                                     let body = {
-                                        let mut builder = ProgramBuilder::new();
+                                        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
                                         let state = builder.add_input(Type::Array(local_type));
                                         let next_state = builder
                                             .add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None)
@@ -5357,7 +5355,7 @@ pub(crate) mod tests {
     #[test]
     fn test_device_ordered_effects_cross_manual_computation_boundary() {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(vector_type.into());
         for label in ["first", "second"] {
             builder
@@ -5396,7 +5394,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_device_ordered_effects_execute_on_two_cpu_devices() {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let device_index = builder
             .add_instruction(
@@ -5802,7 +5800,7 @@ pub(crate) mod tests {
             .unwrap()
         };
         let coordinate_map = |mesh: &LogicalMesh| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let coordinate = builder
                 .add_instruction(AxisIndexOperation::new("x".into()).with_mesh(mesh.clone()), vec![], vec![], None)
                 .unwrap()[0];
@@ -5887,7 +5885,7 @@ pub(crate) mod tests {
             DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let coordinate = builder
             .add_instruction(AxisIndexOperation::new("x".into()).with_mesh(mesh.clone()), vec![], vec![], None)
             .unwrap()[0];

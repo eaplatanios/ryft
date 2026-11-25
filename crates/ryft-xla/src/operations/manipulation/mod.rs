@@ -32,12 +32,12 @@ mod tests {
         DimensionBounds, DimensionMulOperation, DimensionOperation, DimensionSize, DimensionSizeOperation,
         DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
         DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
-        Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, Placeholder, Reshape,
-        Scatter, ScatterMode, ScatterOptions, ScatterReductionKind, Shape, TracingContext, Typed, TypedProgram,
-        ValueProjection, batch, index,
+        Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, Placeholder,
+        ProgramBuilder, Reshape, Scatter, ScatterMode, ScatterOptions, ScatterReductionKind, Shape, TracingContext,
+        Typed, TypedProgram, ValueProjection, batch, index,
     };
 
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, Constant, Options, Session, Type};
@@ -234,7 +234,7 @@ mod tests {
             } else {
                 ArrayType::new(DataType::F64, Shape::new(vec![query_dimension, Dimension::Static(4)]))
             };
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let indices = builder.add_input(indices_type.clone().into());
             let start = builder.add_input(ArrayType::scalar(DataType::I32).into());

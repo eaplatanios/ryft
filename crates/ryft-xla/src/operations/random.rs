@@ -251,15 +251,16 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
         DataType, DeviceMesh, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dropout,
-        DropoutOperation, Error as CoreError, Memory, Placeholder, ProgramError, Random, RandomAlgorithm,
-        RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
+        DropoutOperation, Error as CoreError, Memory, Placeholder, ProgramBuilder as ArrayIrProgramBuilder,
+        ProgramError, Random, RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram,
+        ZeroOperation,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
     use crate::lowering::types::lower_tensor_type;
+    use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
@@ -364,7 +365,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let state_type = RandomAlgorithm::ThreeFry.state_type();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let state = builder.add_input(state_type.clone().into());
         let extent =
             builder.add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
@@ -405,7 +406,7 @@ mod tests {
         // The two generators cover both operand orders and consume the same state, so they produce the same bits.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let state = builder
@@ -884,7 +885,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F64, [4, 8]);
         let state_type = RandomAlgorithm::Philox.state_type();
         let values = (0..32).map(|value| f64::from(value) - 7.5).collect::<Vec<_>>();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let odd_input = builder.add_input(ArrayType::new_static(DataType::F64, [3, 5]).into());
         let state = builder

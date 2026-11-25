@@ -397,10 +397,10 @@ fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CompilationCacheDomain, DimensionBounds, DimensionVariable, Placeholder, Shape};
+    use ryft_core::{CompilationCacheDomain, DimensionBounds, DimensionVariable, Placeholder, ProgramBuilder, Shape};
 
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
     use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
@@ -414,7 +414,7 @@ mod tests {
         left_type: DimensionType,
         right_type: DimensionType,
     ) -> String {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(left_type.into());
         let right = builder.add_input(right_type.into());
         let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
@@ -444,7 +444,7 @@ mod tests {
                 Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap())),
             ]),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let static_size = builder
             .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -494,7 +494,7 @@ mod tests {
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
@@ -603,7 +603,7 @@ mod tests {
             let right_variable = DimensionVariable::new("right", right_bounds);
             let left_type = DimensionType::from(left_variable.clone());
             let right_type = DimensionType::from(right_variable.clone());
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let left = builder.add_input(scalar_type.clone().into());
             let right = builder.add_input(scalar_type.clone().into());
             let left = builder
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_saturating_sub_operation_lower() {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(DimensionType::new("left", DimensionBounds::non_negative(None).unwrap()).into());
         let right = builder.add_input(DimensionType::new("right", DimensionBounds::non_negative(None).unwrap()).into());
         let output = builder
@@ -858,7 +858,7 @@ mod tests {
                      expected_output: i64,
                      invalid_operands: (i64, i64),
                      expected_error: &str| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let left_input = builder.add_input(input_type.clone().into());
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder

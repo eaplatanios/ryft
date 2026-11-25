@@ -954,7 +954,7 @@ mod tests {
     };
     use ryft_mlir::Location;
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
         lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,

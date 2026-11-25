@@ -988,7 +988,7 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayOperation, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
         DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DeviceMesh, Differentiate, DimensionBounds,
-        DimensionVariable, DomainTracingContext, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Mul,
+        DimensionVariable, DomainTracingContext, EagerContext, FlatProgram, LogicalMesh, MeshAxis, MeshAxisType, Mul,
         ProjectedContext, Reduce, Sharding, ShardingDimension, Typed, Value, differentiable_dot_product_attention,
         dot_product_attention,
     };
@@ -997,8 +997,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::lowering::lower_mlir_module_for_program;
-    use crate::operations::FlatProgram;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::sessions::tests::domain_mesh;
     #[cfg(feature = "cuda-13")]
     use crate::tests::values_from_bytes;
@@ -1008,7 +1007,7 @@ mod tests {
     use super::*;
 
     /// Staged program together with its input and output types.
-    type StagedProgram = (FlatProgram, Vec<ArrayType>, Vec<ArrayType>);
+    type StagedProgram = (FlatProgram<Session>, Vec<ArrayType>, Vec<ArrayType>);
 
     /// Context whose values are eager XLA [`Array`]s.
     type ArrayContext = ProjectedContext<Session, ArrayType>;

@@ -2,10 +2,10 @@ use std::rc::Rc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EffectClass,
-    EffectClasses, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized, ProgramError,
-    RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed,
-    TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
+    ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EagerContext,
+    EffectClass, EffectClasses, FlatProgram, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized,
+    Program, ProgramError, RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME,
+    ScanOperation, Shape, Typed, TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -13,17 +13,16 @@ use ryft_mlir::{
     Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::emissions::emitted_regions;
 use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
     dimension_extent_i64, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
     physical_bound_type,
 };
-use crate::lowering::{
-    CollectiveLoweringState, EffectTokens, current_or_new_token, emitted_regions, token_threaded_effects,
-};
+use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::operations::{FlatProgram, Program};
 use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
@@ -89,7 +88,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// that admits no iteration adds no token, while one in a body that the implementation of a named composite replaces
 /// only on some platform still adds one.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &Program<ProgramInput, ProgramOutput, O>,
+    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
 ) -> Result<EffectClasses, Error>
 where
     ProgramInput: Parameterized<Constant>,
@@ -352,7 +351,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 /// of being dropped, which would leave later effects of that class unordered with respect to the effects of the region.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<O>,
+    program: &FlatProgram<EagerContext<Constant, O>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[Type],
     context: &'c MlirContext<'t>,
@@ -514,16 +513,16 @@ mod tests {
         AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionType,
         DimensionValue, DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis, Placeholder, PrintOperation,
-        Sharding, ZeroLikeOperation,
+        ProgramBuilder, Sharding, ZeroLikeOperation,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, Program as PjrtProgram};
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{dynamic_dimension, test_vector_type};
     use crate::lowering::types::lower_array_ir_type;
+    use crate::operations::Operation;
     use crate::operations::jit_call::JitCallOperation;
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program};
 
@@ -537,7 +536,7 @@ mod tests {
     /// Stages whether each element of `value` is positive into `builder`. The mixed executable ABI of
     /// `execute_mixed_program` has no boolean inputs, so control flow that executes for both predicate values derives
     /// its predicate from a floating-point selector input.
-    pub(super) fn positive(builder: &mut ArrayIrProgramBuilder, value: AtomId) -> AtomId {
+    pub(super) fn positive(builder: &mut ProgramBuilder<Constant, Operation>, value: AtomId) -> AtomId {
         let zero = builder
             .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![value], None)
             .unwrap()[0];
@@ -548,7 +547,7 @@ mod tests {
 
     /// Lowers `program` with the boundary types of the mixed executable ABI of `execute_mixed_program`, in which
     /// first-class dimensions cross the boundary as `i64` scalars.
-    pub(super) fn lowered_mixed_module(program: &FlatProgram) -> String {
+    pub(super) fn lowered_mixed_module(program: &FlatProgram<Session>) -> String {
         let boundary_type = |r#type: &Type| match r#type {
             Type::Array(r#type) => r#type.clone(),
             Type::Dimension(_) => ArrayType::scalar(DataType::I64),
@@ -632,12 +631,12 @@ mod tests {
     #[test]
     fn test_lowered_effect_classes_excludes_dormant_rule_regions() {
         let array_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let primal = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let tangent = builder.add_input(array_type.clone().into());
         let scalar = builder
@@ -683,7 +682,7 @@ mod tests {
         assert!(requires_assertion_handler);
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let primal = builder.import_region(primal.entry_region_ref());
         let jvp = builder.import_region(jvp.entry_region_ref());
@@ -734,7 +733,7 @@ mod tests {
         // body would be an assertion of the source program, which every scan reports as its own effect.
         let array_type = test_vector_type(4);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = builder.add_input(array_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(extent.clone()).into());
@@ -754,7 +753,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![carry, symbolic], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         let program = |length: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = vec![
                 builder.add_input(array_type.clone().into()),
                 builder.add_input(DimensionType::from(extent.clone()).into()),
@@ -878,7 +877,7 @@ mod tests {
         // advanced token, whereas a region that threads no class could not return it, so lowering it would leave later
         // I/O unordered with respect to the print.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
@@ -1061,7 +1060,7 @@ mod tests {
         let vector_f32 = test_vector_type(2);
 
         let branch = |double: bool| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_f32.clone().into());
             let output = if double {
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0]
@@ -1073,7 +1072,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut scan_body_builder = ArrayIrProgramBuilder::new();
+        let mut scan_body_builder = ProgramBuilder::<Constant, Operation>::new();
         scan_body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = scan_body_builder.add_input(scalar_f32.clone().into());
         let item = scan_body_builder.add_input(scalar_f32.clone().into());
@@ -1087,7 +1086,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut while_condition_builder = ArrayIrProgramBuilder::new();
+        let mut while_condition_builder = ProgramBuilder::<Constant, Operation>::new();
         let state = while_condition_builder.add_input(scalar_f32.clone().into());
         let while_predicate = while_condition_builder
             .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![state, state], None)
@@ -1095,7 +1094,7 @@ mod tests {
         let while_condition = while_condition_builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut while_body_builder = ArrayIrProgramBuilder::new();
+        let mut while_body_builder = ProgramBuilder::<Constant, Operation>::new();
         let state = while_body_builder.add_input(scalar_f32.clone().into());
         let next_state = while_body_builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None)
@@ -1104,7 +1103,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![next_state], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let true_region = builder.import_region(branch(true).entry_region_ref());
         let false_region = builder.import_region(branch(false).entry_region_ref());
         let scan_region = builder.import_region(scan_body.entry_region_ref());
@@ -1144,7 +1143,7 @@ mod tests {
         // Keep the complete mixed control flow program behind one compiled call boundary. Linearization must preserve
         // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
         // condition and loop operations.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(program.entry_region_ref());
         let predicate = builder.add_input(scalar_boolean.clone().into());
         let input = builder.add_input(scalar_f32.clone().into());

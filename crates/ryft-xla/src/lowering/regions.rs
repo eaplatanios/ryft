@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use ryft_core::{
-    AtomId, Instruction, Operation, Parameterized, Program as CoreProgram, ProgramError, RegionRef,
+    AtomId, EagerContext, FlatProgram, Instruction, Operation, Parameterized, Program, ProgramError, RegionRef,
     RematerializationOptimizationBarrier, Type, Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -9,13 +9,14 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::emissions::lowers_without_regions;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::lower_constant;
 use crate::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction,
-    lower_instruction_operation, lowers_without_regions,
+    EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction, lower_instruction_operation,
 };
 use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Constant, Error, FlatProgram, Program};
+use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
 
@@ -37,7 +38,7 @@ use crate::{Constant, Error, FlatProgram, Program};
 /// barrier. Unselected inputs and captured constants, which are not inputs of the body, do not go through the barrier.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<O>,
+    program: &FlatProgram<EagerContext<Constant, O>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -78,7 +79,7 @@ pub(crate) fn lower_program_outputs_with_inputs<
     ProgramOutput,
     O: LowerableOperationFamily,
 >(
-    program: &Program<ProgramInput, ProgramOutput, O>,
+    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -216,7 +217,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
                 output_types.as_slice(),
             )?;
             if lowerer.effect_tokens.ordered_assertion.is_some() {
-                collective_state.has_assertions.set(true);
+                collective_state.record_assertion();
             }
             *effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
@@ -224,7 +225,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     )
 }
 
-/// Drives [`CoreProgram::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR
+/// Drives [`Program::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR
 /// operations appended to `block`.
 ///
 /// The two callbacks plug in lowering policies for [`Atom::Constant`](ryft_core::Atom::Constant)s and [`Instruction`]s
@@ -243,7 +244,7 @@ fn replay_program_into_block<
     LiftConstant,
     ApplyOperation,
 >(
-    program: &CoreProgram<V, O, Input, Output>,
+    program: &Program<V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -332,7 +333,7 @@ pub(in crate::lowering) mod tests {
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::lowering::types::{lower_literal_value, lower_tensor_type};
     use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
-    use crate::{ArrayConstant, Operation};
+    use crate::{ArrayConstant, Operation, Session};
 
     use super::*;
 
@@ -395,7 +396,7 @@ pub(in crate::lowering) mod tests {
                     output_types.as_slice(),
                 )?;
                 if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    collective_state.has_assertions.set(true);
+                    collective_state.record_assertion();
                 }
                 effect_tokens = lowerer.effect_tokens;
                 Ok(outputs)
@@ -407,7 +408,7 @@ pub(in crate::lowering) mod tests {
     /// returns the inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the
     /// enclosing scope already holds an ordered I/O token when the program is inlined, so the barrier must thread it.
     fn lower_nested_program_inline_behind_input_barrier(
-        program: &FlatProgram,
+        program: &FlatProgram<Session>,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         ordered_io: bool,

@@ -296,7 +296,7 @@ mod tests {
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayOperation, BatchAxis, BatchableOperation, BatchedProgram,
         BatchingContext, ConstantOperation, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, DynamicReshapeOperation, EffectClass,
-        EffectClasses, EmptyRegionDriver, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
+        EffectClasses, EmptyRegionDriver, Error as CoreError, FlatProgram, LogicalMesh, MeshAxis, MeshAxisType,
         Operation as CoreOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder as CoreProgramBuilder,
         ProgramError, Reshape, Shape, ShardMapOptions, Sharding, ShardingDimension, StagingContext, TracingContext,
         TransposeOperation, Typed, TypedProgram,
@@ -308,10 +308,10 @@ mod tests {
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
         test_matrix_type, test_vector_type, to_mlir_module_for_plain_program, unproject_plain_program,
     };
+    use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, test_compilation_options, values_to_bytes};
-    use crate::{ArrayConstant, ArrayTracer, Constant, to_mlir_module_for_program};
+    use crate::{ArrayConstant, ArrayTracer, Constant, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -329,9 +329,9 @@ mod tests {
 
     /// Builds the mixed reshape of a static `f64[6]` input to a dynamic `f64[rows]` output whose bound keeps the
     /// physical capacity at six elements, so only a runtime extent of six passes the element count assertion.
-    fn static_input_dynamic_output_reshape_program() -> FlatProgram {
+    fn static_input_dynamic_output_reshape_program() -> FlatProgram<Session> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(7)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [6]).into());
         let extent = builder.add_input(DimensionType::from(rows).into());
         let output = builder
@@ -1013,7 +1013,7 @@ mod tests {
     fn test_dynamic_reshape_operation_lower_physical_capacities() {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
         let dimension_type = DimensionType::new("columns", DimensionBounds::new(0, Some(4)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder
             .add_instruction(
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn test_dynamic_reshape_operation_lower_unbounded_input() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder
             .add_instruction(
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn test_dynamic_reshape_operation_lower_unbounded_output() {
         let input_type = ArrayType::new_static(DataType::F32, [4]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let rows = builder.add_input(DimensionType::new("rows", DimensionBounds::new(0, None).unwrap()).into());
         let output = builder
@@ -1470,7 +1470,7 @@ mod tests {
         for static_output in [false, true] {
             let input_type = ArrayType::new(DataType::I64, Shape::new(vec![dynamic_dimension("input", Some(5))]));
             let size_type = ArrayType::scalar(DataType::I64);
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let size = builder.add_input(size_type.clone().into());
             let dimension_type = if static_output {

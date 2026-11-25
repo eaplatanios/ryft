@@ -9,12 +9,12 @@ use std::collections::HashSet;
 
 use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use ryft_core::{
-    ArrayOperation, DimensionVariable, Operation as CoreOperation, ProgramError, ReductionKind, ScatterMode,
-    ScatterReductionKind, SortDirection, Type as CoreType, Typed,
+    ArrayOperation, DimensionVariable, FlatProgram, Operation as CoreOperation, ProgramError, ReductionKind,
+    ScatterMode, ScatterReductionKind, SortDirection, Type as CoreType, Typed,
 };
 
-use crate::lowering::emitted_regions;
-use crate::{Error, FlatProgram, Operation, Type};
+use crate::lowering::emissions::emitted_regions;
+use crate::{Error, Operation, Session, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -37,7 +37,7 @@ use crate::{Error, FlatProgram, Operation, Type};
 /// bound, or wrapping [`ProgramError::UnsupportedOperation`] when an operation without a supported padding discipline
 /// consumes a data-derived dimension.
 pub(crate) fn validate_data_dependent_compilation(
-    program: &FlatProgram,
+    program: &FlatProgram<Session>,
     target_platform: Option<&str>,
 ) -> Result<(), Error> {
     let mut variables = HashSet::new();
@@ -406,10 +406,11 @@ mod tests {
         Differentiate, Dimension, DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation,
         DimensionToScalarOperation, DimensionType, DimensionVariable, DomainTracingContext, DotDimensionNumbers,
         DotOperation, DynamicBroadcastOperation, Error as CoreError, IotaOperation, LinearCallOperation, MulOperation,
-        NamedComposite, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramError, RandomAlgorithm,
-        ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation, ScaledDotOperation,
-        ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, SortDirection,
-        SortOperation, StaticShape, SubOperation, Value as CoreValue, differentiable_dot_product_attention,
+        NamedComposite, NegOperation, OneOperation, Placeholder, PrintOperation, ProgramBuilder, ProgramError,
+        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceNewOperation, RngBitGeneratorOperation,
+        ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape,
+        SortDirection, SortOperation, StaticShape, SubOperation, Value as CoreValue,
+        differentiable_dot_product_attention,
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
@@ -421,9 +422,7 @@ mod tests {
         domain_mesh, f32_vector, read_booleans, read_first_shard, replicated_scalar_type, replicated_vector_type,
     };
     use crate::tests::{cpu_client, execution_client, values_from_bytes};
-    use crate::{
-        Array, Constant, Error, FlatProgram, Operation, Options, ProgramBuilder, Session, Tracer, Type, Value,
-    };
+    use crate::{Array, Constant, Error, Operation, Options, Session, Tracer, Type, Value};
 
     use super::*;
 
@@ -461,7 +460,7 @@ mod tests {
     }
 
     /// Builds the kind-sensitive bounded-dynamic padding fixture shared by CPU and CUDA execution tests.
-    fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram {
+    fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram<Session> {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let index_type = dynamic_type.clone().with_data_type(DataType::U64);
         let matrix_type =
@@ -471,7 +470,7 @@ mod tests {
         // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
         // sort. The boolean reductions cover their own false and true identities, and dot covers a contraction padded
         // with zeros.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
@@ -613,10 +612,10 @@ mod tests {
         scaled_element_type: DataType,
         scaled_scale_type: DataType,
         attention_implementation: AttentionImplementation,
-    ) -> FlatProgram {
+    ) -> FlatProgram<Session> {
         /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
         fn bind<O: Into<Operation>>(value: &Tracer, operation: O, inputs: &[Tracer]) -> Tracer {
-            value.domain().bind(operation, Vec::<FlatProgram>::new(), inputs).unwrap().remove(0)
+            value.domain().bind(operation, Vec::<FlatProgram<Session>>::new(), inputs).unwrap().remove(0)
         }
 
         let scaled_block_size = match scaled_element_type {
@@ -721,7 +720,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
 
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
         let dimension = builder
@@ -743,7 +742,7 @@ mod tests {
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
@@ -774,7 +773,7 @@ mod tests {
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
@@ -802,7 +801,7 @@ mod tests {
         // become observable.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
@@ -832,7 +831,7 @@ mod tests {
         // upper-bound element count rather than the logical one.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.clone().into());
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
         let dimension = builder
@@ -866,7 +865,7 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(size_type.into());
         let indices = builder.add_input(indices_type.into());
         let updates = builder.add_input(updates_type.into());
@@ -915,7 +914,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
         let dimension_type = DimensionType::from(extent.clone());
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let size = builder.add_input(replicated_scalar_type(&mesh, DataType::I64).into());
         let dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
@@ -951,7 +950,7 @@ mod tests {
         // dynamic broadcast of the sum of its linear input when `dynamic` is set. That mean consumes a data-derived
         // dimension, which admission rejects in a region that lowering emits.
         let build_region = |dynamic: bool| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let linear = builder.add_input(vector_type.clone().into());
             let output =
@@ -987,22 +986,23 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let build_program = |forward: &FlatProgram, transpose: &FlatProgram| -> FlatProgram {
-            let mut builder = ProgramBuilder::new();
-            let forward = builder.import_region(forward.entry_region_ref());
-            let transpose = builder.import_region(transpose.entry_region_ref());
-            let residual = builder.add_input(vector_type.clone().into());
-            let linear = builder.add_input(vector_type.clone().into());
-            let output = builder
-                .add_instruction(
-                    Operation::LinearCall(LinearCallOperation::new(1)),
-                    vec![forward, transpose],
-                    vec![residual, linear],
-                    None,
-                )
-                .unwrap()[0];
-            builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
-        };
+        let build_program =
+            |forward: &FlatProgram<Session>, transpose: &FlatProgram<Session>| -> FlatProgram<Session> {
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
+                let forward = builder.import_region(forward.entry_region_ref());
+                let transpose = builder.import_region(transpose.entry_region_ref());
+                let residual = builder.add_input(vector_type.clone().into());
+                let linear = builder.add_input(vector_type.clone().into());
+                let output = builder
+                    .add_instruction(
+                        Operation::LinearCall(LinearCallOperation::new(1)),
+                        vec![forward, transpose],
+                        vec![residual, linear],
+                        None,
+                    )
+                    .unwrap()[0];
+                builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
+            };
 
         // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so the mean there does
         // not keep the static primal from compiling.
@@ -1038,7 +1038,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(scalar_type.clone().into());
             let carry = builder.add_input(scalar_type.clone().into());
             let dimension = builder
@@ -1049,7 +1049,7 @@ mod tests {
             Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
         };
         let program = |length: usize| {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let regions = vec![builder.intern_callee(&body, None).unwrap()];
             let scan = ScanOperation::<Type>::new(1, length);
@@ -1058,11 +1058,11 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let lower = |program: &FlatProgram| {
+        let lower = |program: &FlatProgram<Session>| {
             let lowered = session.lower_program(program, 0, &Options::new(mesh.clone()));
             lowered.map(|_| ()).map_err(|error| error.to_string())
         };
-        let validate = |program: &FlatProgram, target_platform: Option<&str>| {
+        let validate = |program: &FlatProgram<Session>, target_platform: Option<&str>| {
             validate_data_dependent_compilation(program, target_platform).map_err(|error| error.to_string())
         };
         let unbounded =
@@ -1078,7 +1078,7 @@ mod tests {
         let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("unbounded").with_named_composite(named));
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
             let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
             let dimension = builder
@@ -1088,7 +1088,7 @@ mod tests {
                 builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.into());
         let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
         let regions = vec![builder.intern_callee(&body, None).unwrap()];

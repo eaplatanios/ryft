@@ -9,7 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::CollectiveLoweringState;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::operations::extrema::FloatExtremumForm;

@@ -410,16 +410,16 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
         BatchingContext, ConstantOperation, DataType, Dimension, DimensionBounds, DimensionSize, DimensionVariable,
-        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization, Placeholder,
+        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, FlatProgram, Linearization, Placeholder,
         ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers, ScatterMode,
         ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypeError, TypedProgram, ValueProjection,
         differentiate_at, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
-    use crate::operations::{FlatProgram, Operation};
+    use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
@@ -1019,7 +1019,7 @@ mod tests {
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
         // operation rule runs, so the joint rule is driven through the dynamic extent policy directly, with the mapped
         // extent read from the staged input.
-        let stage = |operation: ScatterOperation| -> FlatProgram {
+        let stage = |operation: ScatterOperation| -> FlatProgram<Session> {
             crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
                     let extent = inputs[0].dimension_size(0).unwrap();
@@ -1049,7 +1049,7 @@ mod tests {
         // all-ones cotangent, runs it on the client, and returns the primal output, the input gradient, and the
         // updates gradient.
         let execute = |linearization: &Linearization<Constant, Operation>,
-                       pullback: &FlatProgram,
+                       pullback: &FlatProgram<Session>,
                        size: usize,
                        values: &[f64],
                        indices: &[i32],

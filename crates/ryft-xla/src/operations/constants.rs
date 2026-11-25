@@ -664,7 +664,7 @@ mod tests {
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type,
         to_mlir_module_for_plain_program,
     };
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -1233,7 +1233,7 @@ mod tests {
             let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
             assert_eq!(module, expected);
 
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let zero = ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone()));
             let output = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
             let program =
@@ -1559,7 +1559,7 @@ mod tests {
         // output must nevertheless report its own logical extent.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
@@ -1749,7 +1749,7 @@ mod tests {
         // exemplar's elements never reach the results.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
         let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), Dimension::Static(2)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let exemplar = builder.add_input(exemplar_type.into());
         let fill = FillLikeOperation::<Type>::new(Array::scalar(2.5f64).unwrap()).unwrap();
         let fill = ArrayIrOperation::<ArrayConstant>::from(fill);
@@ -1787,7 +1787,7 @@ mod tests {
         // which a dimension constant would supply instead, so the constructors keep it dynamic.
         let size = DimensionVariable::new("size", DimensionBounds::new(3, Some(4)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
@@ -1881,7 +1881,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(3)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into()]))
             .with_memory(Memory::Host { pinned: true });
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(DimensionType::from(size).into());
         let zero = builder
             .add_instruction(
@@ -1949,7 +1949,7 @@ mod tests {
         // validate identities shared by boundary inputs. Both axes therefore stay dynamic without any assertion.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(DimensionType::from(size.clone()).into());
         let second = builder.add_input(DimensionType::from(size).into());
         let output = builder
@@ -2005,7 +2005,7 @@ mod tests {
         // Reusing one operand for every axis of a symbolic identity needs no assertion either.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(DimensionType::from(size).into());
         let output = builder
             .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![input, input], None)
@@ -2055,7 +2055,7 @@ mod tests {
         // reach the lowered constructor.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let second = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
@@ -2091,7 +2091,7 @@ mod tests {
         // constructors share the mixed boundary and cover both operand orders.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let zero = builder
@@ -2180,7 +2180,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![size.clone().into(), size.clone().into(), size.clone().into()]),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(2).unwrap()));
         let output = builder

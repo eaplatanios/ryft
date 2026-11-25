@@ -18,13 +18,13 @@ use serde_json::json;
 use ryft_core::{
     Add, AddOperation, ArrayIrValue, ArrayType, ConditionOperation, Context, DataType, Device, DeviceMesh,
     Dimension as CoreDimension, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, Placeholder,
-    ReferenceNew, ReferenceRead, Shape, Sharding,
+    ProgramBuilder, ReferenceNew, ReferenceRead, Shape, Sharding,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program, load_cpu_plugin};
 use ryft_xla::{
-    Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, ProgramBuilder,
-    Session, Type, Value, jit,
+    Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, Session, Type, Value,
+    jit,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -176,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Eager `condition` whose branch programs are rebuilt for every application, like closures traced per call.
     let branch_type = Type::Array(input_type.clone());
     let branch = |operation: Operation| {
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let value = builder.add_input(branch_type.clone());
         let output = builder.add_instruction(operation, Vec::new(), vec![value, value], None).unwrap()[0];
         builder

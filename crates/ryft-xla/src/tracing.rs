@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 
 use ryft_core::{
-    ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, ProgramError, ProgramStatistics,
+    ArrayType, DomainTracingContext, Parameterized, ParameterizedFamily, Program, ProgramError, ProgramStatistics,
     ProjectedValue, Sharding, Typed, ValueProjection,
 };
 
@@ -28,7 +28,7 @@ use crate::compilation::placements::{
     entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, pruned_program,
 };
 use crate::lowering::emissions::collect_session_constants;
-use crate::{Constant, Error, Program, Session, Tracer, Type};
+use crate::{Constant, Error, Operation, Session, Tracer, Type};
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
@@ -36,9 +36,9 @@ use crate::{Constant, Error, Program, Session, Tracer, Type};
 /// same values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 
-/// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`]. The global input
-/// and output types describe the whole logical arrays at the function boundary. For example, a global array of shape
-/// `[8]` split evenly across two devices has shape `[4]` on each device.
+/// Traced XLA program backed by a staged [`Program`], as returned by [`trace`]. The global input and output types
+/// describe the whole logical arrays at the function boundary. For example, a global array of shape `[8]` split evenly
+/// across two devices has shape `[4]` on each device.
 pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where
     Input::Family: ParameterizedFamily<Constant>,
@@ -51,7 +51,7 @@ where
     output_type: Output,
 
     /// Staged traced XLA program specialized to abstract array leaves.
-    program: Program<Input::To<Constant>, Output::To<Constant>>,
+    program: Program<Constant, Operation, Input::To<Constant>, Output::To<Constant>>,
 }
 
 impl<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>> TracedProgram<Input, Output>
@@ -73,7 +73,7 @@ where
 
     /// Returns the staged program that backs this [`TracedProgram`].
     #[inline]
-    pub fn program(&self) -> &Program<Input::To<Constant>, Output::To<Constant>> {
+    pub fn program(&self) -> &Program<Constant, Operation, Input::To<Constant>, Output::To<Constant>> {
         &self.program
     }
 

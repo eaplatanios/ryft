@@ -2002,9 +2002,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    #[cfg(feature = "cuda-13")]
-    use indoc::formatdoc;
-
     use ryft_core::{
         Add, BatchAxis, Complex, DataType, DeviceMesh, DifferentiableType, Dimension, DomainTracingContext,
         Error as CoreError, Exp, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Operation as CoreOperation,
@@ -2032,9 +2029,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::arrays::host::DIFFERENT_VALUES_MESSAGE;
     #[cfg(feature = "cuda-13")]
-    use crate::distributed::tests::{
-        read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair, run_cuda_rank_pair_probes,
-    };
+    use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair};
 
     use super::*;
 
@@ -2120,14 +2115,49 @@ mod tests {
         }
     }
 
+    /// Returns the text that identifies `error` in the outcome of a placement on one rank of a multi-process test:
+    /// [`DIFFERENT_VALUES_MESSAGE`] when it reports the failed comparison of the values of the ranks, and otherwise the
+    /// first line of the error.
+    #[cfg(feature = "cuda-13")]
+    fn placement_error_outcome(error: Error) -> String {
+        match error {
+            Error::Pjrt(PjrtError::FailedPrecondition { message, .. }) if message == DIFFERENT_VALUES_MESSAGE => {
+                message
+            }
+            error => error.to_string().lines().next().unwrap_or("").to_string(),
+        }
+    }
+
+    /// Returns the outcome of `placed` on this rank: the elements of the shards of this rank once the placed array is
+    /// ready, or the [`placement_error_outcome`] of the error of the placement or of its readiness.
+    #[cfg(feature = "cuda-13")]
+    fn placement_outcome(placed: Result<Array, Error>) -> Result<Vec<Vec<f32>>, String> {
+        placed
+            .and_then(|placed| placed.block_until_ready().map(|()| placed))
+            .map(|placed| read_addressable_f32s(&placed))
+            .map_err(placement_error_outcome)
+    }
+
+    /// Places `source`, an array on the device of rank 0, replicated onto every device of `mesh`, which spans both
+    /// ranks, and returns its [`placement_outcome`]. This ordinary cross-host placement completes only if both ranks
+    /// are still in step, so tests run it after a placement that fails on some rank.
+    #[cfg(feature = "cuda-13")]
+    fn place_replicated_across_ranks(
+        session: &Session,
+        source: &Array,
+        mesh: &DeviceMesh,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let target = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
+        placement_outcome(source.to_placement(session, target))
+    }
+
     /// Places on every rank of the job of `client` a host value with [`Session::place`] and an array that each rank
     /// uploaded without devices with [`Array::to_placement`] onto a split over the two global devices, with the same
     /// values on both ranks or, when `differ` is `true`, with values that differ between them, and then places an
-    /// array of rank 0 replicated onto both devices. Prints one `probe:` line for each placement with the elements of
-    /// the shards of this rank once its result is ready, `different values` when its readiness reports the failed
-    /// comparison of the values of the ranks, or the first line of any other error.
+    /// array of rank 0 replicated onto both devices with [`place_replicated_across_ranks`]. Returns the
+    /// [`placement_outcome`] of these three placements on this rank, in that order.
     #[cfg(feature = "cuda-13")]
-    fn probe_value_comparison(client: &'static Client<'static>, differ: bool) {
+    fn place_values_of_ranks(client: &'static Client<'static>, differ: bool) -> [Result<Vec<Vec<f32>>, String>; 3] {
         let rank = client.process_index().unwrap();
         let devices = client
             .devices()
@@ -2143,34 +2173,18 @@ mod tests {
         let (process_0_mesh, forward_mesh) = (mesh(vec![devices[0]]), mesh(devices.clone()));
         let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
         let split = Placement::new(forward_mesh.clone(), split.unwrap()).unwrap();
-        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let report = |name: &str, placed: Result<Array, Error>| {
-            let outcome = match placed.and_then(|placed| placed.block_until_ready().map(|()| placed)) {
-                Ok(placed) => format!("{:?}", read_addressable_f32s(&placed)),
-                Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
-                    if message == DIFFERENT_VALUES_MESSAGE =>
-                {
-                    "different values".to_string()
-                }
-                Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-            };
-            println!("probe: rank {rank} {name}: {outcome}");
-        };
-
         let offset = if differ { 10. * rank as f32 } else { 0. };
         let values = values_to_bytes(&[1f32, 2., 3., 4.].map(|value| value + offset));
         let r#type = ArrayType::new_static(DataType::F32, [4]);
         let host = CoreArray::new(r#type.clone(), values.clone()).unwrap();
-        report("host value", session.place(host, PlacementOptions::to(PlacementRequest::from(split.clone()))));
+        let host = placement_outcome(session.place(host, PlacementOptions::to(PlacementRequest::from(split.clone()))));
         let uploaded = Array::from_host_buffer(&session, r#type.clone(), None, None, values).unwrap();
-        report("uploaded array", uploaded.to_placement(&session, split));
+        let uploaded = placement_outcome(uploaded.to_placement(&session, split));
 
-        // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
-        let r#type = r#type.with_sharding(replicated(&process_0_mesh)).unwrap();
+        let r#type = r#type.with_sharding(Sharding::replicated(process_0_mesh.logical_mesh().clone(), 1)).unwrap();
         let values = values_to_bytes(&[17f32, 18., 19., 20.]);
-        let source = Array::from_host_buffer(&session, r#type, process_0_mesh.clone(), None, values).unwrap();
-        let target = Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap();
-        report("cross-host placement", source.to_placement(&session, target));
+        let source = Array::from_host_buffer(&session, r#type, process_0_mesh, None, values).unwrap();
+        [host, uploaded, place_replicated_across_ranks(&session, &source, &forward_mesh)]
     }
 
     /// Runs `check` in one of the two CPU processes of a placement test (refer to [`run_cpu_processes`]), and returns
@@ -7131,63 +7145,54 @@ mod tests {
     }
 
     // Worker of `test_session_place_compares_equal_values_on_two_cuda_processes`, which returns immediately unless that
-    // test launched it as one of its two ranks.
+    // test launched it as one of its two ranks, and asserts the outcomes of its rank.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_session_place_compares_equal_values_cuda_process_helper() {
-        run_as_cuda_rank(|client| probe_value_comparison(client, false));
+        run_as_cuda_rank(|client| {
+            // Equal values pass the comparison, and each rank holds its shard of the value.
+            let rank = client.process_index().unwrap();
+            let shard: Result<Vec<Vec<f32>>, String> = Ok([vec![vec![1., 2.]], vec![vec![3., 4.]]][rank].clone());
+            assert_eq!(
+                place_values_of_ranks(client, false),
+                [shard.clone(), shard, Ok(vec![vec![17., 18., 19., 20.]])],
+            );
+        });
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
     fn test_session_place_compares_equal_values_on_two_cuda_processes() {
-        // Equal values pass the comparison, and each rank holds its shard of the value.
-        let helper = "arrays::placement::tests::test_session_place_compares_equal_values_cuda_process_helper";
-        let probes = run_cuda_rank_pair_probes(helper);
-        assert_eq!(
-            probes,
-            indoc! {"
-                rank 0 host value: [[1.0, 2.0]]
-                rank 0 uploaded array: [[1.0, 2.0]]
-                rank 0 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]
-                rank 1 host value: [[3.0, 4.0]]
-                rank 1 uploaded array: [[3.0, 4.0]]
-                rank 1 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]"},
-        );
+        run_cuda_rank_pair("arrays::placement::tests::test_session_place_compares_equal_values_cuda_process_helper");
     }
 
     // Worker of `test_session_place_rejects_different_values_on_two_cuda_processes`, which returns immediately unless
-    // that test launched it as one of its two ranks.
+    // that test launched it as one of its two ranks, and asserts the outcomes of its rank.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_session_place_rejects_different_values_cuda_process_helper() {
-        run_as_cuda_rank(|client| probe_value_comparison(client, true));
+        run_as_cuda_rank(|client| {
+            // Different values fail the results of both ranks alike without a hang, and the ranks stay in step.
+            let different_values: Result<Vec<Vec<f32>>, String> = Err(DIFFERENT_VALUES_MESSAGE.to_string());
+            assert_eq!(
+                place_values_of_ranks(client, true),
+                [different_values.clone(), different_values, Ok(vec![vec![17., 18., 19., 20.]])],
+            );
+        });
     }
 
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
     fn test_session_place_rejects_different_values_on_two_cuda_processes() {
-        // Different values fail the results of both ranks alike without a hang, and the ranks stay in step.
-        let helper = "arrays::placement::tests::test_session_place_rejects_different_values_cuda_process_helper";
-        let probes = run_cuda_rank_pair_probes(helper);
-        assert_eq!(
-            probes,
-            indoc! {"
-                rank 0 host value: different values
-                rank 0 uploaded array: different values
-                rank 0 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]
-                rank 1 host value: different values
-                rank 1 uploaded array: different values
-                rank 1 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]"},
-        );
+        run_cuda_rank_pair("arrays::placement::tests::test_session_place_rejects_different_values_cuda_process_helper");
     }
 
     // Worker of `test_session_place_reports_an_invalid_leaf_on_two_cuda_processes`, which returns immediately unless
-    // that test launched it as one of its two ranks.
+    // that test launched it as one of its two ranks, and asserts the outcomes of its rank.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
@@ -7195,9 +7200,7 @@ mod tests {
         run_as_cuda_rank(|client| {
             // Places a tree of two `bool[2]` host values with `Session::place` onto a split over the two global
             // devices, whose first leaf on rank 0 holds a byte that does not encode a `bool`, and then places an array
-            // of rank 0 replicated onto both devices. Prints one `probe:` line for the tree, with `invalid value` when
-            // the call returns the error of that leaf and otherwise `different values` for each leaf whose readiness
-            // reports the failed comparison, and one for the cross-host placement, as `probe_value_comparison` does.
+            // of rank 0 replicated onto both devices.
             let rank = client.process_index().unwrap();
             let devices = client
                 .devices()
@@ -7217,45 +7220,28 @@ mod tests {
                 first.storage_bytes_mut()[0] = 2;
             }
             let tree = vec![first, CoreArray::new(bools, vec![0, 1]).unwrap()];
-            let outcome = match session.place(tree, PlacementOptions::to(PlacementRequest::from(split))) {
-                Ok(placed) => placed
-                    .iter()
-                    .map(|placed| match placed.block_until_ready() {
-                        Ok(()) => "ready".to_string(),
-                        Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
-                            if message == DIFFERENT_VALUES_MESSAGE =>
-                        {
-                            "different values".to_string()
-                        }
-                        Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                Err(Error::Array(error))
-                    if matches!(error.as_ref(), ArrayError::FailedParameterPlacement { source, .. }
-                        if source.to_string() == "array element 0 has invalid `bool` byte encoding [2]") =>
-                {
-                    "invalid value".to_string()
-                }
-                Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-            };
-            println!("probe: rank {rank} tree: {outcome}");
+            let placed = session.place(tree, PlacementOptions::to(PlacementRequest::from(split)));
+            let placed = placed
+                .map(|placed| {
+                    let ready = placed.iter().map(|placed| placed.block_until_ready().map_err(placement_error_outcome));
+                    ready.collect::<Vec<_>>()
+                })
+                .map_err(placement_error_outcome);
 
-            // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
-            let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
-            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated(&process_0_mesh)).unwrap();
+            // The rank whose first leaf is invalid returns its error after the one comparison of the call, the other
+            // rank sees the mismatch on both of its results, and both stay in step.
+            let invalid =
+                "failed to place the parameter at `$[0]`: array element 0 has invalid `bool` byte encoding [2]";
+            let different_values: Result<(), String> = Err(DIFFERENT_VALUES_MESSAGE.to_string());
+            assert_eq!(placed, [Err(invalid.to_string()), Ok(vec![different_values.clone(), different_values])][rank]);
+            let r#type = ArrayType::new_static(DataType::F32, [4]);
+            let r#type = r#type.with_sharding(Sharding::replicated(process_0_mesh.logical_mesh().clone(), 1)).unwrap();
             let values = values_to_bytes(&[17f32, 18., 19., 20.]);
-            let source = Array::from_host_buffer(&session, r#type, process_0_mesh.clone(), None, values).unwrap();
-            let target = Placement::new(forward_mesh.clone(), replicated(&forward_mesh)).unwrap();
-            let placed = source.to_placement(&session, target);
-            let placed = placed.and_then(|placed| placed.block_until_ready().map(|()| placed));
-            match placed {
-                Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
-                Err(error) => {
-                    let error = error.to_string();
-                    println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
-                }
-            }
+            let source = Array::from_host_buffer(&session, r#type, process_0_mesh, None, values).unwrap();
+            assert_eq!(
+                place_replicated_across_ranks(&session, &source, &forward_mesh),
+                Ok(vec![vec![17., 18., 19., 20.]]),
+            );
         });
     }
 
@@ -7263,22 +7249,11 @@ mod tests {
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
     fn test_session_place_reports_an_invalid_leaf_on_two_cuda_processes() {
-        // The rank whose first leaf is invalid returns its error after the one comparison of the call, the other rank
-        // sees the mismatch on both of its results, and both stay in step.
-        let helper = "arrays::placement::tests::test_session_place_reports_an_invalid_leaf_cuda_process_helper";
-        let probes = run_cuda_rank_pair_probes(helper);
-        assert_eq!(
-            probes,
-            indoc! {"
-                rank 0 tree: invalid value
-                rank 0 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]
-                rank 1 tree: different values, different values
-                rank 1 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]"},
-        );
+        run_cuda_rank_pair("arrays::placement::tests::test_session_place_reports_an_invalid_leaf_cuda_process_helper");
     }
 
     // Worker of `test_session_place_rejects_a_call_with_an_invalid_leaf_on_two_cuda_processes`, which returns
-    // immediately unless that test launched it as one of its two ranks.
+    // immediately unless that test launched it as one of its two ranks, and asserts the outcomes of its rank.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
@@ -7287,9 +7262,7 @@ mod tests {
             // Places with one call of `Session::place` a host value split over the two global devices, which is a
             // scalar on rank 0 (so that only rank 0 rejects it) and a vector on rank 1, and an array of rank 0
             // replicated onto both devices, which rank 1 can only receive from rank 0. Then places that array once
-            // more on its own. Prints one `probe:` line for the call, with `different values` when it returns the
-            // error of the failed comparison or otherwise the first line of its error or the elements of the shards
-            // of this rank, and one for the placement that follows it.
+            // more on its own.
             let rank = client.process_index().unwrap();
             let devices = client
                 .devices()
@@ -7313,31 +7286,24 @@ mod tests {
                 _ => CoreArray::vector(vec![1f32, 2.]).unwrap(),
             };
             let tree = vec![PlaceInput::Host(host), PlaceInput::Runtime(source.clone())];
-            let options = PlacementOptions::to(vec![split, replicated.clone()]);
+            let options = PlacementOptions::to(vec![split, replicated]);
             let placed = session.place(tree, options).and_then(|placed| {
                 placed.iter().try_for_each(Array::block_until_ready)?;
                 Ok(placed)
             });
-            let outcome = match placed {
-                Ok(placed) => format!("{:?}", placed.iter().map(read_addressable_f32s).collect::<Vec<_>>()),
-                Err(Error::Pjrt(ryft_pjrt::Error::FailedPrecondition { message, .. }))
-                    if message == DIFFERENT_VALUES_MESSAGE =>
-                {
-                    "different values".to_string()
-                }
-                Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
-            };
-            println!("probe: rank {rank} tree: {outcome}");
+            let placed = placed.map(|placed| placed.iter().map(read_addressable_f32s).collect::<Vec<_>>());
 
-            // An ordinary cross-host placement afterwards completes only if both ranks are still in step.
-            let placed = source.to_placement(&session, replicated);
-            match placed.and_then(|placed| placed.block_until_ready().map(|()| placed)) {
-                Ok(placed) => println!("probe: rank {rank} cross-host placement: {:?}", read_addressable_f32s(&placed)),
-                Err(error) => {
-                    let error = error.to_string();
-                    println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
-                }
-            }
+            // The first leaf is invalid on rank 0 only, and the second leaf of the same call is a cross-host move that
+            // rank 1 could only complete with rank 0. Both ranks return without placing either leaf, rank 0 with its
+            // own error and rank 1 with the mismatch, and both stay in step for the placement that follows.
+            let leaf = "failed to place the parameter at `$[0]`";
+            let error = "`place` target sharding rank (1) does not match the input rank (0)";
+            let errors = [format!("{leaf}: {error}"), DIFFERENT_VALUES_MESSAGE.to_string()];
+            assert_eq!(placed.map_err(placement_error_outcome), Err(errors[rank].clone()));
+            assert_eq!(
+                place_replicated_across_ranks(&session, &source, &forward_mesh),
+                Ok(vec![vec![17., 18., 19., 20.]]),
+            );
         });
     }
 
@@ -7345,21 +7311,8 @@ mod tests {
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
     fn test_session_place_rejects_a_call_with_an_invalid_leaf_on_two_cuda_processes() {
-        // The first leaf is invalid on rank 0 only, and the second leaf of the same call is a cross-host move that rank
-        // 1 could only complete with rank 0. Both ranks return without placing either leaf, rank 0 with its own error
-        // and rank 1 with the mismatch, and both stay in step for the placement that follows.
-        let helper =
-            "arrays::placement::tests::test_session_place_rejects_a_call_with_an_invalid_leaf_cuda_process_helper";
-        let probes = run_cuda_rank_pair_probes(helper);
-        let leaf = "failed to place the parameter at `$[0]`";
-        let error = "`place` target sharding rank (1) does not match the input rank (0)";
-        assert_eq!(
-            probes,
-            formatdoc! {"
-                rank 0 tree: {leaf}: {error}
-                rank 0 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]
-                rank 1 tree: different values
-                rank 1 cross-host placement: [[17.0, 18.0, 19.0, 20.0]]"},
+        run_cuda_rank_pair(
+            "arrays::placement::tests::test_session_place_rejects_a_call_with_an_invalid_leaf_cuda_process_helper",
         );
     }
 

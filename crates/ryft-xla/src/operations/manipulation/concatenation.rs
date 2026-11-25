@@ -226,7 +226,8 @@ mod tests {
         ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh, Dimension,
         DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
         DimensionValue, DimensionVariable, EffectClasses, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, Shape, Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
+        Placeholder, ProgramBuilder as ArrayIrProgramBuilder, Shape, Sharding, ShardingDimension, TypeError, Typed,
+        TypedProgram,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -235,7 +236,7 @@ mod tests {
         ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, to_mlir_module_for_plain_program,
     };
     use crate::lowering::types::physical_bound_type;
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, Type, compile,
@@ -306,7 +307,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let result_extent = builder
@@ -365,7 +366,7 @@ mod tests {
             &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
         )
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
         let first_size = builder.add_instruction(first_size_operation, Vec::new(), vec![first], None).unwrap()[0];
@@ -459,7 +460,7 @@ mod tests {
                     &[first_type.clone().into(), second_type.clone().into(), extent_type.into()],
                 )
                 .unwrap();
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
                 let first = builder.add_input(first_type.clone().into());
                 let second = builder.add_input(second_type.clone().into());
                 let extent = builder

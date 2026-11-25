@@ -567,9 +567,10 @@ mod tests {
         BatchAxis, Composite, CustomCall, CustomCallArrayAttribute, CustomCallAttribute, CustomCallBatching,
         CustomCallOperation, CustomCallUnrolling, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
         DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracer, EffectClass,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation, ProjectedContext, Reduce,
-        ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, StaticShape, StridedLayout, Tile,
-        TileDimension, TiledLayout, Typed, TypedProgram, batch, differentiate_at, shard_map,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Placeholder, PrintOperation,
+        ProgramBuilder as ArrayIrProgramBuilder, ProjectedContext, Reduce, ReductionKind, Shape, ShardMapOptions,
+        Sharding, ShardingDimension, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Typed, TypedProgram,
+        batch, differentiate_at, shard_map,
     };
     use ryft_mlir::{DialectHandle, Operation as MlirOperation, Value as MlirValue, WalkOrder, WalkResult};
     use ryft_pjrt::extensions::ffi::{
@@ -578,12 +579,12 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, static_sharded_array_type, test_matrix_type,
         unproject_plain_program,
     };
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{
@@ -915,7 +916,7 @@ mod tests {
         let array_type = test_matrix_type(2, 3);
         let first = RuntimeRequirement::new("test.first", 2).unwrap();
         let second = RuntimeRequirement::new("test.second", 1).unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
             .with_attribute("scale", 2i64)
@@ -972,7 +973,7 @@ mod tests {
     #[test]
     fn test_custom_call_runtime_requirements_conflict_across_operations() {
         let array_type = test_matrix_type(2, 3);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let mut output = builder.add_input(array_type.clone().into());
         for version in [1, 2] {
             let operation = CustomCallOperation::new("ryft.test.runtime", vec![array_type.clone()])
@@ -1082,7 +1083,7 @@ mod tests {
         // operand, and the static aliased result is refined with the trailing logical extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -1180,7 +1181,7 @@ mod tests {
         // result regains the input's runtime extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
@@ -1204,7 +1205,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size)]));
         let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let operation = CustomCallOperation::new("ryft.test.unbounded", vec![output_type.clone()]);
         let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -1226,7 +1227,7 @@ mod tests {
         // extent and its redundant extent operand does not refine the result.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let extent =
             builder.add_constant(Constant::Dimension(DimensionValue::new(DimensionType::from(extent), 3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.exact", vec![dynamic_type]);
@@ -1259,7 +1260,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(9)).unwrap());
         let alias_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]));
         let mixed_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let alias_extent = builder
@@ -1382,7 +1383,7 @@ mod tests {
         ] {
             let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
             let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let symbolic = builder.add_input(DimensionType::from(size).into());
             let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
             let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]).with_effect_class(effect);
@@ -1411,7 +1412,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]))
             .with_memory(Memory::Host { pinned: true });
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
         let operation = CustomCallOperation::new("ryft.test.guarded", vec![output_type]);
@@ -1525,7 +1526,7 @@ mod tests {
                 let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
                 let output_type =
                     ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
                 let symbolic = builder.add_input(DimensionType::from(size).into());
                 let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
                 let inputs = if exact_first { vec![exact, symbolic] } else { vec![symbolic, exact] };
@@ -1555,7 +1556,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let alias_type = ArrayType::new_static(DataType::F64, [4]);
         let mixed_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(alias_type.clone().into());
         let symbolic = builder.add_input(DimensionType::from(size).into());
         let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));

@@ -8,7 +8,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::cast_changes_explicit_placement;
+use crate::lowering::modules::cast_changes_explicit_placement;
 use crate::lowering::types::{
     lower_f64_constant_splat, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
     lower_signed_one_bit_to_mlir, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
@@ -1101,10 +1101,10 @@ mod tests {
         ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalar,
         DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, Error as CoreError,
         GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder,
-        Placement, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision,
-        ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape,
-        StridedLayout, Tile, TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed,
-        ValueProjection, WhileOperation,
+        Placement, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramBuilder as ArrayIrProgramBuilder,
+        ProgramError, ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding,
+        ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+        Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection, WhileOperation,
     };
     use ryft_mlir::{Location, OperationResultRef};
     use ryft_pjrt::extensions::ffi::{
@@ -1117,9 +1117,9 @@ mod tests {
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
         to_mlir_module_for_plain_program,
     };
+    use crate::operations::Operation;
     use crate::operations::debugging::with_captured_prints;
     use crate::operations::jit_call::JitCallOperation;
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, f32_vector, read_first_shard};
     use crate::tests::{
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
@@ -1461,7 +1461,7 @@ mod tests {
         )
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let values = builder.add_input(declared_type.into());
         let halves = builder
             .add_instruction(
@@ -1704,7 +1704,7 @@ mod tests {
     #[test]
     fn test_cast_operation_lower_dimension() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let value = builder.add_input(n.clone().into());
         let output = builder
             .add_instruction(
@@ -1889,7 +1889,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             if index {
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
             }
@@ -1924,7 +1924,7 @@ mod tests {
                 if wrapper == 0 && !entered {
                     continue;
                 }
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
                 let input = builder.add_input(symbolic.clone());
                 let region = builder.import_program(body(wrapper >= 3, true));
                 let output = match wrapper {
@@ -1954,7 +1954,7 @@ mod tests {
                             .unwrap()[0]
                     }
                     2 => {
-                        let mut condition = ArrayIrProgramBuilder::new();
+                        let mut condition = ArrayIrProgramBuilder::<Constant, Operation>::new();
                         condition.add_input(symbolic.clone());
                         let predicate = condition.add_constant(Constant::Boolean(entered));
                         let condition = condition
@@ -2078,7 +2078,7 @@ mod tests {
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         let output = ArrayType::new_static(DataType::F64, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let value = builder.add_input(input.clone().into());
         let result = builder
             .add_instruction(
@@ -2154,7 +2154,7 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: Type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let exact: Type = ArrayType::new_static(DataType::F64, [2]).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(exact);
         let second = builder.add_input(symbolic.clone());
         let narrowed = builder
@@ -2247,7 +2247,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -2364,7 +2364,7 @@ mod tests {
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let relation = ArrayType::new(DataType::F64, Shape::new(vec![p.simplified_dimension(); 2]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array.clone().into());
         let input = builder
             .add_instruction(
@@ -2837,7 +2837,7 @@ mod tests {
             ),
         ];
         for (witness_type, expected_module) in cases {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let witness = builder.add_input(witness_type.clone().into());
             let value = builder.add_input(input_type.clone().into());
             let output = builder
@@ -2895,7 +2895,7 @@ mod tests {
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
         let swapped =
             ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), a.simplified_dimension()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2947,7 +2947,7 @@ mod tests {
         assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
 
         // Keeping the original source and output types accepts rectangular shapes.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let value = builder.add_input(array.clone().into());
         let output = builder
             .add_instruction(
@@ -2975,7 +2975,7 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), a.simplified_dimension()]));
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(witness_type.clone().into());
         let output = builder
@@ -3032,7 +3032,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension(), Dimension::Static(3)]));
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         let witness_type = ArrayType::new(DataType::F64, Shape::new(vec![b.simplified_dimension()]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let witness = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let output = builder
@@ -3167,7 +3167,7 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F64, [2, 3]);
         let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(), Dimension::Static(3)]));
         let laid_out = symbolic.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(exact.clone().into());
         let witness = builder.add_input(symbolic.clone().into());
         let widened = builder
@@ -3307,7 +3307,7 @@ mod tests {
         let laid_out = source.clone().with_layout(layout.clone());
         let narrowed = ArrayType::new_static(DataType::F64, [2, 3]).with_layout(layout.clone());
         let copied = ArrayType::new_static(DataType::F64, [6]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(source.clone().into());
         let value = builder
             .add_instruction(
@@ -3529,7 +3529,7 @@ mod tests {
         let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), None, []).unwrap();
         for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
             for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
                 let source = builder.add_input(source_type.clone().into());
                 let zero_input = builder.add_input(zero_type.clone().into());
                 let output = builder
@@ -3578,7 +3578,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
         let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(source_type.clone().into());
         let output = builder
             .add_instruction(
@@ -3731,7 +3731,7 @@ mod tests {
 
         // Different specified representations are admitted before lowering materializes the requested output.
         for (input_type, output_type) in [(contiguous, strided), (sharded, replicated)] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -3752,7 +3752,7 @@ mod tests {
             .clone()
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
@@ -4135,7 +4135,7 @@ mod tests {
             let sharded = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
             let input_type = symbolic.clone().with_sharding(replicated.clone()).unwrap();
             let output_type = symbolic.clone().with_sharding(sharded.clone()).unwrap();
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(input_type.clone().into());
             let output = builder
                 .add_instruction(
@@ -4254,7 +4254,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder
@@ -4306,7 +4306,7 @@ mod tests {
         let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
         let client = execution_client();
         for constructor in [CastOperation::<Type>::checked, CastOperation::<Type>::unchecked] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(source.clone().into());
             let witness = builder.add_input(target.clone().into());
             let output = builder

@@ -235,11 +235,11 @@ impl TargetDevice {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder};
+    use ryft_core::{FlatProgram, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, Placeholder, ProgramBuilder};
 
     use crate::sessions::tests::{domain_mesh, replicated_vector_type};
     use crate::tests::cpu_client;
-    use crate::{FlatProgram, Operation, Options, ProgramBuilder, Session, Type};
+    use crate::{Constant, Operation, Options, Session, Type};
 
     use super::*;
 
@@ -300,13 +300,13 @@ mod tests {
 
         // Lowering over a mesh of the captured devices records the target facts.
         let mesh = domain_mesh(client, "x", 2);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(Type::Array(replicated_vector_type(&mesh, 2)));
         let output = builder
             .add_instruction(Operation::Array(NegOperation::new().into()), Vec::new(), vec![input], None)
             .unwrap()
             .to_vec();
-        let program: FlatProgram = builder.build(output, vec![Placeholder], vec![Placeholder]).unwrap();
+        let program: FlatProgram<Session> = builder.build(output, vec![Placeholder], vec![Placeholder]).unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
         assert_eq!(lowered.platform_name(), target.platform_name());
         assert_eq!(lowered.platform_version(), target.platform_version());

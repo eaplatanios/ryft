@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::CollectiveLoweringState;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelPermuteOperation {

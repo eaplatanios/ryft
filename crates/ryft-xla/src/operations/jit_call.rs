@@ -14,19 +14,19 @@ use ryft_core::{
     CaptureConstant, CastOperation, CompositeKey, Concretizable, ConstrainShardingOperation, Context,
     CotangentAccumulator, CotangentDestinations, Device, DeviceMesh, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh, MaybeZero, MeshAxisType,
-    Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter, OperationPayloadProjection,
-    OutputRegionProvenance, ParallelReduceOperation, Parameterized, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
-    Program as CoreProgram, ProgramBatchingOutputAxesPolicy, ProgramError, ReductionKind, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
-    RematerializationOptimizationBarrier, ReshardOperation, ResidualDemandSplit, ResidualInputSource,
-    ResidualPolicyReference, ShardMapOperation, Sharding, ShardingDimension, StagedCallOperation, StagingContext,
-    TangentActivity, Tracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
-    TransposedProgramCotangent, TranspositionContext, TranspositionDriver, Type as CoreType, TypeError,
-    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection,
-    Zero,
+    EagerContext, FlatProgram, InputRegionProvenance, InterpretableOperation, InterpretationDriver, LogicalMesh,
+    MaybeZero, MeshAxisType, Operation as CoreOperation, OperationBoundaryPruning, OperationFormatter,
+    OperationPayloadProjection, OutputRegionProvenance, ParallelReduceOperation, Parameterized,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PartitionedProgram, Program, ProgramBatchingOutputAxesPolicy, ProgramError,
+    ReductionKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
+    RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
+    ReshardOperation, ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, Sharding,
+    ShardingDimension, StagedCallOperation, StagingContext, TangentActivity, Tracer, TracingContext, Transform,
+    TransformArtifact, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
+    Type as CoreType, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, UnreducedKind,
+    Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -38,17 +38,19 @@ use crate::compilation::domains::{
     argument_type, boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
     is_named_mesh, states_boundary_placement,
 };
-use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
-use crate::lowering::regions::lower_nested_program_inline;
-use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output};
-use crate::lowering::{
-    CollectiveLoweringState, EffectTokens, entry_boundary_sharding, has_placement_requests_in_region,
-    has_untracked_auto_axes, omits_regions, partition_session_constants, unread_call_captures, unread_lifted_captures,
-    validate_declared_pending_reduction,
+use crate::compilation::placements::{
+    entry_boundary_sharding, has_placement_requests_in_region, has_untracked_auto_axes,
 };
+use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
+use crate::lowering::EffectTokens;
+use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
+use crate::lowering::reductions::validate_declared_pending_reduction;
+use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
-use crate::operations::{FlatProgram, Operation, Program};
+use crate::operations::{Operation, unread_lifted_captures};
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     Session, Type, Value,
@@ -85,13 +87,13 @@ pub(crate) struct JitCallProgramKey {
 }
 
 /// One deduplicated callee emitted as a shared private `func.func`.
-pub(crate) struct JitCallFunction<O = Operation> {
+pub(crate) struct JitCallFunction<O: CoreOperation<Type = Type> = Operation> {
     /// Symbol name of the emitted private function.
     symbol: String,
 
     /// Representative callee program for this key (materialized from its callee region), lowered once as the
     /// function body.
-    program: FlatProgram<O>,
+    program: FlatProgram<EagerContext<Constant, O>>,
 
     /// Flat input types of the callee, also the emitted function's argument types.
     input_types: Vec<Type>,
@@ -100,7 +102,7 @@ pub(crate) struct JitCallFunction<O = Operation> {
     output_types: Vec<Type>,
 }
 
-impl<O> JitCallFunction<O> {
+impl<O: CoreOperation<Type = Type>> JitCallFunction<O> {
     /// Returns the symbol name of the emitted private function.
     #[inline]
     pub(crate) fn symbol(&self) -> &str {
@@ -125,7 +127,7 @@ impl<O> JitCallFunction<O> {
 /// Built once by [`collect_jit_call_functions`] before a module is lowered and threaded read-only through the
 /// lowering pass. At each `jit_call` lowering site, a callee whose key is present is emitted as a `func.call` to the
 /// shared function instead of being inlined, and absent callees inline.
-pub(crate) struct JitCallFunctionMap<O = Operation> {
+pub(crate) struct JitCallFunctionMap<O: CoreOperation<Type = Type> = Operation> {
     /// Shared functions keyed by callee identity.
     functions: HashMap<JitCallProgramKey, JitCallFunction<O>>,
 
@@ -137,7 +139,7 @@ pub(crate) struct JitCallFunctionMap<O = Operation> {
     named: HashMap<CompositeKey, Vec<NamedFunction>>,
 }
 
-impl<O> Default for JitCallFunctionMap<O> {
+impl<O: CoreOperation<Type = Type>> Default for JitCallFunctionMap<O> {
     fn default() -> Self {
         Self { functions: HashMap::new(), order: Vec::new(), named: HashMap::new() }
     }
@@ -145,7 +147,7 @@ impl<O> Default for JitCallFunctionMap<O> {
 
 impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     /// Returns the shared function for `program`, if one was emitted for its identity.
-    pub(crate) fn get(&self, program: &FlatProgram<O>) -> Option<&JitCallFunction<O>> {
+    pub(crate) fn get(&self, program: &FlatProgram<EagerContext<Constant, O>>) -> Option<&JitCallFunction<O>> {
         self.functions.get(&jit_call_program_key(program)?)
     }
 
@@ -222,14 +224,14 @@ impl NamedFunction {
 /// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
 /// [`lowered_effect_classes`]).
 pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &Program<Input, Output, O>,
+    program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
 ) -> Result<JitCallFunctionMap<O>, Error>
 where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
-    let mut counts: HashMap<JitCallProgramKey, (usize, FlatProgram<O>)> = HashMap::new();
+    let mut counts: HashMap<JitCallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)> = HashMap::new();
     let mut order: Vec<JitCallProgramKey> = Vec::new();
     let mut memo: HashMap<RegionId, Option<JitCallProgramKey>> = HashMap::new();
     let mut named = HashMap::new();
@@ -2029,7 +2031,7 @@ where
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
         let refined = with_boundary_input_types(original, &boundary)?;
-        let original = refined.as_ref().map_or(original, CoreProgram::entry_region_ref);
+        let original = refined.as_ref().map_or(original, Program::entry_region_ref);
         let (callee, axes) = driver
             .batch_program(context, original, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
@@ -2130,7 +2132,7 @@ where
             let (batched_callee, output_axes) = driver
                 .batch_program(
                     context,
-                    refined.as_ref().map_or(original, CoreProgram::entry_region_ref),
+                    refined.as_ref().map_or(original, Program::entry_region_ref),
                     input_batch_axes.as_slice(),
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )?
@@ -3233,7 +3235,9 @@ struct JitCallSplit {
 /// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
 /// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
 /// separate outlined boundary.
-fn supports_structural_deduplication<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> bool {
+fn supports_structural_deduplication<O: LowerableOperationFamily>(
+    program: &FlatProgram<EagerContext<Constant, O>>,
+) -> bool {
     program.regions().iter().all(|region| {
         region.atoms().iter().all(|atom| !atom.is_constant())
             && region
@@ -3269,7 +3273,9 @@ fn supports_structural_deduplication_of_region<O: LowerableOperationFamily>(
 /// structural deduplication (refer to [`supports_structural_deduplication`]) and therefore always inline. The key is
 /// generic over the program's constant universe so that lookups from the value-generic lowering path type-check,
 /// although the map itself is only ever populated from the staged [`Constant`]-keyed pipeline.
-fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> Option<JitCallProgramKey> {
+fn jit_call_program_key<O: LowerableOperationFamily>(
+    program: &FlatProgram<EagerContext<Constant, O>>,
+) -> Option<JitCallProgramKey> {
     supports_structural_deduplication(program).then(|| structural_key(program))
 }
 
@@ -3279,7 +3285,7 @@ fn jit_call_region_key<O: LowerableOperationFamily>(region: RegionRef<'_, Consta
 }
 
 /// Returns the deduplication key of `program`, an eligible callee (refer to [`JitCallProgramKey`]).
-fn structural_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> JitCallProgramKey {
+fn structural_key<O: LowerableOperationFamily>(program: &FlatProgram<EagerContext<Constant, O>>) -> JitCallProgramKey {
     fn walk<O: LowerableOperationFamily>(
         region: RegionRef<'_, Constant, O>,
         visited: &mut HashSet<RegionId>,
@@ -3325,9 +3331,9 @@ fn structural_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> JitC
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
 /// [`RegionId`]. Interned shared callees repeat their root region id, so each shared callee is rendered once.
 fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
-    program: &Program<Input, Output, O>,
+    program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
-    counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<O>)>,
+    counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)>,
     order: &mut Vec<JitCallProgramKey>,
     memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
     named: &mut HashMap<NamedFunctionKey, Option<JitCallProgramKey>>,
@@ -3339,10 +3345,10 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     fn walk<Input, Output, O: LowerableOperationFamily>(
-        program: &Program<Input, Output, O>,
+        program: &Program<Constant, O, Input, Output>,
         region: RegionId,
         target_platform: Option<&str>,
-        counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<O>)>,
+        counts: &mut HashMap<JitCallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)>,
         order: &mut Vec<JitCallProgramKey>,
         memo: &mut HashMap<RegionId, Option<JitCallProgramKey>>,
         named_calls: &mut NamedRegionCalls,
@@ -3656,7 +3662,7 @@ where
 fn with_boundary_input_types<T, V, O>(
     callee: RegionRef<'_, V, O>,
     boundary: &[Option<Sharding>],
-) -> Result<Option<CoreProgram<V, O, Vec<V>, Vec<V>>>, ProgramError>
+) -> Result<Option<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>
 where
     T: ArrayMemberType + From<ArrayType>,
     V: CoreValue<Type = T>,
@@ -3851,7 +3857,7 @@ fn validate_call_input_types<T: ArrayMemberType>(
 /// to [`JitCallCalleeTransform`]).
 fn shared_jit_call_callee<V: CoreValue<Type = Type>, O: CoreOperation<Type = Type>>(
     callee: RegionRef<'_, V, O>,
-) -> Result<Arc<CoreProgram<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
     if let Some(callee) = callee.interned_callee() {
         return Ok(callee.clone());
     }
@@ -4108,7 +4114,7 @@ where
 /// [`CollectiveLoweringState::session_values`]).
 #[allow(clippy::too_many_arguments)]
 fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<O>,
+    program: &FlatProgram<EagerContext<Constant, O>>,
     capture_count: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     caller_captured_values: &[ValueRef<'b, 'c, 't>],
@@ -4231,13 +4237,12 @@ mod tests {
         BufferSpecification, BufferType, ExecutionDeviceInputs, ExecutionFence, ExecutionInput, Program as PjrtProgram,
     };
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, identity_branch,
         lower_replicated_shard_map_body, neg_branch, test_vector_type, unproject_plain_program,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, read_first_shard, read_sharded_f32_array, two_device_mesh};
     use crate::tests::{
         cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes, vector_type,
@@ -4253,10 +4258,10 @@ mod tests {
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
     struct TestTranspositionDriver {
         /// Source callee exposed to the `jit_call` transpose rule.
-        source: Program<Vec<Constant>, Vec<Constant>>,
+        source: FlatProgram<Session>,
 
         /// Predetermined transposed callee returned by the recursive request.
-        transposed: Program<Vec<Constant>, Vec<Constant>>,
+        transposed: FlatProgram<Session>,
     }
 
     impl RegionDriver<Constant, Operation> for TestTranspositionDriver {
@@ -4350,7 +4355,7 @@ mod tests {
     /// Compiles and executes an array-only `f32` fixture using its declared unsharded program signature.
     fn execute_f32_program(
         client: &'static ryft_pjrt::Client<'static>,
-        program: &Program<Vec<Constant>, Vec<Constant>>,
+        program: &FlatProgram<Session>,
         values: Vec<Vec<f32>>,
     ) -> Vec<Vec<f32>> {
         for r#type in program.input_types().iter() {
@@ -4365,8 +4370,8 @@ mod tests {
 
     /// Builds a mixed-call fixture with one print in each partition, i.e., `known = print(k * k)` and
     /// `residual = print(x * known)`. Its two scalar inputs are the known coefficient and the unknown value.
-    fn effectful_mixed_callee(effect_class: EffectClass) -> Arc<FlatProgram> {
-        let mut builder = ArrayIrProgramBuilder::new();
+    fn effectful_mixed_callee(effect_class: EffectClass) -> Arc<FlatProgram<Session>> {
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type);
@@ -4400,7 +4405,7 @@ mod tests {
     /// and output given as the native-endian bytes of its elements.
     fn execute_array_program(
         client: &'static ryft_pjrt::Client<'static>,
-        program: &Program<Vec<Constant>, Vec<Constant>>,
+        program: &FlatProgram<Session>,
         values: Vec<Vec<u8>>,
     ) -> Vec<Vec<u8>> {
         let array_type = |r#type: &Type| match r#type {
@@ -4457,7 +4462,11 @@ mod tests {
     }
 
     /// Stages `sin(a · b) ⊙ cos(a · b) + a` for `a = left` and `b = right` into `builder` and returns its output.
-    fn add_residual_demand_leaf(builder: &mut ArrayIrProgramBuilder, left: AtomId, right: AtomId) -> AtomId {
+    fn add_residual_demand_leaf(
+        builder: &mut CoreProgramBuilder<Constant, Operation>,
+        left: AtomId,
+        right: AtomId,
+    ) -> AtomId {
         let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
         let product = builder.add_instruction(dot, Vec::new(), vec![left, right], None).unwrap()[0];
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
@@ -4470,7 +4479,7 @@ mod tests {
     /// `g_0(a, b) = sin(a · b) ⊙ cos(a · b) + a` into `builder` with every level inlined, and returns its output. This
     /// is the call-free reference of [`residual_demand_diamond_callee`].
     fn add_inlined_residual_demand_diamond(
-        builder: &mut ArrayIrProgramBuilder,
+        builder: &mut CoreProgramBuilder<Constant, Operation>,
         depth: usize,
         left: AtomId,
         right: AtomId,
@@ -4486,8 +4495,8 @@ mod tests {
 
     /// Returns `(a, b) ↦ sin(a · b) ⊙ cos(a · b) + a`, the shared callee of the residual demand workloads, whose matrix
     /// product `DotsSavable` saves while it recomputes the rest of the callee.
-    fn residual_demand_leaf_callee() -> Arc<FlatProgram> {
-        let mut builder = ArrayIrProgramBuilder::new();
+    fn residual_demand_leaf_callee() -> Arc<FlatProgram<Session>> {
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(residual_demand_matrix_type());
         let right = builder.add_input(residual_demand_matrix_type());
         let output = add_residual_demand_leaf(&mut builder, left, right);
@@ -4500,10 +4509,10 @@ mod tests {
 
     /// Returns the nested diamond `g_k(a, b) = g_{k-1}(a, b) + g_{k-1}(sin a, b)` of `depth` levels over the shared
     /// residual demand callee `g_0`, where each level calls the previous level twice through one shared callee.
-    fn residual_demand_diamond_callee(depth: usize) -> Arc<FlatProgram> {
+    fn residual_demand_diamond_callee(depth: usize) -> Arc<FlatProgram<Session>> {
         let mut callee = residual_demand_leaf_callee();
         for _ in 0..depth {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let left = builder.add_input(residual_demand_matrix_type());
             let right = builder.add_input(residual_demand_matrix_type());
             let first = add_jit_call(&mut builder, &callee, vec![left, right]);
@@ -4526,9 +4535,9 @@ mod tests {
     /// call a differentiated call whose tangent call mixes unknown tangents with known residuals.
     fn residual_demand_program(
         policy: Option<ResidualPolicyReference<Type>>,
-        body: impl Fn(&mut ArrayIrProgramBuilder, AtomId, AtomId) -> AtomId,
-    ) -> FlatProgram {
-        let mut builder = ArrayIrProgramBuilder::new();
+        body: impl Fn(&mut CoreProgramBuilder<Constant, Operation>, AtomId, AtomId) -> AtomId,
+    ) -> FlatProgram<Session> {
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let inputs = (0..3).map(|_| builder.add_input(residual_demand_matrix_type())).collect::<Vec<_>>();
         let called = body(&mut builder, inputs[1], inputs[2]);
         let output =
@@ -4539,7 +4548,7 @@ mod tests {
         let Some(policy) = policy else {
             return program;
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let inputs = (0..3).map(|_| builder.add_input(residual_demand_matrix_type())).collect::<Vec<_>>();
         let body = builder.import_program(program);
         let output = builder.add_instruction(RematerializeOperation::new(policy), vec![body], inputs, None).unwrap()[0];
@@ -4551,9 +4560,10 @@ mod tests {
     /// Returns the residual count of the linearization of `program` with respect to the inputs that `input_indices`
     /// selects, followed by the numbers of instructions in the complete region closures of its primal and tangent
     /// programs, which count every shared callee once.
-    fn residual_demand_statistics(program: &FlatProgram, input_indices: &[usize]) -> [usize; 3] {
+    fn residual_demand_statistics(program: &FlatProgram<Session>, input_indices: &[usize]) -> [usize; 3] {
         let linearization = program.linearize_with_respect_to(input_indices).unwrap();
-        let closure_size = |program: &FlatProgram| program.entry_region_ref().instructions_in_closure().count();
+        let closure_size =
+            |program: &FlatProgram<Session>| program.entry_region_ref().instructions_in_closure().count();
         [linearization.residual_count(), closure_size(linearization.primal()), closure_size(linearization.tangent())]
     }
 
@@ -4562,11 +4572,11 @@ mod tests {
     /// rounding differences that recomputing transcendental functions in differently fused XLA kernels introduces.
     fn assert_residual_demand_linearizations_match(
         client: &'static ryft_pjrt::Client<'static>,
-        actual: &FlatProgram,
-        expected: &FlatProgram,
+        actual: &FlatProgram<Session>,
+        expected: &FlatProgram<Session>,
         input_indices: &[usize],
     ) {
-        let execute = |program: &FlatProgram| {
+        let execute = |program: &FlatProgram<Session>| {
             let linearization = program.linearize_with_respect_to(input_indices).unwrap();
             let inputs =
                 vec![vec![0.5f32, -1.0, 0.25, 2.0], vec![0.3f32, 0.1, -0.2, 0.4], vec![0.7f32, -0.6, 0.2, 0.9]];
@@ -4596,8 +4606,8 @@ mod tests {
     /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Arc`] so callers control
     /// whether `jit_call` sites share one program (i.e., by pointer identity) or use structurally identical distinct
     /// programs.
-    fn add_self_callee(input_type: ArrayType) -> Arc<FlatProgram> {
-        let mut builder = ArrayIrProgramBuilder::new();
+    fn add_self_callee(input_type: ArrayType) -> Arc<FlatProgram<Session>> {
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
@@ -4605,9 +4615,9 @@ mod tests {
 
     /// Lowers an outer program that calls each of `callees` through one `jit_call` and sums the results, returning
     /// the module text. Each callee is `f(x) = x + x`, and the outer function is `g(x) = sum_i callee_i(x)`.
-    fn lower_jit_call_sum_module(callees: Vec<Arc<FlatProgram>>) -> String {
+    fn lower_jit_call_sum_module(callees: Vec<Arc<FlatProgram<Session>>>) -> String {
         let array_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in callees {
@@ -4630,9 +4640,9 @@ mod tests {
     /// Builds the flat callee `f(p, x) = if p { -x } else { x }`, whose body contains a `condition` instruction. Its
     /// nested branch bodies render contextually into the callee's canonical program text, so separately constructed
     /// copies of this callee remain eligible for structural `jit_call` deduplication.
-    fn condition_callee() -> Arc<FlatProgram> {
+    fn condition_callee() -> Arc<FlatProgram<Session>> {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let true_region = builder.import_program(unproject_plain_program(neg_branch(vector_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(identity_branch(vector_type.clone())));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -4708,7 +4718,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let array_type = test_vector_type(4).with_sharding(replicated.clone()).unwrap();
         let inner = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             Arc::new(
                 builder
@@ -4717,7 +4727,7 @@ mod tests {
             )
         };
         let outer = |call: &JitCallOperation<Type>| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let region = builder.intern_callee(&inner, None).unwrap();
             let output =
@@ -4729,7 +4739,7 @@ mod tests {
             )
         };
         let program = |first: &JitCallOperation<Type>, second: &JitCallOperation<Type>| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let first = add_jit_call(&mut builder, &outer(first), vec![input]);
             let second = add_jit_call(&mut builder, &outer(second), vec![input]);
@@ -4772,7 +4782,7 @@ mod tests {
             derived(vec![Some(sharded)]),
         ];
         let function_count =
-            |program: &FlatProgram| collect_jit_call_functions(program, None).unwrap().functions().len();
+            |program: &FlatProgram<Session>| collect_jit_call_functions(program, None).unwrap().functions().len();
         assert_eq!(function_count(&program(&base, &base)), 2);
         for variant in &variants {
             assert_eq!(function_count(&program(&base, variant)), 1, "{variant:?}");
@@ -4836,7 +4846,7 @@ mod tests {
     fn test_collect_jit_call_functions_excludes_dormant_regions() {
         let array_type = test_vector_type(4);
         let callee = |identifier| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let operation = CustomCallOperation::new(identifier, vec![array_type.clone()])
                 .with_runtime_requirements([RuntimeRequirement::builtin(identifier)])
@@ -4851,7 +4861,7 @@ mod tests {
         let active = callee("test.active");
         let dormant = callee("test.dormant");
         let primal = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let first = add_jit_call(&mut builder, &active, vec![input]);
             let second = add_jit_call(&mut builder, &active, vec![input]);
@@ -4862,7 +4872,7 @@ mod tests {
                 .unwrap()
         };
         let jvp = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let tangent = builder.add_input(array_type.clone().into());
             let first = add_jit_call(&mut builder, &dormant, vec![tangent]);
@@ -4877,7 +4887,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let primal_region = builder.import_region(primal.entry_region_ref());
         let jvp = builder.import_region(jvp.entry_region_ref());
@@ -4932,7 +4942,7 @@ mod tests {
         );
         let rules: CustomRuleRegistration<Constant, Operation> =
             CustomRuleRegistration::new(CustomRuleDefinition::new("replaced").with_named_composite(named));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let body = builder.import_region(primal.entry_region_ref());
         let output = builder
@@ -4981,7 +4991,7 @@ mod tests {
         let vector_type = test_vector_type(4);
         let callee = add_self_callee(vector_type.clone());
         let body_program = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let first = add_jit_call(&mut builder, &callee, vec![input]);
             let second = add_jit_call(&mut builder, &callee, vec![input]);
@@ -5021,7 +5031,7 @@ mod tests {
         let first = condition_callee();
         let second = condition_callee();
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let input = builder.add_input(vector_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
@@ -5121,7 +5131,7 @@ mod tests {
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             builder.add_input(n.clone().into());
             let array =
                 builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
@@ -5130,7 +5140,7 @@ mod tests {
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let true_region = builder.import_region(branch().entry_region_ref());
             let false_region = builder.import_region(branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -5151,7 +5161,7 @@ mod tests {
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let dimension = builder.add_input(m.clone().into());
         let array = builder.add_input(array_type.clone().into());
@@ -5232,7 +5242,7 @@ mod tests {
         // callee inlines at both call sites, and the explicit assertion after them continues their assertion chain.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let symbolic = builder.add_input(n.clone().into());
             let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
             let zero = builder
@@ -5253,7 +5263,7 @@ mod tests {
             )
         };
         assert!(callee.effects().classes().is_empty());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let symbolic = builder.add_input(n.clone().into());
         let exact = builder.add_input(DimensionType::from(Dimension::Static(2)).into());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
@@ -5402,7 +5412,7 @@ mod tests {
         assert_eq!(placed.output_sharding(0), Some(&replicated));
         assert_eq!(placed.boundary_shardings().collect::<Vec<_>>(), vec![&sharded, &replicated]);
         let input_type: Type = ArrayType::new_static(DataType::F32, [4]).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         builder.add_input(input_type.clone());
         let input = builder.add_input(input_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -5410,7 +5420,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let render = |operation: JitCallOperation<Type>| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let callee_region = builder.import_region(callee.entry_region_ref());
             let inputs = vec![builder.add_input(input_type.clone()), builder.add_input(input_type.clone())];
             let output =
@@ -5488,7 +5498,7 @@ mod tests {
     #[test]
     fn test_jit_call_operation_with_callee_region() {
         let input_type: Type = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(input_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let callee = builder
@@ -5501,7 +5511,7 @@ mod tests {
                 .with_callee_type_signature(&callee.input_types(), &callee.output_types())
                 .unwrap(),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(input_type);
         let output = builder
@@ -5530,7 +5540,7 @@ mod tests {
 
         // Generated callees can introduce local identities even when the source that was transformed had none.
         // The sealed signature records those definitions, so each new call still receives a fresh caller result.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::I64).into());
         let local = DimensionType::new("local", DimensionBounds::non_negative(Some(8)).unwrap());
         let output = builder
@@ -6091,7 +6101,7 @@ mod tests {
         // input `y` outside of it, so the residual program needs the result of the call.
         let scalar_type = Type::from(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
             let squared =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -6099,7 +6109,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_program(callee);
         let x = builder.add_input(scalar_type.clone());
         let y = builder.add_input(scalar_type);
@@ -6133,7 +6143,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             let before = builder
@@ -6166,7 +6176,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -6926,7 +6936,7 @@ mod tests {
         // call that also returns the scale and a replay call that recomputes only the broadcast.
         let compact_type = ArrayType::new_static(DataType::F32, [1024]);
         let expanded_type = ArrayType::new_static(DataType::F32, [64, 1024]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let weights = builder.add_input(compact_type.clone().into());
         let scale = builder.add_instruction(SinOperation::new(), Vec::new(), vec![weights], None).unwrap()[0];
         let scale = builder
@@ -6938,7 +6948,7 @@ mod tests {
         let callee = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![expanded], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let callee = builder.import_program(callee);
@@ -7022,7 +7032,7 @@ mod tests {
 
         // The same cut survives the rematerialization wrapper's linearization, where the original output remains a
         // known primal result and the expanded scale is needed only by the derivative with respect to the activation.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(expanded_type.clone().into());
         let weights = builder.add_input(compact_type.clone().into());
         let plain_linearization = program.linearize_with_respect_to(&[0]).unwrap();
@@ -7094,7 +7104,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_ignores_known_outputs_without_residual_demand() {
         let scalar_type = Type::from(ArrayType::scalar(DataType::F32));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.clone());
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let needed = builder
@@ -7107,7 +7117,7 @@ mod tests {
         let callee = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type.clone());
         let callee = builder.import_program(callee);
@@ -7189,8 +7199,8 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_preserves_guarded_known_callees() {
         let policy = ResidualPolicyReference::new(NothingSavable);
-        let check_boundary = |callee: Program<Vec<Constant>, Vec<Constant>>, capture_count: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+        let check_boundary = |callee: FlatProgram<Session>, capture_count: usize| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let inputs = callee
                 .input_types()
                 .into_owned()
@@ -7219,7 +7229,7 @@ mod tests {
         // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
         let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(dynamic_type.into());
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         check_boundary(
@@ -7231,7 +7241,7 @@ mod tests {
 
         // An ordered assertion must keep the same owning call and execution order.
         let predicate_type = Type::from(ArrayType::scalar(DataType::Boolean));
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let predicate = builder.add_input(predicate_type.clone());
         builder
             .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
@@ -7244,7 +7254,7 @@ mod tests {
         );
 
         // Reference handles and retained capture constants keep their existing boundary semantics too.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         check_boundary(
             builder
@@ -7252,7 +7262,7 @@ mod tests {
                 .unwrap(),
             0,
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         builder.add_input(predicate_type.clone());
         let captured = builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_type.clone())));
         check_boundary(
@@ -7264,7 +7274,7 @@ mod tests {
 
         // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
         // concrete eager calls whole. Using a literal in a live trace makes the retained call directly observable.
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(predicate_type);
         let callee = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -7360,7 +7370,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh, 1);
         let r#type: Type = ArrayType::new_static(DataType::F32, [4]).into();
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let a = builder.add_input(r#type.clone());
             let x = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
@@ -7371,7 +7381,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let a = builder.add_input(r#type.clone());
         let x = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&callee, None).unwrap();
@@ -7435,7 +7445,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_keeps_effectful_all_known_calls_whole_on_residual_demand() {
         let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar_type.clone());
         builder
             .add_instruction(PrintOperation::<ArrayType>::new("known"), Vec::new(), vec![input], None)
@@ -7445,7 +7455,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap(),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type);
         let forwarded = add_jit_call(&mut builder, &callee, vec![known]);
@@ -7719,7 +7729,7 @@ mod tests {
         // (refer to `JitCallOperation::returns_input_unchanged`). The known program therefore returns the output of the
         // call, which a residual planner then plans as a value of its own.
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let left = builder.add_input(residual_demand_matrix_type());
             let right = builder.add_input(residual_demand_matrix_type());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
@@ -7733,7 +7743,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let w = builder.add_input(residual_demand_matrix_type());
         let b = builder.add_input(residual_demand_matrix_type());
         let callee_region = builder.intern_callee(&callee, None).unwrap();
@@ -7781,8 +7791,8 @@ mod tests {
         let matrix_type = residual_demand_matrix_type();
         let predicate_type = Type::from(ArrayType::scalar(DataType::Boolean));
         let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
-        let check_saved_output = |callee: FlatProgram, capture_count: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+        let check_saved_output = |callee: FlatProgram<Session>, capture_count: usize| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let inputs = callee
                 .input_types()
                 .into_owned()
@@ -7809,7 +7819,7 @@ mod tests {
             assert_eq!(partition.known_program().output_ids(), partition.known_program().instructions()[0].outputs());
         };
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let predicate = builder.add_input(predicate_type.clone());
         let input = builder.add_input(matrix_type.clone());
         builder
@@ -7824,7 +7834,7 @@ mod tests {
             0,
         );
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         builder.add_input(matrix_type.clone());
         let input = builder.add_input(matrix_type.clone());
         let captured = builder.add_constant(Constant::Captured(CaptureReference::new(0, matrix_type.clone())));
@@ -7849,7 +7859,7 @@ mod tests {
         // while the derivative used the saved `bf16` value (1.2109375).
         let scalar_type = Type::from(ArrayType::scalar(DataType::F32));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(scalar_type.clone());
             let to_bf16 = ConvertElementTypeOperation::<ArrayType>::new(DataType::BF16, false);
             let x = builder.add_instruction(to_bf16, Vec::new(), vec![x], None).unwrap()[0];
@@ -7864,7 +7874,7 @@ mod tests {
             )
         };
         let body = |returns_w: bool| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(scalar_type.clone());
             let s = builder.add_input(scalar_type.clone());
             let w = add_jit_call(&mut builder, &callee, vec![x]);
@@ -7898,7 +7908,7 @@ mod tests {
                 in (%1, %2)"},
         );
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let inputs = vec![builder.add_input(scalar_type.clone()), builder.add_input(scalar_type.clone())];
         let body = builder.import_program(body(false));
         let output = builder.add_instruction(RematerializeOperation::new(policy), vec![body], inputs, None).unwrap()[0];
@@ -7954,7 +7964,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_split_transform_shares_boundary_metadata() {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let source = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -7968,7 +7978,7 @@ mod tests {
             repeated_residual: false,
         };
         let derive = |region: RegionRef<'_, Constant, Operation>, _: &JitCallSplitArguments| {
-            let residual = ArrayIrProgramBuilder::new().build::<Vec<Constant>, Vec<Constant>>(
+            let residual = CoreProgramBuilder::<Constant, Operation>::new().build::<Vec<Constant>, Vec<Constant>>(
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -8013,7 +8023,7 @@ mod tests {
         // and the nested workload is the diamond `g_d(k, x) = g_{d-1}(k, x) + g_{d-1}(k, sin x)` with `g_0 = g`.
         let matrix_type = residual_demand_matrix_type();
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known = builder.add_input(matrix_type.clone());
             let unknown = builder.add_input(matrix_type.clone());
             let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
@@ -8029,8 +8039,8 @@ mod tests {
                     .unwrap(),
             )
         };
-        let program = |body: &dyn Fn(&mut ArrayIrProgramBuilder, AtomId, AtomId) -> AtomId| {
-            let mut builder = ArrayIrProgramBuilder::new();
+        let program = |body: &dyn Fn(&mut CoreProgramBuilder<Constant, Operation>, AtomId, AtomId) -> AtomId| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let known = builder.add_input(matrix_type.clone());
             let unknown = builder.add_input(matrix_type.clone());
             let output = body(&mut builder, known, unknown);
@@ -8046,7 +8056,7 @@ mod tests {
         let nested = |depth: usize| {
             let mut nested_callee = callee.clone();
             for _ in 0..depth {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
                 let known = builder.add_input(matrix_type.clone());
                 let unknown = builder.add_input(matrix_type.clone());
                 let first = add_jit_call(&mut builder, &nested_callee, vec![known, unknown]);
@@ -8062,9 +8072,10 @@ mod tests {
             }
             program(&|builder, known, unknown| add_jit_call(builder, &nested_callee, vec![known, unknown]))
         };
-        let closure_sizes = |program: &FlatProgram| {
+        let closure_sizes = |program: &FlatProgram<Session>| {
             let partition = program.partition(&[true, false]).unwrap();
-            let closure_size = |program: &FlatProgram| program.entry_region_ref().instructions_in_closure().count();
+            let closure_size =
+                |program: &FlatProgram<Session>| program.entry_region_ref().instructions_in_closure().count();
             [closure_size(partition.known_program()), closure_size(partition.residual_program())]
         };
 
@@ -8111,7 +8122,7 @@ mod tests {
 
         // The splits are retained by the region transform cache of the shared callee, so partitioning the same
         // workload again binds the very same known callee instead of partitioning the callee again.
-        let first_callee = |program: &FlatProgram| {
+        let first_callee = |program: &FlatProgram<Session>| {
             let region = program.instructions()[0].regions()[0];
             program.region_ref(region).unwrap().interned_callee().unwrap().clone()
         };
@@ -8154,8 +8165,8 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_retains_splits_of_effectful_mixed_calls() {
         let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
-        let program = |callee: &Arc<FlatProgram>, count: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+        let program = |callee: &Arc<FlatProgram<Session>>, count: usize| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
@@ -8164,9 +8175,9 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let statistics = |program: &FlatProgram| {
+        let statistics = |program: &FlatProgram<Session>| {
             let partition = program.partition(&[true, false]).unwrap();
-            let count = |program: &FlatProgram| {
+            let count = |program: &FlatProgram<Session>| {
                 let region = program.entry_region_ref();
                 [region.instructions_in_closure().count(), region.region_ids_in_closure().len()]
             };
@@ -8181,7 +8192,7 @@ mod tests {
         );
         let partition = program(&callee, 1).partition(&[true, false]).unwrap();
         let other = program(&callee, 16).partition(&[true, false]).unwrap();
-        let first_callee = |program: &FlatProgram| {
+        let first_callee = |program: &FlatProgram<Session>| {
             program
                 .region_ref(program.instructions()[0].regions()[0])
                 .unwrap()
@@ -8195,7 +8206,7 @@ mod tests {
         let mut nested = callee;
         let mut counts = Vec::new();
         for _ in 0..6 {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
@@ -8227,7 +8238,7 @@ mod tests {
         /// Supplies only the source callee and partition mode, while the test provides the partition closure directly.
         struct SplitCacheDriver {
             /// Callee shared across both partition modes.
-            callee: Arc<FlatProgram>,
+            callee: Arc<FlatProgram<Session>>,
 
             /// Mode to include in the retained split's key.
             repeated_residual: bool,
@@ -8279,13 +8290,13 @@ mod tests {
 
         let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
         let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(scalar_type.clone());
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
         let ordinary_known = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let unknown = builder.add_input(scalar_type.clone());
         let coefficient = builder.add_input(scalar_type.clone());
         let printed = builder
@@ -8358,7 +8369,7 @@ mod tests {
     fn test_jit_call_partial_evaluation_cached_effectful_splits_preserve_order() {
         let callee = effectful_mixed_callee(EffectClass::OrderedIo);
         let program = |prefix: bool| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
             let known = builder.add_input(scalar_type.clone());
             let unknown = builder.add_input(scalar_type);
@@ -8430,7 +8441,7 @@ mod tests {
     #[test]
     fn test_jit_call_partial_evaluation_cached_effectful_splits_keep_outputless_residuals() {
         let scalar_type: Type = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type.clone());
         let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
@@ -8442,7 +8453,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![squared], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap(),
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(scalar_type.clone());
         let unknown = builder.add_input(scalar_type);
         let output = add_jit_call(&mut builder, &callee, vec![known, unknown]);
@@ -8585,7 +8596,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_batching() {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let callee = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
@@ -8633,7 +8644,7 @@ mod tests {
         let batch_type =
             Type::Array(ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(batch_split.clone()).unwrap());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(item.into());
             let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -8770,14 +8781,14 @@ mod tests {
         let dimension_type = Type::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = Type::Array(ArrayType::scalar(DataType::F64));
 
-        let mut callee_builder = ArrayIrProgramBuilder::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = callee_builder.add_input(dimension_type.clone());
         let array = callee_builder.add_input(array_type.clone());
         let callee = callee_builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![dimension, array], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(dimension_type.clone());
         let array = builder.add_input(array_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -8844,7 +8855,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let captured = builder.add_input(reference_type.clone());
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
@@ -8877,7 +8888,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let captured = builder.add_input(reference_type.clone());
         let reference = builder.add_input(reference_type.clone());
@@ -8933,7 +8944,7 @@ mod tests {
     fn test_jit_call_differentiation_omits_inactive_reference_output_tangents() {
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ArrayIrProgramBuilder::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = callee_builder.add_input(reference_type.clone());
         let value = callee_builder.add_input(scalar_type.clone());
         let doubled =
@@ -8941,7 +8952,7 @@ mod tests {
         let callee = callee_builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![reference, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(reference_type.clone());
         let value = builder.add_input(scalar_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -8978,7 +8989,7 @@ mod tests {
         // structural zero that the fused call does not return.
         let r#type = Type::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(r#type.clone());
             let y = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
@@ -8987,7 +8998,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sine, cosine], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let outputs = builder
@@ -9022,7 +9033,7 @@ mod tests {
         // structural zero that the fused call does not return.
         let r#type = Type::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let zero =
@@ -9031,7 +9042,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type);
         let outputs = builder
@@ -9066,7 +9077,7 @@ mod tests {
         // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
         let r#type = Type::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             let zero =
@@ -9075,7 +9086,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero, input], vec![Placeholder], vec![Placeholder; 3])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(r#type.clone());
         let outputs = builder
@@ -9114,7 +9125,7 @@ mod tests {
         // structural zero.
         let r#type = Type::Array(vector_type());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(r#type.clone());
             builder.add_input(r#type.clone());
             let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
@@ -9122,7 +9133,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let output = builder
@@ -9158,7 +9169,7 @@ mod tests {
         let size_type = Type::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let value = builder.add_input(value_type.clone());
             let size = builder.add_input(size_type.clone());
             let dimension = builder
@@ -9174,7 +9185,7 @@ mod tests {
         let operation = JitCallOperation::new(0)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
         let output = builder.add_instruction(Operation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
@@ -9357,7 +9368,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
@@ -9372,7 +9383,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -9411,7 +9422,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
@@ -9434,7 +9445,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee_region = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -9494,10 +9505,10 @@ mod tests {
         let tangent_type = Type::Array(tangent_type);
         // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
         // identity-region boundary rather than an empty driver that cannot answer that query.
-        let mut source_builder = ArrayIrProgramBuilder::new();
+        let mut source_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = source_builder.add_input(tangent_type.clone());
         let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = ArrayIrProgramBuilder::new();
+        let mut transpose_builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = transpose_builder.add_input(expected.clone());
         let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let driver = TestTranspositionDriver { source, transposed };
@@ -9537,14 +9548,14 @@ mod tests {
         let dead_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dead)])));
         let live_type = Type::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(live)])));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let dead = builder.add_input(dead_type.clone());
             let live = builder.add_input(live_type.clone());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![dead, live], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let dead = builder.add_input(dead_type);
         let live = builder.add_input(live_type.clone());
@@ -9592,13 +9603,13 @@ mod tests {
         // live, the transposed callee receives both seeds and adds them.
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(scalar_type);
         let outputs = builder
@@ -9682,7 +9693,7 @@ mod tests {
         // run. The transposed call has no inputs, and its callee prints a materialized zero seed.
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let seed = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
@@ -9695,7 +9706,7 @@ mod tests {
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let backward = builder.import_region(backward.entry_region_ref());
             let input = builder.add_input(scalar_type.clone());
             let output = builder
@@ -9714,7 +9725,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let input = builder.add_input(scalar_type);
         builder
@@ -9755,7 +9766,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let reference_type = Type::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let reference = builder.add_input(reference_type.clone());
             let update = builder.add_input(scalar_type.clone());
             builder
@@ -9778,7 +9789,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![read, update], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let reference = builder.add_input(reference_type.clone());
         let update = builder.add_input(scalar_type.clone());
@@ -9838,7 +9849,7 @@ mod tests {
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let stack_type = Type::Array(ArrayType::new_static(DataType::F64, [3]));
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone());
             let item = builder.add_input(scalar_type.clone());
@@ -9848,7 +9859,7 @@ mod tests {
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let body = builder.import_region(body.entry_region_ref());
             let carry = builder.add_input(scalar_type.clone());
             let items = builder.add_input(stack_type.clone());
@@ -9860,7 +9871,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let carry = builder.add_input(scalar_type);
         let items = builder.add_input(stack_type);
@@ -9906,7 +9917,7 @@ mod tests {
         // transposed branch consumes the live seed alone, giving `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let branch = |doubled_output: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
             let doubled =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -9916,7 +9927,7 @@ mod tests {
                 .unwrap()
         };
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let true_branch = builder.import_region(branch(1).entry_region_ref());
             let false_branch = builder.import_region(branch(0).entry_region_ref());
             let selector = builder.add_input(scalar_type.clone());
@@ -9947,7 +9958,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
         let selector = builder.add_input(scalar_type.clone());
         let input = builder.add_input(scalar_type);
@@ -10009,7 +10020,7 @@ mod tests {
         // it alone, and `x̄ = ȳ₁ + ȳ₁`.
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F64));
         let doubling = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
             let doubled =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -10020,7 +10031,7 @@ mod tests {
         let rematerialize = || RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
         let nest = |outer: Operation, inner: Operation| {
             let inner_program = {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
                 let region = builder.import_region(doubling.entry_region_ref());
                 let input = builder.add_input(scalar_type.clone());
                 let outputs = builder.add_instruction(inner, vec![region], vec![input], None).unwrap().to_vec();
@@ -10028,7 +10039,7 @@ mod tests {
                     .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
                     .unwrap()
             };
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let region = builder.import_region(inner_program.entry_region_ref());
             let input = builder.add_input(scalar_type.clone());
             let outputs = builder.add_instruction(outer, vec![region], vec![input], None).unwrap().to_vec();
@@ -10100,13 +10111,13 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut callee_builder = ArrayIrProgramBuilder::new();
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
         callee_builder.add_input(dynamic_type.clone().into());
         let live = callee_builder.add_input(scalar_type.clone().into());
         let callee = callee_builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let disconnected = builder.add_input(dynamic_type.into());
         let live = builder.add_input(scalar_type.into());
         let callee = builder.import_region(callee.entry_region_ref());
@@ -10146,7 +10157,7 @@ mod tests {
         let value_program_type = Type::Array(value_type.clone());
         let predicate_program_type = Type::Array(predicate_type.clone());
         let source = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let value = builder.add_input(value_program_type.clone());
             let predicate =
                 builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
@@ -10155,7 +10166,7 @@ mod tests {
                 .unwrap()
         };
         let transposed = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let value_cotangent = builder.add_input(value_program_type.clone());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
@@ -10449,7 +10460,7 @@ mod tests {
         // The callee declares no sharding for its input, so its executable places that input replicated over the mesh
         // of the call (refer to `JitCallOperation::boundary_input_sharding`).
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(Type::Array(ArrayType::new_static(DataType::I32, [4])));
             Arc::new(
                 builder
@@ -10508,7 +10519,7 @@ mod tests {
                 .unwrap();
         assert!(!uncommitted.is_committed());
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(Type::Array(vector_type));
             Arc::new(
                 builder
@@ -10937,7 +10948,7 @@ mod tests {
         let session = Session::builder().client(cpu_client(1)).build().unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32);
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(Type::Array(scalar_type.clone()));
             let operation = Operation::ReferenceNew(ReferenceNewOperation::new());
             let reference = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
@@ -11257,7 +11268,7 @@ mod tests {
                 .with_sharding(Sharding::replicated(logical_mesh.clone(), 1))
                 .unwrap();
             let callee = {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
                 let iota = IotaOperation::<ArrayType>::new(r#type, 0).unwrap();
                 let output = builder.add_instruction(iota, Vec::new(), Vec::new(), None).unwrap()[0];
                 Arc::new(
@@ -11284,7 +11295,7 @@ mod tests {
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let array_type = test_vector_type(4).with_sharding(replicated.clone()).unwrap();
         let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
             Arc::new(
@@ -11293,7 +11304,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let callee_region = builder.intern_callee(&callee, None).unwrap();
         let call = JitCallOperation::new(0).with_boundary(
@@ -11360,7 +11371,7 @@ mod tests {
         // and reject this program with a false missing-capture error, because the operation payload is authoritative.
         let array_type = test_vector_type(4);
         let inner = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let first_capture = builder.add_input(array_type.clone().into());
             let _second_capture = builder.add_input(array_type.clone().into());
             let second = builder.add_constant(Constant::Captured(CaptureReference::new(1, array_type.clone().into())));
@@ -11373,7 +11384,7 @@ mod tests {
             )
         };
         let outer = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(array_type.clone().into());
             let callee_region = builder.intern_callee(&inner, None).unwrap();
             let output = builder
@@ -11390,7 +11401,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(array_type.clone().into());
         let callee_region = builder.intern_callee(&outer, None).unwrap();
         let output = builder

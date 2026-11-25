@@ -134,18 +134,18 @@ mod tests {
         Add, BatchAxis, Context, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, DifferentiationError,
         DimensionBounds, DimensionVariable, EmptyRegionDriver, InterpretableOperation, Layout, LogicalMesh, Memory,
         MeshAxis, MeshAxisType, Neg, NegOperation, Operation as CoreOperation, PartialTracer, PartialValue, Place,
-        PlaceDispatch, Placed, Placeholder, Placement, ProgramError, ProjectedValue, Reduce, ReductionKind, Shape,
-        ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, TiledLayout, TypeError, Typed,
-        Value as CoreValue, ValueProjection, batch, differentiate_at, shard_map,
+        PlaceDispatch, Placed, Placeholder, Placement, ProgramBuilder, ProgramError, ProjectedValue, Reduce,
+        ReductionKind, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, TiledLayout, TypeError,
+        Typed, Value as CoreValue, ValueProjection, batch, differentiate_at, shard_map,
     };
     use ryft_pjrt::Client;
 
+    use crate::operations::Operation;
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
-        ProgramBuilder, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
-        compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions, Session,
+        StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully, compile_with_options, trace,
     };
 
     use super::*;
@@ -1362,7 +1362,7 @@ mod tests {
         .unwrap();
         let input = f32_vector(&session, &mesh, &[1., 2.]);
         let r#type = Type::Array(input.r#type().into_owned());
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let known = builder.add_input(r#type.clone());
         let unknown = builder.add_input(r#type.clone());
         let copy = builder

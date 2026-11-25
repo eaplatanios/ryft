@@ -41,7 +41,7 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue};
 
-    use crate::lowering::CollectiveLoweringState;
+    use crate::lowering::states::CollectiveLoweringState;
     use crate::lowering::types::lower_tensor_type;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;

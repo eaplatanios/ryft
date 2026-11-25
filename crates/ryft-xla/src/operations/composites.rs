@@ -5,8 +5,8 @@ use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Operation, Parameter, Parameterized, Placeholder, ProgramError, RegionId, RegionRef,
-    RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
+    DifferentiableType, FlatProgram, Operation, Parameter, Parameterized, Placeholder, Program, ProgramError, RegionId,
+    RegionRef, RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
 };
 #[cfg(test)]
 use ryft_mlir::Operation as _;
@@ -16,9 +16,11 @@ use ryft_mlir::{
     TypeAndAttributes, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::EffectTokens;
+use crate::lowering::emissions::omits_regions;
 use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::lower_array_ir_type;
-use crate::lowering::{CollectiveLoweringState, EffectTokens, omits_regions};
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
@@ -26,8 +28,7 @@ use crate::operations::jit_call::lower_shared_function_call;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
-use crate::operations::{FlatProgram, Program};
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type};
 
 /// Backend implementation that replaces the calls of a named composite when the XLA lowering targets a
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
@@ -344,7 +345,7 @@ pub(crate) struct NamedCompositionFunction {
     symbol: String,
 
     /// Canonical typed decomposition program.
-    program: FlatProgram,
+    program: FlatProgram<Session>,
 }
 
 impl NamedCompositionFunction {
@@ -393,7 +394,7 @@ impl NamedCompositionFunctionMap {
     /// is already present. The registry is independent of the operation family that produced `key` and `program`, and
     /// closed backend operation enums only decide when to call this seam. A key whose composite name is already taken
     /// by another key receives a symbol suffixed with the number of earlier keys of that name.
-    fn register<F: FnOnce() -> Result<FlatProgram, Error>>(
+    fn register<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
         &mut self,
         key: NamedCompositionKey,
         program: F,
@@ -417,7 +418,7 @@ impl NamedCompositionFunctionMap {
 /// composite call that a backend implementation replaces on that target nor the body of a scan that admits no
 /// iteration contributes compositions.
 pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &Program<Input, Output, O>,
+    program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
 ) -> Result<NamedCompositionFunctionMap, Error>
 where
@@ -571,14 +572,15 @@ mod tests {
         AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeAttribute,
         CompositeJvpRule, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer,
         DomainTracingContext, DotDimensionNumbers, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Mul,
-        MulOperation, NamedComposite, PrintOperation, Program, ProjectedContext, Reduce, ScanOperation, Shape,
-        Sharding, ShardingDimension, Softmax, batch, composite, differentiate_at, softmax,
+        MulOperation, NamedComposite, PrintOperation, Program, ProgramBuilder, ProjectedContext, Reduce, ScanOperation,
+        Shape, Sharding, ShardingDimension, Softmax, batch, composite, differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
+    use crate::lowering::emissions::lowers_without_regions;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
-    use crate::lowering::{lower_mlir_module_for_program, lowers_without_regions};
-    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Constant, Session, Tracer, to_mlir_module_for_program};
@@ -594,9 +596,9 @@ mod tests {
         rules: &CustomRuleRegistration<Constant, Operation>,
         body: &Arc<Program<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
         calls: usize,
-    ) -> FlatProgram {
+    ) -> FlatProgram<Session> {
         let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(vector_type.clone().into());
         let outputs = (0..calls)
             .map(|_| {
@@ -620,14 +622,14 @@ mod tests {
 
     /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
     fn doubled_body() -> Arc<Program<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
     /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
-    fn lower_named_calls(program: &FlatProgram, target_platform: Option<&str>) -> Result<String, Error> {
+    fn lower_named_calls(program: &FlatProgram<Session>, target_platform: Option<&str>) -> Result<String, Error> {
         let input_types = vec![test_vector_type(4)];
         let output_types = vec![test_vector_type(4); program.output_ids().len()];
         lower_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None, target_platform)
@@ -670,7 +672,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         let unavailable = NamedCompositeImplementation::FusedAttentionUnavailable {
             name: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
             reason: "the inputs are not `bf16`".to_string(),
@@ -691,7 +694,7 @@ mod tests {
         // multiplies on the tangent and cotangent sides mark here, reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let printed = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("primal"), Vec::new(), vec![input], None)
@@ -703,7 +706,7 @@ mod tests {
                 .unwrap()
         };
         let jvp = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let tangent = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
@@ -718,7 +721,7 @@ mod tests {
                 .unwrap()
         };
         let forward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
@@ -730,7 +733,7 @@ mod tests {
                 .unwrap()
         };
         let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let input_cotangent =
@@ -748,7 +751,7 @@ mod tests {
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Absent, true), vec![&forward, &backward]),
             (CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, true), vec![&jvp, &forward, &backward]),
         ] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let mut regions = vec![builder.import_region(primal.entry_region_ref())];
             regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
             let input = builder.add_input(vector_type.clone().into());
@@ -785,7 +788,8 @@ mod tests {
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
         let operation = CompositeOperation::<Constant, Operation>::from_rule_regions(CompositeJvpRule::Explicit, false);
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             operation.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -889,14 +893,14 @@ mod tests {
         let vector_type = test_vector_type(4);
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::<Constant, Operation>::new("doubled"));
         let primal = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let input = builder.add_input(vector_type.clone().into());
         let output = builder
@@ -1020,12 +1024,12 @@ mod tests {
         let second = named_rules_with_version("ryft.tests.xla_named_conflict", 1);
         let doubled = doubled_body();
         let squared = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(test_vector_type(4).into());
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &doubled), (&second, &squared), (&first, &doubled), (&second, &squared)]
             .into_iter()
@@ -1070,7 +1074,7 @@ mod tests {
         let inner_body = doubled_body();
         let outer_body = |version: u32| {
             let inner = named_rules_with_version("ryft.tests.xla_named_inner", version);
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(test_vector_type(4).into());
             let regions = vec![builder.intern_callee(&inner_body, None).unwrap()];
             let operation = Operation::Composite(CompositeOperation::new(inner.reference()));
@@ -1082,7 +1086,7 @@ mod tests {
         assert_ne!(first_body.to_string(), second_body.to_string());
         let first = named_rules_with_version("ryft.tests.xla_named_outer", 1);
         let second = named_rules_with_version("ryft.tests.xla_named_outer", 1);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &first_body), (&second, &second_body), (&first, &first_body), (&second, &second_body)]
             .into_iter()
@@ -1131,7 +1135,7 @@ mod tests {
         let replaced = named_rules_with_version("ryft.tests.xla_named_square", 1);
         let lowered = named_rules_with_version("ryft.tests.xla_named_square", 2);
         let body = doubled_body();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [&replaced, &lowered, &lowered]
             .into_iter()
@@ -1170,14 +1174,14 @@ mod tests {
         let first = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
         let second = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
         let unshareable = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(test_vector_type(4).into());
             builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
             let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
         let doubled = doubled_body();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &unshareable), (&second, &doubled), (&first, &unshareable), (&second, &doubled)]
             .into_iter()
@@ -1319,7 +1323,7 @@ mod tests {
         // before lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let residual = builder.add_input(vector_type.clone().into());
             let cotangent = builder.add_input(vector_type.clone().into());
             let output =
@@ -1333,7 +1337,7 @@ mod tests {
             vec![Type::Array(vector_type.clone())],
             vec![Type::Array(vector_type.clone())],
         );
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
         let tangent = builder.add_input(vector_type.clone().into());
         let residual = builder.add_input(vector_type.clone().into());
@@ -1460,7 +1464,7 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
         let carry_types = [output_type, element_type.clone(), element_type, scale_type.clone(), scale_type];
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carries = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
@@ -1470,7 +1474,7 @@ mod tests {
             Arc::new(builder.build(outputs, vec![Placeholder; 6], vec![Placeholder; 5]).unwrap())
         };
         let symbols = |length: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect();
             let regions = vec![builder.intern_callee(&body, None).unwrap()];
             let scan = ScanOperation::<Type>::new(5, length);

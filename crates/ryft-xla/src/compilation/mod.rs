@@ -5,7 +5,8 @@
 //! [`ryft_core::CompilationDomain`] for the session, which lowers a staged program into a [`LoweredProgram`] and
 //! compiles it into a [`CompiledProgram`]. [`options`] configures a compilation, [`keys`] identifies retained
 //! specializations and cached artifacts, [`persistence`] serializes compiled programs, [`analysis`] exposes compiler
-//! diagnostics, and [`profile_guided`] recompiles a function from execution profiles.
+//! diagnostics, and [`profile_guided`] recompiles a function from execution profiles. The crate-internal `placements`
+//! analyses the placements that a staged program requests and the placements of its results.
 
 // TODO(eaplatanios): Review this module.
 
@@ -15,6 +16,7 @@ pub mod functions;
 pub mod keys;
 pub mod options;
 pub mod persistence;
+pub(crate) mod placements;
 pub mod profile_guided;
 pub mod programs;
 
@@ -65,13 +67,13 @@ pub enum CompilationError {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::{ArrayType, Placeholder, ReferenceReadOperation, ReferenceType};
+    use ryft_core::{ArrayType, FlatProgram, Placeholder, ProgramBuilder, ReferenceReadOperation, ReferenceType};
 
-    use crate::{Constant, FlatProgram, ProgramBuilder, Type};
+    use crate::{Constant, Operation, Session, Type};
 
     /// Builds a flat program that reads and returns one externally supplied reference.
-    pub(super) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram {
-        let mut builder = ProgramBuilder::new();
+    pub(super) fn external_reference_read_program(referent_type: ArrayType) -> FlatProgram<Session> {
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(referent_type)));
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];

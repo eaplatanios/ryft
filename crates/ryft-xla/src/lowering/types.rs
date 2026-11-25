@@ -12,7 +12,8 @@ use ryft_mlir::{
 };
 
 use crate::devices::MemoryExtension;
-use crate::lowering::{CollectiveLoweringState, LoweringError, MlirLowerableValue};
+use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::{LoweringError, MlirLowerableValue};
 use crate::{ArrayConstant, ArrayError, Constant, Error, ToMlir, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.

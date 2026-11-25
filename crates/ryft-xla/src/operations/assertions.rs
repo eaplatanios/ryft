@@ -1647,15 +1647,16 @@ mod tests {
         DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionMaxOperation, DimensionOperation,
         DimensionPow, DimensionRemOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
         DimensionVariable, Div, DynamicBroadcastOperation, EmptyRegionDriver, IotaOperation,
-        Operation as CoreOperation, PartialValue, Placeholder, PrintOperation, ProgramError, ReferenceReadOperation,
-        ReferenceType, Rem, Reshape, Shape, StagingContext, Sub, TracingContext, Typed, TypedProgram, batch,
+        Operation as CoreOperation, PartialValue, Placeholder, PrintOperation, ProgramBuilder, ProgramError,
+        ReferenceReadOperation, ReferenceType, Rem, Reshape, Shape, StagingContext, Sub, TracingContext, Typed,
+        TypedProgram, batch,
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
-    use crate::lowering::lower_mlir_module_for_program_with_reference_state;
+    use crate::lowering::modules::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
+    use crate::operations::Operation;
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{boolean_vector, domain_mesh, f32_vector, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
     use crate::{Array, Constant, Options, RaggedDotLoweringStrategy, Session, Type, to_mlir_module_for_program};
@@ -1696,7 +1697,7 @@ mod tests {
         let declared: Vec<Type> =
             vec![n.clone().into(), ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into()];
         let array_type = ArrayType::new_static(DataType::F64, [2]);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let dimension = builder.add_input(m.into());
         let array = builder.add_input(array_type.clone().into());
         builder
@@ -1770,7 +1771,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> Type {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
         let third = builder.add_input(vector(&k));
@@ -1814,7 +1815,7 @@ mod tests {
         let vector = |dimension: &DimensionType| -> Type {
             ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()])).into()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(vector(&m));
         let second = builder.add_input(vector(&k));
         let guard =
@@ -1847,7 +1848,7 @@ mod tests {
         let array_type = ArrayType::new_static(DataType::F64, [3]);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let value = builder.add_input(array_type.clone().into());
@@ -1957,7 +1958,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![dimension.simplified_dimension()]))
             };
             let input_types = vec![vector(&retained), vector(&other)];
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let first = builder.add_input(ReferenceType::new(input_types[0].clone()).into());
             let second = builder.add_input(ReferenceType::new(input_types[1].clone()).into());
             let reads = [first, second]
@@ -2269,7 +2270,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -2360,7 +2361,7 @@ mod tests {
         let left_variable = DimensionVariable::new("left", DimensionBounds::new(1, Some(9)).unwrap());
         let right_variable = DimensionVariable::new("right", DimensionBounds::new(1, Some(9)).unwrap());
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left = builder.add_input(scalar_type.clone().into());
         let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
@@ -2481,7 +2482,7 @@ mod tests {
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let left_input = builder.add_input(input_type.clone().into());
         let right_input = builder.add_input(input_type.clone().into());
         builder
@@ -2549,7 +2550,7 @@ mod tests {
         let second_type = DimensionType::new("second", bounds);
         let third_type = DimensionType::new("third", bounds);
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let first_input = builder.add_input(input_type.clone().into());
         let second_input = builder.add_input(input_type.clone().into());
         let third_input = builder.add_input(input_type.clone().into());
@@ -2631,7 +2632,7 @@ mod tests {
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
         for (left_value, right_value, divisible) in [(3i64, 4i64, false), (7, 3, true), (7, 0, true)] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let left_input = builder.add_input(input_type.clone().into());
             let right_input = builder.add_input(input_type.clone().into());
             let left = builder
@@ -2896,7 +2897,7 @@ mod tests {
                 ("boolean", DataType::Boolean, vec![1], "true".to_owned()),
             ],
         ] {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let predicate = builder.add_input(predicate_type.clone().into());
             let predicate =
                 builder.add_instruction(AndOperation::new(), vec![], vec![predicate, predicate], None).unwrap()[0];

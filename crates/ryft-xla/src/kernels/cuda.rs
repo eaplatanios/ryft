@@ -681,7 +681,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayType, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
-        DimensionVariable, Placeholder, ReferenceRead, ReferenceWrite,
+        DimensionVariable, Placeholder, ProgramBuilder, ReferenceRead, ReferenceWrite,
     };
     use ryft_kernels::{KernelCallOperation, KernelDefinition, KernelParameter, VerifiedKernel};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -691,8 +691,8 @@ mod tests {
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
-    use crate::lowering::lower_mlir_module_for_program;
-    use crate::{Constant, ProgramBuilder};
+    use crate::lowering::modules::lower_mlir_module_for_program;
+    use crate::{Constant, Operation};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use crate::{Platform, RuntimeError};
 
@@ -945,7 +945,7 @@ mod tests {
         // The layout contract applies to caller-registered CUDA targets as well as the built-in target.
         let (payload, digest) = printed_payload(&operation);
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(operation, vec![], vec![input], None).unwrap()[0];
         let program = builder
@@ -1051,7 +1051,7 @@ mod tests {
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
         let configuration = "31cb32dbd5d2f6a4a82541f4443af30574ac09c9ef92c26deb583159d519412c";
         let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(scalar.clone().into());
         let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
         let program = builder

@@ -516,19 +516,19 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Dimension, DimensionBounds,
         DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation, Error as CoreError,
-        MeshAxisType, NegOperation, OneLikeOperation, Placeholder, PrintOperation, Shape, Sharding, ShardingDimension,
-        SubOperation, WhileOptions, batch, r#while,
+        FlatProgram, MeshAxisType, NegOperation, OneLikeOperation, Placeholder, PrintOperation, ProgramBuilder, Shape,
+        Sharding, ShardingDimension, SubOperation, WhileOptions, batch, r#while,
     };
     use ryft_mlir::{Context as MlirContext, Location};
 
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };
+    use crate::operations::Operation;
     use crate::operations::control_flow::tests::{
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Constant, Session, Value, to_mlir_module_for_program};
@@ -540,7 +540,7 @@ mod tests {
         // An unbounded loop with a pure scalar condition evaluates its condition in the condition region and threads
         // only its states through the loop.
         let state_type = ArrayType::scalar(DataType::Boolean);
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -601,7 +601,8 @@ mod tests {
         ));
 
         // An array IR loop needs exactly one condition region and one body region.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -630,7 +631,7 @@ mod tests {
         // remain the original state elements.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let while_operation = WhileOperation::new().with_iteration_bound(3).unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -682,7 +683,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let extent = builder.add_input(extent_type.clone().into());
             let predicate = builder
                 .add_instruction(
@@ -697,14 +698,14 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let extent = builder.add_input(extent_type.into());
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![extent], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
 
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -782,7 +783,7 @@ mod tests {
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
             let predicate = builder.add_constant(Constant::Boolean(true));
@@ -791,7 +792,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
@@ -801,7 +802,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![first, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
@@ -920,7 +921,7 @@ mod tests {
             Shape::new(vec![state_type.shape().dimensions()[0].clone(), Dimension::Static(3)]),
         );
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(state_type.clone().into());
             builder.add_input(state_type.clone().into());
             let predicate = builder.add_constant(Constant::Boolean(true));
@@ -929,7 +930,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let first = builder.add_input(state_type.clone().into());
             let second = builder.add_input(state_type.clone().into());
             let sum = builder
@@ -939,7 +940,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![first, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let dynamic_input = builder.add_input(state_type.clone().into());
@@ -982,7 +983,7 @@ mod tests {
         // state so assertions and prints remain on their independent enclosing effect chains.
         let state_type = ArrayType::scalar(DataType::Boolean);
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(state_type.clone().into());
             builder
                 .add_instruction(AssertOperation::<Type>::new("condition must be true"), Vec::new(), vec![state], None)
@@ -994,7 +995,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_program(unproject_plain_program(identity_branch(state_type.clone())));
         let state = builder.add_input(state_type.clone().into());
@@ -1067,7 +1068,7 @@ mod tests {
         // and truncation at the bound runs it only before each permitted body execution.
         let state_type = ArrayType::scalar(DataType::F64);
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(state_type.clone().into());
             let state = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("condition"), Vec::new(), vec![state], None)
@@ -1077,7 +1078,7 @@ mod tests {
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
@@ -1089,7 +1090,7 @@ mod tests {
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
@@ -1131,14 +1132,14 @@ mod tests {
         // leave nonzero or negative items.
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(state_type.clone().into());
             let one = builder
                 .add_instruction(OneLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
@@ -1147,7 +1148,7 @@ mod tests {
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let state = builder.add_input(state_type.clone().into());
@@ -1327,7 +1328,7 @@ mod tests {
                 ]),
             );
             let condition = {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 builder.add_input(state_type.clone().into());
                 builder
@@ -1339,7 +1340,7 @@ mod tests {
                     .unwrap()
             };
             let body = {
-                let mut builder = ArrayIrProgramBuilder::new();
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
                 let predicate = builder.add_input(predicate_type.clone().into());
                 let state = builder.add_input(state_type.clone().into());
                 builder
@@ -1350,7 +1351,7 @@ mod tests {
                     )
                     .unwrap()
             };
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let condition = builder.import_region(condition.entry_region_ref());
             let body = builder.import_region(body.entry_region_ref());
             let predicate = builder.add_input(predicate_type.clone().into());
@@ -1392,7 +1393,7 @@ mod tests {
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(extent_type.clone().into());
             let state = builder.add_input(state_type.clone().into());
             let predicate = positive(&mut builder, state);
@@ -1404,7 +1405,7 @@ mod tests {
         }
         .unwrap();
         let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let carried_extent = builder.add_input(extent_type.into());
             let state = builder.add_input(state_type.clone().into());
             let one = builder
@@ -1418,7 +1419,7 @@ mod tests {
             )
         }
         .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
         let vector = builder.add_input(dynamic_vector_type.clone().into());
@@ -1501,7 +1502,7 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [8]).with_sharding(vector_sharding.clone()).unwrap();
         let state_types = [scalar_type.clone(), scalar_type.clone(), vector_type.clone()];
         let loop_condition = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let predicate = builder
                 .add_instruction(compare(ComparisonDirection::LessThan), Vec::new(), vec![inputs[0], inputs[1]], None)
@@ -1511,7 +1512,7 @@ mod tests {
                 .unwrap()
         };
         let loop_body = {
-            let mut builder = ArrayIrProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
             let (index, limit, vector) = (inputs[0], inputs[1], inputs[2]);
             let one = builder
@@ -1527,7 +1528,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let mut builder = ArrayIrProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let condition_region = builder.import_region(loop_condition.entry_region_ref());
         let body_region = builder.import_region(loop_body.entry_region_ref());
         let inputs = state_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();

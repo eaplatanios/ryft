@@ -32,7 +32,7 @@ mod tests {
         ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed,
     };
 
-    use crate::lowering::lower_mlir_module_for_program;
+    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_mlir_module_for_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;

@@ -1115,10 +1115,10 @@ mod tests {
         DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
         DimensionOperation, DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis,
-        MeshAxisType, Min, OneOperation, OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind,
-        ReferenceAddUpdate, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceType,
-        ReferenceWrite, Rem, SaturatingSub, Shape, Sharding, Sort, SortDirection, SubOperation, TypeError,
-        TypeIdentityRenaming, Typed, ValueProjection, WhileOperation, WhilePredicate, ZeroOperation, batch,
+        MeshAxisType, Min, OneOperation, OperationProvider, ParallelPermute, Placeholder, Pow, ProgramBuilder, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap,
+        ReferenceType, ReferenceWrite, Rem, SaturatingSub, Shape, Sharding, Sort, SortDirection, SubOperation,
+        TypeError, TypeIdentityRenaming, Typed, ValueProjection, WhileOperation, WhilePredicate, ZeroOperation, batch,
         differentiate_at,
     };
     use ryft_pjrt::Client;
@@ -1126,7 +1126,7 @@ mod tests {
     use crate::tests::{
         cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes, vector_type,
     };
-    use crate::{Array, Error, ExecutionError, FromPjrt, Operation, ProgramBuilder, Session, SessionError};
+    use crate::{Array, Constant, Error, ExecutionError, FromPjrt, Operation, Session, SessionError};
 
     use super::*;
 
@@ -1707,7 +1707,7 @@ mod tests {
         let input = array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]);
 
         // `dimension_size(x, 0) + 2` followed by `dimension_to_scalar`, with the `2` stored as a program constant.
-        let mut builder = ProgramBuilder::new();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let x = builder.add_input(Type::Array(input.r#type().into_owned()));
         let size_operation = DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap();
         let size_type = size_operation.output_type().clone();
@@ -1861,7 +1861,7 @@ mod tests {
         let mesh = mesh_on(client, 0);
         let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let condition = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(scalar_type.clone());
             let zero = Operation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
             let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
@@ -1874,7 +1874,7 @@ mod tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::new();
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let state = builder.add_input(scalar_type.clone());
             let one = Operation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
             let one = builder.add_instruction(one, Vec::new(), Vec::new(), None).unwrap()[0];
