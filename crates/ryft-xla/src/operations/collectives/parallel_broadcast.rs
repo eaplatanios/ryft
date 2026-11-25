@@ -158,7 +158,7 @@ mod tests {
     use ryft_pjrt::Program as PjrtProgram;
 
     #[cfg(feature = "cuda-13")]
-    use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair_probes};
+    use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair};
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::{execute_inputs_on_cpu_devices, test_logical_mesh_2x2};
@@ -474,14 +474,12 @@ mod tests {
     // Worker of `test_parallel_broadcast_on_two_cuda_processes`, which returns immediately unless that test launched
     // it as one of its two ranks. It stages a `shard_map` of `parallel_broadcast` over a mesh `x = 2` whose input
     // `f32[4]` is sharded along `x`, lowers it for this CUDA client through Ryft, executes it with this rank's tile of
-    // `[1, 2, 3, 4]`, and prints a `probe:` line with this rank's output shard and the custom call targets of the
-    // lowered module.
+    // `[1, 2, 3, 4]`, and asserts this rank's output shard and that the lowered module has no custom call.
     #[cfg(feature = "cuda-13")]
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
     fn test_parallel_broadcast_cuda_process_helper() {
         run_as_cuda_rank(|client| {
-            let rank = client.process_index().unwrap();
             let devices = client
                 .devices()
                 .unwrap()
@@ -502,46 +500,42 @@ mod tests {
             )
             .unwrap();
 
-            // Stages, lowers, compiles, and executes the `shard_map` of `$body` with the output sharding
-            // `$output_sharding`, and prints its probe line.
-            macro_rules! probe {
-                ($name:literal, $output_sharding:expr, $body:expr $(,)?) => {{
-                    let output_sharding = $output_sharding;
-                    let staged = crate::stage::<_, ArrayType, ArrayType>(
-                        |x| {
-                            shard_map(
-                                $body,
-                                x,
-                                manual_mesh.clone(),
-                                sharded.clone(),
-                                output_sharding.clone(),
-                                ShardMapOptions::new(),
-                            )
-                            .unwrap()
-                        },
-                        input_type.clone(),
-                        Options::new(mesh.clone()),
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
+                |x| {
+                    shard_map(
+                        |x| Ok(x.parallel_broadcast("x", 1)?),
+                        x,
+                        manual_mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
                     )
                     .unwrap()
-                    .into_inner();
-                    let lowered = staged.lower(&session).unwrap();
-                    let targets = lowered
-                        .lowered_program()
-                        .stable_hlo()
-                        .split("stablehlo.custom_call @")
-                        .skip(1)
-                        .map(|call| call.split('(').next().unwrap().trim_matches('"').to_string())
-                        .collect::<Vec<_>>();
-                    let compiled = lowered.compile(&session).unwrap();
-                    let output = compiled.executable().execute(&session, Value::Array(input.clone())).unwrap();
-                    let Value::Array(output) = output else {
-                        panic!("the compiled function returned a dimension");
-                    };
-                    println!("probe: rank {rank} {}: {:?} {:?}", $name, read_addressable_f32s(&output)[0], targets);
-                }};
-            }
+                },
+                input_type.clone(),
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let lowered = staged.lower(&session).unwrap();
 
-            probe!("parallel_broadcast", sharded.clone(), |x| Ok(x.parallel_broadcast("x", 1)?));
+            // The CUDA lowering uses the native collective, so the lowered module has no custom call.
+            let targets = lowered
+                .lowered_program()
+                .stable_hlo()
+                .split("stablehlo.custom_call @")
+                .skip(1)
+                .map(|call| call.split('(').next().unwrap().trim_matches('"').to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(targets, Vec::<String>::new());
+
+            // Every rank receives the tile of rank 1.
+            let compiled = lowered.compile(&session).unwrap();
+            let output = compiled.executable().execute(&session, Value::Array(input.clone())).unwrap();
+            let Value::Array(output) = output else {
+                panic!("the compiled function returned a dimension");
+            };
+            assert_eq!(read_addressable_f32s(&output), [vec![3., 4.]]);
         });
     }
 
@@ -551,14 +545,8 @@ mod tests {
     fn test_parallel_broadcast_on_two_cuda_processes() {
         // Ryft's CUDA lowering of `parallel_broadcast` (i.e., `collective_broadcast`) executes across two processes
         // with the values of JAX, as `test_gpu_only_collectives_on_two_cuda_processes` records them.
-        let probes = run_cuda_rank_pair_probes(
+        run_cuda_rank_pair(
             "operations::collectives::parallel_broadcast::tests::test_parallel_broadcast_cuda_process_helper",
-        );
-        assert_eq!(
-            probes,
-            indoc! {"
-                rank 0 parallel_broadcast: [3.0, 4.0] []
-                rank 1 parallel_broadcast: [3.0, 4.0] []"},
         );
     }
 }

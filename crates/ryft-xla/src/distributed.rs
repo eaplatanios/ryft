@@ -821,9 +821,6 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use sha2::{Digest, Sha256};
 
-    #[cfg(feature = "cuda-13")]
-    use indoc::indoc;
-
     use ryft_core::{
         ArrayType, CompilationArtifactExchange, CompilationArtifactExchangeError, DataType, Device, DeviceMesh,
         LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
@@ -1709,8 +1706,8 @@ pub(crate) mod tests {
     }
 
     // Worker of `test_gpu_only_collectives_on_two_cuda_processes`, which returns immediately unless that test launched
-    // it as one of its two ranks. It compiles and executes each probe module with this rank's tile of `[1, 2, 3, 4]`
-    // and prints one `probe:` line per module with its outputs or the first line of its compilation or execution
+    // it as one of its two ranks. It compiles and executes each module with this rank's tile of `[1, 2, 3, 4]` and
+    // asserts, for each module, its outputs or the stable part of the first line of its compilation or execution
     // error.
     #[cfg(feature = "cuda-13")]
     #[test]
@@ -1837,6 +1834,7 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         run_as_cuda_rank(|client| {
             let rank = client.process_index().unwrap();
             let device = client.addressable_devices().unwrap().remove(0);
+            let mut outcomes = Vec::new();
             for (name, module) in modules {
                 let compiled = client.compile(
                     &PjrtProgram::Mlir { bytecode: module.trim_start().as_bytes().to_vec() },
@@ -1846,10 +1844,10 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                     Ok(executable) => executable,
                     Err(error) => {
                         // XLA's verifier messages end with the offending instruction, whose generated names change
-                        // between XLA versions, so the probe keeps only the stable part of the first line.
+                        // between XLA versions, so the outcome keeps only the stable part of the first line.
                         let message = error.to_string();
                         let message = message.lines().next().unwrap_or("").split(", but found").next().unwrap();
-                        println!("probe: rank {rank} {name}: compilation failed: {message}");
+                        outcomes.push((name, Err(format!("compilation failed: {message}"))));
                         continue;
                     }
                 };
@@ -1870,18 +1868,46 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
                     )
                     .and_then(|execution| execution.block_until_ready())
                     .and_then(|mut outputs| outputs.remove(0).outputs.remove(0).copy_to_host(None)?.r#await());
-                match executed {
-                    Ok(bytes) => {
-                        println!("probe: rank {rank} {name}: {:?}", values_from_bytes::<f32>(bytes.as_slice()))
-                    }
-                    Err(error) => {
-                        println!(
-                            "probe: rank {rank} {name}: execution failed: {}",
-                            error.to_string().lines().next().unwrap_or("")
-                        )
-                    }
-                }
+                outcomes.push((
+                    name,
+                    match executed {
+                        Ok(bytes) => Ok(values_from_bytes::<f32>(bytes.as_slice())),
+                        Err(error) => {
+                            Err(format!("execution failed: {}", error.to_string().lines().next().unwrap_or("")))
+                        }
+                    },
+                ));
             }
+
+            // This pins what Ryft's pinned XLA supports of JAX's GPU-only collectives across two processes, as each
+            // rank observes it. Following JAX's semantics, `pbroadcast` from source 1 gives both ranks `[3, 4]`, the
+            // swapping `ppermute` gives `[3, 4]` and `[1, 2]`, the tiled all-gather gives both ranks `[1, 2, 3, 4]`,
+            // the tiled sum scatter of the sum `[4, 6]` gives `[4]` and `[6]`, and the all-to-all gives `[1, 3]` and
+            // `[2, 4]`. XLA rejects the swapping `send` and `recv`, whose pairs form a cycle, while the acyclic variant
+            // delivers `[1, 2]` to rank 1 and leaves the received value of rank 0, which no pair targets, zero.
+            let cyclic = "compilation failed: during context [hlo verifier]: Expected send and recv instructions to \
+                          have non-cyclical source-target pairs";
+            let expected = [
+                [
+                    ("pbroadcast", Ok(vec![3., 4.])),
+                    ("ppermute_start_done", Ok(vec![3., 4.])),
+                    ("all_gather_start_done", Ok(vec![1., 2., 3., 4.])),
+                    ("psum_scatter_start_done", Ok(vec![4.])),
+                    ("all_to_all_start_done", Ok(vec![1., 3.])),
+                    ("psend_precv", Err(cyclic.to_string())),
+                    ("psend_precv_acyclic", Ok(vec![0., 0.])),
+                ],
+                [
+                    ("pbroadcast", Ok(vec![3., 4.])),
+                    ("ppermute_start_done", Ok(vec![1., 2.])),
+                    ("all_gather_start_done", Ok(vec![1., 2., 3., 4.])),
+                    ("psum_scatter_start_done", Ok(vec![6.])),
+                    ("all_to_all_start_done", Ok(vec![2., 4.])),
+                    ("psend_precv", Err(cyclic.to_string())),
+                    ("psend_precv_acyclic", Ok(vec![1., 2.])),
+                ],
+            ];
+            assert_eq!(outcomes, expected[rank]);
         });
     }
 
@@ -1889,32 +1915,6 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
     #[test]
     #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
     fn test_gpu_only_collectives_on_two_cuda_processes() {
-        // Pins what Ryft's pinned XLA supports of JAX's GPU-only collectives across two processes, as each rank
-        // observes it. Following JAX's semantics, `pbroadcast` from source 1 gives both ranks `[3, 4]`, the swapping
-        // `ppermute` gives `[3, 4]` and `[1, 2]`, the tiled all-gather gives both ranks `[1, 2, 3, 4]`, the tiled sum
-        // scatter of the sum `[4, 6]` gives `[4]` and `[6]`, and the all-to-all gives `[1, 3]` and `[2, 4]`. XLA
-        // rejects the swapping `send` and `recv`, whose pairs form a cycle, while the acyclic variant delivers `[1, 2]`
-        // to rank 1 and leaves the received value of rank 0, which no pair targets, zero.
-        let probes = run_cuda_rank_pair_probes("distributed::tests::test_gpu_only_collectives_cuda_process_helper");
-        assert_eq!(
-            probes,
-            indoc! {"
-                rank 0 pbroadcast: [3.0, 4.0]
-                rank 0 ppermute_start_done: [3.0, 4.0]
-                rank 0 all_gather_start_done: [1.0, 2.0, 3.0, 4.0]
-                rank 0 psum_scatter_start_done: [4.0]
-                rank 0 all_to_all_start_done: [1.0, 3.0]
-                rank 0 psend_precv: compilation failed: during context [hlo verifier]: Expected send and recv \
-                    instructions to have non-cyclical source-target pairs
-                rank 0 psend_precv_acyclic: [0.0, 0.0]
-                rank 1 pbroadcast: [3.0, 4.0]
-                rank 1 ppermute_start_done: [1.0, 2.0]
-                rank 1 all_gather_start_done: [1.0, 2.0, 3.0, 4.0]
-                rank 1 psum_scatter_start_done: [6.0]
-                rank 1 all_to_all_start_done: [2.0, 4.0]
-                rank 1 psend_precv: compilation failed: during context [hlo verifier]: Expected send and recv \
-                    instructions to have non-cyclical source-target pairs
-                rank 1 psend_precv_acyclic: [1.0, 2.0]"},
-        );
+        run_cuda_rank_pair("distributed::tests::test_gpu_only_collectives_cuda_process_helper");
     }
 }
