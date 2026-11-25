@@ -1648,25 +1648,25 @@ impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArray
 /// Option values of the leaves of one [`Session::place`] input, produced by [`Self::from_prefix`]. An omitted
 /// prefix and a prefix with one leaf at the root give every leaf the same value, which is stored once.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PlacementOptionValues<Value> {
+enum PlacementOptionValues<V> {
     /// Value of every leaf, or `None` if no prefix was given.
-    Uniform(Option<Value>),
+    Uniform(Option<V>),
 
     /// Values of the leaves, in the order of the leaves.
-    PerParameter(Vec<Value>),
+    PerParameter(Vec<V>),
 }
 
-impl<Value> PlacementOptionValues<Value> {
+impl<V> PlacementOptionValues<V> {
     /// Expands an optional placement prefix into its value for each input leaf. A prefix with one leaf at the root
     /// covers the whole input, so it needs no path matching or structure cloning, and neither it nor an omitted
     /// prefix allocates per leaf. Structured prefixes use [`Parameterized::broadcast_parameters`] to validate
     /// every node, including empty containers.
-    fn from_prefix<P: Parameterized<Value>, S: Parameterized<Placeholder>>(
+    fn from_prefix<P: Parameterized<V>, S: Parameterized<Placeholder>>(
         prefix: Option<P>,
         structure: &S,
     ) -> Result<Self, Error>
     where
-        Value: Clone + Parameter,
+        V: Clone + Parameter,
     {
         let Some(prefix) = prefix else {
             return Ok(Self::Uniform(None));
@@ -1681,7 +1681,7 @@ impl<Value> PlacementOptionValues<Value> {
     }
 
     /// Returns the supplied value of the leaf at `index`, if any.
-    fn get(&self, index: usize) -> Option<&Value> {
+    fn get(&self, index: usize) -> Option<&V> {
         match self {
             Self::Uniform(value) => value.as_ref(),
             Self::PerParameter(values) => Some(&values[index]),
@@ -2001,10 +2001,12 @@ mod tests {
     use std::time::Duration;
 
     use half::bf16;
-    #[cfg(feature = "cuda-13")]
-    use indoc::formatdoc;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
+    #[cfg(feature = "cuda-13")]
+    use indoc::formatdoc;
+
     use ryft_core::{
         Add, ArrayIrType, ArrayIrValue, BatchAxis, Complex, DataType, DeviceMesh, DifferentiableType, Differentiate,
         DifferentiationDual, DifferentiationError, Dimension, DimensionBounds, DimensionVariable, DomainTracingContext,
@@ -2018,13 +2020,7 @@ mod tests {
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionFence, KeyValueStore, load_cpu_plugin,
     };
 
-    #[cfg(feature = "cuda-13")]
-    use crate::arrays::host::DIFFERENT_VALUES_MESSAGE;
     use crate::arrays::host::participant_mesh_of;
-    #[cfg(feature = "cuda-13")]
-    use crate::distributed::tests::{
-        read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair, run_cuda_rank_pair_probes,
-    };
     use crate::distributed::tests::{run_cpu_processes, test_process};
     use crate::sessions::tests::{DeclareRemoteDevices, domain_mesh, two_device_mesh};
     use crate::tests::{
@@ -2035,6 +2031,13 @@ mod tests {
         ArrayTracer, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, DistributedRuntime, LoweringError,
         Options, SessionError, StagedFunction, StatefulCompileTracer, ToPjrt, TracedProgram, Type, Value, compile,
         compile_statefully, compile_with_options, jit, stage, trace,
+    };
+
+    #[cfg(feature = "cuda-13")]
+    use crate::arrays::host::DIFFERENT_VALUES_MESSAGE;
+    #[cfg(feature = "cuda-13")]
+    use crate::distributed::tests::{
+        read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair, run_cuda_rank_pair_probes,
     };
 
     use super::*;
@@ -2100,6 +2103,7 @@ mod tests {
             .map(|shard| {
                 let buffer = shard.buffer().unwrap();
                 buffer.ready().unwrap().r#await().unwrap();
+
                 // The buffer is ready and stays alive while `array` does, and its address is only compared and never
                 // dereferenced.
                 unsafe { buffer.unsafe_pointer().unwrap() }
