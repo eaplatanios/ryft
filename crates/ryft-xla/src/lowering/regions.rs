@@ -10,11 +10,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::lower_constant;
-use crate::lowering::{
-    CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction,
-    lower_instruction_operation,
-};
-use crate::operations::composites::lowers_without_regions;
+use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction, lower_instruction_operation, lowers_without_regions};
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{Constant, Error, FlatProgram, Program};
 

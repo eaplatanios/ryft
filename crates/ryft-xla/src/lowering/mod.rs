@@ -39,7 +39,7 @@ use ryft_core::{
     MeshAxisType, OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection,
     PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, Provenance,
     Region as CoreRegion, RegionId, RegionRef, RegionRole, RematerializationOptimizationBarrier, ReshapeOperation,
-    ReshardOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, ScatterOperation, Shape, ShardMapBoundary,
+    ReshardOperation, SCAN_OPERATION_NAME, SHARD_MAP_OPERATION_NAME, ScanOperation, ScatterOperation, Shape, ShardMapBoundary,
     ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
     Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, UnreducedKind, Value,
     WHILE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
@@ -63,9 +63,8 @@ use crate::lowering::regions::{lower_nested_program_inline, lower_program_output
 use crate::lowering::signature::ExecutableSignature;
 use crate::lowering::types::{
     lower_boundary_layout, lower_captured_constant, lower_literal_value, lower_runtime_dimension_size_i64,
-    lower_tensor_type, lower_unplaced_constant_output, validate_boundary_memory,
+    lower_tensor_type, lower_unplaced_constant_output, stable_hlo_dynamic_dimension_bound, validate_boundary_memory,
 };
-use crate::operations::composites::{omits_operation_regions, omits_regions};
 use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::sharding::{ShardyTensorSharding, lower_closed_sharding_constraint};
 use crate::{
@@ -652,6 +651,21 @@ pub trait LowerableOperation: CoreOperation {
     #[inline]
     fn composite_key(&self) -> Option<&CompositeKey> {
         None
+    }
+
+    /// Returns `true` if a backend implementation replaces the calls of the named composite `key` of this family at
+    /// the boundary with the provided types when they are lowered for `target_platform`. The lowering of such a call
+    /// emits none of its regions, so the module-level lowering passes skip them. It returns `false` unless a family
+    /// overrides it, in which case the body of every named composite call is lowered.
+    #[inline]
+    fn has_composite_implementation(
+        key: &CompositeKey,
+        input_types: &[Type],
+        output_types: &[Type],
+        target_platform: Option<&str>,
+    ) -> bool {
+        let _ = (key, input_types, output_types, target_platform);
+        false
     }
 
     /// Returns, for each input of `callee`, the callee of a `jit_call` of this family whose first `capture_count`
@@ -1541,6 +1555,79 @@ pub(crate) fn render_devices(devices: &[Device]) -> String {
     format!("[{}]", devices.iter().map(Device::to_string).collect::<Vec<_>>().join(", "))
 }
 
+/// Returns `true` if the length of `scan` admits an iteration, which is false for a static length of zero and for a
+/// dynamic length whose bounds admit only zero. The lowering of a scan that admits no iteration emits nothing of its
+/// body, and this is the one decision of that, which the walks that follow the regions that lowering emits read
+/// (refer to `omits_regions`).
+pub(crate) fn admits_iterations(scan: &ScanOperation<Type>) -> bool {
+    let length = scan.iteration_count();
+    length.value() != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0)
+}
+
+/// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
+/// named composite call, which [`LowerableOperation::composite_key`] identifies, that a backend implementation replaces
+/// or whose body lowers to a shared function. The lowering loops skip materializing the regions of such instructions,
+/// which would otherwise copy the body per call.
+pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
+    operation: &O,
+    input_types: &[Type],
+    output_types: &[Type],
+    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    target_platform: Option<&str>,
+) -> bool {
+    let Some(key) = operation.composite_key() else {
+        return false;
+    };
+    O::has_composite_implementation(key, input_types, output_types, target_platform)
+        || nested_functions.is_some_and(|functions| functions.named(key, input_types, output_types).is_some())
+}
+
+/// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
+/// for a named composite call whose backend implementation replaces the whole call for that target (refer to
+/// [`LowerableOperation::has_composite_implementation`]) and, on every target, for a scan whose length admits no iteration (refer
+/// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
+/// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
+/// functions that calls share (refer to `collect_jit_call_functions`), the traversal of the regions that lowering emits
+/// (refer to `emitted_regions`, which compilation admission also reads), the summaries of the placement requests and of
+/// the session constants of a region, and the validation of the placements of a compiled program (refer to
+/// `validate_placements`), so that a placement request or a captured array inside a region that lowering omits is never
+/// validated, placed, or passed. The eager application of an operation asks the same question of that operation (refer
+/// to [`omits_operation_regions`]).
+pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
+    region: RegionRef<'_, V, O>,
+    instruction: &Instruction<O>,
+    target_platform: Option<&str>,
+) -> bool {
+    let types = |atoms: &[AtomId]| {
+        atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
+    };
+    omits_operation_regions(
+        instruction.operation(),
+        || (types(instruction.inputs()), types(instruction.outputs())),
+        target_platform,
+    )
+}
+
+/// Returns `true` if lowering `operation` for `target_platform` emits none of its regions. This is the part of
+/// [`omits_regions`] that reads only the operation, its input and output types, which `boundary_types` returns when a
+/// named composite call needs them, and the platform, so that the eager application of an operation (refer to
+/// `Session::bind`) asks the same question of the operation that it binds as the walks of the regions that lowering
+/// emits ask of each instruction.
+pub(crate) fn omits_operation_regions<O: LowerableOperationFamily>(
+    operation: &O,
+    boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
+    target_platform: Option<&str>,
+) -> bool {
+    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(|scan| !admits_iterations(scan)) {
+        return true;
+    }
+    let Some(key) = operation.composite_key() else {
+        return false;
+    };
+    let (input_types, output_types) = boundary_types();
+    O::has_composite_implementation(key, &input_types, &output_types, target_platform)
+}
+
 /// Returns `entry` and the computation regions below it that lowering emits for `target_platform`, visiting shared
 /// regions once, in the order of [`RegionRef::computation_regions`]. Dormant rule regions (e.g., the transpose region
 /// of a `linear_call`) and the regions of the instructions whose lowering omits them (refer to [`omits_regions`]) are
@@ -2108,8 +2195,8 @@ where
 /// Returns whether lowering `instruction` of `region` for `target_platform` omits its regions (refer to
 /// [`omits_regions`]), for the operations of any family, through the same decision (refer to
 /// [`omits_operation_regions`]). Only the named composite calls of [`Operation`] are replaced, which this recognizes
-/// through [`LowerableOperation::composite_key`] when there is a target, so that the families that only partial
-/// evaluation analyses, for no target, need not lower.
+/// when there is a target, so that the families that only partial evaluation analyses, for no target, need not lower.
+/// The body of a scan that admits no iteration is omitted for every family.
 fn omits_placement_regions<V, O>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
@@ -2119,18 +2206,20 @@ where
     V: Value<Type = Type>,
     O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
 {
-    let composite_key = target_platform
-        .and_then(|_| (instruction.operation() as &dyn Any).downcast_ref::<Operation>())
-        .and_then(LowerableOperation::composite_key);
     let types = |atoms: &[AtomId]| {
         atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
     };
-    omits_operation_regions(
-        instruction.operation(),
-        composite_key,
-        || (types(instruction.inputs()), types(instruction.outputs())),
-        target_platform,
-    )
+    match target_platform.and_then(|_| (instruction.operation() as &dyn Any).downcast_ref::<Operation>()) {
+        Some(operation) => omits_operation_regions(
+            operation,
+            || (types(instruction.inputs()), types(instruction.outputs())),
+            target_platform,
+        ),
+        None => instruction
+            .operation()
+            .projected_payload::<ScanOperation<Type>>()
+            .is_some_and(|scan| !admits_iterations(scan)),
+    }
 }
 
 /// Returns the session constants that the program whose entry region is `entry`, which is already pruned, holds in
@@ -2987,7 +3076,7 @@ where
     // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
     // through the lowerer's shared location, with the ambient location as its base.
     let location = collective_state.instruction_location(context, instruction.provenance(), location);
-    let regions = if crate::operations::composites::lowers_without_regions(
+    let regions = if lowers_without_regions(
         instruction.operation(),
         &input_types,
         &output_types,

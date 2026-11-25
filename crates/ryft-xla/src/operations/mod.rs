@@ -50,6 +50,7 @@ use ryft_mlir::{
 
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::lowering::{MlirLowerableValue, unread_lifted_captures, validate_local_output_placement};
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::lower_layout_constraint;
 use crate::{
     Constant, Error, KernelOperation, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type,
@@ -754,6 +755,16 @@ impl LowerableOperation for Operation {
             Self::LiftedComposite(operation) => operation.key(),
             _ => None,
         }
+    }
+
+    #[inline]
+    fn has_composite_implementation(
+        key: &CompositeKey,
+        input_types: &[Type],
+        output_types: &[Type],
+        target_platform: Option<&str>,
+    ) -> bool {
+        NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
     }
 
     #[inline]

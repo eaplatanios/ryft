@@ -12,8 +12,7 @@ use ryft_mlir::{
 
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::types::{lower_array_ir_type, lower_tensor_type};
-use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily};
-use crate::operations::composites::omits_regions;
+use crate::lowering::{CollectiveLoweringState, EffectTokens, LowerableOperationFamily, omits_regions};
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };

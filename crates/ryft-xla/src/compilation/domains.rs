@@ -34,12 +34,7 @@ use crate::compilation::programs::{
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::signature::ExecutableSignature;
-use crate::lowering::{
-    EntryResultPlacement, collect_session_constants, contains_unresolved_references, contains_unresolved_state,
-    emitted_capture_reads, emitted_regions, entry_boundary_sharding, entry_open_results, entry_result_placements,
-    entry_result_shardings, has_placement_requests, pruned_program, unread_entry_arguments,
-};
-use crate::operations::composites::omits_regions;
+use crate::lowering::{EntryResultPlacement, collect_session_constants, contains_unresolved_references, contains_unresolved_state, emitted_capture_reads, emitted_regions, entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, has_placement_requests, pruned_program, unread_entry_arguments, omits_regions};
 use crate::{
     Array, Constant, Error, ExecutionError, FlatProgram, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
     OpShardingExtension, Operation, RetainedArray, Session, Type, Value,

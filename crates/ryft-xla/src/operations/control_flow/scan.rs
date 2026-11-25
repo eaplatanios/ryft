@@ -36,7 +36,7 @@ use crate::lowering::types::{
     lower_array_ir_type, lower_compare_to_mlir, lower_constant_output, lower_static_index_constants, lower_tensor_type,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
-use crate::lowering::{CollectiveLoweringState, EffectTokens};
+use crate::lowering::{CollectiveLoweringState, EffectTokens, admits_iterations};
 use crate::operations::FlatProgram;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
@@ -45,15 +45,6 @@ use crate::operations::control_flow::{
 };
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
-
-/// Returns `true` if the length of `scan` admits an iteration, which is false for a static length of zero and for a
-/// dynamic length whose bounds admit only zero. The lowering of a scan that admits no iteration emits nothing of its
-/// body, and this is the one decision of that, which the walks that follow the regions that lowering emits read
-/// (refer to `omits_regions`).
-pub(crate) fn admits_iterations(scan: &ScanOperation<Type>) -> bool {
-    let length = scan.iteration_count();
-    length.value() != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0)
-}
 
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(

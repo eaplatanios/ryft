@@ -717,7 +717,7 @@ macro_rules! impl_placeable {
     (<$($generic:ident),+> $value:ty $(where $($bounds:tt)+)?) => {
         impl<$($generic),+> PlaceableParameter<$value> for $value
         where
-            Self: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
+            Self: RuntimeArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
             $($($bounds)+)?
         {
             #[inline]
@@ -733,7 +733,7 @@ macro_rules! impl_placeable {
                 // for every leaf.
                 validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
 
-                for array in self.concrete_arrays() {
+                for array in self.runtime_arrays() {
                     // Placement uses the contexts already attached to the tracer. Rebinding would lose state such as
                     // the residual program owned by a partial evaluation context. Check the PJRT client before the
                     // session because device IDs are scoped to a client. Other handles of the same session are
@@ -756,7 +756,7 @@ macro_rules! impl_placeable {
 
         impl<$($generic),+> Placeable for $value
         where
-            Self: ConcreteArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
+            Self: RuntimeArrays + CoreValue<Type = ArrayType, Dispatch: PlaceDispatch<ArrayType, Self>>,
             $($($bounds)+)?
         {
             type Output = Self;
@@ -1540,19 +1540,14 @@ impl Session {
                         None
                     }
                 };
-
-                let target =
-                    resolve(target_values.get(index).cloned().map_or(Ok(None), |request| request.resolve(self)));
-                let source =
-                    resolve(source_values.get(index).cloned().map_or(Ok(None), |request| request.resolve(self)));
+                let target = resolve(target_values.get(index).cloned().map_or(Ok(None), |r| r.resolve(self)));
+                let source = resolve(source_values.get(index).cloned().map_or(Ok(None), |r| r.resolve(self)));
                 let donate = donate_values.get(index).copied().unwrap_or_default();
                 let may_alias = may_alias_values.get(index).copied().flatten();
-
                 if checked.is_ok() {
                     checked =
                         validate_parameter_options(|| path(index), target.as_ref(), source.as_ref(), donate, may_alias);
                 }
-
                 (target, source, donate, may_alias)
             })
             .collect::<Vec<_>>();
@@ -1763,26 +1758,26 @@ fn place_leaves<P: Placeable>(
         .collect()
 }
 
-/// Value that may wrap concrete [`Array`]s, through whose sessions the placement of a traced value executes. A traced
-/// value places its arrays with the contexts that it was created in, which hold the sessions of those arrays, so
-/// [`Session::place`] uses this trait to reject a traced value over the arrays of another session than the receiving
-/// one, and in particular over the arrays of another PJRT client.
-trait ConcreteArrays {
-    /// Returns every concrete [`Array`] that this value wraps (e.g., both the primal and the tangent of a
-    /// differentiated value). Staged values and host values wrap none.
-    fn concrete_arrays(&self) -> Vec<&Array>;
+/// Exposes the borrowed [`ryft_xla::Array`](crate::Array) handles carried by a value. Traced placement runs in the
+/// tracer's existing contexts, so [`Session::place`] checks that those handles belong to the receiving session
+/// and its PJRT client.
+trait RuntimeArrays {
+    /// Returns borrowed handles to the runtime arrays of this value, including the array itself or arrays wrapped
+    /// by a tracer (e.g., those in the primal and tangent of a differentiated value). Host values and abstract
+    /// tracers return an empty list.
+    fn runtime_arrays(&self) -> Vec<&Array>;
 }
 
-impl ConcreteArrays for Array {
+impl RuntimeArrays for Array {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
+    fn runtime_arrays(&self) -> Vec<&Array> {
         vec![self]
     }
 }
 
-impl ConcreteArrays for Value {
+impl RuntimeArrays for Value {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
+    fn runtime_arrays(&self) -> Vec<&Array> {
         match self {
             Self::Array(value) => vec![value],
             Self::Dimension(_) | Self::Reference(_) => Vec::new(),
@@ -1790,53 +1785,53 @@ impl ConcreteArrays for Value {
     }
 }
 
-impl ConcreteArrays for CoreArray {
+impl RuntimeArrays for CoreArray {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
+    fn runtime_arrays(&self) -> Vec<&Array> {
         Vec::new()
     }
 }
 
-impl<C: Context> ConcreteArrays for Tracer<C> {
+impl<C: Context> RuntimeArrays for Tracer<C> {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
+    fn runtime_arrays(&self) -> Vec<&Array> {
         Vec::new()
     }
 }
 
-impl<C: Context<Value: ConcreteArrays>> ConcreteArrays for PartialTracer<C> {
+impl<C: Context<Value: RuntimeArrays>> RuntimeArrays for PartialTracer<C> {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
+    fn runtime_arrays(&self) -> Vec<&Array> {
         // An unknown value has no payload yet, and a poisoned value surfaces its deferred error when it is used.
         match self.value().ok().and_then(|value| value.as_known()) {
-            Some(value) => value.concrete_arrays(),
+            Some(value) => value.runtime_arrays(),
             None => Vec::new(),
         }
     }
 }
 
-impl<C: Context<Value: ConcreteArrays>, P: DifferentiationPolicy<C>> ConcreteArrays for DifferentiationTracer<C, P> {
+impl<C: Context<Value: RuntimeArrays>, P: DifferentiationPolicy<C>> RuntimeArrays for DifferentiationTracer<C, P> {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
-        let mut arrays = self.primal().concrete_arrays();
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        let mut arrays = self.primal().runtime_arrays();
         if let Some(tangent) = self.tangent().as_value() {
-            arrays.extend(tangent.concrete_arrays());
+            arrays.extend(tangent.runtime_arrays());
         }
         arrays
     }
 }
 
-impl<C: Context<Value: ConcreteArrays>, P: BatchingPolicy<C>> ConcreteArrays for BatchingTracer<C, P> {
+impl<C: Context<Value: RuntimeArrays>, P: BatchingPolicy<C>> RuntimeArrays for BatchingTracer<C, P> {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
-        P::value(self.batch()).concrete_arrays()
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        P::value(self.batch()).runtime_arrays()
     }
 }
 
-impl<V: ConcreteArrays> ConcreteArrays for ProjectedValue<ArrayType, V> {
+impl<V: RuntimeArrays> RuntimeArrays for ProjectedValue<ArrayType, V> {
     #[inline]
-    fn concrete_arrays(&self) -> Vec<&Array> {
-        self.value().concrete_arrays()
+    fn runtime_arrays(&self) -> Vec<&Array> {
+        self.value().runtime_arrays()
     }
 }
 

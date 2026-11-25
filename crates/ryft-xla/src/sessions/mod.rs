@@ -126,10 +126,10 @@ use crate::compilation::domains::{captured_type, declared_input_sharding, is_nam
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::{
-    RequestedPlacement, emitted_regions, merge_requested_placement, owned_session_constants, placement_requests,
-    render_devices, requested_placement_mesh,
+    RequestedPlacement, emitted_regions, merge_requested_placement, omits_operation_regions, owned_session_constants,
+    placement_requests, render_devices, requested_placement_mesh,
 };
-use crate::operations::composites::{NamedCompositeImplementation, omits_operation_regions};
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::jit_call::EagerCallDecision;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
@@ -1438,7 +1438,7 @@ impl Context for Session {
                     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
                     (input_types, primal.interface().output_types().to_vec())
                 };
-                omits_operation_regions(&operation, operation.composite_key(), boundary_types, target_platform)
+                omits_operation_regions(&operation, boundary_types, target_platform)
             });
 
         let computation_regions = || {

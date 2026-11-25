@@ -1,12 +1,10 @@
 use std::hash::Hash;
-use std::rc::Rc;
 
 use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, Instruction, Operation, OperationPayloadProjection, Parameter, Placeholder, ProgramError,
-    RegionRef, RematerializationOptimizationBarrier, ScanOperation, Typed, Value,
+    DifferentiableType, Operation, Parameter, Placeholder, ProgramError, RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -16,76 +14,8 @@ use crate::lowering::regions::lower_nested_program_inline;
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
-use crate::operations::control_flow::scan::admits_iterations;
-use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call};
+use crate::operations::jit_call::lower_shared_function_call;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
-
-/// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
-/// named composite call, which [`LowerableOperation::composite_key`] identifies, that a backend implementation replaces
-/// or whose body lowers to a shared function. The lowering loops skip materializing the regions of such instructions,
-/// which would otherwise copy the body per call.
-pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
-    operation: &O,
-    input_types: &[Type],
-    output_types: &[Type],
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
-    target_platform: Option<&str>,
-) -> bool {
-    let Some(key) = operation.composite_key() else {
-        return false;
-    };
-    NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
-        || nested_functions.is_some_and(|functions| functions.named(key, input_types, output_types).is_some())
-}
-
-/// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
-/// for a named composite call whose backend implementation replaces the whole call for that target (refer to
-/// [`NamedCompositeImplementation::select`]) and, on every target, for a scan whose length admits no iteration (refer
-/// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
-/// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
-/// functions that calls share (refer to `collect_jit_call_functions`), the traversal of the regions that lowering emits
-/// (refer to `emitted_regions`, which compilation admission also reads), the summaries of the placement requests and of
-/// the session constants of a region, and the validation of the placements of a compiled program (refer to
-/// `validate_placements`), so that a placement request or a captured array inside a region that lowering omits is never
-/// validated, placed, or passed. The eager application of an operation asks the same question of that operation (refer
-/// to [`omits_operation_regions`]).
-pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
-    region: RegionRef<'_, V, O>,
-    instruction: &Instruction<O>,
-    target_platform: Option<&str>,
-) -> bool {
-    let types = |atoms: &[ryft_core::AtomId]| {
-        atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
-    };
-    omits_operation_regions(
-        instruction.operation(),
-        instruction.operation().composite_key(),
-        || (types(instruction.inputs()), types(instruction.outputs())),
-        target_platform,
-    )
-}
-
-/// Returns `true` if lowering `operation`, which calls the named composite `composite_key` if it is one, for
-/// `target_platform` emits none of its regions. This is the part of [`omits_regions`] that reads only the operation,
-/// its input and output types, which `boundary_types` returns when a named composite call needs them, and the
-/// platform, so that the eager application of an operation (refer to `Session::bind`) asks the same question of the
-/// operation that it binds as the walks of the regions that lowering emits ask of each instruction. The caller passes
-/// the key, because the families that only partial evaluation analyses recognize no named composite call.
-pub(crate) fn omits_operation_regions<O: OperationPayloadProjection>(
-    operation: &O,
-    composite_key: Option<&CompositeKey>,
-    boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
-    target_platform: Option<&str>,
-) -> bool {
-    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(|scan| !admits_iterations(scan)) {
-        return true;
-    }
-    let Some(key) = composite_key else {
-        return false;
-    };
-    let (input_types, output_types) = boundary_types();
-    NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
-}
 
 /// Backend implementation that replaces the calls of a named composite when the XLA lowering targets a
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
@@ -370,8 +300,8 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
-    use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
+    use crate::lowering::{lower_mlir_module_for_program, lowers_without_regions};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
