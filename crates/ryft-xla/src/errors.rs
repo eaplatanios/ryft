@@ -80,6 +80,16 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Converts a background upload failure to the error reported by its destination buffers. Existing PJRT errors
+    /// retain their status, and other errors become internal PJRT errors with the original display message.
+    #[inline]
+    pub(crate) fn into_pjrt_error(self) -> PjrtError {
+        match self {
+            Self::Pjrt(error) => error,
+            error => PjrtError::internal(error.to_string()),
+        }
+    }
 }
 
 impl PartialEq for Error {

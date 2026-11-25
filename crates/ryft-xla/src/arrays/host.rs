@@ -2322,16 +2322,18 @@ impl Array {
         let placement = Placement::single_device(device, 0);
         let (mesh, sharding) = (placement.mesh().clone(), placement.sharding().clone());
         let readback = maximum.clone();
-
-        let poison = |error: Error| match error {
-            Error::Pjrt(error) => error,
-            error => PjrtError::internal(error.to_string()),
-        };
-
         let r#type = ArrayType::scalar(DataType::U8);
         let sources = maximum.host_readback_fence()?;
         let readback = move || verdict(&readback);
-        match Self::from_host_buffer_in_background(session, r#type, mesh, sharding, sources, readback, poison)? {
+        match Self::from_host_buffer_in_background(
+            session,
+            r#type,
+            mesh,
+            sharding,
+            sources,
+            readback,
+            Error::into_pjrt_error,
+        )? {
             Some(array) => Ok(array.execution_fence().cloned().unwrap_or_else(|| ExecutionFence::new(Vec::new()))),
             None => verdict(&maximum).map(|_| ExecutionFence::new(Vec::new())),
         }

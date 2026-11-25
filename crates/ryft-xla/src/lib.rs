@@ -86,7 +86,7 @@ pub use sessions::{
     normalize_runtime_requirements,
 };
 pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
-pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
+pub use tracing::{ArrayTracer, ProgramExtension, TracedProgram, trace, trace_with_context};
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 
 // TODO(eaplatanios): Review this module.
