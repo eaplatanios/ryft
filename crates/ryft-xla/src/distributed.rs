@@ -55,8 +55,6 @@ use ryft_pjrt::{
 
 use crate::{Error, FromPjrt};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Maximum number of artifact bytes that one key-value store record of a compilation artifact exchange holds.
 const DEFAULT_ARTIFACT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -66,15 +64,16 @@ const DEFAULT_MAXIMUM_ARTIFACT_SIZE: usize = 2 * 1024 * 1024 * 1024;
 /// Maximum size, in bytes, of a persistent compilation key that compatibility validation accepts.
 const DEFAULT_MAXIMUM_COMPATIBILITY_KEY_SIZE: usize = 64 * 1024 * 1024;
 
-/// Duration for which [`DistributedRuntime::initialize`] keeps trying to connect to the coordination service, which
-/// is the default of `jax.distributed.initialize`.
+/// Duration for which [`DistributedRuntime::initialize`] keeps trying to connect to the coordination service.
 const DEFAULT_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Version of the compilation artifact exchange protocol, which every participant must share.
-const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 4;
+const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 1;
 
 /// Key-value store key under which the coordinator publishes the launch identity.
 const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
+
+// TODO(eaplatanios): Review from here onwards,
 
 /// Handle of one process on the coordination service of a distributed `ryft-xla` job. Refer to the
 /// [module documentation](self) for the lifecycle of a job.
@@ -824,6 +823,12 @@ pub(crate) mod tests {
         Some((rank, env::var(PROCESS_TEST_ADDRESS).unwrap()))
     }
 
+    // TODO(eaplatanios): Split the workers that check many behaviors in one test, so that each multi-process test
+    // checks one behavior of its owning item. The largest are `check_shard_map_multi_host_scenarios` in
+    // `operations/sharding/shard_map.rs`, `test_session_place_cpu_process_helper` in `arrays/placement.rs`, the
+    // step lists that `check_cuda_rank_pair_placement_steps` runs in `arrays/resharding.rs`, and the modes of
+    // `test_distributed_kernel_process` in `kernels/distributed.rs`, whose launcher should also be replaced by
+    // this one.
     /// Runs the worker test `helper`, given as its path within this test binary, in `process_count` processes that
     /// stand for the ranks of one job, with `environment` added to their environment, and returns their standard
     /// outputs in rank order. Each process finds its rank and a coordinator address on a free loopback port with
@@ -883,7 +888,8 @@ pub(crate) mod tests {
         }
         drop(processes);
 
-        // libtest prints `test <name> ... ` without a line break before a worker runs, so its output follows that prefix.
+        // libtest prints `test <name> ... ` without a line break before a worker runs, so its output follows that
+        // prefix.
         let outputs = (0..process_count)
             .map(|rank| {
                 let stdout = fs::read_to_string(output_path(rank, "stdout")).unwrap();
@@ -919,9 +925,9 @@ pub(crate) mod tests {
         run_test_processes(helper, process_count, &[], Duration::from_secs(30))
     }
 
-    /// Joins the two-process CUDA job that [`run_cuda_rank_pair`] launched this process into, runs `check` with a client
-    /// whose two global devices are the ranks' shares of CUDA device 0, and then shuts the job down in order. Returns
-    /// immediately in a process that no launcher started (refer to [`test_process`]).
+    /// Joins the two-process CUDA job that [`run_cuda_rank_pair`] launched this process into, runs `check` with a
+    /// client whose two global devices are the ranks' shares of CUDA device 0, and then shuts the job down in order.
+    /// Returns immediately in a process that no launcher started (refer to [`test_process`]).
     #[cfg(feature = "cuda-13")]
     pub(crate) fn run_as_cuda_rank(check: impl FnOnce(&'static Client<'static>)) {
         let Some((process_index, address)) = test_process() else {
@@ -1418,14 +1424,14 @@ pub(crate) mod tests {
     fn test_distributed_compilation_artifact_exchange_validate_compatibility_rejects_other_schema_versions() {
         let runtime = single_process_runtime();
         let follower = exchange(&runtime, 1, 2);
-        let manifest = CompilationCompatibilityManifest { schema_version: 1, process_count: 2 };
+        let manifest = CompilationCompatibilityManifest { schema_version: 2, process_count: 2 };
         let manifest = serde_json::to_vec(&manifest).unwrap();
         runtime.key_value_store().put(&follower.key(b"key", b"preflight/manifest"), &manifest).unwrap();
         assert_eq!(
             follower.validate_compatibility(b"key", 0, Duration::from_secs(1)),
             Err(CompilationArtifactExchangeError::Incompatible {
                 message: format!(
-                    "process 0 uses compilation artifact exchange schema 1, but this process uses schema \
+                    "process 0 uses compilation artifact exchange schema 2, but this process uses schema \
                      {ARTIFACT_EXCHANGE_SCHEMA_VERSION}",
                 ),
             }),
@@ -1586,10 +1592,10 @@ pub(crate) mod tests {
         };
         let failed = |message: &str| Err(CompilationArtifactExchangeError::Failed { message: message.to_string() });
 
-        publish(b"other-schema", 1, 6, 2);
+        publish(b"other-schema", 2, 6, 2);
         assert_eq!(
             follower.receive(b"other-schema", Duration::from_secs(1)),
-            failed("unsupported compiled artifact exchange schema 1"),
+            failed("unsupported compiled artifact exchange schema 2"),
         );
         publish(b"oversized", ARTIFACT_EXCHANGE_SCHEMA_VERSION, 33, 11);
         assert_eq!(

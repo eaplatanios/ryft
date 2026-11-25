@@ -380,7 +380,11 @@ fn manual_computation_dimension_shardings<'c, 't>(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
+    use std::pin::pin;
     use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll, Wake, Waker};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
@@ -407,9 +411,12 @@ pub(crate) mod tests {
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput,
-        Program as PjrtProgram,
+        Program as PjrtProgram, load_cpu_plugin,
     };
 
+    use crate::distributed::tests::read_addressable_f32s;
+    #[cfg(feature = "cuda-13")]
+    use crate::distributed::tests::{run_as_cuda_rank, run_cuda_rank_pair};
     use crate::lowering::tests::{
         lower_replicated_shard_map_body, shard_map_module, static_sharded_array_type, test_manual_mesh, test_sharding,
         test_vector_type,
@@ -423,11 +430,11 @@ pub(crate) mod tests {
         FlatProgram, Operation, Operation as ArrayIrOperation, ProgramBuilder, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
-    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayShard, ArrayTracer, ExecutionArguments, FromPjrt, Options, PlacementOptions,
-        Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully, to_mlir_module_for_program,
-        trace, trace_with_context,
+        Array, ArrayConstant, ArrayError, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt,
+        Options, PlacementOptions, Platform, Reference, Session, TracedProgram, Tracer, Value, compile_statefully,
+        to_mlir_module_for_program, trace, trace_with_context,
     };
 
     use super::*;
@@ -1031,6 +1038,223 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(cotangents, emulated_cotangents, "`{case:?}` cotangents differ between XLA and the emulation");
+    }
+
+    /// Checks `shard_map` pipelines over a mesh `x = 2` of the two global devices of `client`, reading only the shards
+    /// that the current process addresses, so that the same checks hold for one process that addresses both devices
+    /// and for two processes that address one device each, as JAX's multi-controller model requires. Every process of
+    /// a job must call this function, because each scenario executes collectives over both devices.
+    fn check_shard_map_multi_host_scenarios(client: &'static Client<'static>) {
+        /// Wakes the thread polling upload readiness when a PJRT event completes.
+        struct TransferWaker(thread::Thread);
+
+        impl Wake for TransferWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let process_index = client.process_index().unwrap();
+        let devices = client
+            .devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(devices.len(), 2);
+        // Mesh positions of the devices that this process addresses select the expected per-device values below.
+        let local_positions = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.process_index() == process_index)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let session = Session::builder().client(client).build().unwrap();
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(manual_mesh.clone(), devices.clone()).unwrap();
+        let sharded = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(manual_mesh.clone(), 1);
+
+        // Each rank packs only its local tiles and uses the same global type and mesh as its peers.
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let tiles = [[1f32, 2.0], [3.0, 4.0]];
+        let local_tiles = local_positions
+            .iter()
+            .map(|&position| (devices[position].id(), Arc::<[u8]>::from(values_to_bytes(&tiles[position]))))
+            .collect::<Vec<_>>();
+        let input = Array::from_host_shards(
+            &session,
+            input_type.clone(),
+            mesh.clone(),
+            None,
+            local_tiles.iter().map(|(device, bytes)| (*device, bytes.as_ref())),
+        )
+        .unwrap();
+        input.block_until_ready().unwrap();
+        let expected_local_tiles = local_positions.iter().map(|&position| tiles[position].to_vec()).collect::<Vec<_>>();
+        assert_eq!(read_addressable_f32s(&input), expected_local_tiles);
+
+        // Dense host materialization of a sharded array needs every tile, so it succeeds only in a process that
+        // addresses both devices and otherwise names a shard of the other process before issuing any copy, as JAX
+        // rejects fetching arrays whose value spans non-addressable devices.
+        if local_positions.len() == 2 {
+            let materialized = input.copy_to_host_bytes().unwrap();
+            assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![1.0, 2.0, 3.0, 4.0]);
+        } else {
+            let remote_position = 1 - local_positions[0];
+            assert!(matches!(
+                input.copy_to_host_bytes(),
+                Err(Error::Array(error)) if matches!(
+                    *error,
+                    ArrayError::MissingShardBuffer { shard_index, device_id }
+                        if shard_index == remote_position && device_id == devices[remote_position].id(),
+                ),
+            ));
+        }
+
+        // Move the host buffers into the second upload so PJRT can retain them until the transfer finishes.
+        let asynchronous_input =
+            Array::from_host_shards(&session, input_type, mesh.clone(), None, local_tiles).unwrap();
+        let mut ready = pin!(asynchronous_input.ready());
+        let waker = Waker::from(Arc::new(TransferWaker(thread::current())));
+        let mut context = TaskContext::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match ready.as_mut().poll(&mut context) {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "asynchronous host shard upload timed out");
+                    thread::park_timeout(remaining);
+                }
+            }
+        }
+        assert_eq!(read_addressable_f32s(&asynchronous_input), expected_local_tiles);
+
+        // An unchecked map returns each tile as its candidate for an output that is unreduced along `x`, and a checked
+        // map completes it with an all-reduce of the matching kind. Both uploads feed a reduction over both devices.
+        let complete = |input: Array, kind: UnreducedKind, reduction: ReductionKind| {
+            let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+            let candidates = shard_map(
+                Ok,
+                input,
+                manual_mesh.clone(),
+                sharded.clone(),
+                unreduced.clone(),
+                ShardMapOptions::new().with_check_manual_variation(false),
+            )
+            .unwrap();
+            assert_eq!(candidates.sharding(), &unreduced);
+            shard_map(
+                |candidates: ProjectedValue<ArrayType, DomainTracer<Session>>| {
+                    candidates.parallel_reduce(reduction, "x")
+                },
+                candidates,
+                manual_mesh.clone(),
+                unreduced,
+                replicated.clone(),
+                ShardMapOptions::new(),
+            )
+            .unwrap()
+        };
+        let sum = complete(input, UnreducedKind::Sum, ReductionKind::Sum);
+        assert_eq!(read_addressable_f32s(&sum), vec![vec![4.0, 6.0]; local_positions.len()]);
+        let maximum = complete(asynchronous_input.clone(), UnreducedKind::Max, ReductionKind::Max);
+        assert_eq!(read_addressable_f32s(&maximum), vec![vec![3.0, 4.0]; local_positions.len()]);
+
+        // A replicated array spans every process, but each process holds its whole value, so dense host reads succeed
+        // in every process, as JAX reads a value that the current process holds in full.
+        let materialized = sum.copy_to_host_bytes().unwrap();
+        assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![4.0, 6.0]);
+
+        // Batching a map along its only manual axis for a caller over an `Explicit` copy of the mesh places one item on
+        // each device, so each device holds its own item doubled.
+        let caller_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let explicit_mesh = DeviceMesh::new(caller_mesh.clone(), devices.clone()).unwrap();
+        let items_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_sharding(
+                Sharding::new(caller_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |x| Ok(x.clone() + x),
+                            item,
+                            manual_mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    input.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            items_type.clone(),
+            Options::new(explicit_mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled = staged.lower(&session).unwrap().compile(&session).unwrap();
+        let items = Array::from_host_buffer(
+            &session,
+            items_type,
+            explicit_mesh,
+            None,
+            values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]),
+        )
+        .unwrap();
+        let Value::Array(doubled) = compiled.executable().execute(&session, Value::Array(items)).unwrap() else {
+            panic!("the compiled function returned a dimension");
+        };
+        let doubled_items = [vec![2.0, 4.0, 6.0], vec![8.0, 10.0, 12.0]];
+        assert_eq!(
+            read_addressable_f32s(&doubled),
+            local_positions.iter().map(|&position| doubled_items[position].clone()).collect::<Vec<_>>(),
+        );
+
+        // An unchecked stateful map doubles every device's copy of a reference that is reduced along `x` and writes it
+        // back, so each process reads `[2, 4]` from its own shards of the referent afterwards. Over a mesh that spans
+        // processes, each process calls with its own reference, binds and commits only its addressable shards, and,
+        // because the referent is replicated, can read the whole final state densely.
+        let (program, referent_type) = doubling_reduced_reference_program(&manual_mesh);
+        let compiled = compile_statefully::<_, Vec<Type>, Vec<Type>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                program.interpret_in_context(&context, inputs)?;
+                Ok(Vec::new())
+            },
+            vec![Type::Reference(ReferenceType::new(referent_type.clone()))],
+            &session,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&session, referent_type, mesh, None, values_to_bytes(&[1f32, 2.0]).as_slice())
+                .unwrap(),
+        );
+        compiled
+            .execute_statefully_and_wait(
+                &session,
+                vec![Value::Reference(Reference::new(reference.clone(), session.clone()))],
+            )
+            .unwrap();
+        assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
+        let materialized = reference.read().unwrap().copy_to_host_bytes().unwrap();
+        assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![2.0, 4.0]);
     }
 
     #[test]
@@ -5845,5 +6069,44 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(outcomes.join("\n"), expected_outcomes.join("\n"));
+    }
+
+    #[test]
+    fn test_shard_map_multi_host_scenarios_on_one_process_with_two_cpu_devices() {
+        // The single-process baseline of the multi-host scenarios, which reads every shard because this process
+        // addresses both devices. The client is minted through a one-node runtime, as in a distributed job.
+        let address = loopback_address();
+        let plugin = load_cpu_plugin().unwrap();
+        // Sessions need a client that lives for the process, and so does the runtime whose key-value store it borrows.
+        let runtime: &'static DistributedRuntime =
+            Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 1, 0).unwrap()));
+        let client: &'static Client<'static> = Box::leak(Box::new(
+            runtime
+                .create_client(
+                    &plugin,
+                    ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }),
+                )
+                .unwrap(),
+        ));
+        check_shard_map_multi_host_scenarios(client);
+    }
+
+    // Worker of `test_shard_map_multi_host_scenarios_on_two_cuda_processes`, which returns immediately unless that
+    // test launched it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_shard_map_multi_host_scenarios_cuda_process_helper() {
+        run_as_cuda_rank(|client| check_shard_map_multi_host_scenarios(client));
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_shard_map_multi_host_scenarios_on_two_cuda_processes() {
+        // The multi-host scenarios run in two processes that address one device each.
+        run_cuda_rank_pair(
+            "operations::sharding::shard_map::tests::test_shard_map_multi_host_scenarios_cuda_process_helper",
+        );
     }
 }
