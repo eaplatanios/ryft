@@ -33,7 +33,7 @@ use ryft_pjrt::{
 use crate::arrays::metadata::ArrayOutputPlan;
 use crate::compilation::programs::OutputDeviceAssignment;
 use crate::devices::MemoryExtension;
-use crate::lowering::signature::ExecutableSignature;
+use crate::lowering::signatures::ExecutableSignature;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::types::DataTypeExtension;
 use crate::{
