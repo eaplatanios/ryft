@@ -678,10 +678,10 @@ impl Array {
         donate: bool,
         may_alias: Option<bool>,
     ) -> Result<Array, Error> {
-        // A forced copy must not return a buffer of this leaf, even one that only the result holds once the placement
-        // consumes the leaf. A donated leaf is never copied (refer to `forces_copy`), and weak handles of the buffers
-        // of a copied one do not keep the buffers that the placement releases alive.
-        let copies = forces_copy(donate, may_alias);
+        // Donation takes precedence over a copy requested by `may_alias`. A forced copy must avoid every input
+        // buffer, including buffers that only the result holds once placement consumes the leaf. The weak handles
+        // let buffers that the placement releases drop normally.
+        let copies = may_alias == Some(false) && !donate;
         let buffers: Vec<_> = match copies {
             true => self.addressable_shards().filter_map(ArrayShard::buffer).map(Arc::downgrade).collect(),
             false => Vec::new(),
@@ -781,7 +781,7 @@ macro_rules! impl_placeable {
 
                 // Record a forced copy even without a destination, so the policy applies when the operation
                 // executes on concrete arrays. Donation only applies to concrete leaves and takes precedence.
-                let may_alias = !forces_copy(donate, may_alias);
+                let may_alias = may_alias != Some(false) || donate;
                 Ok(<Self as CoreValue>::Dispatch::place(&self, target.as_ref(), source, may_alias)?)
             }
         }
@@ -1185,16 +1185,16 @@ impl Array {
     /// Returns a new array (refer to the identity rules of [`RetainedArray`](crate::RetainedArray)) with the type, the
     /// placement, and the commitment of this array whose addressable shard buffers no other handle holds. This is how
     /// a placement whose result must not alias its input (i.e., a placement with `may_alias` set to `false` and without
-    /// donation, refer to [`forces_copy`]) gives that result buffers of its own, and the result is a new array on every
-    /// process, including a process that holds no buffer of this array or holds each of them alone, because it then has
-    /// no buffer to copy (refer to [`Self::with_new_identity`]). Each buffer that another handle also holds (e.g., the
-    /// input of a placement that keeps a shard on its device, which the caller still holds) is replaced with a copy on
-    /// the same device and in the same memory, and each buffer that only this array holds (e.g., one that the placement
-    /// created) is kept. A clone of this array holds all of its buffers, so it makes this function copy every buffer.
-    /// A caller that consumed the only handle of the input must therefore hold the buffers of that input while it calls
-    /// this function, or the result could return them. The copies are made by [`Self::with_copied_shard_buffers`], so
-    /// the execution fence of the result joins the readiness of every copy with the fence of this array, because a
-    /// readback reads only one replica of each tile and would otherwise succeed with a replica whose copy did not fail.
+    /// donation) gives that result buffers of its own. The result is a new array on every process, including a process
+    /// that holds no buffer of this array or holds each of them alone, because it then has no buffer to copy (refer to
+    /// [`Self::with_new_identity`]). A buffer shared with another handle is copied on the same device and in the same
+    /// memory (e.g., when a shard stays on its device and the caller still holds the input). Buffers held only by this
+    /// array, such as those created by placement, are kept. A clone holds all of this array's buffers, so it makes
+    /// this function copy every buffer. A caller that consumed the only handle of the input must therefore hold the
+    /// buffers of that input while it calls this function, or the result could return them. The copies are made by
+    /// [`Self::with_copied_shard_buffers`], so the execution fence of the result joins the readiness of every copy with
+    /// the fence of this array, because a readback reads only one replica of each tile and would otherwise succeed with
+    /// a replica whose copy did not fail.
     pub(crate) fn into_unaliased(self) -> Result<Self, Error> {
         // Clones of this array share its parts, and with them every one of its buffers.
         let has_clones = Arc::strong_count(&self.parts) != 1;
@@ -1867,11 +1867,16 @@ fn admit_and_place_arguments<P: Placeable, C>(
                 digests.push(if checked.is_ok() { value.digest() } else { None });
             } else if admits && checked.is_ok() {
                 let argument = &arguments[index];
-                let readiness = if argument.target.is_some() || forces_copy(argument.donate, argument.may_alias) {
+
+                // A forced copy requires ready buffers even when the caller supplies no destination.
+                let copies = argument.may_alias == Some(false) && !argument.donate;
+
+                let readiness = if argument.target.is_some() || copies {
                     sealed::ArrayReadiness::Required
                 } else {
                     sealed::ArrayReadiness::Unneeded
                 };
+
                 checked = value.validate(readiness).map_err(|error| map_error(index, error));
             }
         }
@@ -1940,16 +1945,6 @@ fn validate_parameter_options<P: FnOnce() -> ParameterPath>(
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns whether the placement of a leaf with the leafwise options `donate` and `may_alias` (refer to
-/// [`Placeable::place_parameter`]) forces a copy, so that its result shares no buffer with any other array. That is
-/// the case for a `may_alias` of `Some(false)` without donation only. JAX selects one copy mode from the two options
-/// and gives donation precedence (i.e., `donate=True` with `may_alias=False` is its `DONATE_INPUT` mode), because a
-/// donated leaf is given up by the caller, so no other array holds the buffers that its result may take, and there
-/// is no alias for `Some(false)` to forbid. Every placement of a leaf in this crate decides with this function.
-pub(crate) fn forces_copy(donate: bool, may_alias: Option<bool>) -> bool {
-    may_alias == Some(false) && !donate
-}
 
 /// Wraps `error`, which concerns the parameter whose path `path` returns, in [`ArrayError::FailedParameterPlacement`],
 /// unless that path is the root. An `error` that already names a path relative to that parameter (i.e., an
