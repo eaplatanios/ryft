@@ -1107,6 +1107,8 @@ impl From<bool> for ArrayConstant {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::DefaultHasher;
+
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
@@ -1117,8 +1119,9 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, Gather, GatherMode, LogicalMesh, Max, Memory, MeshAxis,
         MeshAxisType, Min, OneOperation, OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind,
         ReferenceAddUpdate, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceType,
-        ReferenceWrite, Rem, SaturatingSub, Shape, Sort, SortDirection, SubOperation, TypeError, TypeIdentityRenaming,
-        Typed, ValueProjection, WhileOperation, WhilePredicate, ZeroOperation, batch, differentiate_at,
+        ReferenceWrite, Rem, SaturatingSub, Shape, Sharding, Sort, SortDirection, SubOperation, TypeError,
+        TypeIdentityRenaming, Typed, ValueProjection, WhileOperation, WhilePredicate, ZeroOperation, batch,
+        differentiate_at,
     };
     use ryft_pjrt::Client;
 
@@ -1147,7 +1150,7 @@ mod tests {
         replicated_array(session, mesh, data_type, shape, &values_to_bytes(values))
     }
 
-    /// Reads the elements of the first addressable shard of the array member of `value`.
+    /// Returns the elements of the first addressable shard of the array member of `value`, read back to the host.
     fn read<T: Copy>(value: &Value) -> Vec<T> {
         let Value::Array(array) = value else { panic!("expected an array value but got `{value}`") };
         let shard = array.addressable_shards().next().unwrap();
@@ -1155,7 +1158,7 @@ mod tests {
         values_from_bytes::<T>(bytes.as_slice())
     }
 
-    /// Lifts the static first-class dimension `extent` into `session`.
+    /// Returns the [`Value::Dimension`] that lifting the static first-class dimension `extent` into `session` gives.
     fn dimension(session: &Session, extent: usize) -> Value {
         session.lift(Constant::Dimension(DimensionValue::constant(extent).unwrap())).unwrap()
     }
@@ -1216,23 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_compare() {
-        // The predicate is decided on the host, so only the Boolean result is uploaded and no program is compiled.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
-        let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
-        let program_count = session.cached_program_count();
-        let less_than = two.compare(&three, ComparisonDirection::LessThan).unwrap();
-        assert_eq!(read::<u8>(&less_than), vec![1]);
-        assert!(same_session(less_than.session(), &session));
-        assert_eq!(read::<u8>(&two.compare(&three, ComparisonDirection::Equal).unwrap()), vec![0]);
-        assert_eq!(read::<u8>(&three.compare(&three, ComparisonDirection::GreaterThanOrEqual).unwrap()), vec![1]);
-        assert_eq!(session.cached_program_count(), program_count);
-    }
-
-    #[test]
-    fn test_dimension_session() {
+    fn test_dimension_domain() {
         // Dimension arithmetic dispatches through the dimension's session, which evaluates it on the host.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -1259,6 +1246,22 @@ mod tests {
         let renamed = dimension.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.value(), &DimensionValue::new(target.into(), 4).unwrap());
         assert!(same_session(renamed.session(), dimension.session()));
+    }
+
+    #[test]
+    fn test_dimension_compare() {
+        // The predicate is decided on the host, so only the Boolean result is uploaded and no program is compiled.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
+        let three = Dimension::new(DimensionValue::constant(3).unwrap(), session.clone());
+        let program_count = session.cached_program_count();
+        let less_than = two.compare(&three, ComparisonDirection::LessThan).unwrap();
+        assert_eq!(read::<u8>(&less_than), vec![1]);
+        assert!(same_session(less_than.session(), &session));
+        assert_eq!(read::<u8>(&two.compare(&three, ComparisonDirection::Equal).unwrap()), vec![0]);
+        assert_eq!(read::<u8>(&three.compare(&three, ComparisonDirection::GreaterThanOrEqual).unwrap()), vec![1]);
+        assert_eq!(session.cached_program_count(), program_count);
     }
 
     #[test]
@@ -1308,6 +1311,27 @@ mod tests {
     }
 
     #[test]
+    fn test_value_from_array_ir_value() {
+        // Array members keep their own sessions, while dimension and reference members bind to the given session.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let other_session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
+        let handle = ArrayReference::new(array.clone());
+        let extent = DimensionValue::constant(3).unwrap();
+        let array_value = Value::from_array_ir_value(ArrayIrValue::Array(array.clone()), &other_session);
+        let dimension_value = Value::from_array_ir_value(ArrayIrValue::Dimension(extent.clone()), &other_session);
+        let reference_value = Value::from_array_ir_value(ArrayIrValue::Reference(handle.clone()), &other_session);
+        assert_eq!(array_value, Value::Array(array));
+        assert_eq!(dimension_value, Value::Dimension(Dimension::new(extent, other_session.clone())));
+        assert_eq!(reference_value, Value::Reference(Reference::new(handle, other_session.clone())));
+        assert!(same_session(array_value.session(), &session));
+        assert!(same_session(dimension_value.session(), &other_session));
+        assert!(same_session(reference_value.session(), &other_session));
+    }
+
+    #[test]
     fn test_value_session() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -1321,7 +1345,8 @@ mod tests {
 
     #[test]
     fn test_value_into_array_ir_value() {
-        // A round trip preserves the members and only rebinds the dimension and reference sessions.
+        // The conversion keeps every member and drops the sessions of dimension and reference members.
+        // The `From` conversion into `ArrayIrValue` performs the same conversion.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
@@ -1331,42 +1356,33 @@ mod tests {
         let values = [
             Value::Array(array.clone()),
             Value::Dimension(Dimension::new(extent.clone(), session.clone())),
-            Value::Reference(Reference::new(handle.clone(), session.clone())),
+            Value::Reference(Reference::new(handle.clone(), session)),
         ];
-        let converted = values.clone().map(ArrayIrValue::from);
-        assert_eq!(
-            converted,
-            [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle),],
-        );
-        let other_session = Session::builder().client(client).build().unwrap();
-        let restored = converted.map(|value| Value::from_array_ir_value(value, &other_session));
-        assert_eq!(restored, values);
-        assert!(same_session(restored[0].session(), &session));
-        assert!(same_session(restored[1].session(), &other_session));
-        assert!(same_session(restored[2].session(), &other_session));
+        let expected = [ArrayIrValue::Array(array), ArrayIrValue::Dimension(extent), ArrayIrValue::Reference(handle)];
+        assert_eq!(values.clone().map(Value::into_array_ir_value), expected);
+        assert_eq!(values.map(ArrayIrValue::from), expected);
     }
 
     #[test]
-    fn test_value_constant() {
+    fn test_value_into_constant() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes())
             .unwrap();
 
         // Arrays are retained by their session and become handles to their retained storage.
-        let Ok(Constant::Session(handle)) = Constant::try_from(Value::Array(array.clone())) else {
+        let Ok(Constant::Session(handle)) = Value::Array(array.clone()).into_constant() else {
             panic!("an array was not converted into a session constant");
         };
         assert_eq!(handle.to_array(&session).unwrap(), array);
 
-        // Dimensions become immediate constants, and references are rejected.
+        // Dimensions become immediate constants, also through `TryFrom`, and references are rejected.
         let extent = DimensionValue::constant(2).unwrap();
+        let dimension = Value::Dimension(Dimension::new(extent.clone(), session.clone()));
+        assert_eq!(dimension.clone().into_constant(), Ok(Constant::Dimension(extent.clone())));
+        assert_eq!(Constant::try_from(dimension), Ok(Constant::Dimension(extent)));
         assert_eq!(
-            Constant::try_from(Value::Dimension(Dimension::new(extent.clone(), session.clone()))),
-            Ok(Constant::Dimension(extent)),
-        );
-        assert_eq!(
-            Constant::try_from(Value::Reference(Reference::new(ArrayReference::new(array), session))),
+            Value::Reference(Reference::new(ArrayReference::new(array), session)).into_constant(),
             Err(TypeError::invalid("cannot import an XLA reference into a trace whose capture table holds constants")
                 .into()),
         );
@@ -1400,25 +1416,41 @@ mod tests {
     }
 
     #[test]
+    fn test_value_placement() {
+        // Only array members live on devices, so only they have a placement.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let array = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
+        let reference = Value::Reference(Reference::new(ArrayReference::new(array.clone()), session.clone()));
+        assert_eq!(
+            Value::Array(array).placement(),
+            Some(Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 0)).unwrap()),
+        );
+        assert_eq!(dimension(&session, 3).placement(), None);
+        assert_eq!(reference.placement(), None);
+    }
+
+    #[test]
     fn test_value_domain() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
-        let array = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
-        assert!(same_session(&array.domain(), &session));
+        let value = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
+        assert!(same_session(&value.domain(), &session));
         assert!(same_session(&dimension(&session, 3).domain(), &session));
 
         // A session without a mesh that is recovered from an array adopts that array's mesh, while a session with a
         // mesh keeps its own.
-        assert_eq!(array.domain().device_mesh().unwrap(), &mesh);
+        assert_eq!(value.domain().device_mesh().unwrap(), &mesh);
         assert!(matches!(
             dimension(&session, 3).domain().device_mesh(),
-            Err(crate::Error::Session(SessionError::MissingMesh)),
+            Err(Error::Session(SessionError::MissingMesh)),
         ));
         let other_mesh = mesh_on(client, 1);
         assert_ne!(other_mesh, mesh);
         let meshed_session = session.with_device_mesh(other_mesh.clone());
-        let meshed_array = Value::Array(super::tests::array(&meshed_session, &mesh, DataType::F32, &[1.0f32], &[]));
+        let meshed_array = Value::Array(array(&meshed_session, &mesh, DataType::F32, &[1.0f32], &[]));
         assert_eq!(meshed_array.domain().device_mesh().unwrap(), &other_mesh);
     }
 
@@ -1435,6 +1467,279 @@ mod tests {
             panic!("expected an array")
         };
         assert_eq!(comparison.mesh(), &mesh);
+    }
+
+    #[test]
+    fn test_value_domain_compares_dimensions() {
+        // Comparing first-class dimensions executes eagerly outside any context, without compiling a program, and
+        // materializes the Boolean result in the session of the inputs.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let (two, three) = (dimension(&session, 2), dimension(&session, 3));
+        let program_count = session.cached_program_count();
+        assert_eq!(read::<u8>(&two.less_than(&three).unwrap()), vec![1]);
+        assert_eq!(read::<u8>(&two.equal(&three).unwrap()), vec![0]);
+        assert_eq!(read::<u8>(&three.greater_than_or_equal(&three).unwrap()), vec![1]);
+        assert_eq!(session.cached_program_count(), program_count);
+
+        // A dimension cannot be compared with an array.
+        let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
+        assert_eq!(
+            two.less_than(&scalar),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`compare` inputs must both be arrays or both be first-class dimensions, but got `dimension<2>` and \
+                 `i64[][sharding={mesh<['x'=1:auto]>, []}]`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_value_domain_evaluates_dimension_arithmetic() {
+        // Arithmetic on two first-class dimensions uses their dimension members and executes eagerly outside any
+        // context, without compiling a program.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let (two, three) = (dimension(&session, 2), dimension(&session, 3));
+        let program_count = session.cached_program_count();
+        assert_eq!(two.add(&three), Ok(dimension(&session, 5)));
+        assert_eq!(three.sub(&two), Ok(dimension(&session, 1)));
+        assert_eq!(two.saturating_sub(&three), Ok(dimension(&session, 0)));
+        assert_eq!(two.mul(&three), Ok(dimension(&session, 6)));
+        assert_eq!(three.div(&two), Ok(dimension(&session, 1)));
+        assert_eq!(three.rem(&two), Ok(dimension(&session, 1)));
+        assert_eq!(two.pow(&three), Ok(dimension(&session, 8)));
+        assert_eq!(two.min(&three), Ok(dimension(&session, 2)));
+        assert_eq!(two.max(&three), Ok(dimension(&session, 3)));
+        assert_eq!(session.cached_program_count(), program_count);
+
+        // A dimension paired with an array uses the array members, which rejects the dimension.
+        let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
+        assert_eq!(
+            two.mul(&scalar),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
+    fn test_value_domain_converts_dimensions_to_scalars() {
+        // The session uploads the host extent as an `i64` scalar without compiling a program.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let program_count = session.cached_program_count();
+        let scalar = dimension(&session, 2).to_scalar().unwrap();
+        assert_eq!(scalar.r#type().to_string(), "SCALAR_TYPE_PLACEHOLDER");
+        assert_eq!(read::<i64>(&scalar), vec![2]);
+        assert_eq!(session.cached_program_count(), program_count);
+    }
+
+    #[test]
+    fn test_value_domain_executes_reference_operations() {
+        // Top-level reference operations execute eagerly on their host-side handles, with the validation and locking of
+        // the generic array IR reference implementations.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let vector = |values: &[f32]| Value::Array(array(&session, &mesh, DataType::F32, values, &[values.len()]));
+        let scalar = |value: f32| Value::Array(array(&session, &mesh, DataType::F32, &[value], &[]));
+
+        let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
+        assert!(same_session(reference.session(), &session));
+        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![1.0, 2.0]);
+        reference.write(&vector(&[3.0, 4.0])).unwrap();
+        assert_eq!(read::<f32>(&reference.swap(&vector(&[5.0, 6.0])).unwrap()), vec![3.0, 4.0]);
+        reference.add_update(&vector(&[1.0, 1.0])).unwrap();
+        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![6.0, 7.0]);
+
+        // Views address parts of the referent.
+        let second = [ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
+        assert_eq!(read::<f32>(&reference.read_through(&second, &[]).unwrap()), vec![7.0]);
+        reference.write_through(&scalar(9.0), &second, &[]).unwrap();
+        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![6.0, 9.0]);
+
+        // Mismatched replacements are rejected, and freezing invalidates every alias.
+        assert_eq!(
+            reference.write(&scalar(1.0)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`reference_write` replacement type `f32[][sharding={mesh<['x'=1:auto]>, []}]` must exactly match \
+                 reference referent type `f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]`",
+            ))),
+        );
+        let alias = reference.clone();
+        assert_eq!(read::<f32>(&reference.freeze().unwrap()), vec![6.0, 9.0]);
+        assert_eq!(alias.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        assert_eq!(
+            alias.write(&vector(&[1.0, 1.0])).unwrap_err().downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::Frozen),
+        );
+
+        // Reference operands of array operations are rejected by the array projection of the array IR capabilities.
+        let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
+        assert_eq!(
+            reference.add(&vector(&[1.0, 2.0])),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got reference type"))),
+        );
+    }
+
+    #[test]
+    fn test_value_domain_projects_capabilities_onto_arrays() {
+        // Capabilities without a receiver-shaped signature project onto the array member through the generalized
+        // array IR implementations in `ryft-core`.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = Value::Array(array(&session, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
+        let sorted = Value::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending).unwrap();
+        assert_eq!(read::<f32>(&sorted[0]), vec![1.0, 2.0, 3.0]);
+        let indices = Value::Array(array(&session, &mesh, DataType::I32, &[2i32, 0], &[2]));
+        assert_eq!(read::<f32>(&input.gather_axis(&indices, 0, GatherMode::Clip).unwrap()), vec![2.0, 3.0]);
+        assert_eq!(
+            input.parallel_permute("missing", vec![(0, 0)]),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "missing".to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_value_domain_executes_assertions() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let truth = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
+        let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
+        assert_eq!(truth.assert("predicate must hold", &[]), Ok(()));
+        let message = "assertion failed: predicate must hold";
+
+        // Inline execution can report the failure from the call. An asynchronous submission reports it at the
+        // effect barrier because the assertion has no result array carrying its completion.
+        match falsity.assert("predicate must hold", &[]) {
+            Err(error) => assert_eq!(error, ProgramError::InvalidArgument { message: message.to_string() }),
+            Ok(()) => assert!(matches!(
+                session.effects_barrier(),
+                Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
+                    if matches!(failures.as_slice(), [(_, failure)] if failure.as_ref() == message),
+            )),
+        }
+    }
+
+    #[test]
+    fn test_value_domain_recovered_by_batch() {
+        // Free transform entry points recover the session from the values, so no explicit context is needed.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let squared: Value = batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        assert_eq!(read::<f32>(&squared), vec![1.0, 4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_value_domain_recovered_by_jvp() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let (value, derivative) = differentiate_at(input.clone()).jvp(input, |x| Ok(x.clone() * x)).unwrap();
+        assert_eq!(read::<f32>(&value), vec![1.0, 4.0, 9.0]);
+        assert_eq!(read::<f32>(&derivative), vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_value_domain_recovered_by_value_and_gradient() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let (value, gradient) = differentiate_at(input)
+            .value_and_gradient(|x| (x.clone() * x).reduce(&[0], ReductionKind::Sum).unwrap())
+            .unwrap();
+        assert_eq!(read::<f32>(&value), vec![14.0]);
+        assert_eq!(read::<f32>(&gradient), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_value_domain_replays_dimension_derived_values_under_batch() {
+        // Each item is scaled by its own folded extent, which `batch` replays as a dimension constant.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
+        let scaled: Value = batch(
+            |x| {
+                let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
+                Ok(x * extent)
+            },
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read::<f32>(&scaled), vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0]);
+    }
+
+    #[test]
+    fn test_value_domain_replays_dimension_derived_values_under_jvp() {
+        // The primal is scaled by its folded extent, which `jvp` replays as a dimension constant.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let primal = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
+        let tangent = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 1.0, 1.0], &[3]));
+        let (value, derivative) = differentiate_at(primal)
+            .jvp(tangent, |x| {
+                let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
+                Ok(x * extent)
+            })
+            .unwrap();
+        assert_eq!(read::<f32>(&value), vec![3.0, 6.0, 9.0]);
+        assert_eq!(read::<f32>(&derivative), vec![3.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn test_value_program_replay_lifts_dimension_constants() {
+        // Replaying a program over the session lifts its dimension constants through the session-aware `lift`.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let input = array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]);
+
+        // `dimension_size(x, 0) + 2` followed by `dimension_to_scalar`, with the `2` stored as a program constant.
+        let mut builder = ProgramBuilder::new();
+        let x = builder.add_input(Type::Array(input.r#type().into_owned()));
+        let size_operation = DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap();
+        let size_type = size_operation.output_type().clone();
+        let size = builder.add_instruction(size_operation, Vec::new(), vec![x], None).unwrap()[0];
+        let constant = DimensionValue::constant(2).unwrap();
+        let sum = DimensionAddOperation::new(&size_type, constant.r#type().as_ref()).unwrap();
+        let two = builder.add_constant(Constant::Dimension(constant));
+        let sum = builder
+            .add_instruction(Operation::Dimension(DimensionOperation::Add(sum)), Vec::new(), vec![size, two], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![sum], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let outputs = program.interpret_in_context(&session, vec![Value::Array(input)]).unwrap();
+        assert_eq!(read::<i64>(&outputs[0]), vec![5]);
+    }
+
+    #[test]
+    fn test_value_relocatable_type() {
+        // An uncommitted array whose type records nothing beyond replication is relocatable under its type without a
+        // sharding. Committed arrays, dimensions, and references are not relocatable.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let uncommitted =
+            Array::from_host_buffer(&session, scalar_type.clone(), None, None, 1f32.to_ne_bytes()).unwrap();
+        let committed = array(&session, &mesh, DataType::F32, &[1.0f32], &[]);
+        let reference = Value::Reference(Reference::new(ArrayReference::new(committed.clone()), session.clone()));
+        assert_eq!(Value::Array(uncommitted).relocatable_type(), Some(Type::Array(scalar_type)));
+        assert_eq!(Value::Array(committed).relocatable_type(), None);
+        assert_eq!(dimension(&session, 3).relocatable_type(), None);
+        assert_eq!(reference.relocatable_type(), None);
     }
 
     #[test]
@@ -1518,6 +1823,127 @@ mod tests {
     }
 
     #[test]
+    fn test_value_concretize() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let predicate = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
+        assert_eq!(predicate.concretize(), Ok(true));
+        assert!(matches!(
+            dimension(&session, 3).concretize(),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete boolean from a first-class dimension `3`",
+        ));
+    }
+
+    #[test]
+    fn test_value_any_true() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 1], &[2])).any_true(), Ok(true));
+        assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 0], &[2])).any_true(), Ok(false));
+        assert!(matches!(
+            dimension(&session, 3).any_true(),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot use first-class dimension `3` as a `while` predicate",
+        ));
+    }
+
+    #[test]
+    fn test_value_any_true_decides_a_data_dependent_while_under_jvp() {
+        // At concrete primals, the forward mode `while` rule decides the loop condition on the host through the
+        // predicate contracts of `Value` and unrolls the executed iterations.
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let condition = {
+            let mut builder = ProgramBuilder::new();
+            let state = builder.add_input(scalar_type.clone());
+            let zero = Operation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
+            let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+            let comparison = CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan);
+            let predicate = builder
+                .add_instruction(Operation::Array(comparison.into()), Vec::new(), vec![state, zero], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::new();
+            let state = builder.add_input(scalar_type.clone());
+            let one = Operation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
+            let one = builder.add_instruction(one, Vec::new(), Vec::new(), None).unwrap()[0];
+            let subtraction = SubOperation::<ArrayType>::new();
+            let next = builder
+                .add_instruction(Operation::Array(subtraction.into()), Vec::new(), vec![state, one], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let primal = Value::Array(array(&session, &mesh, DataType::F32, &[3.5f32], &[]));
+        let tangent = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        let (value, derivative) = differentiate_at(primal)
+            .jvp(tangent, |state| {
+                let mut outputs = state.domain().bind(
+                    Operation::While(WhileOperation::new()),
+                    vec![condition.clone(), body.clone()],
+                    std::slice::from_ref(&state),
+                )?;
+                Ok(outputs.remove(0))
+            })
+            .unwrap();
+        assert_eq!(read::<f32>(&value), vec![-0.5]);
+        assert_eq!(read::<f32>(&derivative), vec![2.0]);
+    }
+
+    #[test]
+    fn test_value_select() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+
+        // A scalar predicate selects whole values.
+        let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
+        let one = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
+        let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        assert_eq!(read::<f32>(&falsity.select(&one, &two).unwrap()), vec![2.0]);
+
+        // A batched predicate, whose shape is a prefix of the selected values' shape, selects per item. Item 0 keeps
+        // the first row of `on_false`, and item 1 takes the second row of `on_true`.
+        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 1], &[2]));
+        let on_true = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]));
+        let on_false = Value::Array(array(&session, &mesh, DataType::F32, &[5.0f32, 6.0, 7.0, 8.0], &[2, 2]));
+        assert_eq!(read::<f32>(&mixed.select(&on_true, &on_false).unwrap()), vec![5.0, 6.0, 3.0, 4.0]);
+
+        // Equal dimension carries pass through with their session, while dimensions are never predicates.
+        let three = dimension(&session, 3);
+        let selected = mixed.select(&three, &three).unwrap();
+        assert_eq!(selected, three);
+        assert!(same_session(selected.session(), &session));
+        assert!(matches!(
+            three.select(&one, &two),
+            Err(ProgramError::Concretization { message })
+                if message == "cannot use first-class dimension `3` as a `while` predicate",
+        ));
+    }
+
+    #[test]
+    fn test_value_assertion_value() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let scalar = Value::Array(array(&session, &mesh, DataType::I32, &[42i32], &[]));
+        assert_eq!(scalar.assertion_observation(), Ok("42".to_string()));
+        assert_eq!(scalar.assertion_array(), Ok(Some(CoreArray::scalar(42i32).unwrap())));
+        assert_eq!(dimension(&session, 3).assertion_observation(), Ok("3".to_string()));
+        assert_eq!(dimension(&session, 3).assertion_array(), Ok(None));
+    }
+
+    #[test]
     fn test_value_array_projection() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -1578,395 +2004,288 @@ mod tests {
     }
 
     #[test]
-    fn test_value_concretize() {
+    fn test_value_neg() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
-        let predicate = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
-        assert_eq!(predicate.concretize(), Ok(true));
-        assert!(matches!(
-            dimension(&session, 3).concretize(),
-            Err(ProgramError::Concretization { message })
-                if message == "cannot extract a concrete boolean from a first-class dimension `3`",
-        ));
-    }
-
-    #[test]
-    fn test_value_any_true() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 1], &[2])).any_true(), Ok(true));
-        assert_eq!(Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 0], &[2])).any_true(), Ok(false));
-        assert!(matches!(
-            dimension(&session, 3).any_true(),
-            Err(ProgramError::Concretization { message })
-                if message == "cannot use first-class dimension `3` as a `while` predicate",
-        ));
-    }
-
-    #[test]
-    fn test_value_select() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-
-        // A scalar predicate selects whole values.
-        let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
-        let one = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32], &[]));
         let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
-        assert_eq!(read::<f32>(&falsity.select(&one, &two).unwrap()), vec![2.0]);
-
-        // A batched predicate, whose shape is a prefix of the selected values' shape, selects per item. Item 0 keeps
-        // the first row of `on_false`, and item 1 takes the second row of `on_true`.
-        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8, 1], &[2]));
-        let on_true = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0], &[2, 2]));
-        let on_false = Value::Array(array(&session, &mesh, DataType::F32, &[5.0f32, 6.0, 7.0, 8.0], &[2, 2]));
-        assert_eq!(read::<f32>(&mixed.select(&on_true, &on_false).unwrap()), vec![5.0, 6.0, 3.0, 4.0]);
-
-        // Equal dimension carries pass through with their session, while dimensions are never predicates.
-        let three = dimension(&session, 3);
-        let selected = mixed.select(&three, &three).unwrap();
-        assert_eq!(selected, three);
-        assert!(same_session(selected.session(), &session));
-        assert!(matches!(
-            three.select(&one, &two),
-            Err(ProgramError::Concretization { message })
-                if message == "cannot use first-class dimension `3` as a `while` predicate",
-        ));
+        assert_eq!(read::<f32>(&-two), vec![-2.0]);
     }
 
     #[test]
-    fn test_value_assertion_value() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let scalar = Value::Array(array(&session, &mesh, DataType::I32, &[42i32], &[]));
-        assert_eq!(scalar.assertion_observation(), Ok("42".to_string()));
-        assert_eq!(scalar.assertion_array(), Ok(Some(CoreArray::scalar(42i32).unwrap())));
-        assert_eq!(dimension(&session, 3).assertion_observation(), Ok("3".to_string()));
-        assert_eq!(dimension(&session, 3).assertion_array(), Ok(None));
-    }
-
-    #[test]
-    fn test_value_assert() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let truth = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8], &[]));
-        let falsity = Value::Array(array(&session, &mesh, DataType::Boolean, &[0u8], &[]));
-        assert_eq!(truth.assert("predicate must hold", &[]), Ok(()));
-        let message = "assertion failed: predicate must hold";
-        // Inline execution can report the failure from the call. An asynchronous submission reports it at the
-        // effect barrier because the assertion has no result array carrying its completion.
-        match falsity.assert("predicate must hold", &[]) {
-            Err(error) => assert_eq!(error, ProgramError::InvalidArgument { message: message.to_string() }),
-            Ok(()) => assert!(matches!(
-                session.effects_barrier(),
-                Err(Error::Execution(ExecutionError::EffectSubmissionFailures { failures }))
-                    if matches!(failures.as_slice(), [(_, failure)] if failure.as_ref() == message),
-            )),
-        }
-    }
-
-    #[test]
-    fn test_value_operators() {
+    fn test_value_add() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
         let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
         let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
-        assert_eq!(read::<f32>(&-two.clone()), vec![-2.0]);
-        assert_eq!(read::<f32>(&(two.clone() + four.clone())), vec![6.0]);
-        assert_eq!(read::<f32>(&(two.clone() - four.clone())), vec![-2.0]);
-        assert_eq!(read::<f32>(&(two.clone() * four.clone())), vec![8.0]);
-        assert_eq!(read::<f32>(&(four.clone() / two.clone())), vec![2.0]);
+        assert_eq!(read::<f32>(&(two + four)), vec![6.0]);
+    }
+
+    #[test]
+    fn test_value_sub() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
+        assert_eq!(read::<f32>(&(two - four)), vec![-2.0]);
+    }
+
+    #[test]
+    fn test_value_mul() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
+        assert_eq!(read::<f32>(&(two * four)), vec![8.0]);
+    }
+
+    #[test]
+    fn test_value_div() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
+        assert_eq!(read::<f32>(&(four / two)), vec![2.0]);
+    }
+
+    #[test]
+    fn test_value_rem() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let two = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
+        let four = Value::Array(array(&session, &mesh, DataType::F32, &[4.0f32], &[]));
         assert_eq!(read::<f32>(&(two % four)), vec![2.0]);
 
-        let truths = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 1, 0, 0], &[4]));
+        // Two dimension members produce a dimension.
+        assert_eq!(dimension(&session, 3) % dimension(&session, 2), dimension(&session, 1));
+    }
+
+    #[test]
+    fn test_value_not() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
         let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 0, 1, 0], &[4]));
-        assert_eq!(read::<u8>(&(truths.clone() & mixed.clone())), [1, 0, 0, 0]);
-        assert_eq!(read::<u8>(&(truths.clone() | mixed.clone())), [1, 1, 1, 0]);
-        assert_eq!(read::<u8>(&(truths ^ mixed.clone())), [0, 1, 1, 0]);
         assert_eq!(read::<u8>(&!mixed), [0, 1, 0, 1]);
     }
 
     #[test]
-    fn test_value_compare_dimensions() {
-        // Comparing first-class dimensions executes eagerly outside any context, without compiling a program, and
-        // materializes the Boolean result in the session of the inputs.
+    fn test_value_bitand() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
-        let (two, three) = (dimension(&session, 2), dimension(&session, 3));
-        let program_count = session.cached_program_count();
-        assert_eq!(read::<u8>(&two.less_than(&three).unwrap()), vec![1]);
-        assert_eq!(read::<u8>(&two.equal(&three).unwrap()), vec![0]);
-        assert_eq!(read::<u8>(&three.greater_than_or_equal(&three).unwrap()), vec![1]);
-        assert_eq!(session.cached_program_count(), program_count);
+        let truths = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 1, 0, 0], &[4]));
+        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 0, 1, 0], &[4]));
+        assert_eq!(read::<u8>(&(truths & mixed)), [1, 0, 0, 0]);
+    }
 
-        // A dimension cannot be compared with an array.
-        let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
+    #[test]
+    fn test_value_bitor() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let truths = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 1, 0, 0], &[4]));
+        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 0, 1, 0], &[4]));
+        assert_eq!(read::<u8>(&(truths | mixed)), [1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_value_bitxor() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = mesh_on(client, 0);
+        let truths = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 1, 0, 0], &[4]));
+        let mixed = Value::Array(array(&session, &mesh, DataType::Boolean, &[1u8, 0, 1, 0], &[4]));
+        assert_eq!(read::<u8>(&(truths ^ mixed)), [0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_constant_display() {
+        // Constants render exactly like the payload that they wrap.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let extent = DimensionValue::new(extent_type, 4).unwrap();
         assert_eq!(
-            two.less_than(&scalar),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`compare` inputs must both be arrays or both be first-class dimensions, but got `dimension<2>` and \
-                 `i64[][sharding={mesh<['x'=1:auto]>, []}]`",
-            ))),
+            Constant::Captured(CaptureReference::new(2, Type::Array(vector_type()))).to_string(),
+            "capture#2:f64[4]"
         );
+        assert_eq!(Constant::Dimension(extent).to_string(), "EXTENT_PLACEHOLDER");
+        assert_eq!(Constant::Boolean(true).to_string(), "true");
     }
 
     #[test]
-    fn test_value_dimension_arithmetic() {
-        // Arithmetic on two first-class dimensions uses their dimension members and executes eagerly outside any
-        // context, without compiling a program.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let (two, three) = (dimension(&session, 2), dimension(&session, 3));
-        let program_count = session.cached_program_count();
-        assert_eq!(two.add(&three), Ok(dimension(&session, 5)));
-        assert_eq!(three.sub(&two), Ok(dimension(&session, 1)));
-        assert_eq!(two.saturating_sub(&three), Ok(dimension(&session, 0)));
-        assert_eq!(two.mul(&three), Ok(dimension(&session, 6)));
-        assert_eq!(three.div(&two), Ok(dimension(&session, 1)));
-        assert_eq!(three.rem(&two), Ok(dimension(&session, 1)));
-        assert_eq!(three.clone() % two.clone(), dimension(&session, 1));
-        assert_eq!(two.pow(&three), Ok(dimension(&session, 8)));
-        assert_eq!(two.min(&three), Ok(dimension(&session, 2)));
-        assert_eq!(two.max(&three), Ok(dimension(&session, 3)));
-        assert_eq!(session.cached_program_count(), program_count);
-
-        // A dimension paired with an array uses the array members, which rejects the dimension.
-        let scalar = Value::Array(array(&session, &mesh, DataType::I64, &[2i64], &[]));
+    fn test_constant_type() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let extent = DimensionValue::new(extent_type, 4).unwrap();
         assert_eq!(
-            two.mul(&scalar),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+            Constant::Captured(CaptureReference::new(2, Type::Array(vector_type()))).r#type().into_owned(),
+            Type::Array(vector_type()),
         );
-    }
-
-    #[test]
-    fn test_value_dimension_to_scalar() {
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let program_count = session.cached_program_count();
-        let scalar = dimension(&session, 2).to_scalar().unwrap();
-        assert!(matches!(
-            scalar.r#type().as_ref(),
-            Type::Array(r#type) if r#type.data_type() == DataType::I64 && r#type.rank() == 0,
-        ));
-        assert_eq!(read::<i64>(&scalar), vec![2]);
-        assert_eq!(session.cached_program_count(), program_count);
-    }
-
-    #[test]
-    fn test_value_reference_capabilities() {
-        // Top-level reference operations execute eagerly on their host-side handles, with the validation and locking of
-        // the generic array IR reference implementations.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let vector = |values: &[f32]| Value::Array(array(&session, &mesh, DataType::F32, values, &[values.len()]));
-        let scalar = |value: f32| Value::Array(array(&session, &mesh, DataType::F32, &[value], &[]));
-
-        let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
-        assert!(same_session(reference.session(), &session));
-        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![1.0, 2.0]);
-        reference.write(&vector(&[3.0, 4.0])).unwrap();
-        assert_eq!(read::<f32>(&reference.swap(&vector(&[5.0, 6.0])).unwrap()), vec![3.0, 4.0]);
-        reference.add_update(&vector(&[1.0, 1.0])).unwrap();
-        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![6.0, 7.0]);
-
-        // Views address parts of the referent.
-        let second = [ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
-        assert_eq!(read::<f32>(&reference.read_through(&second, &[]).unwrap()), vec![7.0]);
-        reference.write_through(&scalar(9.0), &second, &[]).unwrap();
-        assert_eq!(read::<f32>(&reference.read().unwrap()), vec![6.0, 9.0]);
-
-        // Mismatched replacements are rejected, and freezing invalidates every alias.
         assert_eq!(
-            reference.write(&scalar(1.0)),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reference_write` replacement type `f32[][sharding={mesh<['x'=1:auto]>, []}]` must exactly match \
-                 reference referent type `f32[2][sharding={mesh<['x'=1:auto]>, [{}]}]`",
-            ))),
+            Constant::Dimension(extent.clone()).r#type().into_owned(),
+            Type::Dimension(extent.r#type().into_owned()),
         );
-        let alias = reference.clone();
-        assert_eq!(read::<f32>(&reference.freeze().unwrap()), vec![6.0, 9.0]);
-        assert_eq!(alias.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        assert_eq!(
-            alias.write(&vector(&[1.0, 1.0])).unwrap_err().downcast_custom::<ReferenceError>(),
-            Some(&ReferenceError::Frozen),
-        );
-
-        // Reference operands of array operations are rejected by the array projection of the array IR capabilities.
-        let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
-        assert_eq!(
-            reference.add(&vector(&[1.0, 2.0])),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got reference type"))),
-        );
+        assert_eq!(Constant::Boolean(true).r#type().into_owned(), Type::Array(ArrayType::scalar(DataType::Boolean)));
     }
 
     #[test]
-    fn test_value_projected_capabilities() {
-        // Capabilities without a receiver-shaped signature project onto the array member through the generalized
-        // array IR implementations in `ryft-core`.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let input = Value::Array(array(&session, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
-        let sorted = Value::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending).unwrap();
-        assert_eq!(read::<f32>(&sorted[0]), vec![1.0, 2.0, 3.0]);
-        let indices = Value::Array(array(&session, &mesh, DataType::I32, &[2i32, 0], &[2]));
-        assert_eq!(read::<f32>(&input.gather_axis(&indices, 0, GatherMode::Clip).unwrap()), vec![2.0, 3.0]);
-        assert_eq!(
-            input.parallel_permute("missing", vec![(0, 0)]),
-            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "missing".to_string() })),
-        );
-    }
-
-    #[test]
-    fn test_value_program_replay_lifts_dimension_constants() {
-        // Replaying a program over the session lifts its dimension constants through the session-aware `lift`.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let input = array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]);
-
-        // `dimension_size(x, 0) + 2` followed by `dimension_to_scalar`, with the `2` stored as a program constant.
-        let mut builder = ProgramBuilder::new();
-        let x = builder.add_input(Type::Array(input.r#type().into_owned()));
-        let size_operation = DimensionSizeOperation::new(input.r#type().as_ref(), 0).unwrap();
-        let size_type = size_operation.output_type().clone();
-        let size = builder.add_instruction(size_operation, Vec::new(), vec![x], None).unwrap()[0];
-        let constant = DimensionValue::constant(2).unwrap();
-        let sum = DimensionAddOperation::new(&size_type, constant.r#type().as_ref()).unwrap();
-        let two = builder.add_constant(Constant::Dimension(constant));
-        let sum = builder
-            .add_instruction(Operation::Dimension(DimensionOperation::Add(sum)), Vec::new(), vec![size, two], None)
-            .unwrap()[0];
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![sum], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let outputs = program.interpret_in_context(&session, vec![Value::Array(input)]).unwrap();
-        assert_eq!(read::<i64>(&outputs[0]), vec![5]);
-    }
-
-    #[test]
-    fn test_value_free_transforms() {
-        // Free transform entry points recover the session from the values, so no explicit context is needed.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
-
-        let squared: Value =
-            batch(|x| Ok(x.clone() * x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
-        assert_eq!(read::<f32>(&squared), vec![1.0, 4.0, 9.0]);
-
-        let (value, derivative) = differentiate_at(input.clone()).jvp(input.clone(), |x| Ok(x.clone() * x)).unwrap();
-        assert_eq!(read::<f32>(&value), vec![1.0, 4.0, 9.0]);
-        assert_eq!(read::<f32>(&derivative), vec![2.0, 8.0, 18.0]);
-
-        let (value, gradient) = differentiate_at(input)
-            .value_and_gradient(|x| (x.clone() * x).reduce(&[0], ReductionKind::Sum).unwrap())
-            .unwrap();
-        assert_eq!(read::<f32>(&value), vec![14.0]);
-        assert_eq!(read::<f32>(&gradient), vec![2.0, 4.0, 6.0]);
-    }
-
-    #[test]
-    fn test_value_free_transforms_replay_dimension_derived_values() {
-        // Each item is scaled by its own folded extent, which the transforms replay as a dimension constant.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let input = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
-        let scaled: Value = batch(
-            |x| {
-                let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
-                Ok(x * extent)
-            },
-            input,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(read::<f32>(&scaled), vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0]);
-
-        let primal = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 2.0, 3.0], &[3]));
-        let tangent = Value::Array(array(&session, &mesh, DataType::F32, &[1.0f32, 1.0, 1.0], &[3]));
-        let (value, derivative) = differentiate_at(primal)
-            .jvp(tangent, |x| {
-                let extent = x.dimension_size(0)?.to_scalar()?.convert_element_type(DataType::F32)?;
-                Ok(x * extent)
-            })
-            .unwrap();
-        assert_eq!(read::<f32>(&value), vec![3.0, 6.0, 9.0]);
-        assert_eq!(read::<f32>(&derivative), vec![3.0, 3.0, 3.0]);
-    }
-
-    #[test]
-    fn test_value_jvp_through_a_data_dependent_while() {
-        // At concrete primals, the forward mode `while` rule decides the loop condition on the host through the
-        // predicate contracts of `Value` and unrolls the executed iterations.
-        let client = execution_client();
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = mesh_on(client, 0);
-        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
-        let condition = {
-            let mut builder = ProgramBuilder::new();
-            let state = builder.add_input(scalar_type.clone());
-            let zero = Operation::provide(ZeroOperation::new(scalar_type.clone()), &[]).unwrap();
-            let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
-            let comparison = CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan);
-            let predicate = builder
-                .add_instruction(Operation::Array(comparison.into()), Vec::new(), vec![state, zero], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
-                .unwrap()
+    fn test_constant_rename_type_identities() {
+        let bounds = DimensionBounds::positive(Some(8)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source.clone(), target.clone()).unwrap();
+        let reference_type = |variable| {
+            Type::Reference(ReferenceType::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![CoreDimension::Dynamic(variable)]),
+            )))
         };
-        let body = {
-            let mut builder = ProgramBuilder::new();
-            let state = builder.add_input(scalar_type.clone());
-            let one = Operation::provide(OneOperation::new(scalar_type.clone()), &[]).unwrap();
-            let one = builder.add_instruction(one, Vec::new(), Vec::new(), None).unwrap()[0];
-            let subtraction = SubOperation::<ArrayType>::new();
-            let next = builder
-                .add_instruction(Operation::Array(subtraction.into()), Vec::new(), vec![state, one], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![next], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let primal = Value::Array(array(&session, &mesh, DataType::F32, &[3.5f32], &[]));
-        let tangent = Value::Array(array(&session, &mesh, DataType::F32, &[2.0f32], &[]));
-        let (value, derivative) = differentiate_at(primal)
-            .jvp(tangent, |state| {
-                let mut outputs = state.domain().bind(
-                    Operation::While(WhileOperation::new()),
-                    vec![condition.clone(), body.clone()],
-                    std::slice::from_ref(&state),
-                )?;
-                Ok(outputs.remove(0))
-            })
-            .unwrap();
-        assert_eq!(read::<f32>(&value), vec![-0.5]);
-        assert_eq!(read::<f32>(&derivative), vec![2.0]);
+
+        // A capture renames the identities of its structural type, including a reference type, and keeps its capture
+        // table index.
+        assert_eq!(
+            Constant::Captured(CaptureReference::new(7, reference_type(source))).rename_type_identities(&renaming),
+            Ok(Constant::Captured(CaptureReference::new(7, reference_type(target)))),
+        );
+        assert_eq!(Constant::Boolean(true).rename_type_identities(&renaming), Ok(Constant::Boolean(true)));
     }
 
     #[test]
-    fn test_array_constant_from() {
-        let capture = CaptureReference::new(2, vector_type());
-        assert_eq!(ArrayConstant::from(capture.clone()), ArrayConstant::Captured(capture));
-        assert_eq!(ArrayConstant::from(true), ArrayConstant::Boolean(true));
+    fn test_constant_capture_index() {
+        // Only a capture names a capture table slot.
+        assert_eq!(Constant::Captured(CaptureReference::new(2, Type::Array(vector_type()))).capture_index(), Some(2));
+        assert_eq!(Constant::Dimension(DimensionValue::constant(4).unwrap()).capture_index(), None);
+        assert_eq!(Constant::Boolean(true).capture_index(), None);
+    }
+
+    #[test]
+    fn test_constant_literal_eq_and_literal_hash() {
+        // The literal identity of a constant is its ordinary equality and hash.
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
+        assert!(captured.literal_eq(&Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())))));
+        assert!(!captured.literal_eq(&Constant::Captured(CaptureReference::new(3, Type::Array(vector_type())))));
+        assert!(!captured.literal_eq(&Constant::Boolean(true)));
+        let mut literal_hasher = DefaultHasher::new();
+        captured.literal_hash(&mut literal_hasher);
+        let mut hasher = DefaultHasher::new();
+        captured.hash(&mut hasher);
+        assert_eq!(literal_hasher.finish(), hasher.finish());
+    }
+
+    #[test]
+    fn test_constant_map_capture_index() {
+        // Only a capture is renumbered, and immediates pass through every remapping unchanged.
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
+        let immediate = Constant::Dimension(DimensionValue::constant(4).unwrap());
         assert_eq!(
-            ArrayIrValue::<ArrayConstant>::try_from(false),
-            Ok(ArrayIrValue::Array(ArrayConstant::Boolean(false))),
+            captured.map_capture_index(|index| index + 3),
+            Constant::Captured(CaptureReference::new(5, Type::Array(vector_type()))),
         );
+        assert_eq!(immediate.map_capture_index(|_| 7), immediate);
+        assert_eq!(Constant::Boolean(true).map_capture_index(|_| 99), Constant::Boolean(true));
+    }
+
+    #[test]
+    fn test_constant_concretize() {
+        assert_eq!(Constant::Boolean(true).concretize(), Ok(true));
+        assert_eq!(Constant::Boolean(false).concretize(), Ok(false));
+        assert_eq!(
+            Constant::Dimension(DimensionValue::constant(3).unwrap()).concretize(),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from the staged XLA constant `3`".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_constant_assertion_value() {
+        let dimension = Constant::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(dimension.assertion_array(), Ok(None));
+        assert_eq!(dimension.assertion_observation(), Ok("3".to_string()));
+        let predicate = Constant::Boolean(true);
+        assert_eq!(predicate.assertion_array(), Ok(Some(CoreArray::scalar(true).unwrap())));
+        assert_eq!(predicate.assertion_observation(), Ok("true".to_string()));
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
+        assert_eq!(
+            captured.assertion_array(),
+            Err(ProgramError::Concretization {
+                message: "cannot read an assertion array from a captured constant reference".to_string(),
+            }),
+        );
+        assert_eq!(
+            captured.assertion_observation(),
+            Err(ProgramError::Concretization {
+                message: "cannot read an assertion observation from a captured constant reference".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_constant_array_projection() {
+        let array_type = vector_type();
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(array_type.clone())));
+        let projected = ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
+
+        // Array captures and Boolean predicates project onto array constants and back.
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::projected(&captured).map(|value| value.r#type().into_owned()),
+            Ok(array_type.clone()),
+        );
+        assert_eq!(ValueProjection::<ArrayType>::into_projected(captured.clone()), Ok(projected.clone()));
+        assert_eq!(<Constant as ValueProjection<ArrayType>>::from_projected(projected), captured);
+        assert_eq!(
+            ValueProjection::<ArrayType>::into_projected(Constant::Boolean(true)),
+            Ok(ArrayConstant::Boolean(true)),
+        );
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::from_projected(ArrayConstant::Boolean(true)),
+            Constant::Boolean(true),
+        );
+
+        // Immediate dimensions and reference captures have no array projection.
+        assert_eq!(
+            ValueProjection::<ArrayType>::into_projected(Constant::Dimension(DimensionValue::constant(4).unwrap())),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        let reference = Constant::Captured(CaptureReference::new(7, Type::Reference(ReferenceType::new(array_type))));
+        assert_eq!(
+            <Constant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+    }
+
+    #[test]
+    fn test_constant_dimension_projection() {
+        let extent = DimensionValue::constant(4).unwrap();
+        let immediate = <Constant as ValueProjection<DimensionType>>::from_projected(extent.clone());
+        assert_eq!(immediate, Constant::Dimension(extent.clone()));
+        assert_eq!(<Constant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
+        assert_eq!(ValueProjection::<DimensionType>::into_projected(immediate), Ok(extent));
+
+        // Only immediate dimensions project onto dimensions.
+        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
+        assert_eq!(
+            <Constant as ValueProjection<DimensionType>>::projected(&captured),
+            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
+        assert_eq!(
+            ValueProjection::<DimensionType>::into_projected(Constant::Boolean(true)),
+            Err(TypeError::invalid("expected a dimension but got a Boolean array")),
+        );
+    }
+
+    #[test]
+    fn test_constant_from() {
+        let capture = CaptureReference::new(2, Type::Array(vector_type()));
+        let extent = DimensionValue::constant(4).unwrap();
+        assert_eq!(Constant::from(capture.clone()), Constant::Captured(capture));
+        assert_eq!(Constant::from(extent.clone()), Constant::Dimension(extent));
+        assert_eq!(Constant::from(true), Constant::Boolean(true));
     }
 
     #[test]
@@ -2001,24 +2320,18 @@ mod tests {
     }
 
     #[test]
-    fn test_array_constant_value_projection() {
-        let array_type = vector_type().with_memory(Memory::Host { pinned: true });
-        let captured = ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
-        let borrowed = ValueProjection::<ArrayType>::projected(&captured).unwrap();
-        assert!(std::ptr::eq(borrowed, &captured));
-        assert_eq!(borrowed.r#type().as_ref(), &array_type);
-        assert_eq!(borrowed.capture_index(), Some(2));
-        let owned = ValueProjection::<ArrayType>::into_projected(captured.clone()).unwrap();
-        assert_eq!(owned, captured);
-        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
+    fn test_array_constant_capture_index() {
+        assert_eq!(ArrayConstant::Captured(CaptureReference::new(2, vector_type())).capture_index(), Some(2));
+        assert_eq!(ArrayConstant::Boolean(true).capture_index(), None);
+    }
 
-        let predicate = ArrayConstant::Boolean(true);
-        let borrowed = ValueProjection::<ArrayType>::projected(&predicate).unwrap();
-        assert!(std::ptr::eq(borrowed, &predicate));
-        assert_eq!(borrowed.capture_index(), None);
-        let owned = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
-        assert_eq!(owned, predicate);
-        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
+    #[test]
+    fn test_array_constant_map_capture_index() {
+        assert_eq!(
+            ArrayConstant::Captured(CaptureReference::new(2, vector_type())).map_capture_index(|index| index + 3),
+            ArrayConstant::Captured(CaptureReference::new(5, vector_type())),
+        );
+        assert_eq!(ArrayConstant::Boolean(true).map_capture_index(|_| 99), ArrayConstant::Boolean(true));
     }
 
     #[test]
@@ -2053,132 +2366,32 @@ mod tests {
     }
 
     #[test]
-    fn test_constant() {
-        let array_type = vector_type();
-        let capture = CaptureReference::new(2, Type::Array(array_type.clone()));
-        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
-        let extent = DimensionValue::new(extent_type, 4).unwrap();
+    fn test_array_constant_array_projection() {
+        let array_type = vector_type().with_memory(Memory::Host { pinned: true });
+        let captured = ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()));
+        let borrowed = ValueProjection::<ArrayType>::projected(&captured).unwrap();
+        assert!(std::ptr::eq(borrowed, &captured));
+        assert_eq!(borrowed.r#type().as_ref(), &array_type);
+        let owned = ValueProjection::<ArrayType>::into_projected(captured.clone()).unwrap();
+        assert_eq!(owned, captured);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), captured);
 
-        // Captures and dimensions are reachable through their payload conversions, report their member type, and render
-        // exactly like the payload they wrap.
-        let captured = Constant::from(capture.clone());
-        let immediate = Constant::from(extent.clone());
-        assert_eq!(captured, Constant::Captured(capture));
-        assert_eq!(immediate, Constant::Dimension(extent.clone()));
-        assert_eq!(captured.r#type().into_owned(), Type::Array(array_type.clone()));
-        assert_eq!(immediate.r#type().into_owned(), Type::Dimension(extent.r#type().into_owned()));
-        assert_eq!(captured.to_string(), "capture#2:f64[4]");
-        assert_eq!(immediate.to_string(), extent.to_string());
-
-        let predicate = Constant::from(true);
-        assert_eq!(predicate, Constant::Boolean(true));
-        assert_eq!(predicate.r#type().into_owned(), Type::Array(ArrayType::scalar(DataType::Boolean)));
-        assert_eq!(predicate.to_string(), "true");
-        assert_eq!(predicate.concretize(), Ok(true));
-        assert_eq!(predicate.capture_index(), None);
-        assert_eq!(predicate.map_capture_index(|_| 99), predicate);
-        let projected = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
-        assert_eq!(projected, ArrayConstant::Boolean(true));
-        assert_eq!(projected.concretize(), Ok(true));
-        assert_eq!(projected.capture_index(), None);
-        assert_eq!(projected.map_capture_index(|_| 99), projected);
-        assert_eq!(<Constant as ValueProjection<ArrayType>>::from_projected(projected), predicate);
-
-        // Only the captured variant names a capture-table slot, and so only it is renumbered by capture bookkeeping.
-        // An immediate is index-free and passes through every remapping unchanged.
-        assert_eq!(captured.capture_index(), Some(2));
-        assert_eq!(immediate.capture_index(), None);
-        assert_eq!(
-            captured.map_capture_index(|index| index + 3),
-            Constant::Captured(CaptureReference::new(5, Type::Array(array_type.clone()))),
-        );
-        assert_eq!(immediate.map_capture_index(|_| 7), immediate);
-
-        // The array-typed captured case and immediate-dimension case project to their corresponding member universes
-        // and reject the other one.
-        assert_eq!(
-            <Constant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
-            Ok(ArrayConstant::Captured(CaptureReference::new(2, array_type.clone()))),
-        );
-        assert_eq!(
-            <Constant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
-            Err(TypeError::invalid("expected array type but got dimension type")),
-        );
-        assert_eq!(
-            <Constant as ValueProjection<ArrayType>>::from_projected(ArrayConstant::Captured(CaptureReference::new(
-                2, array_type
-            ))),
-            captured,
-        );
-        assert_eq!(<Constant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
-        assert_eq!(<Constant as ValueProjection<DimensionType>>::into_projected(immediate), Ok(extent),);
-        assert_eq!(
-            <Constant as ValueProjection<DimensionType>>::projected(&captured),
-            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
-        );
-
-        // A capture of reference type carries only its capture table index and structural type metadata. Identity
-        // renaming preserves that index, while ordinary array and dimension projections remain unavailable. No
-        // `ValueProjection` onto reference types exists, because its intended consumer, capture lifting, has not
-        // landed.
-        let source = DimensionVariable::new("source", DimensionBounds::positive(Some(8)).unwrap());
-        let target = DimensionVariable::new("target", DimensionBounds::positive(Some(8)).unwrap());
-        let reference_type =
-            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(source.clone())])));
-        let reference = Constant::Captured(CaptureReference::new(7, Type::Reference(reference_type.clone())));
-        assert_eq!(reference.capture_index(), Some(7));
-        assert_eq!(
-            <Constant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
-            Err(TypeError::invalid("expected array type but got reference type")),
-        );
-        assert_eq!(
-            <Constant as ValueProjection<DimensionType>>::projected(&reference),
-            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
-        );
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(source, target.clone()).unwrap();
-        let renamed_reference = reference.rename_type_identities(&renaming).unwrap();
-        assert_eq!(renamed_reference.capture_index(), Some(7));
-        assert_eq!(
-            renamed_reference.r#type().into_owned(),
-            Type::Reference(ReferenceType::new(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![CoreDimension::Dynamic(target)]),
-            ))),
-        );
+        let predicate = ArrayConstant::Boolean(true);
+        let borrowed = ValueProjection::<ArrayType>::projected(&predicate).unwrap();
+        assert!(std::ptr::eq(borrowed, &predicate));
+        let owned = ValueProjection::<ArrayType>::into_projected(predicate.clone()).unwrap();
+        assert_eq!(owned, predicate);
+        assert_eq!(<ArrayConstant as ValueProjection<ArrayType>>::from_projected(owned), predicate);
     }
 
     #[test]
-    fn test_constant_concretize() {
-        assert_eq!(Constant::Boolean(false).concretize(), Ok(false));
+    fn test_array_constant_from() {
+        let capture = CaptureReference::new(2, vector_type());
+        assert_eq!(ArrayConstant::from(capture.clone()), ArrayConstant::Captured(capture));
+        assert_eq!(ArrayConstant::from(true), ArrayConstant::Boolean(true));
         assert_eq!(
-            Constant::Dimension(DimensionValue::constant(3).unwrap()).concretize(),
-            Err(ProgramError::Concretization {
-                message: "cannot extract a concrete boolean from the staged XLA constant `3`".to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_constant_assertion_value() {
-        let dimension = Constant::Dimension(DimensionValue::constant(3).unwrap());
-        assert_eq!(dimension.assertion_array(), Ok(None));
-        assert_eq!(dimension.assertion_observation(), Ok("3".to_string()));
-        let predicate = Constant::Boolean(true);
-        assert_eq!(predicate.assertion_array(), Ok(Some(CoreArray::scalar(true).unwrap())));
-        assert_eq!(predicate.assertion_observation(), Ok("true".to_string()));
-        let captured = Constant::Captured(CaptureReference::new(2, Type::Array(vector_type())));
-        assert_eq!(
-            captured.assertion_array(),
-            Err(ProgramError::Concretization {
-                message: "cannot read an assertion array from a captured constant reference".to_string(),
-            }),
-        );
-        assert_eq!(
-            captured.assertion_observation(),
-            Err(ProgramError::Concretization {
-                message: "cannot read an assertion observation from a captured constant reference".to_string(),
-            }),
+            ArrayIrValue::<ArrayConstant>::try_from(false),
+            Ok(ArrayIrValue::Array(ArrayConstant::Boolean(false))),
         );
     }
 }

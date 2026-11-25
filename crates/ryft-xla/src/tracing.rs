@@ -1,24 +1,21 @@
 //! General XLA program tracing. The [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
-//! root tracing context of [`Session`], and its [`TracedProgram`] result reports the statistics of the
-//! staged program and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering) module.
-//! [`Error`] reports the failures of both tracing and lowering.
+//! root tracing context of [`Session`], and its [`TracedProgram`] result reports the statistics of the staged program
+//! and lowers it to a StableHLO/Shardy MLIR module through the [`lowering`](crate::lowering) module. [`Error`] reports
+//! the failures of both tracing and lowering.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
 //! semantics of `shard_map` (i.e., boundary metadata, validation, closure tracing, and transform rules) are owned by
-//! the [`shard_map`](mod@ryft_core::operations::sharding::shard_map) module of `ryft-core`, and its manual computations
-//! lower to Shardy `sdy.manual_computation` operations in the [`lowering`](crate::lowering) module. A `shard_map`
-//! traced on its own is simply a traced function whose body binds one `shard_map` (e.g., through
-//! [`ShardMap`](ryft_core::ShardMap) on the context that [`trace_with_context`] passes to it). The lowered function
-//! signature carries the sharding of every global input and output type that has one (refer to
-//! [`TracedProgram::to_mlir_module`]). Tracing such a function over input types that carry the input shardings of its
-//! `shard_map` therefore yields function arguments and results that are placed as the `shard_map` boundary specifies.
+//! the [`shard_map`](mod@ryft_core::shard_map) module of `ryft-core`, and its manual computations lower to Shardy
+//! `sdy.manual_computation` operations in the [`lowering`](crate::lowering) module. A `shard_map` traced on its own is
+//! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
+//! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
+//! global input and output type that has one (refer to [`TracedProgram::to_mlir_module`]). Tracing such a function over
+//! input types that carry the input shardings of its `shard_map` therefore yields function arguments and results that
+//! are placed as the `shard_map` boundary specifies.
 //!
-//! Core failures use [`Error::Core`], and concrete lowering failures have their own
-//! [`Error`] variants. Logical `shard_map` errors raised while tracing or lowering remain
-//! [`ProgramError::Custom`] payloads, recoverable through
-//! [`ProgramError::downcast_custom`](ryft_core::ProgramError::downcast_custom).
-
-// TODO(eaplatanios): Review this module.
+//! Core failures use [`Error::Core`], and concrete lowering failures have their own [`Error`] variants. Logical
+//! `shard_map` errors raised while tracing or lowering remain [`ProgramError::Custom`] payloads, recoverable through
+//! [`ProgramError::downcast_custom`].
 
 use std::cell::RefCell;
 
@@ -27,105 +24,19 @@ use ryft_core::{
     ProjectedValue, Sharding, Typed, ValueProjection,
 };
 
-use crate::lowering::{
-    collect_session_constants, entry_boundary_sharding, entry_open_results, entry_result_placements,
-    entry_result_shardings, pruned_program,
+use crate::compilation::placements::{
+    entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings, pruned_program,
 };
+use crate::lowering::emissions::collect_session_constants;
 use crate::{Constant, Error, Program, Session, Tracer, Type};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Array value that closures traced through [`trace`] receive and return. It is a
 /// [`DomainTracer`](ryft_core::DomainTracer) of [`Session`] projected onto its array member. The `shard_map` bodies
 /// traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the same
 /// values. This alias is public so that callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
-
-/// Stages an arbitrary traced XLA function over global array types.
-///
-/// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
-/// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
-/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s of
-/// `global_input_types`, and the traced program is simplified. Functions that need that context (e.g., to create values
-/// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
-///
-/// # Parameters
-///
-///   - `function`: Function to trace over global XLA values.
-///   - `global_input_types`: Global input array types passed to the traced function.
-///
-/// # Errors
-///
-/// Returns the errors of [`trace_with_context`].
-pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedProgram<Input, Output>, Error>
-where
-    Input: Parameterized<ArrayType>,
-    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    F: FnOnce(Input::To<ArrayTracer>) -> Output::To<ArrayTracer>,
-{
-    trace_with_context(|_, inputs| Ok(function(inputs)), global_input_types)
-}
-
-/// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
-/// of [`Session`] together with its inputs. The context lets the function create values that derive from no input
-/// (e.g., through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a
-/// `shard_map` without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its
-/// tracers after returning.
-///
-/// # Parameters
-///
-///   - `function`: Function to trace over the tracing context and global XLA values.
-///   - `global_input_types`: Global input array types passed to the traced function. Use `()` for no inputs.
-///
-/// # Errors
-///
-/// Returns [`Error::Core`] wrapping a [`ProgramError`] when `function` fails or when tracing or simplifying the program
-/// fails (e.g., because `function` stages an invalid operation or registers a capture, which the fresh root context
-/// discards), or a [`ParameterError`](ryft_core::ParameterError) when the traced inputs or outputs cannot be
-/// restructured into `Input` or `Output`.
-pub fn trace_with_context<F, Input, Output>(
-    function: F,
-    global_input_types: Input,
-) -> Result<TracedProgram<Input, Output>, Error>
-where
-    Input: Parameterized<ArrayType>,
-    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    Output: Parameterized<ArrayType>,
-    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
-    F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output::To<ArrayTracer>, ProgramError>,
-{
-    let input_structure = global_input_types.parameter_structure();
-    let output_structure = RefCell::new(None);
-    let (output_types, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
-        |context, inputs: Vec<Tracer>| {
-            let inputs = inputs
-                .into_iter()
-                .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs =
-                function(context, Input::To::<ArrayTracer>::from_parameters(input_structure.clone(), inputs)?)?;
-            output_structure.replace(Some(outputs.parameter_structure()));
-            Ok(outputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
-        },
-        global_input_types.parameters().cloned().map(Type::Array).collect::<Vec<_>>(),
-        Vec::new(),
-    )?;
-    let output_structure = output_structure.into_inner().ok_or_else(|| {
-        ProgramError::MalformedProgram("XLA tracing completed without recording its output structure".to_string())
-    })?;
-    let global_output_types = Output::from_parameters(
-        output_structure.clone(),
-        output_types
-            .iter()
-            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?,
-    )?;
-    let program = program
-        .into_simplified()?
-        .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
-    Ok(TracedProgram { global_input_types, global_output_types, program })
-}
 
 /// Traced XLA program backed by a staged [`Program`](ryft_core::Program), as returned by [`trace`].
 pub struct TracedProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
@@ -290,7 +201,7 @@ where
         let result_annotations =
             entry_result_shardings(&output_types, result_shardings, &placements, &argument_shardings)?;
         let open_results = entry_open_results(&output_types, result_shardings, &placements, &result_annotations);
-        Ok(super::lowering::lower_mlir_module_for_program_with_value_shardings(
+        Ok(super::lowering::modules::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &capture_types,
             &self.global_input_types,
@@ -302,6 +213,94 @@ where
         )?
         .into_stable_hlo())
     }
+}
+
+/// Stages an arbitrary traced XLA function over global array types.
+///
+/// This is the general XLA tracing entry point used when callers want to compose `shard_map` with differentiation
+/// transforms and then lower the resulting whole program to StableHLO/Shardy MLIR. `function` is traced once, in a
+/// fresh root tracing context of [`Session`] that binds no named axes, over [`ArrayTracer`]s of
+/// `global_input_types`, and the traced program is simplified. Functions that need that context (e.g., to create values
+/// that derive from no input) or that can fail are traced through [`trace_with_context`] instead.
+///
+/// # Parameters
+///
+///   - `function`: Function to trace over global XLA values.
+///   - `global_input_types`: Global input array types passed to the traced function.
+///
+/// # Errors
+///
+/// Returns the errors of [`trace_with_context`].
+pub fn trace<F, Input, Output>(function: F, global_input_types: Input) -> Result<TracedProgram<Input, Output>, Error>
+where
+    Input: Parameterized<ArrayType>,
+    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
+    Output: Parameterized<ArrayType>,
+    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
+    F: FnOnce(Input::To<ArrayTracer>) -> Output::To<ArrayTracer>,
+{
+    trace_with_context(|_, inputs| Ok(function(inputs)), global_input_types)
+}
+
+/// Stages a fallible XLA function over global array types like [`trace`], passing it the fresh root tracing context
+/// of [`Session`] together with its inputs. The context lets the function create values that derive from no input
+/// (e.g., through [`Context::lift`](ryft_core::Context::lift)) and bind context capabilities directly (e.g., a
+/// `shard_map` without inputs through [`ShardMap`](ryft_core::ShardMap)), and the function must not retain it or its
+/// tracers after returning.
+///
+/// # Parameters
+///
+///   - `function`: Function to trace over the tracing context and global XLA values.
+///   - `global_input_types`: Global input array types passed to the traced function. Use `()` for no inputs.
+///
+/// # Errors
+///
+/// Returns [`Error::Core`] wrapping a [`ProgramError`] when `function` fails or when tracing or simplifying the program
+/// fails (e.g., because `function` stages an invalid operation or registers a capture, which the fresh root context
+/// discards), or a [`ParameterError`](ryft_core::ParameterError) when the traced inputs or outputs cannot be
+/// restructured into `Input` or `Output`.
+pub fn trace_with_context<F, Input, Output>(
+    function: F,
+    global_input_types: Input,
+) -> Result<TracedProgram<Input, Output>, Error>
+where
+    Input: Parameterized<ArrayType>,
+    Input::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
+    Output: Parameterized<ArrayType>,
+    Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer>,
+    F: FnOnce(&DomainTracingContext<Session>, Input::To<ArrayTracer>) -> Result<Output::To<ArrayTracer>, ProgramError>,
+{
+    let input_structure = global_input_types.parameter_structure();
+    let output_structure = RefCell::new(None);
+    let (output_types, program) = DomainTracingContext::<Session>::trace_with_context_and_named_axes(
+        |context, inputs: Vec<Tracer>| {
+            let inputs = inputs
+                .into_iter()
+                .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs =
+                function(context, Input::To::<ArrayTracer>::from_parameters(input_structure.clone(), inputs)?)?;
+            output_structure.replace(Some(outputs.parameter_structure()));
+            Ok(outputs.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
+        },
+        global_input_types.parameters().cloned().map(Type::Array).collect::<Vec<_>>(),
+        Vec::new(),
+    )?;
+    let output_structure = output_structure.into_inner().ok_or_else(|| {
+        ProgramError::MalformedProgram("XLA tracing completed without recording its output structure".to_string())
+    })?;
+    let global_output_types = Output::from_parameters(
+        output_structure.clone(),
+        output_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?,
+    )?;
+    let program = program
+        .into_simplified()?
+        .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
+    Ok(TracedProgram { global_input_types, global_output_types, program })
 }
 
 #[cfg(test)]

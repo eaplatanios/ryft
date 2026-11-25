@@ -124,11 +124,13 @@ use crate::arrays::placement::place_operation_bindings;
 use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{captured_type, declared_input_sharding, is_named_mesh, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
-use crate::compilation::programs::EagerDispatchProgram;
-use crate::lowering::{
-    RequestedPlacement, emitted_regions, merge_requested_placement, omits_operation_regions, owned_session_constants,
-    placement_requests, render_devices, requested_placement_mesh,
+use crate::compilation::placements::{
+    RequestedPlacement, merge_requested_placement, owned_session_constants, placement_requests,
+    requested_placement_mesh,
 };
+use crate::compilation::programs::EagerDispatchProgram;
+use crate::lowering::emissions::{emitted_regions, omits_operation_regions};
+use crate::lowering::modules::render_devices;
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::jit_call::EagerCallDecision;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
