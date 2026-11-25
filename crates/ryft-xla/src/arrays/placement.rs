@@ -31,7 +31,7 @@ use ryft_core::{
     Device, DeviceMesh, DifferentiationPolicy, DifferentiationTracer, ImportingContext, LogicalMesh, Parameter,
     ParameterPath, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placement,
     PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture, ThroughParent, Tracer, Typed,
-    UnreducedKind, Value as CoreValue, f8e4m3fn,
+    UnreducedKind, Value as CoreValue,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, Device as PjrtDevice, Error as PjrtError};
@@ -209,11 +209,11 @@ impl Default for PlacementOptions {
 
 /// Represents [`Parameter`] types accepted by [`Session::place`]. A [`Placeable`] consumes one input leaf and
 /// produces one [`Self::Output`] leaf. Ryft provides implementations for runtime [`Array`] leaves, host scalars
-/// of the [`ArrayElement`] types that are [`Parameter`]s, and host arrays of the reference backend (i.e.,
-/// [`ryft_core::Array`]), which are uploaded as dense arrays whatever their host layout is, and all of which produce
-/// runtime [`Array`] leaves. [`PlaceInput`] holds either kind of these leaves, including scalars of the other element
-/// types (e.g., complex scalars), so that one tree can mix them. Ryft also provides implementations for the traced
-/// values of `ryft-core` that can hold arrays of this backend (i.e., [`Tracer`], [`PartialTracer`],
+/// of the [`ArrayElement`](ryft_core::ArrayElement) types that are [`Parameter`]s, and host arrays of the reference
+/// backend (i.e., [`ryft_core::Array`]), which are uploaded as dense arrays whatever their host layout is, and all of
+/// which produce runtime [`Array`] leaves. [`PlaceInput`] holds either kind of these leaves, including scalars of the
+/// other element types (e.g., complex scalars), so that one tree can mix them. Ryft also provides implementations for
+/// the traced values of `ryft-core` that can hold arrays of this backend (i.e., [`Tracer`], [`PartialTracer`],
 /// [`DifferentiationTracer`], [`BatchingTracer`], and [`ProjectedValue`] over [`ArrayType`], which covers
 /// [`CompileTracer`]), so that the same call works inside compiled functions, differentiation, and batching.
 /// A traced leaf stays traced and records its placement through the [`PlaceDispatch`] primitive of the
@@ -278,8 +278,6 @@ pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output>
     ) -> Result<Self::Output, Error>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: HostValue + Parameter> PlaceableParameter<Array> for T {
     fn validate_placement(
         &self,
@@ -290,11 +288,11 @@ impl<T: HostValue + Parameter> PlaceableParameter<Array> for T {
         may_alias: Option<bool>,
     ) -> Result<(), Error> {
         validate_parameter_options(ParameterPath::root, target, source, donate, may_alias)?;
+
         let r#type = self.host_type();
         let target = validate_host_target(&r#type, target.cloned())?;
 
-        // The upload checks its destination with the same function before it uploads anything (refer to
-        // `HostBufferUploads::new`).
+        // The upload checks its destination with the same function before it uploads anything.
         let default_device = || default_upload_device(session, &session.client().addressable_devices()?);
         let (r#type, placement) = host_upload_destination(&r#type, target, default_device)?;
         Array::validate_host_upload(session, r#type, placement.mesh(), placement.sharding())
@@ -326,11 +324,12 @@ impl<T: HostValue + Parameter> Placeable for T {
         // A host value has no placement to validate and no device buffers to donate or share, so it only rejects the
         // options that no leaf accepts.
         validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
+
         let client = session.client();
 
         // A value without a destination lives on the first device only because nothing chose any, so it is not
-        // committed to that device, and operations move it to the devices of their committed inputs. The device is the
-        // default device of the session (refer to `default_upload_device`).
+        // committed to that device, and operations move it to the devices of their committed inputs. The device is
+        // the default device of the session (refer to `default_upload_device`).
         let r#type = self.host_type();
         let host = self.into_host_array();
         let target = validate_host_target(&r#type, target)?;
@@ -341,10 +340,9 @@ impl<T: HostValue + Parameter> Placeable for T {
         let bytes = dense_host_value_bytes(&host)?;
 
         // An in-place destination names no devices, so it uploads the value to the same device as an upload without
-        // a destination, in the storage that it names, and it commits the result like every other destination, as JAX
-        // commits the result of `device_put` onto a memory space. A value without a destination, or with one that names
-        // only its storage, lives on a device that this process chose on its own (refer to
-        // `Array::is_locally_assigned`).
+        // a destination, in the storage that it names, and it commits the result like every other destination. A value
+        // without a destination, or with one that names only its storage, lives on a device that this process chose on
+        // its own (refer to `Array::is_locally_assigned`).
         let committed = target.is_some();
         let locally_assigned = matches!(target, None | Some(PlacementRequest::InPlace { .. }));
 
@@ -367,6 +365,8 @@ impl<T: HostValue + Parameter> Placeable for T {
 pub trait SessionPlacementRequestParameter: Clone + Parameter + sealed::RequestParameter {}
 
 impl<R: Clone + Parameter + sealed::RequestParameter> SessionPlacementRequestParameter for R {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Items that only this crate can name, which seal the traits of this module that depend on them.
 mod sealed {
@@ -871,6 +871,8 @@ impl_traced_placeable!(
 /// # Ok(())
 /// # }
 /// ```
+///
+/// [`ArrayElement`]: ryft_core::ArrayElement
 #[derive(Clone, Debug, Parameter)]
 pub enum PlaceInput<V = Array> {
     /// Host value, which is uploaded as a dense array (e.g., a scalar, which is a rank-0 array), or which becomes a
@@ -2099,17 +2101,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use half::bf16;
     #[cfg(feature = "cuda-13")]
     use indoc::formatdoc;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayIrType, ArrayIrValue, BatchAxis, DataType, DeviceMesh, DifferentiableType, Differentiate,
+        Add, ArrayIrType, ArrayIrValue, BatchAxis, Complex, DataType, DeviceMesh, DifferentiableType, Differentiate,
         DifferentiationDual, DifferentiationError, Dimension, DimensionBounds, DimensionVariable, DomainTracingContext,
         EmptyRegionDriver, Error as CoreError, Exp, InterpretableOperation, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Neg, Operation as CoreOperation, PLACE_OPERATION_NAME, ParameterError, Place, PlaceOperation,
         Placed, ProgramError, Shape, ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin, StridedLayout,
-        Tile, TileDimension, TiledLayout, TypeError, Typed, ValueProjection, batch, differentiate_at, shard_map,
+        Tile, TileDimension, TiledLayout, TypeError, Typed, ValueProjection, batch, differentiate_at, f8e4m3fn,
+        shard_map,
     };
     use ryft_pjrt::{
         BufferType, Client, ClientOptions, CpuClientOptions, ExecutionFence, KeyValueStore, load_cpu_plugin,
@@ -2429,6 +2433,35 @@ mod tests {
                 println!("probe: rank {rank} cross-host placement: {}", error.lines().next().unwrap_or(""));
             }
         }
+    }
+
+    /// Runs `check` in one of the two CPU processes of a placement test (refer to [`run_cpu_processes`]), and returns
+    /// immediately in a process that no launcher started. `check` receives the client of its process, which lists only
+    /// the device of its own process, and the devices of the two processes in process order. Both processes stay
+    /// connected until each of them has finished its check.
+    fn run_as_cpu_process(check: impl FnOnce(&'static Client<'static>, [Device; 2])) {
+        let Some((rank, address)) = test_process() else {
+            return;
+        };
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 2, rank).unwrap()));
+        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(rank) });
+        let client: &'static Client<'static> = Box::leak(Box::new(runtime.new_client(&plugin, options).unwrap()));
+        assert_eq!(client.devices().unwrap().len(), 1);
+        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let key = |rank| format!("ryft/test/placement/device/{rank}");
+        let store = runtime.key_value_store();
+        let timeout = Duration::from_secs(5);
+        store.put(key(rank).as_bytes(), &local.id().to_le_bytes()).unwrap();
+        let devices = [0, 1].map(|rank| {
+            let bytes = store.get(key(rank).as_bytes(), timeout).unwrap();
+            Device::new(usize::from_le_bytes(bytes.try_into().unwrap()), rank)
+        });
+        check(client, devices);
+        let finished = |rank| format!("ryft/test/placement/finished/{rank}");
+        store.put(finished(rank).as_bytes(), b"ready").unwrap();
+        store.get(finished(1 - rank).as_bytes(), timeout).unwrap();
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -8608,148 +8641,184 @@ mod tests {
         assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
     }
 
+    // Worker of `test_session_place_rejects_unavailable_value_comparisons_on_two_cpu_processes`, which returns
+    // immediately unless that test launched it as one of its two processes.
     #[test]
     #[ignore = "entry point of a process of a multi-process test"]
-    fn test_session_place_cpu_process_helper() {
-        let Some((rank, address)) = test_process() else {
-            return;
-        };
-        let plugin = load_cpu_plugin().unwrap();
-        let runtime = Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 2, rank).unwrap()));
-        let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(rank) });
-        let client: &'static Client<'static> = Box::leak(Box::new(runtime.new_client(&plugin, options).unwrap()));
-        assert_eq!(client.devices().unwrap().len(), 1);
-        let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let key = |rank| format!("ryft/test/placement/device/{rank}");
-        let store = runtime.key_value_store();
-        let timeout = Duration::from_secs(5);
-        store.put(key(rank).as_bytes(), &local.id().to_le_bytes()).unwrap();
-        let devices = [0, 1].map(|rank| {
-            let bytes = store.get(key(rank).as_bytes(), timeout).unwrap();
-            Device::new(usize::from_le_bytes(bytes.try_into().unwrap()), rank)
+    fn test_session_place_rejects_unavailable_value_comparisons_cpu_process_helper() {
+        run_as_cpu_process(|client, devices| {
+            let rank = client.process_index().unwrap();
+            let local = devices[rank];
+            let session = Session::builder().client(client).remote_devices([devices[1 - rank]]).build().unwrap();
+            assert_eq!(session.devices().unwrap(), devices);
+            let mesh = session.mesh([MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            assert_eq!(mesh.devices(), devices);
+            let logical_mesh = mesh.logical_mesh().clone();
+            let target = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
+            let r#type = ArrayType::new_static(DataType::U8, [2]);
+            let host = || CoreArray::new(r#type.clone(), vec![rank as u8; 2]).unwrap();
+            let check_rejected = |output: Result<Array, Error>| {
+                assert!(matches!(output, Err(Error::Session(SessionError::PlacementComparisonUnavailable))));
+            };
+
+            // The declarations make both ranks reject even when one candidate can see every device.
+            let comparison = ValueComparison::new(target.mesh().clone(), vec![local]);
+            let candidate = (rank == 0).then_some(&comparison);
+            let comparison = candidate.or(ValueComparison::of_session(&session).unwrap());
+            check_rejected(session.place_with_comparison(host(), PlacementOptions::to(target.clone()), comparison));
+            check_rejected(session.place(host(), PlacementOptions::to(target.clone())));
+            let uploaded = Array::from_host_buffer(&session, r#type.clone(), None, None, [rank as u8; 2]).unwrap();
+            let core_error = uploaded.place(&target, None).unwrap_err();
+            assert_eq!(
+                core_error.downcast_custom::<SessionError>(),
+                Some(&SessionError::PlacementComparisonUnavailable)
+            );
+            check_rejected(uploaded.to_placement(&session, target.clone()));
+            check_rejected(uploaded.into_placement(&session, target.clone()));
         });
-        let new_session = || Session::builder().client(client).remote_devices([devices[1 - rank]]);
-        let session = new_session().build().unwrap();
-        assert_eq!(session.devices().unwrap(), devices);
-        let mesh = session.mesh([MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        assert_eq!(mesh.devices(), devices);
-        let logical_mesh = mesh.logical_mesh().clone();
-        let target = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
-        let r#type = ArrayType::new_static(DataType::U8, [2]);
-        let host = || CoreArray::new(r#type.clone(), vec![rank as u8; 2]).unwrap();
-        let check_rejected = |output: Result<Array, Error>| {
-            assert!(matches!(output, Err(Error::Session(SessionError::PlacementComparisonUnavailable))));
-        };
-
-        // The declarations make both ranks reject even when one candidate can see every device.
-        let comparison = ValueComparison::new(target.mesh().clone(), vec![local]);
-        let candidate = (rank == 0).then_some(&comparison);
-        let comparison = candidate.or(ValueComparison::of_session(&session).unwrap());
-        check_rejected(session.place_with_comparison(host(), PlacementOptions::to(target.clone()), comparison));
-        check_rejected(session.place(host(), PlacementOptions::to(target.clone())));
-        let uploaded = Array::from_host_buffer(&session, r#type.clone(), None, None, [rank as u8; 2]).unwrap();
-        let core_error = uploaded.place(&target, None).unwrap_err();
-        assert_eq!(core_error.downcast_custom::<SessionError>(), Some(&SessionError::PlacementComparisonUnavailable));
-        check_rejected(uploaded.to_placement(&session, target.clone()));
-        check_rejected(uploaded.into_placement(&session, target.clone()));
-
-        // Local targets and explicitly unchecked placements use no comparison.
-        let local_placement = session.place(3u8, PlacementOptions::to(local)).unwrap();
-        assert_eq!(local_placement.copy_to_host_bytes().unwrap(), [3]);
-        let unchecked = new_session().value_comparison(false).build().unwrap();
-        let placed = unchecked.place(host(), PlacementOptions::to(target)).unwrap();
-        assert_eq!(placed.copy_to_host_bytes().unwrap(), [rank as u8; 2]);
-
-        // CPU rejects the unsupported layout on the owner and nonowner before either can submit a cross-host leaf.
-        let committed = unchecked.place(host(), PlacementOptions::to(devices[0])).unwrap();
-        assert_eq!(committed.addressable_shards().count(), usize::from(rank == 0));
-        let layouts = [
-            (Layout::Strided(StridedLayout::new(vec![2])), "cpu PJRT does not support strided device layouts"),
-            (
-                Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])),
-                "cpu PJRT does not support device layouts with tiles",
-            ),
-        ];
-        for (layout, layout_error) in layouts {
-            let upload = PlacementRequest::Device { device: devices[0], memory: None, layout: Some(layout.clone()) };
-            let relayout = PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) };
-            let transfer = PlacementRequest::from(devices[1]);
-            let unsupported = |error: &Error| {
-                matches!(error, Error::Pjrt(PjrtError::InvalidArgument { message, .. })
-                    if message == layout_error)
-            };
-            let assert_leaf_error = |error: Error, expected_path: &str| {
-                assert!(
-                    matches!(&error, Error::Array(error) if matches!(error.as_ref(),
-                        ArrayError::FailedParameterPlacement { source, path }
-                            if path.to_string() == expected_path && unsupported(source)
-                    )),
-                    "{error:?}"
-                );
-            };
-            let statistics = unchecked.array_statistics();
-            let error = unchecked
-                .place(
-                    (PlaceInput::from(host()), PlaceInput::from(committed.clone())),
-                    PlacementOptions::to((upload, transfer.clone())),
-                )
-                .unwrap_err();
-            assert_leaf_error(error, "$.0");
-            let error = unchecked
-                .place(
-                    (committed.clone(), committed.clone()),
-                    PlacementOptions::to((relayout.clone(), transfer.clone())),
-                )
-                .unwrap_err();
-            assert_leaf_error(error, "$.0");
-            let error = unchecked
-                .place((committed.clone(), committed.clone()), PlacementOptions::to((transfer, relayout.clone())))
-                .unwrap_err();
-            assert_leaf_error(error, "$.1");
-
-            // Direct storage conversion and host constructors share the format check for empty upload lists too.
-            let source_mesh = committed.mesh().clone();
-            let bytes = [7u8, 9];
-            let destination_type = r#type.clone().with_layout(layout.clone());
-            let dense =
-                Array::from_host_buffer(&unchecked, destination_type.clone(), source_mesh.clone(), None, &bytes);
-            let shard = (rank == 0).then_some((devices[0].id(), &bytes));
-            let sharded = Array::from_host_shards(&unchecked, destination_type, source_mesh.clone(), None, shard);
-            let directly_placed = committed.to_placement(&unchecked, relayout.clone());
-            let converted = committed.clone().place_storage(Memory::Device, Some(layout.clone()));
-            for rejected in [dense, sharded, directly_placed, converted] {
-                let error = rejected.unwrap_err();
-                assert!(unsupported(&error), "{error:?}");
-            }
-            assert_eq!(unchecked.array_statistics().created_arrays, statistics.created_arrays);
-
-            let unchanged = committed.to_placement(&unchecked, devices[0]).unwrap();
-            assert_eq!(unchanged, committed);
-
-            let zero_type = ArrayType::new_static(DataType::Zero, [2]);
-            let zero = Array::from_host_buffer(&unchecked, zero_type.clone(), source_mesh.clone(), None, []).unwrap();
-            let placed = unchecked.place(zero, PlacementOptions::to(relayout)).unwrap();
-            let zero_type = zero_type.with_layout(layout.clone());
-            let zero_shard = (rank == 0).then_some((devices[0].id(), &[] as &[u8]));
-            let sharded =
-                Array::from_host_shards(&unchecked, zero_type.clone(), source_mesh.clone(), None, zero_shard).unwrap();
-            let dense = Array::from_host_buffer(&unchecked, zero_type, source_mesh, None, []).unwrap();
-            for zero in [placed, sharded, dense] {
-                assert_eq!(zero.layout(), Some(&layout));
-                assert!(zero.addressable_shards().all(|shard| shard.buffer().is_none()));
-                zero.block_until_ready().unwrap();
-            }
-        }
-
-        let finished = |rank| format!("ryft/test/placement/finished/{rank}");
-        store.put(finished(rank).as_bytes(), b"ready").unwrap();
-        store.get(finished(1 - rank).as_bytes(), timeout).unwrap();
-        runtime.shutdown().unwrap();
     }
 
     #[test]
-    fn test_session_place_on_two_cpu_processes() {
-        run_cpu_processes("arrays::placement::tests::test_session_place_cpu_process_helper", 2);
+    fn test_session_place_rejects_unavailable_value_comparisons_on_two_cpu_processes() {
+        run_cpu_processes(
+            "arrays::placement::tests::test_session_place_rejects_unavailable_value_comparisons_cpu_process_helper",
+            2,
+        );
+    }
+
+    // Worker of `test_session_place_skips_value_comparisons_on_two_cpu_processes`, which returns immediately unless
+    // that test launched it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_session_place_skips_value_comparisons_cpu_process_helper() {
+        run_as_cpu_process(|client, devices| {
+            let rank = client.process_index().unwrap();
+            // Placements onto a device of this process and placements of a session that disables the comparison compare
+            // nothing, so they succeed although the declared devices make the comparison unavailable.
+            let new_session = || Session::builder().client(client).remote_devices([devices[1 - rank]]);
+            let session = new_session().build().unwrap();
+            let mesh = session.mesh([MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+            let logical_mesh = mesh.logical_mesh().clone();
+            let target = Placement::new(mesh, Sharding::replicated(logical_mesh, 1)).unwrap();
+            let r#type = ArrayType::new_static(DataType::U8, [2]);
+            let host = CoreArray::new(r#type, vec![rank as u8; 2]).unwrap();
+            let local_placement = session.place(3u8, PlacementOptions::to(devices[rank])).unwrap();
+            assert_eq!(local_placement.copy_to_host_bytes().unwrap(), [3]);
+            let unchecked = new_session().value_comparison(false).build().unwrap();
+            let placed = unchecked.place(host, PlacementOptions::to(target)).unwrap();
+            assert_eq!(placed.copy_to_host_bytes().unwrap(), [rank as u8; 2]);
+        });
+    }
+
+    #[test]
+    fn test_session_place_skips_value_comparisons_on_two_cpu_processes() {
+        run_cpu_processes("arrays::placement::tests::test_session_place_skips_value_comparisons_cpu_process_helper", 2);
+    }
+
+    // Worker of `test_session_place_rejects_unsupported_layouts_on_two_cpu_processes`, which returns immediately
+    // unless that test launched it as one of its two processes.
+    #[test]
+    #[ignore = "entry point of a process of a multi-process test"]
+    fn test_session_place_rejects_unsupported_layouts_cpu_process_helper() {
+        run_as_cpu_process(|client, devices| {
+            let rank = client.process_index().unwrap();
+            let session = Session::builder().client(client).remote_devices([devices[1 - rank]]);
+            let unchecked = session.value_comparison(false).build().unwrap();
+            let r#type = ArrayType::new_static(DataType::U8, [2]);
+            let host = || CoreArray::new(r#type.clone(), vec![rank as u8; 2]).unwrap();
+
+            // CPU rejects the unsupported layout on the owner and nonowner before either can submit a cross-host leaf.
+            let committed = unchecked.place(host(), PlacementOptions::to(devices[0])).unwrap();
+            assert_eq!(committed.addressable_shards().count(), usize::from(rank == 0));
+            let layouts = [
+                (Layout::Strided(StridedLayout::new(vec![2])), "cpu PJRT does not support strided device layouts"),
+                (
+                    Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])),
+                    "cpu PJRT does not support device layouts with tiles",
+                ),
+            ];
+            for (layout, layout_error) in layouts {
+                let upload =
+                    PlacementRequest::Device { device: devices[0], memory: None, layout: Some(layout.clone()) };
+                let relayout = PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) };
+                let transfer = PlacementRequest::from(devices[1]);
+                let unsupported = |error: &Error| {
+                    matches!(error, Error::Pjrt(PjrtError::InvalidArgument { message, .. })
+                        if message == layout_error)
+                };
+                let assert_leaf_error = |error: Error, expected_path: &str| {
+                    assert!(
+                        matches!(&error, Error::Array(error) if matches!(error.as_ref(),
+                            ArrayError::FailedParameterPlacement { source, path }
+                                if path.to_string() == expected_path && unsupported(source)
+                        )),
+                        "{error:?}"
+                    );
+                };
+                let statistics = unchecked.array_statistics();
+                let error = unchecked
+                    .place(
+                        (PlaceInput::from(host()), PlaceInput::from(committed.clone())),
+                        PlacementOptions::to((upload, transfer.clone())),
+                    )
+                    .unwrap_err();
+                assert_leaf_error(error, "$.0");
+                let error = unchecked
+                    .place(
+                        (committed.clone(), committed.clone()),
+                        PlacementOptions::to((relayout.clone(), transfer.clone())),
+                    )
+                    .unwrap_err();
+                assert_leaf_error(error, "$.0");
+                let error = unchecked
+                    .place((committed.clone(), committed.clone()), PlacementOptions::to((transfer, relayout.clone())))
+                    .unwrap_err();
+                assert_leaf_error(error, "$.1");
+
+                // Direct storage conversion and host constructors share the format check for empty upload lists too.
+                let source_mesh = committed.mesh().clone();
+                let bytes = [7u8, 9];
+                let destination_type = r#type.clone().with_layout(layout.clone());
+                let dense =
+                    Array::from_host_buffer(&unchecked, destination_type.clone(), source_mesh.clone(), None, &bytes);
+                let shard = (rank == 0).then_some((devices[0].id(), &bytes));
+                let sharded = Array::from_host_shards(&unchecked, destination_type, source_mesh.clone(), None, shard);
+                let directly_placed = committed.to_placement(&unchecked, relayout.clone());
+                let converted = committed.clone().place_storage(Memory::Device, Some(layout.clone()));
+                for rejected in [dense, sharded, directly_placed, converted] {
+                    let error = rejected.unwrap_err();
+                    assert!(unsupported(&error), "{error:?}");
+                }
+                assert_eq!(unchecked.array_statistics().created_arrays, statistics.created_arrays);
+
+                let unchanged = committed.to_placement(&unchecked, devices[0]).unwrap();
+                assert_eq!(unchanged, committed);
+
+                let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+                let zero =
+                    Array::from_host_buffer(&unchecked, zero_type.clone(), source_mesh.clone(), None, []).unwrap();
+                let placed = unchecked.place(zero, PlacementOptions::to(relayout)).unwrap();
+                let zero_type = zero_type.with_layout(layout.clone());
+                let zero_shard = (rank == 0).then_some((devices[0].id(), &[] as &[u8]));
+                let sharded =
+                    Array::from_host_shards(&unchecked, zero_type.clone(), source_mesh.clone(), None, zero_shard)
+                        .unwrap();
+                let dense = Array::from_host_buffer(&unchecked, zero_type, source_mesh, None, []).unwrap();
+                for zero in [placed, sharded, dense] {
+                    assert_eq!(zero.layout(), Some(&layout));
+                    assert!(zero.addressable_shards().all(|shard| shard.buffer().is_none()));
+                    zero.block_until_ready().unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_session_place_rejects_unsupported_layouts_on_two_cpu_processes() {
+        run_cpu_processes(
+            "arrays::placement::tests::test_session_place_rejects_unsupported_layouts_cpu_process_helper",
+            2,
+        );
     }
 
     // Worker of `test_session_place_compares_equal_values_on_two_cuda_processes`, which returns immediately unless that
