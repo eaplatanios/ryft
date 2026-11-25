@@ -2547,12 +2547,10 @@ struct SessionState {
     /// is dropped and their queued uploads have run.
     host_upload_workers: HostUploadWorkers,
 
-    // TODO(eaplatanios): Review this.
     /// Whether placements compare the values that the processes of a run place onto a destination that all of them
     /// share (refer to [`SessionBuilder::value_comparison`]).
     value_comparison: bool,
 
-    // TODO(eaplatanios): Review this.
     /// Devices of other processes declared through [`SessionBuilder::remote_devices`], sorted by identifier.
     /// Redundant declarations of devices the client already lists still indicate an explicitly declared topology.
     remote_devices: Box<[Device]>,
@@ -2623,13 +2621,12 @@ pub struct SessionBuilder {
     /// [`RuntimeExtensions`] of the session.
     runtime_extensions: RuntimeExtensions,
 
-    // TODO(eaplatanios): Review this.
-    /// Whether placements of the session compare the values of the processes of a run (refer to
-    /// [`Self::value_comparison`]).
+    /// Whether placements of the session compare the values of the processes of a run.
+    /// Refer to [`Self::value_comparison`] for more information.
     value_comparison: bool,
 
-    // TODO(eaplatanios): Review this.
-    /// Devices of the other processes of the run that the client does not list (refer to [`Self::remote_devices`]).
+    /// Devices of the other processes of the run that the client does not list.
+    /// Refer to [`Self::remote_devices`] for more information.
     remote_devices: Vec<Device>,
 }
 
@@ -2766,7 +2763,6 @@ impl SessionBuilder {
         self
     }
 
-    // TODO(eaplatanios): Review this.
     /// Sets whether the placements of the session check that the processes of a run place equal values onto a
     /// destination that all of them share, which is enabled by default. Every process uploads a host value, or places
     /// an array whose devices it chose on its own (e.g., one uploaded without a destination that names devices), onto
@@ -2793,19 +2789,17 @@ impl SessionBuilder {
         self
     }
 
-    // TODO(eaplatanios): Review this.
     /// Declares `devices`, the devices of the other processes of the run, as devices of the session, in place of any
-    /// that were declared before. The session is the authority on which devices exist, as the client is in JAX, whose
-    /// `jax.devices()` lists every device of a run. A session knows the devices that its client lists, which for most
-    /// distributed clients (e.g., the CUDA plugin in a distributed runtime) are the devices of every process, and the
-    /// devices declared here. Every function that accepts a [`Device`] (e.g., the meshes of uploads and placements,
-    /// [`Session::with_default_device`], and the meshes of compiled functions) rejects any other device with
-    /// [`ArrayError::UnknownDevice`] before any work is submitted, so a mistyped device fails rather than silently
-    /// receiving no buffer. Declare the devices of the other processes for clients that list only their own (e.g., CPU
-    /// clients, also when they share a coordination service) and for tests that stand for several processes with
-    /// several clients. Every process must declare the devices of the others alike, so that every process accepts the
-    /// same devices. A nonempty declaration also selects declared topology on this session, even when the client
-    /// already enumerates all declared devices (refer to [`Self::value_comparison`]).
+    /// that were declared before. The session is the authority on which devices exist. A session knows the devices that
+    /// its client lists, which for most distributed clients (e.g., the CUDA plugin in a distributed runtime) are the
+    /// devices of every process, and the devices declared here. Every function that accepts a [`Device`] (e.g., the
+    /// meshes of uploads and placements, [`Session::with_default_device`], and the meshes of compiled functions)
+    /// rejects any other device with [`ArrayError::UnknownDevice`] before any work is submitted, so a mistyped device
+    /// fails rather than silently receiving no buffer. Declare the devices of the other processes for clients that list
+    /// only their own (e.g., CPU clients, also when they share a coordination service) and for tests that stand for
+    /// several processes with several clients. Every process must declare the devices of the others alike, so that
+    /// every process accepts the same devices. A non-empty declaration also selects declared topology on this session,
+    /// even when the client already enumerates all declared devices (refer to [`Self::value_comparison`]).
     ///
     /// # Errors
     ///
@@ -2850,7 +2844,36 @@ impl SessionBuilder {
             Some(DiskCacheSource::Explicit(disk_cache)) => self.compilation_cache.with_disk_cache(disk_cache),
             Some(DiskCacheSource::Environment) => self.compilation_cache.with_disk_cache_from_env()?,
         };
-        let remote_devices = validated_remote_devices(client, self.remote_devices)?;
+
+        // Keep the declared devices of the other processes sorted by identifier, with repeated declarations removed.
+        // A device of this process is not remote, and a declared process must agree with the process that the client
+        // lists for the device and with every other declaration of it.
+        let mut remote_devices = Vec::<Device>::with_capacity(self.remote_devices.len());
+        if !self.remote_devices.is_empty() {
+            let process_index = client.process_index()?;
+            let listed_devices = client
+                .devices()?
+                .iter()
+                .map(|device| Ok((device.id()?, device.process_index()?)))
+                .collect::<Result<HashMap<_, _>, PjrtError>>()?;
+            let mut devices = self.remote_devices;
+            devices.sort_by_key(Device::id);
+            for device in devices {
+                if device.process_index() == process_index {
+                    return Err(SessionError::LocalRemoteDevice { device, process_index }.into());
+                }
+                let repeated = remote_devices.last().filter(|last| last.id() == device.id()).map(Device::process_index);
+                if let Some(actual) = listed_devices.get(&device.id()).copied().or(repeated)
+                    && actual != device.process_index()
+                {
+                    let (device_id, expected) = (device.id(), device.process_index());
+                    return Err(ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }.into());
+                }
+                if repeated.is_none() {
+                    remote_devices.push(device);
+                }
+            }
+        }
 
         Ok(Session {
             state: Arc::new(SessionState {
@@ -2864,7 +2887,7 @@ impl SessionBuilder {
                 array_tracker: Arc::new(ArrayTracker::new(self.live_array_tracking)),
                 host_upload_workers: HostUploadWorkers::default(),
                 value_comparison: self.value_comparison,
-                remote_devices,
+                remote_devices: remote_devices.into_boxed_slice(),
                 comparison_participants: OnceLock::new(),
                 value_comparisons: AtomicU64::new(0),
             }),
@@ -2923,42 +2946,6 @@ impl DefaultMesh {
     fn is_locally_assigned(&self) -> bool {
         matches!(self, Self::Device(_) | Self::Internal { locally_assigned: true, .. })
     }
-}
-
-// TODO(eaplatanios): Inline this.
-/// Returns `devices`, which a [`SessionBuilder`] declared as the devices of the other processes of the run of `client`
-/// (refer to [`SessionBuilder::remote_devices`]), sorted by identifier with repeated declarations removed.
-fn validated_remote_devices(client: &Client<'_>, mut devices: Vec<Device>) -> Result<Box<[Device]>, Error> {
-    if devices.is_empty() {
-        return Ok(Box::default());
-    }
-
-    let process_index = client.process_index()?;
-    let listed_devices = client
-        .devices()?
-        .iter()
-        .map(|device| Ok((device.id()?, device.process_index()?)))
-        .collect::<Result<HashMap<_, _>, PjrtError>>()?;
-    devices.sort_by_key(Device::id);
-
-    let mut remote_devices = Vec::<Device>::with_capacity(devices.len());
-    for device in devices {
-        if device.process_index() == process_index {
-            return Err(SessionError::LocalRemoteDevice { device, process_index }.into());
-        }
-        let repeated = remote_devices.last().filter(|last| last.id() == device.id()).map(Device::process_index);
-        if let Some(actual) = listed_devices.get(&device.id()).copied().or(repeated)
-            && actual != device.process_index()
-        {
-            let (device_id, expected) = (device.id(), device.process_index());
-            return Err(ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }.into());
-        }
-        if repeated.is_none() {
-            remote_devices.push(device);
-        }
-    }
-
-    Ok(remote_devices.into_boxed_slice())
 }
 
 /// Key and session constants that [`Context::bind`] caches for an attached region. This type also identifies the
