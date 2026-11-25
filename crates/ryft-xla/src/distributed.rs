@@ -355,9 +355,9 @@ impl DistributedRuntime {
     }
 
     /// Returns the devices of the other processes of the job that `client`, a client of this process that uses the
-    /// key-value store of this runtime, does not list, for a [`Session`](crate::Session) to declare (refer to
-    /// [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)). A client that lists a device of
-    /// every process (e.g., a CUDA client) needs none, and nothing is exchanged for it.
+    /// key-value store of this runtime, does not list, which a [`Session`](crate::Session) of that client adds to
+    /// its devices (refer to [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)). A
+    /// client that lists a device of every process (e.g., a CUDA client) needs none, and nothing is exchanged for it.
     ///
     /// Otherwise (e.g., for a CPU client, which lists only the devices of its own process), this process publishes
     /// its devices to the key-value store and reads those that each other process published. Every process of the
@@ -366,11 +366,19 @@ impl DistributedRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Pjrt`] with a failed precondition error if `client` reports another process index than this
-    /// runtime has (i.e., its options did not name its process) or if this process already published other devices
-    /// for this runtime, and with the error of the store if another process does not publish its devices in time.
+    /// Returns [`Error::Pjrt`] with a failed precondition error if `client` does not use the key-value store of this
+    /// runtime, if it reports another process index than this runtime has (i.e., its options did not name its
+    /// process), or if this process already published other devices for this runtime, and with the error of the store
+    /// if another process does not publish its devices in time.
     pub(crate) fn remote_devices(&self, client: &Client<'_>) -> Result<Vec<Device>, Error> {
         let (process_index, process_count) = (self.process_index(), self.process_count());
+        if !client.key_value_store().is_some_and(|store| std::ptr::addr_eq(store, &self.state.key_value_store)) {
+            return Err(ryft_pjrt::Error::failed_precondition(
+                "client does not use the key-value store of its distributed runtime; create it with \
+                 `DistributedRuntime::create_client`",
+            )
+            .into());
+        }
         let client_process_index = client.process_index()?;
         if client_process_index != process_index {
             return Err(ryft_pjrt::Error::failed_precondition(format!(
@@ -783,6 +791,7 @@ mod tests {
     use crate::arrays::host::DIFFERENT_VALUES_MESSAGE;
     use crate::arrays::host::ValueComparison;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
+    use crate::sessions::tests::DeclareRemoteDevices;
     #[cfg(feature = "cuda-13")]
     use crate::tests::test_compilation_options;
     use crate::tests::{loopback_address, values_from_bytes, values_to_bytes};
@@ -1406,9 +1415,18 @@ mod tests {
         let client = runtime.create_client(&plugin, options).unwrap();
         assert!(matches!(runtime.remote_devices(&client), Ok(devices) if devices.is_empty()));
 
-        // A client whose options name another process cannot stand for the process of the runtime.
+        // A client that was created without the runtime takes no part in its job.
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(1) });
-        let other = plugin.client(options).unwrap();
+        let unrelated = plugin.client(options.clone()).unwrap();
+        assert!(matches!(
+            runtime.remote_devices(&unrelated),
+            Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
+                if message == "client does not use the key-value store of its distributed runtime; create it with \
+                               `DistributedRuntime::create_client`",
+        ));
+
+        // A client whose options name another process cannot stand for the process of the runtime.
+        let other = plugin.client_with_key_value_store(options, runtime.key_value_store()).unwrap();
         assert!(matches!(
             runtime.remote_devices(&other),
             Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
@@ -1983,7 +2001,7 @@ mod tests {
         let finished = |rank| format!("ryft/test/placement/finished/{rank}");
         store.put(finished(rank).as_bytes(), b"ready").unwrap();
         store.get(finished(1 - rank).as_bytes(), timeout).unwrap();
-        store.client().shutdown().unwrap();
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -2008,9 +2026,11 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let runtime: &'static DistributedRuntime =
             Box::leak(Box::new(DistributedRuntime::initialize(&plugin, &address, 2, rank).unwrap()));
+        // One of the two clients names another process than the runtime has, which `DistributedRuntime::create_client`
+        // rejects, so both are created from the key-value store of the runtime directly.
         let client = |process_id| {
             let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id: Some(process_id) });
-            &*Box::leak(Box::new(runtime.create_client(&plugin, options).unwrap()))
+            &*Box::leak(Box::new(plugin.client_with_key_value_store(options, runtime.key_value_store()).unwrap()))
         };
         let source_client = client(1 - rank);
         let target_client = client(rank);
@@ -2054,7 +2074,7 @@ mod tests {
         let finished = |rank| format!("ryft/test/host-bridge/finished/{rank}");
         store.put(finished(rank).as_bytes(), b"ready").unwrap();
         store.get(finished(1 - rank).as_bytes(), timeout).unwrap();
-        store.client().shutdown().unwrap();
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -2275,7 +2295,11 @@ mod tests {
             .join("\n");
         assert!(outputs.iter().all(|(status, ..)| status.success()), "a rank of `{helper}` failed\n{report}");
         for (rank, (_, stdout, _)) in outputs.iter().enumerate() {
-            assert!(stdout.contains("1 passed"), "rank {rank} did not run `{helper}`:\n{stdout}");
+            assert!(
+                stdout.contains(&format!("test {helper} ... "))
+                    && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "rank {rank} did not pass `{helper}`:\n{stdout}"
+            );
         }
         outputs.map(|(_, stdout, _)| stdout)
     }
@@ -2724,18 +2748,6 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         let (process_0_mesh, forward_mesh) = (mesh(vec![devices[0]]), mesh(devices.clone()));
         let split = Sharding::new(forward_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]);
         let split = Placement::new(forward_mesh.clone(), split.unwrap()).unwrap();
-        let declared = Session::builder()
-            .client(client)
-            .remote_devices(devices.iter().copied().filter(|device| device.process_index() != rank))
-            .build()
-            .unwrap();
-        assert_eq!(declared.devices().unwrap(), session.devices().unwrap());
-        let declared_host =
-            CoreArray::new(ArrayType::new_static(DataType::F32, [4]), values_to_bytes(&[1f32; 4])).unwrap();
-        assert!(matches!(
-            declared.place(declared_host, PlacementOptions::to(split.clone())),
-            Err(Error::Session(SessionError::PlacementComparisonUnavailable)),
-        ));
         let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let report = |name: &str, placed: Result<Array, Error>| {
             let outcome = match placed.and_then(|placed| placed.block_until_ready().map(|()| placed)) {
@@ -2938,9 +2950,9 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
     /// Places on every rank of the job of `client`, with one call of [`Session::place`], a host value split over the
     /// two global devices, which is a scalar on rank 0 (so that only rank 0 rejects it) and a vector on rank 1, and an
     /// array of rank 0 replicated onto both devices, which rank 1 can only receive from rank 0. Then places that array
-    /// once more on its own. Prints one `probe:` line for the call, with `different values` when it returns the error of
-    /// the failed comparison or otherwise the first line of its error or the elements of the shards of this rank, and
-    /// one for the placement that follows it.
+    /// once more on its own. Prints one `probe:` line for the call, with `different values` when it returns the error
+    /// of the failed comparison or otherwise the first line of its error or the elements of the shards of this rank,
+    /// and one for the placement that follows it.
     #[cfg(feature = "cuda-13")]
     fn probe_call_admission_with_invalid_leaf(client: &'static Client<'static>) {
         let rank = client.process_index().unwrap();
@@ -3172,8 +3184,8 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         );
     }
 
-    // Worker of `test_array_to_placement_agrees_on_strategy_on_two_cuda_processes`, which returns immediately unless that
-    // test launched it as one of its two ranks.
+    // Worker of `test_array_to_placement_agrees_on_strategy_on_two_cuda_processes`, which returns immediately unless
+    // that test launched it as one of its two ranks.
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_array_to_placement_agrees_on_strategy_cuda_process_helper() {
@@ -3297,12 +3309,13 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let values = values_to_bytes(&[1f32, 2., 3., 4.]);
             let source = Array::from_host_buffer(&session, r#type, forward_mesh, None, values).unwrap();
 
-            // Each rank sends its half to the other one and receives the other half into default device memory, which it
-            // then copies to the requested memory. Each rank looks up that memory on its own device only after it issued
-            // both of its transfers, so a memory that its device lacks fails that rank after the swap is paired, and
-            // every later swap still pairs its transfers. A swap that left a transfer unmatched would make the next swap
-            // between the same devices read stale halves. Both memories exist on CUDA devices, so this does not exercise
-            // such a failure, and a rank that failed so would not reach the transfers of a later placement of a tree.
+            // Each rank sends its half to the other one and receives the other half into default device memory, which
+            // it then copies to the requested memory. Each rank looks up that memory on its own device only after it
+            // issued both of its transfers, so a memory that its device lacks fails that rank after the swap is paired,
+            // and every later swap still pairs its transfers. A swap that left a transfer unmatched would make the next
+            // swap between the same devices read stale halves. Both memories exist on CUDA devices, so this does not
+            // exercise such a failure, and a rank that failed so would not reach the transfers of a later placement of
+            // a tree.
             for memory in [Memory::Host { pinned: true }, Memory::Host { pinned: false }, Memory::Device] {
                 let target = Placement::new(reversed_mesh.clone(), sharded.clone()).unwrap().with_memory(memory);
                 match source.to_placement(&session, target) {
@@ -3352,8 +3365,8 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
         );
     }
 
-    // Worker of `test_array_to_placement_sends_from_host_memory_on_two_cuda_processes`, which returns immediately unless
-    // that test launched it as one of its two ranks.
+    // Worker of `test_array_to_placement_sends_from_host_memory_on_two_cuda_processes`, which returns immediately
+    // unless that test launched it as one of its two ranks.
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_array_to_placement_sends_from_host_memory_cuda_process_helper() {
@@ -3435,12 +3448,13 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
 
             // Rank 0 runs a bounded-dynamic identity whose result buffer is allocated for the bound of its dimension
-            // with a trailer that records its extent, and rank 1 holds only the metadata of that result. The CUDA plugin
-            // sends as many bytes as the allocation of the sender holds, while the receiver allocates a static buffer of
-            // the shard, so rank 0 must send a static copy of exactly that size. This holds for an extent below the
-            // bound, where the physical dimensions of the dynamic buffer differ from the shape of the shard, and at the
-            // maximum extent, where they are equal but the allocation still holds the trailer. Each step prints the
-            // number of received elements and whether they are `0, 1, 2, ...`, and a failure names the rank and step.
+            // with a trailer that records its extent, and rank 1 holds only the metadata of that result. The CUDA
+            // plugin sends as many bytes as the allocation of the sender holds, while the receiver allocates a static
+            // buffer of the shard, so rank 0 must send a static copy of exactly that size. This holds for an extent
+            // below the bound, where the physical dimensions of the dynamic buffer differ from the shape of the shard,
+            // and at the maximum extent, where they are equal but the allocation still holds the trailer. Each step
+            // prints the number of received elements and whether they are `0, 1, 2, ...`, and a failure names the rank
+            // and step.
             let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(1024)).unwrap());
             let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
             let identity: crate::CompiledFunction<ArrayType, ArrayType> =

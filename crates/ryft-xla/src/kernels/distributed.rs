@@ -944,7 +944,7 @@ mod tests {
         let address = std::env::var("RYFT_KERNEL_ADDRESS").unwrap();
         let mode = std::env::var("RYFT_KERNEL_MODE").unwrap();
         let plugin = load_cpu_plugin().unwrap();
-        let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process as u32).unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &address, 2, process).unwrap();
         let client = Platform::Cpu
             .client(Some(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
             .unwrap();

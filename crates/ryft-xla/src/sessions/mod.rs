@@ -218,9 +218,9 @@ const DEFAULT_EAGER_DISPATCH_CACHE_CAPACITY: usize = 4096;
 /// is the extension point for clients that Ryft's XLA backend cannot directly create. Every client of a session lives
 /// for the rest of the process and is never destroyed, which is why sessions and their values carry no lifetime for
 /// their underlying clients. [`Self::mesh`] creates device meshes over the devices of the client. The session is the
-/// authority on which devices exist: [`Self::devices`] lists every device that it knows, which are the devices that its
-/// client lists and the devices of other processes that [`SessionBuilder::remote_devices`] declares, and every function
-/// that accepts a [`Device`] rejects any other one.
+/// authority on which devices exist: [`Self::devices`] lists every device that it knows, which are the devices that
+/// its client lists and the devices of other processes that it learns from its distributed runtime (e.g., using
+/// [`SessionBuilder::distributed_runtime`]), and every function that accepts a [`Device`] rejects any other one.
 ///
 /// # Shared and Selected State
 ///
@@ -435,10 +435,11 @@ impl Session {
     }
 
     /// Returns every device that this session knows, sorted by their process indices and then by their identifiers.
-    /// These are the devices that the client of the session lists and the devices of other processes that were declared
-    /// through [`SessionBuilder::remote_devices`], and they are the only devices that the functions of the session
-    /// accept (e.g., in the meshes of uploads, placements, and compiled functions). Obtain devices from this function
-    /// or from [`Self::addressable_devices`] rather than constructing them, so that they name devices that exist.
+    /// These are the devices that the client of the session lists and, for a client that does not list the devices
+    /// of other processes, the devices that the session learned from its distributed runtime (e.g., using
+    /// [`SessionBuilder::distributed_runtime`]). They are the only devices that the functions of the session accept
+    /// (e.g., in the meshes of uploads, placements, and compiled functions). Obtain devices from this function or
+    /// from [`Self::addressable_devices`] rather than constructing them, so that they name devices that exist.
     ///
     /// # Errors
     ///
@@ -452,11 +453,9 @@ impl Session {
             .chain(self.remote_devices().iter().copied().map(Ok))
             .collect::<Result<Vec<_>, PjrtError>>()?;
         devices.sort_by_key(|device| (device.process_index(), device.id()));
-        devices.dedup();
         Ok(devices)
     }
 
-    // TODO(eaplatanios): Should this be renamed to `local_devices` and `remote_devices` be made public?
     /// Returns the devices of this process that this session can address, in the order in which the client
     /// of the session enumerates them. A value that only this process holds (e.g., on the device of
     /// [`Self::with_default_device`]) must be on one of these devices.
@@ -469,8 +468,9 @@ impl Session {
         Ok(self.client().addressable_devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Returns the devices of other processes declared through [`SessionBuilder::remote_devices`],
-    /// sorted by identifier, including any devices the client already lists.
+    /// Returns the devices of other processes that the client of this session does not list and that the session
+    /// learned from its distributed runtime (e.g., using [`SessionBuilder::distributed_runtime`]), sorted by
+    /// identifier. A session with such devices has no native PJRT topology across its processes.
     #[inline]
     pub(crate) fn remote_devices(&self) -> &[Device] {
         &self.state.remote_devices
@@ -852,7 +852,8 @@ impl Session {
     }
 
     /// Creates a [`DeviceMesh`] with the provided `axes` over the first devices in [`Self::devices`] order.
-    /// The inventory includes remote devices reported by PJRT or declared through [`SessionBuilder::remote_devices`].
+    /// The inventory includes the devices of other processes, whether the client lists them or the session learned
+    /// them from its distributed runtime.
     ///
     /// # Errors
     ///
@@ -2557,8 +2558,9 @@ struct SessionState {
     /// share (refer to [`SessionBuilder::value_comparison`]).
     value_comparison: bool,
 
-    /// Devices of other processes declared through [`SessionBuilder::remote_devices`], sorted by identifier.
-    /// Redundant declarations of devices the client already lists still indicate an explicitly declared topology.
+    /// Devices of other processes that the client does not list and that the session learned from its distributed
+    /// runtime, sorted by identifier. It is non-empty exactly when the client has no native topology across the
+    /// processes of the job.
     remote_devices: Box<[Device]>,
 
     /// Distributed runtime of the job that the session takes part in, if it was built with one.
@@ -2584,9 +2586,10 @@ pub type Tracer = DomainTracer<Session>;
 /// not know about, and [`Self::client_options`] configures the client that either of them creates. These clients live
 /// for the rest of the process, and sessions that request the same plugin with equal client options share one client,
 /// as the [`platforms`] module documents. [`Self::client`] instead supplies a client that the caller created. Each of
-/// [`Self::platform`], [`Self::plugin`], and [`Self::client`] replaces the selection of the others. The remaining
-/// functions configure the resources that all handles of the session share. The order in which a builder is configured
-/// does not matter otherwise.
+/// [`Self::platform`], [`Self::plugin`], and [`Self::client`] replaces the selection of the others. A process of a
+/// distributed job adds [`Self::distributed_runtime`], which makes that client take part in the job and declares the
+/// devices of the other processes. The remaining functions configure the resources that all handles of the session
+/// share. The order in which a builder is configured does not matter otherwise.
 ///
 /// # Example
 ///
@@ -2638,8 +2641,9 @@ pub struct SessionBuilder {
     /// Refer to [`Self::value_comparison`] for more information.
     value_comparison: bool,
 
-    /// Devices of the other processes of the run that the client does not list.
-    /// Refer to [`Self::remote_devices`] for more information.
+    /// Devices of other processes that the session declares beside the ones that it learns from
+    /// [`Self::distributed_runtime`]. No public function sets them, so that the processes of a job cannot declare
+    /// different devices. The tests of this crate declare them to stand for several processes without a job.
     remote_devices: Vec<Device>,
 }
 
@@ -2694,10 +2698,11 @@ impl SessionBuilder {
     ///     process count (refer to [`DistributedRuntime::create_client`]), so [`Self::client_options`] need not repeat
     ///     them and must not contradict them.
     ///   - **Devices:** When the client does not list a device of every process (e.g., a CPU client, which lists only
-    ///     its own devices), every process publishes its devices through `runtime` and the session declares those of
-    ///     the other processes, as [`Self::remote_devices`] does. Building the session then waits until every other
-    ///     process has built its own, for the request timeout of `runtime`. Such a session cannot compare the values
-    ///     of the processes (refer to [`Self::value_comparison`]).
+    ///     its own devices), every process publishes its devices through `runtime` and the session learns those of
+    ///     the other processes (refer to [`Session::devices`]). This is the only way in which a session learns such
+    ///     devices, so the processes of a job cannot disagree about them. Building the session then waits until every
+    ///     other process has built its own, for the request timeout of `runtime`. Such a session has no native
+    ///     topology across its processes, so it cannot compare their values (refer to [`Self::value_comparison`]).
     ///
     /// With [`Self::client`], the session uses the client of the caller, which must have been created through
     /// `runtime` for its process, and only the devices are taken from `runtime`. Sharing compiled programs between the
@@ -2834,9 +2839,9 @@ impl SessionBuilder {
     /// call or the readiness of its results.
     ///
     /// The all-reduce requires a common native PJRT device topology. The CPU plugin can enumerate only its local
-    /// devices in a multi-process run, even when it uses a coordination service. If any process needs explicit
-    /// device declarations, configure [`Self::remote_devices`] on every participant, including those that can
-    /// already enumerate every device. A placement that needs comparison on such a session returns
+    /// devices in a multi-process run, even when it uses a coordination service, so its session learns the devices
+    /// of the other processes from its distributed runtime (refer to [`Self::distributed_runtime`]) and has no such
+    /// topology. A placement that needs comparison on such a session returns
     /// [`SessionError::PlacementComparisonUnavailable`] before comparison readback or collective submission.
     /// Independent placements remain usable. Every participant must use the same comparison setting and make the
     /// same sequence of comparing calls (refer to [`Session::place`]). Runs of one process, destinations on a subset
@@ -2848,29 +2853,6 @@ impl SessionBuilder {
         self
     }
 
-    /// Declares `devices`, the devices of the other processes of the run, as devices of the session, in place of any
-    /// that were declared before. The session is the authority on which devices exist. A session knows the devices that
-    /// its client lists, which for most distributed clients (e.g., the CUDA plugin in a distributed runtime) are the
-    /// devices of every process, and the devices declared here. Every function that accepts a [`Device`] (e.g., the
-    /// meshes of uploads and placements, [`Session::with_default_device`], and the meshes of compiled functions)
-    /// rejects any other device with [`ArrayError::UnknownDevice`] before any work is submitted, so a mistyped device
-    /// fails rather than silently receiving no buffer. Declare the devices of the other processes for clients that list
-    /// only their own (e.g., CPU clients, also when they share a coordination service) and for tests that stand for
-    /// several processes with several clients. Every process must declare the devices of the others alike, so that
-    /// every process accepts the same devices. A non-empty declaration also selects declared topology on this session,
-    /// even when the client already enumerates all declared devices (refer to [`Self::value_comparison`]).
-    ///
-    /// # Errors
-    ///
-    /// This function itself cannot fail, but it makes [`Self::build`] return [`SessionError::LocalRemoteDevice`] for a
-    /// device of the process of the client, and [`ArrayError::DeviceProcessIndexMismatch`] for a device that the client
-    /// lists, or that `devices` repeats, for another process.
-    #[inline]
-    pub fn remote_devices<D: IntoIterator<Item = Device>>(mut self, devices: D) -> Self {
-        self.remote_devices = devices.into_iter().collect();
-        self
-    }
-
     /// Builds a [`Session`] with a fresh effect scope.
     ///
     /// # Errors
@@ -2878,9 +2860,10 @@ impl SessionBuilder {
     /// Returns a [`SessionError`] if the requested platform is unavailable in this build or if client options were
     /// supplied for [`Platform::Auto`] or for a client that the caller created, [`Error::Pjrt`] if the plugin of the
     /// session cannot be loaded or initialized or its client cannot be created, [`Error::Io`] if the disk cache that
-    /// the environment configures is invalid, and the errors of [`Self::remote_devices`] for the devices that it
-    /// declares. Building a session only from [`Self::client`] and resources that do not read the environment is
-    /// infallible when no remote devices are declared.
+    /// the environment configures is invalid, and the errors of [`Self::distributed_runtime`] for a session of a
+    /// distributed job, including [`ArrayError::DeviceProcessIndexMismatch`] if a device that another process
+    /// published is one that the client lists for a different process. Building a session only from [`Self::client`]
+    /// and resources that do not read the environment is infallible without a distributed runtime.
     pub fn build(self) -> Result<Session, Error> {
         let runtime = self.distributed_runtime;
         let client: &'static Client<'static> = match (self.client_source, self.client_options) {
@@ -2923,6 +2906,7 @@ impl SessionBuilder {
         if let Some(runtime) = &runtime {
             devices.extend(runtime.remote_devices(client)?);
         }
+
         let mut remote_devices = Vec::<Device>::with_capacity(devices.len());
         if !devices.is_empty() {
             let process_index = client.process_index()?;
@@ -2936,14 +2920,18 @@ impl SessionBuilder {
                 if device.process_index() == process_index {
                     return Err(SessionError::LocalRemoteDevice { device, process_index }.into());
                 }
+
+                let listed = listed_devices.get(&device.id()).copied();
                 let repeated = remote_devices.last().filter(|last| last.id() == device.id()).map(Device::process_index);
-                if let Some(actual) = listed_devices.get(&device.id()).copied().or(repeated)
+                if let Some(actual) = listed.or(repeated)
                     && actual != device.process_index()
                 {
                     let (device_id, expected) = (device.id(), device.process_index());
                     return Err(ArrayError::DeviceProcessIndexMismatch { device_id, expected, actual }.into());
                 }
-                if repeated.is_none() {
+
+                // A device that the client lists is part of its native topology, which a declaration never replaces.
+                if listed.is_none() && repeated.is_none() {
                     remote_devices.push(device);
                 }
             }
@@ -3206,8 +3194,8 @@ pub(crate) mod tests {
     use crate::operations::sharding::shard_map::tests::read_device_f32s;
     use crate::sessions::effects::EffectCallbackGuard;
     use crate::tests::{
-        assert_send_sync, cpu_client, execution_client, other_cpu_client, peer_devices, replicated_array,
-        session_with_remote_devices, values_from_bytes, values_to_bytes,
+        assert_send_sync, cpu_client, execution_client, loopback_address, other_cpu_client, peer_devices,
+        replicated_array, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
         CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FlatProgram, FromPjrt,
@@ -3218,6 +3206,21 @@ pub(crate) mod tests {
     use crate::{CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelEmbedding, KernelCompilerBinding, Options, stage_kernel};
 
     use super::*;
+
+    /// Declaration of the devices of other processes on a [`SessionBuilder`], for tests that stand for several
+    /// processes of a job with clients that do not list each other and without a coordination service. Sessions
+    /// outside of these tests learn such devices only from [`SessionBuilder::distributed_runtime`].
+    pub(crate) trait DeclareRemoteDevices {
+        /// Declares `devices` as the devices of the other processes, in place of any that were declared before.
+        fn remote_devices<D: IntoIterator<Item = Device>>(self, devices: D) -> Self;
+    }
+
+    impl DeclareRemoteDevices for SessionBuilder {
+        fn remote_devices<D: IntoIterator<Item = Device>>(mut self, devices: D) -> Self {
+            self.remote_devices = devices.into_iter().collect();
+            self
+        }
+    }
 
     /// Returns whether the session handles use the same effect scope.
     pub(crate) fn shares_effect_scope(first: &Session, second: &Session) -> bool {
@@ -3457,10 +3460,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_builder_remote_devices() {
+    fn test_session_builder_build_validates_declared_remote_devices() {
         // A declared device must belong to another process than the client, and to the process that the client lists
-        // it for, or that an earlier declaration of the same device names. Repeated declarations of one device, and the
-        // declaration of a device of another process that the client lists, are accepted.
+        // it for, or that an earlier declaration of the same device names. Repeated declarations of one device are
+        // accepted, and a declared device that the client lists stays part of its native topology.
         let client = cpu_client(1);
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let build = |devices: Vec<Device>| {
@@ -3496,6 +3499,60 @@ pub(crate) mod tests {
                 Ok(vec![local, remote]),
             ],
         );
+    }
+
+    #[test]
+    fn test_session_builder_distributed_runtime() {
+        let plugin = load_cpu_plugin().unwrap();
+        let runtime = DistributedRuntime::initialize(&plugin, &loopback_address(), 1, 0).unwrap();
+        let options = |process_id| ClientOptions::CPU(CpuClientOptions { device_count: Some(1), process_id });
+        let build = |builder: SessionBuilder, runtime: &DistributedRuntime| {
+            builder.client_options(options(None)).distributed_runtime(runtime.clone()).build()
+        };
+
+        // The session creates its client through the key-value store of the runtime, with the process of the runtime,
+        // and keeps the runtime. A client that lists every process leaves nothing to declare.
+        let session = build(Session::builder().platform(Platform::Cpu), &runtime).unwrap();
+        assert!(session.client().key_value_store().is_some());
+        assert_eq!(session.client().process_index().unwrap(), 0);
+        assert!(session.distributed_runtime().unwrap().is_same_runtime(&runtime));
+        assert_eq!(session.remote_devices(), []);
+
+        // Sessions share the client of one runtime, plugin, and options. A session of another runtime or without a
+        // runtime gets a client of its own, also for equal options.
+        let later = build(Session::builder().plugin(plugin.clone()), &runtime).unwrap();
+        assert!(std::ptr::eq(later.client(), session.client()));
+        let other_runtime = DistributedRuntime::initialize(&plugin, &loopback_address(), 1, 0).unwrap();
+        let other = build(Session::builder().platform(Platform::Cpu), &other_runtime).unwrap();
+        assert!(!std::ptr::eq(other.client(), session.client()));
+        let local = Session::builder().platform(Platform::Cpu).client_options(options(Some(0))).build().unwrap();
+        assert!(!std::ptr::eq(local.client(), session.client()));
+        assert!(local.client().key_value_store().is_none());
+        assert!(local.distributed_runtime().is_none());
+
+        // A client of the caller that was created through the runtime is used as it is.
+        let supplied = Session::builder().client(session.client()).distributed_runtime(runtime.clone()).build();
+        assert!(std::ptr::eq(supplied.unwrap().client(), session.client()));
+
+        // Without an explicit platform, the processes of a job could select different ones.
+        assert!(matches!(
+            Session::builder().distributed_runtime(runtime.clone()).build(),
+            Err(Error::Session(SessionError::UnspecifiedDistributedPlatform)),
+        ));
+
+        // Client options that name another process, and a client that takes no part in the job, are rejected.
+        let contradictory = Session::builder().platform(Platform::Cpu).client_options(options(Some(1)));
+        assert!(matches!(
+            contradictory.distributed_runtime(runtime.clone()).build(),
+            Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
+                if message == "client option `process_id` is 1, but its distributed runtime has 0",
+        ));
+        assert!(matches!(
+            Session::builder().client(local.client()).distributed_runtime(runtime).build(),
+            Err(Error::Pjrt(PjrtError::FailedPrecondition { message, .. }))
+                if message == "client does not use the key-value store of its distributed runtime; create it with \
+                               `DistributedRuntime::create_client`",
+        ));
     }
 
     #[test]
@@ -3742,8 +3799,8 @@ pub(crate) mod tests {
                 assert_eq!(
                     error.to_string(),
                     format!(
-                        "device {} of process {} is not a device of the session; declare the devices of other \
-                         processes that the PJRT client does not list with `SessionBuilder::remote_devices`",
+                        "device {} of process {} is not a device of the session; a session learns the devices of \
+                         other processes that its PJRT client does not list from `SessionBuilder::distributed_runtime`",
                         owner.id(),
                         owner.process_index(),
                     ),

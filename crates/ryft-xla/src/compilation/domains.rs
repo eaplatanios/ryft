@@ -6239,8 +6239,8 @@ mod tests {
                 format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1),
                 format!("device {} is not addressable by the PJRT client in process {process_index}", device_id + 999),
                 format!(
-                    "device 999 of process {} is not a device of the session; declare the devices of other processes \
-                     that the PJRT client does not list with `SessionBuilder::remote_devices`",
+                    "device 999 of process {} is not a device of the session; a session learns the devices of other \
+                     processes that its PJRT client does not list from `SessionBuilder::distributed_runtime`",
                     process_index + 1,
                 ),
             ],

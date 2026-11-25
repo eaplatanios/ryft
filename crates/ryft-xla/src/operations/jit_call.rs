@@ -1220,13 +1220,13 @@ impl JitCallOperation<Type> {
                 Some(first) if public_arrays.clone().all(|other| other.mesh().devices() == first.mesh().devices()) => {
                     Cow::Borrowed(first.mesh())
                 }
-                Some(_) => Cow::Owned(session.device_mesh_for(&[], None, None)?),
+                Some(_) => Cow::Owned(session.device_mesh_for(&[], None)?),
                 None => {
                     let logical_mesh = interface.output_types().iter().find_map(|r#type| match r#type {
                         Type::Array(r#type) => r#type.sharding().map(Sharding::mesh),
                         _ => None,
                     });
-                    Cow::Owned(session.device_mesh_for(&[], logical_mesh, None)?)
+                    Cow::Owned(session.device_mesh_for(&[], logical_mesh)?)
                 }
             },
         };

@@ -880,7 +880,7 @@ fn execute_aot_case(
 
         let process = std::env::var("RYFT_KERNEL_DISTRIBUTED_PROCESS").unwrap().parse::<usize>().unwrap();
         assert!(process < 2);
-        let coordination = DistributedRuntime::initialize(plugin, &address, 2, process as u32).unwrap();
+        let coordination = DistributedRuntime::initialize(plugin, &address, 2, process).unwrap();
         let options =
             DistributedKernelOptions::new(1024, Duration::from_secs(30)).unwrap().with_chunk_bytes(63).unwrap();
         let mut distributed = DistributedKernel::new(&coordination, &loaded, options).unwrap();

@@ -109,9 +109,9 @@
 //! devices of every process, every process plans whole shards from its own device as the source of the value, so each
 //! one sends its shard to the others and none of them receives, and the placement never completes. Every device that
 //! a placement names must also be a device that the session knows (refer to [`Session::devices`]), which includes the
-//! devices of other processes only when the client lists them or the session declares them (refer to
-//! [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)), so that a mistyped device is rejected
-//! before any work is submitted.
+//! devices of other processes only when the client lists them or the session learned them from its distributed
+//! runtime (refer to [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)), so that a
+//! mistyped device is rejected before any work is submitted.
 //!
 //! A cross-host transfer moves the whole allocation of a buffer in device memory into a static buffer in the default
 //! layout and the default device memory of the receiver, so the sender first copies a shard that its type declares in
@@ -5159,7 +5159,7 @@ mod tests {
     };
 
     use crate::arrays::retained::RetainedArray;
-    use crate::sessions::tests::{domain_mesh, two_device_mesh};
+    use crate::sessions::tests::{DeclareRemoteDevices, domain_mesh, two_device_mesh};
     use crate::tests::{
         cpu_client, four_device_mesh_x, logical_mesh_2x2, other_cpu_client, peer_devices, session_with_remote_devices,
         sessions_of_processes, values_from_bytes, values_to_bytes,

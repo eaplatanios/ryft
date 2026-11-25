@@ -326,7 +326,7 @@ pub(super) fn run_worker(
         let runtime = DistributedRuntime::initialize_with_options(
             &plugin,
             coordinator,
-            rank as u32,
+            None,
             DistributedRuntimeServiceOptions {
                 num_nodes: 2,
                 heartbeat_timeout: timeout,
@@ -390,7 +390,7 @@ pub(super) fn run_worker(
                 return Err(format!("rank {participant} reported an invalid completion record").into());
             }
         }
-        runtime.key_value_store().client().shutdown()?;
+        runtime.shutdown()?;
         Ok(records)
     }
 }

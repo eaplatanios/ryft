@@ -97,6 +97,7 @@ pub(crate) mod tests {
     use std::cell::RefCell;
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::mem::MaybeUninit;
+    use std::net::TcpListener;
     use std::sync::{Mutex, Once, OnceLock, PoisonError};
 
     use ryft_core::{
@@ -114,6 +115,7 @@ pub(crate) mod tests {
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     use crate::compilation::options::resolve_shardy_debug_options;
+    use crate::sessions::tests::DeclareRemoteDevices;
     use crate::{Array, FromPjrt, Session};
 
     #[cfg(any(feature = "cuda-13", feature = "mps"))]
@@ -178,9 +180,9 @@ pub(crate) mod tests {
     }
 
     /// Returns a session of `client` that declares `remote_devices` as the devices of other processes (refer to
-    /// [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)), for tests that describe arrays and
-    /// placements over devices of other processes, which a client without peers does not list. These tests simulate
-    /// ranks independently, so there is no peer making comparing calls in the same order.
+    /// [`DeclareRemoteDevices`]), for tests that describe arrays and placements over devices of other processes, which
+    /// a client without peers does not list. These tests simulate ranks independently, so there is no peer making
+    /// comparing calls in the same order.
     pub(crate) fn session_with_remote_devices<D: IntoIterator<Item = Device>>(
         client: &'static Client<'static>,
         remote_devices: D,
@@ -193,9 +195,16 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Returns a loopback address with a free port that the operating system assigned, for tests that start a
+    /// coordination service on it. The port is released before the service binds it, so the test fails if another
+    /// process takes the port in between, as it does when the environment denies binding a loopback port.
+    pub(crate) fn loopback_address() -> String {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string()
+    }
+
     /// Returns the addressable devices of every client of `clients` other than `client`, which stand for the
     /// processes of one run, as the devices of other processes that a session of `client` declares (refer to
-    /// [`SessionBuilder::remote_devices`](crate::SessionBuilder::remote_devices)).
+    /// [`DeclareRemoteDevices`]).
     pub(crate) fn peer_devices(client: &Client<'_>, clients: &[&'static Client<'static>]) -> Vec<Device> {
         clients
             .iter()
