@@ -23,14 +23,15 @@
 //! transfer strategies, blocking cases, and failures reported by readiness and readback functions.
 
 use std::borrow::Cow;
+use std::convert::identity;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 use ryft_core::{
     Array as CoreArray, ArrayType, BatchingPolicy, BatchingTracer, CapturePlacement, CapturePlacementContext, Context,
     Device, DeviceMesh, DifferentiationPolicy, DifferentiationTracer, ImportingContext, LogicalMesh, Parameter,
-    ParameterPath, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placement,
-    PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture, ThroughParent, Tracer, Typed,
+    ParameterPath, Parameterized, ParameterizedFamily, PartialTracer, PlaceDispatch, PlaceOperation, Placeholder,
+    Placement, PlacementRequest, ProgramError, ProjectedValue, Sharding, ThroughCapture, ThroughParent, Tracer, Typed,
     UnreducedKind, Value as CoreValue,
 };
 use ryft_macros::Parameter;
@@ -612,7 +613,7 @@ impl PlaceableParameter<Array> for Array {
             PlacementRequest::InPlace { .. } => return false,
         };
 
-        resolve_array_placement(target.clone(), self).map_or_else(
+        self.resolve_placement_request(target.clone()).map_or_else(
             |_| {
                 // If resolution fails, conservatively identify potential peers from the source mesh and the
                 // devices named by the request, which every process sees alike.
@@ -1473,12 +1474,7 @@ impl Session {
         options: PlacementOptions<Target, Source, Donate, MayAlias>,
     ) -> Result<<Input as Parameterized<P>>::To<P::Output>, Error>
     where
-        <Input as Parameterized<P>>::Family: ParameterizedFamily<P::Output>
-            + ParameterizedFamily<TargetPlacement>
-            + ParameterizedFamily<SourcePlacement>
-            + ParameterizedFamily<bool>
-            + ParameterizedFamily<Option<bool>>,
-        <MayAlias as Parameterized<Aliasing>>::Family: ParameterizedFamily<Option<bool>>,
+        <Input as Parameterized<P>>::Family: ParameterizedFamily<P::Output>,
     {
         self.place_with_comparison(x, options, ValueComparison::of_session(self)?)
     }
@@ -1502,27 +1498,14 @@ impl Session {
         comparison: Option<&ValueComparison>,
     ) -> Result<<Input as Parameterized<P>>::To<P::Output>, Error>
     where
-        <Input as Parameterized<P>>::Family: ParameterizedFamily<P::Output>
-            + ParameterizedFamily<TargetPlacement>
-            + ParameterizedFamily<SourcePlacement>
-            + ParameterizedFamily<bool>
-            + ParameterizedFamily<Option<bool>>,
-        <MayAlias as Parameterized<Aliasing>>::Family: ParameterizedFamily<Option<bool>>,
+        <Input as Parameterized<P>>::Family: ParameterizedFamily<P::Output>,
     {
         let structure = x.parameter_structure();
         let (target, source, donate, may_alias) = options.into_parts();
-        let target_values =
-            broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(target, &structure, Ok, |prefix, _| Ok(prefix))?;
-        let source_values =
-            broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(source, &structure, Ok, |prefix, _| Ok(prefix))?;
-        let donate_values =
-            broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(donate, &structure, Ok, |prefix, _| Ok(prefix))?;
-        let may_alias_values = broadcast_placement_option::<Input::To<_>, _, _, _, _, _>(
-            may_alias,
-            &structure,
-            |value| Ok(value.into()),
-            Parameterized::try_map_parameters,
-        )?;
+        let target_values = broadcast_placement_option(target, &structure, identity)?;
+        let source_values = broadcast_placement_option(source, &structure, identity)?;
+        let donate_values = broadcast_placement_option(donate, &structure, identity)?;
+        let may_alias_values = broadcast_placement_option(may_alias, &structure, Into::into)?;
 
         // Resolve only requests that reached a leaf. Preserve the targets of the other leaves if a request fails,
         // so distributed admission can still determine whether this call would otherwise communicate.
@@ -1726,6 +1709,60 @@ struct PlacementArgument<P, C = ()> {
     may_alias: Option<bool>,
 }
 
+impl Array {
+    /// Resolves a request against this array for physical placement. An in-place request keeps its mesh and sharding.
+    /// A device request keeps the logical mesh and sharding of a single-device array, with its reduction state
+    /// completed, or gathers a multi-device array onto the canonical single-device mesh. Resolved requests keep
+    /// their mesh and are padded to the rank of the array.
+    pub(super) fn resolve_placement_request(&self, request: PlacementRequest) -> Result<Placement, Error> {
+        validate_parameter_options(ParameterPath::root, Some(&request), None, false, None)?;
+
+        let rank = self.sharding().rank();
+        let memory = request.target_memory();
+        let (mut placement, layout) = match request.padded(rank)? {
+            PlacementRequest::Resolved(placement) => (placement, None),
+            PlacementRequest::Device { device, layout, .. } if self.mesh().devices().len() == 1 => {
+                // Every axis of a single-device mesh has size one, so its reduction state is complete on the target.
+                let mesh = DeviceMesh::new(self.mesh().logical_mesh().clone(), vec![device])?;
+                let sharding = self
+                    .sharding()
+                    .clone()
+                    .with_unreduced_axes(Vec::<String>::new())?
+                    .with_unreduced_kind(UnreducedKind::Sum)?
+                    .with_reduced_axes(Vec::<String>::new())?;
+                (Placement::new(mesh, sharding)?, layout)
+            }
+            PlacementRequest::Device { device, layout, .. } => (single_device_placement(device, rank)?, layout),
+            PlacementRequest::InPlace { layout, .. } => {
+                (Placement::new(self.mesh().clone(), self.sharding().clone())?, layout)
+            }
+        };
+
+        if let Some(layout) = layout {
+            placement = placement.with_layout(layout);
+        }
+
+        if let Some(memory) = memory {
+            placement = placement.with_memory(memory);
+        }
+
+        // Reuse the type rule's rank diagnostic while leaving the remaining checks to the physical placement path,
+        // which supports changes to reduction state that the full type rule would reject.
+        let r#type = self.r#type();
+
+        if placement.sharding().rank() != r#type.rank() {
+            PlaceOperation::infer_output_type_allowing_uneven_splits(
+                &r#type,
+                None,
+                Some(&PlacementRequest::Resolved(placement.clone())),
+                None,
+            )?;
+        }
+
+        Ok(placement)
+    }
+}
+
 /// Places the array inputs bound to the given core placement operations as a group. The core operation requires even
 /// splits and keeps the input client, while the session frontend also admits uneven splits and explicit cross-client
 /// transfers. When the call requires distributed admission, a process whose local check fails still participates
@@ -1884,52 +1921,6 @@ fn admit_and_place_arguments<P: Placeable, C>(
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Resolves a request against an array for physical placement. An in-place request keeps the array's mesh and
-/// sharding. A device request keeps the logical mesh and sharding of a single-device array, with its reduction state
-/// completed, or gathers a multi-device array onto the canonical single-device mesh. Resolved requests keep their
-/// mesh and are padded to the rank of the array.
-pub(super) fn resolve_array_placement(request: PlacementRequest, array: &Array) -> Result<Placement, Error> {
-    validate_parameter_options(ParameterPath::root, Some(&request), None, false, None)?;
-    let rank = array.sharding().rank();
-    let memory = request.target_memory();
-    let (mut placement, layout) = match request.padded(rank)? {
-        PlacementRequest::Resolved(placement) => (placement, None),
-        PlacementRequest::Device { device, layout, .. } if array.mesh().devices().len() == 1 => {
-            // Every axis of a single-device mesh has size one, so its reduction state is complete on the target.
-            let mesh = DeviceMesh::new(array.mesh().logical_mesh().clone(), vec![device])?;
-            let sharding = array
-                .sharding()
-                .clone()
-                .with_unreduced_axes(Vec::<String>::new())?
-                .with_unreduced_kind(UnreducedKind::Sum)?
-                .with_reduced_axes(Vec::<String>::new())?;
-            (Placement::new(mesh, sharding)?, layout)
-        }
-        PlacementRequest::Device { device, layout, .. } => (single_device_placement(device, rank)?, layout),
-        PlacementRequest::InPlace { layout, .. } => {
-            (Placement::new(array.mesh().clone(), array.sharding().clone())?, layout)
-        }
-    };
-    if let Some(layout) = layout {
-        placement = placement.with_layout(layout);
-    }
-    if let Some(memory) = memory {
-        placement = placement.with_memory(memory);
-    }
-    // Reuse the type rule's rank diagnostic while leaving the remaining checks to the physical placement path,
-    // which supports changes to reduction state that the full type rule would reject.
-    let r#type = array.r#type();
-    if placement.sharding().rank() != r#type.rank() {
-        PlaceOperation::infer_output_type_allowing_uneven_splits(
-            &r#type,
-            None,
-            Some(&PlacementRequest::Resolved(placement.clone())),
-            None,
-        )?;
-    }
-    Ok(placement)
-}
-
 /// Returns the replicated placement of a value of rank `rank` over the canonical mesh of one device.
 pub(super) fn single_device_placement(device: Device, rank: usize) -> Result<Placement, Error> {
     let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device])?;
@@ -2007,34 +1998,21 @@ fn with_parameter_path(error: Error, path: impl FnOnce() -> ParameterPath) -> Er
 
 /// Expands an optional placement prefix into its value for each input leaf.
 /// A prefix with one leaf at the root covers the whole input, so it needs no path matching or structure cloning, and
-/// neither it nor an omitted prefix allocates per leaf (refer to [`PlacementOptionValues`]). For other prefixes,
-/// `map_prefix` converts the leaves before broadcasting. Requests and donation flags can use their original
-/// prefixes because their leaves already have the required type.
-fn broadcast_placement_option<
-    Output: Parameterized<Value>,
-    Leaf: Parameter,
-    Value: Clone + Parameter,
-    Prefix: Parameterized<Leaf>,
-    MappedPrefix: Parameterized<Value>,
-    Convert: FnMut(Leaf) -> Result<Value, Error>,
->(
-    prefix: Option<Prefix>,
-    structure: &Output::ParameterStructure,
-    mut convert: Convert,
-    map_prefix: impl FnOnce(Prefix, Convert) -> Result<MappedPrefix, Error>,
+/// neither it nor an omitted prefix allocates per leaf (refer to [`PlacementOptionValues`]). Structured prefixes
+/// use [`Parameterized::broadcast_parameter_values`] to validate every node, including empty containers.
+fn broadcast_placement_option<Leaf: Parameter, Value: Clone>(
+    prefix: Option<impl Parameterized<Leaf>>,
+    structure: &impl Parameterized<Placeholder>,
+    mut convert: impl FnMut(Leaf) -> Value,
 ) -> Result<PlacementOptionValues<Value>, Error> {
     let Some(prefix) = prefix else {
         return Ok(PlacementOptionValues::Uniform(None));
     };
+    // A sole parameter below the root still belongs to a structured prefix, so it needs full tree validation.
     if prefix.parameter_count() == 1 && prefix.named_parameters().next().is_some_and(|(path, _)| path.is_root()) {
-        return Ok(PlacementOptionValues::Uniform(Some(convert(prefix.into_parameters().next().unwrap())?)));
+        return Ok(PlacementOptionValues::Uniform(Some(convert(prefix.into_parameters().next().unwrap()))));
     }
-    Ok(PlacementOptionValues::PerParameter(
-        map_prefix(prefix, convert)?
-            .broadcast_to_parameter_structure::<Output>(structure.clone())?
-            .into_parameters()
-            .collect(),
-    ))
+    Ok(PlacementOptionValues::PerParameter(prefix.broadcast_parameter_values(structure, convert)?))
 }
 
 #[cfg(test)]
@@ -2433,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_array_placement() {
+    fn test_array_resolve_placement_request() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client
@@ -2463,7 +2441,7 @@ mod tests {
         let destination = |device| PlacementRequest::Device { device, memory: Some(memory), layout: None };
         let replicated = Placement::new(mesh.clone(), Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
         assert_eq!(
-            resolve_array_placement(destination(devices[0]), &array).unwrap(),
+            array.resolve_placement_request(destination(devices[0])).unwrap(),
             replicated.clone().with_memory(memory),
         );
         let unreduced = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
@@ -2476,7 +2454,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_array_placement(destination(devices[0]), &unreduced_array).unwrap(),
+            unreduced_array.resolve_placement_request(destination(devices[0])).unwrap(),
             replicated.clone().with_memory(memory),
         );
 
@@ -2493,7 +2471,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_array_placement(destination(devices[1]), &sharded_array).unwrap(),
+            sharded_array.resolve_placement_request(destination(devices[1])).unwrap(),
             Placement::new(other_mesh.clone(), sharding).unwrap().with_memory(memory),
         );
 
@@ -2512,18 +2490,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_array_placement(destination(devices[1]), &split_array).unwrap(),
+            split_array.resolve_placement_request(destination(devices[1])).unwrap(),
             single_device_placement(devices[1], 1).unwrap().with_memory(memory),
         );
 
         // A device target without a memory selects the default memory of its device, as JAX's `device_put` does,
         // whereas a sharding target without a memory selects none, so the array keeps its own memory.
         assert_eq!(
-            resolve_array_placement(devices[0].into(), &array).unwrap(),
+            array.resolve_placement_request(devices[0].into()).unwrap(),
             replicated.clone().with_memory(Memory::Device),
         );
         assert_eq!(
-            resolve_array_placement(devices[1].into(), &array).unwrap(),
+            array.resolve_placement_request(devices[1].into()).unwrap(),
             Placement::new(other_mesh, Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap()
                 .with_memory(Memory::Device),
@@ -2531,13 +2509,13 @@ mod tests {
         let configured = session.with_device_mesh(mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         assert_eq!(
-            resolve_array_placement(configured.placement(sharding).unwrap().into(), &array).unwrap(),
+            array.resolve_placement_request(configured.placement(sharding).unwrap().into()).unwrap(),
             replicated
         );
     }
 
     #[test]
-    fn test_resolve_array_placement_in_place() {
+    fn test_array_resolve_placement_request_in_place() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
@@ -2557,22 +2535,25 @@ mod tests {
         let layout = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
         let placement = Placement::new(mesh.clone(), sharding).unwrap();
         assert_eq!(
-            resolve_array_placement(
-                PlacementRequest::InPlace { memory: Some(memory), layout: Some(layout.clone()) },
-                &array,
-            )
-            .unwrap(),
+            array
+                .resolve_placement_request(PlacementRequest::InPlace {
+                    memory: Some(memory),
+                    layout: Some(layout.clone()),
+                })
+                .unwrap(),
             placement.clone().with_memory(memory).with_layout(layout.clone()),
         );
         assert_eq!(
-            resolve_array_placement(PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) }, &array)
+            array
+                .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: Some(layout.clone()) })
                 .unwrap(),
             placement.with_layout(layout),
         );
 
         // An in-place target that names neither a memory nor a layout changes nothing, so it is rejected.
-        let error =
-            resolve_array_placement(PlacementRequest::InPlace { memory: None, layout: None }, &array).unwrap_err();
+        let error = array
+            .resolve_placement_request(PlacementRequest::InPlace { memory: None, layout: None })
+            .unwrap_err();
         assert!(matches!(&error, Error::Core(error) if matches!(error.as_ref(), CoreError::Type(_))));
         assert_eq!(error.to_string(), "`place` in-place target must name a memory or a layout");
     }
@@ -3954,15 +3935,12 @@ mod tests {
         let array_count = 4_000;
         let input = vec![array.clone(); array_count];
 
-        // An omitted option holds one value for every leaf rather than one per leaf.
+        // Omitted and root options are stored once even when the input has many parameters.
         let structure = input.parameter_structure();
-        let expansion = broadcast_placement_option::<Vec<Option<PlacementRequest>>, _, _, _, _, _>(
-            None::<Option<PlacementRequest>>,
-            &structure,
-            Ok,
-            |prefix, _| Ok(prefix),
-        );
+        let expansion = broadcast_placement_option(None::<PlacementRequest>, &structure, identity);
         assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(None))));
+        let expansion = broadcast_placement_option(Some(false), &structure, Option::from);
+        assert!(matches!(expansion, Ok(PlacementOptionValues::Uniform(Some(Some(false))))));
 
         // Already resident leaves without any option stay where they are.
         let placed = session.place(input.clone(), PlacementOptions::default()).unwrap();
