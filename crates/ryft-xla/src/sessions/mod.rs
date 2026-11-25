@@ -135,8 +135,8 @@ use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
-    Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, Error, FlatProgram, FromPjrt, LiveArray,
-    LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
+    Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, DistributedRuntime, Error, FlatProgram,
+    FromPjrt, LiveArray, LowerableOperation, Operation, Options, ProgramBuilder, RetainedArray, Type, Value,
 };
 
 pub mod effects;
@@ -162,6 +162,12 @@ pub enum SessionError {
 
     #[error("invalid client options: {reason}")]
     InvalidClientOptions { reason: String },
+
+    #[error(
+        "a session of a distributed runtime requires an explicit platform, plugin, or client, \
+         because `Platform::Auto` can select different platforms on different processes"
+    )]
+    UnspecifiedDistributedPlatform,
 
     #[error("session has no device mesh")]
     MissingMesh,
@@ -297,6 +303,7 @@ impl Session {
         SessionBuilder {
             client_source: ClientSource::Platform(Platform::Auto),
             client_options: None,
+            distributed_runtime: None,
             compilation_options: CompilationOptions::default(),
             compilation_cache: CompilationCache::new(),
             disk_cache: None,
@@ -469,6 +476,13 @@ impl Session {
         &self.state.remote_devices
     }
 
+    /// Returns the [`DistributedRuntime`] of the job that this session takes part in, if it was built with one (e.g.,
+    /// using [`SessionBuilder::distributed_runtime`]), for the other coordination protocols of that job.
+    #[inline]
+    pub fn distributed_runtime(&self) -> Option<&DistributedRuntime> {
+        self.state.distributed_runtime.as_ref()
+    }
+
     /// Returns the default [`CompilationOptions`] that every compilation of this [`Session`] forwards to
     /// [`Client::compile`]. Every compilation of the session, including those of eager operations, starts with these
     /// options, unless its [`Options`] supply their own using [`Options::with_compilation_options`]. Lowering then
@@ -565,7 +579,6 @@ impl Session {
         Ok(Placement::new(self.device_mesh()?.clone(), sharding)?)
     }
 
-    // TODO(eaplatanios): Why does this need `addressable_devices`? Can it not get them from `self.addressable_devices`?
     /// Resolves the concrete [`DeviceMesh`] that a value is placed on when its caller names none. A value that is
     /// computed from `inputs` is placed where they live, so the first input's mesh takes precedence over the mesh
     /// configured on this handle. Without either, `logical_mesh` is laid out over addressable devices in enumeration
@@ -574,13 +587,10 @@ impl Session {
     /// [`Zero`], [`One`](ryft_core::One), [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) on sessions without
     /// a configured mesh. [`Array::from_host_buffer`] uses the effective sharding when the caller omits the mesh.
     /// Whether the value is committed to the resolved mesh is decided by [`Self::commits_placement`].
-    /// `addressable_devices` are the addressable devices of the client when the caller has already queried them,
-    /// so that they are queried at most once for one placement, and [`None`] queries them here if they are needed.
     pub(crate) fn device_mesh_for(
         &self,
         inputs: &[Array],
         logical_mesh: Option<&LogicalMesh>,
-        addressable_devices: Option<&[ryft_pjrt::Device<'static>]>,
     ) -> Result<DeviceMesh, ProgramError> {
         // Eager dispatch selects its operand mesh in `Context::bind` and uses the same mesh to key and lower the
         // compiled operation. It only calls this helper when the operands supply no mesh.
@@ -588,14 +598,10 @@ impl Session {
             return Ok(mesh.clone());
         }
 
-        let devices = match addressable_devices {
-            Some(devices) => Cow::Borrowed(devices),
-            None => Cow::Owned(
-                self.client()
-                    .addressable_devices()
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?,
-            ),
-        };
+        let devices = self
+            .client()
+            .addressable_devices()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
 
         if let Some(logical_mesh) = logical_mesh {
             let device_count = logical_mesh.device_count();
@@ -1073,7 +1079,7 @@ impl Session {
                 if operand_meshes().all(|mesh| device_ids(mesh) == first_device_ids) {
                     return Ok(None);
                 }
-                let Ok(mesh) = self.device_mesh_for(&[], None, None) else {
+                let Ok(mesh) = self.device_mesh_for(&[], None) else {
                     return Ok(None);
                 };
                 default_mesh = mesh;
@@ -2334,7 +2340,7 @@ impl Context for Session {
                             output_types.iter().find_map(|r#type| r#type.sharding().map(|sharding| sharding.mesh()));
                         let mesh = match operand_mesh {
                             Some(mesh) => mesh.clone(),
-                            None => self.device_mesh_for(&[], logical_mesh, None)?,
+                            None => self.device_mesh_for(&[], logical_mesh)?,
                         };
                         let options = match (input_shardings, input_placements) {
                             (Some(input_shardings), _) => {
@@ -2555,6 +2561,9 @@ struct SessionState {
     /// Redundant declarations of devices the client already lists still indicate an explicitly declared topology.
     remote_devices: Box<[Device]>,
 
+    /// Distributed runtime of the job that the session takes part in, if it was built with one.
+    distributed_runtime: Option<DistributedRuntime>,
+
     // TODO(eaplatanios): Review this.
     /// Participants and transport of value comparisons, discovered when a placement first needs them.
     comparison_participants: OnceLock<Option<ValueComparison>>,
@@ -2601,6 +2610,10 @@ pub struct SessionBuilder {
 
     /// Options of the [`Client`] that the Ryft XLA backend creates for the session, if the caller supplied any.
     client_options: Option<ClientOptions>,
+
+    /// Distributed runtime of the job that the session takes part in, if any.
+    /// Refer to [`Self::distributed_runtime`] for more information.
+    distributed_runtime: Option<DistributedRuntime>,
 
     /// Template of the options that the session forwards to [`Client::compile`].
     compilation_options: CompilationOptions,
@@ -2665,6 +2678,52 @@ impl SessionBuilder {
     #[inline]
     pub fn client(mut self, client: &'static Client<'static>) -> Self {
         self.client_source = ClientSource::Client(client);
+        self
+    }
+
+    /// Makes the session take part in the distributed job of `runtime`, which is what a process of such a job needs
+    /// to configure beyond its platform. Every process of the job builds its session this way, with the same platform
+    /// or plugin. This setting has three effects:
+    ///
+    ///   - **Client:** The client that the session creates for [`Self::platform`] or [`Self::plugin`] uses the
+    ///     key-value store of `runtime`, which is what lets it take part in cross-host transfers and collectives.
+    ///     It lives for the rest of the process, as does a handle of `runtime`, and sessions that request the same
+    ///     runtime, plugin, and options share it. A platform is required, because [`Platform::Auto`] can select
+    ///     different platforms on different processes.
+    ///   - **Client Options:** The options of that client name the process of `runtime` and, where they have one, its
+    ///     process count (refer to [`DistributedRuntime::create_client`]), so [`Self::client_options`] need not repeat
+    ///     them and must not contradict them.
+    ///   - **Devices:** When the client does not list a device of every process (e.g., a CPU client, which lists only
+    ///     its own devices), every process publishes its devices through `runtime` and the session declares those of
+    ///     the other processes, as [`Self::remote_devices`] does. Building the session then waits until every other
+    ///     process has built its own, for the request timeout of `runtime`. Such a session cannot compare the values
+    ///     of the processes (refer to [`Self::value_comparison`]).
+    ///
+    /// With [`Self::client`], the session uses the client of the caller, which must have been created through
+    /// `runtime` for its process, and only the devices are taken from `runtime`. Sharing compiled programs between the
+    /// processes remains a choice of [`Self::compilation_cache`], which takes the exchange of `runtime` (refer to
+    /// [`DistributedRuntime::compilation_artifact_exchange`]).
+    ///
+    /// # Errors
+    ///
+    /// This function itself cannot fail, but it makes [`Self::build`] return
+    /// [`SessionError::UnspecifiedDistributedPlatform`] without an explicit platform, plugin, or client, and
+    /// [`Error::Pjrt`] if the client options contradict `runtime`, if the client reports another process than
+    /// `runtime` has, or if another process does not publish its devices in time.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use ryft_xla::{DistributedRuntime, Error, Platform, Session};
+    /// # fn build_session(process_count: usize, process_index: usize) -> Result<Session, Error> {
+    /// let plugin = Platform::Cpu.plugin()?;
+    /// let runtime = DistributedRuntime::initialize(&plugin, "10.0.0.1:24680", process_count, process_index)?;
+    /// Session::builder().platform(Platform::Cpu).distributed_runtime(runtime).build()
+    /// # }
+    /// ```
+    #[inline]
+    pub fn distributed_runtime(mut self, runtime: DistributedRuntime) -> Self {
+        self.distributed_runtime = Some(runtime);
         self
     }
 
@@ -2823,10 +2882,20 @@ impl SessionBuilder {
     /// declares. Building a session only from [`Self::client`] and resources that do not read the environment is
     /// infallible when no remote devices are declared.
     pub fn build(self) -> Result<Session, Error> {
+        let runtime = self.distributed_runtime;
         let client: &'static Client<'static> = match (self.client_source, self.client_options) {
-            (ClientSource::Platform(platform), client_options) => platform.client(client_options)?,
+            (ClientSource::Platform(platform), client_options) => match &runtime {
+                None => platform.client(client_options)?,
+                Some(_) if platform == Platform::Auto => {
+                    return Err(SessionError::UnspecifiedDistributedPlatform.into());
+                }
+                Some(runtime) => {
+                    let client_options = client_options.unwrap_or_else(|| platform.client_options());
+                    client_for_plugin(&platform.plugin()?, client_options, Some(runtime))?
+                }
+            },
             (ClientSource::Plugin(plugin), client_options) => {
-                client_for_plugin(&plugin, client_options.unwrap_or_default())?
+                client_for_plugin(&plugin, client_options.unwrap_or_default(), runtime.as_ref())?
             }
             (ClientSource::Client(client), None) => client,
             (ClientSource::Client(_), Some(_)) => {
@@ -2847,16 +2916,21 @@ impl SessionBuilder {
 
         // Keep the declared devices of the other processes sorted by identifier, with repeated declarations removed.
         // A device of this process is not remote, and a declared process must agree with the process that the client
-        // lists for the device and with every other declaration of it.
-        let mut remote_devices = Vec::<Device>::with_capacity(self.remote_devices.len());
-        if !self.remote_devices.is_empty() {
+        // lists for the device and with every other declaration of it. A client of a distributed runtime that does not
+        // list the devices of the other processes learns them from the runtime, and the session declares them beside
+        // the ones that the caller declared.
+        let mut devices = self.remote_devices;
+        if let Some(runtime) = &runtime {
+            devices.extend(runtime.remote_devices(client)?);
+        }
+        let mut remote_devices = Vec::<Device>::with_capacity(devices.len());
+        if !devices.is_empty() {
             let process_index = client.process_index()?;
             let listed_devices = client
                 .devices()?
                 .iter()
                 .map(|device| Ok((device.id()?, device.process_index()?)))
                 .collect::<Result<HashMap<_, _>, PjrtError>>()?;
-            let mut devices = self.remote_devices;
             devices.sort_by_key(Device::id);
             for device in devices {
                 if device.process_index() == process_index {
@@ -2888,6 +2962,7 @@ impl SessionBuilder {
                 host_upload_workers: HostUploadWorkers::default(),
                 value_comparison: self.value_comparison,
                 remote_devices: remote_devices.into_boxed_slice(),
+                distributed_runtime: runtime,
                 comparison_participants: OnceLock::new(),
                 value_comparisons: AtomicU64::new(0),
             }),
@@ -3872,13 +3947,13 @@ pub(crate) mod tests {
         let second_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![wide_mesh.devices()[1]]).unwrap();
 
         // Without inputs, a mesh of the handle, or a logical mesh, the first addressable device forms a mesh.
-        assert_eq!(session.device_mesh_for(&[], None, None), Ok(first_mesh.clone()));
+        assert_eq!(session.device_mesh_for(&[], None), Ok(first_mesh.clone()));
 
         // A logical mesh is laid out over the addressable devices, in the order in which the client reports them.
-        assert_eq!(session.device_mesh_for(&[], Some(wide_mesh.logical_mesh()), None), Ok(wide_mesh.clone()));
+        assert_eq!(session.device_mesh_for(&[], Some(wide_mesh.logical_mesh())), Ok(wide_mesh.clone()));
         let large_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Auto).unwrap()]).unwrap();
         assert_eq!(
-            session.device_mesh_for(&[], Some(&large_mesh), None),
+            session.device_mesh_for(&[], Some(&large_mesh)),
             Err(ProgramError::InvalidArgument {
                 message: format!(
                     "eager XLA placement of a value without array inputs over mesh {large_mesh:?} requires 4 \
@@ -3889,9 +3964,9 @@ pub(crate) mod tests {
 
         // The mesh of the handle takes precedence over a logical mesh, and the mesh of the first input over both.
         let meshed = session.with_device_mesh(second_mesh.clone());
-        assert_eq!(meshed.device_mesh_for(&[], Some(wide_mesh.logical_mesh()), None), Ok(second_mesh));
+        assert_eq!(meshed.device_mesh_for(&[], Some(wide_mesh.logical_mesh())), Ok(second_mesh));
         let input = f32_vector(&session, &first_mesh, &[1.0]);
-        assert_eq!(meshed.device_mesh_for(&[input], Some(wide_mesh.logical_mesh()), None), Ok(first_mesh));
+        assert_eq!(meshed.device_mesh_for(&[input], Some(wide_mesh.logical_mesh())), Ok(first_mesh));
     }
 
     #[test]

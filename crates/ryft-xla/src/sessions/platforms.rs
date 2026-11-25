@@ -5,8 +5,8 @@ use ryft_pjrt::{
     Client, ClientOptions, CpuClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, Plugin, load_cpu_plugin,
 };
 
-use crate::Error;
 use crate::sessions::SessionError;
+use crate::{DistributedRuntime, Error};
 
 /// Platform that a [`Session`](crate::Session) executes on, which selects the PJRT plugin of the client that the Ryft
 /// XLA backend creates for the session. Use [`SessionBuilder::platform`](crate::SessionBuilder::platform) to select a
@@ -96,7 +96,7 @@ impl Platform {
     /// be loaded or initialized or its client cannot be created.
     pub fn client(self, options: Option<ClientOptions>) -> Result<&'static Client<'static>, Error> {
         if self != Self::Auto {
-            return client_for_plugin(&self.plugin()?, options.unwrap_or_else(|| self.client_options()));
+            return client_for_plugin(&self.plugin()?, options.unwrap_or_else(|| self.client_options()), None);
         }
 
         if options.is_some() {
@@ -120,14 +120,15 @@ impl Platform {
         Self::Cpu.client(None)
     }
 
-    /// Loads the PJRT [`Plugin`] that corresponds to this platform. [`Self::Auto`] has no plugin of its own,
-    /// and, in that case, [`Self::client`] resolves it to one of the other platforms instead.
+    /// Loads the PJRT [`Plugin`] that corresponds to this platform (e.g., to initialize a [`DistributedRuntime`] for
+    /// it). [`Self::Auto`] has no plugin of its own, so it loads the plugin of [`Self::Cpu`], and [`Self::client`]
+    /// resolves it to one of the other platforms instead.
     ///
     /// # Errors
     ///
     /// Returns [`SessionError::UnavailablePlatform`] if the feature that provides the plugin is not enabled,
     /// and [`Error::Pjrt`] if the plugin cannot be loaded.
-    fn plugin(self) -> Result<Plugin, Error> {
+    pub fn plugin(self) -> Result<Plugin, Error> {
         match self {
             Self::Auto | Self::Cpu => Ok(load_cpu_plugin()?),
             Self::Cuda => {
@@ -162,7 +163,7 @@ impl Platform {
     /// still the best-fit one, and not [`GpuMemoryAllocator::CudaAsync`], which asks the driver for every buffer. That
     /// costs about 100 microseconds per eager operation and made an eager forward pass of a 1B-parameter Transformer
     /// about five times slower.
-    fn client_options(self) -> ClientOptions {
+    pub(super) fn client_options(self) -> ClientOptions {
         match self {
             Self::Cpu => ClientOptions::CPU(CpuClientOptions::default()),
             Self::Cuda => ClientOptions::GPU(GpuClientOptions {
@@ -202,6 +203,10 @@ struct ProcessClient {
     /// Options that the client was created with.
     options: ClientOptions,
 
+    /// Distributed runtime whose key-value store the client borrows, if it was created through one. The handle is
+    /// never dropped either, because the client borrows it.
+    runtime: Option<&'static DistributedRuntime>,
+
     /// Client, which is never destroyed.
     client: &'static Client<'static>,
 }
@@ -215,13 +220,36 @@ static PROCESS_CLIENTS: Mutex<Vec<ProcessClient>> = Mutex::new(Vec::new());
 /// clients reserving device memory independently. Requests are serialized, so concurrent first requests for one
 /// configuration create a single client.
 ///
+/// With a `runtime`, the client is created through the key-value store of that [`DistributedRuntime`], with `options`
+/// completed by its process coordinates, and it is shared only by requests for the same runtime. A handle of the
+/// runtime then lives for the rest of the process as well.
+///
 /// # Errors
 ///
-/// Returns [`Error::Pjrt`] if the plugin cannot be initialized or the client cannot be created. Neither failure is
-/// retained by this function, so a later request attempts to create the client again.
-pub(super) fn client_for_plugin(plugin: &Plugin, options: ClientOptions) -> Result<&'static Client<'static>, Error> {
+/// Returns [`Error::Pjrt`] if `options` contradict the process coordinates of `runtime`, if the plugin cannot be
+/// initialized, or if the client cannot be created. None of these failures is retained by this function, so a later
+/// request attempts to create the client again.
+pub(super) fn client_for_plugin(
+    plugin: &Plugin,
+    options: ClientOptions,
+    runtime: Option<&DistributedRuntime>,
+) -> Result<&'static Client<'static>, Error> {
+    let options = match runtime {
+        Some(runtime) => runtime.client_options(options)?,
+        None => options,
+    };
+
     let mut clients = PROCESS_CLIENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = clients.iter().find(|existing| existing.plugin == *plugin && existing.options == options) {
+    let shares_runtime = |existing: &ProcessClient| match (existing.runtime, runtime) {
+        (Some(existing), Some(runtime)) => existing.is_same_runtime(runtime),
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    };
+
+    if let Some(existing) = clients
+        .iter()
+        .find(|existing| existing.plugin == *plugin && existing.options == options && shares_runtime(existing))
+    {
         return Ok(existing.client);
     }
 
@@ -229,8 +257,18 @@ pub(super) fn client_for_plugin(plugin: &Plugin, options: ClientOptions) -> Resu
     // than left to panic on the first use of the plugin.
     plugin.initialize()?;
 
-    let client: &'static Client<'static> = Box::leak(Box::new(plugin.client(options.clone())?));
-    clients.push(ProcessClient { plugin: plugin.clone(), options, client });
+    let (runtime, client) = match runtime {
+        Some(runtime) => {
+            // The client borrows the key-value store of the runtime for the rest of the process, so a handle of the
+            // runtime is never dropped, also when creating the client fails.
+            let runtime: &'static DistributedRuntime = Box::leak(Box::new(runtime.clone()));
+            (Some(runtime), runtime.create_client(plugin, options.clone())?)
+        }
+        None => (None, plugin.client(options.clone())?),
+    };
+
+    let client: &'static Client<'static> = Box::leak(Box::new(client));
+    clients.push(ProcessClient { plugin: plugin.clone(), options, runtime, client });
     Ok(client)
 }
 
@@ -302,9 +340,9 @@ mod tests {
         // Clients are keyed by their plugin and options, irrespective of the platform that requested them.
         let plugin = load_cpu_plugin().unwrap();
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(5), ..Default::default() });
-        let client = client_for_plugin(&plugin, options.clone()).unwrap();
+        let client = client_for_plugin(&plugin, options.clone(), None).unwrap();
         assert_eq!(client.addressable_devices().unwrap().len(), 5);
-        assert!(std::ptr::eq(client_for_plugin(&plugin, options.clone()).unwrap(), client));
+        assert!(std::ptr::eq(client_for_plugin(&plugin, options.clone(), None).unwrap(), client));
         assert!(std::ptr::eq(Platform::Cpu.client(Some(options)).unwrap(), client));
     }
 }
