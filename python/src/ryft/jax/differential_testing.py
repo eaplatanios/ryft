@@ -3,9 +3,10 @@
 The Rust side is emitted by `cargo run -p ryft-xla --features differential-testing --bin differential_testing`.
 The JAX side runs in a fresh process so that its selected backend is configured before JAX is imported. Exact
 parity cases compare named values and declared semantic StableHLO contracts. Collective cases additionally compare
-each backend against an independent host reference. The bounded data-dependent case instead
-encodes an explicit capability relation: eager values agree, Ryft stages the bounded result, and pinned JAX rejects
-staging because the result extent depends on traced data.
+each backend against an independent host reference. The bounded data-dependent case checks that eager values agree,
+Ryft stages the bounded result, and pinned JAX rejects staging because the result extent depends on traced data.
+The placement derivative case checks per-framework expectations and reports exact matches, expected Ryft rejections,
+and expected placement differences.
 
 This module intentionally does not import JAX at module load time.
 """
@@ -79,7 +80,7 @@ class CaseComparison:
     differences: tuple[str, ...]
 
     def passed(self) -> bool:
-        """Returns whether the case produced no differences."""
+        """Returns whether all observed behavior satisfied the case's expectations."""
 
         return not self.differences
 
@@ -394,14 +395,14 @@ def compare_case(
 ) -> CaseComparison:
     """Compares one Ryft/JAX record pair according to its declared capability relationship.
 
-    An exact-parity case requires both frameworks to report identical observations, each matching `reference` when one
-    is provided. A `ryft_exceeds_jax` case instead compares the observations that JAX reports, requires Ryft to report
-    them identically, and checks Ryft's additional observations (e.g., results that JAX cannot produce) against
-    `reference`. Its staging observations must match the expected staging of each framework.
+    A `parity` case requires both frameworks to report identical observations, each matching `reference` when one
+    is provided. A `ryft_exceeds_jax` case requires Ryft to match the observations JAX reports and checks Ryft's
+    additional observations (e.g., results that JAX cannot produce) against `reference`. Its staging observations
+    must match the expected staging of each framework.
 
     # Parameters
 
-      - `relationship`: Either `parity` or `ryft_exceeds_jax`.
+      - `relationship`: `parity`, `ryft_exceeds_jax`, or `placement_forward_derivatives`.
       - `collectives`: Collective projection the registry entry expects from both frameworks.
       - `ryft`: Ryft-side observation.
       - `jax`: JAX-side observation.
@@ -428,7 +429,8 @@ def compare_case(
         if not collectives and not stablehlo_patterns and reference is None:
             differences.append("StableHLO: exact-parity case must declare a semantic contract")
         if ryft.stablehlo is None or jax.stablehlo is None:
-            differences.append("StableHLO: exact-parity case requires modules from both frameworks")
+            if collectives or stablehlo_patterns:
+                differences.append("StableHLO: exact-parity case requires modules from both frameworks")
         else:
             if collectives:
                 differences.extend(
@@ -464,6 +466,10 @@ def compare_case(
                 differences.append(f"JAX staging: expected {jax_staging!r} but got {jax.staging!r}")
         if collectives:
             differences.append("StableHLO: a `ryft_exceeds_jax` case does not compare collective projections")
+    elif relationship == "placement_forward_derivatives":
+        from ryft.jax.differential_testing_cases import _validate_placement_forward_derivatives
+
+        differences.extend(_validate_placement_forward_derivatives(ryft, jax))
     else:
         raise ValueError(f"unknown differential relationship '{relationship}'")
     return CaseComparison(case_id=ryft.case_id, differences=tuple(differences))
@@ -876,12 +882,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(error, file=sys.stderr)
         return 1
     for comparison in comparisons:
-        if comparison.passed():
-            print(f"PASS {comparison.case_id}")
-        else:
-            print(f"FAIL {comparison.case_id}")
-            for difference in comparison.differences:
-                print(f"  {difference}")
+        status = "PASS" if comparison.passed() else "FAIL"
+        line = f"{status} {comparison.case_id}"
+        if comparison.case_id == "placement_forward_derivatives" and comparison.passed():
+            line += " (11 exact matches, 9 expected Ryft rejections, 2 expected placement differences)"
+        print(line)
+        for difference in comparison.differences:
+            print(f"  {difference}")
     return 0 if all(comparison.passed() for comparison in comparisons) else 1
 
 

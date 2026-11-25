@@ -30,6 +30,7 @@ from ryft.jax.differential_testing import (
     repo_root,
     run_comparison,
 )
+from ryft.jax.differential_testing_cases import _placement_forward_derivative_references
 
 
 GROUPED_STABLEHLO = "\n".join(
@@ -79,7 +80,7 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(
             [
                 (case.case_id, case.relationship, bool(case.collectives), bool(case.stablehlo_patterns))
-                for case in cases[:9]
+                for case in cases[:10]
             ],
             [
                 ("grouped_shape_changing_collectives", "parity", True, False),
@@ -91,14 +92,15 @@ class DifferentialTestingTest(unittest.TestCase):
                 ("dot_product_attention", "parity", False, True),
                 ("negative_dynamic_slice", "parity", False, True),
                 ("condition_varying_predicate_gradient", "ryft_exceeds_jax", False, False),
+                ("placement_forward_derivatives", "placement_forward_derivatives", False, False),
             ],
         )
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
-        self.assertTrue(cases[9:])
+        self.assertTrue(cases[10:])
         self.assertTrue(all(
             case.reference is not None
             and case.suite in ("collectives", "rematerialization", *differential_testing.CUDA_SUITES)
-            for case in cases[9:]
+            for case in cases[10:]
         ))
         rematerialization_cases = [case for case in cases if case.suite == "rematerialization"]
         self.assertEqual(
@@ -262,6 +264,39 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(len(comparison.differences), 1)
         self.assertTrue(comparison.differences[0].startswith("StableHLO collectives: jax "))
         self.assertIn("!= expected", comparison.differences[0])
+
+    def test_compare_case_parity_uses_an_independent_reference_without_stablehlo(self) -> None:
+        reference = {"output": ((2.0, 4.0), (1.0, 1.0, 0.0))}
+        observation = DifferentialObservation(schema=SCHEMA, case_id="placement", observations=reference)
+        comparison = compare_case("parity", (), observation, observation, reference=reference)
+        self.assertEqual(comparison.differences, ())
+
+    def test_placement_forward_derivative_references(self) -> None:
+        ryft, jax = _placement_forward_derivative_references()
+        self.assertEqual((len(ryft), len(jax)), (22, 22))
+        self.assertEqual(ryft.keys(), jax.keys())
+        self.assertTrue(all(jax.values()))
+        self.assertEqual(
+            {name for name, rows in ryft.items() if not rows},
+            {
+                "add_fused_primal",
+                "add_fused_tangent",
+                "add_saved_committed_tangent",
+                "memory_put_fused_primal",
+                "memory_put_fused_tangent",
+                "memory_put_saved_tangent",
+                "device_put_fused_primal",
+                "device_put_fused_tangent",
+                "device_put_saved_tangent",
+            },
+        )
+        self.assertEqual(
+            {name: rows for name, rows in ryft.items() if rows and rows != jax[name]},
+            {
+                "movable_primal_fused_primal": ((2.0, 4.0), (0.0, 0.0, 0.0)),
+                "stop_gradient_fused_tangent": ((3.0, 4.0), (0.0, 0.0, 0.0)),
+            },
+        )
 
     def test_exact_parity_comparison_rejects_shared_numerical_error(self) -> None:
         observation = grouped_observation()
@@ -495,6 +530,49 @@ class DifferentialTestingTest(unittest.TestCase):
         with redirect_stderr(errors):
             self.assertEqual(main(("--timeout", "0", "--list")), 2)
         self.assertEqual(errors.getvalue(), "--timeout must be positive\n")
+
+    def test_main_reports_placement_outcomes(self) -> None:
+        case_id = "placement_forward_derivatives"
+        ryft_reference, jax_reference = _placement_forward_derivative_references()
+        ryft = DifferentialObservation(schema=SCHEMA, case_id=case_id, observations=ryft_reference)
+        jax = replace(ryft, observations=jax_reference)
+        output = StringIO()
+        with (
+            patch.object(differential_testing, "collect_ryft_observations", return_value=(ryft,)) as collect_ryft,
+            patch.object(differential_testing, "collect_jax_observations", return_value=(jax,)) as collect_jax,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(("--case", case_id)), 0)
+            changed = {**ryft_reference, "add_fused_primal": jax_reference["add_fused_primal"]}
+            collect_ryft.return_value = (replace(ryft, observations=changed),)
+            self.assertEqual(main(("--case", case_id)), 1)
+            collect_ryft.return_value = (ryft,)
+            changed = {**jax_reference, "unexpected": ()}
+            del changed["movable_primal_fused_primal"]
+            collect_jax.return_value = (replace(jax, observations=changed),)
+            self.assertEqual(main(("--case", case_id)), 1)
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                f"PASS {case_id} (11 exact matches, 9 expected Ryft rejections, 2 expected placement differences)",
+                f"FAIL {case_id}",
+                "  Ryft observation 'add_fused_primal': ((2.0, 4.0), (1.0, 1.0, 0.0)) != expected ()",
+                f"FAIL {case_id}",
+                "  JAX observation 'movable_primal_fused_primal': missing",
+                "  JAX observation 'unexpected': unexpected ()",
+            ],
+        )
+
+    def test_main_reports_parity_outcomes(self) -> None:
+        output = StringIO()
+        comparisons = (CaseComparison("pshuffle", ()), CaseComparison("pshuffle", ("unexpected result",)))
+        with (
+            patch.object(differential_testing, "run_comparison", side_effect=[comparisons[:1], comparisons[1:]]),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(("--case", "pshuffle")), 0)
+            self.assertEqual(main(("--case", "pshuffle")), 1)
+        self.assertEqual(output.getvalue(), "PASS pshuffle\nFAIL pshuffle\n  unexpected result\n")
 
     def test_main_subprocess_failure(self) -> None:
         errors = StringIO()

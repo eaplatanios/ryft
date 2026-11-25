@@ -533,6 +533,155 @@ def _build_negative_dynamic_slice(jax: Any, jax_numpy: Any, numpy: Any) -> Diffe
     )
 
 
+def _build_placement_forward_derivatives(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds fused and saved forward derivative values with their single-device placement."""
+
+    devices = jax.devices("cpu")
+    mesh = jax.make_mesh((1,), ("source",), (jax.sharding.AxisType.Explicit,), devices=[devices[1]])
+    source = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    plain_input = jax.device_put(numpy.array([1.0, 2.0], dtype=numpy.float32))
+    input_value = jax.device_put(plain_input, source)
+    tangent_values = numpy.array([3.0, 4.0], dtype=numpy.float32)
+    movable = jax.device_put(tangent_values)
+    committed = jax.device_put(tangent_values, devices[0])
+
+    def add(value: Any) -> Any:
+        return jax_numpy.add(value, value)
+
+    def memory_put(value: Any) -> Any:
+        return jax.device_put(value, jax.memory.Space.Host)
+
+    def device_put(value: Any) -> Any:
+        return add(jax.device_put(value, devices[2]))
+
+    add_committed_rejected = False
+    try:
+        jax.jvp(add, (input_value,), (committed,))
+    except ValueError as error:
+        if "incompatible devices" not in str(error):
+            raise
+        add_committed_rejected = True
+    add_fused_primal, add_fused_tangent = jax.jvp(add, (input_value,), (movable,))
+    add_saved_primal, add_saved = jax.linearize(add, input_value)
+
+    fixed_tangent = jax.device_put(tangent_values, devices[1])
+    movable_fused_primal, movable_fused_tangent = jax.jvp(add, (plain_input,), (fixed_tangent,))
+    movable_saved_primal, movable_saved = jax.linearize(add, plain_input)
+
+    def anchored_sum(fixed: Any, value: Any) -> Any:
+        return jax.lax.stop_gradient(fixed) + value
+
+    anchored = (jax.device_put(plain_input, devices[1]), plain_input)
+    tangents = (jax.device_put(tangent_values, devices[2]), movable)
+    anchor_fused_primal, anchor_fused_tangent = jax.jvp(anchored_sum, anchored, tangents)
+    anchor_saved_primal, anchor_saved = jax.linearize(anchored_sum, *anchored)
+
+    memory_fused_primal, memory_fused_tangent = jax.jvp(memory_put, (input_value,), (movable,))
+    memory_saved_primal, memory_saved = jax.linearize(memory_put, input_value)
+    device_fused_primal, device_fused_tangent = jax.jvp(device_put, (memory_fused_primal,), (memory_fused_tangent,))
+    device_saved_primal, device_saved = jax.linearize(device_put, memory_fused_primal)
+    arrays = {
+        "add_fused_primal": add_fused_primal,
+        "add_fused_tangent": add_fused_tangent,
+        "add_saved_primal": add_saved_primal,
+        "add_saved_movable_tangent": add_saved(movable),
+        "add_saved_committed_tangent": add_saved(committed),
+        "movable_primal_fused_primal": movable_fused_primal,
+        "movable_primal_fused_tangent": movable_fused_tangent,
+        "movable_primal_saved_primal": movable_saved_primal,
+        "movable_primal_saved_tangent": movable_saved(fixed_tangent),
+        "stop_gradient_fused_primal": anchor_fused_primal,
+        "stop_gradient_fused_tangent": anchor_fused_tangent,
+        "stop_gradient_saved_primal": anchor_saved_primal,
+        "stop_gradient_saved_tangent": anchor_saved(*tangents),
+        "memory_put_fused_primal": memory_fused_primal,
+        "memory_put_fused_tangent": memory_fused_tangent,
+        "memory_put_saved_primal": memory_saved_primal,
+        "memory_put_saved_tangent": memory_saved(movable),
+        "device_put_fused_primal": device_fused_primal,
+        "device_put_fused_tangent": device_fused_tangent,
+        "device_put_saved_primal": device_saved_primal,
+        "device_put_saved_tangent": device_saved(memory_fused_tangent),
+    }
+    memory_kinds = {"device": 0.0, "pinned_host": 1.0, "unpinned_host": 2.0}
+    observations = {"add_fused_committed_rejected": ((float(add_committed_rejected),),)}
+    for name, array in arrays.items():
+        device, = array.devices()
+        placement = (float(device.id), float(array.committed), memory_kinds[array.sharding.memory_kind])
+        observations[name] = (*_single_observation_values(array, numpy), placement)
+    return DifferentialObservation(schema=SCHEMA, case_id="placement_forward_derivatives", observations=observations)
+
+
+def _placement_forward_derivative_references() -> tuple[
+    dict[str, tuple[tuple[float, ...], ...]], dict[str, tuple[tuple[float, ...], ...]],
+]:
+    """Returns expected Ryft and JAX observations, including single-device placement and checked rejections."""
+
+    doubled_primal = (2.0, 4.0)
+    doubled_tangent = (6.0, 8.0)
+    movable = (0.0, 0.0, 0.0)
+    committed_source = (1.0, 1.0, 0.0)
+    committed_destination = (2.0, 1.0, 0.0)
+    # Placement records the device ID, commitment, and memory kind. None shares the JAX rows, an empty tuple
+    # records a checked Ryft rejection, and a singleton tuple replaces only the placement row.
+    rows = {
+        "add_fused_committed_rejected": (((1.0,),), None),
+        "add_fused_primal": ((doubled_primal, committed_source), ()),
+        "add_fused_tangent": ((doubled_tangent, committed_source), ()),
+        "add_saved_primal": ((doubled_primal, committed_source), None),
+        "add_saved_movable_tangent": ((doubled_tangent, movable), None),
+        "add_saved_committed_tangent": ((doubled_tangent, (0.0, 1.0, 0.0)), ()),
+        "movable_primal_fused_primal": ((doubled_primal, committed_source), (movable,)),
+        "movable_primal_fused_tangent": ((doubled_tangent, committed_source), None),
+        "movable_primal_saved_primal": ((doubled_primal, movable), None),
+        "movable_primal_saved_tangent": ((doubled_tangent, committed_source), None),
+        "stop_gradient_fused_primal": ((doubled_primal, committed_source), None),
+        "stop_gradient_fused_tangent": (((3.0, 4.0), committed_source), (movable,)),
+        "stop_gradient_saved_primal": ((doubled_primal, committed_source), None),
+        "stop_gradient_saved_tangent": (((3.0, 4.0), movable), None),
+        "memory_put_fused_primal": (((1.0, 2.0), (1.0, 1.0, 1.0)), ()),
+        "memory_put_fused_tangent": (((3.0, 4.0), (0.0, 1.0, 1.0)), ()),
+        "memory_put_saved_primal": (((1.0, 2.0), (1.0, 1.0, 1.0)), None),
+        "memory_put_saved_tangent": (((3.0, 4.0), (0.0, 1.0, 1.0)), ()),
+        "device_put_fused_primal": ((doubled_primal, committed_destination), ()),
+        "device_put_fused_tangent": ((doubled_tangent, committed_destination), ()),
+        "device_put_saved_primal": ((doubled_primal, committed_destination), None),
+        "device_put_saved_tangent": ((doubled_tangent, committed_destination), ()),
+    }
+    ryft_reference = {}
+    jax_reference = {}
+    for name, (jax_rows, ryft_placement) in rows.items():
+        jax_reference[name] = jax_rows
+        if ryft_placement is None:
+            ryft_reference[name] = jax_rows
+        else:
+            ryft_reference[name] = jax_rows[:1] + ryft_placement if ryft_placement else ()
+    return ryft_reference, jax_reference
+
+
+def _validate_placement_forward_derivatives(
+    ryft: DifferentialObservation, jax: DifferentialObservation,
+) -> tuple[str, ...]:
+    """Checks every placement derivative observation against its framework's expected result."""
+
+    ryft_reference, jax_reference = _placement_forward_derivative_references()
+    differences = []
+    for side, observations, expected in (
+        ("Ryft", ryft.observations, ryft_reference), ("JAX", jax.observations, jax_reference),
+    ):
+        for name in sorted(observations.keys() | expected.keys()):
+            prefix = f"{side} observation '{name}'"
+            if name not in expected:
+                differences.append(f"{prefix}: unexpected {observations[name]!r}")
+            elif name not in observations:
+                differences.append(f"{prefix}: missing")
+            elif observations[name] != expected[name]:
+                differences.append(f"{prefix}: {observations[name]!r} != expected {expected[name]!r}")
+    if ryft.staging != jax.staging:
+        differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
+    return tuple(differences)
+
+
 DIFFERENTIAL_CASES = (
     DifferentialCase(
         "grouped_shape_changing_collectives",
@@ -605,6 +754,11 @@ DIFFERENTIAL_CASES = (
         validate=_validate_condition_varying_predicate_gradient,
         ryft_staging=StagingObservation(status="supported", output_type="f32[1]"),
         jax_staging=StagingObservation(status="unsafe", category="collective_inside_branch"),
+    ),
+    DifferentialCase(
+        "placement_forward_derivatives",
+        "placement_forward_derivatives",
+        _build_placement_forward_derivatives,
     ),
 )
 

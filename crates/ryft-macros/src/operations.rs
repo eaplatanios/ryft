@@ -1330,23 +1330,6 @@ impl OperationCodeGenerator {
             #ryft::Tracer<#ryft::TracingContext<#value_type, #self_type>>
         };
 
-        let placement_arms = self.variants.iter().map(|variant| {
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            match &variant.class {
-                OperationVariantClass::FamilyNative => variant.arm(quote! {
-                    <#payload_type as #ryft::TransposableOperation<#value_type, #self_type>>::
-                        accepts_unaligned_derivative_input(#receiver, input_index)
-                }),
-                OperationVariantClass::ProjectedMember { structural: false, .. } => variant.arm(quote! {
-                    <#payload_type as #ryft::MemberTransposableOperation<#value_type, #self_type>>::
-                        accepts_unaligned_derivative_input(#receiver, input_index)
-                }),
-                // A mixed member's projected inputs need not have the same positions as the parent's inputs.
-                _ => variant.wildcard_arm(quote!(false)),
-            }
-        });
-
         let (impl_generics, _, where_clause) = generics.split_for_impl();
 
         quote! {
@@ -1362,12 +1345,6 @@ impl OperationCodeGenerator {
                     accumulators: &[#ryft::CotangentAccumulator],
                 ) -> ::std::result::Result<(), #ryft::DifferentiationError> {
                     match self { #(#arms)* }
-                }
-
-                #[inline]
-                fn accepts_unaligned_derivative_input(&self, input_index: usize) -> bool {
-                    let _ = input_index;
-                    match self { #(#placement_arms)* }
                 }
             }
         }
@@ -4371,27 +4348,6 @@ mod tests {
                             Self::Gather(operation) => {
                                 context.transpose_mixed_operation(operation, inputs, outputs, accumulators)
                             },
-                        }
-                    }
-
-                    #[inline]
-                    fn accepts_unaligned_derivative_input(&self, input_index: usize) -> bool {
-                        let _ = input_index;
-                        match self {
-                            Self::Add(operation) => {
-                                <AddOperation<ArrayIrType> as ryft::TransposableOperation<
-                                    __TranspositionValue,
-                                    Operation<A>,
-                                >>::accepts_unaligned_derivative_input(operation, input_index)
-                            },
-                            Self::Array(operation) => {
-                                <ArrayOperation<A> as ryft::MemberTransposableOperation<
-                                    __TranspositionValue,
-                                    Operation<A>,
-                                >>::accepts_unaligned_derivative_input(&**operation, input_index)
-                            },
-                            Self::Dimension(..) => { false },
-                            Self::Gather(..) => { false },
                         }
                     }
                 }

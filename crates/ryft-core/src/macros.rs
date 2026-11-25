@@ -1986,8 +1986,8 @@ macro_rules! impl_differentiable_operation {
         $crate::impl_non_transposable_operation!($operation);
     };
 
-    // This internal helper begins collecting an explicitly bounded transposition rule while retaining the complete
-    // normalized JVP. The transposition body supplies the unambiguous end marker for its predicates.
+    // This internal helper emits the complete JVP before collecting the transposition predicates.
+    // The transposition body supplies the unambiguous end marker for its predicates.
     (
         @jvp_ready [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
@@ -1996,10 +1996,17 @@ macro_rules! impl_differentiable_operation {
         $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
+            @impl_jvp
+            impl<$context $(, $generic)*> $operation
+            where { $($jvp_bounds)* }
+            |$self, $jvp_context, $jvp_driver, $inputs| {
+                $jvp_body
+            }
+        }
+
+        $crate::impl_differentiable_operation! {
             @collect_transpose_where
-            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [] $($tail)*
+            [$($generic),*] [$operation] [$value] [$operations] [] $($tail)*
         }
     };
 
@@ -2042,12 +2049,10 @@ macro_rules! impl_differentiable_operation {
         }
     };
 
-    // This internal helper ends transposition bound collection and emits the retained JVP and transposition rules.
+    // This internal helper ends transposition bound collection and emits the transposition rule.
     (
         @collect_transpose_where
-        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        [$($generic:ident),*] [$operation:ty] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         {
             |
                 $transpose_self:ident,
@@ -2058,15 +2063,6 @@ macro_rules! impl_differentiable_operation {
                 $accumulators:ident
             | $transpose_body:block } $(,)?
     ) => {
-        $crate::impl_differentiable_operation! {
-            @impl_jvp
-            impl<$context $(, $generic)*> $operation
-            where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| {
-                $jvp_body
-            }
-        }
-
         $crate::impl_differentiable_operation! {
             @impl_transpose
             impl<$value, $operations $(, $generic)*> $operation
@@ -2087,16 +2083,12 @@ macro_rules! impl_differentiable_operation {
     // the four-token arm below advance without ever consuming the body as a predicate token.
     (
         @collect_transpose_where
-        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        [$($generic:ident),*] [$operation:ty] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $first:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_transpose_where
-            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [$($transpose_bounds)* $first] { $($body)* } $($tail)*
+            [$($generic),*] [$operation] [$value] [$operations] [$($transpose_bounds)* $first] { $($body)* } $($tail)*
         }
     };
 
@@ -2105,16 +2097,12 @@ macro_rules! impl_differentiable_operation {
     // the four-token arm below advance without ever consuming the body as a predicate token.
     (
         @collect_transpose_where
-        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        [$($generic:ident),*] [$operation:ty] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $first:tt $second:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_transpose_where
-            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [$($transpose_bounds)* $first $second] { $($body)* } $($tail)*
+            [$($generic),*] [$operation] [$value] [$operations] [$($transpose_bounds)* $first $second] { $($body)* } $($tail)*
         }
     };
 
@@ -2123,16 +2111,12 @@ macro_rules! impl_differentiable_operation {
     // the four-token arm below advance without ever consuming the body as a predicate token.
     (
         @collect_transpose_where
-        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        [$($generic:ident),*] [$operation:ty] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $first:tt $second:tt $third:tt { $($body:tt)* } $($tail:tt)*
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_transpose_where
-            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [$($transpose_bounds)* $first $second $third] { $($body)* } $($tail)*
+            [$($generic),*] [$operation] [$value] [$operations] [$($transpose_bounds)* $first $second $third] { $($body)* } $($tail)*
         }
     };
 
@@ -2141,16 +2125,12 @@ macro_rules! impl_differentiable_operation {
     // and the look-ahead arms above guarantee that the rule body is never consumed as a predicate token.
     (
         @collect_transpose_where
-        [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
-        [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
-        [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
+        [$($generic:ident),*] [$operation:ty] [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
         $first:tt $second:tt $third:tt $fourth:tt $($rest:tt)+
     ) => {
         $crate::impl_differentiable_operation! {
             @collect_transpose_where
-            [$($generic),*] [$context] [$operation] [$($jvp_bounds)*]
-            [$self] [$jvp_context] [$jvp_driver] [$inputs] [$jvp_body]
-            [$value] [$operations] [$($transpose_bounds)* $first $second $third $fourth] $($rest)*
+            [$($generic),*] [$operation] [$value] [$operations] [$($transpose_bounds)* $first $second $third $fourth] $($rest)*
         }
     };
 

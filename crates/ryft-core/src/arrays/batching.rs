@@ -1375,6 +1375,15 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
     }
 
     #[inline]
+    fn unbatched_relocatable_type(batch: &Self::Batch) -> Option<ArrayIrType> {
+        // Only array members can be free to be placed elsewhere. References and dimensions have no relocatable type.
+        match batch.value().relocatable_type()? {
+            ArrayIrType::Array(r#type) => Some(r#type.unbatched(batch.batch_axis()).ok()?.into()),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+        }
+    }
+
+    #[inline]
     fn boundary_inputs(axis_extent: &Self::Extent) -> Vec<C::Value> {
         // The adapted program's leading input still defines the `DimensionVariable` referenced by every inserted
         // dynamic batch dimension, so the first-class mapped extent value must become its matching program input.
@@ -1997,6 +2006,11 @@ where
         let unbatched_type = <ArrayIrBatchingPolicy as BatchingPolicy<C>>::unbatched_type(self.batch());
         let r#type = <&T>::try_from(unbatched_type.as_ref())?.clone();
         Ok(ProjectedValue::new(self, r#type))
+    }
+
+    #[inline]
+    fn projected_relocatable_type(&self) -> Option<T> {
+        <&T>::try_from(&self.relocatable_type()?).ok().cloned()
     }
 }
 

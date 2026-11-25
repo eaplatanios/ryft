@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::broadcasting::Broadcastable;
-use crate::arrays::sharding::meshes::{DeviceMesh, MeshAxisType};
+use crate::arrays::sharding::meshes::{DeviceMesh, LogicalMesh, MeshAxisType};
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension, UnreducedKind};
 use crate::arrays::sharding::{ShardableType, ShardingError};
 use crate::arrays::types::data::DataType;
@@ -151,7 +151,9 @@ impl ArrayType {
     /// Array types record placement over explicit and manual mesh axes only. The partitioner owns placement over auto
     /// mesh axes, so a type cannot promise it: placement over auto axes is either a compiler constraint (i.e.,
     /// [`ConstrainSharding`](crate::ConstrainSharding)) or runtime metadata of a concrete array. Code that
-    /// derives a type from such a placement uses [`Sharding::without_auto_axes`] explicitly.
+    /// derives a type from such a placement uses [`Sharding::without_auto_axes`] explicitly. After validation,
+    /// this function omits sharding over [`LogicalMesh::single_device`]. Other singleton descriptors, including a
+    /// mesh with zero axes, retain their topology in the type.
     #[inline]
     pub fn with_sharding<S: Into<Option<Sharding>>>(self, sharding: S) -> Result<Self, ShardingError> {
         let sharding = sharding.into();
@@ -163,6 +165,9 @@ impl ArrayType {
             }
             if sharding.references_auto_axis() {
                 return Err(ShardingError::AutoAxisInArrayType { sharding: sharding.clone() });
+            }
+            if sharding.mesh() == &LogicalMesh::single_device() {
+                return Ok(self.with_sharding_unchecked(None));
             }
         }
         Ok(self.with_sharding_unchecked(sharding))
@@ -333,7 +338,8 @@ impl ArrayType {
         self.payload.layout.as_ref()
     }
 
-    /// Returns [`Sharding`] information about the array if it is known.
+    /// Returns the [`Sharding`] tracked by this type, if any. A concrete array on [`LogicalMesh::single_device`]
+    /// has no type sharding. Its placement is available through [`Placed`](crate::Placed) when supported by the value.
     #[inline]
     pub fn sharding(&self) -> Option<&Sharding> {
         self.payload.sharding.as_ref()
@@ -550,23 +556,20 @@ impl ArrayType {
     /// sharding of its target or the concrete sharding of its input), so that a type that one of them accepts is
     /// accepted by the others. A value without `sharding` has one shard, which is the whole value.
     ///
-    /// A tiled layout is a permutation of the dimensions with tiles, which is valid for every shape of its rank, so it
-    /// is validated against the shape of the value. A strided layout holds byte strides that must keep the elements of
-    /// a shard apart, and strides that overlap the elements of a shard also overlap those of every larger shard, so it
-    /// is validated against the largest shard (i.e., the first shard along each dimension, which holds the ceiling of
-    /// its extent divided by the number of shards along it, also when that number does not divide it). An unconstrained
-    /// dimension (i.e., `{?}`) is stored replicated (refer to [`ShardingDimension::Unconstrained`]), so its shards have
-    /// its whole extent, as for a replicated dimension. A dynamic extent is replaced by its lower bound, so a layout is
+    /// A tiled layout must be a valid permutation with tiles, and a strided layout must keep the elements of a shard
+    /// apart. Both checks also verify that the shard's physical size is representable. The check uses the largest
+    /// shard (i.e., the first shard along each dimension, which holds the ceiling of its extent divided by the number
+    /// of shards along it, also when that number does not divide it), when the sharding determines its shape. An
+    /// unconstrained dimension (i.e., `{?}`) is stored replicated (refer to [`ShardingDimension::Unconstrained`]),
+    /// so each shard has its whole extent. A dynamic extent is replaced by its lower bound, so a layout is
     /// rejected when it overlaps the elements of a shard for every extent that the bounds permit (e.g., a zero stride
     /// of an `f32[n]` with `2 <= n <= 8`), and accepted when it only overlaps those of larger extents (e.g., a zero
     /// stride of an `f32[n]` with `1 <= n <= 8`), which the backend that places a concrete value validates against the
     /// shards that it creates. The shards are only determined when `sharding` describes every mesh axis, which
     /// `is_complete` states (e.g., the runtime sharding of a concrete value), or when its mesh has no
     /// [`MeshAxisType::Auto`] axis larger than one, along which a value may be split without its type recording it.
-    /// Otherwise, only the rank of a strided layout is validated here. A `sharding` of another rank than this type
-    /// describes no shards of it, so it is rejected for every layout rather than falling back to that rank check
-    /// (callers such as the type rule of [`PlaceOperation`](crate::PlaceOperation) validate the rank of a requested
-    /// sharding themselves, and this function does not rely on them).
+    /// Otherwise, a tiled layout is checked against the global shape and a strided layout is checked for rank.
+    /// A `sharding` must have the rank of this type for every layout.
     ///
     /// # Errors
     ///
@@ -590,14 +593,14 @@ impl ArrayType {
         }
 
         let shard_shape = match (layout, sharding) {
-            (Layout::Tiled(_), _) | (_, None) => Some(self.shape().clone()),
-            (Layout::Strided(_), Some(sharding)) => {
-                let is_determined = is_complete
+            (_, Some(sharding))
+                if is_complete
                     || sharding
                         .mesh()
                         .axes()
                         .iter()
-                        .all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1);
+                        .all(|axis| axis.r#type() != MeshAxisType::Auto || axis.size() == 1) =>
+            {
                 let dimensions = self
                     .shape()
                     .dimensions()
@@ -608,8 +611,7 @@ impl ArrayType {
                         Dimension::Static(match sharding_dimension {
                             ShardingDimension::Replicated | ShardingDimension::Unconstrained => extent,
                             ShardingDimension::Sharded(axis_names) => {
-                                // The product is over distinct axes of one mesh, so it never exceeds the device count
-                                // of that mesh, which fits `usize`, and it is at least one.
+                                // The product over distinct axes is bounded by the mesh's device count.
                                 let count = axis_names
                                     .iter()
                                     .filter_map(|name| sharding.mesh().axis_size(name))
@@ -619,8 +621,10 @@ impl ArrayType {
                         })
                     })
                     .collect::<Vec<_>>();
-                is_determined.then(|| Shape::new(dimensions))
+                Some(Shape::new(dimensions))
             }
+            (Layout::Tiled(_), _) | (_, None) => Some(self.shape().clone()),
+            (Layout::Strided(_), Some(_)) => None,
         };
 
         match (layout, shard_shape) {
@@ -2085,6 +2089,19 @@ mod tests {
         assert_eq!(matrix.validate_shard_layout(&strided(vec![4, 8]), Some(&columns), false), overlap(8, 1, 16));
         let tiled = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         assert_eq!(matrix.validate_shard_layout(&tiled, Some(&columns), false), Ok(()));
+
+        // The largest shard can fit in addressable storage even when an unsharded tiled array would overflow.
+        let tiles = Layout::Tiled(TiledLayout::new(vec![0], vec![]));
+        let large_vector = ArrayType::new_static(F32, [usize::MAX / 4 + 1]);
+        let split_vector = split(&explicit, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(large_vector.validate_shard_layout(&tiles, Some(&split_vector), true), Ok(()));
+        assert_eq!(
+            large_vector.validate_shard_layout(&tiles, None, true),
+            Err(TypeError::invalid(format!(
+                "array type `{}` requires more bytes than can be represented",
+                large_vector.with_layout(tiles),
+            ))),
+        );
 
         // An uneven split is validated against its largest shard, which is the first one (e.g., two of the three
         // elements of an `f32[3]` over two devices).

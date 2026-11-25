@@ -174,16 +174,18 @@ impl LogicalMesh {
     /// Returns the canonical [`LogicalMesh`] of a single device, which has one [`MeshAxisType::Auto`] axis
     /// named `device` of size 1. A value that is gathered from several devices onto one device (e.g., by a
     /// [`PlaceOperation`](crate::PlaceOperation) with a [`PlacementRequest::Device`](crate::PlacementRequest::Device)
-    /// target) lives on this mesh, replicated, so that the type that a staged placement infers for it and the
-    /// placement that a backend gives it when the placement executes agree. Backends also give this mesh to a value
-    /// that they place without a configured mesh (e.g., a host value that is uploaded without one), so that such a
-    /// value combines with a gathered value on the same device. Types name their logical mesh, so a value on another
-    /// mesh of one device (e.g., one with an explicit axis named `x`) does not combine with values on this one.
+    /// target) lives on this mesh at runtime. Backends also use this mesh for a value that they place
+    /// on a device without a configured mesh (e.g., a host value uploaded to the default device). An
+    /// [`ArrayType`](crate::ArrayType) derived from either placement carries no sharding. A named
+    /// mesh can carry sharding information even when it contains a single device.
     #[inline]
     pub fn single_device() -> Self {
         // The only axis has a valid name and size, and a mesh with one axis has neither duplicate axis names
         // nor a device count that overflows.
-        Self::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap()
+        static SINGLE_DEVICE: OnceLock<LogicalMesh> = OnceLock::new();
+        SINGLE_DEVICE
+            .get_or_init(|| Self::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto).unwrap()]).unwrap())
+            .clone()
     }
 
     /// Returns this [`LogicalMesh`] with the axes named `axis_names` retyped as `r#type`, keeping the names, sizes, and

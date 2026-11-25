@@ -84,6 +84,14 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
         EagerContext::new()
     }
 
+    #[inline]
+    fn relocatable_type(&self) -> Option<ArrayIrType> {
+        match self {
+            Self::Array(value) => value.relocatable_type().map(ArrayIrType::Array),
+            Self::Dimension(_) | Self::Reference(_) => None,
+        }
+    }
+
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,

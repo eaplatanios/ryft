@@ -13137,15 +13137,15 @@ mod tests {
                 ),
             ));
 
-            // The pullback accepts seeds at the concrete outputs' sharding even when its program uses the joined
-            // declaration. Seed each output independently to check every consumer's contribution.
+            // The pullback accepts seeds at the concrete outputs' sharding and at the alternate placement allowed by
+            // the joined declaration. Seed each output independently to check every consumer's contribution.
             let (_, pullback) = context.differentiate_at(at.clone()).vjp(consumers).unwrap();
             assert_eq!(pullback.linear_program().output_types(), vec![declared_type.clone(); 3]);
             let cotangent_type = concrete_type.cotangent().unwrap();
             let one = Array::from_elements(cotangent_type.clone(), &[1.0f64]).unwrap();
             let zero = Array::from_elements(cotangent_type.clone(), &[0.0f64]).unwrap();
-            let mismatched_type = if cotangent_type.sharding().is_some() { declared_type } else { placed_type.clone() };
-            let mismatched = Array::from_elements(mismatched_type.clone(), &[1.0f64]).unwrap();
+            let alternate_type = if cotangent_type.sharding().is_some() { &declared_type } else { &placed_type };
+            let alternate = Array::from_elements(alternate_type.clone(), &[1.0f64]).unwrap();
             let apply = |[sum, square, sine]: [Array; 3]| pullback.apply((sum, square, sine));
             for (index, expected) in derivatives.into_iter().enumerate() {
                 let mut seeds = std::array::from_fn(|_| zero.clone());
@@ -13154,13 +13154,16 @@ mod tests {
                 let actual = Concretizable::<f64>::concretize(cotangent.as_value().unwrap()).unwrap();
                 assert!((actual - expected).abs() < 1e-12, "output {index}: expected {expected}, got {actual}");
 
-                seeds[index] = mismatched.clone();
-                assert!(matches!(
-                    apply(seeds),
-                    Err(ProgramError::MalformedProgram(message)) if message == format!(
-                        "pullback cotangent {index} has type {mismatched_type} but its primal boundary requires cotangent type {cotangent_type}",
-                    ),
-                ));
+                seeds[index] = alternate.clone();
+                let cotangent = apply(seeds).unwrap();
+                let value = cotangent.as_value().unwrap();
+
+                // The sum passes through the seed's placement. The nonlinear rules can also inherit the saved
+                // coefficient's placement, so at least one factor carries the automatic mesh.
+                let expected_type = if index == 0 { alternate_type } else { &placed_type };
+                assert_eq!(value.r#type().as_ref(), expected_type);
+                let actual = Concretizable::<f64>::concretize(value).unwrap();
+                assert!((actual - expected).abs() < 1e-12, "output {index}: expected {expected}, got {actual}");
             }
             check_gradient!(
                 |input| stage_runtime_predicate_condition(input, branches.clone()),

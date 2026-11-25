@@ -1079,9 +1079,9 @@ pub trait Parameterized<P: Parameter>: Sized {
     ///
     /// Map keys are identified by their [`Debug`] texts (refer to [`ParameterPathSegment::Key`]), and so the last rule
     /// requires distinct keys of one map to have distinct [`Debug`] texts, unless a leaf of this value above that map
-    /// covers all of its entries. For instance, the entries of two keys that both print `[private]` share the path
-    /// `$[[private]]`, and an option map with one value for each of them would otherwise give one of the values to
-    /// both entries.
+    /// covers all of its entries. In maps reached by the prefix, callers must also ensure that corresponding keys have
+    /// the same [`Debug`] text and that different keys across the two maps have different texts. Duplicate paths can be
+    /// detected within a tree, but different keys with the same text in separate trees match the same path.
     ///
     /// Nodes are matched by their paths only, which is intended. This value may therefore have another type than `T`
     /// whose nodes have the same paths (e.g., a derived struct with the same parameter fields as `T`, or an array for
@@ -3665,6 +3665,17 @@ mod tests {
         assert_eq!(
             vec![Vec::<i32>::new()].broadcast_to_parameter_structure::<[Vec<i32>; 1]>([Vec::new()]),
             Ok([Vec::new()]),
+        );
+    }
+
+    #[test]
+    fn test_parameterized_broadcast_to_parameter_structure_with_borrowed_map_keys() {
+        let key = String::from("borrowed");
+        let prefix = BTreeMap::from([(key.clone(), 7_i32)]);
+        let target = BTreeMap::from([(key.as_str(), vec![Placeholder; 2])]);
+        assert_eq!(
+            prefix.broadcast_to_parameter_structure::<BTreeMap<&str, Vec<i32>>>(target),
+            Ok(BTreeMap::from([(key.as_str(), vec![7; 2])])),
         );
     }
 
