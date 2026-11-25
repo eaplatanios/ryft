@@ -73,38 +73,33 @@ const ARTIFACT_EXCHANGE_SCHEMA_VERSION: u32 = 1;
 /// Key-value store key under which the coordinator publishes the launch identity.
 const LAUNCH_ID_KEY: &[u8] = b"ryft/distributed-launch/v1/id";
 
-// TODO(eaplatanios): Review from here onwards,
-
-/// Handle of one process on the coordination service of a distributed `ryft-xla` job. Refer to the
-/// [module documentation](self) for the lifecycle of a job.
-///
-/// The handle owns the [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient) of its process, wrapped in a
+/// Handle of one process on the coordination service of a distributed Ryft XLA job. Refer to
+/// the [module documentation](self) for the lifecycle of a distributed job. The handle owns the
+/// [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient) of its process, wrapped in a
 /// [`DistributedKeyValueStore`], and, on the coordinator only, the [`DistributedRuntimeService`] that hosts the
 /// coordination state of every process. Clones share that state, which is released when the last of them is dropped.
-///
 /// A PJRT [`Client`] that [`Self::create_client`] returns borrows the key-value store of the handle, so the handle
-/// must outlive it. [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime) takes care of
-/// that for the client of a [`Session`](crate::Session), which lives for the rest of the process.
+/// must outlive it. [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime) takes care
+/// of that for the client of a [`Session`](crate::Session), which lives for the rest of the process.
 #[derive(Clone)]
 pub struct DistributedRuntime {
     state: Arc<DistributedRuntimeState>,
 }
 
 impl DistributedRuntime {
-    /// Initializes the [`DistributedRuntime`] of one process of a job, as `jax.distributed.initialize` does. Every
-    /// process of the job must call this function with the same `coordinator_address` and `process_count` and with its
-    /// own `process_index`. Process 0 is the coordinator, so it hosts the [`DistributedRuntimeService`] in addition to
-    /// its own [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient). The call blocks until every process
-    /// has connected.
+    /// Initializes the [`DistributedRuntime`] of one process of a distributed job. Every process of the job must call
+    /// this function with the same `coordinator_address` and `process_count` and with its own `process_index`. Process
+    /// 0 is the coordinator, so it hosts the [`DistributedRuntimeService`] in addition to its own
+    /// [`DistributedRuntimeClient`](ryft_pjrt::DistributedRuntimeClient). The call blocks until
+    /// every process has connected.
     ///
     /// This function uses the default [`DistributedRuntimeServiceOptions`] and [`DistributedRuntimeClientOptions`],
-    /// except that a process keeps trying to reach the coordinator for five minutes, as in JAX, and that a missed
-    /// heartbeat does not terminate the process. Use [`Self::initialize_with_options`] for other timeouts.
+    /// except that a process keeps trying to reach the coordinator for five minutes, and that a missed heartbeat does
+    /// not terminate the process. Use [`Self::initialize_with_options`] for other timeouts.
     ///
     /// # Parameters
     ///
-    ///   - `plugin`: PJRT [`Plugin`] that provides the service and the client (e.g., [`Platform::plugin`](
-    ///     crate::Platform::plugin)).
+    ///   - `plugin`: PJRT [`Plugin`] that provides the service and the client.
     ///   - `coordinator_address`: TCP address that process 0 serves and every process connects to (e.g.,
     ///     `"10.0.0.1:24680"`). It must be reachable from every process.
     ///   - `process_count`: Number of processes of the job.
@@ -124,10 +119,12 @@ impl DistributedRuntime {
                 ryft_pjrt::Error::invalid_argument(format!("distributed runtime {name} {value} does not fit in `u32`"))
             })
         };
+
         let service_options = DistributedRuntimeServiceOptions {
             num_nodes: coordinate("process count", process_count)?,
             ..Default::default()
         };
+
         // The default `missed_heartbeat_callback` panics, which aborts a process during an orderly shutdown when its
         // polling request observes the service stopping before its own polling loop has stopped. Callers that want a
         // missed heartbeat to terminate the process install their own callback with `Self::initialize_with_options`.
@@ -137,8 +134,11 @@ impl DistributedRuntime {
             missed_heartbeat_callback: Some(Box::new(|_| {})),
             ..Default::default()
         };
+
         Self::initialize_with_options(plugin, coordinator_address, None, service_options, client_options)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Initializes the [`DistributedRuntime`] of one process as [`Self::initialize`] does, with explicit
     /// [`DistributedRuntimeServiceOptions`] and [`DistributedRuntimeClientOptions`] (e.g., for other heartbeat,

@@ -727,8 +727,7 @@ impl Array {
     ///   - **Storage Placements:** It is the result of a placement of such an array that names only a memory or a
     ///     layout, or a copy of such an array on its own devices.
     ///   - **Eager Results:** It is the result of an eager operation whose array inputs are all locally assigned,
-    ///     or of one without array inputs that runs where such an upload would (refer to
-    ///     [`Session::assigns_placement_locally`]).
+    ///     or of one without array inputs that runs where such an upload would.
     ///
     /// A placement onto a device, a mesh, or a sharding, a construction on a mesh that the caller provides (e.g.,
     /// through [`Self::from_addressable_buffers`]), and direct execution of a compiled function all produce arrays
@@ -747,7 +746,7 @@ impl Array {
     /// each process placed on its own first addressable device with an explicit device target does not have the fact.
     /// A later placement over every process's devices then makes each process send its own value without any receiver.
     #[inline]
-    pub(crate) fn is_locally_assigned(&self) -> bool {
+    pub fn is_locally_assigned(&self) -> bool {
         self.locally_assigned
     }
 

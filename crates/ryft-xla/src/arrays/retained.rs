@@ -386,26 +386,29 @@ impl RetainedArray {
         )
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns the first successful placement of this retained array (refer to [`Self::placed`]), in the order in which
-    /// they were recorded, whose devices are `devices` in that order, whose memory and declared layout are those of
-    /// this array, and which `accepts`, if its work has already completed without an error. A placement from such a
-    /// copy has the type that a placement from this array has, because a placement keeps the memory of its source and
-    /// derives its layout from the layout of its source and the destination alone (refer to
-    /// `Array::placement_layout`), whereas a copy that dropped the layout of this array (e.g., a replicated copy of
-    /// column shards) would drop it from every placement made from it as well. It never waits: it skips attempts that
-    /// are still running and returns nothing while the work of the first such placement is pending, because a
-    /// placement that was submitted can still fail, and a copy made from it would share its failed buffers. Only that
-    /// first candidate is queried, so that a pending one does not make every later lookup (e.g., one for each new axis
-    /// name of the same devices) query the readiness of every earlier candidate, and nothing is always a correct
-    /// answer, because the caller then places from this array itself. It holds the lock of the placements only to copy
-    /// out one candidate at a time, and queries the readiness of the first such candidate after releasing it.
+    /// Returns a completed placement of this retained array on `devices`, if one was recorded (refer to
+    /// [`Self::placed`]), so that a caller can place from that copy rather than from this array. The candidate is the
+    /// first recorded placement, in the order in which they were recorded, that succeeded, whose devices are `devices`
+    /// in that order, whose memory and declared layout are those of this array, and which `accepts`.
+    ///
+    /// The candidate must keep the memory and the declared layout of this array, because a placement keeps the memory
+    /// of its source and derives its layout from the layout of its source and the destination alone. A placement from
+    /// such a copy therefore has the type that a placement from this array has, whereas a copy that dropped the layout
+    /// (e.g., a replicated copy of column shards) would drop it from every placement made from it as well.
+    ///
+    /// This function never waits. It skips attempts that are still running, and it returns [`None`] unless the work of
+    /// the candidate has already completed without an error, because a submitted placement can still fail and a copy
+    /// made from it would share its failed buffers. Only that first candidate is queried, so that a pending one does
+    /// not make every later lookup query the readiness of every earlier candidate. Returning [`None`] is always
+    /// correct, because the caller then places from this array itself. The lock of the placements is held only
+    /// to copy out one candidate at a time, and it is released before readiness is queried.
     pub(crate) fn completed_placement_on(&self, devices: &[Device], accepts: impl Fn(&Self) -> bool) -> Option<Self> {
         let r#type = self.metadata.r#type();
         let keeps_storage = |placed: &Self| {
             let placed_type = placed.metadata.r#type();
             placed_type.memory() == r#type.memory() && placed_type.layout() == r#type.layout()
         };
+
         let key = (devices.to_vec(), self.locally_assigned);
         let candidate = (0..)
             .map_while(|position| {
@@ -431,17 +434,17 @@ impl RetainedArray {
         completed.then_some(candidate)
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns whether a shard of this retained array on a device of this process has no buffer, and every such shard
-    /// either has no elements or has another shard on this process that holds the same contribution (refer to
-    /// `ShardContribution`) with a buffer, so that a placement of this array onto its own mesh and sharding fills every
-    /// missing local buffer with a copy of a local replica or a new empty buffer (refer to
-    /// `Array::with_local_replicas`). This mirrors the rule by which execution supplies the missing buffers of an
-    /// argument (refer to `Array::serves_missing_local_buffers`), which an array of the zero data type never needs, so
-    /// that every buffer that execution would supply on every call is supplied here once. It reads the placement
-    /// metadata and the buffers of this process only, and such a placement moves every shard to its own device, so it
-    /// communicates with nobody, whatever buffers the other processes hold (refer to `placed_constant`).
-    pub(crate) fn fills_missing_local_replicas(&self) -> Result<bool, Error> {
+    /// Returns whether this retained array lacks the buffer of some shard on a device of this process, and this process
+    /// can supply every such buffer on its own. A missing buffer can be supplied when its shard has no elements, for
+    /// which an empty buffer suffices, or when another shard on this process holds the same contribution with a buffer,
+    /// which can be copied. It returns `false` when no local buffer is missing, and for an array of the zero data type,
+    /// which never needs buffers.
+    ///
+    /// A placement of such an array onto its own mesh and sharding supplies the missing buffers. Execution would
+    /// otherwise supply them again on every call, by the same rule, so a caller places the array once instead. The
+    /// check reads only the placement metadata and the buffers of this process, and supplying the buffers moves no
+    /// shard to another device, so it involves no other process, whatever buffers the other processes hold.
+    pub(crate) fn can_fill_missing_local_buffers(&self) -> Result<bool, Error> {
         let process_index = self.client.process_index()?;
         let local = |shard: &&ArrayShard| shard.device().process_index() == process_index;
         let missing = |shard: &&ArrayShard| shard.buffer().is_none();
@@ -786,8 +789,8 @@ mod tests {
         let upload =
             || Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 1f32.to_ne_bytes());
 
-        // A capture with locally assigned devices never communicates (refer to `RetainedArray::placement_communicates`),
-        // so the source names its devices for every process.
+        // A capture with locally assigned devices never communicates (refer to
+        // `RetainedArray::placement_communicates`), so the source names its devices for every process.
         let source = upload().unwrap().with_locally_assigned(false);
         let retained = RetainedArray::new(&source);
         let attempts = AtomicUsize::new(0);
@@ -914,7 +917,7 @@ mod tests {
         )
         .unwrap();
         let retained = RetainedArray::new(&array);
-        assert!(retained.fills_missing_local_replicas().unwrap());
+        assert!(retained.can_fill_missing_local_buffers().unwrap());
         assert!(!retained.placement_communicates(&mesh, &sharding));
         let failure = CoreError::from(ProgramError::InvalidArgument { message: "replica fill failed".to_string() });
         let failed = retained.placed(&mesh, &sharding, |_| Err(failure.clone().into()));
