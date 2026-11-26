@@ -365,10 +365,10 @@ impl Array {
 
         let process_index = self.client().process_index()?;
         let missing = |shard: &ArrayShard| shard.device().process_index() == process_index && shard.buffer().is_none();
-        let resolve_layout = cross_host_layout_resolver(self.client());
+        let layout_resolver = cross_host_layout_resolver(self.client());
         if self.shards().iter().any(missing)
             && let Ok(DevicePlacementStrategy::ExactShards { plan, .. }) =
-                self.device_placement_strategy(&resolve_layout, mesh, sharding, process_index)
+                self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index)
         {
             let replicas = LocalReplicas::new(process_index);
             for movement in plan.moves.iter().filter(|movement| movement.source_device.process_index() == process_index)
@@ -2226,7 +2226,7 @@ impl Array {
     /// array is placed with the strategies of [`PlacementPlanningView::strategy`].
     fn device_placement_strategy(
         &self,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         process_index: usize,
@@ -2234,8 +2234,9 @@ impl Array {
         if self.data_type().is_zero() {
             return Ok(DevicePlacementStrategy::Bufferless);
         }
+
         if !self.is_locally_assigned() {
-            return self.placement_planning_view().strategy(resolve_layout, mesh, sharding);
+            return self.placement_planning_view().strategy(layout_resolver, mesh, sharding);
         }
 
         // Placing the value with local work only also handles every placement that no shared strategy supports (e.g.,
@@ -2276,9 +2277,9 @@ impl Array {
         };
         let planned = match &view {
             Some((metadata, shards)) => {
-                PlacementPlanningView { metadata, shards: shards.iter() }.strategy(resolve_layout, mesh, sharding)
+                PlacementPlanningView { metadata, shards: shards.iter() }.strategy(layout_resolver, mesh, sharding)
             }
-            None => self.placement_planning_view().strategy(resolve_layout, mesh, sharding),
+            None => self.placement_planning_view().strategy(layout_resolver, mesh, sharding),
         };
         let shared = |planned: Result<DevicePlacementStrategy, Error>| match planned {
             Ok(strategy) if takes_shared(&strategy) => Ok(Some(strategy)),
@@ -2294,7 +2295,7 @@ impl Array {
         if view.is_none() || self.moves_to_owner_view(mesh, sharding, process_index) {
             return Ok(planned);
         }
-        let planned = shared(self.placement_planning_view().strategy(resolve_layout, mesh, sharding))?;
+        let planned = shared(self.placement_planning_view().strategy(layout_resolver, mesh, sharding))?;
         Ok(planned.unwrap_or(DevicePlacementStrategy::ProcessLocalValue))
     }
 

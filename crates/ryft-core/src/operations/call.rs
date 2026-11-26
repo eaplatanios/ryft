@@ -1,5 +1,5 @@
-//! Staged calls of flat programs. A [`CallOperation`] calls a callee program that is attached to its instruction as
-//! a region, and it carries the boundary of the function whose program that callee is (i.e., the sharding overrides of
+//! Staged calls of flat programs. A [`CallOperation`] calls a callee program that is attached to its instruction as a
+//! region, and it carries the boundary of the function whose program that callee is (i.e., the sharding overrides of
 //! the inputs and outputs of the function and the devices that the function names), together with what only the call
 //! knows about where its inputs are placed. This module owns the backend-neutral contract of a call, which is its
 //! payload and boundary, its type rule, the analysis of the placement requests of its callee (refer to
@@ -7,13 +7,13 @@
 //! differentiation, and transposition. Every rule keeps a call boundary on the calls that it derives instead of
 //! inlining the callee, so a transformed call still runs its callee as one function.
 //!
-//! A backend lowers calls and applies them on its own runtime. It reads the boundary through the functions of
-//! [`CallOperation`] and through the free functions of this module (e.g., [`declared_input_sharding`] and
-//! [`entered_argument_sharding`]), so that every entry point of the backend agrees with these rules on where a call
-//! places its inputs. The interpretation of a call in the eager contexts of this crate (i.e., [`EagerContext`] and the
-//! [`LockstepDomain`] of the `shard_map` emulation) is the reference semantics of a call, which runs the callee region
-//! on the inputs that the type rule of the call accepts and returns the outputs of the callee. A backend with a device
-//! runtime implements the interpretation for its own context instead (e.g., by compiling the callee and executing it).
+//! A backend lowers calls and applies them on its own runtime. It reads the boundary through the functions
+//! of [`CallOperation`] and through the free functions of this module (e.g., [`declared_input_sharding`]), so that
+//! every entry point of the backend agrees with these rules on where a call places its inputs. The interpretation of
+//! a call in the eager contexts of this crate (i.e., [`EagerContext`] and the [`LockstepDomain`] of the `shard_map`
+//! emulation) is the reference semantics of a call, which runs the callee region on the inputs that the type rule
+//! of the call accepts and returns the outputs of the callee. A backend with a device runtime implements the
+//! interpretation for its own context instead (e.g., by compiling the callee and executing it).
 
 use std::any::TypeId;
 use std::borrow::Cow;
@@ -24,8 +24,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayMemberType, ArrayType,
-    Device, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError, UnreducedKind,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue,
+    ArrayMemberType, ArrayType, Device, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension,
+    UnreducedKind,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -37,11 +38,12 @@ use crate::differentiation::{
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
     TangentActivity, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::manipulation::conversions::CastOperation;
@@ -49,8 +51,9 @@ use crate::operations::reductions::ReductionKind;
 use crate::operations::references::ReferenceNewOperation;
 use crate::operations::sharding::constrain_sharding::ConstrainShardingOperation;
 use crate::operations::sharding::place::{PlaceOperation, PlacementRequest};
-use crate::operations::sharding::reshard::ReshardOperation;
+use crate::operations::sharding::reshard::{Reshard, ReshardOperation};
 use crate::operations::sharding::shard_map::{LockstepDomain, LockstepOperation, LockstepValue};
+use crate::operations::sharding::validate_preserved_mesh_axes;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualDemandSplit, ResidualInputSource,
@@ -66,7 +69,7 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`CallOperation`].
 pub const CALL_OPERATION_NAME: &str = "call";
@@ -123,7 +126,7 @@ pub const CALL_OPERATION_NAME: &str = "call";
 ///     (e.g., a residual), because its declared input types are only traced types (refer to
 ///     `with_derived_boundary_shardings`). Partial evaluation treats a call as forwarding one of its inputs only where
 ///     the placement decision of every application returns that input unchanged (refer to
-///     [`Self::returns_input_unchanged`]).
+///     `Self::returns_input_unchanged`).
 ///
 /// The boundary takes part in equality and hashing, but a call of a function that names no devices and that is not a
 /// `jit` dispatcher hashes and renders exactly as it did before boundaries existed. A call that a transform derives
@@ -262,10 +265,10 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Returns this call as a call that a program transform derived from another call, whose callee input at each
-    /// position has the effective boundary sharding at that position of `shardings`, where [`None`] marks an input that
-    /// the call leaves where it is (refer to [`Self::derived_input_shardings`]). The rules of this module derive such
-    /// calls themselves (refer to `with_derived_boundary_shardings`), so only code that builds a derived call outside
-    /// of them (e.g., a backend that checks how it lowers or applies such a call) uses this function.
+    /// position without a sharding override has the effective boundary sharding at that position of `shardings`, where
+    /// [`None`] marks an input that the call leaves where it is (refer to [`Self::derived_input_shardings`]). Such a
+    /// call places the inputs that it receives from the original call as that call does, and leaves every other input
+    /// where it is, instead of placing it as the declared input types of its callee, which are only traced types, say.
     pub fn with_derived_input_shardings(mut self, shardings: Vec<Option<Sharding>>) -> Self {
         self.derived_input_shardings = Some(Arc::from(shardings));
         self
@@ -349,17 +352,17 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
-    /// it states a placement at its boundary (refer to [`Self::states_boundary_placement`]) or when its callee requests
+    /// it states a placement at its boundary (refer to [`states_boundary_placement`]) or when its callee requests
     /// a placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
     /// [`RegionPlacementSummary::has_requests`]), which `callee_names_devices` says and which is asked only when the
     /// call records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when
     /// the function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
     /// [`Program::into_pruned`]) can record a mesh that only a request of a dropped output named, which this function
     /// no longer reports, as JAX lowers a nested `jit` function pruned to the outputs that its caller uses and so
-    /// without the shardings of the dropped ones. The analysis of a program (refer to
-    /// [`RegionPlacementSummary::requests`]) answers `callee_names_devices` with the facts of the callee that it
-    /// derives in the same pass over the program, so that it never analyses a callee again for each call that encloses
-    /// it.
+    /// without the shardings of the dropped ones. The analyses of a program (refer to
+    /// [`RegionPlacementSummary::requests`] and [`RegionPlacementSummary::device_naming`]) answer
+    /// `callee_names_devices` with the facts of the callee that they derive in the same pass over the program, so that
+    /// they never analyse a callee again for each call that encloses it.
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
@@ -369,7 +372,7 @@ impl<T: Type> CallOperation<T> {
     /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
     /// [`states_boundary_placement`]).
     #[inline]
-    pub fn states_boundary_placement(&self) -> bool {
+    fn states_boundary_placement(&self) -> bool {
         states_boundary_placement(self.boundary_shardings())
     }
 
@@ -537,7 +540,7 @@ impl<T: Type> CallOperation<T> {
     fn validate_capture_prefix(&self, input_count: usize) -> Result<(), TypeError> {
         if self.capture_count > input_count {
             return Err(TypeError::invalid(format!(
-                "`call` lifted capture prefix {} exceeds its {input_count} callee inputs",
+                "`{CALL_OPERATION_NAME}` lifted capture prefix {} exceeds its {input_count} callee inputs",
                 self.capture_count,
             )));
         }
@@ -592,7 +595,7 @@ impl<T: ArrayMemberType> CallOperation<T> {
     /// backend that places the inputs of a call (e.g., its eager application, its lowering, and the result placements
     /// of its compiled programs) consults this function, so that they agree on where a call places its inputs. Only an
     /// eager application also gives an argument on one device the logical mesh of a declared placement over a single
-    /// device (refer to `CallOperation::eager_boundary_input_sharding`).
+    /// device (refer to [`CallOperation::eager_boundary_input_sharding`]).
     pub fn boundary_input_sharding<'s>(
         &'s self,
         index: usize,
@@ -606,10 +609,11 @@ impl<T: ArrayMemberType> CallOperation<T> {
     /// `callee_input_types`, in count and position, by the type rule of the call (refer to
     /// [`Operation::infer_output_types`]). A call accepts an input of exactly the callee input type and every input
     /// whose type refines it up to the placement that its sharding describes, with the same unreduced and reduced axes
-    /// and with manual variation along at most more manual mesh axes of one mesh. This is the only owner of that rule,
-    /// so that every context that binds a call (e.g., the eager application of a backend, staging, and the transforms
-    /// of a call) accepts the same inputs. An execution of the callee by a backend accepts a reduced argument as well,
-    /// because it reshards its arguments.
+    /// and with manual variation along at most more manual mesh axes of one mesh, where a callee input type with a
+    /// sharding must define every mesh axis that carries that state as the input type does. This is the only owner of
+    /// that rule, so that every context that binds a call (e.g., the eager application of a backend, staging, and the
+    /// transforms of a call) accepts the same inputs. An execution of the callee by a backend accepts a reduced
+    /// argument as well, because it reshards its arguments.
     ///
     /// # Errors
     ///
@@ -690,7 +694,7 @@ impl CallOperation<ArrayIrType> {
     /// (e.g., `q` for an argument over `p`). A direct execution of the callee by a backend gives every argument the
     /// mesh and the sharding with which its executable receives it, so the application gives the argument that logical
     /// mesh too, and both entry points accept the same arguments and return the same results. Partial evaluation
-    /// forwards no input that this sharding changes (refer to [`Self::returns_input_unchanged`]).
+    /// forwards no input that this sharding changes (refer to `Self::returns_input_unchanged`).
     pub fn eager_boundary_input_sharding<'s>(
         &'s self,
         index: usize,
@@ -724,7 +728,7 @@ impl CallOperation<ArrayIrType> {
     /// runs, including one that only moves a value to another memory (refer to
     /// [`RegionPlacementSummary::has_requests`]). A backend commits every result of a call that requests a placement,
     /// so the placement decision of an eager application by a backend and the forwarding of partial evaluation (refer
-    /// to [`Self::returns_input_unchanged`]) read it from here. `callee_summary` returns the [`RegionPlacementSummary`]
+    /// to `Self::returns_input_unchanged`) read it from here. `callee_summary` returns the [`RegionPlacementSummary`]
     /// of the callee for the target platform that the call runs on, or for no target platform (refer to
     /// [`RegionPlacementSummary::new`]), and it is called only when the answer depends on the callee. The summary of a
     /// callee depends on the callee and the platform alone, so it is derived once for each callee and platform and
@@ -751,10 +755,9 @@ impl CallOperation<ArrayIrType> {
     ///   - the input is not a lifted capture, which the call moves to where it runs and returns uncommitted,
     ///   - the type of the input records a sharding over a mesh without auto axes, because an eager application of the
     ///     call rejects an argument with a pending reduction that the executable of its callee cannot receive, which a
-    ///     type records over explicit and manual mesh axes, where the type rule of
-    ///     the call checks it when the call is staged, but never over auto mesh axes, including those of a type without
-    ///     a sharding, whose value may live on any mesh, so that only such a type proves that the call admits every
-    ///     argument of it, and
+    ///     type records over explicit and manual mesh axes, where the type rule of the call checks it when the call is
+    ///     staged, but never over auto mesh axes, including those of a type without a sharding, whose value may live on
+    ///     any mesh, so that only such a type proves that the call admits every argument of it, and
     ///   - the boundary does not place the input (refer to [`Self::boundary_input_placement`]), and an eager
     ///     application does not give it the logical mesh of another placement over its single device either (refer to
     ///     [`Self::eager_boundary_input_sharding`]).
@@ -771,7 +774,7 @@ impl CallOperation<ArrayIrType> {
     /// the call returns there or whether it returns at all, which types alone cannot show at partition time. A call
     /// that is not forwarded stays in the known program and takes its placement decision, admission included, whenever
     /// that program is interpreted.
-    pub fn returns_input_unchanged<V, O>(
+    fn returns_input_unchanged<V, O>(
         &self,
         callee: RegionRef<'_, V, O>,
         input_types: &[Cow<'_, ArrayIrType>],
@@ -1043,16 +1046,15 @@ where
     }
 }
 
-// Reference interpretation of a call in an eager context of this crate. The type rule of the call validates the
-// complete application first (refer to `CallOperation::validate_input_types`), because direct eager binding does not
-// pass through program construction, so that interpretation accepts exactly the inputs that staging accepts. The callee
-// region then runs on the inputs, and its outputs are the outputs of the call. The region entry validates the inputs
-// against the callee input types and the region exit compares the outputs with the callee output types under the facts
-// of the inputs, which are the facts by which the type rule infers the output types of the call. The sharding overrides
-// of the boundary place values on the devices of a backend and change no value, so this rule does not apply them, as
-// the type rule does not.
+// Reference interpretation of a call in an eager context of this crate (refer to `interpret_call`), which accepts
+// exactly the inputs that staging accepts and returns outputs of the types that the type rule of the call infers. Each
+// input is resharded to where the call places it (i.e., the sharding that its callee input type declares, or its
+// boundary sharding when that type declares none), which changes no value of an `Array`, so that the callee receives
+// the input at the placement that a backend gives it.
 impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<V, O>>
     for CallOperation<ArrayIrType>
+where
+    V: Reshard,
 {
     #[inline]
     fn interpret<D: InterpretationDriver<EagerContext<V, O>>>(
@@ -1061,23 +1063,61 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Interpretab
         driver: &D,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        interpret_call(self, context, driver, inputs)
+        interpret_call(self, context, driver, inputs, |input, sharding| input.reshard(sharding), |input, _| Ok(input))
+            .map(|(_, outputs)| outputs)
     }
 }
 
-// The `shard_map` emulation runs a call whose callee communicates across the emulated devices once for all of them, by
-// the reference interpretation of a call (refer to the implementation for `EagerContext`), whose region replay runs the
-// callee in lockstep. That replay validates neither the entry nor the outputs of the callee, so only the validation of
-// the type rule of the call applies there.
+// The `shard_map` emulation runs a call once for all emulated devices when its callee communicates across them or when
+// an input varies along manual mesh axes beyond its callee input type, by the reference interpretation of a call (refer
+// to `interpret_call`), which reshards the value of every device of an input whose placement differs from its callee
+// input type, and whose region replay runs the callee in lockstep. That replay validates neither the entry nor the
+// outputs of the callee, so only the validation of the type rule of the call applies there. An input that varies
+// beyond its callee input type enters the callee without that extra variation, which changes no value of any device,
+// so that the callee runs at the types that it was traced at, as a backend runs it, because manual variation is not
+// materialized inside a manual computation. The operations of the callee that have regions of their own (e.g., a
+// `condition` or a `while` loop) were typed for those inputs and would reject the wider variation. An output that the
+// callee computes from invariant inputs alone, or from inputs that entered it without their extra variation, still
+// varies along the manual mesh axes along which inputs vary beyond their callee input types, as the type rule of the
+// call states (refer to `CallVariation`), so that every later operation receives the output at its staged type.
 impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<LockstepDomain<O>> for CallOperation<ArrayIrType> {
-    #[inline]
     fn interpret<D: InterpretationDriver<LockstepDomain<O>>>(
         &self,
         context: &LockstepDomain<O>,
         driver: &D,
         inputs: &[LockstepValue<O>],
     ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
-        interpret_call(self, context, driver, inputs)
+        let reshard = |input: LockstepValue<O>, sharding: &Sharding| {
+            let values = input.into_values().into_iter().map(|value| value.reshard(sharding)).collect::<Result<_, _>>();
+            LockstepValue::new(values?, context)
+        };
+        let narrow = |input: LockstepValue<O>, axes: &BTreeSet<String>| {
+            let values = input
+                .into_values()
+                .into_iter()
+                .map(|value| match value {
+                    ArrayIrValue::Array(array) => {
+                        let r#type = array.r#type().into_owned();
+                        let Some(mut sharding) = r#type.sharding().cloned() else {
+                            return Ok(ArrayIrValue::Array(array));
+                        };
+                        let variation = sharding.varying_manual_axes().difference(axes).cloned().collect::<Vec<_>>();
+                        sharding.set_varying_manual_axes(variation).map_err(TypeError::from)?;
+                        let r#type = r#type.with_sharding(sharding).map_err(TypeError::from)?;
+                        Array::from_logical_bytes(r#type, &array.logical_bytes()).map(ArrayIrValue::Array)
+                    }
+                    value => Ok(value),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            LockstepValue::new(values, context)
+        };
+        let (output_types, outputs) = interpret_call(self, context, driver, inputs, reshard, narrow)?;
+        check_count!("output", outputs, output_types.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(&output_types)
+            .map(|(output, r#type)| vary_lockstep_call_output(context, driver, output, r#type))
+            .collect()
     }
 }
 
@@ -1724,8 +1764,8 @@ where
             context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "`call` primal program produced {} outputs which is fewer than its {output_count} primal \
-                 output(s)",
+                "`{CALL_OPERATION_NAME}` primal program produced {} outputs which is fewer than its {output_count} \
+                 primal output(s)",
                 primal_call_outputs.len(),
             ))
             .into());
@@ -1857,8 +1897,8 @@ pub enum RequestedPlacement {
 /// that it analyses is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
 /// outputs and its observable effects depend on, refer to [`Program::into_pruned`]), so a request that nothing uses is
 /// not among its requests, as JAX lowers a `jit` function without dead equations. The regions of an instruction that
-/// the backend never runs are not analysed either (i.e., the body of a scan whose length admits no iteration on every
-/// target, and the regions that a backend omits for a target platform, refer to [`Self::for_target`]).
+/// the backend never runs are not analysed either. These include scan bodies with zero iterations on every target
+/// and regions that a backend omits for a given target platform (refer to [`Self::for_target`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionPlacementSummary {
     /// Placement requests of the program, in the order of its regions and of the instructions in each region, with
@@ -1867,10 +1907,10 @@ pub struct RegionPlacementSummary {
 }
 
 impl RegionPlacementSummary {
-    /// Returns the [`RegionPlacementSummary`] of the program of `region` for no target platform, in which only the
-    /// body of a scan whose length admits no iteration is not analysed. Partial evaluation reads this summary, and so
-    /// does a backend that compiles a program before it knows its target platform. Refer to [`Self::for_target`] for
-    /// how the summary is derived and retained.
+    /// Returns the [`RegionPlacementSummary`] of the program of `region` without a target platform. Only scan bodies
+    /// with zero iterations are omitted. Partial evaluation reads this summary, as does a backend that compiles a
+    /// program before it knows its target platform. Refer to [`Self::for_target`] for how the summary is derived and
+    /// retained.
     pub fn new<V, O>(region: RegionRef<'_, V, O>) -> Self
     where
         V: 'static + Value<Type = ArrayIrType>,
@@ -1923,6 +1963,29 @@ impl RegionPlacementSummary {
             RequestedPlacement::Memory => includes_memory_requests,
             RequestedPlacement::Devices(_) | RequestedPlacement::Sharding => true,
         })
+    }
+
+    /// Returns a function that answers, for each region of the program whose entry region is `entry`, whether that
+    /// region requests a placement that names devices (i.e., any request except one that only moves a value to another
+    /// memory, refer to [`Self::has_requests`]) in the regions that the backend runs, which is what a call that records
+    /// a mesh reads of its callee (refer to [`CallOperation::names_devices`]). The program must be the one that the
+    /// backend runs (i.e., it is already pruned, refer to [`Program::into_pruned`]), because each region is analysed as
+    /// the program holds it. The regions of the instructions for which `omits_regions` returns `true` are not analysed,
+    /// and neither is the body of a scan with zero iterations (refer to [`ScanOperation::has_zero_iterations`]). The
+    /// function analyses each region at most once and reads its fact for every call of it and for every region that
+    /// encloses it, so that answering for every call of a program with nested calls costs one pass over the program,
+    /// whereas the summary of each callee (refer to [`Self::for_target`]) would prune and walk the closure of each
+    /// callee again.
+    pub fn device_naming<'o, V, O>(
+        entry: RegionRef<'_, V, O>,
+        omits_regions: &'o dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
+    ) -> impl FnMut(RegionRef<'_, V, O>) -> bool + use<'o, V, O>
+    where
+        V: Value<Type = ArrayIrType>,
+        O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
+    {
+        let mut analysis = DeviceNamingAnalysis::new(entry.arena().len(), omits_regions);
+        move |region| analysis.names_devices(region)
     }
 
     /// Returns the summary of `region` for `target_platform` (refer to [`Self::for_target`]), whose regions that the
@@ -1992,34 +2055,9 @@ pub fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Optio
 /// present but states nothing (i.e., an empty list, or a list without an override at any position) states no
 /// placement, so it neither commits the results of the function nor makes it name devices. This is the one test of a
 /// placement stated at the boundary of a function, which a backend that compiles a function and a call of one (refer
-/// to [`CallOperation::states_boundary_placement`]) read.
+/// to [`CallOperation::names_devices`]) read.
 pub fn states_boundary_placement<'s>(overrides: impl IntoIterator<Item = &'s Sharding>) -> bool {
     overrides.into_iter().next().is_some()
-}
-
-/// Returns `sharding`, the placement with which an argument arrives at a function (e.g., an input sharding override),
-/// as the body of the function holds that argument once it has entered: without its reduction state over auto mesh axes
-/// (i.e., its pending reductions and its completed-reduction markers over them), which no value of a program carries,
-/// because types never record reduction state over auto mesh axes. A backend completes such a pending reduction where
-/// the argument enters its entry function, and a completed-reduction marker states nothing about the buffers, so the
-/// body of a function, and every result that returns the argument, holds the completed value without either. The
-/// lowering of a nested call receives an operand at this sharding for the same reason (refer to
-/// [`CallOperation::boundary_input_sharding`]). The dimensions, including their splits along auto mesh axes, and the
-/// reduction state that a type records (i.e., over explicit or manual mesh axes) are kept, unlike
-/// [`Sharding::without_auto_axes`], which also drops the splits along auto mesh axes. A sharding without reduction
-/// state over auto mesh axes, which is the common case, is returned without a copy.
-///
-/// # Errors
-///
-/// Returns the [`ShardingError`] of removing the axes from `sharding`, which never fails for a valid sharding.
-pub fn entered_argument_sharding(sharding: &Sharding) -> Result<Cow<'_, Sharding>, ShardingError> {
-    let is_auto = |axis: &String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
-    if !sharding.unreduced_axes().iter().chain(sharding.reduced_axes()).any(is_auto) {
-        return Ok(Cow::Borrowed(sharding));
-    }
-    let kept = |axes: &BTreeSet<String>| axes.iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
-    let unreduced = sharding.clone().with_unreduced_axes(kept(sharding.unreduced_axes()))?;
-    Ok(Cow::Owned(unreduced.with_reduced_axes(kept(sharding.reduced_axes()))?))
 }
 
 /// Transposes a tangent [`CallOperation`] while retaining its compilation boundary.
@@ -2187,7 +2225,7 @@ where
         // override of its primal, as the cotangent types of those primals record it, and each known primal value is
         // placed at the override itself. An input cotangent that the transposed call returns is the cotangent of the
         // argument as the callee holds it once it has entered, so it carries no reduction state over auto mesh axes,
-        // which no type records (refer to `entered_argument_sharding`).
+        // which no type records (refer to `Sharding::without_auto_reduction_axes`).
         let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
         let output_cotangent_shardings = outputs
             .iter()
@@ -2216,11 +2254,8 @@ where
             .collect::<Result<Vec<_>, _>>()
             .map_err(TypeError::from)?
             .into_iter()
-            .map(|sharding| {
-                sharding.map(|sharding| entered_argument_sharding(&sharding).map(Cow::into_owned)).transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            .map(|sharding| sharding.map(|sharding| sharding.without_auto_reduction_axes()))
+            .collect::<Vec<_>>();
         transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
     }
     let transposed_call = O::from(transposed_call);
@@ -2724,7 +2759,10 @@ struct CallSplit {
 /// with the kind of reduction, where a declared type without a sharding describes a fully reduced value. The input may
 /// vary along more manual mesh axes than the declared type, which a value of a `shard_map` body does where the callee
 /// declares none, as a JAX `jit` function called on such a value is retraced at its varying type, and the outputs of
-/// the call then vary along those axes too (refer to `CallVariation`).
+/// the call then vary along those axes too (refer to `CallVariation`). When both types have shardings, the mesh of the
+/// declared sharding must define every mesh axis that carries manual variation or reduction state of the input as the
+/// mesh of the input defines it, because one name must not denote two different axes for state that crosses the call
+/// boundary, while other axes may differ (refer to `validate_preserved_mesh_axes`).
 fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTreeSet<String>> {
     fn components(
         sharding: Option<&Sharding>,
@@ -2747,6 +2785,15 @@ fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTre
     {
         return None;
     }
+    if let (Some(declared_sharding), Some(actual_sharding)) = (declared.sharding(), actual.sharding()) {
+        validate_preserved_mesh_axes(
+            CALL_OPERATION_NAME,
+            actual_sharding.mesh(),
+            actual_variation.iter().chain(actual_unreduced).chain(actual_reduced),
+            declared_sharding.mesh(),
+        )
+        .ok()?;
+    }
     let declared_without_sharding = declared.clone().with_sharding(None).ok()?;
     let actual_without_sharding = actual.clone().with_sharding(None).ok()?;
     declared_without_sharding
@@ -2758,9 +2805,8 @@ fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTre
 /// count and position, and reports the first input that it rejects as a type error naming `operation_name`. A call
 /// accepts an input of exactly the callee input type and every input that `call_input_variation` accepts. Returns the
 /// manual mesh axes along which the inputs vary beyond the callee input types, if any, along which the outputs of the
-/// call vary too. This is the only owner of that rule, so that every context that binds a call (e.g., eager dispatch,
-/// staging, and the transforms of a call) accepts the same inputs and infers the same outputs (refer to
-/// [`CallOperation::validate_input_types`]).
+/// call vary too, so that every context that binds a call infers the same outputs. This implements the rule that
+/// [`CallOperation::validate_input_types`] owns.
 fn validate_call_input_types<T: ArrayMemberType>(
     operation_name: &'static str,
     expected_types: &[T],
@@ -2856,8 +2902,8 @@ where
     requests
 }
 
-/// Returns whether the backend never runs the regions of `instruction` of `region`, which is the case for the body of a
-/// scan whose length admits no iteration (refer to [`admits_iterations`]) on every target, and for the regions for
+/// Returns whether the backend never runs the regions of `instruction` of `region`. This holds on every target for
+/// the body of a scan with zero iterations (refer to [`ScanOperation::has_zero_iterations`]) and for the regions for
 /// which `omits_regions` returns `true` (refer to [`RegionPlacementSummary::for_target`]).
 fn omits_placement_regions<V, O>(
     region: RegionRef<'_, V, O>,
@@ -2871,15 +2917,8 @@ where
     instruction
         .operation()
         .projected_payload::<ScanOperation<ArrayIrType>>()
-        .is_some_and(|scan| !admits_iterations(scan))
+        .is_some_and(ScanOperation::has_zero_iterations)
         || omits_regions(region, instruction)
-}
-
-/// Returns `true` if the length of `scan` admits an iteration, which is false for a static length of zero and for a
-/// dynamic length whose bounds admit only zero (i.e., whose exclusive upper bound is one). A scan that admits no
-/// iteration never runs its body.
-fn admits_iterations(scan: &ScanOperation<ArrayIrType>) -> bool {
-    scan.iteration_count().upper_bound() != Some(1)
 }
 
 /// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
@@ -2901,17 +2940,141 @@ fn placement_request<O: Operation<Type = ArrayIrType> + OperationPayloadProjecti
     Some(InstructionPlacementRequest::Mesh(mesh))
 }
 
-/// Interprets `call` in `context` on `inputs` by the reference semantics of a call, which validates the inputs by the
-/// type rule of the call (refer to [`CallOperation::validate_input_types`]) and runs the callee region on them.
+/// Interprets `call` in `context` on `inputs` by the reference semantics of a call. The type rule of the call validates
+/// the complete application first (refer to [`CallOperation::validate_input_types`]), because direct eager binding does
+/// not pass through program construction, so that interpretation accepts exactly the inputs that staging accepts. Each
+/// array input is then placed where the eager application of a backend places it (refer to
+/// [`CallOperation::eager_boundary_input_sharding`]), as far as the callee region accepts that placement and the type
+/// of a value records it, and the callee region runs on the placed inputs:
+///
+///   - An input of a callee input type that declares a sharding enters the callee at that sharding, because the callee
+///     region validates its inputs against its declared input types and accepts no other placement. This is the
+///     boundary sharding of the input unless the call has a sharding override or a derived sharding for it that
+///     differs from the declared one, whose placement is therefore not observable inside the callee. An input of the
+///     lifted capture prefix, an input that the call keeps placed as it is, and an input that varies along manual mesh
+///     axes beyond its callee input type have no boundary sharding and enter at the declared sharding too. The target
+///     of the placement is the declared sharding without its manual reduction state, which `reshard` carries over from
+///     the input together with its manual variation, so that an input that varies beyond its callee input type keeps
+///     that variation.
+///   - An input of a callee input type without a sharding is placed at its boundary sharding, which is its sharding
+///     override, its derived sharding, or the sharding that replicates it over the mesh of the call, including the
+///     logical mesh of a placement over a single device, as far as its type records that sharding (refer to
+///     [`boundary_input_type`]). Placement along auto mesh axes is runtime state that neither types nor the values of
+///     the reference backend record (refer to [`Placed`](crate::operations::sharding::place::Placed)), so a backend
+///     applies it while this rule, as the reference rules of `place` and `constrain_sharding` do, keeps only the part
+///     that types record. A boundary sharding that states more than a placement (e.g., a pending reduction) or that
+///     `reshard` rejects (e.g., one that places a dimension along a manual mesh axis) is not applied at all. An input
+///     without a boundary sharding (i.e., of the lifted capture prefix, kept placed as it is, varying beyond its callee
+///     input type, or without a sharding when the call names no mesh) keeps its placement.
+///
+/// Each placed input that varies along manual mesh axes beyond its callee input type (refer to `call_input_variation`)
+/// is then passed to `narrow` with those axes. Returns the output types that the type rule infers together with the
+/// outputs of the callee.
+///
+/// # Parameters
+///
+///   - `reshard`: Reshards a value of `context` to a [`Sharding`] (refer to [`Reshard`]).
+///   - `narrow`: Returns a value of `context` that does not vary along the provided manual mesh axes, which a context
+///     whose values hold the values of every device of a manual region can do without changing any value (e.g., the
+///     [`LockstepDomain`] of the `shard_map` emulation). Other contexts return the value unchanged.
 fn interpret_call<C: Domain<Type = ArrayIrType>, D: InterpretationDriver<C>>(
     call: &CallOperation<ArrayIrType>,
     context: &C,
     driver: &D,
     inputs: &[C::Value],
-) -> Result<Vec<C::Value>, ProgramError> {
+    reshard: impl Fn(C::Value, &Sharding) -> Result<C::Value, ProgramError>,
+    narrow: impl Fn(C::Value, &BTreeSet<String>) -> Result<C::Value, ProgramError>,
+) -> Result<(Vec<ArrayIrType>, Vec<C::Value>), ProgramError> {
     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    call.infer_output_types(&input_types, &driver.region_interfaces())?;
-    driver.interpret_region(context, 0, inputs.to_vec())
+    let region_interfaces = driver.region_interfaces();
+    let output_types = call.infer_output_types(&input_types, &region_interfaces)?;
+    let inputs = inputs
+        .iter()
+        .zip(&input_types)
+        .zip(region_interfaces[0].input_types())
+        .enumerate()
+        .map(|(index, ((input, actual), declared))| {
+            let placement = match (actual, declared) {
+                (ArrayIrType::Array(actual), ArrayIrType::Array(declared_type)) => match declared_type.sharding() {
+                    Some(sharding) => Some(Cow::Borrowed(sharding)),
+                    None => call
+                        .eager_boundary_input_sharding(index, actual, declared)
+                        .and_then(|boundary| boundary_input_type(declared_type, &boundary)?.sharding().cloned())
+                        .filter(|sharding| {
+                            let reshard = ReshardOperation::new(sharding.clone());
+                            reshard.infer_output_types(&[actual.clone()], &[]).is_ok()
+                        })
+                        .map(Cow::Owned),
+                }
+                .filter(|sharding| actual.sharding() != Some(sharding.as_ref())),
+                _ => None,
+            };
+            let input = match placement {
+                Some(sharding) => reshard(input.clone(), &sharding.without_manual_reduction_axes())?,
+                None => input.clone(),
+            };
+            let variation = match (actual, declared) {
+                (ArrayIrType::Array(actual), ArrayIrType::Array(declared)) => call_input_variation(declared, actual),
+                _ => None,
+            };
+            match variation.filter(|axes| !axes.is_empty()) {
+                Some(axes) => narrow(input, &axes),
+                None => Ok(input),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((output_types, driver.interpret_region(context, 0, inputs)?))
+}
+
+/// Returns `output`, an output of a call that the `shard_map` emulation interprets in lockstep, varying along every
+/// manual mesh axis along which `r#type`, its type by the type rule of the call, varies and its own type does not. Each
+/// such axis is added by `parallel_vary`, which changes no value of any device. An output without a sharding first
+/// takes the replicated sharding over the mesh of `r#type`, as an output type without one does in the type rule.
+fn vary_lockstep_call_output<O: Operation<Type = ArrayIrType>, D: InterpretationDriver<LockstepDomain<O>>>(
+    context: &LockstepDomain<O>,
+    driver: &D,
+    output: LockstepValue<O>,
+    r#type: &ArrayIrType,
+) -> Result<LockstepValue<O>, ProgramError> {
+    let output_type = output.r#type().into_owned();
+    let (ArrayIrType::Array(r#type), ArrayIrType::Array(actual)) = (r#type, &output_type) else {
+        return Ok(output);
+    };
+    let Some(sharding) = r#type.sharding() else { return Ok(output) };
+    let actual_sharding = actual.sharding();
+    let axes = sharding
+        .varying_manual_axes()
+        .iter()
+        .filter(|axis| !actual_sharding.is_some_and(|actual| actual.varying_manual_axes().contains(*axis)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if axes.is_empty() {
+        return Ok(output);
+    }
+    let mut output = match actual_sharding {
+        Some(_) => output,
+        None => {
+            let replicated = Sharding::replicated(sharding.mesh().clone(), actual.rank());
+            let placed = actual.clone().with_sharding(replicated).map_err(TypeError::from)?;
+            let values = output
+                .into_values()
+                .into_iter()
+                .map(|value| match value {
+                    ArrayIrValue::Array(array) => {
+                        Array::from_logical_bytes(placed.clone(), &array.logical_bytes()).map(ArrayIrValue::Array)
+                    }
+                    value => Ok(value),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            LockstepValue::new(values, context)?
+        }
+    };
+    for axis in axes {
+        let mut outputs = ParallelVaryOperation::new(axis).interpret_in_parent(context, driver, &[output])?;
+        check_count!("output", outputs, 1, ProgramError);
+        output = outputs.remove(0);
+    }
+    Ok(output)
 }
 
 /// Returns the callee of a `call` bound over `callee` as a shared program, which is the program that `callee` was
@@ -3259,10 +3422,10 @@ fn batched_boundary_sharding(
 /// (i.e., `{?}`) and the other replicates (refer to [`replicates_unconstrained_dimensions`]) is cast to `refined` as
 /// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
 /// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. A runtime array
-/// stores an unconstrained dimension replicated, so its buffers are those of `refined`.
-/// Inside a compiled program, the cast emits no sharding constraint (an unconstrained and a replicated dimension do not
-/// conflict over explicit mesh axes, and types record no placement over auto mesh axes), and the entry boundary of the
-/// program replicates an unconstrained dimension of any value that it exchanges.
+/// stores an unconstrained dimension replicated, so its buffers are those of `refined`. Inside a compiled program, the
+/// cast emits no sharding constraint (an unconstrained and a replicated dimension do not conflict over explicit mesh
+/// axes, and types record no placement over auto mesh axes), and the entry boundary of the program replicates an
+/// unconstrained dimension of any value that it exchanges.
 ///
 /// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
 /// an input of type `refined` for a callee input of the type of the value (refer to [`is_untracked_refinement`]), as
@@ -3417,8 +3580,8 @@ mod tests {
     use ryft_macros::Operation;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Memory, MeshAxis, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Memory, MeshAxis, Shape,
     };
     use crate::batching::RecursiveBatchingDriver;
     use crate::captures::CaptureReference;
@@ -3432,12 +3595,18 @@ mod tests {
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::operations::composite_transpose::CompositeTransposeOperation;
+    use crate::operations::composites::{
+        CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition,
+        CustomRuleRegistration, CustomRuleTracer, NamedComposite,
+    };
     use crate::operations::constants::iota::IotaOperation;
+    use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::control_flow::r#while::WhileOperation;
     use crate::operations::debugging::PrintOperation;
+    use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::rematerialize::RematerializeOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
@@ -3448,7 +3617,7 @@ mod tests {
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceReadOperation, ReferenceSwapOperation,
     };
-    use crate::operations::sharding::place::PLACE_OPERATION_NAME;
+    use crate::operations::sharding::place::{PLACE_OPERATION_NAME, Placed};
     use crate::operations::sharding::shard_map::{ShardMapBoundary, ShardMapOperation};
     use crate::operations::tagging::TagOperation;
     use crate::operations::trigonometric::{CosOperation, SinOperation};
@@ -3518,6 +3687,137 @@ mod tests {
         builder
             .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee_region], inputs, None)
             .unwrap()[0]
+    }
+
+    /// Returns the logical mesh of one manual axis `x` of 2 devices, together with the local type `f32[1]` of the shard
+    /// of an `f32[2]` input split along `x`, which varies along `x`, of the `shard_map` that
+    /// [`lockstep_call_program`] builds.
+    fn lockstep_call_mesh_and_input_type() -> (LogicalMesh, ArrayIrType) {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        (mesh, ArrayIrType::Array(f32_vector_type(1).with_sharding(varying).unwrap()))
+    }
+
+    /// Returns `x ↦ x * x` at type `r#type`.
+    fn lockstep_call_square(r#type: ArrayIrType) -> TestProgram {
+        build_program(vec![r#type], |builder, inputs| {
+            let mul = ArrayOperation::from(MulOperation::new());
+            builder.add_instruction(mul, Vec::new(), vec![inputs[0], inputs[0]], None).unwrap().to_vec()
+        })
+    }
+
+    /// Builds the body of a `shard_map` over the manual axis `x` of `mesh` that applies `build` to the shard `a`, of
+    /// type `a_local_type`, of its one `f32[2]` input split along `x`, and sums every output of `build` over `x`,
+    /// together with the program that applies that `shard_map` to an `f32[2]` input.
+    fn lockstep_shard_map_program(
+        mesh: &LogicalMesh,
+        a_local_type: &ArrayIrType,
+        build: impl FnOnce(&mut ProgramBuilder<TestValue, TestOperation>, AtomId) -> Vec<AtomId>,
+    ) -> (TestProgram, TestProgram) {
+        let body = build_program(vec![a_local_type.clone()], |builder, inputs| {
+            build(builder, inputs[0])
+                .into_iter()
+                .map(|output| {
+                    let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+                    builder
+                        .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![output], None)
+                        .unwrap()[0]
+                })
+                .collect()
+        });
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let output_count = body.output_types().len();
+        let boundary =
+            ShardMapBoundary::new(mesh.clone(), vec![sharded], vec![replicated; output_count], Vec::new()).unwrap();
+        let input_types = vec![ArrayIrType::Array(f32_vector_type(2))];
+        let operation = ShardMapOperation::from_program(&body, input_types.clone(), boundary).unwrap();
+        let program = build_program(input_types, |builder, inputs| {
+            let body = builder.import_program(body.clone());
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        (body, program)
+    }
+
+    /// Builds the body of a `shard_map` over the manual axis `x` of `mesh` that calls `callee` on the shard `a`, of
+    /// type `a_local_type`, of its one `f32[2]` input split along `x`, and sums every output of the call over `x`,
+    /// together with the program that applies that `shard_map` to an `f32[2]` input (refer to
+    /// [`lockstep_shard_map_program`]). When `passes_axis_index` is set, the first input of the call is the index of
+    /// each device along `x`, and every other input of the call is `a`.
+    fn lockstep_call_program(
+        mesh: &LogicalMesh,
+        a_local_type: &ArrayIrType,
+        callee: TestProgram,
+        passes_axis_index: bool,
+    ) -> (TestProgram, TestProgram) {
+        lockstep_shard_map_program(mesh, a_local_type, |builder, a| {
+            let mut call_inputs = vec![a; callee.input_types().len()];
+            if passes_axis_index {
+                let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                call_inputs[0] =
+                    builder.add_instruction(ArrayOperation::AxisIndex(index), Vec::new(), Vec::new(), None).unwrap()[0];
+            }
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], call_inputs, None).unwrap().to_vec()
+        })
+    }
+
+    /// Builds the `shard_map` programs of [`lockstep_call_program`] for a callee traced at `callee_input_types` whose
+    /// instructions `build` adds over its inputs, followed by the programs of [`lockstep_shard_map_program`] whose body
+    /// applies `build` to `a` directly, once per entry of `callee_input_types`. `build` receives its inputs together
+    /// with their types, at which it traces the regions of the operations that it adds.
+    fn lockstep_nested_programs(
+        mesh: &LogicalMesh,
+        a_local_type: &ArrayIrType,
+        callee_input_types: Vec<ArrayIrType>,
+        build: impl Fn(&mut ProgramBuilder<TestValue, TestOperation>, &[AtomId], &[ArrayIrType]) -> Vec<AtomId>,
+    ) -> [(TestProgram, TestProgram); 2] {
+        let input_count = callee_input_types.len();
+        let callee =
+            build_program(callee_input_types.clone(), |builder, inputs| build(builder, inputs, &callee_input_types));
+        let called = lockstep_call_program(mesh, a_local_type, callee, false);
+        let direct = lockstep_shard_map_program(mesh, a_local_type, |builder, a| {
+            build(builder, &vec![a; input_count], &vec![a_local_type.clone(); input_count])
+        });
+        [called, direct]
+    }
+
+    /// Returns `x ↦ x + x` at type `r#type`, which is linear and its own transpose.
+    fn lockstep_call_double(r#type: ArrayIrType) -> TestProgram {
+        build_program(vec![r#type], |builder, inputs| {
+            let add = ArrayOperation::from(AddOperation::new());
+            builder.add_instruction(add, Vec::new(), vec![inputs[0], inputs[0]], None).unwrap().to_vec()
+        })
+    }
+
+    /// Returns whether `r#type` varies along the manual axis `x`.
+    fn lockstep_call_varies_along_x(r#type: &ArrayIrType) -> bool {
+        matches!(
+            r#type,
+            ArrayIrType::Array(r#type) if r#type.sharding().is_some_and(|sharding| {
+                sharding.varying_manual_axes().contains("x")
+            }),
+        )
+    }
+
+    /// Returns `(b, a) ↦ a * Σ b` over `b` of type `b_type` and `a` of type `a_type`, where `Σ` sums over the manual
+    /// axis `x` of `mesh`. The sum does not vary along `x`, so it first varies along `x` by `parallel_vary` when `a`
+    /// does. The function is linear in `a` and its own transpose, with `b` as its residual.
+    fn lockstep_call_scale_by_sum(mesh: &LogicalMesh, b_type: ArrayIrType, a_type: ArrayIrType) -> TestProgram {
+        let varies = lockstep_call_varies_along_x(&a_type);
+        build_program(vec![b_type, a_type], |builder, inputs| {
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+            let mut sum = builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![inputs[0]], None)
+                .unwrap()[0];
+            if varies {
+                let vary = ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+                sum = builder.add_instruction(vary, Vec::new(), vec![sum], None).unwrap()[0];
+            }
+            let mul = ArrayOperation::from(MulOperation::new());
+            builder.add_instruction(mul, Vec::new(), vec![inputs[1], sum], None).unwrap().to_vec()
+        })
     }
 
     /// Builds a mixed-call fixture with one print of `effect_class` in each partition, i.e., `known = print(k * k)` and
@@ -3766,6 +4066,19 @@ mod tests {
         // A call of a callee that names no devices, including one whose lists hold no override, equals the plain call
         // and hashes only its capture count, its type marker, and its absent result bindings.
         let plain = CallOperation::<ArrayIrType>::new(1);
+        // A field added to the operation fails to compile here until the equality and hashing assertions of this test
+        // and of `test_call_operation_with_derived_input_shardings` cover it.
+        let CallOperation {
+            capture_count: _,
+            marker: _,
+            output_types: _,
+            input_shardings: _,
+            output_shardings: _,
+            mesh: _,
+            keeps_input_placements: _,
+            derived_input_shardings: _,
+            function_mesh: _,
+        } = &plain;
         let mut expected = DefaultHasher::new();
         1usize.hash(&mut expected);
         PhantomData::<fn() -> ArrayIrType>.hash(&mut expected);
@@ -4108,6 +4421,74 @@ mod tests {
             call.validate_input_types(&[f32_vector_type(4)], &[]),
             Err(TypeError::invalid("`call` expected 1 input(s) but got 0")),
         );
+    }
+
+    #[test]
+    fn test_call_operation_validate_input_types_rejects_redefined_state_axes() {
+        let typed = |mesh: &LogicalMesh, sharding: fn(Sharding) -> Sharding| {
+            f32_vector_type(2).with_sharding(sharding(Sharding::replicated(mesh.clone(), 1))).unwrap()
+        };
+        let unreduced_x = |sharding: Sharding| sharding.with_unreduced_axes(["x"]).unwrap();
+        let varying_x = |sharding: Sharding| sharding.with_varying_manual_axes(["x"]).unwrap();
+        let varying_x_y = |sharding: Sharding| sharding.with_varying_manual_axes(["x", "y"]).unwrap();
+        let call = CallOperation::<ArrayType>::new(0);
+
+        // A callee input type with a sharding must define every mesh axis that carries the unreduced, reduced, or
+        // varying state of the input as the mesh of the input does, because an axis of the same name with another
+        // size or type is another axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let larger_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        for (declared, actual) in [
+            (typed(&larger_mesh, unreduced_x), typed(&mesh, unreduced_x)),
+            (typed(&explicit_mesh, unreduced_x), typed(&mesh, unreduced_x)),
+            (typed(&larger_mesh, varying_x), typed(&mesh, varying_x)),
+        ] {
+            assert_eq!(
+                call.validate_input_types(std::slice::from_ref(&declared), std::slice::from_ref(&actual)),
+                Err(TypeError::invalid(format!("`call` input #0 expected {declared} but got {actual}"))),
+            );
+        }
+
+        // Axes that carry no state of the input may differ.
+        let wide_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let other_wide_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            call.validate_input_types(&[typed(&other_wide_mesh, varying_x)], &[typed(&wide_mesh, varying_x)]),
+            Ok(())
+        );
+
+        // Manual mesh axes along which the input varies beyond the callee input type carry state into the call too, so
+        // the mesh of the callee input type must define each of them as well, with the same size and type.
+        let manual_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let other_manual_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            call.validate_input_types(&[typed(&manual_mesh, varying_x)], &[typed(&manual_mesh, varying_x_y)]),
+            Ok(())
+        );
+        for declared in [typed(&other_manual_mesh, varying_x), typed(&mesh, varying_x)] {
+            let actual = typed(&manual_mesh, varying_x_y);
+            assert_eq!(
+                call.validate_input_types(std::slice::from_ref(&declared), std::slice::from_ref(&actual)),
+                Err(TypeError::invalid(format!("`call` input #0 expected {declared} but got {actual}"))),
+            );
+        }
     }
 
     #[test]
@@ -4581,6 +4962,270 @@ mod tests {
     }
 
     #[test]
+    fn test_call_operation_interpret_places_inputs_at_declared_input_shardings() {
+        // A call accepts an input whose placement differs from the sharding that its callee input type declares and
+        // places it at that sharding, so that the callee receives the input `x`, which is split along `x`, replicated,
+        // and the output of the call has the replicated type that the type rule of the call infers.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split_type = f32_vector_type(4).with_sharding(split).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let callee = build_program(vec![ArrayIrType::Array(replicated_type.clone())], |builder, inputs| {
+            builder
+                .add_instruction(
+                    ArrayOperation::from(MulOperation::new()),
+                    Vec::new(),
+                    vec![inputs[0], inputs[0]],
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
+        let program = build_program(vec![ArrayIrType::Array(split_type.clone())], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{split_type} .
+                let %1:{replicated_type} = call %0 [
+                    callee={{
+                        lambda %0:{replicated_type} .
+                        let %1:{replicated_type} = mul %0 %0
+                        in (%1)
+                    }},
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            program.interpret(vec![f32_value(split_type, &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(replicated_type, &[1.0, 4.0, 9.0, 16.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_replicates_inputs_of_callee_input_types_without_shardings() {
+        // A callee input type without a sharding receives its input replicated over the mesh of the call, which is the
+        // mesh of the input when the call names none, as the eager application of a backend places it. The callee
+        // therefore receives the input `x`, which is split along `x`, replicated, and its output is replicated too.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split_type = f32_vector_type(4).with_sharding(split).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let callee = build_program(vec![ArrayIrType::Array(f32_vector_type(4))], |builder, inputs| {
+            builder
+                .add_instruction(
+                    ArrayOperation::from(MulOperation::new()),
+                    Vec::new(),
+                    vec![inputs[0], inputs[0]],
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
+        let program = build_program(vec![ArrayIrType::Array(split_type.clone())], |builder, inputs| {
+            let callee = builder.import_program(callee.clone());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{split_type} .
+                let %1:f32[4] = call %0 [
+                    callee={{
+                        lambda %0:f32[4] .
+                        let %1:f32[4] = mul %0 %0
+                        in (%1)
+                    }},
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            program.interpret(vec![f32_value(split_type, &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(replicated_type, &[1.0, 4.0, 9.0, 16.0])]),
+        );
+
+        // A placement over a single device is placed too, so the input `y`, which is split along the axis `y` of size
+        // one, is replicated over its mesh.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let split_type = f32_vector_type(4).with_sharding(split).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let program = build_program(vec![ArrayIrType::Array(split_type.clone())], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.interpret(vec![f32_value(split_type, &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(replicated_type, &[1.0, 4.0, 9.0, 16.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_places_inputs_at_boundary_shardings_that_callees_accept() {
+        // The input `a` of a callee input type without a sharding is placed at its sharding override, which splits it
+        // along `x`, so the callee receives `a` split. The input `b` of a callee input type that declares the
+        // replicated sharding enters the callee at that sharding, which is the only one that the callee accepts, so its
+        // override, which splits it along `x`, is not observable inside the callee.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let split_type = f32_vector_type(4).with_sharding(split.clone()).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let callee_input_types =
+            vec![ArrayIrType::Array(f32_vector_type(4)), ArrayIrType::Array(replicated_type.clone())];
+        let callee = build_program(callee_input_types, |builder, inputs| {
+            inputs
+                .iter()
+                .map(|input| {
+                    let mul = ArrayOperation::from(MulOperation::new());
+                    builder.add_instruction(mul, Vec::new(), vec![*input, *input], None).unwrap()[0]
+                })
+                .collect()
+        });
+        let input_types =
+            vec![ArrayIrType::Array(replicated_type.clone()), ArrayIrType::Array(replicated_type.clone())];
+        let call = |operation: CallOperation<ArrayIrType>| {
+            build_program(input_types.clone(), |builder, inputs| {
+                let callee = builder.import_program(callee.clone());
+                let call = TestOperation::Call(operation);
+                builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+            })
+        };
+        let overrides = "[{mesh<['x'=2:explicit]>, [{'x'}]}, {mesh<['x'=2:explicit]>, [{'x'}]}]";
+        let overridden = call(CallOperation::new(0).with_boundary(
+            Some(&device_mesh),
+            vec![Some(split.clone()), Some(split.clone())],
+            Vec::new(),
+        ));
+        assert_eq!(
+            overridden.to_string(),
+            formatdoc! {"
+                lambda %0:{replicated_type}, %1:{replicated_type} .
+                let %2:f32[4], %3:{replicated_type} = call [
+                    input_shardings={overrides},
+                    devices=[0, 1],
+                ] %0 %1 [
+                    callee={{
+                        lambda %0:f32[4], %1:{replicated_type} .
+                        let %2:f32[4] = mul %0 %0
+                            %3:{replicated_type} = mul %1 %1
+                        in (%2, %3)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        let inputs = vec![
+            f32_value(replicated_type.clone(), &[1.0, 2.0, 3.0, 4.0]),
+            f32_value(replicated_type.clone(), &[5.0, 6.0, 7.0, 8.0]),
+        ];
+        assert_eq!(
+            overridden.interpret(inputs.clone()),
+            Ok(vec![
+                f32_value(split_type.clone(), &[1.0, 4.0, 9.0, 16.0]),
+                f32_value(replicated_type.clone(), &[25.0, 36.0, 49.0, 64.0]),
+            ]),
+        );
+
+        // A call that a program transform derives from another call places the inputs that it receives from the
+        // original call at their derived shardings by the same rule.
+        let derived = call(CallOperation::new(0).with_derived_input_shardings(vec![Some(split.clone()), Some(split)]));
+        assert_eq!(
+            derived.to_string(),
+            formatdoc! {"
+                lambda %0:{replicated_type}, %1:{replicated_type} .
+                let %2:f32[4], %3:{replicated_type} = call [
+                    derived_input_shardings={overrides},
+                ] %0 %1 [
+                    callee={{
+                        lambda %0:f32[4], %1:{replicated_type} .
+                        let %2:f32[4] = mul %0 %0
+                            %3:{replicated_type} = mul %1 %1
+                        in (%2, %3)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            derived.interpret(inputs),
+            Ok(vec![
+                f32_value(split_type, &[1.0, 4.0, 9.0, 16.0]),
+                f32_value(replicated_type, &[25.0, 36.0, 49.0, 64.0]),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_keeps_no_placement_along_auto_axes() {
+        // Array types do not record placement along auto mesh axes, and reference arrays live on no devices, so they
+        // report no placement. The overrides split both inputs along the auto axis `x`, which a backend applies at
+        // runtime, while the reference results keep the replicated types that the type rule infers and report no
+        // placement, whether the callee input type declares no sharding (`a`) or a sharding over the auto mesh (`b`).
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let callee_input_types =
+            vec![ArrayIrType::Array(f32_vector_type(4)), ArrayIrType::Array(replicated_type.clone())];
+        let callee = build_program(callee_input_types, |builder, inputs| {
+            inputs
+                .iter()
+                .map(|input| {
+                    let mul = ArrayOperation::from(MulOperation::new());
+                    builder.add_instruction(mul, Vec::new(), vec![*input, *input], None).unwrap()[0]
+                })
+                .collect()
+        });
+        let input_types =
+            vec![ArrayIrType::Array(replicated_type.clone()), ArrayIrType::Array(replicated_type.clone())];
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0).with_boundary(
+                Some(&device_mesh),
+                vec![Some(split.clone()), Some(split)],
+                Vec::new(),
+            ));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let overrides = "[{mesh<['x'=2:auto]>, [{'x'}]}, {mesh<['x'=2:auto]>, [{'x'}]}]";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{replicated_type}, %1:{replicated_type} .
+                let %2:f32[4], %3:{replicated_type} = call [
+                    input_shardings={overrides},
+                    devices=[0, 1],
+                ] %0 %1 [
+                    callee={{
+                        lambda %0:f32[4], %1:{replicated_type} .
+                        let %2:f32[4] = mul %0 %0
+                            %3:{replicated_type} = mul %1 %1
+                        in (%2, %3)
+                    }},
+                ]
+                in (%2, %3)"},
+        );
+        let outputs = program
+            .interpret(vec![
+                f32_value(replicated_type.clone(), &[1.0, 2.0, 3.0, 4.0]),
+                f32_value(replicated_type.clone(), &[5.0, 6.0, 7.0, 8.0]),
+            ])
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                f32_value(replicated_type.clone(), &[1.0, 4.0, 9.0, 16.0]),
+                f32_value(replicated_type, &[25.0, 36.0, 49.0, 64.0]),
+            ],
+        );
+        assert_eq!(outputs.iter().map(Placed::placement).collect::<Vec<_>>(), vec![None, None]);
+    }
+
+    #[test]
     fn test_call_operation_interpret_in_lockstep() {
         // Inside the body of a `shard_map`, a call whose callee sums over the manual axis `x` runs its callee once for
         // both devices in lockstep, which replaces the values `1` and `2` of the two devices by their sum.
@@ -4615,6 +5260,1206 @@ mod tests {
             program.interpret(vec![f32_value(global_type.clone(), &[1.0, 2.0])]),
             Ok(vec![f32_value(global_type.with_sharding(sharded).unwrap(), &[3.0, 3.0])]),
         );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_varies_outputs_along_extra_input_variation() {
+        // Inside the body of a `shard_map`, input `b` varies along the manual axis `x` beyond its callee input type, so
+        // both outputs of the call vary along `x` by the type rule of the call, although the callee computes them from
+        // the sum of `a` over `x` and from a constant, which are invariant. The sums over `x` that follow therefore
+        // count the value of each of the two devices, which are `3` and `0`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![sharded.clone(), sharded.clone()],
+            vec![replicated.clone(), replicated.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+        let a_type = f32_vector_type(2);
+        let b_type = f32_vector_type(4);
+        let local_type = |index, r#type: &ArrayType| {
+            let global_type = r#type.clone().with_sharding(sharded.clone()).unwrap();
+            ArrayIrType::Array(boundary.local_input_type(index, &global_type).unwrap())
+        };
+        let (a_local_type, b_local_type) = (local_type(0, &a_type), local_type(1, &b_type));
+        let parallel_sum = || {
+            ArrayOperation::ParallelReduce(
+                ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone()),
+            )
+        };
+        let callee =
+            build_program(vec![a_local_type.clone(), ArrayIrType::Array(f32_vector_type(2))], |builder, inputs| {
+                let sum = builder.add_instruction(parallel_sum(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                let zero = ArrayOperation::from(ZeroOperation::new(f32_vector_type(1)));
+                let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+                vec![sum, zero]
+            });
+        let body = build_program(vec![a_local_type.clone(), b_local_type.clone()], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            let outputs = builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec();
+            outputs
+                .into_iter()
+                .map(|output| builder.add_instruction(parallel_sum(), Vec::new(), vec![output], None).unwrap()[0])
+                .collect()
+        });
+        let output_type = f32_vector_type(1).with_sharding(replicated).unwrap();
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{a_local_type}, %1:{b_local_type} .
+                let %2:{a_local_type}, %3:{a_local_type} = call %0 %1 [
+                    callee={{
+                        lambda %0:{a_local_type}, %1:f32[2] .
+                        let %2:{output_type} = {sum} %0
+                            %3:f32[1] = zero [type=f32[1]]
+                        in (%2, %3)
+                    }},
+                ]
+                    %4:{output_type} = {sum} %2
+                    %5:{output_type} = {sum} %3
+                in (%4, %5)"},
+        );
+        let input_types = vec![ArrayIrType::Array(a_type.clone()), ArrayIrType::Array(b_type.clone())];
+        let operation = ShardMapOperation::from_program(&body, input_types.clone(), boundary).unwrap();
+        let program = build_program(input_types, |builder, inputs| {
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.interpret(vec![f32_value(a_type, &[1.0, 2.0]), f32_value(b_type, &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(output_type.clone(), &[6.0]), f32_value(output_type, &[0.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_varies_outputs_of_callees_without_collectives() {
+        // Inside the body of a `shard_map`, input `a` varies along the manual axis `x` beyond its callee input type, so
+        // the output of the call varies along `x` by the type rule of the call, although the callee contains no
+        // collective and computes it from the invariant input `b` alone. The emulation therefore runs the call once for
+        // both devices, which places `a` at the replicated sharding that its callee input type declares and keeps its
+        // variation, and the sum over `x` that follows counts the value `b * b` of each of the two devices.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![sharded.clone(), replicated.clone()],
+            vec![replicated.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+        let global_type = f32_vector_type(2);
+        let a_local_type = ArrayIrType::Array(
+            boundary.local_input_type(0, &global_type.clone().with_sharding(sharded).unwrap()).unwrap(),
+        );
+        let b_local_type = ArrayIrType::Array(
+            boundary
+                .local_input_type(1, &global_type.clone().with_sharding(replicated.clone()).unwrap())
+                .unwrap(),
+        );
+        let a_declared_type = ArrayIrType::Array(f32_vector_type(1).with_sharding(replicated.clone()).unwrap());
+        let callee =
+            build_program(vec![a_declared_type.clone(), ArrayIrType::Array(f32_vector_type(2))], |builder, inputs| {
+                builder
+                    .add_instruction(
+                        ArrayOperation::from(MulOperation::new()),
+                        Vec::new(),
+                        vec![inputs[1], inputs[1]],
+                        None,
+                    )
+                    .unwrap()
+                    .to_vec()
+            });
+        let body = build_program(vec![a_local_type.clone(), b_local_type.clone()], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            let squared = builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap()[0];
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+            builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![squared], None)
+                .unwrap()
+                .to_vec()
+        });
+        let varying_type = f32_vector_type(2)
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let output_type = global_type.clone().with_sharding(replicated).unwrap();
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{a_local_type}, %1:{b_local_type} .
+                let %2:{varying_type} = call %0 %1 [
+                    callee={{
+                        lambda %0:{a_declared_type}, %1:f32[2] .
+                        let %2:f32[2] = mul %1 %1
+                        in (%2)
+                    }},
+                ]
+                    %3:{output_type} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %2
+                in (%3)"},
+        );
+        let input_types = vec![ArrayIrType::Array(global_type.clone()), ArrayIrType::Array(global_type.clone())];
+        let operation = ShardMapOperation::from_program(&body, input_types.clone(), boundary).unwrap();
+        let program = build_program(input_types, |builder, inputs| {
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.interpret(vec![f32_value(global_type.clone(), &[1.0, 2.0]), f32_value(global_type, &[3.0, 4.0])]),
+            Ok(vec![f32_value(output_type, &[18.0, 32.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_conditions_at_callee_input_types() {
+        // Inside the body of a `shard_map`, input `a` varies along the manual axis `x` beyond its first callee input
+        // type, and the callee, traced at that plain type, selects with a `condition` whose branches declare it too.
+        // The emulation runs the callee at the types that it was traced at, as a backend does, so the `condition`
+        // accepts `a` and squares it on both devices, and the sum over `x` that follows is `1 + 4`. The second callee
+        // input declares the variation of `a`, so the callee also sums `a` over `x`, which runs the call in lockstep for
+        // that reason too, and the second output then counts that sum `3` once per device.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let callee = build_program(vec![plain_type.clone(), a_local_type.clone()], |builder, inputs| {
+            let zero = ArrayOperation::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
+            let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+            let compare = ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::Equal));
+            let predicate = builder.add_instruction(compare, Vec::new(), vec![zero, zero], None).unwrap()[0];
+            let true_branch = builder.import_program(lockstep_call_square(plain_type.clone()));
+            let false_branch =
+                builder.import_program(build_program(vec![plain_type.clone()], |_, inputs| inputs.to_vec()));
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            let selected = builder
+                .add_instruction(condition, vec![true_branch, false_branch], vec![predicate, inputs[0]], None)
+                .unwrap()[0];
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+            let sum = builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![inputs[1]], None)
+                .unwrap()[0];
+            vec![selected, sum]
+        });
+        let (body, program) = lockstep_call_program(&mesh, &a_local_type, callee, false);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying}, %2:{varying} = call %0 %0 [
+                    callee={{
+                        lambda %0:f32[1], %1:{varying} .
+                        let %2:f32[] = zero [type=f32[]]
+                            %3:bool[] = compare [direction=Equal] %2 %2
+                            %4:f32[1] = condition %3 %0 [
+                                true={{
+                                    lambda %0:f32[1] .
+                                    let %1:f32[1] = mul %0 %0
+                                    in (%1)
+                                }},
+                                false={{
+                                    lambda %0:f32[1] .
+                                    in (%0)
+                                }},
+                            ]
+                            %5:{invariant} = {sum} %1
+                        in (%4, %5)
+                    }},
+                ]
+                    %3:{invariant} = {sum} %1
+                    %4:{invariant} = {sum} %2
+                in (%3, %4)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type.clone(), &[5.0]), f32_value(output_type, &[6.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_selects_nested_condition_branches_per_device() {
+        // The callee selects with a `condition` on whether its first input is `0`, which is the index of each device
+        // along `x` and varies along `x` beyond its plain callee input type, as `a` does. The branches use no
+        // collective, so each device takes its own branch, as on a backend: device 0 squares its value `1` and device 1
+        // keeps its value `2`, and the sum over `x` that follows is `1 + 2`.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::U64));
+        let callee = build_program(vec![index_type, plain_type.clone()], |builder, inputs| {
+            let zero = ArrayOperation::from(ZeroLikeOperation::<ArrayType>::new());
+            let zero = builder.add_instruction(zero, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let compare = ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::Equal));
+            let predicate = builder.add_instruction(compare, Vec::new(), vec![inputs[0], zero], None).unwrap()[0];
+            let true_branch = builder.import_program(lockstep_call_square(plain_type.clone()));
+            let false_branch =
+                builder.import_program(build_program(vec![plain_type.clone()], |_, inputs| inputs.to_vec()));
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            builder
+                .add_instruction(condition, vec![true_branch, false_branch], vec![predicate, inputs[1]], None)
+                .unwrap()
+                .to_vec()
+        });
+        let (body, program) = lockstep_call_program(&mesh, &a_local_type, callee, true);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let index = "u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let axis_index = r#"axis_index [axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{index} = {axis_index}
+                    %2:{varying} = call %1 %0 [
+                        callee={{
+                            lambda %0:u64[], %1:f32[1] .
+                            let %2:u64[] = zero_like %0
+                                %3:bool[] = compare [direction=Equal] %0 %2
+                                %4:f32[1] = condition %3 %1 [
+                                    true={{
+                                        lambda %0:f32[1] .
+                                        let %1:f32[1] = mul %0 %0
+                                        in (%1)
+                                    }},
+                                    false={{
+                                        lambda %0:f32[1] .
+                                        in (%0)
+                                    }},
+                                ]
+                            in (%4)
+                        }},
+                    ]
+                    %3:{invariant} = {sum} %2
+                in (%3)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type, &[3.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_rejects_disagreeing_predicates_of_nested_collective_conditions() {
+        // As in `test_call_operation_interpret_in_lockstep_selects_nested_condition_branches_per_device`, the devices
+        // disagree on the predicate of the `condition` of the callee, but its `true` branch sums over `x`, so the
+        // branches must run in lockstep, which requires every device to take the same path. The emulation rejects
+        // this, as its documentation states, while a backend would run a collective on device 0 alone.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let declared_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::U64));
+        let true_branch = build_program(vec![declared_type.clone()], |builder, inputs| {
+            let vary = ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+            let varying = builder.add_instruction(vary, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone());
+            builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![varying], None)
+                .unwrap()
+                .to_vec()
+        });
+        let callee = build_program(vec![index_type, declared_type.clone()], |builder, inputs| {
+            let zero = ArrayOperation::from(ZeroLikeOperation::<ArrayType>::new());
+            let zero = builder.add_instruction(zero, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let compare = ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::Equal));
+            let predicate = builder.add_instruction(compare, Vec::new(), vec![inputs[0], zero], None).unwrap()[0];
+            let true_branch = builder.import_program(true_branch);
+            let false_branch =
+                builder.import_program(build_program(vec![declared_type.clone()], |_, inputs| inputs.to_vec()));
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            builder
+                .add_instruction(condition, vec![true_branch, false_branch], vec![predicate, inputs[1]], None)
+                .unwrap()
+                .to_vec()
+        });
+        let (body, program) = lockstep_call_program(&mesh, &a_local_type, callee, true);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let index = "u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let axis_index = r#"axis_index [axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{index} = {axis_index}
+                    %2:{varying} = call %1 %0 [
+                        callee={{
+                            lambda %0:u64[], %1:{invariant} .
+                            let %2:u64[] = zero_like %0
+                                %3:bool[] = compare [direction=Equal] %0 %2
+                                %4:{invariant} = condition %3 %1 [
+                                    true={{
+                                        lambda %0:{invariant} .
+                                        let %1:{varying} = {vary} %0
+                                            %2:{invariant} = {sum} %1
+                                        in (%2)
+                                    }},
+                                    false={{
+                                        lambda %0:{invariant} .
+                                        in (%0)
+                                    }},
+                                ]
+                            in (%4)
+                        }},
+                    ]
+                    %3:{invariant} = {sum} %2
+                in (%3)"},
+        );
+        assert!(matches!(
+            program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Err(ProgramError::UnsupportedOperation { message }) if message == "the devices of a `shard_map` disagree \
+                on the predicate of a `condition` whose regions use collectives over the manual axes, but lockstep \
+                emulation requires every device to take the same path",
+        ));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_while_loops_at_callee_input_types() {
+        // The callee, traced at a plain input type, squares its input once in a `while` loop whose state declares that
+        // type. The loop accepts `a`, which varies along `x` beyond that type, because the callee runs at the types
+        // that it was traced at, and the sum over `x` that follows is `1 + 4`.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let counter_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let condition = build_program(vec![counter_type.clone(), plain_type.clone()], |builder, inputs| {
+            let one = ArrayOperation::OneLike(OneLikeOperation::new());
+            let one = builder.add_instruction(one, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let compare = ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan));
+            builder.add_instruction(compare, Vec::new(), vec![inputs[0], one], None).unwrap().to_vec()
+        });
+        let body = build_program(vec![counter_type, plain_type.clone()], |builder, inputs| {
+            let one = ArrayOperation::OneLike(OneLikeOperation::new());
+            let one = builder.add_instruction(one, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let add = ArrayOperation::from(AddOperation::new());
+            let counter = builder.add_instruction(add, Vec::new(), vec![inputs[0], one], None).unwrap()[0];
+            let mul = ArrayOperation::from(MulOperation::new());
+            let squared = builder.add_instruction(mul, Vec::new(), vec![inputs[1], inputs[1]], None).unwrap()[0];
+            vec![counter, squared]
+        });
+        let callee = build_program(vec![plain_type], |builder, inputs| {
+            let zero = ArrayOperation::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
+            let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+            let regions = vec![builder.import_program(condition), builder.import_program(body)];
+            vec![builder.add_instruction(WhileOperation::new(), regions, vec![zero, inputs[0]], None).unwrap()[1]]
+        });
+        let (body, program) = lockstep_call_program(&mesh, &a_local_type, callee, false);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[] = zero [type=f32[]]
+                            %2:f32[], %3:f32[1] = while %1 %0 [
+                                condition={{
+                                    lambda %0:f32[], %1:f32[1] .
+                                    let %2:f32[] = one_like %0
+                                        %3:bool[] = compare [direction=LessThan] %0 %2
+                                    in (%3)
+                                }},
+                                body={{
+                                    lambda %0:f32[], %1:f32[1] .
+                                    let %2:f32[] = one_like %0
+                                        %3:f32[] = add %0 %2
+                                        %4:f32[1] = mul %1 %1
+                                    in (%3, %4)
+                                }},
+                            ]
+                        in (%3)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type, &[5.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_scans_at_callee_input_types() {
+        // The callee, traced at a plain input type, doubles its input twice in a `scan` whose carry declares that type.
+        // The scan accepts `a`, which varies along `x` beyond that type, because the callee runs at the types that it
+        // was traced at, and the sum over `x` that follows is `4 + 8`.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let body =
+            build_program(vec![ArrayType::scalar(DataType::I64).into(), plain_type.clone()], |builder, inputs| {
+                let add = ArrayOperation::from(AddOperation::new());
+                builder.add_instruction(add, Vec::new(), vec![inputs[1], inputs[1]], None).unwrap().to_vec()
+            });
+        let callee = build_program(vec![plain_type], |builder, inputs| {
+            let body = builder.import_program(body);
+            let scan = ScanOperation::<ArrayIrType>::new(1, 2usize);
+            builder.add_instruction(scan, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let (body, program) = lockstep_call_program(&mesh, &a_local_type, callee, false);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[1] = scan [carry_count=1, iteration_count=2, reverse=false] %0 [
+                            body={{
+                                lambda %0:i64[], %1:f32[1] .
+                                let %2:f32[1] = add %1 %1
+                                in (%2)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type, &[12.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_composites_at_callee_input_types() {
+        // The callee, traced at a plain input type, doubles its input in a `composite` whose primal region declares
+        // that type. `a` enters the callee without its variation along `x`, so the `composite` accepts it and binds
+        // once per device, because its region uses no collective, and the sum over `x` that follows is `2 + 4`. The
+        // same `composite` staged directly in the body, at the type of `a`, computes the same sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let [(call_body, call_program), (direct_body, direct_program)] =
+            lockstep_nested_programs(&mesh, &a_local_type, vec![plain_type], |builder, inputs, input_types| {
+                let primal = builder.import_program(lockstep_call_double(input_types[0].clone()));
+                let composite =
+                    CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Derived, false);
+                builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap().to_vec()
+            });
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[1] = composite [jvp_from_primal=true] %0 [
+                            primal={{
+                                lambda %0:f32[1] .
+                                let %1:f32[1] = add %0 %0
+                                in (%1)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = composite [jvp_from_primal=true] %0 [
+                    primal={{
+                        lambda %0:{varying} .
+                        let %1:{varying} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[6.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[6.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_collective_composites_at_callee_input_types() {
+        // The callee scales its second input, of an invariant type, by the sum over `x` of its first input, which
+        // declares the variation of `a`, in a `composite` whose primal region computes that sum, so the `composite`
+        // runs in lockstep by its rule over all devices. `a` enters the second input without its variation along `x`,
+        // so the `composite` accepts it and scales `1` and `2` by `1 + 2`, and the call varies the result along `x`,
+        // so that the sum over `x` that follows is `3 + 6`. The same `composite` staged directly in the body, at the
+        // type of `a`, whose region varies the sum along `x` to scale `a` by it, computes the same sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let invariant_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let [(call_body, call_program), (direct_body, direct_program)] = lockstep_nested_programs(
+            &mesh,
+            &a_local_type,
+            vec![a_local_type.clone(), invariant_type],
+            |builder, inputs, input_types| {
+                let primal = lockstep_call_scale_by_sum(&mesh, input_types[0].clone(), input_types[1].clone());
+                let primal = builder.import_program(primal);
+                let composite =
+                    CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Derived, false);
+                builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap().to_vec()
+            },
+        );
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 %0 [
+                    callee={{
+                        lambda %0:{varying}, %1:{invariant} .
+                        let %2:{invariant} = composite [jvp_from_primal=true] %0 %1 [
+                            primal={{
+                                lambda %0:{varying}, %1:{invariant} .
+                                let %2:{invariant} = {sum} %0
+                                    %3:{invariant} = mul %1 %2
+                                in (%3)
+                            }},
+                        ]
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = composite [jvp_from_primal=true] %0 %0 [
+                    primal={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{invariant} = {sum} %0
+                            %3:{varying} = {vary} %2
+                            %4:{varying} = mul %1 %3
+                        in (%4)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[9.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[9.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_named_composites_at_callee_input_types() {
+        // As in `test_call_operation_interpret_in_lockstep_runs_nested_composites_at_callee_input_types`, but the
+        // `composite` is a call of a named composite, whose primal region is the body that the definition traces for
+        // the input types of the call. The callee shares the body traced at the plain type, the direct form shares the
+        // body traced at the type of `a`, and both compute the sum `2 + 4`.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let registration = CustomRuleRegistration::new(
+            CustomRuleDefinition::<TestValue, TestOperation>::new("double").with_named_composite(NamedComposite::new(
+                CompositeKey::new("ryft.tests.lockstep_double", 1),
+                |input_types: &[ArrayIrType]| Ok(input_types.to_vec()),
+                |inputs: &[CustomRuleTracer<TestValue, TestOperation>]| {
+                    let add = ArrayOperation::from(AddOperation::new());
+                    inputs[0].context().bind(add, Vec::new(), &[inputs[0].clone(), inputs[0].clone()])
+                },
+            )),
+        );
+        let [(call_body, call_program), (direct_body, direct_program)] =
+            lockstep_nested_programs(&mesh, &a_local_type, vec![plain_type], |builder, inputs, input_types| {
+                let body = registration.reference().body(input_types).unwrap();
+                let primal = builder.intern_callee(&body, None).unwrap();
+                let composite = TestOperation::Composite(CompositeOperation::new(registration.reference()));
+                builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap().to_vec()
+            });
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let key = r#"key="ryft.tests.lockstep_double.v1""#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[1] = composite [{key}] %0 [
+                            primal={{
+                                lambda %0:f32[1] .
+                                let %1:f32[1] = add %0 %0
+                                in (%1)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = composite [{key}] %0 [
+                    primal={{
+                        lambda %0:{varying} .
+                        let %1:{varying} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[6.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[6.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_collective_named_composites_at_callee_input_types() {
+        // As in `test_call_operation_interpret_in_lockstep_runs_nested_collective_composites_at_callee_input_types`,
+        // but the `composite` is a call of a named composite whose body computes the scaled sum, and which varies the
+        // sum along `x` when the scaled input varies along `x`. Its call in the callee runs in lockstep, and both forms
+        // compute the sum `3 + 6`.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let invariant_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let body_mesh = mesh.clone();
+        let registration = CustomRuleRegistration::new(
+            CustomRuleDefinition::<TestValue, TestOperation>::new("scale_by_sum").with_named_composite(
+                NamedComposite::new(
+                    CompositeKey::new("ryft.tests.lockstep_scale_by_sum", 1),
+                    |input_types: &[ArrayIrType]| Ok(vec![input_types[1].clone()]),
+                    move |inputs: &[CustomRuleTracer<TestValue, TestOperation>]| {
+                        let context = inputs[0].context();
+                        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string())
+                            .with_mesh(body_mesh.clone());
+                        let sum = ArrayOperation::ParallelReduce(sum);
+                        let mut sum = context.bind(sum, Vec::new(), std::slice::from_ref(&inputs[0]))?.remove(0);
+                        if lockstep_call_varies_along_x(&inputs[1].r#type()) {
+                            let vary = ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+                            sum = context.bind(vary, Vec::new(), &[sum])?.remove(0);
+                        }
+                        let mul = ArrayOperation::from(MulOperation::new());
+                        context.bind(mul, Vec::new(), &[inputs[1].clone(), sum])
+                    },
+                ),
+            ),
+        );
+        let [(call_body, call_program), (direct_body, direct_program)] = lockstep_nested_programs(
+            &mesh,
+            &a_local_type,
+            vec![a_local_type.clone(), invariant_type],
+            |builder, inputs, input_types| {
+                let body = registration.reference().body(input_types).unwrap();
+                let primal = builder.intern_callee(&body, None).unwrap();
+                let composite = TestOperation::Composite(CompositeOperation::new(registration.reference()));
+                builder.add_instruction(composite, vec![primal], inputs.to_vec(), None).unwrap().to_vec()
+            },
+        );
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        let key = r#"key="ryft.tests.lockstep_scale_by_sum.v1""#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 %0 [
+                    callee={{
+                        lambda %0:{varying}, %1:{invariant} .
+                        let %2:{invariant} = composite [{key}] %0 %1 [
+                            primal={{
+                                lambda %0:{varying}, %1:{invariant} .
+                                let %2:{invariant} = {sum} %0
+                                    %3:{invariant} = mul %1 %2
+                                in (%3)
+                            }},
+                        ]
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = composite [{key}] %0 %0 [
+                    primal={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{invariant} = {sum} %0
+                            %3:{varying} = {vary} %2
+                            %4:{varying} = mul %1 %3
+                        in (%4)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[9.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[9.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_linear_calls_at_callee_input_types() {
+        // The callee, traced at a plain input type, doubles its input in a `linear_call` whose forward and transpose
+        // regions declare that type. `a` enters the callee without its variation along `x`, so the `linear_call`
+        // accepts it and binds once per device, because its regions use no collective, and the sum over `x` that
+        // follows is `2 + 4`. The same `linear_call` staged directly in the body, at the type of `a`, computes the
+        // same sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let [(call_body, call_program), (direct_body, direct_program)] =
+            lockstep_nested_programs(&mesh, &a_local_type, vec![plain_type], |builder, inputs, input_types| {
+                let forward = builder.import_program(lockstep_call_double(input_types[0].clone()));
+                let transpose = builder.import_program(lockstep_call_double(input_types[0].clone()));
+                let linear_call = LinearCallOperation::<ArrayIrType>::new(0);
+                builder
+                    .add_instruction(linear_call, vec![forward, transpose], inputs.to_vec(), None)
+                    .unwrap()
+                    .to_vec()
+            });
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[1] = linear_call [residual_count=0] %0 [
+                            forward={{
+                                lambda %0:f32[1] .
+                                let %1:f32[1] = add %0 %0
+                                in (%1)
+                            }},
+                            transpose={{
+                                lambda %0:f32[1] .
+                                let %1:f32[1] = add %0 %0
+                                in (%1)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = linear_call [residual_count=0] %0 [
+                    forward={{
+                        lambda %0:{varying} .
+                        let %1:{varying} = add %0 %0
+                        in (%1)
+                    }},
+                    transpose={{
+                        lambda %0:{varying} .
+                        let %1:{varying} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[6.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[6.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_collective_linear_calls_at_callee_input_types() {
+        // The callee scales its second input, of an invariant type, by the sum over `x` of its first input, which
+        // declares the variation of `a` and is the residual of a `linear_call` whose forward region computes that sum,
+        // so the `linear_call` runs in lockstep by its rule over all devices. Its transpose region is the same linear
+        // function. `a` enters the second input without its variation along `x`, so the `linear_call` accepts it and
+        // scales `1` and `2` by `1 + 2`, and the call varies the result along `x`, so that the sum over `x` that
+        // follows is `3 + 6`. The same `linear_call` staged directly in the body, at the type of `a`, whose regions
+        // vary the sum along `x` to scale `a` by it, computes the same sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let invariant_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let [(call_body, call_program), (direct_body, direct_program)] = lockstep_nested_programs(
+            &mesh,
+            &a_local_type,
+            vec![a_local_type.clone(), invariant_type],
+            |builder, inputs, input_types| {
+                let forward = lockstep_call_scale_by_sum(&mesh, input_types[0].clone(), input_types[1].clone());
+                let transpose = builder.import_program(forward.clone());
+                let forward = builder.import_program(forward);
+                let linear_call = LinearCallOperation::<ArrayIrType>::new(1);
+                builder
+                    .add_instruction(linear_call, vec![forward, transpose], inputs.to_vec(), None)
+                    .unwrap()
+                    .to_vec()
+            },
+        );
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 %0 [
+                    callee={{
+                        lambda %0:{varying}, %1:{invariant} .
+                        let %2:{invariant} = linear_call [residual_count=1] %0 %1 [
+                            forward={{
+                                lambda %0:{varying}, %1:{invariant} .
+                                let %2:{invariant} = {sum} %0
+                                    %3:{invariant} = mul %1 %2
+                                in (%3)
+                            }},
+                            transpose={{
+                                lambda %0:{varying}, %1:{invariant} .
+                                let %2:{invariant} = {sum} %0
+                                    %3:{invariant} = mul %1 %2
+                                in (%3)
+                            }},
+                        ]
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = linear_call [residual_count=1] %0 %0 [
+                    forward={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{invariant} = {sum} %0
+                            %3:{varying} = {vary} %2
+                            %4:{varying} = mul %1 %3
+                        in (%4)
+                    }},
+                    transpose={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{invariant} = {sum} %0
+                            %3:{varying} = {vary} %2
+                            %4:{varying} = mul %1 %3
+                        in (%4)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[9.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[9.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_rematerializations_at_callee_input_types() {
+        // The callee, traced at a plain input type, doubles its input in a `rematerialize` call whose body declares
+        // that type. `a` enters the callee without its variation along `x`, so the `rematerialize` call accepts it
+        // and binds once per device, because its body uses no collective, and the sum over `x` that follows is
+        // `2 + 4`. The same `rematerialize` call staged directly in the body, at the type of `a`, computes the same
+        // sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let plain_type = ArrayIrType::Array(f32_vector_type(1));
+        let [(call_body, call_program), (direct_body, direct_program)] =
+            lockstep_nested_programs(&mesh, &a_local_type, vec![plain_type], |builder, inputs, input_types| {
+                let body = builder.import_program(lockstep_call_double(input_types[0].clone()));
+                let policy = ResidualPolicyReference::new(NothingSavable);
+                let rematerialize = TestOperation::Rematerialize(RematerializeOperation::new(policy));
+                builder.add_instruction(rematerialize, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+            });
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:f32[1] .
+                        let %1:f32[1] = rematerialize %0 [
+                            body={{
+                                lambda %0:f32[1] .
+                                let %1:f32[1] = add %0 %0
+                                in (%1)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = rematerialize %0 [
+                    body={{
+                        lambda %0:{varying} .
+                        let %1:{varying} = add %0 %0
+                        in (%1)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[6.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[6.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_nested_collective_rematerializations_at_callee_input_types() {
+        // The callee scales its second input, of an invariant type, by the sum over `x` of its first input, which
+        // declares the variation of `a`, in a `rematerialize` call whose body computes that sum, so the call runs in
+        // lockstep by its rule over all devices. `a` enters the second input without its variation along `x`, so the
+        // `rematerialize` call accepts it and scales `1` and `2` by `1 + 2`, and the outer call varies the result
+        // along `x`, so that the sum over `x` that follows is `3 + 6`. The same `rematerialize` call staged directly
+        // in the body, at the type of `a`, whose body varies the sum along `x` to scale `a` by it, computes the same
+        // sum.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let invariant_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let [(call_body, call_program), (direct_body, direct_program)] = lockstep_nested_programs(
+            &mesh,
+            &a_local_type,
+            vec![a_local_type.clone(), invariant_type],
+            |builder, inputs, input_types| {
+                let body = lockstep_call_scale_by_sum(&mesh, input_types[0].clone(), input_types[1].clone());
+                let body = builder.import_program(body);
+                let policy = ResidualPolicyReference::new(NothingSavable);
+                let rematerialize = TestOperation::Rematerialize(RematerializeOperation::new(policy));
+                builder.add_instruction(rematerialize, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+            },
+        );
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        assert_eq!(
+            call_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 %0 [
+                    callee={{
+                        lambda %0:{varying}, %1:{invariant} .
+                        let %2:{invariant} = rematerialize %0 %1 [
+                            body={{
+                                lambda %0:{varying}, %1:{invariant} .
+                                let %2:{invariant} = {sum} %0
+                                    %3:{invariant} = mul %1 %2
+                                in (%3)
+                            }},
+                        ]
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            direct_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = rematerialize %0 %0 [
+                    body={{
+                        lambda %0:{varying}, %1:{varying} .
+                        let %2:{invariant} = {sum} %0
+                            %3:{varying} = {vary} %2
+                            %4:{varying} = mul %1 %3
+                        in (%4)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let input = f32_value(f32_vector_type(2), &[1.0, 2.0]);
+        assert_eq!(call_program.interpret(vec![input.clone()]), Ok(vec![f32_value(output_type.clone(), &[9.0])]));
+        assert_eq!(direct_program.interpret(vec![input]), Ok(vec![f32_value(output_type, &[9.0])]));
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_runs_collectives_of_callees_at_invariant_input_types() {
+        // The callee, traced at the invariant type `f32[1]` over the mesh of `x`, sums its input over `x`, which the
+        // type rule of `parallel_reduce` accepts only after `parallel_vary` makes the input varying. That transition
+        // changes no value of any device, so the call of the callee on `a`, which varies along `x` beyond that type,
+        // sums the values `1` and `2` of the two devices, as the callee traced at the varying type of `a` does, which
+        // needs no transition. Both calls return the sum `3` on every device, typed as varying along `x` (the second
+        // callee varies it explicitly), so the sum over `x` that follows is `6` for both.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let invariant_type =
+            ArrayIrType::Array(f32_vector_type(1).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let parallel_sum = || {
+            ArrayOperation::ParallelReduce(
+                ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()).with_mesh(mesh.clone()),
+            )
+        };
+        let parallel_vary = || ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+        let invariant_callee = build_program(vec![invariant_type], |builder, inputs| {
+            let varying = builder.add_instruction(parallel_vary(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder.add_instruction(parallel_sum(), Vec::new(), vec![varying], None).unwrap().to_vec()
+        });
+        let varying_callee = build_program(vec![a_local_type.clone()], |builder, inputs| {
+            let sum = builder.add_instruction(parallel_sum(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder.add_instruction(parallel_vary(), Vec::new(), vec![sum], None).unwrap().to_vec()
+        });
+        let (invariant_body, invariant_program) = lockstep_call_program(&mesh, &a_local_type, invariant_callee, false);
+        let (varying_body, varying_program) = lockstep_call_program(&mesh, &a_local_type, varying_callee, false);
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        let sum = r#"parallel_reduce [kind=sum, axis_name="x", mesh=['x'=2:manual]]"#;
+        let vary = r#"parallel_vary [axis_name="x"]"#;
+        assert_eq!(
+            invariant_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:{invariant} .
+                        let %1:{varying} = {vary} %0
+                            %2:{invariant} = {sum} %1
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        assert_eq!(
+            varying_body.to_string(),
+            formatdoc! {"
+                lambda %0:{varying} .
+                let %1:{varying} = call %0 [
+                    callee={{
+                        lambda %0:{varying} .
+                        let %1:{invariant} = {sum} %0
+                            %2:{varying} = {vary} %1
+                        in (%2)
+                    }},
+                ]
+                    %2:{invariant} = {sum} %1
+                in (%2)"},
+        );
+        let output_type = f32_vector_type(1).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        assert_eq!(
+            invariant_program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type.clone(), &[6.0])]),
+        );
+        assert_eq!(
+            varying_program.interpret(vec![f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Ok(vec![f32_value(output_type, &[6.0])]),
+        );
+    }
+
+    #[test]
+    fn test_call_operation_interpret_in_lockstep_rejects_diverging_mutations_of_replicated_references() {
+        // The callee, traced at the invariant types of a reference replicated along `x` and of its referent, adds its
+        // second input into the reference. The call accepts `a`, which varies along `x` beyond that type, as that
+        // second input, so each device adds its own value into its own copy of the reference, and the copies diverge.
+        // The emulation rejects the map when it writes the reference back, and reference discharge, which every
+        // backend applies before lowering, rejects it as well, because the call types the final state of the
+        // reference as varying along `x` while the replicated reference requires it to be invariant.
+        let (mesh, a_local_type) = lockstep_call_mesh_and_input_type();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let boundary =
+            ShardMapBoundary::new(mesh.clone(), vec![replicated, sharded.clone()], vec![sharded], Vec::new()).unwrap();
+        let referent_type = boundary.local_input_type(0, &f32_vector_type(1)).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let callee =
+            build_program(vec![reference_type.clone(), ArrayIrType::Array(referent_type)], |builder, inputs| {
+                builder
+                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![inputs[0], inputs[1]], None)
+                    .unwrap();
+                builder
+                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None)
+                    .unwrap()
+                    .to_vec()
+            });
+        let body = build_program(vec![reference_type, a_local_type.clone()], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let varying = &a_local_type;
+        let invariant = "f32[1][sharding={mesh<['x'=2:manual]>, [{}]}]";
+        assert_eq!(
+            body.to_string(),
+            formatdoc! {"
+                lambda %0:ref<{invariant}>, %1:{varying} .
+                let %2:{varying} = call %0 %1 [
+                    callee={{
+                        lambda %0:ref<{invariant}>, %1:{invariant} .
+                        let () = reference_add_update %0 %1
+                            %2:{invariant} = reference_read %0
+                        in (%2)
+                    }},
+                ]
+                in (%2)"},
+        );
+        let input_types = vec![
+            ArrayIrType::Reference(ReferenceType::new(f32_vector_type(1))),
+            ArrayIrType::Array(f32_vector_type(2)),
+        ];
+        let operation = ShardMapOperation::from_program(&body, input_types.clone(), boundary).unwrap();
+        let program = build_program(input_types, |builder, inputs| {
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let initial_state = Array::from_elements(f32_vector_type(1), &[0.0f32]).unwrap();
+        let reference = ArrayReference::new(initial_state.clone());
+        assert_eq!(
+            program
+                .interpret(vec![TestValue::Reference(reference.clone()), f32_value(f32_vector_type(2), &[1.0, 2.0])]),
+            Err(ProgramError::MalformedProgram(
+                "`shard_map` reference input #0 is replicated along manual axis `x`, but its devices along that axis \
+                 finished with different states"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(reference.read(), Ok(initial_state));
+        assert!(matches!(
+            program.discharge_references(0),
+            Err(ProgramError::MalformedProgram(message)) if message == format!(
+                "reference discharge state has type `{varying}` but allocation `ref<{invariant}>` requires \
+                 `{invariant}`",
+            ),
+        ));
     }
 
     #[test]
@@ -8194,8 +10039,7 @@ mod tests {
             &[(RequestedPlacement::Memory, PLACE_OPERATION_NAME)],
         );
 
-        // The body of a scan whose length admits no iteration never runs, so its requests are not requests of the
-        // program.
+        // The body of a scan with zero iterations never runs, so its requests do not count toward the program.
         let body =
             build_program(vec![ArrayType::scalar(DataType::I64).into(), vector_type.clone()], |builder, inputs| {
                 builder
