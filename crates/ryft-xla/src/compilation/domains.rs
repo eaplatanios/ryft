@@ -37,8 +37,8 @@ use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
 use crate::lowering::extensions::{
-    EntryResultPlacement, ProgramLoweringExtension, ShardingLoweringExtension, entry_open_results,
-    entry_result_shardings,
+    OutputShardingSource, ProgramLoweringExtension, ShardingLoweringExtension, entry_open_outputs,
+    entry_output_shardings,
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
 use crate::lowering::signatures::ExecutableSignature;
@@ -693,19 +693,19 @@ impl Session {
         // A public output that a `place` in the entry region or in the callee of a `jit_call` produces, directly or
         // through operations that return its value and placement unchanged, has the placement of its target, which
         // states the placement along every mesh axis, and one that returns an argument in the same way is placed where
-        // that argument enters the executable (refer to `ProgramLoweringExtension::entry_result_placements`). Its
+        // that argument enters the executable (refer to `ProgramLoweringExtension::output_sharding_sources`). Its
         // type drops the auto mesh axes of that placement, and its result has no physical buffer whose placement the
         // compiler could report when it has the zero data type, so the placement is carried to the boundary instead.
         // Outputs follow the output override first, then the placement from the program, both including over auto mesh
         // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule
-        // (refer to `entry_result_shardings`). The arguments of the program are its captures and its public inputs,
+        // (refer to `entry_output_shardings`). The arguments of the program are its captures and its public inputs,
         // between which the executable receives the arrays of session constants.
         let constant_shardings = session_constants
             .iter()
             .map(|binding| (binding.source(), binding.argument().sharding()))
             .collect::<HashMap<_, _>>();
-        let placed_outputs =
-            program.entry_result_placements(output_count, |constant| constant_shardings[constant].clone());
+        let sharding_sources =
+            program.output_sharding_sources(output_count, |constant| constant_shardings[constant].clone());
         let program_argument_shardings = logical_argument_shardings[..source_capture_count]
             .iter()
             .chain(&logical_argument_shardings[lowered_capture_count..])
@@ -715,10 +715,10 @@ impl Session {
         // An output without a placement is replicated. These are the result annotations that lowering emits, and a
         // result is never left without one, which would let the compiler place it differently (e.g., as the output of a
         // `shard_map` that it is derived from) than execution expects.
-        let mut result_annotations = entry_result_shardings(
+        let mut output_annotations = entry_output_shardings(
             &output_types,
             options.output_shardings(),
-            &placed_outputs,
+            &sharding_sources,
             &program_argument_shardings,
         )?
         .into_iter()
@@ -731,12 +731,12 @@ impl Session {
         .collect::<Vec<_>>();
         // The executable returns its outputs split evenly as well, so an output that its annotation splits unevenly
         // could not be reconstructed with its runtime placement. Hidden reference states are placed as their inputs.
-        for (index, (array_type, sharding)) in output_types.iter().zip(&result_annotations).enumerate() {
+        for (index, (array_type, sharding)) in output_types.iter().zip(&output_annotations).enumerate() {
             validate_even_sharding("output", index, array_type, sharding)?;
         }
         // Reconstruct the outputs with the placements of their executable annotations, preserving authored
         // unconstrained dimensions in runtime metadata (refer to `runtime_output_sharding`).
-        let mut output_shardings = result_annotations
+        let mut output_shardings = output_annotations
             .iter()
             .zip(&output_types)
             .enumerate()
@@ -744,9 +744,9 @@ impl Session {
                 // An anonymous singleton can omit a requested unconstrained sharding from its array type.
                 // Keep the unclosed placement of an explicit request or of an argument that the output forwards.
                 let requested = options.output_shardings().map(|shardings| &shardings[index]).or_else(|| {
-                    match &placed_outputs[index] {
-                        Some(EntryResultPlacement::Target(sharding)) => Some(sharding),
-                        Some(EntryResultPlacement::Argument(index)) => {
+                    match &sharding_sources[index] {
+                        Some(OutputShardingSource::Determined(sharding)) => Some(sharding),
+                        Some(OutputShardingSource::Argument(index)) => {
                             program_argument_shardings.get(*index).and_then(Option::as_ref)
                         }
                         None => None,
@@ -760,7 +760,7 @@ impl Session {
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if state.is_mutated() {
                 output_types.push(effective_input_types[logical_input_index].clone());
-                result_annotations.push(argument_annotations[logical_input_index].clone());
+                output_annotations.push(argument_annotations[logical_input_index].clone());
                 output_shardings.push(logical_argument_shardings[logical_input_index].clone());
             }
         }
@@ -801,7 +801,7 @@ impl Session {
         // along an auto axis), so that no replica returns a full buffer where the runtime placement describes a part.
         if !use_shardy_partitioner
             && options.mesh().devices().len() > 1
-            && argument_annotations.iter().chain(&result_annotations).any(|sharding| !sharding.is_replicated())
+            && argument_annotations.iter().chain(&output_annotations).any(|sharding| !sharding.is_replicated())
         {
             return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
@@ -819,16 +819,16 @@ impl Session {
         // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(argument_annotations.as_slice());
-        let lowered_result_shardings = use_shardy_partitioner.then_some(result_annotations.as_slice());
+        let lowered_output_shardings = use_shardy_partitioner.then_some(output_annotations.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. The StableHLO
-        // export of traced programs makes the same decision (refer to `entry_open_results`). Hidden reference states
+        // export of traced programs makes the same decision (refer to `entry_open_outputs`). Hidden reference states
         // are always placed as declared, and so is every output of a program that runs as replicas without Shardy.
-        let public_open_outputs = entry_open_results(
+        let public_open_outputs = entry_open_outputs(
             &output_types[..output_count],
             options.output_shardings(),
-            &placed_outputs,
-            &result_annotations[..output_count].iter().cloned().map(Some).collect::<Vec<_>>(),
+            &sharding_sources,
+            &output_annotations[..output_count].iter().cloned().map(Some).collect::<Vec<_>>(),
         );
         let open_outputs = (0..output_shardings.len())
             .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
@@ -840,7 +840,7 @@ impl Session {
             &output_types,
             "main",
             lowered_argument_shardings,
-            lowered_result_shardings,
+            lowered_output_shardings,
             target_platform,
             supports_shardy,
             reference_states,

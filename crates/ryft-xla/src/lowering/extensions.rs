@@ -157,10 +157,11 @@ where
             .map(|sharding| sharding.map(ShardingLoweringExtension::entry_boundary_sharding).transpose())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = output_type.parameters().cloned().collect::<Vec<_>>();
-        let placements = program.entry_result_placements(output_types.len(), |constant| constant.sharding().clone());
+        let sharding_sources =
+            program.output_sharding_sources(output_types.len(), |constant| constant.sharding().clone());
         let output_annotations =
-            entry_result_shardings(&output_types, output_shardings, &placements, &input_shardings)?;
-        let open_results = entry_open_results(&output_types, output_shardings, &placements, &output_annotations);
+            entry_output_shardings(&output_types, output_shardings, &sharding_sources, &input_shardings)?;
+        let open_outputs = entry_open_outputs(&output_types, output_shardings, &sharding_sources, &output_annotations);
         Ok(lower_mlir_module_for_program_with_value_shardings(
             &program,
             &capture_types,
@@ -169,7 +170,7 @@ where
             function_name,
             &input_annotations,
             &output_annotations,
-            &open_results,
+            &open_outputs,
         )?
         .into_stable_hlo())
     }
@@ -211,40 +212,39 @@ pub(crate) trait ProgramLoweringExtension: Sized {
     /// replaces is not counted, and with [`None`] no region is replaced.
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the placement that this program gives each of its first `output_count` results, or [`None`] for a
-    /// result that it gives no placement. A result that a `place` in the entry region produces has the placement of
-    /// its target, which states the placement along every mesh axis, including the auto mesh axes that the result type
-    /// drops. A bufferless result of `condition`, `scan`, or `while` uses its declared sharding or an entry output
-    /// override, because the compiler has no result buffer from which to report a placement along auto axes. A
-    /// result that is an entry argument is placed where that argument enters the program. A result that returns a
-    /// [`RetainedArray`] is placed as the hidden argument that supplies it, whose sharding `constant_sharding` returns.
+    /// Returns where the sharding of each of the first `output_count` outputs of this program comes from (refer to
+    /// [`OutputShardingSource`]), or [`None`] for an output whose sharding the program does not determine. An output
+    /// that a `place` in the entry region produces has the placement of its target, which states the placement along
+    /// every mesh axis, including the auto mesh axes that the output type drops. A bufferless output of `condition`,
+    /// `scan`, or `while` uses its declared sharding or an entry output override, because the compiler has no output
+    /// buffer from which to report a placement along auto axes. An output that is an entry argument is placed where
+    /// that argument enters the program. An output that returns a [`RetainedArray`] is placed as the hidden argument
+    /// that supplies it, whose sharding `constant_sharding` returns.
     ///
     /// Operations that return the value of an input together with its placement are followed back to that input, so
-    /// that a result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place`
+    /// that an output keeps the placement of a `place` or of an entry argument that precedes them. These are a `place`
     /// without a target, which leaves its input where it is, a `place` with a device target, which keeps the sharding
     /// of its input on the only device of the program mesh, `transfer_to_memory`, which only changes the memory of its
     /// input as a `place` with an in-place target does, `stop_gradient` and `tag`, which only mark values for program
     /// transforms, and identity `broadcast` operations that forget a compatible global sharding on an explicit mesh. A
-    /// device target that completes a pending reduction over mesh axes of size one gives its result another sharding
-    /// than its input, so such a result is placed as its type states instead. A `jit_call` always runs its callee,
-    /// whose results are the results of the call, so a result of a call has the placement that the callee gives the
-    /// corresponding callee result, and a callee result that returns a callee input is followed back to the
+    /// device target that completes a pending reduction over mesh axes of size one gives its output another sharding
+    /// than its input, so such an output is placed as its type states instead. A `jit_call` always runs its callee,
+    /// whose outputs are the outputs of the call, so an output of a call has the placement that the callee gives the
+    /// corresponding callee output, and a callee output that returns a callee input is followed back to the
     /// corresponding input of the call. The boundary of the callee takes precedence, because the callee body cannot
-    /// always show it, so a result of the call that a sharding override of a callee output covers is placed as that
+    /// always show it, so an output of the call that a sharding override of a callee output covers is placed as that
     /// override, and one that returns a callee input with an effective boundary sharding (i.e., its override or
     /// otherwise where the executable of the callee places it, refer to [`JitCallOperation::boundary_input_sharding`])
-    /// is placed as that sharding. Lowering constrains that result or operand of the call to that sharding as well, so
+    /// is placed as that sharding. Lowering constrains that output or operand of the call to that sharding as well, so
     /// that the call places it alike whether a program returns it or consumes it (refer to the lowering of
     /// [`JitCallOperation`]). Other operations that return a value equal to an input are not followed, because they
     /// change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
-    /// results differently (e.g., the `optimization_barrier` of rematerialization).
-    fn entry_result_placements(
+    /// outputs differently (e.g., the `optimization_barrier` of rematerialization).
+    fn output_sharding_sources<F: Fn(&RetainedArray) -> Sharding>(
         &self,
         output_count: usize,
-        constant_sharding: impl Fn(&RetainedArray) -> Sharding,
-    ) -> Vec<Option<EntryResultPlacement>>;
+        constant_sharding: F,
+    ) -> Vec<Option<OutputShardingSource>>;
 }
 
 impl<Input, Output> ProgramLoweringExtension for Program<Constant, Operation, Input, Output>
@@ -254,12 +254,12 @@ where
 {
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
         let program = self.clone().into_pruned()?.into_simplified()?;
+
         // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
-        // whose outputs pruning dropped together with the only request that named them names no devices any more (refer
-        // to `JitCallOperation::names_devices`), and it is lowered as a call that names none. Whether a callee names
-        // devices is derived once for each region of the pruned program (refer to `DeviceNamingAnalysis`), so that nested
-        // calls cost one pass over the program. Most programs have no call that records a mesh and pay one scan of their
-        // calls.
+        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and
+        // it is lowered as a call that names none. Whether a callee names devices is derived once for each region of
+        // the pruned program, so that nested calls cost one pass over the program. Most programs have no call that
+        // records a mesh and pay one scan of their calls.
         let arena = program.entry_region_ref().arena();
         let mut naming = DeviceNamingAnalysis::new(arena.len(), target_platform);
         let mut stale = HashSet::new();
@@ -275,9 +275,11 @@ where
                 }
             }
         }
+
         if stale.is_empty() {
             return Ok(program);
         }
+
         let regions = program
             .regions()
             .iter()
@@ -304,23 +306,28 @@ where
                 )
             })
             .collect::<Vec<_>>();
+
         Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
     }
 
+    #[inline]
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool {
         has_placement_requests_in_region(self.entry_region_ref(), target_platform, includes_memory_requests)
     }
 
-    fn entry_result_placements(
+    #[inline]
+    fn output_sharding_sources<F: Fn(&RetainedArray) -> Sharding>(
         &self,
         output_count: usize,
-        constant_sharding: impl Fn(&RetainedArray) -> Sharding,
-    ) -> Vec<Option<EntryResultPlacement>> {
-        let mut callee_placements = HashMap::new();
-        region_result_placements(self.entry_region_ref(), &constant_sharding, &mut callee_placements)[..output_count]
+        constant_sharding: F,
+    ) -> Vec<Option<OutputShardingSource>> {
+        let mut callee_sources = HashMap::new();
+        region_output_sharding_sources(self.entry_region_ref(), &constant_sharding, &mut callee_sources)[..output_count]
             .to_vec()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Interprets core shardings for XLA entry signatures.
 pub(crate) trait ShardingLoweringExtension {
@@ -802,66 +809,66 @@ pub(crate) fn merge_requested_placement<'r>(
     Ok(())
 }
 
-/// Placement that the entry region of a program gives one of its results, as
-/// [`ProgramLoweringExtension::entry_result_placements`] returns it.
+/// Source of the sharding of one output of a program, as [`ProgramLoweringExtension::output_sharding_sources`] returns
+/// it.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum EntryResultPlacement {
-    /// The program determines the result's sharding.
-    Target(Sharding),
+pub(crate) enum OutputShardingSource {
+    /// The program determines the sharding of the output.
+    Determined(Sharding),
 
-    /// The result is the entry argument at this index, which it returns where that argument enters the program.
+    /// The output is the entry argument at this index, which it returns where that argument enters the program.
     Argument(usize),
 }
 
-/// Returns the sharding with which the entry function of a program annotates each of its results, whose types are
-/// `output_types`, and which describes the buffers that the results are returned in. These are the `result_shardings`
-/// overrides when they are provided, and otherwise the placement that the program gives each result (i.e., the
-/// corresponding element of `placements`, as [`ProgramLoweringExtension::entry_result_placements`] returns them, where
-/// an entry argument is placed as the corresponding element of `argument_shardings`), or the sharding of the result
-/// type when the program gives it none (e.g., when that argument has no sharding). A result without either has no
-/// sharding. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
-/// [`TracedProgram`](crate::TracedProgram) both choose the shardings of results with this function, so that an exported
-/// module places its results as the executable that a session compiles for it does.
+/// Returns the sharding with which the entry function of a program annotates each of its outputs, whose types are
+/// `output_types`, and which describes the buffers that the outputs are returned in. These are the `output_shardings`
+/// overrides when they are provided, and otherwise the placement that the program gives each output (i.e., the
+/// corresponding element of `sharding_sources`, as [`ProgramLoweringExtension::output_sharding_sources`] returns them,
+/// where an entry argument is placed as the corresponding element of `argument_shardings`), or the sharding of the
+/// output type when the program gives it none (e.g., when that argument has no sharding). An output without either has
+/// no sharding. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
+/// [`TracedProgram`](crate::TracedProgram) both choose the shardings of outputs with this function, so that an exported
+/// module places its outputs as the executable that a session compiles for it does.
 ///
-/// An override, a `place` target, an argument placement, or a result type may leave dimensions unconstrained, but the
-/// runtime placement of an array reads such a dimension as replicated, and the result type records it exactly, so it
+/// An override, a `place` target, an argument placement, or an output type may leave dimensions unconstrained, but the
+/// runtime placement of an array reads such a dimension as replicated, and the output type records it exactly, so it
 /// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here
-/// (refer to [`ShardingLoweringExtension::entry_boundary_sharding`]), whatever operation produces the result (e.g.,
-/// arithmetic whose result type inherits an unconstrained dimension from the target of a `place` that precedes it), so
-/// that the executable returns the buffers that the runtime placement of the result describes, while the dimensions
+/// (refer to [`ShardingLoweringExtension::entry_boundary_sharding`]), whatever operation produces the output (e.g.,
+/// arithmetic whose output type inherits an unconstrained dimension from the target of a `place` that precedes it), so
+/// that the executable returns the buffers that the runtime placement of the output describes, while the dimensions
 /// that they constrain keep their placement. Provided overrides are not checked against `output_types`, so that a count
 /// mismatch is still reported when the module is lowered.
 ///
-/// A placement that the program gives a result never keeps reduction state that the result type does not record (i.e.,
+/// A placement that the program gives an output never keeps reduction state that the output type does not record (i.e.,
 /// a pending reduction or a completed-reduction marker over auto mesh axes). No value of a program carries such state:
 /// an argument whose input sharding override states a pending reduction is reduced where it enters the program (refer
 /// to the lowering of entry arguments, which constrains it to its placement with only the unreduced axes that its type
-/// records), and a marker states nothing about the buffers, so a result that returns that argument, directly, through
+/// records), and a marker states nothing about the buffers, so an output that returns that argument, directly, through
 /// operations that keep its placement, or through a call whose boundary states the state, returns the completed value.
-/// Annotating the result with the placement of the argument as it arrives would instead make the executable introduce
+/// Annotating the output with the placement of the argument as it arrives would instead make the executable introduce
 /// the pending reduction again, and return an array whose runtime sharding states a reduction that its type does not
 /// record and that every consumer of the array rejects, or whose marker makes every consumer move it again.
-pub(crate) fn entry_result_shardings(
+pub(crate) fn entry_output_shardings(
     output_types: &[ArrayType],
-    result_shardings: Option<&[Sharding]>,
-    placements: &[Option<EntryResultPlacement>],
+    output_shardings: Option<&[Sharding]>,
+    sharding_sources: &[Option<OutputShardingSource>],
     argument_shardings: &[Option<Sharding>],
 ) -> Result<Vec<Option<Sharding>>, Error> {
-    match result_shardings {
+    match output_shardings {
         Some(shardings) => shardings.iter().map(|sharding| sharding.entry_boundary_sharding().map(Some)).collect(),
         None => output_types
             .iter()
-            .zip(placements)
-            .map(|(output_type, placement)| {
-                let placement = match placement {
-                    Some(EntryResultPlacement::Target(sharding)) => Some(sharding),
-                    Some(EntryResultPlacement::Argument(index)) => {
+            .zip(sharding_sources)
+            .map(|(output_type, source)| {
+                let stated = match source {
+                    Some(OutputShardingSource::Determined(sharding)) => Some(sharding),
+                    Some(OutputShardingSource::Argument(index)) => {
                         argument_shardings.get(*index).and_then(Option::as_ref)
                     }
                     None => None,
                 };
                 let (unreduced_axes, reduced_axes) = (output_type.unreduced_axes(), output_type.reduced_axes());
-                match placement {
+                match stated {
                     Some(sharding)
                         if sharding.unreduced_axes().iter().any(|axis| !unreduced_axes.contains(axis))
                             || sharding.reduced_axes().iter().any(|axis| !reduced_axes.contains(axis)) =>
@@ -869,7 +876,7 @@ pub(crate) fn entry_result_shardings(
                         let unreduced = sharding.clone().with_unreduced_axes(unreduced_axes.iter().cloned())?;
                         unreduced.with_reduced_axes(reduced_axes.iter().cloned())?.entry_boundary_sharding().map(Some)
                     }
-                    placement => placement
+                    stated => stated
                         .or(output_type.sharding())
                         .map(ShardingLoweringExtension::entry_boundary_sharding)
                         .transpose(),
@@ -879,40 +886,40 @@ pub(crate) fn entry_result_shardings(
     }
 }
 
-/// Returns whether the entry function of a program leaves each of its results, whose types are `output_types` and
-/// whose annotations are `result_annotations` (i.e., the shardings that [`entry_result_shardings`] returns for
-/// `result_shardings` and `placements`), open over the auto mesh axes of its annotation, so that the compiler chooses
-/// the placement of the result along those axes, like JAX lowers the results of a `jit` function without
+/// Returns whether the entry function of a program leaves each of its outputs, whose types are `output_types` and whose
+/// annotations are `output_annotations` (i.e., the shardings that [`entry_output_shardings`] returns for
+/// `output_shardings` and `sharding_sources`), open over the auto mesh axes of its annotation, so that the compiler
+/// chooses the placement of the output along those axes, like JAX lowers the outputs of a `jit` function without
 /// `out_shardings`. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
-/// [`TracedProgram`](crate::TracedProgram) both decide this with this function, so that an exported module leaves
-/// open the results whose placement the compiler chooses for the executable that a session compiles for it.
+/// [`TracedProgram`](crate::TracedProgram) both decide this with this function, so that an exported module leaves open
+/// the outputs whose placement the compiler chooses for the executable that a session compiles for it.
 ///
-/// A result is open when it has an annotation over a mesh with an auto axis larger than one (i.e., one along which the
-/// compiler has a choice), and when nothing else fixes its placement. A result sharding override, a placement that the
-/// program gives the result (i.e., that a `place` produces it or that it returns an argument), reduction state or
-/// manual variation in the annotation, which the compiler must not change, and unconstrained dimensions in the result
-/// type, which the runtime placement of the result must record as its type does and read as replicated, all fix it.
-/// Results without an annotation are never open, because they have no annotation that could be.
+/// An output is open when it has an annotation over a mesh with an auto axis larger than one (i.e., one along which the
+/// compiler has a choice), and when nothing else fixes its placement. An output sharding override, a placement that the
+/// program gives the output (i.e., that a `place` produces it or that it returns an argument), reduction state or
+/// manual variation in the annotation, which the compiler must not change, and unconstrained dimensions in the output
+/// type, which the runtime placement of the output must record as its type does and read as replicated, all fix it.
+/// Outputs without an annotation are never open, because they have no annotation that could be.
 ///
 /// Export lowers a program without a device mesh, so it can only decide what the program and its signature state.
 /// It cannot know whether compilation runs the program partitioned, because a program with bounded dynamic shapes
-/// runs as fully replicated replicas whose results are never open, nor which placements the compiler then chooses for
-/// the open results, which only the compiled executable reports. It also cannot know the runtime placements of
+/// runs as fully replicated replicas whose outputs are never open, nor which placements the compiler then chooses for
+/// the open outputs, which only the compiled executable reports. It also cannot know the runtime placements of
 /// arguments without signature shardings, whose types do not record auto mesh axes, so that their annotations and
-/// those of the results that return them are left to Shardy.
-pub(crate) fn entry_open_results(
+/// those of the outputs that return them are left to Shardy.
+pub(crate) fn entry_open_outputs(
     output_types: &[ArrayType],
-    result_shardings: Option<&[Sharding]>,
-    placements: &[Option<EntryResultPlacement>],
-    result_annotations: &[Option<Sharding>],
+    output_shardings: Option<&[Sharding]>,
+    sharding_sources: &[Option<OutputShardingSource>],
+    output_annotations: &[Option<Sharding>],
 ) -> Vec<bool> {
     output_types
         .iter()
-        .zip(placements)
-        .zip(result_annotations)
-        .map(|((output_type, placement), annotation)| {
-            result_shardings.is_none()
-                && placement.is_none()
+        .zip(sharding_sources)
+        .zip(output_annotations)
+        .map(|((output_type, source), annotation)| {
+            output_shardings.is_none()
+                && source.is_none()
                 && annotation.as_ref().is_some_and(|sharding| {
                     sharding.mesh().has_untracked_auto_axes()
                         && sharding.unreduced_axes().is_empty()
@@ -926,20 +933,20 @@ pub(crate) fn entry_open_results(
         .collect()
 }
 
-/// Returns the placement that `region` gives each of its results, which
-/// [`ProgramLoweringExtension::entry_result_placements`] describes, with [`EntryResultPlacement::Argument`] naming an
-/// input of `region`. A result that returns a [`RetainedArray`] has the placement of that array, which enters the
+/// Returns the source of the sharding of each output of `region`, which
+/// [`ProgramLoweringExtension::output_sharding_sources`] describes, with [`OutputShardingSource::Argument`] naming an
+/// input of `region`. An output that returns a [`RetainedArray`] has the placement of that array, which enters the
 /// executable as a hidden argument with that placement, and which has no buffer whose placement the compiler could
 /// report when it has the zero data type. The placements of the callee regions of `jit_call`s are computed once per
-/// callee and memoized in `callee_placements`, because repeated calls share their callee region. The inputs of `region`
+/// callee and memoized in `callee_sources`, because repeated calls share their callee region. The inputs of `region`
 /// and the producer of each of its values, together with the position of that value among the outputs of its producer,
-/// are indexed once, so that following a result back to an input costs one lookup per step rather than a scan of the
+/// are indexed once, so that following an output back to an input costs one lookup per step rather than a scan of the
 /// inputs or of the outputs of an instruction.
-fn region_result_placements<O: LowerableOperationFamily>(
+fn region_output_sharding_sources<O: LowerableOperationFamily>(
     region: RegionRef<'_, Constant, O>,
     constant_sharding: &impl Fn(&RetainedArray) -> Sharding,
-    callee_placements: &mut HashMap<RegionId, Rc<[Option<EntryResultPlacement>]>>,
-) -> Rc<[Option<EntryResultPlacement>]> {
+    callee_sources: &mut HashMap<RegionId, Rc<[Option<OutputShardingSource>]>>,
+) -> Rc<[Option<OutputShardingSource>]> {
     let mut producers = vec![None; region.atoms().len()];
     for (instruction_index, instruction) in region.instructions().iter().enumerate() {
         for (output_index, output) in instruction.outputs().iter().enumerate() {
@@ -951,21 +958,21 @@ fn region_result_placements<O: LowerableOperationFamily>(
     for (position, input) in region.input_ids().iter().enumerate().rev() {
         input_positions[input.index()] = Some(position);
     }
-    let mut result_placement = |output_id: AtomId| {
+    let mut output_source = |output_id: AtomId| {
         let mut value_id = output_id;
         loop {
             let Some((instruction_index, output_index)) = producers[value_id.index()] else {
                 if let Some(Constant::Session(constant)) = region.atoms()[value_id.index()].as_constant() {
-                    return Some(EntryResultPlacement::Target(constant_sharding(constant)));
+                    return Some(OutputShardingSource::Determined(constant_sharding(constant)));
                 }
-                return input_positions[value_id.index()].map(EntryResultPlacement::Argument);
+                return input_positions[value_id.index()].map(OutputShardingSource::Argument);
             };
             let instruction = &region.instructions()[instruction_index];
             let operation = instruction.operation();
             let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
                 match operation.target() {
                     Some(PlacementRequest::Resolved(target)) => {
-                        return Some(EntryResultPlacement::Target(target.sharding().clone()));
+                        return Some(OutputShardingSource::Determined(target.sharding().clone()));
                     }
                     Some(PlacementRequest::Device { .. }) => {
                         // A device target completes a pending reduction over mesh axes of size one, so its result can
@@ -976,7 +983,7 @@ fn region_result_placements<O: LowerableOperationFamily>(
                         };
                         let output_sharding = sharding(instruction.outputs()[output_index]);
                         if output_sharding != sharding(*instruction.inputs().first()?) {
-                            return output_sharding.map(EntryResultPlacement::Target);
+                            return output_sharding.map(OutputShardingSource::Determined);
                         }
                         0
                     }
@@ -1015,33 +1022,35 @@ fn region_result_placements<O: LowerableOperationFamily>(
                 // or the forwarded input that it covers, as an execution of the callee does, which its body cannot
                 // always show (e.g., a replicated override over auto mesh axes stages nothing).
                 if let Some(sharding) = call.output_sharding(output_index) {
-                    return Some(EntryResultPlacement::Target(sharding.clone()));
+                    return Some(OutputShardingSource::Determined(sharding.clone()));
                 }
                 let callee = *instruction.regions().first()?;
-                let placements = match callee_placements.get(&callee) {
-                    Some(placements) => Rc::clone(placements),
+                let sources = match callee_sources.get(&callee) {
+                    Some(sources) => Rc::clone(sources),
                     None => {
-                        let placements = region_result_placements(
+                        let sources = region_output_sharding_sources(
                             region.with_id(callee).ok()?,
                             constant_sharding,
-                            callee_placements,
+                            callee_sources,
                         );
-                        callee_placements.insert(callee, Rc::clone(&placements));
-                        placements
+                        callee_sources.insert(callee, Rc::clone(&sources));
+                        sources
                     }
                 };
-                match placements.get(output_index)?.as_ref()? {
-                    EntryResultPlacement::Target(sharding) => {
-                        return Some(EntryResultPlacement::Target(sharding.clone()));
+                match sources.get(output_index)?.as_ref()? {
+                    OutputShardingSource::Determined(sharding) => {
+                        return Some(OutputShardingSource::Determined(sharding.clone()));
                     }
-                    EntryResultPlacement::Argument(index) => {
+                    OutputShardingSource::Argument(index) => {
                         let actual = region.atoms()[instruction.inputs().get(*index)?.index()].r#type();
                         let callee = region.with_id(callee).ok()?;
                         let declared = callee.input_types();
                         match (actual.as_ref(), declared.get(*index)?) {
                             (Type::Array(actual), declared) => {
                                 match call.boundary_input_sharding(*index, actual, declared) {
-                                    Some(sharding) => return Some(EntryResultPlacement::Target(sharding.into_owned())),
+                                    Some(sharding) => {
+                                        return Some(OutputShardingSource::Determined(sharding.into_owned()));
+                                    }
                                     None => *index,
                                 }
                             }
@@ -1055,7 +1064,7 @@ fn region_result_placements<O: LowerableOperationFamily>(
             value_id = *instruction.inputs().get(input_index)?;
         }
     };
-    region.output_ids().iter().map(|&output_id| result_placement(output_id)).collect()
+    region.output_ids().iter().map(|&output_id| output_source(output_id)).collect()
 }
 
 #[cfg(test)]
@@ -1615,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_result_placements_follow_operations_that_keep_the_placement_of_their_input() {
+    fn test_program_output_sharding_sources_follow_operations_that_keep_the_placement_of_their_input() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
@@ -1634,7 +1643,7 @@ mod tests {
 
         // Every operation that returns its input together with its placement keeps the split that a preceding `place`
         // gives its input along an auto mesh axis, which the type of the result does not record, so that the result
-        // of the program is split as well (refer to `ProgramLoweringExtension::entry_result_placements`).
+        // of the program is split as well (refer to `ProgramLoweringExtension::output_sharding_sources`).
         let operations: [(&str, fn(CompileTracer) -> CompileTracer); 5] = [
             ("place without a target", |x| x.place(&None::<Placement>, None).unwrap()),
             ("place with an in-place target", |x| x.place(&Memory::Host { pinned: true }, None).unwrap()),

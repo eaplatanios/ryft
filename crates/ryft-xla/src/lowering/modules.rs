@@ -181,7 +181,7 @@ pub(crate) fn serialize_lowered_module(
 /// Lowers a traced XLA program of any [`LowerableOperationFamily`] to a textual StableHLO/Shardy MLIR module whose
 /// entry function is named `function_name`.
 ///
-/// When `argument_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding` attribute is
+/// When `argument_shardings` and/or `output_shardings` are provided, the corresponding `sdy.sharding` attribute is
 /// attached to each function argument or result, which drives per-device boundary slicing (e.g., for uneven splits) in
 /// the XLA SPMD partitioner. When they are `None`, the corresponding values carry no sharding attributes, and Shardy
 /// propagates their placement from the program.
@@ -194,7 +194,7 @@ pub(crate) fn serialize_lowered_module(
 ///   - `global_output_types`: Global types of the program outputs.
 ///   - `function_name`: Symbol name of the entry function.
 ///   - `argument_shardings`: Optional shardings of the entry function arguments.
-///   - `result_shardings`: Optional shardings of the entry function results.
+///   - `output_shardings`: Optional shardings of the entry function results.
 ///
 /// # Errors
 ///
@@ -208,7 +208,7 @@ pub fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S,
     global_output_types: &Output,
     function_name: S,
     argument_shardings: Option<&[Sharding]>,
-    result_shardings: Option<&[Sharding]>,
+    output_shardings: Option<&[Sharding]>,
 ) -> Result<String, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -224,7 +224,7 @@ where
         global_output_types,
         function_name,
         argument_shardings,
-        result_shardings,
+        output_shardings,
         None,
     )?
     .stable_hlo)
@@ -245,7 +245,7 @@ pub(crate) fn lower_mlir_module_for_program<
     global_output_types: &Output,
     function_name: S,
     argument_shardings: Option<&[Sharding]>,
-    result_shardings: Option<&[Sharding]>,
+    output_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
 ) -> Result<LoweredModule, Error>
 where
@@ -263,7 +263,7 @@ where
         global_output_types,
         function_name,
         &value_shardings(argument_shardings, argument_count),
-        &value_shardings(result_shardings, global_output_types.parameter_count()),
+        &value_shardings(output_shardings, global_output_types.parameter_count()),
         target_platform,
         true,
         &[],
@@ -278,8 +278,8 @@ where
 /// Lowers an arbitrary traced XLA program like [`lower_mlir_module_for_program`], but with one optional sharding per
 /// entry function argument (i.e., captures first) and per result, so that only the values whose sharding is known carry
 /// an `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program. The results
-/// flagged in `open_results` (i.e., one flag per result, or none at all) are lowered open over auto mesh axes, so that
-/// the compiler chooses their placement over those axes (refer to `entry_open_results`).
+/// flagged in `open_outputs` (i.e., one flag per result, or none at all) are lowered open over auto mesh axes, so that
+/// the compiler chooses their placement over those axes (refer to `entry_open_outputs`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     Input,
@@ -295,8 +295,8 @@ pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     global_output_types: &Output,
     function_name: S,
     argument_shardings: &[Option<Sharding>],
-    result_shardings: &[Option<Sharding>],
-    open_results: &[bool],
+    output_shardings: &[Option<Sharding>],
+    open_outputs: &[bool],
 ) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -312,20 +312,20 @@ where
         global_output_types,
         function_name,
         argument_shardings,
-        result_shardings,
+        output_shardings,
         None,
         true,
         &[],
         &[],
         &[],
         RaggedDotLoweringStrategy::default(),
-        open_results,
+        open_outputs,
         false,
     )
 }
 
 /// Lowers a discharged program with logical external reference state aliases on its entry boundary. The results
-/// flagged in `open_results` (i.e., one flag per logical output, or none at all) are lowered open over auto mesh axes,
+/// flagged in `open_outputs` (i.e., one flag per logical output, or none at all) are lowered open over auto mesh axes,
 /// so that the compiler chooses their placement over those axes.
 ///
 /// `reference_states` are the external state recipes of the discharge artifact, and each must name a distinct logical
@@ -369,14 +369,14 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     global_output_types: &Output,
     function_name: S,
     argument_shardings: Option<&[Sharding]>,
-    result_shardings: Option<&[Sharding]>,
+    output_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
     unread_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-    open_results: &[bool],
+    open_outputs: &[bool],
 ) -> Result<LoweredModule, Error>
 where
     Input: Parameterized<ArrayType>,
@@ -393,14 +393,14 @@ where
         global_output_types,
         function_name,
         &value_shardings(argument_shardings, argument_count),
-        &value_shardings(result_shardings, global_output_types.parameter_count()),
+        &value_shardings(output_shardings, global_output_types.parameter_count()),
         target_platform,
         supports_shardy,
         reference_states,
         donated_inputs,
         unread_inputs,
         ragged_dot_lowering_strategy,
-        open_results,
+        open_outputs,
         true,
     )
 }
@@ -730,12 +730,12 @@ fn plan_entry_boundary<Input, Output, ProgramInput, ProgramOutput, O: LowerableO
     global_output_types: &Output,
     function_name: &str,
     argument_shardings: &[Option<Sharding>],
-    result_shardings: &[Option<Sharding>],
+    output_shardings: &[Option<Sharding>],
     target_platform: Option<&str>,
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
     unread_inputs: &[bool],
-    open_results: &[bool],
+    open_outputs: &[bool],
     export_effects: bool,
 ) -> Result<EntryBoundary, Error>
 where
@@ -806,14 +806,14 @@ where
             actual: argument_shardings.len(),
         }));
     }
-    if result_shardings.len() != global_output_types.len() {
+    if output_shardings.len() != global_output_types.len() {
         return Err(Error::Compilation(CompilationError::ShardingCountMismatch {
-            kind: "result",
+            kind: "output",
             expected: global_output_types.len(),
-            actual: result_shardings.len(),
+            actual: output_shardings.len(),
         }));
     }
-    for (sharding, output_type) in result_shardings.iter().zip(&global_output_types) {
+    for (sharding, output_type) in output_shardings.iter().zip(&global_output_types) {
         if let Some(sharding) = sharding {
             let data_type = output_type.data_type();
             validate_declared_pending_reduction(sharding, output_type.sharding(), data_type, &[], "output_shardings")?;
@@ -822,13 +822,13 @@ where
     let aliases = entry_aliases(
         reference_states,
         donated_inputs,
-        open_results,
+        open_outputs,
         capture_types.len(),
         &logical_argument_types,
         &global_output_types,
         &signature,
         argument_shardings,
-        result_shardings,
+        output_shardings,
     )?;
     let physical_argument_types = signature.physical_input_types(logical_argument_types.as_slice());
     let physical_output_types = signature.physical_output_types(global_output_types.as_slice());
@@ -857,13 +857,13 @@ where
 fn entry_aliases(
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
-    open_results: &[bool],
+    open_outputs: &[bool],
     capture_count: usize,
     logical_argument_types: &[ArrayType],
     global_output_types: &[ArrayType],
     signature: &ExecutableSignature,
     argument_shardings: &[Option<Sharding>],
-    result_shardings: &[Option<Sharding>],
+    output_shardings: &[Option<Sharding>],
 ) -> Result<HashMap<usize, usize>, Error> {
     let mut aliases = HashMap::with_capacity(reference_states.len());
     let mut state_inputs = HashSet::with_capacity(reference_states.len());
@@ -922,8 +922,8 @@ fn entry_aliases(
                     ),
                 }));
             }
-            match (&argument_shardings[logical_input_index], &result_shardings[logical_output_index]) {
-                (Some(argument_sharding), Some(result_sharding)) if argument_sharding != result_sharding => {
+            match (&argument_shardings[logical_input_index], &output_shardings[logical_output_index]) {
+                (Some(argument_sharding), Some(output_sharding)) if argument_sharding != output_sharding => {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
                             "state input {logical_input_index} and output {logical_output_index} must use the same \
@@ -983,8 +983,8 @@ fn entry_aliases(
             let physical_output_index =
                 global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
                     let physical_output_index = signature.output_mapping()[logical_output_index]?;
-                    let is_open = open_results.get(logical_output_index).copied().unwrap_or(false);
-                    let output_sharding = &result_shardings[logical_output_index];
+                    let is_open = open_outputs.get(logical_output_index).copied().unwrap_or(false);
+                    let output_sharding = &output_shardings[logical_output_index];
                     let shares_buffers = match same_sharding {
                         true => output_type == input_type && output_sharding == input_sharding,
                         false => has_same_shard_types(
@@ -1019,8 +1019,8 @@ fn entry_aliases(
 fn entry_function_attributes<'c, 't>(
     boundary: &EntryBoundary,
     argument_shardings: &[Option<Sharding>],
-    result_shardings: &[Option<Sharding>],
-    open_results: &[bool],
+    output_shardings: &[Option<Sharding>],
+    open_outputs: &[bool],
     has_mesh: bool,
     supports_shardy: bool,
     target_platform: Option<&str>,
@@ -1049,14 +1049,14 @@ fn entry_function_attributes<'c, 't>(
         .collect::<Result<Vec<_>, _>>()?;
     // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers the
     // shardings of output types without `out_shardings` (refer to `ShardySharding`).
-    let physical_open_results =
-        if open_results.is_empty() { Vec::new() } else { signature.project_outputs(open_results) };
+    let physical_open_outputs =
+        if open_outputs.is_empty() { Vec::new() } else { signature.project_outputs(open_outputs) };
     let mut result_sharding_attributes = signature
-        .physical_optional_output_shardings(result_shardings)
+        .physical_optional_output_shardings(output_shardings)
         .iter()
         .enumerate()
         .map(|(index, sharding)| {
-            let open = physical_open_results.get(index).copied().unwrap_or(false);
+            let open = physical_open_outputs.get(index).copied().unwrap_or(false);
             let open_dimensions = if open { OpenDimensions::All } else { OpenDimensions::None };
             sharding
                 .as_ref()
@@ -1372,14 +1372,14 @@ fn lower_mlir_module_for_program_with_effect_boundary<
     global_output_types: &Output,
     function_name: S,
     argument_shardings: &[Option<Sharding>],
-    result_shardings: &[Option<Sharding>],
+    output_shardings: &[Option<Sharding>],
     target_platform: Option<&str>,
     supports_shardy: bool,
     reference_states: &[ExternalReferenceBinding],
     donated_inputs: &[bool],
     unread_inputs: &[bool],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-    open_results: &[bool],
+    open_outputs: &[bool],
     export_effects: bool,
 ) -> Result<LoweredModule, Error>
 where
@@ -1396,12 +1396,12 @@ where
         global_output_types,
         function_name.as_ref(),
         argument_shardings,
-        result_shardings,
+        output_shardings,
         target_platform,
         reference_states,
         donated_inputs,
         unread_inputs,
-        open_results,
+        open_outputs,
         export_effects,
     )?;
 
@@ -1412,7 +1412,7 @@ where
     // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional signature
     // shardings, so the `func.func` attributes can refer to `@mesh`.
     let mut signature_mesh = None;
-    for sharding in argument_shardings.iter().chain(result_shardings).flatten() {
+    for sharding in argument_shardings.iter().chain(output_shardings).flatten() {
         signature_mesh = Some(match signature_mesh.take() {
             Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
             None => sharding.mesh().clone(),
@@ -1473,8 +1473,8 @@ where
     let (function_arguments, function_results) = entry_function_attributes(
         &boundary,
         argument_shardings,
-        result_shardings,
-        open_results,
+        output_shardings,
+        open_outputs,
         mesh.is_some(),
         supports_shardy,
         target_platform,
@@ -2481,7 +2481,7 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         ];
-        let result_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
+        let output_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let states = [
             ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, Some(0)),
             ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, None),
@@ -2494,7 +2494,7 @@ mod tests {
             &output_types,
             "main",
             Some(argument_shardings.as_slice()),
-            Some(result_shardings.as_slice()),
+            Some(output_shardings.as_slice()),
             None,
             true,
             &states,
@@ -2537,7 +2537,7 @@ mod tests {
                 &output_types,
                 "main",
                 Some(argument_shardings.as_slice()),
-                Some(result_shardings.as_slice()),
+                Some(output_shardings.as_slice()),
                 None,
                 true,
                 std::slice::from_ref(&invalid_state),
@@ -2552,8 +2552,8 @@ mod tests {
 
         let asymmetric_sharding_message =
             "reference-state aliases require both argument and result sharding metadata or neither";
-        for (argument_shardings, result_shardings) in
-            [(Some(argument_shardings.as_slice()), None), (None, Some(result_shardings.as_slice()))]
+        for (argument_shardings, output_shardings) in
+            [(Some(argument_shardings.as_slice()), None), (None, Some(output_shardings.as_slice()))]
         {
             assert!(matches!(
                 lower_mlir_module_for_program_with_reference_state(
@@ -2563,7 +2563,7 @@ mod tests {
                     &output_types,
                     "main",
                     argument_shardings,
-                    result_shardings,
+                    output_shardings,
                     None,
                     true,
                     &states,
@@ -2577,7 +2577,7 @@ mod tests {
             ));
         }
 
-        let mismatched_result_shardings = vec![Sharding::replicated(mesh, 1)];
+        let mismatched_output_shardings = vec![Sharding::replicated(mesh, 1)];
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
                 &program,
@@ -2586,7 +2586,7 @@ mod tests {
                 &output_types,
                 "main",
                 Some(argument_shardings.as_slice()),
-                Some(mismatched_result_shardings.as_slice()),
+                Some(mismatched_output_shardings.as_slice()),
                 None,
                 true,
                 &states,
@@ -2647,9 +2647,9 @@ mod tests {
         let input_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
         let output_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
         let lower_with = |argument_shardings: Option<&[Sharding]>,
-                          result_shardings: Option<&[Sharding]>,
+                          output_shardings: Option<&[Sharding]>,
                           donated_inputs: &[bool],
-                          open_results: &[bool]| {
+                          open_outputs: &[bool]| {
             lower_mlir_module_for_program_with_reference_state(
                 &program,
                 &[],
@@ -2657,18 +2657,18 @@ mod tests {
                 &output_types,
                 "main",
                 argument_shardings,
-                result_shardings,
+                output_shardings,
                 None,
                 true,
                 &[],
                 donated_inputs,
                 &[],
                 RaggedDotLoweringStrategy::default(),
-                open_results,
+                open_outputs,
             )
         };
-        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_results: &[bool]| {
-            lower_with(shardings, shardings, donated_inputs, open_results)
+        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_outputs: &[bool]| {
+            lower_with(shardings, shardings, donated_inputs, open_outputs)
         };
         let signature = |lowered: LoweredModule| {
             let line = lowered.stable_hlo.lines().find(|line| line.contains("func.func @main")).unwrap();
@@ -2711,10 +2711,10 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Auto).unwrap()]).unwrap();
             vec![Sharding::replicated(mesh, 1); 3]
         };
-        let open_results = [true, false, false];
-        let single_device = signature(lower(Some(&shardings(1)), &[true, false, false], &open_results).unwrap());
+        let open_outputs = [true, false, false];
+        let single_device = signature(lower(Some(&shardings(1)), &[true, false, false], &open_outputs).unwrap());
         assert!(single_device.contains("tf.aliasing_output = 0 : i64"));
-        let two_devices = signature(lower(Some(&shardings(2)), &[true, false, false], &open_results).unwrap());
+        let two_devices = signature(lower(Some(&shardings(2)), &[true, false, false], &open_outputs).unwrap());
         assert!(two_devices.contains("tf.aliasing_output = 1 : i64"));
 
         // An input that finds no output of its own sharding is paired with an output under which every device holds
@@ -2746,9 +2746,9 @@ mod tests {
             .into_iter()
             .map(|(name, [first_argument, second_argument], [first_result, second_result], [first, second])| {
                 let argument_shardings = [first_argument, second_argument, replicated.clone()];
-                let result_shardings = [first_result, second_result, replicated.clone()];
+                let output_shardings = [first_result, second_result, replicated.clone()];
                 let donated_inputs = [first, second, false];
-                let lowered = lower_with(Some(&argument_shardings), Some(&result_shardings), &donated_inputs, &[]);
+                let lowered = lower_with(Some(&argument_shardings), Some(&output_shardings), &donated_inputs, &[]);
                 (name, aliases(lowered.unwrap()))
             })
             .collect::<Vec<_>>();

@@ -2079,7 +2079,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let argument_shardings = [input_type.sharding().unwrap().clone()];
-            let result_shardings = [output_type.sharding().unwrap().clone()];
+            let output_shardings = [output_type.sharding().unwrap().clone()];
             lower_mlir_module_for_program(
                 &unproject_plain_program(program),
                 &[],
@@ -2087,7 +2087,7 @@ mod tests {
                 &vec![output_type],
                 "main",
                 Some(&argument_shardings),
-                Some(&result_shardings),
+                Some(&output_shardings),
                 target_platform,
             )
             .unwrap()
@@ -2198,7 +2198,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let argument_shardings = [input_type.sharding().unwrap().clone()];
-            let result_shardings = [output_type.sharding().unwrap().clone()];
+            let output_shardings = [output_type.sharding().unwrap().clone()];
             lower_mlir_module_for_program(
                 &unproject_plain_program(program),
                 &[],
@@ -2206,7 +2206,7 @@ mod tests {
                 &vec![output_type],
                 "main",
                 Some(&argument_shardings),
-                Some(&result_shardings),
+                Some(&output_shardings),
                 None,
             )
             .unwrap()
