@@ -180,13 +180,10 @@ where
 /// Prepares XLA programs for lowering and analyzes their entry placements.
 pub(crate) trait ProgramLoweringExtension: Sized {
     /// Returns this program as lowering emits it, without the unused outputs of its instructions that carry regions,
-    /// together with the computations that only those outputs use (refer to
-    /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), and without every other instruction that neither an
-    /// output nor an observable effect needs (refer to
-    /// [`Program::into_simplified`](ryft_core::Program::into_simplified)), as JAX removes dead equations (e.g., a
-    /// `device_put` whose result nothing uses, or the outputs of a nested `jit` call that its caller drops) before it
-    /// lowers a `jit` function and reads its shardings. Every entry point that lowers a program (i.e., the compilation
-    /// of a [`Session`](crate::Session) and the StableHLO export of traced programs) lowers this program, and
+    /// together with the computations that only those outputs use (i.e., like [`Program::into_pruned`]), and without
+    /// every other instruction that neither an output nor an observable effect needs (i.e., like
+    /// [`Program::into_simplified`]). Every entry point that lowers a program (i.e., the compilation of a
+    /// [`Session`](crate::Session) and the StableHLO export of traced programs) lowers this program, and
     /// [`placement_requests`] analyses it, so that the validation of placements, the lowering itself, commitment, and
     /// the devices that a program names all see the same instructions. Whether a call still names devices is read for
     /// `target_platform`, so a callee that names devices only inside a body that lowering for that platform replaces
@@ -194,8 +191,7 @@ pub(crate) trait ProgramLoweringExtension: Sized {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Program::into_pruned`](ryft_core::Program::into_pruned) and
-    /// [`Program::into_simplified`](ryft_core::Program::into_simplified).
+    /// Returns the errors of [`Program::into_pruned`] and [`Program::into_simplified`].
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError>;
 
     /// Returns whether this program requests the placement of a value explicitly in any of the regions that lowering
