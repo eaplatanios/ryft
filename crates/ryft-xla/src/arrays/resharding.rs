@@ -221,56 +221,52 @@ const COMBINED_CONTRIBUTIONS_ERROR_MESSAGE: &str = "cannot place an array with a
      (e.g., when the PJRT plugin does not report the default layout that a cross-host receive allocates), because the \
      placement would have to combine the contributions of the pending reduction (complete the reduction first)";
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Array {
+    // TODO(eaplatanios): Should this be moved to `placement.rs`?
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
-    /// [`Array`] remains fully usable after the call returns. This is the `ryft` analogue of JAX's
-    /// `jax.device_put(arr, sharding, donate=False)`.
+    /// [`Array`] remains fully usable after the call returns.
     ///
     /// When the placement and storage already match, the result is this array (i.e., the same logical array, refer to
     /// the identity rules of [`RetainedArray`](crate::RetainedArray)). If each process chose the devices of this array
-    /// on its own, a target that names devices gives a new array on every process instead, which shares the
-    /// buffers of this array where they already are, so that independent placements remain distinct when captured.
-    /// Every other placement gives a new array. A change of devices or sharding takes the first device strategy that
-    /// applies of those that [`crate::arrays::resharding`] describes (i.e., moves of exact shards, shard regions, or a
-    /// compiled reshard) and otherwise the host fallback. A source with [locally assigned
-    /// devices](Self::is_locally_assigned) (e.g., the result of [`Array::from_host_buffer`] without a mesh) takes none
-    /// of them, and every process places its own such array on its own target devices with local work only, as
-    /// that module describes.
+    /// on its own, a target that names devices gives a new array on every process instead, which shares the buffers of
+    /// this array where they already are, so that independent placements remain distinct when captured. Every other
+    /// placement gives a new array. A change of devices or sharding takes the first device strategy that applies of
+    /// those that [`crate::arrays::resharding`] describes (i.e., moves of exact shards, shard regions, or a compiled
+    /// reshard) and otherwise the host fallback. A source with [locally assigned devices](Self::is_locally_assigned)
+    /// (e.g., the result of [`Array::from_host_buffer`] without a mesh) takes none of them, and every process places
+    /// its own such array on its own target devices with local work only, as that module describes.
     ///
     /// The host fallback copies the global array to the host as [`Array::copy_to_host`] does and uploads it again as
     /// [`Array::from_host_buffer`] does, so the result has the shards that a host upload of the same values with the
-    /// target sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy
-    /// supports a manual target, or when a compiled reshard would change the value of an array whose reduction
-    /// state the placement changes), when the target mesh is fully addressable from this process, and when this
-    /// process can read the source back. That is the case when this process holds a buffer for one replica of every
-    /// distinct contribution to the value with elements (i.e., of every tile and, along unreduced axes, of every
-    /// per-device value of a tile), whatever the other processes hold, and when no two devices that hold one such
-    /// contribution differ along a varying manual mesh axis, because those devices can hold different values for the
-    /// same slice that a dense host copy cannot represent. Devices that differ along a manual axis which splits the
-    /// array hold distinct tiles, so they read back like any other tiles. A placement that keeps the contributions of a
-    /// pending reduction or of manual variation within a tile requires a device strategy, because the host fallback
-    /// combines contributions. The readback and the upload continue in the background (refer to
-    /// [`crate::arrays::resharding`] for when they block), and a failure of that work, whose error also describes the
-    /// failure of the device work, surfaces through the readiness functions and the readbacks of the result and
-    /// through [`Session::synchronize`].
+    /// target sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy supports
+    /// a manual target, or when a compiled reshard would change the value of an array whose reduction state the
+    /// placement changes), when the target mesh is fully addressable from this process, and when this process can
+    /// read the source back. That is the case when this process holds a buffer for one replica of every distinct
+    /// contribution to the value with elements (i.e., of every tile and, along unreduced axes, of every per-device
+    /// value of a tile), whatever the other processes hold, and when no two devices that hold one such contribution
+    /// differ along a varying manual mesh axis, because those devices can hold different values for the same slice that
+    /// a dense host copy cannot represent. Devices that differ along a manual axis which splits the array hold distinct
+    /// tiles, so they read back like any other tiles. A placement that keeps the contributions of a pending reduction
+    /// or of manual variation within a tile requires a device strategy, because the host fallback combines
+    /// contributions. The readback and the upload continue in the background, and a failure of that work, whose error
+    /// also describes the failure of the device work, surfaces through the readiness functions and the readbacks of the
+    /// result and through [`Session::synchronize`].
     ///
-    /// When the target is shared across processes and this array is locally assigned, every process must hold the
-    /// same value, because each process places its own value on the devices that it owns. As JAX does for uncommitted
-    /// inputs, a mesh or sharding target whose devices belong to exactly the processes of a run of more than one
-    /// process compares the values of the processes (refer to
-    /// [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)): each process reads its value
-    /// back on the calling thread, hashes it, and submits a comparison before anything else depends on the value.
-    /// The comparison uses a compiled all-reduce on a shared native PJRT topology. Explicit remote device declarations
-    /// return [`SessionError::PlacementComparisonUnavailable`](crate::SessionError::PlacementComparisonUnavailable)
-    /// before readback when the placement requires a comparison. A digest that differs (including when data types or
-    /// shapes differ) or cannot be computed causes a [`ryft_pjrt::Error::FailedPrecondition`] on every process. The
-    /// same sequence of comparing placements on every process remains a precondition (refer to [`Session::place`]).
+    /// When the target is shared across processes and this array is locally assigned, every process must hold the same
+    /// value, because each process places its own value on the devices that it owns. For uncommitted inputs, a mesh or
+    /// sharding target whose devices belong to exactly the processes of a run of more than one process compares the
+    /// per-process values based on [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison):
+    /// each process reads its value back on the calling thread, hashes it, and submits a comparison before anything
+    /// else depends on the value. The comparison uses a compiled all-reduce on a shared native PJRT topology. Explicit
+    /// remote device declarations return
+    /// [`SessionError::PlacementComparisonUnavailable`](crate::SessionError::PlacementComparisonUnavailable) before
+    /// readback when the placement requires a comparison. A digest that differs (including when data types or shapes
+    /// differ) or cannot be computed causes a [`ryft_pjrt::Error::FailedPrecondition`] on every process. The same
+    /// sequence of comparing placements on every process remains a precondition (refer to [`Session::place`]).
     /// For any other target shared across processes, equal values remain an unchecked precondition.
     ///
-    /// The host fallback reads back the combined value of an array with unreduced axes and uploads it again as
-    /// [`Array::from_host_buffer`] does, so when the target keeps an unreduced axis, it redistributes the
+    /// The host fallback reads back the combined value of an array with unreduced axes and uploads it again
+    /// as [`Array::from_host_buffer`] does, so when the target keeps an unreduced axis, it redistributes the
     /// contributions along that axis. With [`UnreducedKind::Sum`], the devices at coordinate zero along it hold the
     /// whole value and the others hold the additive identity. With [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
     /// every device along it holds the whole value, which is its own extremum. The logical value is the same, but the
@@ -280,26 +276,24 @@ impl Array {
     /// PJRT client (e.g., of another backend) is read back and uploaded onto the devices that `target` names, because
     /// PJRT copies buffers only within one client, as JAX places an array onto the devices of another backend. That
     /// uses the host path directly. For an array with bytes, the placement must keep no distinct contributions apart,
-    /// each target owner must be able to read the value back, and the target must lie on the devices of one
-    /// process unless this array is locally assigned. The memory follows the same rule as a transfer within one client.
+    /// each target owner must be able to read the value back, and the target must lie on the devices of one process
+    /// unless this array is locally assigned. The memory follows the same rule as a transfer within one client.
     /// The request must name the target devices, and the result is [committed](Self::is_committed) to them.
     ///
     /// When the host fallback also cannot satisfy the request, typically because some source shards that the value
     /// needs live on a remote process or because the source varies along manual mesh axes, the original error of the
     /// device work is propagated as the most informative diagnostic.
     ///
-    /// The target uses the requested [`Memory`]. When the memory is omitted, a target that names a single
-    /// device (refer to [`PlacementRequest::Device`]) uses the default memory of that device for every source,
-    /// including one in pinned host memory, and a mesh or sharding target keeps the memory of the source. This is
-    /// Ryft's contract, whatever JAX version it is compared with, because JAX handles a bare device and pinned inputs
-    /// differently across releases (e.g., 0.12.0.1 accepted another bare CPU and a same-device forced copy, and 0.12.1
-    /// rejected both). PJRT cross-host receives land in device memory and can then be copied to the requested memory on
-    /// that device. An explicit [`Layout`] applies to each target shard. When the layout is omitted, the result
-    /// keeps the layout of the source only while that layout still describes each target shard (e.g., the strides
-    /// of a column shard do not describe the whole value that a gather produces), and declares no layout otherwise.
-    /// Layout changes use a compiled conversion on each shard's device when supported. Otherwise, each affected local
-    /// shard is read back and uploaded in the requested layout in the background, as for the host fallback. Both paths
-    /// preserve the separate contributions along unreduced axes.
+    /// The target uses the requested [`Memory`]. When the memory is omitted, a target that names a single device (i.e.,
+    /// a [`PlacementRequest::Device`]) uses the default memory of that device for every source, including one in pinned
+    /// host memory, and a mesh or sharding target keeps the memory of the source. PJRT cross-host receives land in
+    /// device memory and can then be copied to the requested memory on that device. An explicit [`Layout`] applies to
+    /// each target shard. When the layout is omitted, the result keeps the layout of the source only while that layout
+    /// still describes each target shard (e.g., the strides of a column shard do not describe the whole value that a
+    /// gather produces), and declares no layout otherwise. Layout changes use a compiled conversion on each shard's
+    /// device when supported. Otherwise, each affected local shard is read back and uploaded in the requested layout
+    /// in the background, as for the host fallback. Both paths preserve the separate contributions along unreduced
+    /// axes.
     ///
     /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
     /// lets PJRT reuse the source buffers for the target where it can, which may avoid an extra allocation.
@@ -314,6 +308,9 @@ impl Array {
             .place_with_request(session, target.into(), false, ValueComparison::of_session(session)?)
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
+    // TODO(eaplatanios): Should this be moved to `placement.rs`?
     /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the
     /// target. This is the `ryft` analogue of JAX's `jax.device_put(arr, sharding, donate=True)`.
     ///
@@ -349,6 +346,7 @@ impl Array {
         self.place_with_request(session, target.into(), true, ValueComparison::of_session(session)?)
     }
 
+    // TODO(eaplatanios): Should this be moved to `placement.rs`?
     /// Places this array as `request` asks, which [`Self::to_placement`] and [`Self::into_placement`] do with the
     /// [`ValueComparison`] of `session`. The request is resolved against this array (refer to
     /// [`Self::resolve_placement_request`]) and placed with [`Self::run_placement_dispatch`], or with
@@ -407,6 +405,7 @@ impl Array {
         Ok(output.with_locally_assigned(locally_assigned && in_place).with_value_comparison(verdict))
     }
 
+    // TODO(eaplatanios): Should this be moved to `placement.rs` (and maybe more of the functions of this module)?
     /// Checks that `session` can place this array onto `request`, which [`Self::place_with_request`] and the
     /// admission of an [`Array`] leaf of [`Session::place`] both check before anything else that concerns this array.
     /// A same-client placement first checks that `session` can bind the source (refer to [`Self::with_session`]).
