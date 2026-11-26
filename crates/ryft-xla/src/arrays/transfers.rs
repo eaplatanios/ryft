@@ -303,12 +303,12 @@ impl Array {
 
     /// Returns this array with a buffer on every device of this process, or `None` when it already has one there (or
     /// holds the [`DataType::Zero`] data type, whose shards have no buffers). A device without its own buffer receives
-    /// a copy of the local replica of its contribution that [`Self::local_replica`] selects, or a new empty buffer for
-    /// a shard without elements (refer to [`Self::local_contribution_buffer`]). This is how a compiled program, which
-    /// reads the buffer of every device of this process, takes an array imported with only some of its local replicas
-    /// (e.g., a compiled reshard, or an argument of a compiled function). Nothing is started for the shards of other
-    /// processes. The result keeps the placement, the fences, the commitment, and the locally assigned devices of this
-    /// array, and its execution fence joins the readiness of every copy.
+    /// a copy of the local replica of its contribution that [`Self::local_replica_shard`] selects, or a new empty
+    /// buffer for a shard without elements (refer to [`Self::local_contribution_buffer`]). This is how a compiled
+    /// program, which reads the buffer of every device of this process, takes an array imported with only some of its
+    /// local replicas (e.g., a compiled reshard, or an argument of a compiled function). Nothing is started for the
+    /// shards of other processes. The result keeps the placement, the fences, the commitment, and the locally assigned
+    /// devices of this array, and its execution fence joins the readiness of every copy.
     ///
     /// # Errors
     ///
@@ -379,7 +379,7 @@ impl Array {
 
     /// Returns whether this array lacks the buffer of a shard on a device of this process, whose process index is
     /// `process_index`, and a local replica of the contribution of every such shard with elements has a buffer (refer
-    /// to [`Self::local_replica`]), so that [`Self::with_filled_local_buffers`] can supply every missing buffer. The
+    /// to [`Self::local_replica_shard`]), so that [`Self::with_filled_local_buffers`] can supply every missing buffer. The
     /// replicas are the shards with the same contribution (refer to [`ShardContribution`]), so this holds for an array
     /// with a pending reduction or with manual variation as well. An array with every buffer of this process, which is
     /// the common case, costs one scan of its shards.
@@ -396,7 +396,7 @@ impl Array {
         let replicas = LocalReplicas::new(process_index);
         missing.all(|shard| {
             shard.slice().iter().any(Range::is_empty)
-                || self.local_replica(&replicas, shard.index(), shard.device()).is_ok()
+                || self.local_replica_shard(&replicas, shard.index(), shard.device()).is_ok()
         })
     }
 
@@ -629,7 +629,7 @@ impl Array {
     /// array has a buffer on every device of this process only where this array itself is the input of a compiled
     /// program, which reads every such buffer (refer to the documentation of this module). Any other strategy reads
     /// only the shards that its moves name and serves a missing one from another replica of this process (refer to
-    /// [`Self::local_replica`]).
+    /// [`Self::local_replica_shard`]).
     // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn place_with_strategy(
@@ -1120,8 +1120,7 @@ impl Array {
                     Entry::Vacant(entry) => {
                         let shard = &self.shards()[movement.source_shard_index];
                         let device = devices.get(shard.device().id())?;
-                        let buffer =
-                            self.cross_host_source_buffer(&replicas, shard.index(), device, &mut completion)?;
+                        let buffer = self.buffer_on_send_device(&replicas, shard.index(), device, &mut completion)?;
                         let layout = &cross_host_layouts[&movement.shape()];
 
                         // The send moves the whole device allocation. Stage host buffers in device memory,
@@ -1177,7 +1176,7 @@ impl Array {
             let mut work = session.reserve_work();
             for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
                 let (shard, buffer) =
-                    self.local_replica(&replicas, movement.source_shard_index, movement.target_device)?;
+                    self.local_replica_shard(&replicas, movement.source_shard_index, movement.target_device)?;
                 let same_device = shard.device() == movement.target_device;
                 if same_device && memory == source_memory {
                     addressable_buffers.push(Arc::clone(buffer));
@@ -1318,12 +1317,8 @@ impl Array {
                         Entry::Occupied(entry) => Arc::clone(entry.get()),
                         Entry::Vacant(entry) => {
                             let source_device = devices.get(source.device().id())?;
-                            let buffer = self.cross_host_source_buffer(
-                                &replicas,
-                                source.index(),
-                                source_device,
-                                &mut completion,
-                            )?;
+                            let buffer =
+                                self.buffer_on_send_device(&replicas, source.index(), source_device, &mut completion)?;
                             let buffer = self.stage_region_source(source, buffer, &mut work, &mut completion)?;
                             Arc::clone(entry.insert(buffer))
                         }
@@ -1371,7 +1366,7 @@ impl Array {
         // phases share one staged buffer for each shard.
         for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
             let device = movement.target_device;
-            let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index, device)?;
+            let (source, buffer) = self.local_replica_shard(&replicas, movement.source_shard_index, device)?;
             let buffer = match staged_buffers.entry(source.index()) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
@@ -1832,7 +1827,7 @@ impl Array {
             let replicas = LocalReplicas::new(process_index);
             for movement in plan.moves.iter().filter(|movement| movement.source_device.process_index() == process_index)
             {
-                self.local_replica(&replicas, movement.source_shard_index, movement.target_device)?;
+                self.local_replica_shard(&replicas, movement.source_shard_index, movement.target_device)?;
             }
         }
 
@@ -1963,28 +1958,26 @@ impl Array {
         Ok(())
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the shard of this array that serves a move between two devices of this process, whose process index is
-    /// `process_index`, to `target`, together with its buffer. The move names the shard at `preferred`, which a
-    /// plan chose from metadata that every process shares (e.g., the source of a local copy of whole shards or of a
-    /// shard region), and that shard serves whenever it has a buffer. Otherwise, another replica of its slice on this
-    /// process with a buffer serves instead (e.g., for an array that holds only some of its replicas), the one on
-    /// `target` first and then the one with the lowest device identifier, so that the choice stays deterministic.
-    /// The replicas are the shards that hold the same contribution (i.e., of the same slice and with the same
-    /// coordinates along unreduced and varying manual axes, refer to [`ShardContribution`]), so a replica holds the
-    /// same bytes also for an array with a pending reduction (e.g., the source of an introduced sum, refer to
+    /// `process_index`, to `target`, together with its buffer. The move names the shard at `preferred`, which a plan
+    /// chose from metadata that every process shares (e.g., the source of a local copy of whole shards or of a shard
+    /// region), and that shard serves whenever it has a buffer. Otherwise, another replica of its slice on this process
+    /// with a buffer serves instead (e.g., for an array that holds only some of its replicas), the one on `target`
+    /// first and then the one with the lowest device identifier, so that the choice stays deterministic. The replicas
+    /// are the shards that hold the same contribution (i.e., of the same slice and with the same coordinates along
+    /// unreduced and varying manual axes, refer to [`ShardContribution`]), so a replica holds the same bytes also for
+    /// an array with a pending reduction (e.g., the source of an introduced sum, refer to
     /// [`Self::local_contribution_buffer`]) or with variation along a manual axis. Only a move without another process
     /// may read another replica directly, because the peer of a cross-host transfer pairs it with the device of the
     /// preferred shard, so a cross-host send first copies that replica to that device (refer to
-    /// [`Self::cross_host_source_buffer`]). `replicas` is the index of the local replicas of this array that the caller
+    /// [`Self::buffer_on_send_device`]). `replicas` is the index of the local replicas of this array that the caller
     /// keeps for the whole placement, so that many targets of one resident replica cost linear work in all.
     ///
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] for the preferred shard when no replica of its contribution on this
     /// process has a buffer.
-    fn local_replica(
+    fn local_replica_shard(
         &self,
         replicas: &LocalReplicas,
         preferred: ShardIndex,
@@ -1994,27 +1987,33 @@ impl Array {
         if let Some(buffer) = preferred_shard.buffer() {
             return Ok((preferred_shard, buffer));
         }
+
         let process_index = replicas.process_index;
         let holds_buffer =
             |shard: &ArrayShard| shard.device().process_index() == process_index && shard.buffer().is_some();
+
         let index = replicas.shards.get_or_init(|| {
             let mut index = HashMap::<ShardContribution, Vec<ShardIndex>>::new();
             for shard in self.shards().iter().filter(|shard| holds_buffer(shard)) {
                 index.entry(self.shard_contribution(shard.descriptor())).or_default().push(shard.index());
             }
+
             for shards in index.values_mut() {
                 shards.sort_unstable_by_key(|&shard| (self.shards()[shard].device().id(), shard));
             }
+
             index
         });
+
         let contribution = self.shard_contribution(preferred_shard.descriptor());
+
         // The replica on `target` serves first, and otherwise the one with the lowest device identifier.
-        let on_target = self.device_shard(target.id()).filter(|shard| {
-            holds_buffer(shard)
-                && shard.device() == target
-                && self.shard_contribution(shard.descriptor()) == contribution
-        });
-        on_target
+        self.device_shard(target.id())
+            .filter(|shard| {
+                holds_buffer(shard)
+                    && shard.device() == target
+                    && self.shard_contribution(shard.descriptor()) == contribution
+            })
             .or_else(|| index.get(&contribution).and_then(|shards| shards.first()).map(|&shard| &self.shards()[shard]))
             .map(|shard| (shard, shard.buffer().unwrap()))
             .ok_or_else(|| {
@@ -2025,22 +2024,21 @@ impl Array {
             })
     }
 
-    /// Returns the buffer that a cross-host transfer sends for the shard at `index`, which is a shard of this array on
-    /// `device` of this process, whose local replicas `replicas` indexes. The receivers of the transfer pair it with
-    /// the device of that shard, which a plan chose from metadata that every process shares, so the buffer must live on
-    /// that device, whatever replicas this process holds. The shard sends its own buffer when it has one. Otherwise,
-    /// the replica of its slice that [`Self::local_replica`] selects (e.g., of an array imported with a buffer for only
-    /// one of its local replicas) is copied to the memory of `device` that the type of this array declares.
-    /// `completion` records the readiness of the returned buffer in both cases, so that the result of a placement that
-    /// only sends from this process (e.g., to a target without devices of this process) still reports a failure of
-    /// the work that produced the sent buffer, which may have no other fence (e.g., a pending host upload, whose
-    /// readiness only its buffer carries) and whose failure a plugin need not report through the send.
+    /// Returns a buffer for the shard at `index` on the local `device` named by the cross-host transfer plan.
+    /// Receivers pair their transfers with that device, which the plan chose from metadata shared by every process.
+    /// This function reuses the shard's own buffer when present. Otherwise, [`Self::local_replica_shard`] uses
+    /// `replicas` to find a local copy of the same contribution. Its buffer is copied to `device` in the memory
+    /// that the array's type declares. `completion` records the readiness of the returned buffer in both cases,
+    /// so that the result of a placement that only sends from this process (e.g., to a target without devices of this
+    /// process) still reports a failure of the work that produced the sent buffer, which may have no other fence (e.g.,
+    /// a pending host upload, whose readiness only its buffer carries) and whose failure a plugin need not report
+    /// through the send.
     ///
     /// # Errors
     ///
     /// Returns [`ArrayError::MissingShardBuffer`] for the shard at `index` when no replica of its slice on this process
     /// has a buffer.
-    fn cross_host_source_buffer(
+    fn buffer_on_send_device(
         &self,
         replicas: &LocalReplicas,
         index: ShardIndex,
@@ -2048,7 +2046,7 @@ impl Array {
         completion: &mut PlacementCompletion,
     ) -> Result<Arc<Buffer<'static>>, Error> {
         let shard = &self.shards()[index];
-        let (replica, buffer) = self.local_replica(replicas, index, shard.device())?;
+        let (replica, buffer) = self.local_replica_shard(replicas, index, shard.device())?;
         if replica.index() == index {
             completion.track_buffer(buffer)?;
             return Ok(Arc::clone(buffer));
@@ -2057,6 +2055,8 @@ impl Array {
         let copied = buffer.copy_to_memory(device.memory(self.r#type().memory())?)?;
         completion.track_new(&mut work, copied)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns `buffer`, which holds a shard of an array whose type declares `memory`, in the default memory of its
     /// device, copying it there unless `memory` is [`Memory::Device`]. `completion` records the readiness of the copy.
@@ -2394,7 +2394,7 @@ impl Array {
     /// Returns a buffer on the device of the shard of this array at `index`, a device of this process, whose local
     /// replicas `replicas` indexes, that holds the contribution of that shard: its own buffer, or otherwise a copy, in
     /// the memory that the type of this array declares, of the replica of the same contribution on this process that
-    /// [`Self::local_replica`] selects. A shard without elements and without its own buffer needs no replica and gets
+    /// [`Self::local_replica_shard`] selects. A shard without elements and without its own buffer needs no replica and gets
     /// a new empty buffer in that memory and in the declared layout of this array. `devices` holds the addressable
     /// devices of the client of this array, which the caller looks up once for all its shards. `work` and `completion`
     /// record the copy or the new buffer.
@@ -2422,7 +2422,7 @@ impl Array {
             let empty = self.client().buffer(Arc::<[u8]>::from([]), buffer_type, dimensions, None, memory, layout)?;
             return completion.track_new(work, empty);
         }
-        let (replica, buffer) = self.local_replica(replicas, index, device)?;
+        let (replica, buffer) = self.local_replica_shard(replicas, index, device)?;
         if replica.device() == device {
             return Ok(Arc::clone(buffer));
         }
@@ -3781,7 +3781,7 @@ impl AddressableDevices {
 
 /// Index of the shards of an array that hold a buffer on the process with index [`Self::process_index`] by the
 /// contribution that they hold (refer to [`ShardContribution`]), which a placement keeps for all of its lookups of
-/// [`Array::local_replica`], so that many targets of one resident replica cost linear rather than quadratic work.
+/// [`Array::local_replica_shard`], so that many targets of one resident replica cost linear rather than quadratic work.
 /// The index is built on the first lookup that needs another replica, so a placement whose planned shards all have
 /// buffers never builds it.
 struct LocalReplicas {
@@ -3821,7 +3821,7 @@ fn is_standalone_session(session: &Session, process_index: ProcessIndex) -> Resu
 ///
 /// Each target shard with elements receives a source shard that holds the same contribution (refer to
 /// [`ShardContribution`]), and the plan may move any replica of it, and a missing one is served from another replica of
-/// the same contribution (refer to [`Array::local_replica`]). When both shardings hold one value per slice (refer to
+/// the same contribution (refer to [`Array::local_replica_shard`]). When both shardings hold one value per slice (refer to
 /// [`Sharding::holds_one_value_per_slice`]), that is any source shard with the slices of the target shard.
 /// Otherwise, shards of one slice can hold different contributions (e.g., the summands of an unreduced value or the
 /// values along a varying manual axis that does not split the array). The placement must move each contribution
@@ -7176,7 +7176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_cross_host_source_buffer() {
+    fn test_array_buffer_on_send_device() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let client_devices = client.addressable_devices().unwrap();
@@ -7201,7 +7201,7 @@ mod tests {
 
             let mut completion = PlacementCompletion::default();
             let replicas = LocalReplicas::new(process_index);
-            let sent = source.cross_host_source_buffer(&replicas, 0, &client_devices[0], &mut completion).unwrap();
+            let sent = source.buffer_on_send_device(&replicas, 0, &client_devices[0], &mut completion).unwrap();
             completion.join(None).unwrap().block_until_ready().unwrap();
             assert!(!Arc::ptr_eq(&sent, &held));
             assert_eq!(sent.device().unwrap().id().unwrap(), devices[0].id());
@@ -7212,7 +7212,7 @@ mod tests {
             // The shard that holds a buffer sends it without a copy, and the result of the placement then waits for
             // and reports its readiness, which may be the only completion of the work that produced it.
             let mut completion = PlacementCompletion::default();
-            let sent = source.cross_host_source_buffer(&replicas, 1, &client_devices[1], &mut completion).unwrap();
+            let sent = source.buffer_on_send_device(&replicas, 1, &client_devices[1], &mut completion).unwrap();
             assert!(Arc::ptr_eq(&sent, &held));
             let fence = completion.join(None).unwrap();
             fence.block_until_ready().unwrap();
@@ -7231,7 +7231,7 @@ mod tests {
         .unwrap();
         let mut completion = PlacementCompletion::default();
         let error = source
-            .cross_host_source_buffer(&LocalReplicas::new(process_index), 1, &client_devices[1], &mut completion)
+            .buffer_on_send_device(&LocalReplicas::new(process_index), 1, &client_devices[1], &mut completion)
             .err()
             .unwrap();
         assert!(matches!(

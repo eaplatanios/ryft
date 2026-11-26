@@ -572,8 +572,6 @@ impl RegionPlacementRequestsExtension for RegionPlacementRequests {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Transform`] marker under which [`owned_session_constants`] retains the session constants that a region owns with
 /// it, for the target platform that its arguments name. The region-owned cache only retains owned arguments, so the
 /// name of the platform is held as a [`String`].
@@ -585,6 +583,8 @@ impl Transform<CoreRegion<Constant, Operation>> for OwnedSessionConstantsAnalysi
 
     const DEFAULT_CACHE_CAPACITY: usize = 1;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the session constants that the program whose entry region is `entry`, which is already pruned, holds in
 /// the regions that its entry region owns and that lowering emits for `target_platform` (refer to
