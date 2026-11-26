@@ -7,7 +7,7 @@ use std::sync::Arc;
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, Instruction, LogicalMesh, MeshAxisType,
     Parameterized, ParameterizedFamily, PlaceOperation, PlacementRequest, Program, ProgramError, Region as CoreRegion,
-    RegionId, RegionPlacementSummary, RegionRef, RequestedPlacement, Sharding, ShardingDimension,
+    RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Sharding, ShardingDimension,
     StopGradientOperation, TagOperation, TransferToMemoryOperation, Transform, TransformArtifact, Type as CoreType,
     Typed, Value,
 };
@@ -182,7 +182,7 @@ pub(crate) trait ProgramLoweringExtension: Sized {
     /// every other instruction that neither an output nor an observable effect needs (i.e., like
     /// [`Program::into_simplified`]). Every entry point that lowers a program (i.e., the compilation of a
     /// [`Session`](crate::Session) and the StableHLO export of traced programs) lowers this program, and
-    /// [`RegionPlacementSummary::requests`] analyses it, so that the validation of placements, the lowering itself,
+    /// [`RegionPlacementRequests::requests`] analyzes it, so that the validation of placements, the lowering itself,
     /// commitment, and the devices that a program names all see the same instructions. Whether a call still names
     /// devices is read for `target_platform`, so a callee that names devices only inside a body that lowering for
     /// that platform replaces names none.
@@ -207,7 +207,7 @@ pub(crate) trait ProgramLoweringExtension: Sized {
     /// With `includes_memory_requests` unset, an in-place target is not counted, because it names no devices. This is
     /// how a compiled function decides whether it names the devices of its mesh, and commits its outputs there.
     ///
-    /// The program is analysed for `target_platform`, so a request inside a body that lowering for that platform
+    /// The program is analyzed for `target_platform`, so a request inside a body that lowering for that platform
     /// replaces is not counted, and with [`None`] no region is replaced.
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool;
 
@@ -257,13 +257,13 @@ where
         // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
         // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
         // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
-        // pruned program (refer to `RegionPlacementSummary::device_naming`), so that nested calls cost one pass over
+        // pruned program (refer to `RegionPlacementRequests::device_naming`), so that nested calls cost one pass over
         // the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
-        // that lowering omits are those of `RegionPlacementSummaryExtension::for_lowering`.
+        // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
         let arena = program.entry_region_ref().arena();
         let omitted: &dyn Fn(RegionRef<'_, Constant, Operation>, &Instruction<Operation>) -> bool =
             &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
-        let mut names_devices = RegionPlacementSummary::device_naming(program.entry_region_ref(), omitted);
+        let mut names_devices = RegionPlacementRequests::device_naming(program.entry_region_ref(), omitted);
         let mut stale = HashSet::new();
         for (index, region) in program.regions().iter().enumerate() {
             let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
@@ -314,7 +314,7 @@ where
 
     #[inline]
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool {
-        RegionPlacementSummary::for_lowering(self.entry_region_ref(), target_platform)
+        RegionPlacementRequests::for_lowering(self.entry_region_ref(), target_platform)
             .has_requests(includes_memory_requests)
     }
 
@@ -517,25 +517,23 @@ impl ShardingLoweringExtension for Sharding {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Derives the [`RegionPlacementSummary`] of the program that lowering emits for a region, and the devices that its
+/// Derives the [`RegionPlacementRequests`] of the program that lowering emits for a region, and the devices that its
 /// placement requests name.
-pub(crate) trait RegionPlacementSummaryExtension: Sized {
-    /// Returns the [`RegionPlacementSummary`] of the program that lowering emits for `region` and `target_platform`,
+pub(crate) trait RegionPlacementRequestsExtension: Sized {
+    /// Returns the [`RegionPlacementRequests`] of the program that lowering emits for `region` and `target_platform`,
     /// every output of `region` being used (refer to [`ProgramLoweringExtension::pruned_for_lowering`]). For a target
-    /// platform, the regions of the instructions whose lowering for that platform omits them (refer to
-    /// `omits_regions`) are not analysed (refer to [`RegionPlacementSummary::for_target`]), and [`None`] analyses the
-    /// program for no target (refer to [`RegionPlacementSummary::new`]). The summary is derived once for each region
-    /// and platform and retained with the region.
+    /// platform, the regions of the instructions whose lowering for that platform omits them are not analyzed (refer
+    /// to [`RegionPlacementRequests::for_target`]), and [`None`] analyzes the program for no target (refer to
+    /// [`RegionPlacementRequests::new`]). The summary is derived once for each region and platform and
+    /// retained with the region.
     fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
     where
         V: 'static + Value<Type = Type>,
         O: 'static + LowerableOperationFamily;
 
     /// Returns the devices that the placement requests of the program name (refer to
-    /// [`RegionPlacementSummary::requests`]), as the mesh of a request that names devices together with the name of
-    /// the operation that makes it, or [`None`] when no request names devices. A device target is resolved as
+    /// [`RegionPlacementRequests::requests`]), as the mesh of a request that names devices together with the name
+    /// of the operation that makes it, or [`None`] when no request names devices. A device target is resolved as
     /// [`RequestedPlacement`] documents, and a request over a named mesh of the same devices takes precedence over the
     /// canonical mesh (refer to [`merge_requested_placement`]), so that the result does not depend on the order of the
     /// requests. The caller merges the requests of other regions with [`merge_requested_placement`].
@@ -547,7 +545,8 @@ pub(crate) trait RegionPlacementSummaryExtension: Sized {
     fn requested_mesh(&self) -> Result<Option<(DeviceMesh, &'static str)>, Error>;
 }
 
-impl RegionPlacementSummaryExtension for RegionPlacementSummary {
+impl RegionPlacementRequestsExtension for RegionPlacementRequests {
+    #[inline]
     fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
     where
         V: 'static + Value<Type = Type>,
@@ -561,6 +560,7 @@ impl RegionPlacementSummaryExtension for RegionPlacementSummary {
         }
     }
 
+    #[inline]
     fn requested_mesh(&self) -> Result<Option<(DeviceMesh, &'static str)>, Error> {
         let mut requested = None;
         for (request, operation) in self.requests() {
@@ -571,6 +571,8 @@ impl RegionPlacementSummaryExtension for RegionPlacementSummary {
         Ok(requested.map(|(mesh, operation)| (mesh.into_owned(), operation)))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`Transform`] marker under which [`owned_session_constants`] retains the session constants that a region owns with
 /// it, for the target platform that its arguments name. The region-owned cache only retains owned arguments, so the
@@ -639,7 +641,7 @@ pub(crate) fn owned_session_constants(
 /// Merges `mesh`, the devices that a placement request of the operation named `operation` names, into `requested`, the
 /// request that names devices among those seen before it, if any, together with the name of its operation. A request
 /// over the canonical mesh of one device (i.e., [`LogicalMesh::single_device`], over which a device target whose input
-/// tracks no mesh is resolved, refer to [`RegionPlacementSummaryExtension::requested_mesh`]) gives way to a request
+/// tracks no mesh is resolved, refer to [`RegionPlacementRequestsExtension::requested_mesh`]) gives way to a request
 /// over another logical mesh of the same device, whichever comes first, so that a bare device and a named mesh of that
 /// device select the named mesh in either order. Requests over two named meshes of the same devices keep the first.
 ///
@@ -1434,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_summary_requested_mesh() {
+    fn test_region_placement_requests_requested_mesh() {
         let vector_type = test_vector_type(4);
         let first = Device::new(0, 0);
         let second = Device::new(1, 0);
@@ -1452,7 +1454,7 @@ mod tests {
                 .unwrap()
         };
         let requested = |program: &FlatProgram<Session>| {
-            RegionPlacementSummary::for_lowering(program.entry_region_ref(), None)
+            RegionPlacementRequests::for_lowering(program.entry_region_ref(), None)
                 .requested_mesh()
                 .map(|requested| requested.map(|(mesh, _)| mesh))
                 .map_err(|error| error.to_string())
@@ -1503,10 +1505,10 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_summary_new_of_nested_calls() {
+    fn test_region_placement_requests_new_of_nested_calls() {
         // `f(x) = place(x, CPU 0)` wrapped in 40 functions that each call the previous one. The call of each wrapper
         // names devices because the request in the innermost callee does, which the analysis of a wrapper reads from
-        // the facts of its callee that it derives in the same pass over the pruned program, rather than by analysing
+        // the facts of its callee that it derives in the same pass over the pruned program, rather than by analyzing
         // the callee of every nested call again, which took time exponential in the depth of the nesting (about 4.5
         // seconds for 20 wrappers in a debug build), and would not finish for these 40. Staging nests as deeply as
         // the functions do, so the test runs on a thread with a larger stack.
@@ -1527,10 +1529,11 @@ mod tests {
                             .unwrap();
                 }
                 let program = function.source_program().program();
-                let requested = RegionPlacementSummary::for_lowering(program.entry_region_ref(), None).requested_mesh();
+                let requested =
+                    RegionPlacementRequests::for_lowering(program.entry_region_ref(), None).requested_mesh();
                 assert_eq!(requested.unwrap().map(|(requested, _)| requested), Some(mesh.clone()));
                 assert_eq!(program.pruned_for_lowering(None).unwrap().to_string(), program.to_string());
-                (mesh, RegionPlacementSummary::for_lowering(program.entry_region_ref(), None).requests().to_vec())
+                (mesh, RegionPlacementRequests::for_lowering(program.entry_region_ref(), None).requests().to_vec())
             })
             .unwrap()
             .join()
@@ -1657,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_summary_new_skips_bodies_that_the_target_replaces() {
+    fn test_region_placement_requests_new_skips_bodies_that_the_target_replaces() {
         // A `place` in the body of a named composite call is a request where lowering emits the body, and not for a
         // target whose backend implementation replaces the whole call (`ryft.tests.xla_named_square` version 1 on
         // CUDA, refer to `omits_regions`), so that the eager placement of the enclosing operation does not read it.
@@ -1684,7 +1687,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
         let program = program.unwrap();
         let requests = |target_platform| {
-            RegionPlacementSummary::for_lowering(program.entry_region_ref(), target_platform)
+            RegionPlacementRequests::for_lowering(program.entry_region_ref(), target_platform)
                 .requests()
                 .to_vec()
         };
@@ -1696,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_summary_new_skips_the_bodies_of_scans_without_iterations() {
+    fn test_region_placement_requests_new_skips_the_bodies_of_scans_without_iterations() {
         // A `place` in the body of a scan is a request when the length of the scan admits an iteration, and not on any
         // target when its length is zero, because lowering then emits nothing of its body (refer to `omits_regions`).
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
@@ -1720,7 +1723,7 @@ mod tests {
                 .unwrap()
         };
         let requests = |length, target_platform| {
-            RegionPlacementSummary::for_lowering(program(length).entry_region_ref(), target_platform)
+            RegionPlacementRequests::for_lowering(program(length).entry_region_ref(), target_platform)
                 .requests()
                 .to_vec()
         };
