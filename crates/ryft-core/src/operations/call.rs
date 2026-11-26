@@ -69,8 +69,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`CallOperation`].
 pub const CALL_OPERATION_NAME: &str = "call";
 
@@ -89,10 +87,10 @@ pub const CALL_OPERATION_NAME: &str = "call";
 /// retention remains an independent boundary-pruning requirement.
 ///
 /// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
-/// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
-/// while separate calls receive independent local result identities.
+/// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains
+/// them while separate calls receive independent local result identities.
 ///
-/// # Calls of compiled functions
+/// # Calls of Compiled Functions
 ///
 /// A call stages the callee's source in its caller. When an input or output has a sharding override, or the body
 /// requests placement through a `place` whose target names devices, a `constrain_sharding`, or a nested call that names
@@ -101,35 +99,33 @@ pub const CALL_OPERATION_NAME: &str = "call";
 /// of its function (refer to [`Self::function_mesh`]), and a nested call follows its caller. Lifted captures follow
 /// those devices, even when the original array is committed.
 ///
-/// A call therefore carries the boundary of its callee as that function was compiled (refer to
-/// [`Self::with_boundary`]), which is the sharding override of each of its inputs and outputs, if any, together with
-/// the device mesh that the function names, if any. Neither can be read from the callee body where the call is used
-/// (e.g., a replicated output override over auto mesh axes stages nothing, and a callee inlined into a caller on other
-/// devices no longer shows where it was compiled to run). A call of a `jit` dispatcher additionally records that it
-/// keeps each input without an override placed as it is (refer to [`Self::with_kept_input_placements`]). Each entry
-/// point honors the boundary as follows:
+/// A call therefore carries the boundary of its callee as that function was compiled, which is the sharding override
+/// of each of its inputs and outputs, if any, together with the device mesh that the function names, if any. Neither
+/// can be read from the callee body where the call is used (e.g., a replicated output override over auto mesh axes
+/// stages nothing, and a callee inlined into a caller on other devices no longer shows where it was compiled to run).
+/// A call of a `jit` dispatcher additionally records that it keeps each input without an override placed as it is
+/// (refer to [`Self::with_kept_input_placements`]). Each entry point honors the boundary as follows:
 ///
 ///   - A backend that lowers or applies a call places the inputs and the outputs that have overrides as an execution
 ///     of the function places its arguments and results, and every other input at its effective boundary sharding
 ///     (refer to [`Self::boundary_input_sharding`]). The backend states how it does so on its own implementations.
-///   - The type rule of the call accepts every input whose type refines the callee input type up to the placement that
-///     its sharding describes, so every context that binds a call accepts the same inputs (refer to
+///   - The type rule of the call accepts every input whose type refines the callee input type up to the placement
+///     that its sharding describes, so every context that binds a call accepts the same inputs (refer to
 ///     [`Self::validate_input_types`]). It rejects an input whose unreduced or reduced axes differ from those of the
 ///     callee input type, which an execution would reshard where it can, because a call does not reshard its inputs.
 ///     An input of a `shard_map` body may vary along manual mesh axes that the callee input type does not declare,
 ///     and every output of the call then varies along them too.
-///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with the
-///     device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
-///     evaluation split, or a batched call). A call that a transform creates (e.g., the primal and tangent calls of a
-///     linearization, the known and residual calls of a split, or a transposed call) also keeps the effective
+///   - Program transforms keep the overrides of every input and output that the derived calls keep, together with
+///     the device mesh and the kept input placements of the call (e.g., the known and residual calls of a partial
+///     evaluation split, or a batched call). A call that a transform creates (e.g., the primal and tangent calls
+///     of a linearization, the known and residual calls of a split, or a transposed call) also keeps the effective
 ///     boundary of every input of the original call that it receives, and places no input that the transform adds
-///     (e.g., a residual), because its declared input types are only traced types (refer to
-///     `with_derived_boundary_shardings`). Partial evaluation treats a call as forwarding one of its inputs only where
-///     the placement decision of every application returns that input unchanged (refer to
-///     `Self::returns_input_unchanged`).
+///     (e.g., a residual), because its declared input types are only traced types. Partial evaluation treats a call
+///     as forwarding one of its inputs only where the placement decision of every application returns that input
+///     unchanged.
 ///
-/// The boundary takes part in equality and hashing, but a call of a function that names no devices and that is not a
-/// `jit` dispatcher hashes and renders exactly as it did before boundaries existed. A call that a transform derives
+/// The boundary takes part in equality and hashing, but a call of a function that names no devices and that is not
+/// a `jit` dispatcher hashes and renders exactly as it did before boundaries existed. A call that a transform derives
 /// always renders the boundary that it keeps, so that it never renders like an ordinary call, which places its inputs
 /// differently. A backend that deduplicates callees by their structure still compares the calls that they contain by
 /// equality.
@@ -137,9 +133,6 @@ pub const CALL_OPERATION_NAME: &str = "call";
 pub struct CallOperation<T: Type> {
     /// Number of leading callee inputs that form its lifted lexical capture prefix.
     capture_count: usize,
-
-    /// Type universe of the callee boundary.
-    marker: PhantomData<fn() -> T>,
 
     /// Caller-owned result identities and the formal input scope used to instantiate forwarded names.
     output_types: Option<CallTypeBindings<T>>,
@@ -155,16 +148,16 @@ pub struct CallOperation<T: Type> {
     mesh: Option<DeviceMesh>,
 
     /// Whether the call leaves each input without a sharding override placed as it is, as the executables of a `jit`
-    /// dispatcher are specialized for (refer to [`Self::with_kept_input_placements`]).
+    /// dispatcher are specialized for. Refer to [`Self::with_kept_input_placements`] for more information.
     keeps_input_placements: bool,
 
     /// Effective boundary sharding of each callee input without a sharding override, by position, for a call that a
-    /// program transform derives from another call (refer to `with_derived_boundary_shardings`), or [`None`] for a
-    /// call of a compiled function, whose declared input types define it (refer to [`Self::boundary_input_sharding`]).
+    /// program transform derives from another call, or [`None`] for a call of a compiled function, whose declared input
+    /// types define it. Refer to [`Self::boundary_input_sharding`] for more information.
     derived_input_shardings: Option<Arc<[Option<Sharding>]>>,
 
-    /// Device mesh that the called function was compiled for (refer to [`Self::with_function_mesh`]), or [`None`] for a
-    /// call that a program transform creates. Only the placement decision of an eager application by a backend reads
+    /// Device mesh that the called function was compiled for (refer to [`Self::with_function_mesh`]), or [`None`] for
+    /// a call that a program transform creates. Only the placement decision of an eager application by a backend reads
     /// it, so it takes part in equality but is neither hashed nor rendered, and staged programs and their lowering do
     /// not use it to select the execution mesh. It is separate from [`Self::mesh`], which type inference and transforms
     /// read as the devices that the call names. A transform keeps it on a call that replaces the whole call in the same
@@ -177,41 +170,20 @@ pub struct CallOperation<T: Type> {
     /// application must use. Calls staged into known and residual programs under a staging context follow the enclosing
     /// caller.
     function_mesh: Option<DeviceMesh>,
+
+    /// Type universe of the callee boundary.
+    marker: PhantomData<fn() -> T>,
 }
 
-impl<T: Type + Hash> Hash for CallOperation<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // The fields that existed before the boundary shardings hash as the derived implementation did, and an absent
-        // boundary writes nothing, so that the keys of programs whose calls have none stay unchanged.
-        self.capture_count.hash(state);
-        self.marker.hash(state);
-        self.output_types.hash(state);
-        if let Some(shardings) = &self.input_shardings {
-            shardings.hash(state);
-        }
-        if let Some(shardings) = &self.output_shardings {
-            shardings.hash(state);
-        }
-        if let Some(mesh) = &self.mesh {
-            mesh.hash(state);
-        }
-        if self.keeps_input_placements {
-            self.keeps_input_placements.hash(state);
-        }
-        if let Some(shardings) = &self.derived_input_shardings {
-            shardings.hash(state);
-        }
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type> CallOperation<T> {
-    /// Creates a staged `call` operation. The flat callee program is supplied as a shared region attachment to
+    /// Creates a new [`CallOperation`]. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
     pub fn new(capture_count: usize) -> Self {
         Self {
             capture_count,
-            marker: PhantomData,
             output_types: None,
             input_shardings: None,
             output_shardings: None,
@@ -219,15 +191,16 @@ impl<T: Type> CallOperation<T> {
             keeps_input_placements: false,
             derived_input_shardings: None,
             function_mesh: None,
+            marker: PhantomData,
         }
     }
 
-    /// Returns this call with the boundary of its callee, made of `mesh`, the device mesh that the callee was compiled
-    /// for when it names devices, and of the sharding override of each callee input and output, by position, where
-    /// [`None`] marks a position without one. A callee names devices when it has a sharding override or its program
-    /// requests a placement that names devices (refer to [`RegionPlacementSummary::has_requests`]), so `mesh`
-    /// must be present whenever an override is. A missing override is implicit past the end of either list. A list
-    /// without overrides is stored as absent.
+    /// Returns this [`CallOperation`] with the boundary of its callee, made of `mesh`, the device mesh that the
+    /// callee was compiled for when it names devices, and of the sharding override of each callee input and output, by
+    /// position, where [`None`] marks a position without one. A callee names devices when it has a sharding override
+    /// or its program requests a placement that names devices (refer to [`RegionPlacementSummary::has_requests`]),
+    /// so `mesh` must be present whenever an override is. A missing override is implicit past the end of either list.
+    /// A list without overrides is stored as absent.
     pub fn with_boundary(
         mut self,
         mesh: Option<&DeviceMesh>,
@@ -237,20 +210,23 @@ impl<T: Type> CallOperation<T> {
         let normalize = |shardings: Vec<Option<Sharding>>| {
             shardings.iter().any(Option::is_some).then(|| Arc::<[Option<Sharding>]>::from(shardings))
         };
+
         self.input_shardings = normalize(input_shardings);
         self.output_shardings = normalize(output_shardings);
+
         debug_assert!(mesh.is_some() || !self.has_boundary_shardings(), "sharding overrides require a mesh");
+
         self.mesh = mesh.cloned();
         self
     }
 
-    /// Returns this call marked as a call of a `jit` dispatcher, whose executables are specialized for the placement of
-    /// each of their inputs without a sharding override, including over the auto mesh axes that input types do not
-    /// record (refer to [`CompilationDomain::dispatch_signature`](crate::CompilationDomain::dispatch_signature)).
-    /// Such a call leaves those inputs placed as they are, like a JAX `jit` call without input shardings, so that an
-    /// eager call of a dispatcher places them as an execution of the dispatcher does. A call that is not marked is a
-    /// call of a function compiled ahead of time for its input types, whose executable places such an input as its
+    /// Returns this [`CallOperation`] marked as a call of a Just-In-Time (JIT) compilation dispatcher, whose
+    /// executables are specialized for the placement of each of their inputs without a sharding override, including
+    /// over the auto mesh axes that input types do not record. Such a call leaves those inputs placed as they are, so
+    /// that an eager call of a dispatcher places them as an execution of the dispatcher does. A call that is not marked
+    /// is a call of a function compiled ahead of time for its input types, whose executable places such an input as its
     /// type records, and an eager call places it the same way.
+    #[inline]
     pub fn with_kept_input_placements(mut self) -> Self {
         self.keeps_input_placements = true;
         self
@@ -259,6 +235,7 @@ impl<T: Type> CallOperation<T> {
     /// Returns this call with `mesh`, the device mesh that the called function was compiled for, which decides where
     /// an eager application of the call by a backend runs (refer to [`Self::function_mesh`]). A call nested in another
     /// compiled function runs where its caller runs whatever this mesh is.
+    #[inline]
     pub fn with_function_mesh(mut self, mesh: &DeviceMesh) -> Self {
         self.function_mesh = Some(mesh.clone());
         self
@@ -269,6 +246,7 @@ impl<T: Type> CallOperation<T> {
     /// [`None`] marks an input that the call leaves where it is (refer to [`Self::derived_input_shardings`]). Such a
     /// call places the inputs that it receives from the original call as that call does, and leaves every other input
     /// where it is, instead of placing it as the declared input types of its callee, which are only traced types, say.
+    #[inline]
     pub fn with_derived_input_shardings(mut self, shardings: Vec<Option<Sharding>>) -> Self {
         self.derived_input_shardings = Some(Arc::from(shardings));
         self
@@ -286,6 +264,7 @@ impl<T: Type> CallOperation<T> {
     /// # Errors
     ///
     /// Returns a type error for an oversized capture prefix or a type that cannot rename its local identities.
+    #[inline]
     pub fn with_callee_type_signature(mut self, input_types: &[T], output_types: &[T]) -> Result<Self, TypeError> {
         self.validate_capture_prefix(input_types.len())?;
         self.output_types = CallTypeBindings::fresh(input_types, output_types)?;
@@ -309,6 +288,7 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Retains caller-owned result identities after a callee boundary rewrite, including reference discharge.
+    #[inline]
     fn with_result_type_signature(
         mut self,
         input_types: &[T],
@@ -363,6 +343,7 @@ impl<T: Type> CallOperation<T> {
     /// [`RegionPlacementSummary::requests`] and [`RegionPlacementSummary::device_naming`]) answer
     /// `callee_names_devices` with the facts of the callee that they derive in the same pass over the program, so that
     /// they never analyse a callee again for each call that encloses it.
+    #[inline]
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
@@ -378,13 +359,15 @@ impl<T: Type> CallOperation<T> {
 
     /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
     /// [`Self::names_devices`]).
+    #[inline]
     pub fn without_mesh(&self) -> Self {
         Self { mesh: None, ..self.clone() }
     }
 
     /// Returns this call without the mesh of its function (refer to [`Self::function_mesh`]), for a call that a
     /// transform places into a program, where it follows its caller.
-    fn without_function_mesh(&self) -> Self {
+    #[inline]
+    pub fn without_function_mesh(&self) -> Self {
         Self { function_mesh: None, ..self.clone() }
     }
 
@@ -815,6 +798,31 @@ impl CallOperation<ArrayIrType> {
     }
 }
 
+impl<T: Type + Hash> Hash for CallOperation<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The fields that existed before the boundary shardings hash as the derived implementation did, and an absent
+        // boundary writes nothing, so that the keys of programs whose calls have none stay unchanged.
+        self.capture_count.hash(state);
+        self.marker.hash(state);
+        self.output_types.hash(state);
+        if let Some(shardings) = &self.input_shardings {
+            shardings.hash(state);
+        }
+        if let Some(shardings) = &self.output_shardings {
+            shardings.hash(state);
+        }
+        if let Some(mesh) = &self.mesh {
+            mesh.hash(state);
+        }
+        if self.keeps_input_placements {
+            self.keeps_input_placements.hash(state);
+        }
+        if let Some(shardings) = &self.derived_input_shardings {
+            shardings.hash(state);
+        }
+    }
+}
+
 impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
     type Type = T;
 
@@ -827,15 +835,37 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         self.output_types.as_ref().map_or(Cow::Borrowed(&[]), |types| Cow::Owned(types.definitions()))
     }
 
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        let mut renamed = self.clone();
-        renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
-        Ok(renamed)
-    }
-
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         const { &[RegionSlot::computation("callee")] }
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        check_count!("region", interfaces, 1, TypeError);
+        let declared = interfaces[0].input_types();
+        if declared == input_types {
+            return Ok(vec![None]);
+        }
+
+        // Inputs that instantiate identities of the callee rename them in the callee, whose inputs otherwise keep their
+        // declared types, because the call accepts inputs whose types only refine them (refer to
+        // `validate_call_input_types`), as an execution of the callee accepts its arguments.
+        match T::derive_identity_renaming(declared, input_types) {
+            Ok(renaming) if !renaming.is_identity() => {
+                let renamed =
+                    declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+                validate_call_input_types(self.name(), &renamed, input_types)?;
+                Ok(vec![Some(renamed)])
+            }
+            _ => {
+                validate_call_input_types(self.name(), declared, input_types)?;
+                Ok(vec![None])
+            }
+        }
     }
 
     fn infer_output_types(
@@ -874,34 +904,6 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         match variation {
             Some(variation) => variation.apply(self.name(), output_types),
             None => Ok(output_types),
-        }
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[T],
-        interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        check_count!("region", interfaces, 1, TypeError);
-        let declared = interfaces[0].input_types();
-        if declared == input_types {
-            return Ok(vec![None]);
-        }
-
-        // Inputs that instantiate identities of the callee rename them in the callee, whose inputs otherwise keep their
-        // declared types, because the call accepts inputs whose types only refine them (refer to
-        // `validate_call_input_types`), as an execution of the callee accepts its arguments.
-        match T::derive_identity_renaming(declared, input_types) {
-            Ok(renaming) if !renaming.is_identity() => {
-                let renamed =
-                    declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
-                validate_call_input_types(self.name(), &renamed, input_types)?;
-                Ok(vec![Some(renamed)])
-            }
-            _ => {
-                validate_call_input_types(self.name(), declared, input_types)?;
-                Ok(vec![None])
-            }
         }
     }
 
@@ -953,6 +955,12 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
     #[inline]
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
         (region_index == 0).then_some(self.capture_count)
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let mut renamed = self.clone();
+        renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
+        Ok(renamed)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
