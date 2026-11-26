@@ -2076,18 +2076,15 @@ impl Array {
         completion.track_new(&mut work, staged)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns `buffer`, which holds a shard or a region with `shape` of an array of `data_type` on `device`, in the
     /// default memory of that device, as a buffer that a cross-host send can move to a receiver that allocates a static
     /// buffer of `shape` in `layout`. A static `buffer` of that shape and layout is reused. Otherwise, this function
-    /// prepares a static buffer with the same elements, as every sender of a cross-host transfer does.
-    ///
-    /// The conversion runs on `device` with [`Self::try_relayout_shard_on_device`], whose program has the static type
-    /// of `shape` and so also drops the trailer of a buffer whose type has dynamic dimensions, and `completion` then
-    /// records its fence. When the plugin cannot lower or compile that conversion, the shard is copied through host
-    /// memory into a new buffer in `layout` with [`Self::copy_shard_through_host`] instead, and `completion` records
-    /// the readiness of that buffer. That is the only entry of a host round trip for a cross-host send.
+    /// prepares a static buffer with the same elements, as every sender of a cross-host transfer does. The conversion
+    /// runs on `device` with [`Self::try_relayout_shard_on_device`], whose program has the static type of `shape` and
+    /// so also drops the trailer of a buffer whose type has dynamic dimensions, and `completion` then records its
+    /// fence. When the plugin cannot lower or compile that conversion, the shard is copied through host memory into
+    /// a new buffer in `layout` with [`Self::copy_shard_through_host`] instead, and `completion` records the readiness
+    /// of that buffer. That is the only entry of a host round trip for a cross-host send.
     fn buffer_for_cross_host_send(
         session: &Session,
         data_type: DataType,
@@ -2105,22 +2102,28 @@ impl Array {
         {
             return Ok(buffer);
         }
+
         let current_layout = Layout::from_pjrt(buffer.specification()?.layout)?;
         let input_type = ArrayType::new(data_type, shape.clone().into()).with_layout(current_layout);
         let target_layout = Layout::from_pjrt(layout.clone())?;
         let source = Arc::clone(&buffer);
+
         if let Some(converted) =
             Self::try_relayout_shard_on_device(session, device, source, input_type, &target_layout, completion)?
         {
             return Ok(converted);
         }
+
         let buffer_type = data_type.executable_buffer_type();
         let memory = buffer.memory()?;
+
         Self::copy_shard_through_host(session, &buffer, shape, buffer_type, memory, Some(layout.clone()), completion)
     }
 
-    /// Returns `buffer`, which holds the contribution of `shard`, a shard of this array on a device of this process, on
-    /// the device of `shard`, staged for slicing and cross-host sends of its regions (refer to
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Returns `buffer`, which holds the contribution of `shard`, a shard of this array on a device of this process,
+    /// on the device of `shard`, staged for slicing and cross-host sends of its regions (refer to
     /// [`Self::place_shard_regions`]). That is the default memory of that device and, when this array declares a
     /// layout other than the dense row-major one (refer to [`PlacementPlanningView::shard_region_plan`]), a conversion
     /// of this shard alone to the dense row-major layout on its device (refer to [`Self::place_shard_storage`]), which
