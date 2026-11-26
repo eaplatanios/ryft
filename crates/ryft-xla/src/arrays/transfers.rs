@@ -238,6 +238,22 @@ impl Array {
         Self::from_addressable_buffers_internal(session, r#type, Some(sharding), mesh, None, vec![buffer], false)
     }
 
+    /// Returns this array, which a host upload of a placement has just created on the calling thread (e.g., with
+    /// [`Self::from_host_buffer`] when the PJRT plugin lacks host to device transfer managers), with an execution fence
+    /// that joins its own fence, if any, and `fence` (i.e., the execution fence of the source of the placement) with
+    /// the readiness of every addressable buffer of this array, so that its readbacks report a failed upload of any
+    /// replica, as for background uploads (refer to [`crate::arrays::transfers`]). Plain host uploads keep no such
+    /// fence, because every one of their replicas receives the same host bytes (refer to [`crate::arrays::host`]).
+    fn with_upload_completion(mut self, fence: Option<ExecutionFence>) -> Result<Self, Error> {
+        let mut completion = PlacementCompletion::default();
+        completion.track_fence(fence.as_ref());
+        for buffer in self.addressable_shards().filter_map(ArrayShard::buffer) {
+            completion.track_buffer(buffer)?;
+        }
+        self.execution_fence = completion.join(self.execution_fence.take());
+        Ok(self)
+    }
+
     /// Returns an array with the type, the placement, the commitment, and the
     /// [locally assigned devices](Self::is_locally_assigned) of this array whose addressable shard buffers are copies
     /// of the buffers of this array for which `copy` returns `true`, on the same devices and in the same memories, and
@@ -320,6 +336,47 @@ impl Array {
         self.placement_planning_view().communicates(self.is_locally_assigned(), mesh, sharding)
     }
 
+    /// Returns the layout that each shard of a placement of this array on `mesh` according to `sharding` has, which
+    /// is `requested` when the placement names a layout, and the layout of this array otherwise, but only while that
+    /// layout still describes the target shards, as the type rule of the placement keeps it (e.g., the strides of a
+    /// column shard do not describe the value that a gather produces). It reads only the type of this array and the
+    /// target, which every process shares, so every process and every strategy of a placement record the same layout.
+    /// A requested layout is validated against the target shards here, because a placement without buffers never
+    /// meets a buffer that would reject it.
+    fn placement_layout(
+        &self,
+        requested: Option<&Layout>,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+    ) -> Result<Option<Layout>, Error> {
+        if requested.is_none() && self.layout().is_none() {
+            return Ok(None);
+        }
+
+        check_sharding!(mesh, sharding);
+
+        let r#type = self.r#type();
+        if sharding.rank() != r#type.rank() {
+            return Err(ShardingError::ShardingRankMismatch {
+                sharding_rank: sharding.rank(),
+                array_rank: r#type.rank(),
+            }
+            .into());
+        }
+
+        let sharding_is_complete = true;
+        let validate = |layout: &Layout| r#type.validate_shard_layout(layout, Some(sharding), sharding_is_complete);
+        match requested {
+            Some(layout) => {
+                validate(layout).map_err(|error| {
+                    TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
+                })?;
+                Ok(Some(layout.clone()))
+            }
+            None => Ok(self.layout().filter(|layout| validate(layout).is_ok()).cloned()),
+        }
+    }
+
     /// Returns whether this array lacks the buffer of a shard on a device of this process, whose process index is
     /// `process_index`, and a local replica of the contribution of every such shard with elements has a buffer (refer
     /// to [`Self::local_replica`]), so that [`Self::with_filled_local_buffers`] can supply every missing buffer. The
@@ -341,6 +398,501 @@ impl Array {
             shard.slice().iter().any(Range::is_empty)
                 || self.local_replica(&replicas, shard.index(), shard.device()).is_ok()
         })
+    }
+
+    /// Places this array on the devices, with the sharding, and in the storage that `target` names, with the memory,
+    /// layout, and host fallback rules of [`Self::to_placement`]. A request resolves its default memory into `target`
+    /// (refer to [`PlacementRequest::target_memory`]), so a memory that `target` omits keeps the memory of this array.
+    /// The result always belongs to `session`, so this array is first associated with `session`, which rejects an
+    /// array of another PJRT client, even when the placement leaves the array where it is. The result is
+    /// [committed](Self::is_committed) to the devices that `target` names, so it never has
+    /// [locally assigned devices](Self::is_locally_assigned), even when they are the devices of this array, and a
+    /// caller whose request named only a memory or a layout restores that fact (refer to [`Self::place_with_request`]).
+    ///
+    /// The requested layout (refer to [`Self::validate_placement_layout`]) and the target devices (refer to
+    /// [`validate_mesh_devices`]) are checked before any device work, because a placement without buffers (e.g.,
+    /// of a [`DataType::Zero`] array) would otherwise never check the layout, and a device that the target
+    /// misattributes would receive no buffer in any process. When the device work fails and returns this array, the
+    /// host fallback runs [`Self::upload_host_readback`]. Whatever this function can reject before reading back (e.g.,
+    /// a target mesh that this process does not fully address or a source that this process cannot read back) is
+    /// reported with the error of the device work.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
+    ///   - `target`: Resolved [`Placement`] (refer to [`Self::resolve_placement_request`]).
+    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
+    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
+    pub(crate) fn place_within_client(
+        self,
+        session: &Session,
+        target: &Placement,
+        donate: bool,
+    ) -> Result<Self, Error> {
+        // A placement may return the input or share its buffers. Associate it with the target session before
+        // choosing a strategy. Consuming `self` keeps the buffers uniquely owned for a donation.
+        let array = self.with_session(session)?;
+        let layout = array.validate_placement_layout(session, target)?;
+        let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
+        let memory = target.memory().unwrap_or_else(|| array.r#type().memory());
+        let placed = |array: Self| array.with_committed(true).with_locally_assigned(false);
+
+        if array.mesh() == &mesh && array.sharding() == &sharding {
+            // A placement that only changes the storage of this array, or nothing, does not inherit the sends of the
+            // placement that produced it (refer to `Self::without_send_fence`).
+            return Ok(placed(array.without_send_fence().place_storage(memory, layout)?));
+        }
+
+        validate_mesh_devices(session, &mesh)?;
+
+        // Keep the error of the device work, which is the most informative one if the host fallback fails too.
+        let (compiled_error, source) =
+            match array.try_reshard_on_devices(&mesh, &sharding, memory, layout.as_ref(), donate, true) {
+                Ok(array) => return Ok(placed(array.place_storage(memory, layout)?)),
+                Err((error, Some(source))) => (error, source),
+                Err((error, None)) => return Err(error),
+            };
+
+        // The fallback uploads the dense readback directly into the requested storage. If it cannot complete from this
+        // process, surface the original device error. That includes a source whose devices hold one slice but vary
+        // along a manual mesh axis, so that they can hold different values for it, which the readback rejects rather
+        // than silently replacing the values of the other devices with one of them.
+        let source_session = source.session();
+        let local_process = source_session.client().process_index()?;
+
+        // A placement that keeps some contributions of a pending reduction or of manual variation within a tile never
+        // reads back their combined value (refer to `keeps_some_contributions`), so the failure of its device work is
+        // final.
+        let target_fully_addressable = mesh.devices().iter().all(|device| device.process_index() == local_process);
+        if keeps_some_contributions(source.sharding(), &sharding)
+            || !target_fully_addressable
+            || source.validate_host_readback().is_err()
+        {
+            return Err(compiled_error);
+        }
+
+        // The round trip reads back and uploads in the background. Its failure poisons the result with an error that
+        // also describes the failure of the device work, because that failure is what made the host fallback necessary.
+        let device_error = compiled_error.to_string();
+        let poison = move |error: Error| {
+            PjrtError::internal(format!(
+                "the host fallback of an array placement failed with: {error} (the device work that it replaced \
+                failed with: {device_error})",
+            ))
+        };
+
+        match source.upload_host_readback(source_session, mesh, sharding, memory, layout, poison) {
+            Ok(array) => Ok(placed(array)),
+            Err(_) => Err(compiled_error),
+        }
+    }
+
+    /// Places this array, whose PJRT client is not that of `session`, onto `target` as an array of `session`.
+    /// PJRT copies buffers only within one client, so this process reads the value back and uploads it with the host
+    /// fallback of [`Self::place_within_client`] (refer to [`Self::upload_host_readback`]), whose upload waits for the
+    /// work that produces this array and reports its failures. The result is [committed](Self::is_committed), not
+    /// [locally assigned](Self::is_locally_assigned), and in the memory that `target` names, or in the memory of this
+    /// array otherwise, as within one client (refer to [`PlacementRequest::target_memory`], which resolves the default
+    /// memory of a request for a device into `target`). A target device without that memory is an
+    /// [`ArrayError::UnsupportedMemory`] error of the process that owns it. Donation never applies, because no buffer
+    /// of this array can become a buffer of the result. A process that owns no device of `target` reads nothing back
+    /// and returns the placement without buffers. The caller checks the placement first with
+    /// [`Self::validate_placement_from_other_client`].
+    pub(super) fn place_across_clients(self, session: &Session, target: &Placement) -> Result<Self, Error> {
+        let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
+        let memory = target.memory().unwrap_or_else(|| self.r#type().memory());
+        let layout = self.placement_layout(target.layout(), &mesh, &sharding)?;
+        let uploaded = self.upload_host_readback(session, mesh, sharding, memory, layout, |error: Error| {
+            PjrtError::internal(format!("the transfer of an array from another PJRT client failed with: {error}"))
+        })?;
+        Ok(uploaded.with_committed(true).with_locally_assigned(false))
+    }
+
+    /// Applies storage requirements to the shards already on their target devices. A layout change first tries a
+    /// compiled conversion on the device of each shard, and uses a host round trip for that shard when the plugin
+    /// cannot lower or compile that conversion (refer to [`Self::try_relayout_shard_on_device`]). Once a buffer has the
+    /// requested layout, it can be reused or copied directly to the requested memory. The result keeps the devices of
+    /// this array, and with them its [locally assigned devices](Self::is_locally_assigned). It declares exactly
+    /// `layout`, which [`Self::placement_layout`] resolved from information that every process shares, whatever layout
+    /// the strategy that produced this array recorded, so that every process records the same layout. Without `layout`,
+    /// it declares no layout and keeps the buffers as they are. The result keeps the send fence of this array, which
+    /// callers pass in only when its sends belong to the same public placement (i.e., when this array is an
+    /// intermediate step of that placement, refer to [`Self::place_within_client`]).
+    ///
+    /// The host round trip of a shard runs in the background as [`Self::copy_shard_through_host`] describes. The
+    /// execution fence of the result joins the fences of this array with the readiness of every buffer that this
+    /// function creates (i.e., the copies to another memory and the buffers of host round trips) and with the
+    /// fences of the compiled conversions.
+    pub(super) fn place_storage(self, memory: Memory, layout: Option<Layout>) -> Result<Self, Error> {
+        if self.r#type().memory() == memory && self.layout() == layout.as_ref() {
+            return Ok(self);
+        }
+
+        validate_device_layout(self.client(), self.data_type(), layout.as_ref(), false)?;
+
+        let session = self.session();
+        let r#type = self.r#type().into_owned().with_memory(memory).with_layout(layout);
+        let mesh = self.mesh().clone();
+        let sharding = Some(self.sharding().clone());
+        let mut completion = PlacementCompletion::default();
+
+        let mut output = if r#type.data_type().is_zero() {
+            Self::zero(session, r#type, sharding, mesh)?
+        } else {
+            // Register the submission before the first copy, so that a concurrent `Session::synchronize` snapshot
+            // includes every copy that may already be running. The host round trips register their own work.
+            let mut work = session.reserve_work();
+            let mut buffers = Vec::new();
+            for shard in self.addressable_shards() {
+                let (source_buffer, layout) = (shard.buffer().unwrap(), r#type.layout());
+                let completion = &mut completion;
+                buffers.push(self.place_shard_storage(shard, source_buffer, memory, layout, &mut work, completion)?);
+            }
+            Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, None, buffers, false)?
+        };
+
+        output.execution_fence = completion.join(self.execution_fence);
+        output.send_fence = self.send_fence;
+
+        Ok(output.with_locally_assigned(self.locally_assigned))
+    }
+
+    /// Returns `source_buffer`, which holds the contribution of `shard`, a shard of this array, on the device of
+    /// `shard`, in `memory` and in `layout` (or in its own layout for [`None`]), as [`Self::place_storage`] places
+    /// each shard. A layout change first tries a compiled conversion on that device, and a buffer in the requested
+    /// layout is reused or copied to `memory`. When the plugin cannot lower or compile the conversion, or reports that
+    /// it cannot copy the buffer to `memory` on the device (e.g., a host memory buffer that a compiled program produced
+    /// in a layout that the CPU plugin cannot copy), the shard is copied through host memory with
+    /// [`Self::copy_shard_through_host`] instead, from its own buffer, so the contributions of different
+    /// devices stay separate. `work` and `completion` record the copies and the fences of the conversions.
+    fn place_shard_storage(
+        &self,
+        shard: &ArrayShard,
+        source_buffer: &Arc<Buffer<'static>>,
+        memory: Memory,
+        layout: Option<&Layout>,
+        work: &mut WorkReservation,
+        completion: &mut PlacementCompletion,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        let session = self.session();
+        let device = source_buffer.device()?;
+        let target_memory = device.memory(memory)?;
+
+        let target_layout = layout.map(ToPjrt::to_pjrt).transpose()?;
+        let layout_change = match layout.zip(target_layout.as_ref()) {
+            Some((layout, target_layout)) => {
+                let current_layout = source_buffer.specification()?.layout;
+                (current_layout != *target_layout).then_some((current_layout, layout))
+            }
+            None => None,
+        };
+
+        let buffer = match layout_change {
+            Some((current_layout, layout)) => {
+                let input_type = ArrayType::new(self.data_type(), shard.shape().into())
+                    .with_memory(self.r#type().memory())
+                    .with_layout(Layout::from_pjrt(current_layout)?);
+                let (device, source_buffer) = (shard.device(), Arc::clone(source_buffer));
+                Self::try_relayout_shard_on_device(session, device, source_buffer, input_type, layout, completion)?
+            }
+            None => Some(Arc::clone(source_buffer)),
+        };
+
+        if let Some(buffer) = &buffer
+            && buffer.memory()? == target_memory
+        {
+            return Ok(Arc::clone(buffer));
+        }
+
+        self.copy_shard_to_memory(
+            buffer.as_ref(),
+            source_buffer,
+            shard.descriptor(),
+            target_memory,
+            || Ok(target_layout),
+            work,
+            completion,
+        )
+    }
+
+    /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
+    /// required layout or the plugin cannot copy it, reads `source_buffer` through host memory and uploads the
+    /// shard into `memory` with `fallback_layout`. An individual shard readback preserves its contribution.
+    fn copy_shard_to_memory<L: FnOnce() -> Result<Option<ryft_pjrt::Layout>, LayoutError>>(
+        &self,
+        buffer: Option<&Arc<Buffer<'static>>>,
+        source_buffer: &Arc<Buffer<'static>>,
+        shard: &ShardDescriptor,
+        memory: PjrtMemory<'_>,
+        fallback_layout: L,
+        work: &mut WorkReservation,
+        completion: &mut PlacementCompletion,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        if let Some(buffer) = buffer {
+            match buffer.copy_to_memory(memory) {
+                Ok(copied) => return completion.track_new(work, copied),
+                Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Self::copy_shard_through_host(
+            self.session(),
+            source_buffer,
+            shard.shape(),
+            self.data_type().executable_buffer_type(),
+            memory,
+            fallback_layout()?,
+            completion,
+        )
+    }
+
+    /// Returns a new buffer in `memory` and in `layout` (or the default layout of the PJRT plugin for [`None`])
+    /// that holds the shard with `shape` that `buffer` holds, copied through host memory in dense row-major order.
+    /// `completion` records the readiness of the new buffer, and the work tracking of `session` includes it, so
+    /// [`Session::synchronize`] waits for it.
+    ///
+    /// The round trip is its own job on the background upload workers of `session`, which reads the shard back once
+    /// `buffer` is ready and uploads it into the new buffer, which this function creates up front, so this function
+    /// returns without waiting for the job. The job waits only for `buffer` before it occupies a worker, so the round
+    /// trips of different shards are independent, and one never waits for the source of another (e.g., for a source
+    /// that a producer fills only once the round trip of another shard is ready). Each shard is read back from its own
+    /// device, because devices can hold different values for the same slice (e.g., the contributions along unreduced
+    /// axes). The job owns its own handle of `buffer`, so that buffer stays alive until the job has read it back. The
+    /// job is handed over before anything observes the new buffer, because nothing else can complete that buffer, and
+    /// observing it can wait for it (e.g., a fence built from its event awaits an event whose callback PJRT fails to
+    /// register). A failed readback or upload poisons the new buffer, and if the job cannot be handed over, dropping
+    /// its transfer manager poisons it as well. This function blocks on the readback only when the PJRT plugin lacks
+    /// host to device transfer managers or their literal transfers.
+    fn copy_shard_through_host(
+        session: &Session,
+        buffer: &Arc<Buffer<'static>>,
+        shape: StaticShape,
+        buffer_type: BufferType,
+        memory: PjrtMemory<'_>,
+        layout: Option<ryft_pjrt::Layout>,
+        completion: &mut PlacementCompletion,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        let client = session.client();
+        let dimensions = shape.as_slice().iter().map(|&size| size as u64).collect::<Vec<_>>();
+        let mut work = session.reserve_work();
+        let placed = match PendingHostUpload::new(client, buffer_type, dimensions.clone(), memory, layout.clone())? {
+            Some((upload, placed)) => {
+                let source = Arc::clone(buffer);
+                let sources = ExecutionFence::new(vec![buffer.ready()?]);
+                session.host_upload_workers().submit(sources, move || {
+                    run_host_uploads(
+                        vec![upload],
+                        |_| read_shard_to_host(&source, &shape, Event::r#await).map(HostBufferSlice::from),
+                        Error::into_pjrt_error,
+                    )
+                })?;
+                placed
+            }
+            None => {
+                let bytes = read_shard_to_host(buffer, &shape, |copy| work.track_host_copy(copy).wait())?;
+                client.buffer(Arc::<[u8]>::from(bytes), buffer_type, dimensions, None, memory, layout)?
+            }
+        };
+        completion.track_new(&mut work, placed)
+    }
+
+    /// Uploads the value of this array, which this process reads back as [`Self::copy_to_host_bytes`] does, onto `mesh`
+    /// according to `sharding`, in `memory` and `layout`, as an array of `session`. This is the host round trip that
+    /// the host fallback of [`Self::place_within_client`], [`Self::place_across_clients`], and the upload of
+    /// [`Self::place_process_local_value`] share. The target buffers are created up front and the readback and the
+    /// upload run in the background (refer to [`Self::from_host_buffer_in_background`]), whose failures, including
+    /// those of the work that produces this array, `poison` converts into the error that the target buffers report.
+    /// Only when the PJRT plugin lacks host to device transfer managers or their literal transfers does this function
+    /// read back and upload on the calling thread, and the execution fence of the result then joins the readiness of
+    /// its uploads and the execution fence of this array. A process that owns no device of `mesh` reads nothing back,
+    /// and a [`DataType::Zero`] value has no bytes to read back or upload, so both return without waiting the result
+    /// of [`Self::metadata_only_placement`], which waits for and reports the work that produces this array, after the
+    /// checks of the upload that read only metadata (refer to [`Self::validate_host_upload`]).
+    fn upload_host_readback<P: 'static + Send + FnOnce(Error) -> PjrtError>(
+        &self,
+        session: &Session,
+        mesh: DeviceMesh,
+        sharding: Sharding,
+        memory: Memory,
+        layout: Option<Layout>,
+        poison: P,
+    ) -> Result<Self, Error> {
+        let host_type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(memory).with_layout(layout);
+        let process_index = session.client().process_index()?;
+        if self.data_type().is_zero() || mesh.devices().iter().all(|device| device.process_index() != process_index) {
+            Self::validate_host_upload(session, host_type.clone(), &mesh, &sharding)?;
+            return self.metadata_only_placement(session, host_type, &mesh, &sharding);
+        }
+
+        let sources = self.host_readback_fence()?;
+        let readback_source = self.clone();
+        let uploaded = Self::from_host_buffer_in_background(
+            session,
+            host_type.clone(),
+            mesh.clone(),
+            sharding.clone(),
+            sources,
+            move || readback_source.copy_to_host_bytes(),
+            poison,
+        )?;
+
+        if let Some(array) = uploaded {
+            return Ok(array);
+        }
+
+        // Without host to device transfer managers, read back and upload on this thread.
+        let host_bytes = self.copy_to_host_bytes()?;
+        Self::from_host_buffer(session, host_type, mesh, Some(sharding), host_bytes.as_slice())
+            .and_then(|array| array.with_upload_completion(self.execution_fence().cloned()))
+    }
+
+    /// Places this array on `mesh` according to `sharding` with device work only (i.e., without copying its contents
+    /// through host memory), except that a source whose devices this process chose on its own can be read back and
+    /// uploaded (refer to [`Self::place_process_local_value`]) and that a shard whose storage the PJRT plugin cannot
+    /// change on its device is copied through host memory on its own (refer to [`Self::copy_shard_through_host`]).
+    /// [`Self::to_placement`] and [`Self::into_placement`] start with this work, and the execution of a compiled
+    /// program uses it for inputs whose sharding differs from the one that the program was compiled for. Refer to
+    /// [`Self::try_reshard_on_devices`] for the strategies that it tries.
+    ///
+    /// The result has the memory of this array and the layout that [`Self::placement_layout`] keeps for the target
+    /// shards, which a device reshard changes neither, as [`Self::place_within_client`] gives its result the storage
+    /// that it promises (e.g., an executable that declares the layout of its input accepts the result of a reshard of
+    /// that input).
+    ///
+    /// A result on a single device keeps the [commitment](Self::is_committed) of this array, because this is how arrays
+    /// move to the devices that an operation runs on rather than to devices that a caller chose. A result on more than
+    /// one device is committed, like every eager result on more than one device (refer to [`Self::commit_if`]). For the
+    /// same reason, a result on devices of this process only keeps the locally assigned devices of this array, while a
+    /// result on devices of other processes never has them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that executes the reshard and owns the resulting array. It must use the same PJRT
+    ///     client as this array.
+    ///   - `mesh`: Target [`DeviceMesh`].
+    ///   - `sharding`: Target [`Sharding`].
+    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
+    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
+    pub(crate) fn reshard_on_devices(
+        self,
+        session: &Session,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        donate: bool,
+    ) -> Result<Self, Error> {
+        let memory = self.r#type().memory();
+        let layout = self.placement_layout(None, mesh, sharding)?;
+        let (committed, locally_assigned) = (self.is_committed(), self.is_locally_assigned());
+        let array = self.with_session(session)?;
+
+        // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout
+        // of this array as the public placement path gives a result its storage, whatever strategy placed it.
+        array
+            .try_reshard_on_devices(mesh, sharding, memory, layout.as_ref(), donate, false)
+            .map_err(|(error, _)| error)
+            .and_then(|output| output.place_storage(memory, layout))
+            .map(|output| output.commit_if(committed).with_locally_assigned(locally_assigned))
+    }
+
+    /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this
+    /// array when a host fallback may still place it. [`Self::device_placement_strategy`] chooses the strategy (refer
+    /// to the documentation of this module), and [`Self::place_with_strategy`] performs the part of this process in it.
+    /// The errors of a planning and of moves of exact shards are final, so they come without this array. A donated
+    /// array is still returned when its compiled reshard fails to stage or to compile, and after a failed execution
+    /// only as [`Self::fallback_source`] allows.
+    ///
+    /// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`] (refer to
+    /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation,
+    /// and execution failures propagate through [`Error`] without losing their typed payloads.
+    ///
+    /// `layout` is the layout of each target shard that the placement records (refer to [`Self::placement_layout`]),
+    /// which [`Self::place_process_local_value`] uploads into directly. `host_fallback` is whether the caller falls
+    /// back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a change of reduction state
+    /// that only a host round trip makes exactly is an error right after the planning, whichever process could make
+    /// it (refer to [`HostRoundTripCause::without_host_route`]).
+    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
+    #[allow(clippy::result_large_err)]
+    fn try_reshard_on_devices(
+        self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        layout: Option<&Layout>,
+        donate: bool,
+        host_fallback: bool,
+    ) -> Result<Self, (Error, Option<Self>)> {
+        let process_index = match self.session().client().process_index() {
+            Ok(process_index) => process_index,
+            Err(error) => return Err((error.into(), None)),
+        };
+
+        // A planning error reads only shared metadata, so every process meets it alike, and no process recovers from
+        // it with a host fallback of its own (a decline that one process can make with a host round trip is planned
+        // as one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
+        // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
+        // for that fallback.
+        let layout_resolver = cross_host_layout_resolver(self.client());
+        let strategy = match self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index) {
+            Ok(strategy) => strategy,
+            Err(error) => return Err((error, None)),
+        };
+
+        if let Some(cause) = strategy.host_round_trip_cause().filter(|_| !host_fallback) {
+            return Err((cause.without_host_route(), None));
+        }
+
+        let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
+            match self.moved_to_owner_view(mesh) {
+                Ok(moved) => moved,
+                Err(error) => return Err((error, Some(self))),
+            }
+        } else {
+            self
+        };
+
+        array.place_with_strategy(strategy, process_index, mesh, sharding, memory, layout, donate)
+    }
+
+    /// Tries a layout conversion on one device, keeping the shard's contents and memory unchanged, and returns the
+    /// converted buffer, whose execution fence `completion` records. Returns `None` when lowering or compilation does
+    /// not support the conversion, so the caller can upload the shard through host memory instead. Errors from
+    /// executing a compiled conversion are propagated.
+    fn try_relayout_shard_on_device(
+        session: &Session,
+        device: Device,
+        buffer: Arc<Buffer<'static>>,
+        input_type: ArrayType,
+        layout: &Layout,
+        completion: &mut PlacementCompletion,
+    ) -> Result<Option<Arc<Buffer<'static>>>, Error> {
+        // A single-device program treats this buffer as an independent value, even when it holds only one
+        // contribution to an unreduced array. Its input uses the buffer's existing layout.
+        let input = Self::from_device_buffer(session, input_type.clone(), device, buffer)?;
+        let output_type = input_type.clone().with_layout(layout.clone());
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let argument = builder.add_input(input_type.clone().into());
+        let cast = CastOperation::<Type>::checked(output_type.into(), vec![input_type.into()])?;
+        let output = builder.add_instruction(cast, Vec::new(), vec![argument], None)?[0];
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder])?;
+        let compiled = session
+            .lower_program(&program, 0, &Options::new(input.mesh().clone()))
+            .and_then(|lowered| session.compilation_cache().compile(session, &lowered));
+        match compiled {
+            Ok(program) => {
+                let converted = session.execute_program(&program, vec![input])?.pop().unwrap();
+                completion.track_fence(converted.execution_fence());
+                Ok(Some(Arc::clone(converted.shards()[0].buffer().unwrap())))
+            }
+            Err(
+                Error::Lowering(
+                    LoweringError::UnsupportedOperation { .. }
+                    | LoweringError::UnsupportedElementType { .. }
+                    | LoweringError::UnsupportedBoundaryMemory { .. },
+                )
+                | Error::Pjrt(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }),
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Validates the target and checks that required whole-shard moves from a shared array have local sources.
@@ -504,548 +1056,7 @@ impl Array {
         Ok(())
     }
 
-    /// Places this array on the devices, with the sharding, and in the storage that `target` names, with the memory,
-    /// layout, and host fallback rules of [`Self::to_placement`]. A request resolves its default memory into `target`
-    /// (refer to [`PlacementRequest::target_memory`]), so a memory that `target` omits keeps the memory of this array.
-    /// The result always belongs to `session`, so this array is first associated with `session`, which rejects an
-    /// array of another PJRT client, even when the placement leaves the array where it is. The result is
-    /// [committed](Self::is_committed) to the devices that `target` names, so it never has
-    /// [locally assigned devices](Self::is_locally_assigned), even when they are the devices of this array, and a
-    /// caller whose request named only a memory or a layout restores that fact (refer to [`Self::place_with_request`]).
-    ///
-    /// The requested layout (refer to [`Self::validate_placement_layout`]) and the target devices (refer to
-    /// [`validate_mesh_devices`]) are checked before any device work, because a placement without buffers (e.g.,
-    /// of a [`DataType::Zero`] array) would otherwise never check the layout, and a device that the target
-    /// misattributes would receive no buffer in any process. When the device work fails and returns this array, the
-    /// host fallback runs [`Self::upload_host_readback`]. Whatever this function can reject before reading back (e.g.,
-    /// a target mesh that this process does not fully address or a source that this process cannot read back) is
-    /// reported with the error of the device work.
-    ///
-    /// # Parameters
-    ///
-    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `target`: Resolved [`Placement`] (refer to [`Self::resolve_placement_request`]).
-    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
-    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
-    pub(crate) fn place_within_client(
-        self,
-        session: &Session,
-        target: &Placement,
-        donate: bool,
-    ) -> Result<Self, Error> {
-        // A placement may return the input or share its buffers. Associate it with the target session before
-        // choosing a strategy. Consuming `self` keeps the buffers uniquely owned for a donation.
-        let array = self.with_session(session)?;
-        let layout = array.validate_placement_layout(session, target)?;
-        let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
-        let memory = target.memory().unwrap_or_else(|| array.r#type().memory());
-        let placed = |array: Self| array.with_committed(true).with_locally_assigned(false);
-
-        if array.mesh() == &mesh && array.sharding() == &sharding {
-            // A placement that only changes the storage of this array, or nothing, does not inherit the sends of the
-            // placement that produced it (refer to `Self::without_send_fence`).
-            return Ok(placed(array.without_send_fence().place_storage(memory, layout)?));
-        }
-
-        validate_mesh_devices(session, &mesh)?;
-
-        // Keep the error of the device work, which is the most informative one if the host fallback fails too.
-        let (compiled_error, source) =
-            match array.try_reshard_on_devices(&mesh, &sharding, memory, layout.as_ref(), donate, true) {
-                Ok(array) => return Ok(placed(array.place_storage(memory, layout)?)),
-                Err((error, Some(source))) => (error, source),
-                Err((error, None)) => return Err(error),
-            };
-
-        // The fallback uploads the dense readback directly into the requested storage. If it cannot complete from this
-        // process, surface the original device error. That includes a source whose devices hold one slice but vary
-        // along a manual mesh axis, so that they can hold different values for it, which the readback rejects rather
-        // than silently replacing the values of the other devices with one of them.
-        let source_session = source.session();
-        let local_process = source_session.client().process_index()?;
-
-        // A placement that keeps some contributions of a pending reduction or of manual variation within a tile never
-        // reads back their combined value (refer to `keeps_some_contributions`), so the failure of its device work is
-        // final.
-        let target_fully_addressable = mesh.devices().iter().all(|device| device.process_index() == local_process);
-        if keeps_some_contributions(source.sharding(), &sharding)
-            || !target_fully_addressable
-            || source.validate_host_readback().is_err()
-        {
-            return Err(compiled_error);
-        }
-
-        // The round trip reads back and uploads in the background. Its failure poisons the result with an error that
-        // also describes the failure of the device work, because that failure is what made the host fallback necessary.
-        let device_error = compiled_error.to_string();
-        let poison = move |error: Error| {
-            PjrtError::internal(format!(
-                "the host fallback of an array placement failed with: {error} (the device work that it replaced \
-                failed with: {device_error})",
-            ))
-        };
-
-        match source.upload_host_readback(source_session, mesh, sharding, memory, layout, poison) {
-            Ok(array) => Ok(placed(array)),
-            Err(_) => Err(compiled_error),
-        }
-    }
-
-    /// Places this array, whose PJRT client is not that of `session`, onto `target` as an array of `session`.
-    /// PJRT copies buffers only within one client, so this process reads the value back and uploads it with the host
-    /// fallback of [`Self::place_within_client`] (refer to [`Self::upload_host_readback`]), whose upload waits for the
-    /// work that produces this array and reports its failures. The result is [committed](Self::is_committed), not
-    /// [locally assigned](Self::is_locally_assigned), and in the memory that `target` names, or in the memory of this
-    /// array otherwise, as within one client (refer to [`PlacementRequest::target_memory`], which resolves the default
-    /// memory of a request for a device into `target`). A target device without that memory is an
-    /// [`ArrayError::UnsupportedMemory`] error of the process that owns it. Donation never applies, because no buffer
-    /// of this array can become a buffer of the result. A process that owns no device of `target` reads nothing back
-    /// and returns the placement without buffers. The caller checks the placement first with
-    /// [`Self::validate_placement_from_other_client`].
-    pub(super) fn place_across_clients(self, session: &Session, target: &Placement) -> Result<Self, Error> {
-        let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
-        let memory = target.memory().unwrap_or_else(|| self.r#type().memory());
-        let layout = self.placement_layout(target.layout(), &mesh, &sharding)?;
-        let uploaded = self.upload_host_readback(session, mesh, sharding, memory, layout, |error: Error| {
-            PjrtError::internal(format!("the transfer of an array from another PJRT client failed with: {error}"))
-        })?;
-        Ok(uploaded.with_committed(true).with_locally_assigned(false))
-    }
-
-    /// Places this array on `mesh` according to `sharding` with device work only (i.e., without copying its contents
-    /// through host memory), except that a source whose devices this process chose on its own can be read back and
-    /// uploaded (refer to [`Self::place_process_local_value`]) and that a shard whose storage the PJRT plugin cannot
-    /// change on its device is copied through host memory on its own (refer to [`Self::copy_shard_through_host`]).
-    /// [`Self::to_placement`] and [`Self::into_placement`] start with this work, and the execution of a compiled
-    /// program uses it for inputs whose sharding differs from the one that the program was compiled for. Refer to
-    /// [`Self::try_reshard_on_devices`] for the strategies that it tries.
-    ///
-    /// The result has the memory of this array and the layout that [`Self::placement_layout`] keeps for the target
-    /// shards, which a device reshard changes neither, as [`Self::place_within_client`] gives its result the storage
-    /// that it promises (e.g., an executable that declares the layout of its input accepts the result of a reshard of
-    /// that input).
-    ///
-    /// A result on a single device keeps the [commitment](Self::is_committed) of this array, because this is how arrays
-    /// move to the devices that an operation runs on rather than to devices that a caller chose. A result on more than
-    /// one device is committed, like every eager result on more than one device (refer to [`Self::commit_if`]). For the
-    /// same reason, a result on devices of this process only keeps the locally assigned devices of this array, while a
-    /// result on devices of other processes never has them.
-    ///
-    /// # Parameters
-    ///
-    ///   - `session`: [`Session`] that executes the reshard and owns the resulting array. It must use the same PJRT
-    ///     client as this array.
-    ///   - `mesh`: Target [`DeviceMesh`].
-    ///   - `sharding`: Target [`Sharding`].
-    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
-    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
-    pub(crate) fn reshard_on_devices(
-        self,
-        session: &Session,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        donate: bool,
-    ) -> Result<Self, Error> {
-        let memory = self.r#type().memory();
-        let layout = self.placement_layout(None, mesh, sharding)?;
-        let (committed, locally_assigned) = (self.is_committed(), self.is_locally_assigned());
-        let array = self.with_session(session)?;
-
-        // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout
-        // of this array as the public placement path gives a result its storage, whatever strategy placed it.
-        array
-            .try_reshard_on_devices(mesh, sharding, memory, layout.as_ref(), donate, false)
-            .map_err(|(error, _)| error)
-            .and_then(|output| output.place_storage(memory, layout))
-            .map(|output| output.commit_if(committed).with_locally_assigned(locally_assigned))
-    }
-
-    /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this
-    /// array when a host fallback may still place it. [`Self::device_placement_strategy`] chooses the strategy (refer
-    /// to the documentation of this module), and [`Self::place_with_strategy`] performs the part of this process in it.
-    /// The errors of a planning and of moves of exact shards are final, so they come without this array. A donated
-    /// array is still returned when its compiled reshard fails to stage or to compile, and after a failed execution
-    /// only as [`Self::fallback_source`] allows.
-    ///
-    /// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`] (refer to
-    /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation,
-    /// and execution failures propagate through [`Error`] without losing their typed payloads.
-    ///
-    /// `layout` is the layout of each target shard that the placement records (refer to [`Self::placement_layout`]),
-    /// which [`Self::place_process_local_value`] uploads into directly. `host_fallback` is whether the caller falls
-    /// back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a change of reduction state
-    /// that only a host round trip makes exactly is an error right after the planning, whichever process could make
-    /// it (refer to [`HostRoundTripCause::without_host_route`]).
-    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
-    #[allow(clippy::result_large_err)]
-    fn try_reshard_on_devices(
-        self,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        layout: Option<&Layout>,
-        donate: bool,
-        host_fallback: bool,
-    ) -> Result<Self, (Error, Option<Self>)> {
-        let process_index = match self.session().client().process_index() {
-            Ok(process_index) => process_index,
-            Err(error) => return Err((error.into(), None)),
-        };
-
-        // A planning error reads only shared metadata, so every process meets it alike, and no process recovers from
-        // it with a host fallback of its own (a decline that one process can make with a host round trip is planned
-        // as one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
-        // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
-        // for that fallback.
-        let layout_resolver = cross_host_layout_resolver(self.client());
-        let strategy = match self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index) {
-            Ok(strategy) => strategy,
-            Err(error) => return Err((error, None)),
-        };
-
-        if let Some(cause) = strategy.host_round_trip_cause().filter(|_| !host_fallback) {
-            return Err((cause.without_host_route(), None));
-        }
-
-        let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
-            match self.moved_to_owner_view(mesh) {
-                Ok(moved) => moved,
-                Err(error) => return Err((error, Some(self))),
-            }
-        } else {
-            self
-        };
-
-        array.place_with_strategy(strategy, process_index, mesh, sharding, memory, layout, donate)
-    }
-
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Applies storage requirements to the shards already on their target devices. A layout change first tries a
-    /// compiled conversion on the device of each shard, and uses a host round trip for that shard when the plugin
-    /// cannot lower or compile that conversion (refer to [`Self::try_relayout_shard_on_device`]). Once a buffer
-    /// has the requested layout, it can be reused or copied directly to the requested memory. The result keeps the
-    /// devices of this array, and with them its [locally assigned devices](Self::is_locally_assigned). It declares
-    /// exactly `layout`, which [`Self::placement_layout`] resolved from information that every process shares, whatever
-    /// layout the strategy that produced this array recorded, so that every process records the same layout. Without
-    /// `layout`, it declares no layout and keeps the buffers as they are. The result keeps the send fence of this
-    /// array, which callers pass in only when its sends belong to the same public placement (i.e., when this array is
-    /// an intermediate step of that placement, refer to [`Self::place_within_client`]).
-    ///
-    /// The host round trip of a shard runs in the background as [`Self::copy_shard_through_host`] describes. The
-    /// execution fence of the result joins the fences of this array with the readiness of every buffer that this
-    /// function creates (i.e., the copies to another memory and the buffers of host round trips) and with the fences of
-    /// the compiled conversions (refer to [`crate::arrays::transfers`]).
-    pub(super) fn place_storage(self, memory: Memory, layout: Option<Layout>) -> Result<Self, Error> {
-        if self.r#type().memory() == memory && self.layout() == layout.as_ref() {
-            return Ok(self);
-        }
-        validate_device_layout(self.client(), self.data_type(), layout.as_ref(), false)?;
-
-        let session = self.session();
-        let r#type = self.r#type().into_owned().with_memory(memory).with_layout(layout);
-        let mesh = self.mesh().clone();
-        let sharding = Some(self.sharding().clone());
-        let mut completion = PlacementCompletion::default();
-        let mut output = if r#type.data_type().is_zero() {
-            Self::zero(session, r#type, sharding, mesh)?
-        } else {
-            // Register the submission before the first copy, so that a concurrent `Session::synchronize` snapshot
-            // includes every copy that may already be running. The host round trips register their own work.
-            let mut work = session.reserve_work();
-            let mut buffers = Vec::new();
-            for shard in self.addressable_shards() {
-                let (source_buffer, layout) = (shard.buffer().unwrap(), r#type.layout());
-                let completion = &mut completion;
-                buffers.push(self.place_shard_storage(shard, source_buffer, memory, layout, &mut work, completion)?);
-            }
-            Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, None, buffers, false)?
-        };
-        output.execution_fence = completion.join(self.execution_fence);
-        output.send_fence = self.send_fence;
-        Ok(output.with_locally_assigned(self.locally_assigned))
-    }
-
-    /// Uploads the value of this array, which this process reads back as [`Self::copy_to_host_bytes`] does, onto
-    /// `mesh` according to `sharding`, in `memory` and `layout`, as an array of `session`. This is the host round trip
-    /// that the host fallback of [`Self::place_within_client`], [`Self::place_across_clients`], and the upload of
-    /// [`Self::place_process_local_value`] share. The
-    /// target buffers are created up front and the readback and the upload run in the background (refer to
-    /// [`Self::from_host_buffer_in_background`]), whose failures, including those of the work that produces this
-    /// array, `poison` converts into the error that the target buffers report. Only when the PJRT plugin lacks
-    /// host to device transfer managers or their literal transfers does this function read back and upload on the
-    /// calling thread, and the execution fence of the result then joins the readiness of its uploads and the execution
-    /// fence of this array. A process that owns no device of `mesh` reads nothing back, and a [`DataType::Zero`] value
-    /// has no bytes to read back or upload, so both return without waiting the result of
-    /// [`Self::metadata_only_placement`], which waits for and reports the work that produces this array, after the
-    /// checks of the upload that read only metadata (refer to [`Self::validate_host_upload`]).
-    fn upload_host_readback<P: 'static + Send + FnOnce(Error) -> PjrtError>(
-        &self,
-        session: &Session,
-        mesh: DeviceMesh,
-        sharding: Sharding,
-        memory: Memory,
-        layout: Option<Layout>,
-        poison: P,
-    ) -> Result<Self, Error> {
-        let host_type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(memory).with_layout(layout);
-        let process_index = session.client().process_index()?;
-        if self.data_type().is_zero() || mesh.devices().iter().all(|device| device.process_index() != process_index) {
-            Self::validate_host_upload(session, host_type.clone(), &mesh, &sharding)?;
-            return self.metadata_only_placement(session, host_type, &mesh, &sharding);
-        }
-        let sources = self.host_readback_fence()?;
-        let readback_source = self.clone();
-        let uploaded = Self::from_host_buffer_in_background(
-            session,
-            host_type.clone(),
-            mesh.clone(),
-            sharding.clone(),
-            sources,
-            move || readback_source.copy_to_host_bytes(),
-            poison,
-        )?;
-        if let Some(array) = uploaded {
-            return Ok(array);
-        }
-
-        // Without host to device transfer managers, read back and upload on this thread.
-        let host_bytes = self.copy_to_host_bytes()?;
-        Self::from_host_buffer(session, host_type, mesh, Some(sharding), host_bytes.as_slice())
-            .and_then(|array| array.with_upload_completion(self.execution_fence().cloned()))
-    }
-
-    /// Returns the layout that each shard of a placement of this array on `mesh` according to `sharding` has, which is
-    /// `requested` when the placement names a layout, and the layout of this array otherwise, but only while that
-    /// layout still describes the target shards, as the type rule of the placement keeps it (e.g., the strides of
-    /// a column shard do not describe the value that a gather produces). It reads only the type of this array and the
-    /// target, which every process shares, so every process and every strategy of a placement record the same
-    /// layout. A requested layout is validated against the target shards here, because a placement without
-    /// buffers never meets a buffer that would reject it.
-    fn placement_layout(
-        &self,
-        requested: Option<&Layout>,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-    ) -> Result<Option<Layout>, Error> {
-        if requested.is_none() && self.layout().is_none() {
-            return Ok(None);
-        }
-        check_sharding!(mesh, sharding);
-        let r#type = self.r#type();
-        if sharding.rank() != r#type.rank() {
-            return Err(ShardingError::ShardingRankMismatch {
-                sharding_rank: sharding.rank(),
-                array_rank: r#type.rank(),
-            }
-            .into());
-        }
-        let sharding_is_complete = true;
-        let validate = |layout: &Layout| r#type.validate_shard_layout(layout, Some(sharding), sharding_is_complete);
-        match requested {
-            Some(layout) => {
-                validate(layout).map_err(|error| {
-                    TypeError::invalid(format!("`{PLACE_OPERATION_NAME}` target layout is invalid: {error}"))
-                })?;
-                Ok(Some(layout.clone()))
-            }
-            None => Ok(self.layout().filter(|layout| validate(layout).is_ok()).cloned()),
-        }
-    }
-
-    /// Returns this array, which a host upload of a placement has just created on the calling thread (e.g., with
-    /// [`Self::from_host_buffer`] when the PJRT plugin lacks host to device transfer managers), with an execution fence
-    /// that joins its own fence, if any, and `fence` (i.e., the execution fence of the source of the placement) with
-    /// the readiness of every addressable buffer of this array, so that its readbacks report a failed upload of any
-    /// replica, as for background uploads (refer to [`crate::arrays::transfers`]). Plain host uploads keep no such
-    /// fence, because every one of their replicas receives the same host bytes (refer to [`crate::arrays::host`]).
-    fn with_upload_completion(mut self, fence: Option<ExecutionFence>) -> Result<Self, Error> {
-        let mut completion = PlacementCompletion::default();
-        completion.track_fence(fence.as_ref());
-        for buffer in self.addressable_shards().filter_map(ArrayShard::buffer) {
-            completion.track_buffer(buffer)?;
-        }
-        self.execution_fence = completion.join(self.execution_fence.take());
-        Ok(self)
-    }
-
-    /// Returns `source_buffer`, which holds the contribution of `shard`, a shard of this array, on the device of
-    /// `shard`, in `memory` and in `layout` (or in its own layout for [`None`]), as [`Self::place_storage`] places each
-    /// shard. A layout change first tries a compiled conversion on that device (refer to
-    /// [`Self::try_relayout_shard_on_device`]), and a buffer in the requested layout is reused or copied to `memory`.
-    /// When the plugin cannot lower or compile the conversion, or reports that it cannot copy the buffer to `memory`
-    /// on the device (e.g., a host memory buffer that a compiled program produced in a layout that the CPU plugin
-    /// cannot copy), the shard is copied through host memory with [`Self::copy_shard_through_host`] instead, from its
-    /// own buffer, so the contributions of different devices stay separate. `work` and `completion` record the copies
-    /// and the fences of the conversions.
-    fn place_shard_storage(
-        &self,
-        shard: &ArrayShard,
-        source_buffer: &Arc<Buffer<'static>>,
-        memory: Memory,
-        layout: Option<&Layout>,
-        work: &mut WorkReservation,
-        completion: &mut PlacementCompletion,
-    ) -> Result<Arc<Buffer<'static>>, Error> {
-        let session = self.session();
-        let target_layout = layout.map(ToPjrt::to_pjrt).transpose()?;
-        let device = source_buffer.device()?;
-        let target_memory = device.memory(memory)?;
-        let layout_change = match layout.zip(target_layout.as_ref()) {
-            Some((layout, target_layout)) => {
-                let current_layout = source_buffer.specification()?.layout;
-                (current_layout != *target_layout).then_some((current_layout, layout))
-            }
-            None => None,
-        };
-        let buffer = match layout_change {
-            Some((current_layout, layout)) => {
-                let input_type = ArrayType::new(self.data_type(), shard.shape().into())
-                    .with_memory(self.r#type().memory())
-                    .with_layout(Layout::from_pjrt(current_layout)?);
-                let (device, source_buffer) = (shard.device(), Arc::clone(source_buffer));
-                Self::try_relayout_shard_on_device(session, device, source_buffer, input_type, layout, completion)?
-            }
-            None => Some(Arc::clone(source_buffer)),
-        };
-        if let Some(buffer) = &buffer
-            && buffer.memory()? == target_memory
-        {
-            return Ok(Arc::clone(buffer));
-        }
-        self.copy_shard_to_memory(
-            buffer.as_ref(),
-            source_buffer,
-            shard.descriptor(),
-            target_memory,
-            || Ok(target_layout),
-            work,
-            completion,
-        )
-    }
-
-    /// Tries a layout conversion on one device, keeping the shard's contents and memory unchanged, and returns the
-    /// converted buffer, whose execution fence `completion` records. Returns `None` when lowering or compilation does
-    /// not support the conversion, so the caller can upload the shard through host memory instead. Errors from
-    /// executing a compiled conversion are propagated.
-    fn try_relayout_shard_on_device(
-        session: &Session,
-        device: Device,
-        buffer: Arc<Buffer<'static>>,
-        input_type: ArrayType,
-        layout: &Layout,
-        completion: &mut PlacementCompletion,
-    ) -> Result<Option<Arc<Buffer<'static>>>, Error> {
-        // A single-device program treats this buffer as an independent value, even when it holds only one
-        // contribution to an unreduced array. Its input uses the buffer's existing layout.
-        let input = Self::from_device_buffer(session, input_type.clone(), device, buffer)?;
-        let output_type = input_type.clone().with_layout(layout.clone());
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let argument = builder.add_input(input_type.clone().into());
-        let cast = CastOperation::<Type>::checked(output_type.into(), vec![input_type.into()])?;
-        let output = builder.add_instruction(cast, Vec::new(), vec![argument], None)?[0];
-        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder])?;
-        let compiled = session
-            .lower_program(&program, 0, &Options::new(input.mesh().clone()))
-            .and_then(|lowered| session.compilation_cache().compile(session, &lowered));
-        match compiled {
-            Ok(program) => {
-                let converted = session.execute_program(&program, vec![input])?.pop().unwrap();
-                completion.track_fence(converted.execution_fence());
-                Ok(Some(Arc::clone(converted.shards()[0].buffer().unwrap())))
-            }
-            Err(
-                Error::Lowering(
-                    LoweringError::UnsupportedOperation { .. }
-                    | LoweringError::UnsupportedElementType { .. }
-                    | LoweringError::UnsupportedBoundaryMemory { .. },
-                )
-                | Error::Pjrt(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }),
-            ) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
-    /// required layout or the plugin cannot copy it, reads `source_buffer` through host memory and uploads the
-    /// shard into `memory` with `fallback_layout`. An individual shard readback preserves its contribution.
-    fn copy_shard_to_memory(
-        &self,
-        buffer: Option<&Arc<Buffer<'static>>>,
-        source_buffer: &Arc<Buffer<'static>>,
-        shard: &ShardDescriptor,
-        memory: PjrtMemory<'_>,
-        fallback_layout: impl FnOnce() -> Result<Option<ryft_pjrt::Layout>, LayoutError>,
-        work: &mut WorkReservation,
-        completion: &mut PlacementCompletion,
-    ) -> Result<Arc<Buffer<'static>>, Error> {
-        if let Some(buffer) = buffer {
-            match buffer.copy_to_memory(memory) {
-                Ok(copied) => return completion.track_new(work, copied),
-                Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Self::copy_shard_through_host(
-            self.session(),
-            source_buffer,
-            shard.shape(),
-            self.data_type().executable_buffer_type(),
-            memory,
-            fallback_layout()?,
-            completion,
-        )
-    }
-
-    /// Returns a new buffer in `memory` and in `layout` (or the default layout of the PJRT plugin for [`None`]) that
-    /// holds the shard with `shape` that `buffer` holds, copied through host memory in dense row-major order.
-    /// `completion` records the readiness of the new buffer, and the work tracking of `session` includes it, so
-    /// [`Session::synchronize`] waits for it.
-    ///
-    /// The round trip is its own job on the background upload workers of `session`, which reads the shard back once
-    /// `buffer` is ready and uploads it into the new buffer, which this function creates up front, so this function
-    /// returns without waiting for the job. The job waits only for `buffer` before it occupies a worker, so the round
-    /// trips of different shards are independent, and one never waits for the source of another (e.g., for a source
-    /// that a producer fills only once the round trip of another shard is ready). Each shard is read back from its own
-    /// device, because devices can hold different values for the same slice (e.g., the contributions along unreduced
-    /// axes). The job owns its own handle of `buffer`, so that buffer stays alive until the job has read it back. The
-    /// job is handed over before anything observes the new buffer, because nothing else can complete that buffer, and
-    /// observing it can wait for it (e.g., a fence built from its event awaits an event whose callback PJRT fails to
-    /// register). A failed readback or upload poisons the new buffer, and if the job cannot be handed over, dropping
-    /// its transfer manager poisons it as well. This function blocks on the readback only when the PJRT plugin lacks
-    /// host to device transfer managers or their literal transfers.
-    fn copy_shard_through_host(
-        session: &Session,
-        buffer: &Arc<Buffer<'static>>,
-        shape: StaticShape,
-        buffer_type: BufferType,
-        memory: PjrtMemory<'_>,
-        layout: Option<ryft_pjrt::Layout>,
-        completion: &mut PlacementCompletion,
-    ) -> Result<Arc<Buffer<'static>>, Error> {
-        let client = session.client();
-        let dimensions = shape.as_slice().iter().map(|&size| size as u64).collect::<Vec<_>>();
-        let mut work = session.reserve_work();
-        let placed = match PendingHostUpload::new(client, buffer_type, dimensions.clone(), memory, layout.clone())? {
-            Some((upload, placed)) => {
-                let source = Arc::clone(buffer);
-                let sources = ExecutionFence::new(vec![buffer.ready()?]);
-                session.host_upload_workers().submit(sources, move || {
-                    run_host_uploads(
-                        vec![upload],
-                        |_| read_shard_to_host(&source, &shape, Event::r#await).map(HostBufferSlice::from),
-                        Error::into_pjrt_error,
-                    )
-                })?;
-                placed
-            }
-            None => {
-                let bytes = read_shard_to_host(buffer, &shape, |copy| work.track_host_copy(copy).wait())?;
-                client.buffer(Arc::<[u8]>::from(bytes), buffer_type, dimensions, None, memory, layout)?
-            }
-        };
-        completion.track_new(&mut work, placed)
-    }
 
     /// Places this array, which has [locally assigned devices](Self::is_locally_assigned) (refer to
     /// [`Self::device_placement_strategy`]), on the devices of this process in `mesh` according to `sharding` and in
@@ -2200,7 +2211,7 @@ impl Array {
     }
 
     /// Chooses the device work that places this array on `mesh` according to `sharding` in the process with index
-    /// `process_index`, or returns the error that rules out all of it. `resolve_layout` supplies the layouts needed
+    /// `process_index`, or returns the error that rules out all of it. `layout_resolver` supplies the layouts needed
     /// for cross-host transfers. [`Self::try_reshard_on_devices`] executes the chosen strategy, and the
     /// agreement test of this module plans every process of a distributed placement with this same function.
     ///
@@ -2309,6 +2320,7 @@ impl Array {
         let devices = self.addressable_devices_by_id(process_index)?;
         let replicas = LocalReplicas::new(process_index);
         let mut work = self.session().reserve_work();
+
         // The shards of the devices of `mesh` are looked up by device, so a restriction to `n` devices costs `O(n)`.
         let shards = mesh.devices().iter().filter_map(|device| self.device_shard(device.id()));
         let mut buffers = Vec::new();
@@ -2317,6 +2329,7 @@ impl Array {
             let buffer = self.local_contribution_buffer(&replicas, index, &devices, &mut work, &mut completion);
             buffers.push(buffer?);
         }
+
         self.rebuilt(r#type, mesh, sharding, buffers, completion)
     }
 
@@ -2915,7 +2928,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     ///      shards of the replicated value (refer to [`plan_exact_shard_put`]).
     fn strategy(
         &self,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<DevicePlacementStrategy, Error> {
@@ -2937,7 +2950,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         if let Some(plan) = exact {
             let cross_host_shards =
                 plan.cross_host_moves().map(|movement| (movement.target_shard_index, movement.shape()));
-            if let Some(cross_host_layouts) = cross_host_layouts(resolve_layout, element_type, cross_host_shards)? {
+            if let Some(cross_host_layouts) = cross_host_layouts(layout_resolver, element_type, cross_host_shards)? {
                 return Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts });
             }
         }
@@ -2951,7 +2964,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // placement fails here (e.g., without a default layout for a cross-host receive).
         let keeps = keeps_contributions(self.sharding(), sharding);
         if keeps {
-            if let Some((plan, cross_host_layouts)) = self.shard_region_plan(resolve_layout, mesh, sharding)? {
+            if let Some((plan, cross_host_layouts)) = self.shard_region_plan(layout_resolver, mesh, sharding)? {
                 return Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts });
             }
             let keeps_state_by_name = self.mesh() == mesh
@@ -2990,7 +3003,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
             let remaining = sharding.unreduced_axes().iter().filter(|axis| !introduced.contains(&axis.as_str()));
             let first_sharding = sharding.clone().with_unreduced_axes(remaining.cloned().collect::<Vec<_>>())?;
-            return self.introduced_sums_strategy(resolve_layout, mesh, &first_sharding, axis_indices);
+            return self.introduced_sums_strategy(layout_resolver, mesh, &first_sharding, axis_indices);
         }
 
         let compiled = self.validate_compiled_reshard(mesh, sharding);
@@ -3012,7 +3025,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // A placement that keeps contributions has asked `Self::shard_region_plan` above with the same arguments.
         if try_regions
             && !keeps
-            && let Some((plan, cross_host_layouts)) = self.shard_region_plan(resolve_layout, mesh, sharding)?
+            && let Some((plan, cross_host_layouts)) = self.shard_region_plan(layout_resolver, mesh, sharding)?
         {
             return Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts });
         }
@@ -3092,7 +3105,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let mut cross_host_layouts = HashMap::new();
         if let Some(movement) = replicas.cross_host_moves().next() {
             let shape = movement.shape();
-            let layout = resolve_layout(element_type, movement.target_shard_index, &shape)?.ok_or_else(|| {
+            let layout = layout_resolver(element_type, movement.target_shard_index, &shape)?.ok_or_else(|| {
                 Error::Pjrt(PjrtError::unimplemented(
                     "the PJRT plugin does not report the default layout that a cross-host receive allocates",
                 ))
@@ -3166,7 +3179,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     /// those devices).
     fn introduced_sums_strategy(
         &self,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
         first_sharding: &Sharding,
         axis_indices: Vec<usize>,
@@ -3200,7 +3213,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             } else {
                 let (metadata, shards) = self.on_mesh(first_mesh.clone(), restricted_sharding)?;
                 let view = PlacementPlanningView { metadata: &metadata, shards: shards.iter() };
-                let first = view.strategy(resolve_layout, &first_mesh, &first_sharding)?;
+                let first = view.strategy(layout_resolver, &first_mesh, &first_sharding)?;
                 (first_mesh, first_sharding, true, Some(first))
             }
         } else {
@@ -3208,14 +3221,14 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             // which needs one process that owns the source and those devices only.
             let on_target_mesh =
                 !self.sharding().holds_one_value_per_slice() && !keeps_contributions(self.sharding(), first_sharding);
-            let direct = on_target_mesh.then(|| self.strategy(resolve_layout, mesh, first_sharding)).transpose()?;
+            let direct = on_target_mesh.then(|| self.strategy(layout_resolver, mesh, first_sharding)).transpose()?;
             match direct {
                 Some(first) if !matches!(first, DevicePlacementStrategy::HostRoundTrip { .. }) => {
                     (mesh.clone(), first_sharding.clone(), false, Some(first))
                 }
                 _ => {
                     let (first_mesh, first_sharding) = coordinate_zero()?;
-                    let first = self.strategy(resolve_layout, &first_mesh, &first_sharding)?;
+                    let first = self.strategy(layout_resolver, &first_mesh, &first_sharding)?;
                     (first_mesh, first_sharding, false, Some(first))
                 }
             }
@@ -3352,14 +3365,14 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     /// default layout of the shape of every region that crosses processes when [`Array::place_shard_regions`] can
     /// place this array on `mesh` according to `sharding`, or `None` when it cannot. That is the case when
     /// [`Self::plan_shard_regions`] declines the placement (e.g., when it changes the contributions of a pending
-    /// reduction), or `resolve_layout` cannot obtain a default layout for a remote region because the plugin lacks the
+    /// reduction), or `layout_resolver` cannot obtain a default layout for a remote region because the plugin lacks the
     /// cross-host transfers extension or cannot report the layout. Every process derives the same moves and checks all
     /// of them, not only its own, so all processes decline alike, and the placement then executes these moves rather
     /// than deriving them again. Neither the memory nor the declared layout of this array matters, because each process
     /// converts its own shards (refer to [`Array::place_shard_regions`]).
     fn shard_region_plan(
         &self,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<Option<(ShardMovePlan, HashMap<StaticShape, ryft_pjrt::Layout>)>, Error> {
@@ -3368,7 +3381,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             return Ok(None);
         };
         let remote_regions = plan.cross_host_moves().map(|movement| (movement.target_shard_index, movement.shape()));
-        let layouts = cross_host_layouts(resolve_layout, plan.element_type, remote_regions)?;
+        let layouts = cross_host_layouts(layout_resolver, plan.element_type, remote_regions)?;
         Ok(layouts.map(|layouts| (plan, layouts)))
     }
 
@@ -4209,20 +4222,20 @@ fn cross_host_layout_resolver<'o>(
     }
 }
 
-/// Uses `resolve_layout` to obtain the default layout for buffers of `element_type` with each shape of
+/// Uses `layout_resolver` to obtain the default layout for buffers of `element_type` with each shape of
 /// `shards` (i.e., of pairs of the index of a target shard and a shape that crosses processes for it), or `None`
 /// when `shards` is not empty and the plugin lacks the cross-host transfers extension or cannot report one of those
 /// layouts. The first shard with each shape supplies the index for a single lookup of that shape. Every process derives
 /// the same `shards` for a placement and queries the same plugin, so all of them get the same result.
 fn cross_host_layouts(
-    resolve_layout: &CrossHostLayoutResolver<'_>,
+    layout_resolver: &CrossHostLayoutResolver<'_>,
     element_type: BufferType,
     shards: impl Iterator<Item = (ShardIndex, StaticShape)>,
 ) -> Result<Option<HashMap<StaticShape, ryft_pjrt::Layout>>, Error> {
     let mut layouts = HashMap::new();
     for (shard_index, shape) in shards {
         if let Entry::Vacant(entry) = layouts.entry(shape) {
-            match resolve_layout(element_type, shard_index, entry.key()) {
+            match layout_resolver(element_type, shard_index, entry.key()) {
                 Ok(Some(layout)) => {
                     entry.insert(layout);
                 }
@@ -4557,13 +4570,13 @@ mod tests {
     /// placement follows as well, so this is the work that the placement performs.
     fn planned_work(
         source: &Array,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
         process_index: usize,
         mesh: &DeviceMesh,
         sharding: &Sharding,
     ) -> Result<PlannedWork, String> {
         let strategy = source
-            .device_placement_strategy(resolve_layout, mesh, sharding, process_index)
+            .device_placement_strategy(layout_resolver, mesh, sharding, process_index)
             .map_err(|error| error.to_string())?;
         // The additive identities of introduced sums are uploads of each process, so only their first step crosses
         // processes.
@@ -5002,8 +5015,8 @@ mod tests {
         // reduction state.
         let source = import(DataType::U8, UnreducedKind::Sum, &[vec![3], vec![5]]);
         let sharding = pending(&renamed, UnreducedKind::Sum);
-        let resolve_layout = cross_host_layout_resolver(client);
-        let strategy = source.device_placement_strategy(&resolve_layout, &renamed, &sharding, 0).unwrap();
+        let layout_resolver = cross_host_layout_resolver(client);
+        let strategy = source.device_placement_strategy(&layout_resolver, &renamed, &sharding, 0).unwrap();
         assert!(matches!(strategy, DevicePlacementStrategy::ExactShards { .. }));
         let placed = source.place_with_strategy(strategy, 0, &renamed, &sharding, Memory::Device, None, false);
         let placed = placed.map_err(|(error, _)| error).unwrap();
@@ -6751,8 +6764,8 @@ mod tests {
             let r#type = ArrayType::new_static(DataType::F32, [4]);
             let (mesh, sharding) = (mesh.clone(), Some(source.clone()));
             let input = Array::from_addressable_buffers(&session, r#type, mesh.clone(), sharding, buffers).unwrap();
-            let resolve_layout = cross_host_layout_resolver(client);
-            let strategy = input.device_placement_strategy(&resolve_layout, &mesh, target_sharding, 0).unwrap();
+            let layout_resolver = cross_host_layout_resolver(client);
+            let strategy = input.device_placement_strategy(&layout_resolver, &mesh, target_sharding, 0).unwrap();
             assert!(matches!(strategy, DevicePlacementStrategy::CompiledReshard { .. }), "{source:?}");
             let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
             let placed = input.clone().reshard_on_devices(&session, &mesh, target_sharding, false);
@@ -6793,8 +6806,8 @@ mod tests {
             Array::from_addressable_buffers(&session, r#type.clone(), source_mesh.clone(), sharding, buffers).unwrap()
         };
         let input = import(&[1, 3]);
-        let resolve_layout = cross_host_layout_resolver(client);
-        let strategy = input.device_placement_strategy(&resolve_layout, &target_mesh, &replicated, 0).unwrap();
+        let layout_resolver = cross_host_layout_resolver(client);
+        let strategy = input.device_placement_strategy(&layout_resolver, &target_mesh, &replicated, 0).unwrap();
         assert!(matches!(strategy, DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather: Some(_), .. }));
         let options = Options::new(target_mesh.clone()).with_input_shardings(vec![replicated.clone()]);
         let identity: CompiledFunction<ArrayType, ArrayType> =
@@ -7521,14 +7534,14 @@ mod tests {
         let metadata_only =
             Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), Some(sharding.clone()), Vec::new())
                 .unwrap();
-        let resolve_layout = cross_host_layout_resolver(session.client());
+        let layout_resolver = cross_host_layout_resolver(session.client());
         let process_index = local.process_index();
 
         // The choice reads only metadata that every process shares, so whether this process holds its buffers does not
         // change it. Keeping each shard on its device moves no shard across processes.
         for source in [&held, &metadata_only] {
             assert!(matches!(
-                source.device_placement_strategy(&resolve_layout, &source_mesh, &sharding, process_index),
+                source.device_placement_strategy(&layout_resolver, &source_mesh, &sharding, process_index),
                 Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts })
                     if plan.cross_host_moves().count() == 0 && cross_host_layouts.is_empty(),
             ));
@@ -7559,7 +7572,7 @@ mod tests {
         assert_eq!(plan.cross_host_moves().count(), 1);
         for source in [&held, &metadata_only] {
             assert!(matches!(
-                source.device_placement_strategy(&resolve_layout, &target_mesh, &target_sharding, process_index),
+                source.device_placement_strategy(&layout_resolver, &target_mesh, &target_sharding, process_index),
                 Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                     if message == "the cross-host transfers extension is not provided by the PJRT plugin",
             ));
@@ -7596,11 +7609,11 @@ mod tests {
         for source in [uploaded.clone(), uploaded.clone().with_committed(true)] {
             assert!(source.is_locally_assigned());
             let (mesh, sharding) = (&target_mesh, &target_sharding);
-            let strategy = source.device_placement_strategy(&resolve_layout, mesh, sharding, process_index);
+            let strategy = source.device_placement_strategy(&layout_resolver, mesh, sharding, process_index);
             assert!(matches!(strategy, Ok(DevicePlacementStrategy::ProcessLocalValue)));
             assert!(matches!(
                 source.device_placement_strategy(
-                    &resolve_layout,
+                    &layout_resolver,
                     &local_mesh,
                     &local_sharding,
                     second_remote.process_index(),
@@ -7611,7 +7624,7 @@ mod tests {
         }
         assert!(matches!(
             uploaded.clone().with_locally_assigned(false).device_placement_strategy(
-                &resolve_layout,
+                &layout_resolver,
                 &target_mesh,
                 &target_sharding,
                 process_index,
@@ -7623,7 +7636,7 @@ mod tests {
         // A target on devices of this process alone moves nothing between processes, so this process places such
         // an array there with the strategy of an array on devices that every process knows.
         assert!(matches!(
-            uploaded.device_placement_strategy(&resolve_layout, &local_mesh, &local_sharding, process_index),
+            uploaded.device_placement_strategy(&layout_resolver, &local_mesh, &local_sharding, process_index),
             Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts })
                 if plan.cross_host_moves().count() == 0 && cross_host_layouts.is_empty(),
         ));
@@ -8273,8 +8286,9 @@ mod tests {
                     (statistics.created_arrays, statistics.live_arrays, session.live_arrays().unwrap().len())
                 };
                 let before = counts();
-                let resolve_layout = cross_host_layout_resolver(session.client());
-                let strategy = planned_work(&source, &resolve_layout, process_index, &mesh, &varying).unwrap().strategy;
+                let layout_resolver = cross_host_layout_resolver(session.client());
+                let strategy =
+                    planned_work(&source, &layout_resolver, process_index, &mesh, &varying).unwrap().strategy;
                 assert_eq!(counts(), before, "{order} {process_index}: planning");
                 let placed = source.to_placement(session, target.clone()).unwrap();
                 let during = counts();
@@ -8747,7 +8761,7 @@ mod tests {
         // The CPU plugin reports row-major layouts, but they are usable for a remote receive only when the plugin
         // also supports cross-host transfers.
         let client = cpu_client(1);
-        let resolve = cross_host_layout_resolver(client);
+        let layout_resolver = cross_host_layout_resolver(client);
         for (element_type, shape) in [(BufferType::F32, vec![2, 3]), (BufferType::Predicate, vec![4])] {
             let dimensions = shape.iter().map(|&size| size as u64).collect::<Vec<_>>();
             let layout = client.default_layout(element_type, dimensions).unwrap().proto().unwrap();
@@ -8756,7 +8770,7 @@ mod tests {
                 dense_row_major_layout(shape.len()).to_pjrt().unwrap(),
             );
             assert!(matches!(
-                resolve(element_type, 0, &StaticShape::new(shape)),
+                layout_resolver(element_type, 0, &StaticShape::new(shape)),
                 Err(Error::Pjrt(PjrtError::Unimplemented { .. })),
             ));
         }
