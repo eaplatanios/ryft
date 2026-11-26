@@ -304,8 +304,6 @@ impl<T: Type> CallOperation<T> {
         Ok(self)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
     #[inline]
     pub fn capture_count(&self) -> usize {
@@ -325,6 +323,7 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Returns every sharding override of the boundary of the callee, inputs first.
+    #[inline]
     pub fn boundary_shardings(&self) -> impl Iterator<Item = &Sharding> {
         let input_shardings = self.input_shardings.iter().flat_map(|shardings| shardings.iter());
         let output_shardings = self.output_shardings.iter().flat_map(|shardings| shardings.iter());
@@ -339,28 +338,36 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
-    /// it states a placement at its boundary (refer to [`states_boundary_placement`]) or when its callee requests
-    /// a placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
-    /// [`RegionPlacementRequests::has_requests`]), which `callee_names_devices` says and which is asked only when the
-    /// call records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when
-    /// the function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
-    /// [`Program::into_pruned`]) can record a mesh that only a request of a dropped output named, which this function
-    /// no longer reports, as JAX lowers a nested `jit` function pruned to the outputs that its caller uses and so
-    /// without the shardings of the dropped ones. The analyses of a program (refer to
-    /// [`RegionPlacementRequests::requests`] and [`RegionPlacementRequests::device_naming`]) answer
-    /// `callee_names_devices` with the facts of the callee that they derive in the same pass over the program, so that
-    /// they never analyze a callee again for each call that encloses it.
+    /// it states a placement at its boundary (refer to [`states_boundary_placement`]) or when its callee requests a
+    /// placement that names devices (i.e., any request except one that only moves a value to another memory), which
+    /// `callee_names_devices` says and which is asked only when the call records a mesh and states no placement at its
+    /// boundary, and [`None`] otherwise. The mesh is recorded when the function is staged, from its whole program, so a
+    /// call whose outputs pruning dropped can record a mesh that only a request of a dropped output named, which this
+    /// function no longer reports. The analyses of a program (i.e., [`RegionPlacementRequests::requests`] and
+    /// [`RegionPlacementRequests::device_naming`]) answer `callee_names_devices` with the facts of the callee that they
+    /// derive in the same pass over the program, so that they never analyze a callee again for each call that encloses
+    /// it.
     #[inline]
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
     }
 
-    /// Returns whether this call leaves each input without a sharding override placed as it is (refer to
-    /// [`Self::with_kept_input_placements`]).
+    /// Returns whether this call leaves each input without a sharding override placed as it is.
+    /// Rrefer to [`Self::with_kept_input_placements`] for more information.
     #[inline]
     pub fn keeps_input_placements(&self) -> bool {
         self.keeps_input_placements
+    }
+
+    /// Returns the effective boundary sharding of each callee input without a sharding override, by position, for a
+    /// call that a program transform derived from another call, or [`None`] for a call of a compiled function, whose
+    /// declared input types define that boundary (refer to [`CallOperation::boundary_input_sharding`]). A backend
+    /// reads it to leave the inputs of a derived call without a boundary sharding where they are, because the
+    /// declared input types of its callee are only traced types.
+    #[inline]
+    pub fn derived_input_shardings(&self) -> Option<&[Option<Sharding>]> {
+        self.derived_input_shardings.as_deref()
     }
 
     /// Returns the device mesh that the called function was compiled for (refer to [`Self::with_function_mesh`]), or
@@ -371,15 +378,7 @@ impl<T: Type> CallOperation<T> {
         self.function_mesh.as_ref()
     }
 
-    /// Returns the effective boundary sharding of each callee input without a sharding override, by position, for a
-    /// call that a program transform derived from another call, or [`None`] for a call of a compiled function, whose
-    /// declared input types define that boundary (refer to [`CallOperation::boundary_input_sharding`]). A backend
-    /// reads it to leave the inputs of a derived call without a boundary sharding where they are, because the declared
-    /// input types of its callee are only traced types.
-    #[inline]
-    pub fn derived_input_shardings(&self) -> Option<&[Option<Sharding>]> {
-        self.derived_input_shardings.as_deref()
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns whether this call states a placement at the boundary of its callee, which is when an input or an output
     /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
