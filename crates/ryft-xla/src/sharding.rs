@@ -291,31 +291,6 @@ impl OpShardingExtension for OpSharding {
     }
 }
 
-/// Queries logical meshes for XLA placement and lowering decisions.
-pub(crate) trait LogicalMeshExtension {
-    /// Returns whether this is a named mesh. The canonical [`LogicalMesh::single_device`] mesh and a mesh with no axes
-    /// are anonymous, analogous to a device selected without a mesh. A function compiled for a named mesh runs there
-    /// whenever a session applies it and commits its results.
-    fn is_named(&self) -> bool;
-
-    /// Returns whether this mesh has an auto axis larger than one. Array types do not record placement along auto
-    /// axes (refer to [`ArrayType::with_sharding`](ryft_core::ArrayType::with_sharding)), so the compiler has a choice
-    /// of placement along any such axis.
-    fn has_untracked_auto_axes(&self) -> bool;
-}
-
-impl LogicalMeshExtension for LogicalMesh {
-    #[inline]
-    fn is_named(&self) -> bool {
-        !self.axes().is_empty() && *self != Self::single_device()
-    }
-
-    #[inline]
-    fn has_untracked_auto_axes(&self) -> bool {
-        self.axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
-    }
-}
-
 /// Derives device meshes for XLA placement decisions.
 pub(crate) trait DeviceMeshExtension: Sized {
     /// Returns the mesh of the devices of this mesh at coordinate zero along its axes at `axis_indices`, in the order
@@ -785,39 +760,6 @@ pub(crate) mod tests {
             ..tiled_op_sharding(vec![4], vec![], false)
         };
         assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
-    }
-
-    #[test]
-    fn test_logical_mesh_is_named() {
-        // A mesh with axes is named, whatever their sizes and types.
-        assert!(logical_mesh_2x2().is_named());
-        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        assert!(explicit.is_named());
-
-        // The canonical mesh of a single device and a mesh without axes are anonymous.
-        assert!(!LogicalMesh::single_device().is_named());
-        assert!(!LogicalMesh::new(Vec::new()).unwrap().is_named());
-    }
-
-    #[test]
-    fn test_logical_mesh_has_untracked_auto_axes() {
-        let mesh = |r#type: MeshAxisType, size: usize| {
-            LogicalMesh::new(vec![MeshAxis::new("x", size, r#type).unwrap()]).unwrap()
-        };
-        assert!(mesh(MeshAxisType::Auto, 2).has_untracked_auto_axes());
-
-        // An auto axis of size one leaves the compiler no choice, and types record placement along other axes.
-        assert!(!mesh(MeshAxisType::Auto, 1).has_untracked_auto_axes());
-        assert!(!mesh(MeshAxisType::Explicit, 2).has_untracked_auto_axes());
-        assert!(!mesh(MeshAxisType::Manual, 2).has_untracked_auto_axes());
-        assert!(!LogicalMesh::new(Vec::new()).unwrap().has_untracked_auto_axes());
-
-        // One such axis among others is enough.
-        let mixed = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ]);
-        assert!(mixed.unwrap().has_untracked_auto_axes());
     }
 
     #[test]

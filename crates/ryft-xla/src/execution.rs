@@ -2000,7 +2000,7 @@ fn validate_reduction(
 /// because an execution reshards its arguments as its executable expects. A reshard cannot change a pending reduction
 /// (i.e., the unreduced axes of a sharding and their kind), so the two types must agree on it. This is the rule by
 /// which an executable accepts its arguments. The type rule of a `jit_call` accepts the inputs of a call by a stricter
-/// rule, because a call does not reshard its inputs (refer to `validate_call_input_types`).
+/// rule, because a call does not reshard its inputs (refer to `JitCallOperation::validate_input_types`).
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {

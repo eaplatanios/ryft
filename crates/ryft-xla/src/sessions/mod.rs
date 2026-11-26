@@ -112,9 +112,10 @@ use ryft_core::{
     EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance, InterpretableOperation,
     LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis, NestedTracingContext,
     Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramBuilder, ProgramError, Provenance,
-    ProvenanceScope, Region, RegionDriver, RegionKey, RegionRole, Sharding, SpecializationCache,
-    SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform, TransformArtifact,
-    Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation, decode_logical_bytes,
+    ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementSummary, RegionRole, RequestedPlacement, Sharding,
+    SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform,
+    TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation,
+    declared_input_sharding, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -122,21 +123,20 @@ use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plu
 use crate::arrays::host::{HostUploadWorkers, ValueComparison, validate_mesh_devices};
 use crate::arrays::placement::place_operation_bindings;
 use crate::arrays::statistics::ArrayTracker;
-use crate::compilation::domains::{captured_type, declared_input_sharding, placed_constant};
+use crate::compilation::domains::{captured_type, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::emissions::{emitted_regions, omits_operation_regions};
 use crate::lowering::extensions::{
-    RegionPlacementSummary, RequestedPlacement, merge_requested_placement, owned_session_constants,
+    RegionPlacementSummaryExtension, merge_requested_placement, owned_session_constants,
 };
 use crate::lowering::modules::render_devices;
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::operations::jit_call::EagerCallDecision;
+use crate::operations::jit_call::{EagerCallDecision, JitCallEagerExtension};
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
-use crate::sharding::LogicalMeshExtension;
 use crate::{
     Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, DistributedRuntime, Error, FromPjrt,
     LiveArray, LowerableOperation, Operation, Options, RetainedArray, Type, Value,
@@ -1026,10 +1026,10 @@ impl Session {
     /// still apply to it.
     ///
     /// `requested` is the mesh that the regions of an operation without committed operands request placements onto
-    /// (refer to [`RegionPlacementSummary::requested_mesh`]), which is then the target mesh instead, so that every
-    /// uncommitted input that lives elsewhere moves there by the rules above, as the uncommitted arguments of an eager
-    /// call of a function that names devices move onto its mesh. It is also the mesh of this handle for an operation
-    /// without committed operands that a named mesh of the user places.
+    /// (refer to [`RegionPlacementSummaryExtension::requested_mesh`]), which is then the target mesh instead, so that
+    /// every uncommitted input that lives elsewhere moves there by the rules above, as the uncommitted arguments of an
+    /// eager call of a function that names devices move onto its mesh. It is also the mesh of this handle for an
+    /// operation without committed operands that a named mesh of the user places.
     pub(crate) fn place_uncommitted_inputs(
         &self,
         inputs: &[Array],
@@ -1610,13 +1610,13 @@ impl Context for Session {
         };
 
         // An operation with regions whose regions request placements onto devices names those devices, as a compiled
-        // function that names devices does (refer to `RegionPlacementSummary::requested_mesh`), so without committed
-        // operands it runs on them. Committed operands decide the mesh instead, and the compilation of the program
-        // rejects a region that places a value onto other devices. An operation without regions, which is the common
-        // case, pays for the first test alone, and one whose regions request no devices behaves as if they requested
-        // none. Only the regions that lowering emits for the platform of this session request anything (refer to
-        // `RegionPlacementSummary::requests`), so an operation whose regions lowering omits requests nothing. The
-        // devices that each attached region requests depend on that region and on the platform alone, so they are
+        // function that names devices does (refer to `RegionPlacementSummaryExtension::requested_mesh`), so without
+        // committed operands it runs on them. Committed operands decide the mesh instead, and the compilation of the
+        // program rejects a region that places a value onto other devices. An operation without regions, which is the
+        // common case, pays for the first test alone, and one whose regions request no devices behaves as if they
+        // requested none. Only the regions that lowering emits for the platform of this session request anything
+        // (refer to `RegionPlacementSummary::requests`), so an operation whose regions lowering omits requests nothing.
+        // The devices that each attached region requests depend on that region and on the platform alone, so they are
         // derived once for each region and retained with it (refer to `RequestedPlacementMesh`), and repeated
         // applications only look them up and merge them.
         let requested_mesh = if has_regions
@@ -1633,7 +1633,8 @@ impl Context for Session {
             {
                 region
                     .transform::<RequestedPlacementMesh, _, Error>(target_platform.map(str::to_owned), |region, _| {
-                        let requested = RegionPlacementSummary::new(region, target_platform).requested_mesh()?;
+                        let requested =
+                            RegionPlacementSummary::for_lowering(region, target_platform).requested_mesh()?;
                         Ok(TransformArtifact::new(Vec::new(), requested))
                     })
                     .and_then(|artifact| match artifact.metadata() {
@@ -1664,7 +1665,7 @@ impl Context for Session {
                     .enumerate()
                     .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
                     .any(|(_, region)| {
-                        RegionPlacementSummary::new(region, target_platform)
+                        RegionPlacementSummary::for_lowering(region, target_platform)
                             .requests()
                             .iter()
                             .any(|(request, _)| matches!(request, RequestedPlacement::Devices(_)))
@@ -3039,9 +3040,10 @@ impl Transform<Region<Constant, Operation>> for DispatchRegion {
 
 /// Marker of the devices that the placement requests of one attached region and its computation descendants name,
 /// together with the name of the operation that makes the first such request (refer to
-/// `RegionPlacementSummary::requested_mesh`), for the target platform that its arguments name. They depend on the
-/// contents of the region and on the platform alone, so eager dispatch derives them once for each region and retains
-/// them with it, and an application of an operation with regions looks them up rather than walking its regions.
+/// `RegionPlacementSummaryExtension::requested_mesh`), for the target platform that its arguments name. They depend on
+/// the contents of the region and on the platform alone, so eager dispatch derives them once for each region and
+/// retains them with it, and an application of an operation with regions looks them up rather than walking its
+/// regions.
 struct RequestedPlacementMesh;
 
 impl Transform<Region<Constant, Operation>> for RequestedPlacementMesh {

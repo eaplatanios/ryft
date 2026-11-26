@@ -250,6 +250,14 @@ impl LogicalMesh {
         self.0.axes.iter().map(|axis| axis.size).product()
     }
 
+    /// Returns whether this is a named mesh. The canonical [`LogicalMesh::single_device`] mesh and a mesh with no axes
+    /// are anonymous, analogous to a device selected without a mesh. A function compiled for a named mesh runs there
+    /// whenever a backend applies it eagerly, and it commits its results.
+    #[inline]
+    pub fn is_named(&self) -> bool {
+        !self.axes().is_empty() && *self != Self::single_device()
+    }
+
     /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., the same axes, with the
     /// same names and sizes in the same order, irrespective of their [`MeshAxisType`]s). Axis types describe how values
     /// are typed over the mesh rather than which devices it arranges (e.g., the mesh of a `shard_map` types the axes
@@ -279,6 +287,14 @@ impl LogicalMesh {
                 .iter()
                 .zip(other.axes())
                 .all(|(left, right)| (left.r#type == MeshAxisType::Manual) == (right.r#type == MeshAxisType::Manual))
+    }
+
+    /// Returns whether this mesh has an [`Auto`](MeshAxisType::Auto) axis larger than one. Array types do not record
+    /// placement along auto axes (refer to [`ArrayType::with_sharding`](crate::ArrayType::with_sharding)), so a backend
+    /// compiler has a choice of placement along any such axis.
+    #[inline]
+    pub fn has_untracked_auto_axes(&self) -> bool {
+        self.axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
     }
 }
 
@@ -632,6 +648,44 @@ mod tests {
             mesh.with_axis_types(["x", "w"], MeshAxisType::Auto),
             Err(ShardingError::UnknownMeshAxisName { name }) if name == "w",
         ));
+    }
+
+    #[test]
+    fn test_logical_mesh_is_named() {
+        // A mesh with axes is named, whatever their sizes and types.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        assert!(mesh.is_named());
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert!(explicit.is_named());
+
+        // The canonical mesh of a single device and a mesh without axes are anonymous.
+        assert!(!LogicalMesh::single_device().is_named());
+        assert!(!LogicalMesh::new(Vec::new()).unwrap().is_named());
+    }
+
+    #[test]
+    fn test_logical_mesh_has_untracked_auto_axes() {
+        let mesh = |r#type: MeshAxisType, size: usize| {
+            LogicalMesh::new(vec![MeshAxis::new("x", size, r#type).unwrap()]).unwrap()
+        };
+        assert!(mesh(MeshAxisType::Auto, 2).has_untracked_auto_axes());
+
+        // An auto axis of size one leaves the compiler no choice, and types record placement along other axes.
+        assert!(!mesh(MeshAxisType::Auto, 1).has_untracked_auto_axes());
+        assert!(!mesh(MeshAxisType::Explicit, 2).has_untracked_auto_axes());
+        assert!(!mesh(MeshAxisType::Manual, 2).has_untracked_auto_axes());
+        assert!(!LogicalMesh::new(Vec::new()).unwrap().has_untracked_auto_axes());
+
+        // One such axis among others is enough.
+        let mixed = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ]);
+        assert!(mixed.unwrap().has_untracked_auto_axes());
     }
 
     #[test]
