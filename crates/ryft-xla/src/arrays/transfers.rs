@@ -304,7 +304,7 @@ impl Array {
     /// Returns this array with a buffer on every device of this process, or `None` when it already has one there (or
     /// holds the [`DataType::Zero`] data type, whose shards have no buffers). A device without its own buffer receives
     /// a copy of the local replica of its contribution that [`Self::local_replica_shard`] selects, or a new empty
-    /// buffer for a shard without elements (refer to [`Self::local_contribution_buffer`]). This is how a compiled
+    /// buffer for a shard without elements (refer to [`Self::buffer_for_local_contribution`]). This is how a compiled
     /// program, which reads the buffer of every device of this process, takes an array imported with only some of its
     /// local replicas (e.g., a compiled reshard, or an argument of a compiled function). Nothing is started for the
     /// shards of other processes. The result keeps the placement, the fences, the commitment, and the locally assigned
@@ -845,9 +845,10 @@ impl Array {
                                     })
                                 })?;
                             let completion = &mut completion;
-                            buffers.push(
-                                placed.local_contribution_buffer(&replicas, index, &devices, &mut work, completion)?,
-                            );
+                            buffers
+                                .push(placed.buffer_for_local_contribution(
+                                    &replicas, index, &devices, &mut work, completion,
+                                )?);
                         }
 
                         let mut identities = Vec::<(usize, Arc<[u8]>)>::new();
@@ -1014,7 +1015,7 @@ impl Array {
         // owner of a target on which the owner runs a shared strategy takes `DevicePlacementStrategy::OnOwner`
         // instead, and never gets here (refer to `Self::device_placement_strategy`).
         if targets.is_empty() {
-            return self.metadata_only_placement(session, host_type, mesh, sharding);
+            return self.place_without_local_buffers(session, host_type, mesh, sharding);
         }
 
         let source = match self.shards() {
@@ -1471,10 +1472,10 @@ impl Array {
         Ok(output)
     }
 
-    /// Returns the result of placing this array on `mesh` according to `sharding` in `memory` in a process
-    /// that takes no part in that placement (refer to [`Self::metadata_only_placement`]). When `round_trip` is
-    /// present, this process checks from metadata what the owner checks before uploading. If no process owns
-    /// the round trip or the upload cannot use the requested memory and layout, every process returns its cause.
+    /// Returns the result of placing this array on `mesh` according to `sharding` in `memory` in a process that takes
+    /// no part in that placement (refer to [`Self::place_without_local_buffers`]). When `round_trip` is present, this
+    /// process checks from metadata what the owner checks before uploading. If no process owns the round trip or the
+    /// upload cannot use the requested memory and layout, every process returns its cause.
     fn place_elsewhere(
         &self,
         round_trip: Option<(&HostRoundTripCause, Option<usize>, &DeviceMesh, &Sharding)>,
@@ -1494,7 +1495,38 @@ impl Array {
             }
         }
         let r#type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(memory);
-        self.metadata_only_placement(self.session(), r#type, mesh, sharding)
+        self.place_without_local_buffers(self.session(), r#type, mesh, sharding)
+    }
+
+    /// Returns the result of placing this array on `mesh` with `sharding` and `r#type` in `session` without creating
+    /// local PJRT buffers. This covers processes that own no target device and placements of [`DataType::Zero`] arrays.
+    /// The result's execution fence joins the source's fence with the readiness of every local source buffer. A buffer
+    /// can carry the only completion of the work that produced it (e.g., a pending host upload), so the result still
+    /// waits for and reports that work even when this process takes no part in the reshard or host round trip.
+    fn place_without_local_buffers(
+        &self,
+        session: &Session,
+        r#type: ArrayType,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+    ) -> Result<Self, Error> {
+        let mut completion = PlacementCompletion::default();
+
+        for buffer in self.addressable_shards().filter_map(ArrayShard::buffer) {
+            completion.track_buffer(buffer)?;
+        }
+
+        let (sharding, mesh) = (Some(sharding.clone()), mesh.clone());
+
+        let mut output = if r#type.data_type().is_zero() {
+            Self::zero(session, r#type, sharding, mesh)?
+        } else {
+            Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, None, Vec::new(), false)?
+        };
+
+        output.execution_fence = completion.join(self.execution_fence().cloned());
+
+        Ok(output)
     }
 
     /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
@@ -1588,8 +1620,8 @@ impl Array {
     /// read back and upload on the calling thread, and the execution fence of the result then joins the readiness of
     /// its uploads and the execution fence of this array. A process that owns no device of `mesh` reads nothing back,
     /// and a [`DataType::Zero`] value has no bytes to read back or upload, so both return without waiting the result
-    /// of [`Self::metadata_only_placement`], which waits for and reports the work that produces this array, after the
-    /// checks of the upload that read only metadata (refer to [`Self::validate_host_upload`]).
+    /// of [`Self::place_without_local_buffers`], which waits for and reports the work that produces this array,
+    /// after the checks of the upload that read only metadata (refer to [`Self::validate_host_upload`]).
     fn upload_host_readback<P: 'static + Send + FnOnce(Error) -> PjrtError>(
         &self,
         session: &Session,
@@ -1603,7 +1635,7 @@ impl Array {
         let process_index = session.client().process_index()?;
         if self.data_type().is_zero() || mesh.devices().iter().all(|device| device.process_index() != process_index) {
             Self::validate_host_upload(session, host_type.clone(), &mesh, &sharding)?;
-            return self.metadata_only_placement(session, host_type, &mesh, &sharding);
+            return self.place_without_local_buffers(session, host_type, &mesh, &sharding);
         }
 
         let sources = self.host_readback_fence()?;
@@ -1969,9 +2001,9 @@ impl Array {
     /// are the shards that hold the same contribution (i.e., of the same slice and with the same coordinates along
     /// unreduced and varying manual axes, refer to [`ShardContribution`]), so a replica holds the same bytes also for
     /// an array with a pending reduction (e.g., the source of an introduced sum, refer to
-    /// [`Self::local_contribution_buffer`]) or with variation along a manual axis. Only a move without another process
-    /// may read another replica directly, because the peer of a cross-host transfer pairs it with the device of the
-    /// preferred shard, so a cross-host send first copies that replica to that device (refer to
+    /// [`Self::buffer_for_local_contribution`]) or with variation along a manual axis. Only a move without another
+    /// process may read another replica directly, because the peer of a cross-host transfer pairs it with the device
+    /// of the preferred shard, so a cross-host send first copies that replica to that device (refer to
     /// [`Self::buffer_on_send_device`]). `replicas` is the index of the local replicas of this array that the caller
     /// keeps for the whole placement, so that many targets of one resident replica cost linear work in all.
     ///
@@ -2024,6 +2056,47 @@ impl Array {
                     device_id: preferred_shard.device().id(),
                 })
             })
+    }
+
+    /// Returns a buffer on the device of the shard of this array at `index`, a device of this process, whose local
+    /// replicas `replicas` indexes, that holds the contribution of that shard: its own buffer, or otherwise a copy,
+    /// in the memory that the type of this array declares, of the replica of the same contribution on this process that
+    /// [`Self::local_replica_shard`] selects. A shard without elements and without its own buffer needs no replica and
+    /// gets a new empty buffer in that memory and in the declared layout of this array. `devices` holds the addressable
+    /// devices of the client of this array, which the caller looks up once for all its shards. `work` and `completion`
+    /// record the copy or the new buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::MissingShardBuffer`] for that shard when it has elements and no replica of its
+    /// contribution on this process has a buffer.
+    fn buffer_for_local_contribution(
+        &self,
+        replicas: &LocalReplicas,
+        index: ShardIndex,
+        devices: &AddressableDevices,
+        work: &mut WorkReservation,
+        completion: &mut PlacementCompletion,
+    ) -> Result<Arc<Buffer<'static>>, Error> {
+        let shard = &self.shards()[index];
+        let device = shard.device();
+        if shard.buffer().is_none() && shard.slice().iter().any(Range::is_empty) {
+            // A shard without elements holds no contribution, so it gets a new empty buffer rather than a replica.
+            let dimensions = shard.shape().as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
+            let layout = self.layout().map(ToPjrt::to_pjrt).transpose()?;
+            let memory = devices.get(device.id())?.memory(self.r#type().memory())?;
+            let buffer_type = self.data_type().executable_buffer_type();
+            let empty = self.client().buffer(Arc::<[u8]>::from([]), buffer_type, dimensions, None, memory, layout)?;
+            return completion.track_new(work, empty);
+        }
+
+        let (replica, buffer) = self.local_replica_shard(replicas, index, device)?;
+        if replica.device() == device {
+            return Ok(Arc::clone(buffer));
+        }
+
+        let copied = buffer.copy_to_memory(devices.get(device.id())?.memory(self.r#type().memory())?)?;
+        completion.track_new(work, copied)
     }
 
     /// Returns a buffer for the shard at `index` on the local `device` named by the cross-host transfer plan.
@@ -2200,36 +2273,6 @@ impl Array {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Returns the result of placing this array on `mesh` according to `sharding` as an array of `session` in a process
-    /// that owns no device of `mesh`, or of a [`DataType::Zero`] array, which has `r#type` and no buffers, as the
-    /// metadata that the processes that own those devices return. Such a process can still hold buffers of this array
-    /// (e.g., replicas of a pending reduction that another process reads back, or the value of a process that takes no
-    /// part), and a buffer can carry the only completion of the work that produced it (e.g., of a pending host upload
-    /// or of a buffer of a PJRT transfer manager), so the execution fence of the result joins the fence of this array
-    /// with the readiness of every buffer of this array that this process holds, and the result waits for and reports
-    /// that work. A process that takes no part in a placement (e.g., that does not run its compiled reshard or its host
-    /// round trip) builds its result with this function.
-    fn metadata_only_placement(
-        &self,
-        session: &Session,
-        r#type: ArrayType,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-    ) -> Result<Self, Error> {
-        let mut completion = PlacementCompletion::default();
-        for buffer in self.addressable_shards().filter_map(ArrayShard::buffer) {
-            completion.track_buffer(buffer)?;
-        }
-        let (sharding, mesh) = (Some(sharding.clone()), mesh.clone());
-        let mut output = if r#type.data_type().is_zero() {
-            Self::zero(session, r#type, sharding, mesh)?
-        } else {
-            Self::from_addressable_buffers_internal(session, r#type, sharding, mesh, None, Vec::new(), false)?
-        };
-        output.execution_fence = completion.join(self.execution_fence().cloned());
-        Ok(output)
-    }
-
     /// Borrows the source metadata and global shard descriptors without exposing its buffers or session.
     fn placement_planning_view(&self) -> PlacementPlanningView<'_, impl Iterator<Item = &ShardDescriptor> + Clone> {
         PlacementPlanningView {
@@ -2371,7 +2414,7 @@ impl Array {
     /// sharding of this array over `mesh` and keeps the fences, the commitment, and the locally assigned devices of
     /// this array. It shares the buffers of those devices, and a device of this process without its own buffer receives
     /// a copy of another local replica of its contribution, or a new empty buffer for a shard without elements (refer
-    /// to [`Self::local_contribution_buffer`]), whose readiness the execution fence of the result joins, and the
+    /// to [`Self::buffer_for_local_contribution`]), whose readiness the execution fence of the result joins, and the
     /// restriction fails when no such replica exists. The execution fence of the result also joins the readiness of
     /// every buffer of this array whose shard has no elements (refer to
     /// [`PlacementCompletion::track_empty_shard_buffers`]).
@@ -2390,50 +2433,11 @@ impl Array {
         let mut buffers = Vec::new();
         for shard in shards.filter(|shard| shard.device().process_index() == process_index) {
             let index = shard.index();
-            let buffer = self.local_contribution_buffer(&replicas, index, &devices, &mut work, &mut completion);
+            let buffer = self.buffer_for_local_contribution(&replicas, index, &devices, &mut work, &mut completion);
             buffers.push(buffer?);
         }
 
         self.rebuilt(r#type, mesh, sharding, buffers, completion)
-    }
-
-    /// Returns a buffer on the device of the shard of this array at `index`, a device of this process, whose local
-    /// replicas `replicas` indexes, that holds the contribution of that shard: its own buffer, or otherwise a copy, in
-    /// the memory that the type of this array declares, of the replica of the same contribution on this process that
-    /// [`Self::local_replica_shard`] selects. A shard without elements and without its own buffer needs no replica and gets
-    /// a new empty buffer in that memory and in the declared layout of this array. `devices` holds the addressable
-    /// devices of the client of this array, which the caller looks up once for all its shards. `work` and `completion`
-    /// record the copy or the new buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrayError::MissingShardBuffer`] for that shard when it has elements and no replica of its
-    /// contribution on this process has a buffer.
-    fn local_contribution_buffer(
-        &self,
-        replicas: &LocalReplicas,
-        index: ShardIndex,
-        devices: &AddressableDevices,
-        work: &mut WorkReservation,
-        completion: &mut PlacementCompletion,
-    ) -> Result<Arc<Buffer<'static>>, Error> {
-        let shard = &self.shards()[index];
-        let device = shard.device();
-        if shard.buffer().is_none() && shard.slice().iter().any(Range::is_empty) {
-            // A shard without elements holds no contribution, so it gets a new empty buffer rather than a replica.
-            let dimensions = shard.shape().as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let layout = self.layout().map(ToPjrt::to_pjrt).transpose()?;
-            let memory = devices.get(device.id())?.memory(self.r#type().memory())?;
-            let buffer_type = self.data_type().executable_buffer_type();
-            let empty = self.client().buffer(Arc::<[u8]>::from([]), buffer_type, dimensions, None, memory, layout)?;
-            return completion.track_new(work, empty);
-        }
-        let (replica, buffer) = self.local_replica_shard(replicas, index, device)?;
-        if replica.device() == device {
-            return Ok(Arc::clone(buffer));
-        }
-        let copied = buffer.copy_to_memory(devices.get(device.id())?.memory(self.r#type().memory())?)?;
-        completion.track_new(work, copied)
     }
 
     /// Compiles `program`, the identity that reshards this array, which must be on the mesh of `program` with its
@@ -2478,7 +2482,7 @@ impl Array {
 
     /// Executes `reshard`, which [`Self::compile_reshard_on_same_mesh`] compiled from `program` for this array, on this
     /// array. Without `reshard` (i.e., in a process that does not run `program`), this function runs nothing and
-    /// returns the metadata of the output of `program` (refer to [`Self::metadata_only_placement`]). The execution
+    /// returns the metadata of the output of `program` (refer to [`Self::place_without_local_buffers`]). The execution
     /// fence of the result joins the execution fence of this array with the fence of the launch (refer to the
     /// documentation of this module). This function consumes the array so that a donation takes effect.
     ///
@@ -2492,7 +2496,7 @@ impl Array {
     ) -> Result<Self, Error> {
         let Some(reshard) = reshard else {
             let r#type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(self.r#type().memory());
-            return self.metadata_only_placement(self.session(), r#type, &program.mesh, &program.output);
+            return self.place_without_local_buffers(self.session(), r#type, &program.mesh, &program.output);
         };
         let mut completion = PlacementCompletion::default();
         completion.track_fence(self.execution_fence());
