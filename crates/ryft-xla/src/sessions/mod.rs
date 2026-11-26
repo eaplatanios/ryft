@@ -122,14 +122,14 @@ use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plu
 use crate::arrays::host::{HostUploadWorkers, ValueComparison, validate_mesh_devices};
 use crate::arrays::placement::place_operation_bindings;
 use crate::arrays::statistics::ArrayTracker;
-use crate::compilation::domains::{captured_type, declared_input_sharding, is_named_mesh, placed_constant};
+use crate::compilation::domains::{captured_type, declared_input_sharding, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
-use crate::compilation::placements::{
+use crate::compilation::programs::EagerDispatchProgram;
+use crate::lowering::emissions::{emitted_regions, omits_operation_regions};
+use crate::lowering::extensions::{
     RequestedPlacement, merge_requested_placement, owned_session_constants, placement_requests,
     requested_placement_mesh,
 };
-use crate::compilation::programs::EagerDispatchProgram;
-use crate::lowering::emissions::{emitted_regions, omits_operation_regions};
 use crate::lowering::modules::render_devices;
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::jit_call::EagerCallDecision;
@@ -137,6 +137,7 @@ use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dis
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
+use crate::sharding::LogicalMeshExtension;
 use crate::{
     Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, DistributedRuntime, Error, FromPjrt,
     LiveArray, LowerableOperation, Operation, Options, RetainedArray, Type, Value,
@@ -1267,7 +1268,7 @@ impl CapturePlacementContext for Session {
         // `Self::with_device_mesh`), so the arrays that the regions of its eager operations close over follow the
         // operation onto that mesh, as JAX traces an uncommitted array of one device without a mesh.
         match self.default_mesh.mesh() {
-            Some(mesh) if self.default_mesh.is_explicit() && is_named_mesh(mesh.logical_mesh()) => {
+            Some(mesh) if self.default_mesh.is_explicit() && mesh.logical_mesh().is_named() => {
                 CapturePlacement::FollowCall
             }
             _ => CapturePlacement::Preserve,
@@ -1698,7 +1699,7 @@ impl Context for Session {
             }
             _ => None,
         };
-        let session_mesh = placing_mesh.filter(|mesh| is_named_mesh(mesh.logical_mesh()));
+        let session_mesh = placing_mesh.filter(|mesh| mesh.logical_mesh().is_named());
         let default_device_target = placing_mesh.filter(|_| {
             self.default_device_mesh().is_some()
                 && !array_inputs.iter().any(Array::is_committed)
@@ -1714,7 +1715,7 @@ impl Context for Session {
         let is_explicit =
             |logical_mesh: &LogicalMesh| logical_mesh.axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
         let names_another_mesh = |mesh: &DeviceMesh, other: &DeviceMesh| {
-            is_named_mesh(other.logical_mesh())
+            other.logical_mesh().is_named()
                 && other.logical_mesh() != mesh.logical_mesh()
                 && (is_explicit(other.logical_mesh()) || is_explicit(mesh.logical_mesh()))
         };
@@ -2104,7 +2105,7 @@ impl Context for Session {
                 .first()
                 .map(|first| {
                     let mesh = first.mesh();
-                    if !is_call && !is_named_mesh(mesh.logical_mesh()) {
+                    if !is_call && !mesh.logical_mesh().is_named() {
                         for input in &array_inputs[1..] {
                             let other = input.mesh();
                             if other.devices() == mesh.devices() && is_explicit(other.logical_mesh()) {

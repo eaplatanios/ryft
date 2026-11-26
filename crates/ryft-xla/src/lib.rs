@@ -69,6 +69,7 @@ pub use kernels::{
     ROCM_KERNEL_CUSTOM_CALL_TARGET, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp,
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
+pub use lowering::extensions::ProgramExtension;
 pub use lowering::{
     DataDependentPaddingDiscipline, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     MemberLowerableOperation, RaggedDotLoweringStrategy, lower_projected_operation, to_mlir_module_for_program,
@@ -86,7 +87,7 @@ pub use sessions::{
     normalize_runtime_requirements,
 };
 pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
-pub use tracing::{ArrayTracer, ProgramExtension, TracedProgram, trace, trace_with_context};
+pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 
 // TODO(eaplatanios): Review this module.

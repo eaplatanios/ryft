@@ -1,13 +1,14 @@
 //! Lowering of staged XLA programs to textual StableHLO/Shardy MLIR modules.
 //!
-//! [`to_mlir_module_for_program`] is the public entry point. It lowers a program of any [`LowerableOperationFamily`]
-//! into one module whose entry function takes the hidden capture arguments followed by the program inputs, and whose
-//! function signature optionally carries `sdy.sharding` attributes. The crate-internal entry points that the
-//! compilation path uses also return the `ExecutableSignature` that maps the logical program boundary to the
-//! physical executable boundary (e.g., erasing static zero-sized leaves and appending hidden extent scalars and effect
-//! tokens), together with the runtime requirements of the module. Programs must have their references and mutable
-//! state discharged before lowering, and failures that only lowering can detect are reported as [`LoweringError`]s
-//! wrapped in [`Error::Lowering`].
+//! [`to_mlir_module_for_program`] lowers a program of any [`LowerableOperationFamily`] with caller-supplied boundary
+//! types. Its entry function takes the hidden capture arguments followed by the program inputs and can carry
+//! `sdy.sharding` attributes. [`ProgramExtension::to_mlir_module`](crate::ProgramExtension::to_mlir_module) derives
+//! the signature and collects session constants when exporting traced programs over XLA's built-in operation family.
+//! The crate-internal entry points used by compilation return the `ExecutableSignature`, which maps the logical
+//! program boundary to the physical executable boundary (e.g., erasing static zero-sized leaves and appending hidden
+//! extent scalars and effect tokens), along with the module's runtime requirements. Programs must have their
+//! references and mutable state discharged before lowering. Failures that only lowering can detect are reported as
+//! [`LoweringError`]s wrapped in [`Error::Lowering`].
 //!
 //! Each operation lowers itself through [`LowerableOperation::lower`], which receives a [`Lowerer`] that exposes the
 //! block receiving the emitted operations, the MLIR context and location, the attached regions of the instruction, and
@@ -20,10 +21,10 @@
 //!
 //! The crate-internal submodules own the parts of this pipeline. `modules` lowers a whole program to a module and
 //! `regions` lowers nested programs and regions inline. `states` holds the state that the lowering of one module
-//! shares, `emissions` decides which regions, captures, and session constants lowering emits, and `reductions` lowers
-//! and validates pending reductions. `admission` rejects data-dependent dynamic programs whose padding could become
-//! observable, `signatures` defines the executable signature, and `types` lowers types, constants, and dynamic
-//! dimensions.
+//! shares, `emissions` decides which regions, captures, and session constants lowering emits, and `extensions`
+//! prepares programs and analyzes their placements. `reductions` lowers and validates pending reductions.
+//! `admission` rejects data-dependent dynamic programs whose padding could become observable, `signatures` defines
+//! the executable signature, and `types` lowers types, constants, and dynamic dimensions.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -165,6 +166,8 @@ pub enum RaggedDotLoweringStrategy {
 pub(crate) mod admission;
 /// Decisions about which regions, captures, and session constants of a program lowering emits.
 pub(crate) mod emissions;
+/// Placement preparation and analysis shared with compilation and eager dispatch.
+pub(crate) mod extensions;
 /// Lowering of whole programs to StableHLO modules.
 pub(crate) mod modules;
 /// Lowering and validation of pending reductions.

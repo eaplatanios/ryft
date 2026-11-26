@@ -211,6 +211,7 @@ use crate::arrays::shards::{
 use crate::arrays::{Array, ArrayError};
 use crate::devices::PjrtDeviceExtension;
 use crate::sessions::synchronization::WorkReservation;
+use crate::sharding::DeviceMeshExtension;
 use crate::types::DataTypeExtension;
 use crate::{
     CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt, Type, stage,
@@ -2424,12 +2425,12 @@ impl Array {
     }
 
     /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
-    /// of this array with some axes of size one (refer to [`coordinate_zero_mesh`]), along which this array must be
-    /// replicated, so that the shards of those devices hold its whole value. The result has the sharding of this array
-    /// over `mesh` and keeps the fences, the commitment, and the locally assigned devices of this array. It shares the
-    /// buffers of those devices, and a device of this process without its own buffer receives a copy of another local
-    /// replica of its contribution, or a new empty buffer for a shard without elements (refer to
-    /// [`Self::local_contribution_buffer`]), whose readiness the execution fence of the result joins, and the
+    /// of this array with some axes of size one (refer to [`DeviceMeshExtension::at_coordinate_zero`]), along which
+    /// this array must be replicated, so that the shards of those devices hold its whole value. The result has the
+    /// sharding of this array over `mesh` and keeps the fences, the commitment, and the locally assigned devices of
+    /// this array. It shares the buffers of those devices, and a device of this process without its own buffer receives
+    /// a copy of another local replica of its contribution, or a new empty buffer for a shard without elements (refer
+    /// to [`Self::local_contribution_buffer`]), whose readiness the execution fence of the result joins, and the
     /// restriction fails when no such replica exists. The execution fence of the result also joins the readiness of
     /// every buffer of this array whose shard has no elements (refer to
     /// [`PlacementCompletion::track_empty_shard_buffers`]).
@@ -2663,12 +2664,13 @@ impl Array {
     /// additive identity of the data type, which is how [`DevicePlacementStrategy::IntroducedSums`] ends. This array is
     /// the result of its first step (or the source itself when there is none), which holds the value without the sums
     /// that `sharding` introduces along those axes on at least the devices at coordinate zero (i.e., on
-    /// [`coordinate_zero_mesh`], or on `mesh` with those axes replicated). Each other device of this process receives a
-    /// new buffer of the identity (refer to [`unreduced_sum_identity`]), uploaded from the host in the memory and the
-    /// declared layout of this array and with the static shape of its destination shard, as a cross-host receive
-    /// allocates it, so the summands add up to the value of this array bit for bit, as a host upload with `sharding`
-    /// splits a value. Only metadata that every process shares decides which devices hold an identity, and each process
-    /// uploads only to its own devices, so no process waits for another. Nothing is read back and nothing is compiled.
+    /// [`DeviceMeshExtension::at_coordinate_zero`], or on `mesh` with those axes replicated). Each other device of this
+    /// process receives a new buffer of the identity (refer to [`unreduced_sum_identity`]), uploaded from the host in
+    /// the memory and the declared layout of this array and with the static shape of its destination shard, as a
+    /// cross-host receive allocates it, so the summands add up to the value of this array bit for bit, as a host upload
+    /// with `sharding` splits a value. Only metadata that every process shares decides which devices hold an identity,
+    /// and each process uploads only to its own devices, so no process waits for another. Nothing is read back and
+    /// nothing is compiled.
     ///
     /// The result has the type, the fences, the commitment, and the locally assigned devices of this array, and its
     /// execution fence also joins the readiness of every identity buffer and of every buffer of this array whose shard
@@ -2869,7 +2871,8 @@ enum DevicePlacementStrategy {
     /// to [`PlacementPlanningView::introduced_sums_strategy`] and [`Array::with_introduced_sums`]).
     IntroducedSums {
         /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
-        /// to [`coordinate_zero_mesh`]), or the destination mesh when the array cannot be placed there directly.
+        /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the destination mesh when the array cannot be placed
+        /// there directly.
         mesh: DeviceMesh,
 
         /// Destination sharding without the pending sums that the destination introduces, over `mesh`.
@@ -3264,8 +3267,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     /// Chooses [`DevicePlacementStrategy::IntroducedSums`] for placing this array on `mesh` with a sharding that is
     /// `first_sharding` plus pending sums along the mesh axes at `axis_indices` (refer to [`split_introduced_sums`]).
     /// Its first step places the value with `first_sharding` on the devices at coordinate zero along those axes only
-    /// (i.e., on [`coordinate_zero_mesh`]), because every other device receives the additive identity and needs
-    /// nothing else. It starts from the first of the following that applies:
+    /// (i.e., on [`DeviceMeshExtension::at_coordinate_zero`]), because every other device receives the additive
+    /// identity and needs nothing else. It starts from the first of the following that applies:
     ///
     ///   1. **Restriction:** When this array is on `mesh` and replicated along every introduced axis (i.e., its shards
     ///      along that axis hold one contribution, refer to [`Sharding::distinguishes_shards_along`]), the shards at
@@ -3300,7 +3303,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let replicated_along_introduced_axes =
             self.mesh() == mesh && introduced.iter().all(|axis| !self.sharding().distinguishes_shards_along(axis));
         let coordinate_zero = || -> Result<(DeviceMesh, Sharding), Error> {
-            let first_mesh = coordinate_zero_mesh(mesh, &axis_indices)?;
+            let first_mesh = mesh.at_coordinate_zero(&axis_indices)?;
             let first_sharding = sharding_on_mesh(first_sharding, first_mesh.logical_mesh())?;
             Ok((first_mesh, first_sharding))
         };
@@ -4645,38 +4648,11 @@ fn split_introduced_sums(
     Ok(Some((first, axis_indices)))
 }
 
-/// Returns the mesh of the devices of `mesh` at coordinate zero along its axes at `axis_indices`, in the order of
-/// `mesh`, whose logical mesh is that of `mesh` with those axes of size one, so that every sharding over `mesh` that
-/// neither splits a dimension along those axes nor reduces over them places a value on it as on those devices of `mesh`
-/// (refer to [`sharding_on_mesh`]). It is `mesh` itself when those axes have size one already.
-fn coordinate_zero_mesh(mesh: &DeviceMesh, axis_indices: &[usize]) -> Result<DeviceMesh, Error> {
-    let axes = mesh
-        .logical_mesh()
-        .axes()
-        .iter()
-        .enumerate()
-        .map(|(index, axis)| {
-            if axis_indices.contains(&index) { MeshAxis::new(axis.name(), 1, axis.r#type()) } else { Ok(axis.clone()) }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let devices = mesh
-        .devices()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            mesh.device_coordinates(*index)
-                .is_some_and(|coordinates| axis_indices.iter().all(|&axis| coordinates[axis] == 0))
-        })
-        .map(|(_, device)| *device)
-        .collect();
-    Ok(DeviceMesh::new(LogicalMesh::new(axes)?, devices)?)
-}
-
 /// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with
-/// the same names and types, some of which may have another size (e.g., the logical mesh of [`coordinate_zero_mesh`]),
-/// with the same placement, reduction state, and manual variation. Unlike [`Sharding::with_mesh`], which requires the
-/// same topology, this lets a sharding that splits no dimension along a resized axis describe the same shards on the
-/// devices that remain.
+/// the same names and types, some of which may have another size (e.g., the logical mesh of
+/// [`DeviceMeshExtension::at_coordinate_zero`]), with the same placement, reduction state, and manual variation. Unlike
+/// [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension along a
+/// resized axis describe the same shards on the devices that remain.
 fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, Error> {
     Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
         .with_unreduced_axes(sharding.unreduced_axes().clone())?

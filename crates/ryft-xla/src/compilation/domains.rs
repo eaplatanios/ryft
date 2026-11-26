@@ -27,10 +27,6 @@ use crate::arrays::host::validate_mesh_devices;
 use crate::compilation::CompilationError;
 use crate::compilation::keys::{CompilationKey, DispatchKey, dispatch_signature};
 use crate::compilation::options::{FeedbackDirectedProfile, Options, resolve_shardy_debug_options, supports_shardy};
-use crate::compilation::placements::{
-    EntryResultPlacement, entry_boundary_sharding, entry_open_results, entry_result_placements, entry_result_shardings,
-    has_placement_requests, pruned_for_lowering,
-};
 use crate::compilation::programs::{
     CompiledProgram, EagerDispatchProgram, LoweredProgram, OutputDeviceAssignment, ProgramLowering, RemoteEagerProgram,
     SessionConstantBinding,
@@ -40,8 +36,13 @@ use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
+use crate::lowering::extensions::{
+    EntryResultPlacement, ProgramLoweringExtension, ShardingLoweringExtension, entry_open_results,
+    entry_result_shardings,
+};
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
 use crate::lowering::signatures::ExecutableSignature;
+use crate::sharding::LogicalMeshExtension;
 use crate::{
     Array, Constant, Error, ExecutionError, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
     OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
@@ -108,7 +109,7 @@ impl CompilationDomain for Session {
                 let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
                 // No session is at hand here, so the callee is read for no target, and the pruning of the program
                 // that lowering emits for its target drops the mesh of a call whose callee names devices only inside a
-                // body that the target replaces (refer to `pruned_for_lowering`).
+                // body that the target replaces (refer to `ProgramLoweringExtension::pruned_for_lowering`).
                 let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
                 let call =
                     call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
@@ -317,9 +318,9 @@ impl Session {
     ) -> Result<ProgramLowering, Error> {
         validate_mesh_devices(self, options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
-        // `pruned_for_lowering`), as the analysis of its placement requests does.
+        // `ProgramLoweringExtension::pruned_for_lowering`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
-        self.lower_pruned_program(&pruned_for_lowering(program, target_platform)?, capture_count, options, function)
+        self.lower_pruned_program(&program.pruned_for_lowering(target_platform)?, capture_count, options, function)
     }
 
     /// Lowers `program` after dead instruction pruning.
@@ -650,9 +651,12 @@ impl Session {
         }
         // An argument is annotated as its runtime array stores it, which replicates the dimensions that its placement
         // leaves unconstrained, as the StableHLO export of traced programs annotates it (refer to
-        // `entry_boundary_sharding`). Execution still expects the placement itself, which describes the same buffers.
-        let argument_annotations =
-            logical_argument_shardings.iter().map(entry_boundary_sharding).collect::<Result<Vec<_>, _>>()?;
+        // `ShardingLoweringExtension::entry_boundary_sharding`). Execution still expects the placement itself, which
+        // describes the same buffers.
+        let argument_annotations = logical_argument_shardings
+            .iter()
+            .map(ShardingLoweringExtension::entry_boundary_sharding)
+            .collect::<Result<Vec<_>, _>>()?;
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.output_index().is_some() {
@@ -689,11 +693,11 @@ impl Session {
         // A public output that a `place` in the entry region or in the callee of a `jit_call` produces, directly or
         // through operations that return its value and placement unchanged, has the placement of its target, which
         // states the placement along every mesh axis, and one that returns an argument in the same way is placed where
-        // that argument enters the executable (refer to `entry_result_placements`). Its type drops the auto mesh axes
-        // of that placement, and its result has no physical buffer whose placement the compiler could report when it
-        // has the zero data type, so the placement is carried to the boundary instead. Outputs are then placed as an
-        // output override requests, then as the program places them, both including over auto mesh axes, and
-        // otherwise as their types are, which is the same rule that the StableHLO export of traced programs follows
+        // that argument enters the executable (refer to `ProgramLoweringExtension::entry_result_placements`). Its
+        // type drops the auto mesh axes of that placement, and its result has no physical buffer whose placement the
+        // compiler could report when it has the zero data type, so the placement is carried to the boundary instead.
+        // Outputs follow the output override first, then the placement from the program, both including over auto mesh
+        // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule
         // (refer to `entry_result_shardings`). The arguments of the program are its captures and its public inputs,
         // between which the executable receives the arrays of session constants.
         let constant_shardings = session_constants
@@ -701,7 +705,7 @@ impl Session {
             .map(|binding| (binding.source(), binding.argument().sharding()))
             .collect::<HashMap<_, _>>();
         let placed_outputs =
-            entry_result_placements(program, output_count, |constant| constant_shardings[constant].clone());
+            program.entry_result_placements(output_count, |constant| constant_shardings[constant].clone());
         let program_argument_shardings = logical_argument_shardings[..source_capture_count]
             .iter()
             .chain(&logical_argument_shardings[lowered_capture_count..])
@@ -764,9 +768,10 @@ impl Session {
         // by every execution, as JAX commits every result of a `jit` function with any explicit sharding, which makes
         // this a property of the whole function rather than of the outputs that the request reaches. The function
         // requests a placement through an input or output sharding override, or through a `place` with a target or a
-        // `constrain_sharding` in any region that lowering emits (refer to `has_placement_requests`). Every output of a
-        // function that is compiled for more than one device is committed as well, including its hidden reference
-        // states, as JAX commits every result of a computation on more than one device (refer to
+        // `constrain_sharding` in any region that lowering emits (refer to
+        // `ProgramLoweringExtension::has_placement_requests`). Every output of a function compiled for more than one
+        // device is committed as well, including its hidden reference states, as JAX commits every result of a
+        // computation on more than one device (refer to
         // `lower_sharding_computation` in `jax._src.interpreters.pxla`), whereas a function that is compiled for a
         // single device leaves its outputs to the other rules. Every public output of a function compiled for a named
         // mesh (`function`) is committed too, as JAX commits every result of a `jit` function under `set_mesh` (refer
@@ -784,7 +789,7 @@ impl Session {
         let committed_outputs = (0..output_types.len())
             .map(|index| runs_on_multiple_devices || index < output_count && commits_public_outputs)
             .collect::<Vec<_>>();
-        let output_device_assignment = if is_named_mesh(options.mesh().logical_mesh())
+        let output_device_assignment = if options.mesh().logical_mesh().is_named()
             || requests_placement(program, options, target_platform, false)
         {
             OutputDeviceAssignment::Fixed
@@ -1078,7 +1083,7 @@ pub(crate) fn capture_sharding(
     if sharding.mesh().has_same_topology(mesh) {
         return Ok(sharding.clone());
     }
-    let stored = array_type.sharding().map(entry_boundary_sharding).transpose()?;
+    let stored = array_type.sharding().map(ShardingLoweringExtension::entry_boundary_sharding).transpose()?;
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return Err(Error::from(ProgramError::InvalidArgument {
             message: format!(
@@ -1092,22 +1097,23 @@ pub(crate) fn capture_sharding(
 }
 
 /// Returns the type with which a function traced under [`CapturePlacement::FollowCall`] receives, and is traced with,
-/// an array whose type is `array_type`, or [`None`] when the function must keep the placement that the type records.
-/// A capture follows the call of the function. A type without sharding, including that of a capture on the anonymous
-/// mesh of one device, stays unsharded. When its type records only replication (refer to `entry_boundary_sharding`),
-/// the function receives it without sharding, as it receives a public argument whose type declares none. The types of
-/// the values that it computes from the capture then name no mesh of the capture. A call of a function that names no
-/// devices therefore runs where its caller runs whatever the devices of its captures, as JAX computes
-/// `jit(lambda x: x + c)` on the devices of `x` whether `c` is uncommitted or committed elsewhere. A capture whose type
-/// records more (i.e., a split, a pending reduction, or manual variation), or whose stored placement cannot be
-/// computed, keeps its own type, and lowering checks that the function can receive it on the mesh of its options (refer
-/// to [`capture_sharding`]). This is the single rule for the type of a captured array inside a compiled function, which
-/// every route by which an array enters the trace of a compiled function shares (refer to `Session::capture_constant`
-/// and [`imported_constant`]). Lowering binds a session constant to its placed argument (refer to
-/// [`placed_constant`]). An uncommitted public argument follows the call as a capture does, so a `jit` dispatcher
-/// specializes for such an argument with the type that this function returns as well (refer to [`argument_type`]).
+/// an array whose type is `array_type`, or [`None`] when the function must keep the placement that the type records. A
+/// capture follows the call of the function. A type without sharding, including that of a capture on the anonymous mesh
+/// of one device, stays unsharded. When its type records only replication (refer to
+/// `ShardingLoweringExtension::entry_boundary_sharding`), the function receives it without sharding, as it receives a
+/// public argument whose type declares none. The types of the values that it computes from the capture then name no
+/// mesh of the capture. A call of a function that names no devices therefore runs where its caller runs whatever the
+/// devices of its captures, as JAX computes `jit(lambda x: x + c)` on the devices of `x` whether `c` is uncommitted or
+/// committed elsewhere. A capture whose type records more (i.e., a split, a pending reduction, or manual variation), or
+/// whose stored placement cannot be computed, keeps its own type, and lowering checks that the function can receive it
+/// on the mesh of its options (refer to [`capture_sharding`]). This is the single rule for the type of a captured array
+/// inside a compiled function, which every route by which an array enters the trace of a compiled function shares
+/// (refer to `Session::capture_constant` and [`imported_constant`]). Lowering binds a session constant to its placed
+/// argument (refer to [`placed_constant`]). An uncommitted public argument follows the call as a capture does, so a
+/// `jit` dispatcher specializes for such an argument with the type that this function returns as well (refer to
+/// [`argument_type`]).
 pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
-    let stored = array_type.sharding().map(entry_boundary_sharding).transpose().ok()?;
+    let stored = array_type.sharding().map(ShardingLoweringExtension::entry_boundary_sharding).transpose().ok()?;
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return None;
     }
@@ -1417,10 +1423,10 @@ pub(crate) fn jit_compilation_options(
 /// arguments of an eager application or of an eager operation. This is the case when the program requests a placement,
 /// as JAX commits every result of a `jit` function with any explicit sharding, when it runs on more than one device, as
 /// JAX commits every result of a computation on more than one device, and when it runs on the named mesh of its
-/// function (refer to [`is_named_mesh`]), as JAX commits every result of a `jit` function under `set_mesh`, on one
-/// device too. A result of a function on a named mesh of one device is therefore committed to that mesh, so combining
-/// it with a value committed to other devices is an error, as under `set_mesh`. On an anonymous mesh, results are
-/// committed only by the other rules or by a committed public argument.
+/// function (refer to [`LogicalMeshExtension::is_named`]), as JAX commits every result of a `jit` function under
+/// `set_mesh`, on one device too. A result of a function on a named mesh of one device is therefore committed to that
+/// mesh, so combining it with a value committed to other devices is an error, as under `set_mesh`. On an anonymous
+/// mesh, results are committed only by the other rules or by a committed public argument.
 ///
 /// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
 /// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
@@ -1428,22 +1434,13 @@ pub(crate) fn jit_compilation_options(
 /// interpretation of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an
 /// execution does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
 pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, requests_placement: bool) -> bool {
-    requests_placement || mesh.devices().len() > 1 || function_mesh && is_named_mesh(mesh.logical_mesh())
-}
-
-/// Returns whether `mesh` is named, the analogue of a mesh that JAX's `set_mesh` makes current, which is any mesh other
-/// than [`LogicalMesh::single_device`] and the mesh without axes. Those two are anonymous, the analogue of one device
-/// without a mesh (e.g., under JAX's `default_device`). A function compiled for a named mesh runs there wherever a
-/// session applies it and commits its results (refer to `JitCallOperation::eager_decision` and
-/// [`commits_public_outputs`]).
-pub(crate) fn is_named_mesh(mesh: &LogicalMesh) -> bool {
-    !mesh.axes().is_empty() && *mesh != LogicalMesh::single_device()
+    requests_placement || mesh.devices().len() > 1 || function_mesh && mesh.logical_mesh().is_named()
 }
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a
 /// value explicitly, through an input or output sharding override or anywhere in its program (refer to
-/// [`has_placement_requests`]), with or without the requests that only move a value to another memory, as
-/// `includes_memory_requests` selects. Every request commits every public output of the executions of the function,
+/// [`ProgramLoweringExtension::has_placement_requests`]), with or without the requests that only move a value to
+/// another memory, as `includes_memory_requests` selects. Every request commits every public output of the function,
 /// so commitment counts them all. A request that names devices (i.e., every request except one that only moves a
 /// value to another memory) also makes the function name the devices of the mesh of `options`, which every execution
 /// and every call of it runs on whatever its inputs. Any other function has a program that is agnostic of devices, and
@@ -1462,7 +1459,7 @@ fn requests_placement(
         .into_iter()
         .flatten()
         .chain(options.output_shardings().into_iter().flatten());
-    states_boundary_placement(overrides) || has_placement_requests(program, target_platform, includes_memory_requests)
+    states_boundary_placement(overrides) || program.has_placement_requests(target_platform, includes_memory_requests)
 }
 
 /// Returns whether a function whose boundary has the sharding overrides `overrides` (i.e., those of its inputs and of
@@ -1701,11 +1698,12 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// without the Shardy partitioner, depending on `use_shardy_partitioner`.
 ///
 /// A `jit_call` whose callee boundary has sharding overrides places values on the devices of the mesh that its callee
-/// was compiled for (refer to [`JitCallOperation`]), so it is accepted exactly when that mesh has the devices of
-/// `mesh` in the same order and its topology, as JAX rejects a nested `jit` whose shardings name devices other than
-/// those of the computation that calls it. Without the Shardy partitioner and on more than one device, every override
-/// must also be fully replicated once its unconstrained dimensions are (refer to [`entry_boundary_sharding`]), which
-/// is the constraint that lowering emits for it, because replicas cannot enforce a split.
+/// was compiled for (refer to [`JitCallOperation`]), so it is accepted exactly when that mesh has the devices of `mesh`
+/// in the same order and its topology, as JAX rejects a nested `jit` whose shardings name devices other than those of
+/// the computation that calls it. Without the Shardy partitioner and on more than one device, every override must also
+/// be fully replicated once its unconstrained dimensions are (refer to
+/// [`ShardingLoweringExtension::entry_boundary_sharding`]), which is the constraint that lowering emits for it, because
+/// replicas cannot enforce a split.
 ///
 /// A compiled program runs on the devices of one mesh, so a `place` inside it can only redistribute a value over those
 /// devices and change its storage. Lowering only knows the logical mesh of the module, so the devices are checked
@@ -1741,14 +1739,15 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// # Errors
 ///
 /// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
-/// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`]
-/// for the first `place` whose device target is not the only device of `mesh`,
-/// [`LoweringError::CallOutsideProgramMesh`] for the first `jit_call` whose callee mesh differs from `mesh` in the same
-/// ways, and [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose
-/// effective boundary sharding (i.e., an override or where the executable of the callee
-/// places an input, refer to [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to
-/// [`Sharding::is_replicated`]), once its unconstrained dimensions are read as replicated (refer to
-/// [`entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has more than one device.
+/// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`] for
+/// the first `place` whose device target is not the only device of `mesh`, [`LoweringError::CallOutsideProgramMesh`]
+/// for the first `jit_call` whose callee mesh differs from `mesh` in the same ways, and
+/// [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose effective
+/// boundary sharding (i.e., an override or where the executable of the callee places an input, refer to
+/// [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
+/// its unconstrained dimensions are read as replicated (refer to
+/// [`ShardingLoweringExtension::entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has
+/// more than one device.
 fn validate_placements(
     program: &FlatProgram<Session>,
     mesh: &DeviceMesh,
@@ -1807,7 +1806,7 @@ fn validate_placements(
                         (0..instruction.outputs().len()).filter_map(|index| call.output_sharding(index).cloned()),
                     );
                     for sharding in &shardings {
-                        if !entry_boundary_sharding(sharding)?.is_replicated() {
+                        if !sharding.entry_boundary_sharding()?.is_replicated() {
                             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                                 operation: JIT_CALL_OPERATION_NAME.to_string(),
                                 reason: "bounded-dynamic multi-device programs currently require fully replicated \
@@ -1850,7 +1849,7 @@ fn validate_placements(
                     // An unconstrained dimension is stored replicated, as at the boundary of a call.
                     if !use_shardy_partitioner
                         && mesh.devices().len() > 1
-                        && !entry_boundary_sharding(placement.sharding())?.is_replicated()
+                        && !placement.sharding().entry_boundary_sharding()?.is_replicated()
                     {
                         return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                             operation: PLACE_OPERATION_NAME.to_string(),
@@ -3906,7 +3905,7 @@ mod tests {
                 .unwrap()[0];
             let program: FlatProgram<Session> =
                 builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-            assert!(!has_placement_requests(&program, None, true));
+            assert!(!program.has_placement_requests(None, true));
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             assert_eq!(lowered.committed_outputs(), [false]);
             let compiled = session.compile_program(&lowered).unwrap();

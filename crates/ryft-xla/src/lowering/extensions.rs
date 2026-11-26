@@ -1,5 +1,9 @@
-//! Analyses of the placements that a staged program requests and of the placements of its results, which
-//! compilation, eager calls, and sessions read to decide where a program runs and what it commits.
+//! StableHLO/Shardy export and placement preparation shared by XLA lowering, compilation, and eager dispatch.
+//! [`ProgramExtension`](crate::ProgramExtension) exports a traced XLA program to MLIR.
+//! [`ProgramLoweringExtension`](crate::lowering::extensions::ProgramLoweringExtension) prepares programs for lowering
+//! and queries their placements. [`ShardingLoweringExtension`](crate::lowering::extensions::ShardingLoweringExtension)
+//! normalizes shardings at the executable boundary. Region-level analyses supply the placement requests and retained
+//! constants that eager dispatch uses to choose devices and commit results.
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -10,68 +14,370 @@ use std::sync::Arc;
 
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, ConstrainShardingOperation, Device, DeviceMesh, Instruction, LogicalMesh,
-    MeshAxisType, Operation as CoreOperation, OperationPayloadProjection, Parameterized, PlaceOperation,
-    PlacementRequest, Program, ProgramError, Region as CoreRegion, RegionId, RegionRef, RegionRole, ScanOperation,
-    Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Transform,
-    TransformArtifact, Type as CoreType, Typed, Value,
+    MeshAxisType, Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily,
+    PlaceOperation, PlacementRequest, Program, ProgramError, Region as CoreRegion, RegionId, RegionRef, RegionRole,
+    ScanOperation, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
+    Transform, TransformArtifact, Type as CoreType, Typed, Value,
 };
 
 use crate::lowering::emissions::{
-    admits_iterations, emitted_regions_entering_calls, omits_operation_regions, partition_region_session_constants,
+    admits_iterations, collect_session_constants, emitted_regions_entering_calls, omits_operation_regions,
+    partition_region_session_constants,
 };
-use crate::lowering::modules::render_devices;
+use crate::lowering::modules::{lower_mlir_module_for_program_with_value_shardings, render_devices};
 use crate::lowering::{LowerableOperationFamily, LoweringError};
+use crate::sharding::LogicalMeshExtension;
 use crate::{Constant, Error, JitCallOperation, Operation, RetainedArray, Type};
 
 // TODO(eaplatanios): Review this module.
 
-/// Returns whether `program` requests the placement of a value explicitly in any of the regions that lowering emits,
-/// through a `place` with a target, a `constrain_sharding`, or a `jit_call` whose callee names devices (i.e., carries a
-/// sharding override of its boundary or requests a placement itself, refer to [`JitCallOperation::with_boundary`]),
-/// whether or not that value reaches a result. These are the analogues of the `device_put` and
-/// `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX commit every output of a
-/// `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Only a request of the program that
-/// lowering emits counts (refer to [`pruned_for_lowering`] and [`placement_requests`]), as JAX lowers a `jit` function
-/// without its dead equations and a nested `jit` function pruned to the outputs that its caller uses, so a wrapper that
-/// drops the only result of a callee that places a value requests nothing. Such calls count because their
-/// callees cannot show their overrides (e.g., a replicated override over auto mesh axes stages nothing). The callees of
-/// calls are among the regions that lowering emits, so a request inside a callee counts too. A `place` without a target
-/// leaves its input where it is, so it requests nothing. A `place` with a device target (i.e., a
-/// [`PlacementRequest::Device`]) is counted, as an explicit device commits an array eagerly, although JAX leaves a
-/// value that a bare device places inside `jit` uncommitted and on the devices that it already occupies. A `place` with
-/// an in-place target (i.e., a [`PlacementRequest::InPlace`]) is counted too, because JAX commits every output of a
-/// `jit` function that moves a value to a memory space (i.e., `jax.device_put(x, jax.memory.Space.Host)`), whose
-/// destinations `jaxpr_transfer_mem_kinds` in `jax._src.interpreters.pxla` collects and `lower_sharding_computation`
-/// counts among the reasons to commit. A `reshard` is not counted, because JAX does not count its own `reshard` among
-/// these requests either.
-///
-/// With `includes_memory_requests` unset, an in-place target is not counted, because it names no devices. This is how
-/// a compiled function decides whether it names the devices of its mesh (refer to `requests_placement` in
-/// `crate::compilation::domains`), since JAX runs a `jit` function whose body only moves a value to another memory
-/// (e.g., `jax.device_put(x, jax.memory.Space.Host)`) where its arguments are, directly and nested in another `jit`
-/// function alike, and commits its outputs there.
-///
-/// The program is analysed for `target_platform`, so a request inside a body that lowering for that platform replaces
-/// is not counted, and with [`None`] no region is replaced (refer to [`placement_requests`]).
-pub(crate) fn has_placement_requests<ProgramInput, ProgramOutput, O>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    target_platform: Option<&str>,
-    includes_memory_requests: bool,
-) -> bool
+/// Exports staged [`Program`]s of the XLA backend whose inputs and outputs are arrays (e.g., a
+/// [`TracedProgram`](crate::TracedProgram)) as StableHLO/Shardy MLIR modules. The export reads the global input and
+/// output types of the program (refer to [`Program::input_type`] and [`Program::output_type`]).
+/// Programs over a custom operation family can use [`to_mlir_module_for_program`](crate::to_mlir_module_for_program)
+/// and supply their entry signatures explicitly.
+pub trait ProgramExtension {
+    /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature
+    /// carries the shardings of the global input and output types that have one. Refer to
+    /// [`Self::to_mlir_module_with_shardings`] for more information.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::to_mlir_module_with_shardings`].
+    #[inline]
+    fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
+        self.to_mlir_module_with_shardings(function_name, None, None)
+    }
+
+    /// Same as [`Self::to_mlir_module`] but with explicitly provided `sdy.sharding` attributes for the function's
+    /// inputs and/or outputs. This is what the XLA Single Program Multiple Data (SPMD) partitioner reads to drive
+    /// boundary slicing of per-device output buffers, including for shapes whose dimensions are not divisible by the
+    /// partition count (e.g., shape `[5]` on 2 partitions producing `[3]` + `[2]`). Without explicit shardings, the
+    /// arguments carry the sharding of each of their global types that has one, and the results carry the placement
+    /// that the program gives them (i.e., the target of a `place` that produces them, including over auto mesh axes,
+    /// or the sharding of the argument that they return, also through the callee of a `jit_call`) or otherwise the
+    /// sharding of their global types, as the compilation path of [`Session`](crate::Session) does. Like that path, arguments and
+    /// results replicate the unconstrained dimensions of their shardings, which their runtime placements read as
+    /// replicated, and results whose placement over auto mesh axes nothing fixes are left open over those axes, so that
+    /// the compiler chooses it. Unlike that path, which places a value without either as replicated because it lowers
+    /// for concrete placed arrays, such a value is left unannotated here, so that Shardy propagates its placement from
+    /// the program. Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
+    /// arguments that precede the inputs. The export annotates them with the placements of those arrays, as
+    /// compilation for a [`Session`](crate::Session) does.
+    ///
+    /// The traced program is pruned before lowering, as the compilation of a [`Session`](crate::Session) prunes it, which drops dead
+    /// outputs of instructions that carry regions together with the body computation that only they use (e.g., the
+    /// dead primal outputs of a forward mode `shard_map` whose residuals feed a gradient), and is then simplified. A
+    /// `shard_map` whose ordinary outputs are all dead but whose body has observable effects (e.g., prints with the
+    /// [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary outputs and
+    /// lowers to a manual computation that only threads its effect token.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
+    ///   - `input_shardings`: Optional shardings to attach to each function argument instead of those of the global
+    ///     input types. Must have the same length as the global input types, or be [`None`].
+    ///   - `output_shardings`: Optional shardings to attach to each function result instead of those that the program
+    ///     and the global output types give it. Must have the same length as the global output types, or be [`None`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Core`] when an input or output of the program is not an array, when pruning or simplifying the
+    /// traced program fails, or when the program imports an array whose type names a mesh of another topology than the
+    /// meshes of the signature, because a plain trace keeps the type of an array that it imports (a function compiled
+    /// through a [`Session`](crate::Session), whose captures follow its call, receives it where it runs instead). Lowering failures use
+    /// the corresponding [`Error`] variants (e.g., for an invalid function name, mismatched signature shardings,
+    /// unresolved references or state, or operations that the backend cannot lower).
+    fn to_mlir_module_with_shardings<S: AsRef<str>>(
+        &self,
+        function_name: S,
+        input_shardings: Option<&[Sharding]>,
+        output_shardings: Option<&[Sharding]>,
+    ) -> Result<String, Error>;
+}
+
+impl<Input: Parameterized<Constant>, Output: Parameterized<Constant>> ProgramExtension
+    for Program<Constant, Operation, Input, Output>
 where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-    O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
+    Input::Family: ParameterizedFamily<Type> + ParameterizedFamily<ArrayType>,
+    Output::Family: ParameterizedFamily<Type> + ParameterizedFamily<ArrayType>,
 {
-    has_placement_requests_in_region(program.entry_region_ref(), target_platform, includes_memory_requests)
+    fn to_mlir_module_with_shardings<S: AsRef<str>>(
+        &self,
+        function_name: S,
+        input_shardings: Option<&[Sharding]>,
+        output_shardings: Option<&[Sharding]>,
+    ) -> Result<String, Error> {
+        // Export accepts only arrays at the program boundary. Project the types while preserving their structures.
+        let as_array_type = |r#type: Type| <&ArrayType>::try_from(&r#type).cloned().map_err(ProgramError::from);
+        let input_type = self.input_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
+        let output_type = self.output_type().map_err(ProgramError::from)?.try_map_parameters(as_array_type)?;
+        let program = self.pruned_for_lowering(None)?;
+        let input_shardings: Vec<_> = match input_shardings {
+            Some(shardings) => shardings.iter().cloned().map(Some).collect(),
+            None => input_type.parameters().map(|r#type| r#type.sharding().cloned()).collect(),
+        };
+
+        // Arrays that session constants refer to enter the module as hidden arguments that precede the inputs, which
+        // are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The export
+        // lowers for no target platform, so it collects them for none either.
+        let session_constants = collect_session_constants(&program, None);
+
+        // A plain trace preserves the types of the arrays that enter it (i.e., `CapturePlacement::Preserve`), so an
+        // array that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of
+        // another topology cannot hold it. This is reported with its cause and the way forward, rather than as the
+        // disagreement of the meshes that lowering would find.
+        let mesh = input_shardings
+            .iter()
+            .flatten()
+            .chain(output_shardings.into_iter().flatten())
+            .chain(output_type.parameters().filter_map(ArrayType::sharding))
+            .map(Sharding::mesh)
+            .next();
+        if let Some(mesh) = mesh {
+            for constant in &session_constants {
+                let declared_type = constant.r#type();
+                if let Some(sharding) = declared_type.sharding()
+                    && !sharding.mesh().has_same_topology(mesh)
+                {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "the traced program imports an array of type `{declared_type}`, whose mesh does not have \
+                             the topology of the mesh `{mesh}` of the signature of the module, because a plain `trace` \
+                             keeps the type of an array that it imports; stage or compile the function for a device \
+                             mesh over `{mesh}` through a `Session` instead (e.g., with `stage` or `compile`), \
+                             which receives the array on that mesh",
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let capture_types = session_constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
+        let input_annotations = session_constants
+            .iter()
+            .map(|constant| Some(constant.sharding()))
+            .chain(input_shardings.iter().map(Option::as_ref))
+            .map(|sharding| sharding.map(ShardingLoweringExtension::entry_boundary_sharding).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_types = output_type.parameters().cloned().collect::<Vec<_>>();
+        let placements = program.entry_result_placements(output_types.len(), |constant| constant.sharding().clone());
+        let output_annotations =
+            entry_result_shardings(&output_types, output_shardings, &placements, &input_shardings)?;
+        let open_results = entry_open_results(&output_types, output_shardings, &placements, &output_annotations);
+        Ok(lower_mlir_module_for_program_with_value_shardings(
+            &program,
+            &capture_types,
+            &input_type,
+            &output_type,
+            function_name,
+            &input_annotations,
+            &output_annotations,
+            &open_results,
+        )?
+        .into_stable_hlo())
+    }
+}
+
+/// Prepares XLA programs for lowering and analyzes their entry placements.
+pub(crate) trait ProgramLoweringExtension: Sized {
+    /// Returns this program as lowering emits it, without the unused outputs of its instructions that carry regions,
+    /// together with the computations that only those outputs use (refer to
+    /// [`Program::into_pruned`](ryft_core::Program::into_pruned)), and without every other instruction that neither an
+    /// output nor an observable effect needs (refer to
+    /// [`Program::into_simplified`](ryft_core::Program::into_simplified)), as JAX removes dead equations (e.g., a
+    /// `device_put` whose result nothing uses, or the outputs of a nested `jit` call that its caller drops) before it
+    /// lowers a `jit` function and reads its shardings. Every entry point that lowers a program (i.e., the compilation
+    /// of a [`Session`](crate::Session) and the StableHLO export of traced programs) lowers this program, and
+    /// [`placement_requests`] analyses it, so that the validation of placements, the lowering itself, commitment, and
+    /// the devices that a program names all see the same instructions. Whether a call still names devices is read for
+    /// `target_platform`, so a callee that names devices only inside a body that lowering for that platform replaces
+    /// names none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Program::into_pruned`](ryft_core::Program::into_pruned) and
+    /// [`Program::into_simplified`](ryft_core::Program::into_simplified).
+    fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError>;
+
+    /// Returns whether this program requests the placement of a value explicitly in any of the regions that lowering
+    /// emits, through a `place` with a target, a `constrain_sharding`, or a `jit_call` whose callee names devices
+    /// (i.e., carries a sharding override of its boundary or requests a placement itself, refer to
+    /// [`JitCallOperation::with_boundary`]), whether or not that value reaches a result. These are the analogues of the
+    /// `device_put` and `with_sharding_constraint` calls and of the shardings of nested `jit` calls that make JAX
+    /// commit every output of a `jit` function (refer to `get_intermediate_shardings` in `jax._src.dispatch`). Only a
+    /// request of the program that lowering emits counts (refer to [`Self::pruned_for_lowering`] and
+    /// [`placement_requests`]), as JAX lowers a `jit` function without its dead equations and a nested `jit` function
+    /// pruned to the outputs that its caller uses, so a wrapper that drops the only result of a callee that places a
+    /// value requests nothing. Such calls count because their callees cannot show their overrides (e.g., a replicated
+    /// override over auto mesh axes stages nothing). The callees of calls are among the regions that lowering emits, so
+    /// a request inside a callee counts too. A `place` without a target leaves its input where it is, so it requests
+    /// nothing. A `place` with a device target (i.e., a [`PlacementRequest::Device`]) is counted, as an explicit device
+    /// commits an array eagerly, although JAX leaves a value that a bare device places inside `jit` uncommitted and on
+    /// the devices that it already occupies. A `place` with an in-place target (i.e., a [`PlacementRequest::InPlace`])
+    /// is counted too, because JAX commits every output of a `jit` function that moves a value to a memory space (i.e.,
+    /// `jax.device_put(x, jax.memory.Space.Host)`), whose destinations `jaxpr_transfer_mem_kinds` in
+    /// `jax._src.interpreters.pxla` collects and `lower_sharding_computation` counts among the reasons to commit. A
+    /// `reshard` is not counted, because JAX does not count its own `reshard` among these requests either.
+    ///
+    /// With `includes_memory_requests` unset, an in-place target is not counted, because it names no devices. This is
+    /// how a compiled function decides whether it names the devices of its mesh (refer to `requests_placement` in
+    /// `crate::compilation::domains`), since JAX runs a `jit` function whose body only moves a value to another memory
+    /// (e.g., `jax.device_put(x, jax.memory.Space.Host)`) where its arguments are, directly and nested in another `jit`
+    /// function alike, and commits its outputs there.
+    ///
+    /// The program is analysed for `target_platform`, so a request inside a body that lowering for that platform
+    /// replaces is not counted, and with [`None`] no region is replaced (refer to [`placement_requests`]).
+    fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool;
+
+    /// Returns the placement that this program gives each of its first `output_count` results, or [`None`] for a result
+    /// that it gives no placement. A result that a `place` in the entry region produces has the placement of its
+    /// target, which states the placement along every mesh axis, including the auto mesh axes that the result type
+    /// drops. A bufferless result of `condition`, `scan`, or `while` uses its declared sharding or an entry output
+    /// override, because the compiler has no result buffer from which to report a placement along auto axes. A result
+    /// that is an entry argument is placed where that argument enters the program. A result that returns a
+    /// [`RetainedArray`] is placed as the hidden argument that supplies it, whose sharding `constant_sharding` returns.
+    ///
+    /// Operations that return the value of an input together with its placement are followed back to that input, so
+    /// that a result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place`
+    /// without a target, which leaves its input where it is, a `place` with a device target, which keeps the sharding
+    /// of its input on the only device of the program mesh, `transfer_to_memory`, which only changes the memory of its
+    /// input as a `place` with an in-place target does, `stop_gradient` and `tag`, which only mark values for program
+    /// transforms, and identity `broadcast` operations that forget a compatible global sharding on an explicit mesh. A
+    /// device target that completes a pending reduction over mesh axes of size one gives its result another sharding
+    /// than its input, so such a result is placed as its type states instead. A `jit_call` always runs its callee,
+    /// whose results are the results of the call, so a result of a call has the placement that the callee gives the
+    /// corresponding callee result, and a callee result that returns a callee input is followed back to the
+    /// corresponding input of the call. The boundary of the callee takes precedence, because the callee body cannot
+    /// always show it, so a result of the call that a sharding override of a callee output covers is placed as that
+    /// override, and one that returns a callee input with an effective boundary sharding (i.e., its override or
+    /// otherwise where the executable of the callee places it, refer to [`JitCallOperation::boundary_input_sharding`])
+    /// is placed as that sharding. Lowering constrains that result or operand of the call to that sharding as well, so
+    /// that the call places it alike whether a program returns it or consumes it (refer to the lowering of
+    /// [`JitCallOperation`]). Other operations that return a value equal to an input are not followed, because they
+    /// change its placement (e.g., `reshard` and `constrain_sharding`) or because the compiler is free to place their
+    /// results differently (e.g., the `optimization_barrier` of rematerialization).
+    fn entry_result_placements(
+        &self,
+        output_count: usize,
+        constant_sharding: impl Fn(&RetainedArray) -> Sharding,
+    ) -> Vec<Option<EntryResultPlacement>>;
+}
+
+impl<Input, Output> ProgramLoweringExtension for Program<Constant, Operation, Input, Output>
+where
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
+{
+    fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
+        let program = self.clone().into_pruned()?.into_simplified()?;
+        // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
+        // whose outputs pruning dropped together with the only request that named them names no devices any more (refer
+        // to `JitCallOperation::names_devices`), and it is lowered as a call that names none. Whether a callee names
+        // devices is derived once for each region of the pruned program (refer to `DeviceNamingAnalysis`), so that nested
+        // calls cost one pass over the program. Most programs have no call that records a mesh and pay one scan of their
+        // calls.
+        let arena = program.entry_region_ref().arena();
+        let mut naming = DeviceNamingAnalysis::new(arena.len(), target_platform);
+        let mut stale = HashSet::new();
+        for (index, region) in program.regions().iter().enumerate() {
+            let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
+            for (position, instruction) in region.instructions().iter().enumerate() {
+                let Operation::JitCall(call) = instruction.operation() else { continue };
+                if call.mesh().is_some()
+                    && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
+                    && call.names_devices(|| naming.names_devices(callee)).is_none()
+                {
+                    stale.insert((index, position));
+                }
+            }
+        }
+        if stale.is_empty() {
+            return Ok(program);
+        }
+        let regions = program
+            .regions()
+            .iter()
+            .enumerate()
+            .map(|(index, region)| {
+                let instructions = region
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, instruction)| match instruction.operation() {
+                        Operation::JitCall(call) if stale.contains(&(index, position)) => {
+                            let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
+                            Instruction::new(Operation::JitCall(call.without_mesh()), inputs, outputs, regions)
+                                .with_provenance(provenance)
+                        }
+                        _ => instruction.clone(),
+                    })
+                    .collect();
+                CoreRegion::new(
+                    region.atoms().to_vec(),
+                    region.input_ids().to_vec(),
+                    region.output_ids().to_vec(),
+                    instructions,
+                )
+            })
+            .collect::<Vec<_>>();
+        Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
+    }
+
+    fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool {
+        has_placement_requests_in_region(self.entry_region_ref(), target_platform, includes_memory_requests)
+    }
+
+    fn entry_result_placements(
+        &self,
+        output_count: usize,
+        constant_sharding: impl Fn(&RetainedArray) -> Sharding,
+    ) -> Vec<Option<EntryResultPlacement>> {
+        let mut callee_placements = HashMap::new();
+        region_result_placements(self.entry_region_ref(), &constant_sharding, &mut callee_placements)[..output_count]
+            .to_vec()
+    }
+}
+
+/// Interprets core shardings for XLA entry signatures.
+pub(crate) trait ShardingLoweringExtension {
+    /// Returns the sharding with which the entry function of a program annotates a value at its boundary (i.e., an
+    /// argument or a result) whose runtime array has this sharding. This is the same sharding with its unconstrained
+    /// dimensions replicated. A runtime array stores such a dimension replicated, because its placement reads an
+    /// unconstrained dimension as replicated, so an annotation that left the dimension open would let the compiler
+    /// shard it and exchange buffers of other shapes than those of the array (e.g., expect `[2, 2]` argument buffers
+    /// where an array placed as `[{"x"}, {?}]` supplies `[2, 4]` buffers).
+    fn entry_boundary_sharding(&self) -> Result<Sharding, Error>;
+}
+
+impl ShardingLoweringExtension for Sharding {
+    fn entry_boundary_sharding(&self) -> Result<Sharding, Error> {
+        if !self.dimensions().contains(&ShardingDimension::Unconstrained) {
+            return Ok(self.clone());
+        }
+        let dimensions = self
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+                dimension => dimension.clone(),
+            })
+            .collect();
+        Ok(self.with_dimensions(dimensions)?)
+    }
 }
 
 /// Returns whether `region` requests the placement of a value explicitly in any of the regions that lowering emits for
-/// it for `target_platform` (refer to [`has_placement_requests`] and [`placement_requests`]), every output of `region`
-/// being used. This is the one test of whether a program requests a placement, which commitment (refer to
-/// `commits_public_outputs` in `crate::compilation::domains`), whether a compiled function names the devices of its
-/// mesh, the placement decision of an eager call, and partial evaluation all read. It reads the requests that
-/// [`placement_requests`] retains with `region`, so it analyses each region once for each platform.
+/// it for `target_platform` (refer to [`ProgramLoweringExtension::has_placement_requests`] and [`placement_requests`]),
+/// every output of `region` being used. This is the one test of whether a program requests a placement, which
+/// commitment (refer to `commits_public_outputs` in `crate::compilation::domains`), whether a compiled function names
+/// the devices of its mesh, the placement decision of an eager call, and partial evaluation all read. It reads the
+/// requests that [`placement_requests`] retains with `region`, so it analyses each region once for each platform.
 pub(crate) fn has_placement_requests_in_region<V, O>(
     region: RegionRef<'_, V, O>,
     target_platform: Option<&str>,
@@ -85,84 +391,6 @@ where
         RequestedPlacement::Memory => includes_memory_requests,
         RequestedPlacement::Devices(_) | RequestedPlacement::Sharding => true,
     })
-}
-
-/// Returns `program` as lowering emits it, which is `program` without the unused outputs of its instructions that carry
-/// regions, together with the computations that only those outputs use (refer to
-/// [`Program::into_pruned`](ryft_core::Program::into_pruned)), and without every other instruction that neither an
-/// output nor an observable effect needs (refer to [`Program::into_simplified`](ryft_core::Program::into_simplified)),
-/// as JAX removes dead equations (e.g., a `device_put` whose result nothing uses, or the outputs of a nested `jit` call
-/// that its caller drops) before it lowers a `jit` function and reads its shardings. Every entry point that lowers a
-/// program (i.e., the compilation of a [`Session`](crate::Session) and the StableHLO export of traced programs) lowers
-/// this program, and [`placement_requests`] analyses it, so that the validation of placements, the lowering itself,
-/// commitment, and the devices that a program names all see the same instructions. Whether a call still names devices
-/// is read for `target_platform`, so a callee that names devices only inside a body that lowering for that platform
-/// replaces names none.
-///
-/// # Errors
-///
-/// Returns the errors of [`Program::into_pruned`](ryft_core::Program::into_pruned) and
-/// [`Program::into_simplified`](ryft_core::Program::into_simplified).
-pub(crate) fn pruned_for_lowering<ProgramInput, ProgramOutput>(
-    program: &Program<Constant, Operation, ProgramInput, ProgramOutput>,
-    target_platform: Option<&str>,
-) -> Result<Program<Constant, Operation, ProgramInput, ProgramOutput>, ProgramError>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    let program = program.clone().into_pruned()?.into_simplified()?;
-    // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
-    // whose outputs pruning dropped together with the only request that named them names no devices any more (refer
-    // to `JitCallOperation::names_devices`), and it is lowered as a call that names none. Whether a callee names
-    // devices is derived once for each region of the pruned program (refer to `DeviceNamingAnalysis`), so that nested
-    // calls cost one pass over the program. Most programs have no call that records a mesh and pay one scan of their
-    // calls.
-    let arena = program.entry_region_ref().arena();
-    let mut naming = DeviceNamingAnalysis::new(arena.len(), target_platform);
-    let mut stale = HashSet::new();
-    for (index, region) in program.regions().iter().enumerate() {
-        let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
-        for (position, instruction) in region.instructions().iter().enumerate() {
-            let Operation::JitCall(call) = instruction.operation() else { continue };
-            if call.mesh().is_some()
-                && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
-                && call.names_devices(|| naming.names_devices(callee)).is_none()
-            {
-                stale.insert((index, position));
-            }
-        }
-    }
-    if stale.is_empty() {
-        return Ok(program);
-    }
-    let regions = program
-        .regions()
-        .iter()
-        .enumerate()
-        .map(|(index, region)| {
-            let instructions = region
-                .instructions()
-                .iter()
-                .enumerate()
-                .map(|(position, instruction)| match instruction.operation() {
-                    Operation::JitCall(call) if stale.contains(&(index, position)) => {
-                        let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
-                        Instruction::new(Operation::JitCall(call.without_mesh()), inputs, outputs, regions)
-                            .with_provenance(provenance)
-                    }
-                    _ => instruction.clone(),
-                })
-                .collect();
-            CoreRegion::new(
-                region.atoms().to_vec(),
-                region.input_ids().to_vec(),
-                region.output_ids().to_vec(),
-                instructions,
-            )
-        })
-        .collect::<Vec<_>>();
-    Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
 }
 
 /// Placement request of one instruction of the program that lowering emits, as [`placement_requests`] returns it.
@@ -182,11 +410,11 @@ pub(crate) enum RequestedPlacement {
 }
 
 /// Returns what `analyse` returns for the entry region of the program that lowering emits for `region` (refer to
-/// [`pruned_for_lowering`]), every output of `region` being used, which is `region` with its closure without the unused
-/// outputs of instructions that carry regions and without dead instructions and constants, or with its closure
-/// unchanged when it cannot be pruned (a program that cannot be pruned cannot be lowered either, so that an analysis of
-/// it never hides anything of such a program). This is the one program that the summary of a region reads (refer to
-/// [`region_placement_summary`]).
+/// [`ProgramLoweringExtension::pruned_for_lowering`]), every output of `region` being used, which is `region` with its
+/// closure without the unused outputs of instructions that carry regions and without dead instructions and constants,
+/// or with its closure unchanged when it cannot be pruned (a program that cannot be pruned cannot be lowered either, so
+/// that an analysis of it never hides anything of such a program). This is the one program that the summary of a region
+/// reads (refer to [`region_placement_summary`]).
 fn analyse_pruned_region<V, O, R>(region: RegionRef<'_, V, O>, analyse: impl FnOnce(RegionRef<'_, V, O>) -> R) -> R
 where
     V: Value<Type = Type>,
@@ -212,9 +440,9 @@ pub(crate) struct RegionPlacementSummary {
 
 /// [`Transform`] marker under which [`region_placement_summary`] retains the summary of a region with it, for the
 /// target platform that its arguments name, held as a [`String`] as for [`OwnedSessionConstantsAnalysis`]. Two
-/// summaries are retained, because an eager call reads the requests of its callee for the platform of its session
-/// while partial evaluation and compilation read them for no target (refer to [`JitCallOperation::requests_placement`]
-/// and [`has_placement_requests`]), and one summary would be derived again at every alternation.
+/// summaries are retained, because an eager call reads the requests of its callee for the platform of its session while
+/// partial evaluation and compilation read them for no target (refer to [`JitCallOperation::requests_placement`] and
+/// [`ProgramLoweringExtension::has_placement_requests`]), and one summary would be derived again at every alternation.
 struct RegionPlacementAnalysis;
 
 impl<V: Value, O: CoreOperation<Type = V::Type>> Transform<CoreRegion<V, O>> for RegionPlacementAnalysis {
@@ -346,12 +574,13 @@ fn entry_session_constants<O: LowerableOperationFamily>(
 }
 
 /// Whether each region of one program requests a placement that names devices (i.e., any request except one that only
-/// moves a value to another memory) in the regions that lowering emits for it, which is what a call that records a
-/// mesh reads of its callee (refer to [`JitCallOperation::names_devices`]). Each region of the program is analysed at
-/// most once, and its fact is read by every call of it and by every region that encloses it, so a pass over a program
-/// with nested calls is linear in the size of the program. The program must be the one that lowering emits (i.e., it
-/// is already pruned, refer to [`pruned_for_lowering`]), because a callee is analysed as the program holds it. The regions
-/// of an instruction whose lowering for the target platform omits them are not analysed (refer to `omits_regions`).
+/// moves a value to another memory) in the regions that lowering emits for it, which is what a call that records a mesh
+/// reads of its callee (refer to [`JitCallOperation::names_devices`]). Each region of the program is analysed at most
+/// once, and its fact is read by every call of it and by every region that encloses it, so a pass over a program with
+/// nested calls is linear in the size of the program. The program must be the one that lowering emits (i.e., it is
+/// already pruned, refer to [`ProgramLoweringExtension::pruned_for_lowering`]), because a callee is analysed as the
+/// program holds it. The regions of an instruction whose lowering for the target platform omits them are not analysed
+/// (refer to `omits_regions`).
 struct DeviceNamingAnalysis<'t> {
     /// Whether the region at each index of the arena of the program names devices, or [`None`] if it has not been
     /// analysed yet.
@@ -489,7 +718,8 @@ pub(crate) fn owned_session_constants(
     artifact.metadata().clone()
 }
 
-/// Placement request that one instruction makes explicitly (refer to [`has_placement_requests`]).
+/// Placement request that one instruction makes explicitly (refer to
+/// [`ProgramLoweringExtension::has_placement_requests`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum InstructionPlacementRequest<'o> {
     /// A `place` with a device target, which names that device.
@@ -507,9 +737,9 @@ pub(crate) enum InstructionPlacementRequest<'o> {
 }
 
 /// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
-/// placement requests of a program, which both [`has_placement_requests`] (and through it whether a compiled function
-/// names the devices of its mesh, refer to `requests_placement` in `crate::compilation::domains`) and
-/// [`requested_placement_mesh`] project.
+/// placement requests of a program, which both [`ProgramLoweringExtension::has_placement_requests`] (and through it
+/// whether a compiled function names the devices of its mesh, refer to `requests_placement` in
+/// `crate::compilation::domains`) and [`requested_placement_mesh`] project.
 pub(crate) fn placement_request<O: CoreOperation<Type = Type> + OperationPayloadProjection>(
     operation: &O,
 ) -> Option<InstructionPlacementRequest<'_>> {
@@ -594,7 +824,8 @@ pub(crate) fn merge_requested_placement<'r>(
     Ok(())
 }
 
-/// Placement that the entry region of a program gives one of its results, as [`entry_result_placements`] returns it.
+/// Placement that the entry region of a program gives one of its results, as
+/// [`ProgramLoweringExtension::entry_result_placements`] returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum EntryResultPlacement {
     /// The program determines the result's sharding.
@@ -604,86 +835,24 @@ pub(crate) enum EntryResultPlacement {
     Argument(usize),
 }
 
-/// Returns the placement that `program` itself gives each of its first `output_count` results, or [`None`] for a
-/// result that it gives no placement. A result that a `place` in the entry region produces has the placement of its
-/// target, which states the placement along every mesh axis, including the auto mesh axes that the result type drops.
-/// A bufferless result of `condition`, `scan`, or `while` uses its declared sharding or an entry output override,
-/// because the compiler has no result buffer from which to report a placement along auto axes. A result that is an
-/// entry argument is placed where that argument enters the program. A result that returns a [`RetainedArray`] is
-/// placed as the hidden argument that supplies it, whose sharding `constant_sharding` returns.
-///
-/// Operations that return the value of an input together with its placement are followed back to that input, so that a
-/// result keeps the placement of a `place` or of an entry argument that precedes them. These are a `place` without a
-/// target, which leaves its input where it is, a `place` with a device target, which keeps the sharding of its input
-/// on the only device of the program mesh, `transfer_to_memory`, which only changes the memory of its input as a
-/// `place` with an in-place target does, `stop_gradient` and `tag`, which only mark values for program transforms,
-/// and identity `broadcast` operations that forget a compatible global sharding on an explicit mesh. A device
-/// target that completes a pending reduction over mesh axes of size one
-/// gives its result another sharding than its input, so such a result is placed as its type states instead. A
-/// `jit_call` always runs its callee, whose results are the results of the call, so a result of a call has the
-/// placement that the callee gives the corresponding callee result, and a callee result that returns a callee input is
-/// followed back to the corresponding input of the call. The boundary of the callee takes precedence, because the
-/// callee body cannot always show it, so a result of the call that a sharding override of a callee output covers is
-/// placed as that override, and one that returns a callee input with an effective boundary sharding (i.e., its
-/// override or otherwise where the executable of the callee places it, refer to
-/// [`JitCallOperation::boundary_input_sharding`]) is placed as that sharding. Lowering constrains that result or
-/// operand of the call to that sharding as well, so that the call places it alike whether a program returns it or
-/// consumes it (refer to the lowering of [`JitCallOperation`]). Other operations that return a value equal to an input
-/// are not followed, because they change its placement (e.g., `reshard` and `constrain_sharding`) or because the
-/// compiler is free to place their results differently (e.g., the `optimization_barrier` of rematerialization).
-pub(crate) fn entry_result_placements<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    output_count: usize,
-    constant_sharding: impl Fn(&RetainedArray) -> Sharding,
-) -> Vec<Option<EntryResultPlacement>>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    let mut callee_placements = HashMap::new();
-    region_result_placements(program.entry_region_ref(), &constant_sharding, &mut callee_placements)[..output_count]
-        .to_vec()
-}
-
-/// Returns the sharding with which the entry function of a program annotates a value at its boundary (i.e., an
-/// argument or a result) whose runtime array is placed as `sharding`. This is `sharding` with its unconstrained
-/// dimensions replicated. A runtime array stores such a dimension replicated, because its placement reads an
-/// unconstrained dimension as replicated, so an annotation that left the dimension open would let the compiler shard
-/// it and exchange buffers of other shapes than those of the array (e.g., expect `[2, 2]` argument buffers where an
-/// array placed as `[{"x"}, {?}]` supplies `[2, 4]` buffers).
-pub(crate) fn entry_boundary_sharding(sharding: &Sharding) -> Result<Sharding, Error> {
-    if !sharding.dimensions().contains(&ShardingDimension::Unconstrained) {
-        return Ok(sharding.clone());
-    }
-    let dimensions = sharding
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            ShardingDimension::Unconstrained => ShardingDimension::Replicated,
-            dimension => dimension.clone(),
-        })
-        .collect();
-    Ok(sharding.with_dimensions(dimensions)?)
-}
-
 /// Returns the sharding with which the entry function of a program annotates each of its results, whose types are
 /// `output_types`, and which describes the buffers that the results are returned in. These are the `result_shardings`
 /// overrides when they are provided, and otherwise the placement that the program gives each result (i.e., the
-/// corresponding element of `placements`, as [`entry_result_placements`] returns them, where an entry argument is
-/// placed as the corresponding element of `argument_shardings`), or the sharding of the result type when the program
-/// gives it none (e.g., when that argument has no sharding). A result without either has no sharding. Compilation for
-/// a [`Session`](crate::Session) and the StableHLO export of a [`TracedProgram`](crate::TracedProgram) both choose the
-/// shardings of results with this function, so that an exported module places its results as the executable that a
-/// session compiles for it does.
+/// corresponding element of `placements`, as [`ProgramLoweringExtension::entry_result_placements`] returns them, where
+/// an entry argument is placed as the corresponding element of `argument_shardings`), or the sharding of the result
+/// type when the program gives it none (e.g., when that argument has no sharding). A result without either has no
+/// sharding. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
+/// [`TracedProgram`](crate::TracedProgram) both choose the shardings of results with this function, so that an exported
+/// module places its results as the executable that a session compiles for it does.
 ///
 /// An override, a `place` target, an argument placement, or a result type may leave dimensions unconstrained, but the
 /// runtime placement of an array reads such a dimension as replicated, and the result type records it exactly, so it
 /// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here
-/// (refer to [`entry_boundary_sharding`]), whatever operation produces the result (e.g., arithmetic whose result type
-/// inherits an unconstrained dimension from the target of a `place` that precedes it), so that the executable returns
-/// the buffers that the runtime placement of the result describes, while the dimensions that they constrain keep their
-/// placement. Provided overrides are not checked against `output_types`, so that a count mismatch is still reported
-/// when the module is lowered.
+/// (refer to [`ShardingLoweringExtension::entry_boundary_sharding`]), whatever operation produces the result (e.g.,
+/// arithmetic whose result type inherits an unconstrained dimension from the target of a `place` that precedes it), so
+/// that the executable returns the buffers that the runtime placement of the result describes, while the dimensions
+/// that they constrain keep their placement. Provided overrides are not checked against `output_types`, so that a count
+/// mismatch is still reported when the module is lowered.
 ///
 /// A placement that the program gives a result never keeps reduction state that the result type does not record (i.e.,
 /// a pending reduction or a completed-reduction marker over auto mesh axes). No value of a program carries such state:
@@ -701,7 +870,7 @@ pub(crate) fn entry_result_shardings(
     argument_shardings: &[Option<Sharding>],
 ) -> Result<Vec<Option<Sharding>>, Error> {
     match result_shardings {
-        Some(shardings) => shardings.iter().map(|sharding| entry_boundary_sharding(sharding).map(Some)).collect(),
+        Some(shardings) => shardings.iter().map(|sharding| sharding.entry_boundary_sharding().map(Some)).collect(),
         None => output_types
             .iter()
             .zip(placements)
@@ -720,9 +889,12 @@ pub(crate) fn entry_result_shardings(
                             || sharding.reduced_axes().iter().any(|axis| !reduced_axes.contains(axis)) =>
                     {
                         let unreduced = sharding.clone().with_unreduced_axes(unreduced_axes.iter().cloned())?;
-                        entry_boundary_sharding(&unreduced.with_reduced_axes(reduced_axes.iter().cloned())?).map(Some)
+                        unreduced.with_reduced_axes(reduced_axes.iter().cloned())?.entry_boundary_sharding().map(Some)
                     }
-                    placement => placement.or(output_type.sharding()).map(entry_boundary_sharding).transpose(),
+                    placement => placement
+                        .or(output_type.sharding())
+                        .map(ShardingLoweringExtension::entry_boundary_sharding)
+                        .transpose(),
                 }
             })
             .collect(),
@@ -764,7 +936,7 @@ pub(crate) fn entry_open_results(
             result_shardings.is_none()
                 && placement.is_none()
                 && annotation.as_ref().is_some_and(|sharding| {
-                    has_untracked_auto_axes(sharding)
+                    sharding.mesh().has_untracked_auto_axes()
                         && sharding.unreduced_axes().is_empty()
                         && sharding.reduced_axes().is_empty()
                         && sharding.varying_manual_axes().is_empty()
@@ -776,21 +948,15 @@ pub(crate) fn entry_open_results(
         .collect()
 }
 
-/// Returns whether the mesh of `sharding` has an auto axis larger than one (i.e., one along which the compiler has a
-/// choice), along which an array type never records a placement (refer to [`ArrayType::with_sharding`]), so that a
-/// value with the type of `sharding` may be placed along it in more than one way.
-pub(crate) fn has_untracked_auto_axes(sharding: &Sharding) -> bool {
-    sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
-}
-
-/// Returns the placement that `region` gives each of its results, which [`entry_result_placements`] describes, with
-/// [`EntryResultPlacement::Argument`] naming an input of `region`. A result that returns a [`RetainedArray`] has the
-/// placement of that array, which enters the executable as a hidden argument with that placement, and which has no
-/// buffer whose placement the compiler could report when it has the zero data type. The placements of the callee
-/// regions of `jit_call`s are computed once per callee and memoized in `callee_placements`, because repeated calls
-/// share their callee region. The inputs of `region` and the producer of each of its values, together with the
-/// position of that value among the outputs of its producer, are indexed once, so that following a result back to an
-/// input costs one lookup per step rather than a scan of the inputs or of the outputs of an instruction.
+/// Returns the placement that `region` gives each of its results, which
+/// [`ProgramLoweringExtension::entry_result_placements`] describes, with [`EntryResultPlacement::Argument`] naming an
+/// input of `region`. A result that returns a [`RetainedArray`] has the placement of that array, which enters the
+/// executable as a hidden argument with that placement, and which has no buffer whose placement the compiler could
+/// report when it has the zero data type. The placements of the callee regions of `jit_call`s are computed once per
+/// callee and memoized in `callee_placements`, because repeated calls share their callee region. The inputs of `region`
+/// and the producer of each of its values, together with the position of that value among the outputs of its producer,
+/// are indexed once, so that following a result back to an input costs one lookup per step rather than a scan of the
+/// inputs or of the outputs of an instruction.
 fn region_result_placements<O: LowerableOperationFamily>(
     region: RegionRef<'_, Constant, O>,
     constant_sharding: &impl Fn(&RetainedArray) -> Sharding,
@@ -916,29 +1082,559 @@ fn region_result_placements<O: LowerableOperationFamily>(
 
 #[cfg(test)]
 mod tests {
-
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, CompositeKey, CompositeOperation, CustomRuleDefinition, CustomRuleRegistration,
-        DataType, Device, DeviceMesh, FlatProgram, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
-        NegOperation, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest,
-        ProgramBuilder, ScanOperation, Sharding, ShardingDimension, StopGradient, Tag, TransferToMemory, Typed,
+        AddOperation, ArrayType, CompositeKey, CompositeOperation, ConstrainSharding, CustomRuleDefinition,
+        CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionValue, DomainTracingContext,
+        EffectClass, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
+        NegOperation, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print,
+        ProgramBuilder, Reshape, Reshard, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin,
+        StopGradient, Tag, TransferToMemory, Typed, ValueProjection, shard_map,
     };
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::{
-        CompileTracer, CompiledFunction, Constant, JIT_CALL_OPERATION_NAME, JitCallOperation, Operation, Options,
-        RetainedArray, Session, StagedFunction, Type, compile, stage,
-    };
-
-    use crate::lowering::tests::test_vector_type;
-
+    use crate::lowering::tests::{test_sharding, test_vector_type};
     use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
-
-    use crate::tests::{cpu_client, values_to_bytes};
+    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::{
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, JIT_CALL_OPERATION_NAME, JitCallOperation,
+        Operation, Options, RetainedArray, Session, StagedFunction, ThroughSession, TracedProgram, Tracer, Type, Value,
+        compile, ensure_print_handler_registered, stage, trace, trace_with_context, with_captured_prints,
+    };
 
     use super::*;
+
+    /// Traces a program over a sharded `f64[4]` input that invokes a `shard_map` over the manual mesh of two devices,
+    /// whose body prints its local shard with the [`EffectClass::DeviceOrderedIo`] effect and whose only output is
+    /// dead, and that returns its input unchanged.
+    fn traced_effectful_dead_shard_map() -> (TracedProgram<ArrayType, ArrayType>, Sharding) {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ArrayTracer| {
+                    let _printed = shard_map(
+                        |local_x: ArrayTracer| local_x.print_with_effect_class("body", EffectClass::DeviceOrderedIo),
+                        x.clone(),
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap();
+                    x
+                }
+            },
+            ArrayType::new_static(DataType::F64, [4]),
+        )
+        .unwrap();
+        (traced, sharding)
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ArrayTracer| x.sin().unwrap().reshard(&sharding).unwrap()
+            },
+            global_input_type.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{\"x\"}]> : tensor<8xf32>
+                    return %1 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_reshard_then_reshape() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ArrayTracer| {
+                    x.reshard(&sharding)
+                        .unwrap()
+                        .reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(8), Dimension::Static(1)]))
+                        .unwrap()
+                }
+            },
+            input_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {\"x\"}, {}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<8xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>
+                    return %1 : tensor<1x8x1xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
+        // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
+        // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
+        // the tracked type by marking the explicit axis replicated. The result is not the result of a `place`, so its
+        // placement along the auto axis is left to the compiler, as compilation leaves it.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let tracked = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let constraint = test_sharding(&mesh, vec![ShardingDimension::sharded(["a"])], vec![]);
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(tracked.clone())
+            .unwrap();
+
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            {
+                let constraint = constraint.clone();
+                move |x: ArrayTracer| x.constrain_sharding(&constraint).unwrap()
+            },
+            global_input_type.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\", ?}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\", \"a\"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_annotates_placed_results() {
+        // A result that a `place` produces, also through an operation that returns its input unchanged, is annotated
+        // with the target of that `place`, including its split along the auto axis that the result type drops, as
+        // compilation places it.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh, sharding).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(),
+            ArrayType::new_static(DataType::F32, [8]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_passes_imported_arrays_as_arguments() {
+        // An array that the traced function imports becomes a session constant, which enters the module as a hidden
+        // argument that precedes the inputs and is annotated as the array is placed, as compilation passes it.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, 4f32.to_ne_bytes())
+            .unwrap();
+        let device = array.mesh().devices()[0];
+        let traced = trace_with_context::<_, (), ArrayTracer>(
+            |context, ()| {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
+                ValueProjection::<ArrayType>::into_projected(imported)?.place(&device, None)
+            },
+            (),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"device\"=1]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> \
+                        (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    return %arg0 : tensor<f32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings() {
+        // Explicit shardings are attached to the arguments and the results of the function. The global types have no
+        // sharding here, so without explicit shardings the signature is not annotated, as `to_mlir_module` renders it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(|x: ArrayTracer| x.sin().unwrap(), ArrayType::new_static(DataType::F32, [8])).unwrap();
+        let shardings = Some(std::slice::from_ref(&sharding));
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", shardings, shardings).unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                        (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", None, None).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            traced.to_mlir_module_with_shardings("main", None, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_rejects_boundaries_that_are_not_arrays() {
+        // The export reads array types at the boundary of the program, so a program whose input is a dimension is
+        // rejected before anything is lowered.
+        let dimension_type = Type::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
+        let (_, program) =
+            DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), vec![dimension_type]).unwrap();
+        assert_eq!(
+            program.to_mlir_module_with_shardings("main", None, None).unwrap_err().to_string(),
+            "expected array type but got dimension type",
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_rejects_imports_over_other_topologies() {
+        // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
+        // cannot hold an array over two devices, and the error names the cause and the way forward.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        let array_type = ArrayType::new_static(DataType::F32, [4]);
+        let array = Array::from_host_buffer(
+            &session,
+            array_type.clone().with_sharding(sharding.clone()).unwrap(),
+            None,
+            Some(sharding),
+            values_to_bytes(&[0f32, 1., 2., 3.]),
+        )
+        .unwrap();
+        let traced = trace_with_context::<_, ArrayType, ArrayTracer>(
+            |context, _| {
+                let imported =
+                    ImportingContext::<Session, ThroughSession>::import(context, Value::Array(array.clone()))?;
+                Ok(ValueProjection::<ArrayType>::into_projected(imported)?)
+            },
+            array_type,
+        )
+        .unwrap();
+        let signature = Sharding::replicated(LogicalMesh::single_device(), 1);
+        let signatures = Some(std::slice::from_ref(&signature));
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", signatures, signatures).unwrap_err().to_string(),
+            "the traced program imports an array of type `f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]`, whose mesh \
+             does not have the topology of the mesh `['device'=1:auto]` of the signature of the module, because a \
+             plain `trace` keeps the type of an array that it imports; stage or compile the function for a device \
+             mesh over `['device'=1:auto]` through a `Session` instead (e.g., with `stage` or `compile`), which \
+             receives the array on that mesh",
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_placements() {
+        // The runtime placement of a result reads an unconstrained dimension of the target of the `place` that produces
+        // it, or of a result sharding override, as replicated, so the result is annotated with that dimension closed,
+        // as compilation annotates it, while the constraint inside the function keeps it open.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+                MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+            ])
+            .unwrap(),
+            (0..4).map(|id| Device::new(id, 0)).collect(),
+        )
+        .unwrap();
+        let input_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["r"])],
+        )
+        .unwrap();
+        let open_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()],
+        )
+        .unwrap();
+        let target = Placement::new(mesh, open_sharding.clone()).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(move |x: ArrayTracer| x.place(&target, None).unwrap(), ArrayType::new_static(DataType::I32, [4, 4]))
+                .unwrap();
+        let expected = indoc! {"
+            module {
+              sdy.mesh @mesh = <[\"x\"=2, \"r\"=2]>
+              func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {\"r\"}]>}) -> \
+                    (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) {
+                %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}, {?}]> : tensor<4x4xi32>
+                return %0 : tensor<4x4xi32>
+              }
+            }
+        "};
+        assert_eq!(
+            traced
+                .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(
+            traced
+                .to_mlir_module_with_shardings(
+                    "main",
+                    Some(std::slice::from_ref(&input_sharding)),
+                    Some(std::slice::from_ref(&open_sharding)),
+                )
+                .unwrap(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_types() {
+        // A result that is computed from the result of a `place` inherits the unconstrained dimension of its target in
+        // its type, which its runtime placement reads as replicated as well, so it is annotated with that dimension
+        // closed, as compilation annotates it.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+                MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+            ])
+            .unwrap(),
+            (0..4).map(|id| Device::new(id, 0)).collect(),
+        )
+        .unwrap();
+        let input_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let open_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::unconstrained()],
+        )
+        .unwrap();
+        let target = Placement::new(mesh, open_sharding).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
+                let placed = x.place(&target, None).unwrap();
+                placed.clone() + placed
+            },
+            ArrayType::new_static(DataType::I32, [4, 4]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced
+                .to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&input_sharding)), None)
+                .unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2, \"r\"=2]>
+                  func.func @main(%arg0: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}, {}]>}) -> \
+                        (tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}, {?}]> : tensor<4x4xi32>
+                    %1 = stablehlo.add %0, %0 : tensor<4x4xi32>
+                    return %1 : tensor<4x4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_leaves_results_open_over_auto_axes() {
+        // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
+        // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
+        // result is annotated open over it, as compilation annotates it.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Placement::new(mesh, sharded).unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            move |x: ArrayTracer| {
+                let placed = x.place(&target, None).unwrap();
+                placed.clone() + placed
+            },
+            ArrayType::new_static(DataType::F32, [4]),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_mlir_module_with_shardings("main", Some(std::slice::from_ref(&replicated)), None).unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> \
+                        (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<4xf32>
+                    %1 = stablehlo.add %0, %0 : tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_keeps_effectful_dead_shard_maps() {
+        // Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
+        // ordinary results, so the lowered manual computation only threads the effect token of its body.
+        let (traced, sharding) = traced_effectful_dead_shard_map();
+        assert_eq!(
+            traced
+                .to_mlir_module_with_shardings(
+                    "main",
+                    Some(std::slice::from_ref(&sharding)),
+                    Some(std::slice::from_ref(&sharding)),
+                )
+                .unwrap(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> \
+                        (tensor<4xf64> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = sdy.manual_computation(%arg0, %0) in_shardings=[<@mesh, [{\"x\"}]>, <@mesh, []>] \
+                        out_shardings=[<@mesh, []>] manual_axes={\"x\"} \
+                        (%arg1: tensor<2xf64>, %arg2: !stablehlo.token) {
+                      %2 = stablehlo.custom_call @ryft.print(%arg1, %arg2) {api_version = 4 : i32, \
+                          backend_config = {label = \"body\"}, has_side_effect = true, \
+                          operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
+                          result_layouts = [dense<> : tensor<0xindex>]} : (tensor<2xf64>, !stablehlo.token) \
+                          -> !stablehlo.token
+                      sdy.return %2 : !stablehlo.token
+                    } : (tensor<4xf64>, !stablehlo.token) -> !stablehlo.token
+                    return %arg0 : tensor<4xf64>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_extension_to_mlir_module_with_shardings_executes_effectful_dead_shard_maps_on_cpu() {
+        let (traced, sharding) = traced_effectful_dead_shard_map();
+        let module = traced
+            .to_mlir_module_with_shardings(
+                "main",
+                Some(std::slice::from_ref(&sharding)),
+                Some(std::slice::from_ref(&sharding)),
+            )
+            .unwrap();
+        let client = cpu_client(2);
+        ensure_print_handler_registered(client).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
+            .unwrap();
+        let shards = [vec![1.5f64, 2.5], vec![3.5f64, 4.5]];
+        let inputs = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .zip(&shards)
+            .map(|(device, shard)| {
+                let bytes = values_to_bytes(shard.as_slice());
+                vec![ExecutionInput {
+                    buffer: Arc::new(
+                        client.buffer(bytes.as_slice(), BufferType::F64, [2u64], None, device.clone(), None).unwrap(),
+                    ),
+                    donatable: false,
+                }]
+            })
+            .collect::<Vec<_>>();
+        let (outputs, mut lines) = with_captured_prints(|| {
+            executable
+                .execute(
+                    inputs.iter().map(|inputs| ExecutionDeviceInputs { inputs, ..Default::default() }).collect(),
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+        });
+
+        // Every device returns its own shard and prints it exactly once, although nothing uses the `shard_map` output.
+        assert_eq!(outputs.len(), 2);
+        for (output, shard) in outputs.iter().zip(&shards) {
+            assert_eq!(output.outputs.len(), 1);
+            let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(&values_from_bytes::<f64>(&bytes), shard);
+        }
+        lines.sort();
+        assert_eq!(lines, vec!["body: [1.5, 2.5]".to_string(), "body: [3.5, 4.5]".to_string()]);
+    }
 
     #[test]
     fn test_entry_result_placements_follow_operations_that_keep_the_placement_of_their_input() {
@@ -960,7 +1656,7 @@ mod tests {
 
         // Every operation that returns its input together with its placement keeps the split that a preceding `place`
         // gives its input along an auto mesh axis, which the type of the result does not record, so that the result
-        // of the program is split as well (refer to `entry_result_placements`).
+        // of the program is split as well (refer to `ProgramLoweringExtension::entry_result_placements`).
         let operations: [(&str, fn(CompileTracer) -> CompileTracer); 5] = [
             ("place without a target", |x| x.place(&None::<Placement>, None).unwrap()),
             ("place with an in-place target", |x| x.place(&Memory::Host { pinned: true }, None).unwrap()),
@@ -1009,8 +1705,8 @@ mod tests {
         // A request that only moves a value to another memory names no devices, and requests that name the same
         // devices form one mesh, which a device target names as the canonical mesh of that device.
         assert_eq!(requested(&program(vec![memory.clone()])), Ok(None));
-        assert!(has_placement_requests(&program(vec![memory.clone()]), None, true));
-        assert!(!has_placement_requests(&program(vec![memory.clone()]), None, false));
+        assert!(program(vec![memory.clone()]).has_placement_requests(None, true));
+        assert!(!program(vec![memory.clone()]).has_placement_requests(None, false));
         assert_eq!(
             requested(&program(vec![memory, PlacementRequest::from(first), PlacementRequest::from(first)])),
             Ok(Some(device_mesh(first))),
@@ -1082,7 +1778,7 @@ mod tests {
                 let program = function.source_program().program();
                 let requested = requested_placement_mesh(program.entry_region_ref(), None).unwrap();
                 assert_eq!(requested.map(|(requested, _)| requested.into_owned()), Some(mesh.clone()));
-                assert_eq!(pruned_for_lowering(program, None).unwrap().to_string(), program.to_string());
+                assert_eq!(program.pruned_for_lowering(None).unwrap().to_string(), program.to_string());
                 (mesh, placement_requests(program.entry_region_ref(), None))
             })
             .unwrap()
