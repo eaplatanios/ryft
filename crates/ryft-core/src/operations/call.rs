@@ -1843,45 +1843,49 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Placement request of one instruction of a program, as [`RegionPlacementRequests::requests`] returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestedPlacement {
-    /// A request that names the devices of this mesh (i.e., a `place` with a device target or a resolved target, or a
-    /// `call` whose callee names devices). A device target names no logical mesh, so it is resolved as the type
-    /// rule of `place` resolves it (i.e., over the logical mesh of its input when the type of that input tracks a mesh
-    /// of one device, and over the canonical mesh of one device otherwise).
+    /// A request that names the devices of this mesh (i.e., a [`place`](crate::PlaceOperation) with a device target or
+    /// a resolved target, or a [`call`](crate::CallOperation) whose callee names devices). A device target names no
+    /// logical mesh, so it is resolved as the type rule of `place` resolves it (i.e., over the logical mesh of its
+    /// input when the type of that input tracks a mesh of one device, and over the canonical mesh of one device
+    /// otherwise).
     Devices(DeviceMesh),
 
-    /// A `place` with an in-place target, which only moves a value to another memory and names no devices.
+    /// A [`place`](crate::PlaceOperation) with an in-place target, which only moves a value to another memory and names
+    /// no devices.
     Memory,
 
-    /// A `constrain_sharding`, which names a sharding over a logical mesh but no devices.
+    /// A [`constrain_sharding`](crate::ConstrainShardingOperation), which names a sharding over a logical mesh but no
+    /// devices.
     Sharding,
 }
 
 /// Facts about the placements that the program of one region requests, every output of that region being used, which
 /// [`Self::new`] and [`Self::for_target`] derive once for each region and target platform and retain with the region.
 /// Every analysis of the placement requests of a region reads it, which includes the facts that a call reads of its
-/// callee (refer to [`CallOperation::names_devices`] and [`CallOperation::has_placement_requests`]). The program
-/// that it analyzes is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
+/// callee (refer to [`CallOperation::names_devices`] and [`CallOperation::has_placement_requests`]). The program that
+/// it analyzes is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
 /// outputs and its observable effects depend on, refer to [`Program::into_pruned`]), so a request that nothing uses is
-/// not among its requests, as JAX lowers a `jit` function without dead equations. The regions of an instruction that
-/// the backend never runs are not analyzed either. These include scan bodies with zero iterations on every target
-/// and regions that a backend omits for a given target platform (refer to [`Self::for_target`]).
+/// not among its requests. The regions of an instruction that the backend never runs are not analyzed either. These
+/// include scan bodies with zero iterations on every target and regions that a backend omits for a given target
+/// platform (refer to [`Self::for_target`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionPlacementRequests {
     /// Placement requests of the program, in the order of its regions and of the instructions in each region, with
-    /// the name of the operation that makes each request (refer to [`Self::requests`]).
+    /// the name of the operation that makes each request. Refer to [`Self::requests`] for more information.
     requests: Arc<[(RequestedPlacement, &'static str)]>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl RegionPlacementRequests {
     /// Returns the [`RegionPlacementRequests`] of the program of `region` without a target platform. Only scan bodies
     /// with zero iterations are omitted. Partial evaluation reads this summary, as does a backend that compiles a
-    /// program before it knows its target platform. Refer to [`Self::for_target`] for how the summary is derived and
-    /// retained.
+    /// program before it knows its target platform. Refer to [`Self::for_target`] for how the summary is derived
+    /// and retained.
+    #[inline]
     pub fn new<V, O>(region: RegionRef<'_, V, O>) -> Self
     where
         V: 'static + Value<Type = ArrayIrType>,
@@ -1891,15 +1895,16 @@ impl RegionPlacementRequests {
     }
 
     /// Returns the [`RegionPlacementRequests`] of the program of `region` that a backend runs for `target_platform`,
-    /// whose lowering omits the regions of each instruction for which `omits_regions` returns `true` (e.g., the body of
-    /// a named composite call that the backend implements for that platform). `omits_regions` must depend on the
-    /// instruction and `target_platform` alone, because the summary depends on `region` and `target_platform` alone, so
-    /// it is derived once for each region and platform and retained with the region, and every later analysis of the
+    /// whose lowering omits the regions of each instruction for which `omits_regions` returns `true` (e.g., the body
+    /// of a named composite call that the backend implements for that platform). `omits_regions` must depend on the
+    /// instruction and `target_platform` alone, because the summary depends on `region` and `target_platform` alone,
+    /// so it is derived once for each region and platform and retained with the region, and every later analysis of the
     /// same region and platform (e.g., of the callee of each eager application of a call, or of a call that partial
     /// evaluation forwards) only looks it up. Its derivation prunes the closure of `region` once and walks the regions
     /// of the pruned program once, deriving what each call of that program reads of its callee in the same pass, so it
     /// never analyzes a nested region on its own, and the cost of a region is linear in the size of its closure however
     /// deeply its calls nest. A region without a placement request pays one scan of its computation regions.
+    #[inline]
     pub fn for_target<V, O>(
         region: RegionRef<'_, V, O>,
         target_platform: &str,
@@ -1917,18 +1922,19 @@ impl RegionPlacementRequests {
     /// and no observable effect depends on is not among them, whether its instruction is dead in its own region (e.g.,
     /// a branch of a `condition` that drops the result of a `place`) or only computes an output of an instruction that
     /// carries regions that nothing uses (e.g., an output of a `condition` or of a `call` that the program drops).
-    /// Nor is a request in the regions of an instruction that the backend never runs (refer to
-    /// [`RegionPlacementRequests`]).
+    /// Nor is a request in the regions of an instruction that the backend never runs. Refer to
+    /// [`RegionPlacementRequests`] for more information.
     #[inline]
     pub fn requests(&self) -> &[(RequestedPlacement, &'static str)] {
         &self.requests
     }
 
-    /// Returns whether the program requests the placement of a value explicitly (refer to [`Self::requests`]), counting
+    /// Returns whether the program requests the placement of a value explicitly (i.e., in [`Self::requests`]), counting
     /// the requests that only move a value to another memory when `includes_memory_requests` is set. This is the one
-    /// test of whether a region requests a placement, which the commitment of the results of a compiled function by a
-    /// backend, whether a compiled function names the devices of its mesh, the placement decision of an eager call,
+    /// test of whether a region requests a placement, which the commitment of the results of a compiled function by
+    /// a backend, whether a compiled function names the devices of its mesh, the placement decision of an eager call,
     /// and partial evaluation all read.
+    #[inline]
     pub fn has_requests(&self, includes_memory_requests: bool) -> bool {
         self.requests.iter().any(|(request, _)| match request {
             RequestedPlacement::Memory => includes_memory_requests,
@@ -1947,6 +1953,7 @@ impl RegionPlacementRequests {
     /// encloses it, so that answering for every call of a program with nested calls costs one pass over the program,
     /// whereas the summary of each callee (refer to [`Self::for_target`]) would prune and walk the closure of each
     /// callee again.
+    #[inline]
     pub fn device_naming<'o, V, O>(
         entry: RegionRef<'_, V, O>,
         omits_regions: &'o dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
@@ -1959,8 +1966,8 @@ impl RegionPlacementRequests {
         move |region| analysis.names_devices(region)
     }
 
-    /// Returns the summary of `region` for `target_platform` (refer to [`Self::for_target`]), whose regions that the
-    /// backend omits are those for which `omits_regions` returns `true`, retained with `region` for that platform.
+    /// Returns the summary of `region` for `target_platform`, whose regions that the backend omits are those for which
+    /// `omits_regions` returns `true`, retained with `region` for that platform.
     fn derive<V, O>(
         region: RegionRef<'_, V, O>,
         target_platform: Option<&str>,
