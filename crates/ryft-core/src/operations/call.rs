@@ -593,13 +593,13 @@ impl<T: ArrayMemberType> CallOperation<T> {
         actual: &ArrayType,
         declared: &'s T,
     ) -> Option<Cow<'s, Sharding>> {
-        self.boundary_input_sharding_over(index, actual, declared, false)
+        self.boundary_input_sharding_with(index, actual, declared, false)
     }
 
     /// Returns the effective boundary sharding of each callee input without a sharding override, for a call of a callee
     /// whose declared input types are `declared` with inputs of types `actual`, which a call that a program transform
     /// derives from this call receives.
-    fn effective_input_boundary_sharding<'t>(
+    fn effective_boundary_input_shardings<'t>(
         &self,
         declared: &[T],
         actual: impl IntoIterator<Item = Cow<'t, T>>,
@@ -620,14 +620,14 @@ impl<T: ArrayMemberType> CallOperation<T> {
             .collect()
     }
 
-    /// Returns the effective boundary sharding of callee input `index`, which, with `single_device`,
+    /// Returns the effective boundary sharding of callee input `index`, which, with `includes_single_device`,
     /// includes a placement over a single device.
-    fn boundary_input_sharding_over<'s>(
+    fn boundary_input_sharding_with<'s>(
         &'s self,
         index: usize,
         actual: &ArrayType,
         declared: &'s T,
-        single_device: bool,
+        includes_single_device: bool,
     ) -> Option<Cow<'s, Sharding>> {
         if index < self.capture_count {
             return None;
@@ -661,37 +661,37 @@ impl<T: ArrayMemberType> CallOperation<T> {
             }
         };
 
-        (single_device || sharding.mesh().device_count() > 1).then_some(sharding)
+        (includes_single_device || sharding.mesh().device_count() > 1).then_some(sharding)
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CallOperation<ArrayIrType> {
-    /// Returns the sharding to which an eager application of this call places callee input `index`, which receives an
-    /// argument of type `actual`, on the devices of that argument before the callee runs. This is the effective
-    /// boundary sharding of the input (refer to [`Self::boundary_input_sharding`]), and, for an argument on one device,
+    /// Returns the sharding to which an eager application of this call places callee input `index`, which receives
+    /// an argument of type `actual`, on the devices of that argument before the callee runs. This is the effective
+    /// boundary sharding of the input (i.e., [`Self::boundary_input_sharding`]), and, for an argument on one device,
     /// also a placement over a single device, which moves no data but may name another logical mesh than `actual` does
     /// (e.g., `q` for an argument over `p`). A direct execution of the callee by a backend gives every argument the
     /// mesh and the sharding with which its executable receives it, so the application gives the argument that logical
     /// mesh too, and both entry points accept the same arguments and return the same results. Partial evaluation
-    /// forwards no input that this sharding changes (refer to `Self::returns_input_unchanged`).
+    /// forwards an input only if eager application would preserve its sharding.
+    #[inline]
     pub fn eager_boundary_input_sharding<'s>(
         &'s self,
         index: usize,
         actual: &ArrayType,
         declared: &'s ArrayIrType,
     ) -> Option<Cow<'s, Sharding>> {
-        let single_device = actual.sharding().is_some_and(|sharding| sharding.mesh().device_count() == 1);
-        self.boundary_input_sharding_over(index, actual, declared, single_device)
+        let includes_single_device = actual.sharding().is_some_and(|sharding| sharding.mesh().device_count() == 1);
+        self.boundary_input_sharding_with(index, actual, declared, includes_single_device)
     }
 
-    /// Returns the effective boundary sharding of callee input `index` (refer to [`Self::boundary_input_sharding`])
-    /// when the call can move an input of type `actual` to it, which is when it is a sharding override, when it
-    /// differs from the sharding of `actual`, or when its mesh has auto axes, along which `actual` cannot show where
-    /// the input is placed. A backend that lowers a call constrains exactly these inputs, and partial evaluation
-    /// forwards an input through a call only when it is not one of them.
-    pub fn boundary_input_placement<'s>(
+    /// Returns the effective boundary sharding of callee input `index` (i.e., [`Self::boundary_input_sharding`]) when
+    /// the call can move an input of type `actual` to it, which is when it is a sharding override, when it differs from
+    /// the sharding of `actual`, or when its mesh has auto axes, along which `actual` cannot show where the input is
+    /// placed. A backend that lowers a call constrains exactly these inputs, and partial evaluation forwards an input
+    /// through a call only when it is not one of them.
+    #[inline]
+    pub fn boundary_input_sharding_constraint<'s>(
         &'s self,
         index: usize,
         actual: &ArrayType,
@@ -705,94 +705,17 @@ impl CallOperation<ArrayIrType> {
     }
 
     /// Returns whether this call requests the placement of a value explicitly, which is when the call names devices
-    /// (refer to [`Self::names_devices`]) or its callee requests a placement anywhere in the regions that the backend
-    /// runs, including one that only moves a value to another memory (refer to
-    /// [`RegionPlacementRequests::has_requests`]). A backend commits every result of a call that requests a placement,
-    /// so the placement decision of an eager application by a backend and the forwarding of partial evaluation (refer
-    /// to `Self::returns_input_unchanged`) read it from here. `callee_requests` returns the [`RegionPlacementRequests`]
-    /// of the callee for the target platform that the call runs on, or for no target platform (refer to
-    /// [`RegionPlacementRequests::new`]), and it is called only when the answer depends on the callee. The summary of a
-    /// callee depends on the callee and the platform alone, so it is derived once for each callee and platform and
-    /// retained with the callee, and repeated applications only look it up.
-    pub fn requests_placement(&self, callee_requests: impl Fn() -> RegionPlacementRequests) -> bool {
+    /// (i.e., [`Self::names_devices`]) or its callee requests a placement anywhere in the regions that the backend
+    /// runs, including one that only moves a value to another memory (i.e., [`RegionPlacementRequests::has_requests`]).
+    /// A backend commits every result of a call that requests a placement, so the placement decision of an eager
+    /// application by a backend and the forwarding of partial evaluation read it from here. `callee_requests` returns
+    /// the [`RegionPlacementRequests`] of the callee for the target platform that the call runs on, or for no target
+    /// platform, and it is called only when the answer depends on the callee. The summary of a allee depends on the
+    /// callee and the platform alone, so it is derived once for each callee and platform and retained with the callee,
+    /// and repeated applications only look it up.
+    #[inline]
+    pub fn has_placement_requests(&self, callee_requests: impl Fn() -> RegionPlacementRequests) -> bool {
         self.names_devices(|| callee_requests().has_requests(false)).is_some() || callee_requests().has_requests(true)
-    }
-
-    /// Returns, for each input of an application of this call to arguments of types `input_types`, whether the call
-    /// returns that input unchanged whatever the arguments of those types are, which is the static projection of the
-    /// placement decision of an eager application by a backend that partial evaluation consults before it replaces an
-    /// output of the call that returns an input by that input (refer to `forward_call_inputs`). The forwarded value
-    /// must have the devices, the placement, and the commitment that the call would give it, and no admission check of
-    /// the call may disappear with it, which types alone establish only when:
-    ///
-    ///   - the call specifies no function mesh or explicit devices, so a top-level application can follow its
-    ///     argument instead of assigning its own devices or commitment,
-    ///   - the callee requests no placement at all, because any request, including one that only moves a value to
-    ///     another memory, commits every output of the call (refer to [`Self::requests_placement`]),
-    ///   - the input is the only public array argument of the call, because a sibling argument that is committed
-    ///     selects the devices of the call, moves an uncommitted input onto them, and commits every result, and two
-    ///     committed arguments on different devices are rejected, none of which the types of the arguments record and
-    ///     all of which would be lost with the call once its last output is forwarded,
-    ///   - the input is not a lifted capture, which the call moves to where it runs and returns uncommitted,
-    ///   - the type of the input records a sharding over a mesh without auto axes, because an eager application of the
-    ///     call rejects an argument with a pending reduction that the executable of its callee cannot receive, which a
-    ///     type records over explicit and manual mesh axes, where the type rule of the call checks it when the call is
-    ///     staged, but never over auto mesh axes, including those of a type without a sharding, whose value may live on
-    ///     any mesh, so that only such a type proves that the call admits every argument of it, and
-    ///   - the boundary does not place the input (refer to [`Self::boundary_input_placement`]), and an eager
-    ///     application does not give it the logical mesh of another placement over its single device either (refer to
-    ///     [`Self::eager_boundary_input_sharding`]).
-    ///
-    /// An argument of another client is rejected by the call and returned by the forwarded value, as by any program
-    /// that returns its argument, and every consumer of that value that executes rejects it.
-    ///
-    /// These conditions hold whatever the known side of the partial evaluation is. An eager known side folds the call,
-    /// which takes its placement decision on the concrete arguments, before any output is forwarded, so forwarding
-    /// loses no admission check there. A staged known side compiles nothing by itself, and the program that it stages
-    /// may be compiled, where the boundary of the outer executable admits every argument, or interpreted eagerly (e.g.,
-    /// by [`Program::interpret_in_context`](crate::Program)), where each call takes its own placement decision on
-    /// the concrete arguments, so that a sibling argument, or a pending reduction that no type records, changes what
-    /// the call returns there or whether it returns at all, which types alone cannot show at partition time. A call
-    /// that is not forwarded stays in the known program and takes its placement decision, admission included, whenever
-    /// that program is interpreted.
-    fn returns_input_unchanged<V, O>(
-        &self,
-        callee: RegionRef<'_, V, O>,
-        input_types: &[Cow<'_, ArrayIrType>],
-    ) -> Vec<bool>
-    where
-        V: 'static + Value<Type = ArrayIrType>,
-        O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
-    {
-        let public_array_count = input_types
-            .iter()
-            .skip(self.capture_count)
-            .filter(|r#type| matches!(r#type.as_ref(), ArrayIrType::Array(_)))
-            .count();
-        if public_array_count != 1
-            || self.function_mesh.is_some()
-            || self.requests_placement(|| RegionPlacementRequests::new(callee))
-        {
-            return vec![false; input_types.len()];
-        }
-        let declared = callee.input_types();
-        input_types
-            .iter()
-            .enumerate()
-            .map(|(position, r#type)| match r#type.as_ref() {
-                ArrayIrType::Array(actual) if position >= self.capture_count => {
-                    let records_reduction_state = actual.sharding().is_some_and(|sharding| {
-                        sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto)
-                    });
-                    records_reduction_state
-                        && self.boundary_input_placement(position, actual, &declared[position]).is_none()
-                        && self
-                            .eager_boundary_input_sharding(position, actual, &declared[position])
-                            .is_none_or(|sharding| actual.sharding() == Some(sharding.as_ref()))
-                }
-                _ => false,
-            })
-            .collect()
     }
 }
 
@@ -829,6 +752,7 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         CALL_OPERATION_NAME
     }
 
+    #[inline]
     fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
         self.output_types.as_ref().map_or(Cow::Borrowed(&[]), |types| Cow::Owned(types.definitions()))
     }
@@ -849,8 +773,8 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
             return Ok(vec![None]);
         }
 
-        // Inputs that instantiate identities of the callee rename them in the callee, whose inputs otherwise keep their
-        // declared types, because the call accepts inputs whose types only refine them (refer to
+        // Inputs that instantiate identities of the callee rename them in the callee, whose inputs otherwise
+        // keep their declared types, because the call accepts inputs whose types only refine them (refer to
         // `validate_call_input_types`), as an execution of the callee accepts its arguments.
         match T::derive_identity_renaming(declared, input_types) {
             Ok(renaming) if !renaming.is_identity() => {
@@ -873,13 +797,16 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
             return Err(TypeError::invalid(format!(
-                "`{CALL_OPERATION_NAME}` expects 1 attached callee region but got {}",
+                "`{}` expects 1 attached callee region but got {}",
+                CALL_OPERATION_NAME,
                 region_interfaces.len(),
             )));
         }
+
         let callee_interface = &region_interfaces[0];
         self.validate_capture_prefix(callee_interface.input_types().len())?;
         let variation = validate_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
+
         self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
         let output_types = if let Some(types) = &self.output_types {
             types.instantiated(callee_interface.input_types())?
@@ -901,6 +828,7 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
                 .collect::<Result<_, _>>()?,
             Err(_) => output_types,
         };
+
         match variation {
             Some(variation) => variation.apply(self.name(), output_types),
             None => Ok(output_types),
@@ -916,10 +844,12 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         }
     }
 
+    #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    #[inline]
     fn region_data_flow(&self) -> RegionDataFlow<'_> {
         RegionDataFlow::Provenance
     }
@@ -936,9 +866,11 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
         kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
         check_count!("input", kept_inputs, input_types.len(), ProgramError);
+
         let mut operation = self.clone();
         operation.output_types =
             self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;
+
         // The boundary shardings follow the kept callee inputs and outputs.
         let kept_input_indices = kept_inputs.iter().enumerate().filter_map(|(index, kept)| kept.then_some(Some(index)));
         let kept_output_indices =
@@ -949,6 +881,7 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
             kept_input_indices,
             kept_output_indices,
         );
+
         Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
@@ -957,6 +890,7 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         (region_index == 0).then_some(self.capture_count)
     }
 
+    #[inline]
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         let mut renamed = self.clone();
         renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
@@ -1012,6 +946,8 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // A `call` operation forwards its inputs onto its callee's inputs one for one and reports the callee's outputs as
 // its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading inputs.
@@ -1284,7 +1220,7 @@ where
             &partition.residual_program().input_types(),
             &partition.residual_program().output_types(),
         )?;
-        let boundary = self.effective_input_boundary_sharding(
+        let boundary = self.effective_boundary_input_shardings(
             &callee.input_types(),
             inputs.iter().map(PartialEvaluationValue::r#type),
         );
@@ -1376,7 +1312,7 @@ where
         // the extent input, and an eager parent compiles the call as a standalone program, whose results must be
         // arrays.
         let original = driver.region(0)?;
-        let boundary = self.effective_input_boundary_sharding(
+        let boundary = self.effective_boundary_input_shardings(
             &original.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
@@ -1467,7 +1403,7 @@ where
         // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
         // (refer to its gate G8), through a batching policy hook returning `Option<key>` where `None` keeps a policy
         // uncached, so that soundness stays opt-in per policy.
-        let boundary = self.effective_input_boundary_sharding(
+        let boundary = self.effective_boundary_input_shardings(
             &driver.region(0)?.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
@@ -1668,7 +1604,7 @@ where
             // sharding of its primal.
             let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
             let boundary = self
-                .effective_input_boundary_sharding(&input_types, inputs.iter().map(|input| input.primal().r#type()));
+                .effective_boundary_input_shardings(&input_types, inputs.iter().map(|input| input.primal().r#type()));
             // The fused call replaces the whole call in the same context, so it keeps the mesh of the function and an
             // eager JVP runs where the call runs.
             let operation = C::Operation::from(CallOperation {
@@ -1755,7 +1691,7 @@ where
         // placement that it happens to have (refer to `Value::relocatable_type`), so the tangent and the cotangent of
         // such an argument may live on the devices of the function.
         let boundary =
-            self.effective_input_boundary_sharding(&input_types, primal_inputs.iter().map(|input| input.r#type()));
+            self.effective_boundary_input_shardings(&input_types, primal_inputs.iter().map(|input| input.r#type()));
         let primal_call = C::Operation::from(CallOperation {
             function_mesh: self.function_mesh.clone(),
             ..self.with_derived_boundary_shardings(
@@ -1897,7 +1833,7 @@ pub enum RequestedPlacement {
 /// Facts about the placements that the program of one region requests, every output of that region being used, which
 /// [`Self::new`] and [`Self::for_target`] derive once for each region and target platform and retain with the region.
 /// Every analysis of the placement requests of a region reads it, which includes the facts that a call reads of its
-/// callee (refer to [`CallOperation::names_devices`] and [`CallOperation::requests_placement`]). The program
+/// callee (refer to [`CallOperation::names_devices`] and [`CallOperation::has_placement_requests`]). The program
 /// that it analyzes is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
 /// outputs and its observable effects depend on, refer to [`Program::into_pruned`]), so a request that nothing uses is
 /// not among its requests, as JAX lowers a `jit` function without dead equations. The regions of an instruction that
@@ -2914,11 +2850,36 @@ fn can_cache_call_split<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayI
 
 /// Returns `outputs`, the outputs of `operation`, a call of `callee` with `inputs`, with every output that `callee`
 /// returns by forwarding one of its inputs replaced by that call input, like the input forwarding of JAX's `pjit`
-/// staging rule, wherever the call provably returns that input unchanged (refer to
-/// [`CallOperation::returns_input_unchanged`]). An all-known call that partial evaluation keeps whole under a
-/// residual policy uses this, so that the residual planner sees such an output as the call input that it is, rather
-/// than as an output of the call that it would save separately (e.g., a primal input that the primal call of a
-/// linearized callee returns as a residual).
+/// staging rule, wherever the call provably returns that input unchanged. For an all-known call that partial
+/// evaluation keeps whole under a residual policy, this lets the residual planner reuse the forwarded input (e.g.,
+/// a primal input that the primal call of a linearized callee returns as a residual).
+///
+/// The input types must prove that forwarding preserves devices, placement, commitment, and admission checks. The
+/// proof requires all of the following conditions.
+///
+/// - The call leaves the function mesh and explicit devices unspecified, so a top-level application can follow its
+///   argument.
+/// - The callee makes no placement requests. Any request, including a memory-only transfer, commits every output
+///   (refer to [`CallOperation::has_placement_requests`]).
+/// - The forwarded input is the only public array argument. A committed sibling can select the devices, move an
+///   uncommitted input there, and commit every result. Two committed arguments on different devices are rejected.
+///   These decisions depend on runtime facts that the argument types omit.
+/// - The input is outside the lifted capture prefix. The call moves its captures to where it runs and returns them
+///   uncommitted.
+/// - The input type records sharding on a mesh without auto axes. An eager call rejects pending reductions its callee
+///   cannot receive. The type rule checks pending reductions on explicit and manual axes during staging, and pending
+///   reductions on auto axes require a runtime check. An input with no recorded sharding can live on any mesh.
+/// - The boundary leaves the input in place (refer to [`CallOperation::boundary_input_sharding_constraint`]) and the
+///   eager application preserves its logical mesh on a single device (refer to
+///   [`CallOperation::eager_boundary_input_sharding`]).
+///
+/// The call rejects an argument from another client. A forwarded argument from another client can be returned, as
+/// by any program that returns an argument directly, and every consumer that executes rejects it.
+///
+/// An eager known side folds the call on concrete arguments before forwarding any outputs, so admission checks have
+/// already run. A staged known side can later be compiled, in which case the outer executable admits the arguments,
+/// or interpreted eagerly (e.g., by [`Program::interpret_in_context`](crate::Program)), in which case each surviving
+/// call checks its arguments and decides placement at runtime. The same forwarding conditions apply in both cases.
 fn forward_call_inputs<V, O, W>(
     operation: &CallOperation<ArrayIrType>,
     callee: RegionRef<'_, V, O>,
@@ -2931,7 +2892,35 @@ where
     W: Value<Type = ArrayIrType>,
 {
     let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
-    let unchanged = operation.returns_input_unchanged(callee, &input_types);
+    let public_array_count = input_types
+        .iter()
+        .skip(operation.capture_count)
+        .filter(|r#type| matches!(r#type.as_ref(), ArrayIrType::Array(_)))
+        .count();
+    if public_array_count != 1
+        || operation.function_mesh.is_some()
+        || operation.has_placement_requests(|| RegionPlacementRequests::new(callee))
+    {
+        return outputs;
+    }
+    let declared = callee.input_types();
+    let unchanged = input_types
+        .iter()
+        .enumerate()
+        .map(|(position, r#type)| match r#type.as_ref() {
+            ArrayIrType::Array(actual) if position >= operation.capture_count => {
+                let records_reduction_state = actual.sharding().is_some_and(|sharding| {
+                    sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto)
+                });
+                records_reduction_state
+                    && operation.boundary_input_sharding_constraint(position, actual, &declared[position]).is_none()
+                    && operation
+                        .eager_boundary_input_sharding(position, actual, &declared[position])
+                        .is_none_or(|sharding| actual.sharding() == Some(sharding.as_ref()))
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
     if !unchanged.contains(&true) {
         return outputs;
     }
@@ -3039,7 +3028,7 @@ where
 
     // The effective boundary of the call follows the types of its inputs before they are guarded.
     let boundary = operation
-        .effective_input_boundary_sharding(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
+        .effective_boundary_input_shardings(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
 
     // Partitioning seeds both callees at the declared input types of the callee, so neither checks a relationship that
     // the entry of the callee checks between a known and an unknown input. Both calls therefore consume guarded inputs.
@@ -3421,7 +3410,7 @@ where
     // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
     // leaves its residuals where they are.
     let boundary =
-        operation.effective_input_boundary_sharding(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
+        operation.effective_boundary_input_shardings(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
     // Seed inputs enter on the tangent result's cotangent sharding when the call already knows its devices.
     // Eager admission checks device commitments before applying these boundary shardings. The callee can then
     // transpose any placement-only result cast using the seed's admitted type.
@@ -7993,9 +7982,9 @@ mod tests {
         // linearized callee). Partitioning a caller with both inputs known stages the known side, and partial
         // evaluation keeps `w` as an output of the call instead of forwarding the argument, because a staged known
         // program may later be interpreted eagerly, where a committed `b` selects the devices of the call, moves `w`
-        // there, and commits it (refer to `CallOperation::returns_input_unchanged`). The known program therefore
-        // returns the output of the call, which a residual planner then plans as a value of its own. Both arguments are
-        // replicated over an explicit mesh, so that their number alone keeps `w` from being forwarded.
+        // there, and commits it (refer to `forward_call_inputs`). The known program therefore returns the output of the
+        // call, which a residual planner then plans as a value of its own. Both arguments are replicated over an
+        // explicit mesh, so that their number alone keeps `w` from being forwarded.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let matrix_type: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 2])
             .with_sharding(Sharding::replicated(mesh, 2))
