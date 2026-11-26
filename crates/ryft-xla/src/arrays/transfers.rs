@@ -670,7 +670,7 @@ impl Array {
                 // The regions land in default device memory without a declared layout, and each process then moves its
                 // own shards to the requested storage, which needs no other process. A source shard in another declared
                 // layout is converted to the dense row-major layout only when a move reads it, and before the sends of
-                // this process only when a send reads it (refer to `Self::stage_region_source`).
+                // this process only when a send reads it (refer to `Self::buffer_for_shard_slicing`).
                 let placed = self
                     .place_shard_regions(mesh, sharding, &plan, &cross_host_layouts)
                     .and_then(|output| output.place_storage(memory, layout.cloned()));
@@ -1035,7 +1035,7 @@ impl Array {
             for target in targets {
                 let device = devices.get(target.device().id())?;
                 let source_buffer = Arc::clone(source.buffer().unwrap());
-                let buffer = Self::prepare_shard_region(
+                let buffer = Self::buffer_for_shard_region(
                     session,
                     self.data_type(),
                     source,
@@ -1279,10 +1279,10 @@ impl Array {
     ///
     /// Slices and cross-host transfers read device buffers, so a source shard that the type of this array declares in
     /// another memory, or in a layout other than the dense row-major one, is staged in device memory and in that layout
-    /// first (refer to [`Self::stage_region_source`]), once for all of its regions and only when a move reads it. The
-    /// result is in default device memory and declares no layout, whatever this array declares, because its buffers are
-    /// slices, received buffers, and concatenations in the default layout, as well as whole source shards in their own
-    /// layout. The caller moves it to the requested memory and layout (e.g., with [`Self::place_storage`]).
+    /// first (refer to [`Self::buffer_for_shard_slicing`]), once for all of its regions and only when a move reads it.
+    /// The result is in default device memory and declares no layout, whatever this array declares, because its buffers
+    /// are slices, received buffers, and concatenations in the default layout, as well as whole source shards in their
+    /// own layout. The caller moves it to the requested memory and layout (e.g., with [`Self::place_storage`]).
     fn place_shard_regions(
         &self,
         mesh: &DeviceMesh,
@@ -1303,7 +1303,7 @@ impl Array {
         // A region that this process sends to another one leaves from the planned device, with which its receiver pairs
         // it, so a local replica that serves a planned one without a buffer is copied to that device first, once for
         // all the regions of that shard, as for sends of whole shards. This process stages a source shard (refer to
-        // `Self::stage_region_source`) once, before its transfers when a send reads it and after them otherwise.
+        // `Self::buffer_for_shard_slicing`) once, before its transfers when a send reads it and after them otherwise.
         let replicas = LocalReplicas::new(process_index);
         let mut work = session.reserve_work();
         let mut transfers = Vec::new();
@@ -1319,11 +1319,11 @@ impl Array {
                             let source_device = devices.get(source.device().id())?;
                             let buffer =
                                 self.buffer_on_send_device(&replicas, source.index(), source_device, &mut completion)?;
-                            let buffer = self.stage_region_source(source, buffer, &mut work, &mut completion)?;
+                            let buffer = self.buffer_for_shard_slicing(source, buffer, &mut work, &mut completion)?;
                             Arc::clone(entry.insert(buffer))
                         }
                     };
-                    let buffer = Self::prepare_shard_region(
+                    let buffer = Self::buffer_for_shard_region(
                         session,
                         data_type,
                         source,
@@ -1370,12 +1370,14 @@ impl Array {
             let buffer = match staged_buffers.entry(source.index()) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
-                    let buffer = self.stage_region_source(source, Arc::clone(buffer), &mut work, &mut completion)?;
+                    let buffer =
+                        self.buffer_for_shard_slicing(source, Arc::clone(buffer), &mut work, &mut completion)?;
                     Arc::clone(entry.insert(buffer))
                 }
             };
             let slice = &movement.slice;
-            let buffer = Self::prepare_shard_region(session, data_type, source, buffer, slice, None, &mut completion)?;
+            let buffer =
+                Self::buffer_for_shard_region(session, data_type, source, buffer, slice, None, &mut completion)?;
             let buffer = if source.device() == device {
                 buffer
             } else {
@@ -2120,17 +2122,15 @@ impl Array {
         Self::copy_shard_through_host(session, &buffer, shape, buffer_type, memory, Some(layout.clone()), completion)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns `buffer`, which holds the contribution of `shard`, a shard of this array on a device of this process,
-    /// on the device of `shard`, staged for slicing and cross-host sends of its regions (refer to
+    /// Returns `buffer`, which holds the contribution of `shard`, a shard of this array on a device of
+    /// this process, on the device of `shard`, staged for slicing and cross-host sends of its regions (refer to
     /// [`Self::place_shard_regions`]). That is the default memory of that device and, when this array declares a
     /// layout other than the dense row-major one (refer to [`PlacementPlanningView::shard_region_plan`]), a conversion
     /// of this shard alone to the dense row-major layout on its device (refer to [`Self::place_shard_storage`]), which
     /// moves bytes within the shard and keeps its contribution. The conversion lands in default device memory, where
     /// every plugin can hold the dense layout (e.g., the CPU plugin cannot in pinned host memory). `work` and
     /// `completion` record the copies and conversions.
-    fn stage_region_source(
+    fn buffer_for_shard_slicing(
         &self,
         shard: &ArrayShard,
         buffer: Arc<Buffer<'static>>,
@@ -2147,11 +2147,11 @@ impl Array {
     /// Produces the region with `slice`, in global array coordinates, from `source_buffer`, which holds the shard
     /// `source` on its device, on that device. `source_buffer` must be in the default memory of that device. A region
     /// that a remote transfer sends (i.e., with `remote_layout`, which is the default layout of the plugin for its
-    /// shape) is a static buffer of its shape in that layout, because a cross-host send moves the whole allocation of
-    /// its buffer, so [`Self::buffer_for_cross_host_send`] converts a region whose allocation differs from the
-    /// receiver's (e.g., a whole source shard of a bounded-dynamic result). `completion` records the fences of the programs
-    /// and the readiness of the buffers that produce it.
-    fn prepare_shard_region(
+    /// shape) is a static buffer of its shape in that layout, because a cross-host send moves the whole allocation
+    /// of its buffer, so [`Self::buffer_for_cross_host_send`] converts a region whose allocation differs from the
+    /// receiver's (e.g., a whole source shard of a bounded-dynamic result). `completion` records the fences of the
+    /// programs and the readiness of the buffers that produce it.
+    fn buffer_for_shard_region(
         session: &Session,
         data_type: DataType,
         source: &ArrayShard,
@@ -2180,6 +2180,7 @@ impl Array {
             completion.track_fence(output.execution_fence());
             Arc::clone(output.shards()[0].buffer().unwrap())
         };
+
         // A receive declares the shape of the region and uses the default device layout of the plugin.
         if let Some(layout) = remote_layout {
             let shape = StaticShape::new(slice.iter().map(Range::len).collect::<Vec<_>>());
@@ -2193,8 +2194,11 @@ impl Array {
                 completion,
             )?;
         }
+
         Ok(buffer)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the result of placing this array on `mesh` according to `sharding` as an array of `session` in a process
     /// that owns no device of `mesh`, or of a [`DataType::Zero`] array, which has `r#type` and no buffers, as the
@@ -7337,7 +7341,7 @@ mod tests {
             )
             .unwrap();
             let mut region_completion = PlacementCompletion::default();
-            let region = Array::prepare_shard_region(
+            let region = Array::buffer_for_shard_region(
                 &session,
                 DataType::F32,
                 shard,

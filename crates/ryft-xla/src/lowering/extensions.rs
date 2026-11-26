@@ -567,7 +567,16 @@ impl RegionPlacementRequestsExtension for RegionPlacementRequests {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Source of the sharding of one output of a program, as [`ProgramLoweringExtension::output_sharding_sources`]
+/// returns it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OutputShardingSource {
+    /// The program determines the sharding of the output.
+    Determined(Sharding),
+
+    /// The output is the entry argument at this index, which it returns where that argument enters the program.
+    Argument(usize),
+}
 
 /// Merges `mesh`, the devices that a placement request of the operation named `operation` names, into `requested`, the
 /// request that names devices among those seen before it, if any, together with the name of its operation. A request
@@ -608,16 +617,7 @@ pub(crate) fn merge_requested_placement<'r>(
     Ok(())
 }
 
-/// Source of the sharding of one output of a program, as [`ProgramLoweringExtension::output_sharding_sources`] returns
-/// it.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum OutputShardingSource {
-    /// The program determines the sharding of the output.
-    Determined(Sharding),
-
-    /// The output is the entry argument at this index, which it returns where that argument enters the program.
-    Argument(usize),
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the sharding with which the entry function of a program annotates each of its outputs, whose types are
 /// `output_types`, and which describes the buffers that the outputs are returned in. These are the `output_shardings`
