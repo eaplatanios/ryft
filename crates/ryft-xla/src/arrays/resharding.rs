@@ -8,8 +8,8 @@
 //!
 //! A placement that keeps the devices and sharding of its source only changes the storage of each shard, copying it
 //! to the requested memory and converting it to the requested layout on its device, or through host memory when that
-//! conversion cannot be compiled. Any other placement chooses one device strategy, which is the first of the
-//! following that applies:
+//! conversion cannot be compiled. Any other placement chooses one device strategy, which is the first of the following
+//! that applies:
 //!
 //!   1. **Exact Shards:** Every destination shard with elements has the slices of one source shard, and both shardings
 //!      hold one value per slice, or the placement only moves the contributions of a pending reduction or of manual
@@ -55,8 +55,8 @@
 //! session, which do not depend on whether the session shares compilation artifacts with other processes), so all the
 //! processes of a distributed placement choose the same strategy and issue matching transfers and collectives. What
 //! only one process knows (e.g., the physical layout of a buffer when the type declares none, or which buffers it
-//! holds) never changes the choice. A source with locally assigned devices takes none of these strategies, as the next
-//! section describes.
+//! holds) never changes the choice. A source with locally assigned devices takes none of these strategies, as the
+//! next section describes.
 //!
 //! # Locally Assigned Devices
 //!
@@ -65,38 +65,37 @@
 //! uploads without a mesh, which lands on the first device of each process) has a mesh that differs on every process,
 //! so a strategy planned from it would make each process send its shards to the others, and no process would plan the
 //! matching receives. Every array therefore records whether it has such locally assigned devices (refer to
-//! [`Array::is_locally_assigned`]), and the following invariant holds.
+//! [`Array::is_locally_assigned`]), and the following invariant holds:
 //!
-//!   - **Meaning:** An array is locally assigned when this process chose its devices without any information
-//!     that the other processes share, so each process may hold the same value on devices of its own choice. Such an
-//!     array lives on devices of this process only.
+//!   - **Meaning:** An array is locally assigned when this process chose its devices without any information that the
+//!     other processes share, so each process may hold the same value on devices of its own choice. Such an array lives
+//!     on devices of this process only.
 //!   - **Sources:** Host uploads without a mesh of the caller or of the session set the fact, and so do uploads onto
 //!     the default device of the session (refer to [`Session::with_default_device`]), which only this process holds,
 //!     and [`Session::place`] uploads of host values without a destination or with a destination that names only a
 //!     memory or a layout.
-//!   - **Propagation:** Placements that name only a memory or a layout, copies of an array on its own devices, moves
-//!     of an array between devices of this process for an operation, and eager operations whose array inputs all have
-//!     the fact keep it.
+//!   - **Propagation:** Placements that name only a memory or a layout, copies of an array on its own devices, moves of
+//!     an array between devices of this process for an operation, and eager operations whose array inputs all have the
+//!     fact keep it.
 //!   - **Clearing:** A placement onto a device, a mesh, or a sharding clears it, even when that destination holds the
-//!     devices of its source. Construction on a caller-supplied mesh and direct execution on a compiled mesh also
-//!     clear it. A call without a placement request inherits local assignment from its public arguments.
+//!     devices of its source. Construction on a caller-supplied mesh and direct execution on a compiled mesh also clear
+//!     it. A call without a placement request inherits local assignment from its public arguments.
 //!
 //! The fact is separate from [commitment](Array::is_committed), which records whether the devices were chosen on
-//! purpose and which a destination that names only a memory or a layout also sets, as in JAX, so commitment cannot
-//! tell whether the other processes know the devices. Every process of a distributed program applies the same
-//! functions to the same kinds of inputs, so every process computes the same fact for its own source. Every process
-//! therefore chooses the same strategy for a locally assigned source. Each process places its full value on its own
-//! devices of the destination with local copies, slices, or a host upload, so no process transfers anything or runs a
-//! collective to place it, as JAX does for uncommitted arrays. A process whose devices hold the whole destination may
-//! do that local work with the strategies above, because they then move nothing between processes. The values of the
-//! processes must therefore be equal. When the devices of the destination belong to exactly the processes of a run of
-//! more than one process, the processes compare the SHA-256 digests of their values before they place them, and the
-//! result fails on every process when they differ (refer to [`Array::to_placement`]), unless the session disables
-//! the check.
+//! purpose and which a destination that names only a memory or a layout also sets, as in JAX, so commitment cannot tell
+//! whether the other processes know the devices. Every process of a distributed program applies the same functions to
+//! the same kinds of inputs, so every process computes the same fact for its own source. Every process therefore
+//! chooses the same strategy for a locally assigned source. Each process places its full value on its own devices of
+//! the destination with local copies, slices, or a host upload, so no process transfers anything or runs a collective
+//! to place it. A process whose devices hold the whole destination may do that local work with the strategies above,
+//! because they then move nothing between processes. The values of the processes must therefore be equal. When the
+//! devices of the destination belong to exactly the processes of a run of more than one process, the processes compare
+//! the SHA-256 digests of their values before they place them, and the result fails on every process when they differ
+//! (refer to [`Array::to_placement`]), unless the session disables the check.
 //!
 //! Clearing the fact for devices that the caller or the session names is sound only because every process of a
-//! distributed run names the same devices there, which is a precondition that no process can check, because each one
-//! sees only its own request. Every device, mesh, and sharding that a program names (e.g., the default mesh of a
+//! distributed run names the same devices there, which is a precondition that no process can check, because each
+//! one sees only its own request. Every device, mesh, and sharding that a program names (e.g., the default mesh of a
 //! [`Session`], the mesh of a construction, or the device of an [`PlacementRequest::Device`] request) must therefore be
 //! the same on every process of the run, and a choice that differs between processes is expressible only by naming no
 //! device, which leaves the choice to each process and records the fact. For example, when each process places a value
@@ -105,9 +104,9 @@
 //! devices of every process, every process plans whole shards from its own device as the source of the value, so each
 //! one sends its shard to the others and none of them receives, and the placement never completes. Every device that
 //! a placement names must also be a device that the session knows (refer to [`Session::devices`]), which includes the
-//! devices of other processes only when the client lists them or the session learned them from its distributed
-//! runtime (refer to [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)), so that a
-//! mistyped device is rejected before any work is submitted.
+//! devices of other processes only when the client lists them or the session learned them from its distributed runtime
+//! (refer to [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)), so that a mistype
+//! device is rejected before any work is submitted.
 //!
 //! A cross-host transfer moves the whole allocation of a buffer in device memory into a static buffer in the default
 //! layout and the default device memory of the receiver, so the sender first copies a shard that its type declares in
@@ -135,23 +134,22 @@
 //! because a readback reads only one replica of each tile and would otherwise miss a failed replica or a failure of
 //! the work that produced the source. A result also retains the completion of the cross-host sends of its process,
 //! which no placement waits for, because a send completes only once its receiver issues the matching receive. The
-//! observations of a result report the following failures.
+//! observations of a result report the following failures:
 //!
-//!   - [`Array::ready`] and [`Array::block_until_ready`] report the failures of every addressable buffer, of the
-//!     execution fence, and of those sends.
+//!   - [`Array::ready`] and [`Array::block_until_ready`] report the failures of every addressable buffer,
+//!     of the execution fence, and of those sends.
 //!   - [`Array::copy_to_host`] and [`Array::copy_to_host_bytes`] report the failures of the execution fence and of
-//!     the buffers that they read. They never wait for the sends, because a send may wait for a receive that
-//!     another process issues only after its own readback, so a send that fails only on its receiver is not reported
-//!     there. A result without elements copies nothing and waits for its execution fence and every addressable buffer.
+//!     the buffers that they read. They never wait for the sends, because a send may wait for a receive that another
+//!     process issues only after its own readback, so a send that fails only on its receiver is not reported there.
+//!     A result without elements copies nothing and waits for its execution fence and every addressable buffer.
 //!   - [`Session::synchronize`] reports the failures of every copy, transfer, upload, and program that a placement
 //!     registered with the session, including its sends.
 //!
-//! The CUDA plugin performs the first cross-host rendezvous between two devices on the calling thread. Host
-//! readbacks can block placement when the PJRT plugin lacks host to device transfer managers or their literal
-//! transfers. A completion fence waits synchronously when the PJRT plugin rejects its callback. Value comparison
-//! reads back a locally assigned source on the calling thread when its destination names devices of every process
-//! of a run. Whole-call admission waits for the collective verdict before placing any leaf. JAX's multi-host
-//! path compares the inputs with a collective and a host materialization before it submits anything. A failure
+//! The CUDA plugin performs the first cross-host rendezvous between two devices on the calling thread. Host readbacks
+//! can block placement when the PJRT plugin lacks host to device transfer managers or their literal transfers. A
+//! completion fence waits synchronously when the PJRT plugin rejects its callback. Value comparison reads back a
+//! locally assigned source on the calling thread when its destination names devices of every process of a run.
+//! Whole-call admission waits for the collective verdict before placing any leaf that compares the inputs. A failure
 //! after the transfers (e.g., a destination memory that a device of the receiver lacks) is returned only once every
 //! transfer is issued, so the peers of the failing process complete their transfers.
 //!
@@ -164,20 +162,20 @@
 //! check (e.g., which replica serves a local copy, or a memory of its devices) it checks once its transfers are issued,
 //! so that a failure there stops only this process. Which buffers a process holds is such information, and a missing
 //! buffer of a replica is served by another replica of the same slice on this process. What remains before the
-//! transfers are the following failures, which only the failing process can see.
+//! transfers are the following failures, which only the failing process can see:
 //!
-//!   - **A Sent Slice Without Any Local Buffer:** A process that imported an array with only metadata for a tile that
-//!     the plan has it send (i.e., without a buffer for that tile or for any local replica of it) returns
-//!     [`ArrayError::MissingShardBuffer`] before it issues anything, while the receiver of that tile issues its receive
-//!     and waits.
-//!   - **A Program That Reads The Source:** A compiled program whose input is the source (i.e., a compiled reshard on
-//!     the mesh of the source, or the gather of a reshard across meshes) reads every shard of this process, so a
-//!     failure to start that program on this process stops it before that program, while its peers wait in its
-//!     collectives and in the transfers that follow it. Such failures are a missing buffer of any of these shards, a
-//!     failed conversion of a buffer whose physical layout only this process knows, and a failed launch (e.g., a
+//!   - **A Sent Slice Without Any Local Buffer:** A process that imported an array with only metadata for a tile
+//!     that the plan has it send (i.e., without a buffer for that tile or for any local replica of it) returns
+//!     [`ArrayError::MissingShardBuffer`] before it issues anything, while the receiver of that tile issues its
+//!     receive and waits.
+//!   - **A Program That Reads The Source:** A compiled program whose input is the source (i.e., a compiled reshard
+//!     on the mesh of the source, or the gather of a reshard across meshes) reads every shard of this process, so
+//!     a failure to start that program on this process stops it before that program, while its peers wait in its
+//!     collectives and in the transfers that follow it. Such failures are a missing buffer of any of these shards,
+//!     a failed conversion of a buffer whose physical layout only this process knows, and a failed launch (e.g., a
 //!     failed allocation).
-//!   - **A Failed Preparation Of A Sent Buffer:** A copy, a staging in device memory, or a conversion to the layout of
-//!     the receiver that fails to start stops this process before its transfers.
+//!   - **A Failed Preparation Of A Sent Buffer:** A copy, a staging in device memory, or a conversion to the layout
+//!     of the receiver that fails to start stops this process before its transfers.
 
 use std::cell::OnceCell;
 use std::collections::hash_map::Entry;
@@ -217,7 +215,7 @@ use crate::{
     CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt, Type, stage,
 };
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
