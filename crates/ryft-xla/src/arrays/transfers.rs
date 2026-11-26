@@ -474,14 +474,12 @@ impl Array {
         // The round trip reads back and uploads in the background. Its failure poisons the result with an error that
         // also describes the failure of the device work, because that failure is what made the host fallback necessary.
         let device_error = compiled_error.to_string();
-        let poison = move |error: Error| {
+        match source.upload_host_readback(source_session, mesh, sharding, memory, layout, move |error| {
             PjrtError::internal(format!(
                 "the host fallback of an array placement failed with: {error} (the device work that it replaced \
                 failed with: {device_error})",
             ))
-        };
-
-        match source.upload_host_readback(source_session, mesh, sharding, memory, layout, poison) {
+        }) {
             Ok(array) => Ok(placed(array)),
             Err(_) => Err(compiled_error),
         }
@@ -976,6 +974,83 @@ impl Array {
         self.upload_host_readback(session, mesh, sharding, memory, layout.cloned(), Error::into_pjrt_error)
     }
 
+    /// Places this array on `mesh` according to `sharding` and in `memory` by sharing, copying, and transferring the
+    /// whole shards that `plan` describes, which [`Self::device_placement_strategy`] chose with `cross_host_layouts`.
+    /// [`Self::exact_shard_buffers`] provides the target shards and the layout that the result records. The execution
+    /// fence of the result joins the execution fence of this array, so that errors of the execution that produced this
+    /// array still surface through the result, with the readiness of every buffer that this placement copies or
+    /// receives and the fences of the conversions that it runs. The result also retains the completion fence of the
+    /// cross-host sends that this process issued, so that the readiness functions of the result surface the errors
+    /// of those sends.
+    fn place_exact_shards(
+        &self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        plan: &ShardMovePlan,
+        cross_host_layouts: &HashMap<StaticShape, ryft_pjrt::Layout>,
+    ) -> Result<Self, Error> {
+        let session = self.session();
+        let mut completion = PlacementCompletion::default();
+        let (mut buffers, layout, send_fence) =
+            self.exact_shard_buffers(plan, cross_host_layouts, memory, &mut completion)?;
+
+        // A shard without elements holds no contribution, so the plan moves nothing to it (refer to
+        // `plan_exact_shard_put`), and this process creates its own empty target shards after its transfers, as
+        // shard regions do. The buffers of its empty source shards, which no move reads, still report their failures.
+        let client = session.client();
+        let process_index = client.process_index()?;
+        completion.track_empty_shard_buffers(self)?;
+        let target_layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
+        let empty_targets = target_layout
+            .descriptors()
+            .iter()
+            .filter(|shard| {
+                shard.device().process_index() == process_index && shard.slice().iter().any(Range::is_empty)
+            })
+            .collect::<Vec<_>>();
+        if !empty_targets.is_empty() {
+            let devices = self.addressable_devices_by_id(process_index)?;
+            let device_layout = layout.as_ref().map(ToPjrt::to_pjrt).transpose()?;
+            let buffer_type = self.data_type().executable_buffer_type();
+            let mut work = session.reserve_work();
+            for shard in empty_targets {
+                let device = devices.get(shard.device().id())?;
+                let dimensions = shard.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
+                let empty = Arc::<[u8]>::from([]);
+                let buffer = client.buffer(
+                    empty,
+                    buffer_type,
+                    dimensions,
+                    None,
+                    device.memory(memory)?,
+                    device_layout.clone(),
+                )?;
+                buffers.push(completion.track_new(&mut work, buffer)?);
+            }
+        }
+
+        let r#type = self.r#type().into_owned().with_shape(self.shape()).with_memory(memory).with_layout(layout);
+        let output = Self::from_addressable_buffers_internal(
+            session,
+            r#type.with_sharding(None)?,
+            Some(sharding.clone()),
+            mesh.clone(),
+            None,
+            buffers,
+            false,
+        )?;
+
+        let mut output = match send_fence {
+            Some(fence) => output.with_send_fence(fence),
+            None => output,
+        };
+
+        output.execution_fence = completion.join(self.execution_fence().cloned());
+
+        Ok(output)
+    }
+
     /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
     /// required layout or the plugin cannot copy it, reads `source_buffer` through host memory and uploads the
     /// shard into `memory` with `fallback_layout`. An individual shard readback preserves its contribution.
@@ -1277,9 +1352,11 @@ impl Array {
         }
 
         let process_index = self.client().process_index()?;
-        let missing = |shard: &ArrayShard| shard.device().process_index() == process_index && shard.buffer().is_none();
         let layout_resolver = cross_host_layout_resolver(self.client());
-        if self.shards().iter().any(missing)
+        if self
+            .shards()
+            .iter()
+            .any(|shard| shard.device().process_index() == process_index && shard.buffer().is_none())
             && let Ok(DevicePlacementStrategy::ExactShards { plan, .. }) =
                 self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index)
         {
@@ -1418,78 +1495,6 @@ impl Array {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Places this array on `mesh` according to `sharding` and in `memory` by sharing, copying, and transferring the
-    /// whole shards that `plan` describes, which [`Self::device_placement_strategy`] chose with `cross_host_layouts`.
-    /// [`Self::exact_shard_buffers`] provides the target shards and the layout that the result records. The
-    /// execution fence of the result joins the execution fence of this array, so that errors of the execution that
-    /// produced this array still surface through the result, with the readiness of every buffer that this placement
-    /// copies or receives and the fences of the conversions that it runs (refer to [`crate::arrays::transfers`]). The
-    /// result also retains the completion fence of the cross-host sends that this process issued, so that the readiness
-    /// functions of the result surface the errors of those sends.
-    fn place_exact_shards(
-        &self,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        plan: &ShardMovePlan,
-        cross_host_layouts: &HashMap<StaticShape, ryft_pjrt::Layout>,
-    ) -> Result<Self, Error> {
-        let session = self.session();
-        let mut completion = PlacementCompletion::default();
-        let (mut buffers, layout, send_fence) =
-            self.exact_shard_buffers(plan, cross_host_layouts, memory, &mut completion)?;
-
-        // A shard without elements holds no contribution, so the plan moves nothing to it (refer to
-        // `plan_exact_shard_put`), and this process creates its own empty target shards after its transfers, as
-        // shard regions do. The buffers of its empty source shards, which no move reads, still report their failures.
-        let client = session.client();
-        let process_index = client.process_index()?;
-        let is_empty = |slice: &[Range<usize>]| slice.iter().any(Range::is_empty);
-        completion.track_empty_shard_buffers(self)?;
-        let target_layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
-        let empty_targets = target_layout
-            .descriptors()
-            .iter()
-            .filter(|shard| shard.device().process_index() == process_index && is_empty(shard.slice()))
-            .collect::<Vec<_>>();
-        if !empty_targets.is_empty() {
-            let devices = self.addressable_devices_by_id(process_index)?;
-            let device_layout = layout.as_ref().map(ToPjrt::to_pjrt).transpose()?;
-            let buffer_type = self.data_type().executable_buffer_type();
-            let mut work = session.reserve_work();
-            for shard in empty_targets {
-                let device = devices.get(shard.device().id())?;
-                let dimensions = shard.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
-                let empty = Arc::<[u8]>::from([]);
-                let buffer = client.buffer(
-                    empty,
-                    buffer_type,
-                    dimensions,
-                    None,
-                    device.memory(memory)?,
-                    device_layout.clone(),
-                )?;
-                buffers.push(completion.track_new(&mut work, buffer)?);
-            }
-        }
-        let r#type = self.r#type().into_owned().with_shape(self.shape()).with_memory(memory).with_layout(layout);
-        let output = Self::from_addressable_buffers_internal(
-            session,
-            r#type.with_sharding(None)?,
-            Some(sharding.clone()),
-            mesh.clone(),
-            None,
-            buffers,
-            false,
-        )?;
-        let mut output = match send_fence {
-            Some(fence) => output.with_send_fence(fence),
-            None => output,
-        };
-        output.execution_fence = completion.join(self.execution_fence().cloned());
-        Ok(output)
-    }
 
     /// Returns the buffers of the target shards that `session` can address for the moves of whole shards that
     /// `plan` describes (refer to [`plan_exact_shard_put`]). A shard can share its source buffer when the device
@@ -1668,13 +1673,15 @@ impl Array {
                 && shard.device() == target
                 && self.shard_contribution(shard.descriptor()) == contribution
         });
-        let first = || index.get(&contribution).and_then(|shards| shards.first()).map(|&shard| &self.shards()[shard]);
-        on_target.or_else(first).map(|shard| (shard, shard.buffer().unwrap())).ok_or_else(|| {
-            Error::from(ArrayError::MissingShardBuffer {
-                shard_index: preferred,
-                device_id: preferred_shard.device().id(),
+        on_target
+            .or_else(|| index.get(&contribution).and_then(|shards| shards.first()).map(|&shard| &self.shards()[shard]))
+            .map(|shard| (shard, shard.buffer().unwrap()))
+            .ok_or_else(|| {
+                Error::from(ArrayError::MissingShardBuffer {
+                    shard_index: preferred,
+                    device_id: preferred_shard.device().id(),
+                })
             })
-        })
     }
 
     /// Returns the buffer that a cross-host transfer sends for the shard at `index`, which is a shard of this array on
@@ -2296,9 +2303,6 @@ impl Array {
         let view = (view_mesh != *self.mesh())
             .then(|| self.placement_planning_view().on_mesh(view_mesh, self.sharding().clone()))
             .transpose()?;
-        let takes_shared = |strategy: &DevicePlacementStrategy| {
-            keeps || !matches!(strategy.host_round_trip_cause(), Some(HostRoundTripCause::Device(_)))
-        };
         let planned = match &view {
             Some((metadata, shards)) => {
                 PlacementPlanningView { metadata, shards: shards.iter() }.strategy(layout_resolver, mesh, sharding)
@@ -2306,7 +2310,11 @@ impl Array {
             None => self.placement_planning_view().strategy(layout_resolver, mesh, sharding),
         };
         let shared = |planned: Result<DevicePlacementStrategy, Error>| match planned {
-            Ok(strategy) if takes_shared(&strategy) => Ok(Some(strategy)),
+            Ok(strategy)
+                if keeps || !matches!(strategy.host_round_trip_cause(), Some(HostRoundTripCause::Device(_))) =>
+            {
+                Ok(Some(strategy))
+            }
             Err(error) if keeps => Err(error),
             _ => Ok(None),
         };
@@ -2893,10 +2901,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // layout into execution, so admission can assume one exists without asking a PJRT client. If execution
         // declines the assumed strategy, admission has already accounted for any communication its replacement might
         // require.
-        let assume_receive_layout = |_, _, shape: &StaticShape| -> Result<Option<ryft_pjrt::Layout>, Error> {
-            Ok(Some(dense_row_major_layout(shape.rank()).to_pjrt()?))
-        };
-        self.strategy(&assume_receive_layout, mesh, sharding)
+        self.strategy(&|_, _, shape| Ok(Some(dense_row_major_layout(shape.rank()).to_pjrt()?)), mesh, sharding)
             .map_or(true, |strategy| strategy.communicates())
     }
 
@@ -3306,8 +3311,6 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             Ok(total)
         };
         let replicas = SourceReplicas::by_contribution(self.mesh(), self.sharding(), self.shards.clone(), source_axes);
-        let intersects =
-            |source: &Range<usize>, target: &Range<usize>| source.start.max(target.start) < source.end.min(target.end);
         let mut source_ranges = vec![Vec::new(); self.shape().rank()];
         for (slice, _) in replicas.keys() {
             for (ranges, range) in source_ranges.iter_mut().zip(slice.iter()) {
@@ -3329,7 +3332,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 // The ranges that intersect `target_range` end after it starts and start before it ends.
                 let first = ranges.partition_point(|range| range.end <= target_range.start);
                 let last = ranges.partition_point(|range| range.start < target_range.end).max(first);
-                let intersecting = ranges[first..last].iter().filter(|range| intersects(range, target_range));
+                let intersecting = ranges[first..last]
+                    .iter()
+                    .filter(|range| range.start.max(target_range.start) < range.end.min(target_range.end));
                 let intersecting = intersecting.collect::<Vec<_>>();
                 candidates = candidates
                     .into_iter()
@@ -4087,15 +4092,6 @@ fn contribution_member(
 /// contributions.
 fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<ContributionAxes> {
     let names = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.name().to_string()).collect::<Vec<_>>();
-    let in_order = |source: &[&MeshAxis], target: &[&MeshAxis]| {
-        let same_sizes = source.iter().zip(target).all(|(axis, other)| axis.size() == other.size());
-        (source.len() == target.len() && same_sizes).then(|| names(target))
-    };
-    let by_name = |source: &[&MeshAxis], target: &[&MeshAxis]| {
-        let found =
-            |axis: &&MeshAxis| target.iter().any(|other| other.name() == axis.name() && other.size() == axis.size());
-        (source.len() == target.len() && source.iter().all(found)).then(|| names(source))
-    };
     let count = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.size()).product::<usize>();
     let (source_unreduced, source_varying) = contribution_axes(input);
     let (target_unreduced, target_varying) = contribution_axes(output);
@@ -4110,7 +4106,18 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
         return None;
     }
     let paired = |source: &[&MeshAxis]| {
-        let target = by_name(source, &target_varying).or_else(|| in_order(source, &target_varying))?;
+        if source.len() != target_varying.len() {
+            return None;
+        }
+        let matches_by_name = source
+            .iter()
+            .all(|axis| target_varying.iter().any(|other| other.name() == axis.name() && other.size() == axis.size()));
+        let target = if matches_by_name {
+            names(source)
+        } else {
+            let same_sizes = source.iter().zip(&target_varying).all(|(axis, other)| axis.size() == other.size());
+            same_sizes.then(|| names(&target_varying))?
+        };
         Some(ContributionAxes { source: names(source), target })
     };
     paired(&source_varying).or_else(|| {
@@ -4170,14 +4177,15 @@ fn kept_unreduced_axes<'o>(input: &Sharding, output: &'o Sharding) -> Vec<&'o st
     if input.unreduced_kind() != output.unreduced_kind() {
         return Vec::new();
     }
-    let in_input = |axis: &MeshAxis| {
-        input.unreduced_axes().contains(axis.name())
-            && input.mesh().axes().iter().any(|other| other.name() == axis.name() && other.size() == axis.size())
-    };
     let axes = output.mesh().axes().iter();
-    axes.filter(|&axis| output.unreduced_axes().contains(axis.name()) && in_input(axis))
-        .map(MeshAxis::name)
-        .collect()
+    axes.filter(|axis| {
+        let name = axis.name();
+        output.unreduced_axes().contains(name)
+            && input.unreduced_axes().contains(name)
+            && input.mesh().axes().iter().any(|other| other.name() == name && other.size() == axis.size())
+    })
+    .map(MeshAxis::name)
+    .collect()
 }
 
 /// Checks that a placement of a value placed as `input` keeps every distinct contribution with elements of its source
@@ -5240,8 +5248,6 @@ mod tests {
                 .map(|(a, b)| a + b)
                 .collect::<Vec<_>>()
         };
-        let f8_contribution = |_: usize, rows: usize| vec![0x7fu8; rows * 2];
-        let f8_value = |rows: usize| vec![0x80u8; rows * 2];
         // The device at `(x, s)` holds the rows of part `s` of the contribution at `x`.
         let parts = |contribution: &dyn Fn(usize, usize) -> Vec<u8>, rows: usize| {
             let upper = rows.div_ceil(2);
@@ -5253,8 +5259,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         type Elements<'a> = &'a dyn Fn(usize, usize) -> Vec<u8>;
-        let cases: [(DataType, Elements<'_>, &dyn Fn(usize) -> Vec<u8>); 2] =
-            [(DataType::U8, &u8_contribution, &u8_value), (DataType::F8E8M0FNU, &f8_contribution, &f8_value)];
+        let cases: [(DataType, Elements<'_>, &dyn Fn(usize) -> Vec<u8>); 2] = [
+            (DataType::U8, &u8_contribution, &u8_value),
+            (DataType::F8E8M0FNU, &|_, rows| vec![0x7fu8; rows * 2], &|rows| vec![0x80u8; rows * 2]),
+        ];
         for rows in [3, 4] {
             for &(data_type, contribution, value) in &cases {
                 let value = value(rows);
@@ -5779,15 +5787,20 @@ mod tests {
             DataType::I32 => i32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
             _ => format!("{:#04x}", bytes[0]),
         };
-        let f32_bits = |bits: u32| bits.to_ne_bytes().to_vec();
-        let i32_bytes = |value: i32| value.to_ne_bytes().to_vec();
         let (size_one, size_two) = (vec![("x", 2), ("y", 1)], vec![("x", 2), ("y", 2)]);
         // Each case is its name, data type, source mesh axes, source and target unreduced axes, and the bytes of
         // the contributions of the devices of the source mesh in mesh order.
         let (x, x_y) = (vec!["x"], vec!["x", "y"]);
         let cases = [
-            ("f32 sum(x) -> sum(x, y)", DataType::F32, &size_two, &x, &x_y, vec![f32_bits(1); 4]),
-            ("i32 sum(x, y) -> sum(x)", DataType::I32, &size_two, &x_y, &x, [3, 4, 5, 6].map(i32_bytes).to_vec()),
+            ("f32 sum(x) -> sum(x, y)", DataType::F32, &size_two, &x, &x_y, vec![1u32.to_ne_bytes().to_vec(); 4]),
+            (
+                "i32 sum(x, y) -> sum(x)",
+                DataType::I32,
+                &size_two,
+                &x_y,
+                &x,
+                [3i32, 4, 5, 6].map(|value| value.to_ne_bytes().to_vec()).to_vec(),
+            ),
             ("f8e8m0fnu sum(x) -> sum(x, y=1)", DataType::F8E8M0FNU, &size_one, &x, &x_y, vec![vec![0x7f]; 2]),
             ("f8e8m0fnu sum(x) -> sum(x, y=2)", DataType::F8E8M0FNU, &size_two, &x, &x_y, vec![vec![0x7f]; 4]),
         ];
@@ -6062,9 +6075,6 @@ mod tests {
             ];
             for (data_type, values) in rows {
                 let r#type = ArrayType::new_static(data_type, [2]);
-                let encode = |value: f64| {
-                    CoreArray::scalar(value).unwrap().convert_element_type(data_type).unwrap().logical_bytes()
-                };
                 let decode = |bytes: &[u8]| {
                     let array = CoreArray::new(r#type.clone(), bytes.to_vec()).unwrap();
                     array.convert_element_type(DataType::F64).unwrap().elements::<f64>().unwrap()
@@ -6082,7 +6092,15 @@ mod tests {
                                 2 => [values[2 * x + y], values[x + 2 * y]],
                                 _ => [values[2 * x], values[2 * x + 1]],
                             };
-                            let bytes = elements.map(encode).concat();
+                            let bytes = elements
+                                .map(|value: f64| {
+                                    CoreArray::scalar(value)
+                                        .unwrap()
+                                        .convert_element_type(data_type)
+                                        .unwrap()
+                                        .logical_bytes()
+                                })
+                                .concat();
                             (device.id(), Arc::<[u8]>::from(bytes))
                         });
                         let sharding = Some(pending(&replicated, source_axes));
@@ -6574,14 +6592,6 @@ mod tests {
         .unwrap();
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         let tiled = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let shared_buffers = |left: &Array, right: &Array| {
-            left.shards()
-                .iter()
-                .zip(right.shards())
-                .map(|(left, right)| Arc::ptr_eq(left.buffer().unwrap(), right.buffer().unwrap()))
-                .collect::<Vec<_>>()
-        };
-
         // A sharding with the same shards on the same devices shares every buffer, compiles nothing, and keeps the
         // completion of the execution that produced the array.
         let (event, promise) = client.event(()).unwrap();
@@ -6597,7 +6607,13 @@ mod tests {
         assert!(pending);
         assert_eq!(output.sharding(), &reduced);
         assert_eq!(output.mesh(), &mesh);
-        assert_eq!(shared_buffers(&source, &output), vec![true; 4]);
+        let shared_buffers = source
+            .shards()
+            .iter()
+            .zip(output.shards())
+            .map(|(left, right)| Arc::ptr_eq(left.buffer().unwrap(), right.buffer().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(shared_buffers, vec![true; 4]);
         assert_eq!(session.cached_program_count(), 0);
 
         // On another device mesh, the shard on a device of the source shares its buffer and the others are copies.
@@ -7951,7 +7967,6 @@ mod tests {
         let vector = ArrayType::new_static(DataType::U8, [5]);
         let split_mesh = explicit_mesh(&[local[0], remote[0]]);
         let split = Sharding::new(split_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let replicated_vector = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let strided = Layout::Strided(StridedLayout::new(vec![1]));
         let outcomes = [
             ("implicit layout", vector.clone()),
@@ -7962,7 +7977,9 @@ mod tests {
         ]
         .iter()
         .map(|(source, r#type)| {
-            let views = shared_views(&session, r#type, &[local[0], remote[0]], &replicated_vector);
+            let views = shared_views(&session, r#type, &[local[0], remote[0]], &|mesh| {
+                Sharding::replicated(mesh.logical_mesh().clone(), 1)
+            });
             let outcome = match placement_agreement(&views, &split_mesh, &split) {
                 Ok(strategy) => strategy,
                 Err(disagreement) => format!("DISAGREE: {disagreement}"),
@@ -8071,19 +8088,22 @@ mod tests {
         // Returns the process that each view plans as the owner of the host round trip of a placement on `mesh`
         // according to `sharding`, which is the strategy of that placement or of its first step.
         fn owners(views: &[Array], mesh: &DeviceMesh, sharding: &Sharding) -> Vec<Option<usize>> {
-            let owner = |(process_index, view): (usize, &Array)| {
-                let strategy =
-                    view.device_placement_strategy(&simulated_cross_host_layout, mesh, sharding, process_index);
-                let strategy = match strategy.unwrap() {
-                    DevicePlacementStrategy::IntroducedSums { first: Some(first), .. } => *first,
-                    strategy => strategy,
-                };
-                match strategy {
-                    DevicePlacementStrategy::HostRoundTrip { process_index, .. } => process_index,
-                    _ => panic!("the target needs a host round trip"),
-                }
-            };
-            views.iter().enumerate().map(owner).collect()
+            views
+                .iter()
+                .enumerate()
+                .map(|(process_index, view)| {
+                    let strategy =
+                        view.device_placement_strategy(&simulated_cross_host_layout, mesh, sharding, process_index);
+                    let strategy = match strategy.unwrap() {
+                        DevicePlacementStrategy::IntroducedSums { first: Some(first), .. } => *first,
+                        strategy => strategy,
+                    };
+                    match strategy {
+                        DevicePlacementStrategy::HostRoundTrip { process_index, .. } => process_index,
+                        _ => panic!("the target needs a host round trip"),
+                    }
+                })
+                .collect()
         }
 
         let client = cpu_client(2);
@@ -8405,9 +8425,11 @@ mod tests {
                 let lowered = compiled.staged().into_inner().lower(&session).unwrap();
                 let optimized = session.compilation_cache().compile(&session, lowered.lowered_program()).unwrap();
                 let optimized = optimized.optimized_program().unwrap();
-                let names =
-                    |opcode: &str| optimized.bytes().windows(opcode.len()).any(|window| window == opcode.as_bytes());
-                let present = collectives.iter().filter(|opcode| names(opcode)).copied().collect::<Vec<_>>();
+                let present = collectives
+                    .iter()
+                    .filter(|opcode| optimized.bytes().windows(opcode.len()).any(|window| window == opcode.as_bytes()))
+                    .copied()
+                    .collect::<Vec<_>>();
                 outcomes.push(format!("{axis_type:?} {name}: {present:?}"));
             }
         }
@@ -8518,10 +8540,10 @@ mod tests {
 
     #[test]
     fn test_source_replicas_preferred() {
-        let logical_mesh =
-            |size| LogicalMesh::new(vec![MeshAxis::new("x", size, MeshAxisType::Auto).unwrap()]).unwrap();
         let replicated_shards = |devices: Vec<Device>| {
-            let mesh = DeviceMesh::new(logical_mesh(devices.len()), devices).unwrap();
+            let logical_mesh =
+                LogicalMesh::new(vec![MeshAxis::new("x", devices.len(), MeshAxisType::Auto).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(logical_mesh, devices).unwrap();
             ShardLayout::new(&StaticShape::new(vec![2]), &mesh, &Sharding::replicated(mesh.logical_mesh().clone(), 1))
                 .unwrap()
         };
@@ -8870,12 +8892,6 @@ mod tests {
                 }
             }
         };
-        let code = |decision: String| match decision.split(':').next().unwrap() {
-            "compiled reshard" => ".",
-            "host round trip" => "h",
-            "additive identities" => "i",
-            _ => "E",
-        };
         let mut outcomes = Vec::new();
         for (size, axis_type) in [(2, MeshAxisType::Auto), (2, MeshAxisType::Explicit), (1, MeshAxisType::Explicit)] {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", size, axis_type).unwrap()]).unwrap();
@@ -8895,7 +8911,12 @@ mod tests {
                 for (name, input) in &states {
                     let codes = states
                         .iter()
-                        .map(|(_, output)| code(decide(data_type, &mesh, input, output)))
+                        .map(|(_, output)| match decide(data_type, &mesh, input, output).split(':').next().unwrap() {
+                            "compiled reshard" => ".",
+                            "host round trip" => "h",
+                            "additive identities" => "i",
+                            _ => "E",
+                        })
                         .collect::<Vec<_>>();
                     outcomes.push(format!("{axis_type:?} {size} {data_type} {name}: {}", codes.join(" ")));
                 }

@@ -480,25 +480,32 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Converts core shardings to the form in which runtime arrays store them.
 pub(crate) trait ShardingLoweringExtension {
-    /// Returns the dimension shardings of this sharding with its unconstrained dimensions replicated, which is how a
-    /// runtime array stores them and how a constraint that must state its pending reduction can declare them.
-    fn dimensions_with_unconstrained_replicated(&self) -> Rc<[ShardingDimension]>;
-
     /// Returns this sharding with its unconstrained dimensions replicated (refer to
-    /// [`Self::dimensions_with_unconstrained_replicated`]), which is the sharding of a runtime array that is placed
-    /// with this sharding. A runtime array stores such a dimension replicated, because its placement reads an
-    /// unconstrained dimension as replicated. The entry function of a program therefore annotates a value at its
+    /// [`Self::dimensions_with_unconstrained_replicated`]), which is the sharding of a runtime array that is
+    /// placed with this sharding. A runtime array stores such a dimension replicated, because its placement reads
+    /// an unconstrained dimension as replicated. The entry function of a program therefore annotates a value at its
     /// boundary (i.e., an argument or an output) with this sharding, because an annotation that left the dimension
     /// open would let the compiler shard it and exchange buffers of other shapes than those of the array (e.g., expect
     /// `[2, 2]` argument buffers where an array placed as `[{"x"}, {?}]` supplies `[2, 4]` buffers).
     fn with_unconstrained_dimensions_replicated(&self) -> Result<Sharding, Error>;
+
+    /// Returns the dimension shardings of this sharding with its unconstrained dimensions replicated, which is how a
+    /// runtime array stores them and how a constraint that must state its pending reduction can declare them.
+    fn dimensions_with_unconstrained_replicated(&self) -> Rc<[ShardingDimension]>;
 }
 
 impl ShardingLoweringExtension for Sharding {
+    #[inline]
+    fn with_unconstrained_dimensions_replicated(&self) -> Result<Sharding, Error> {
+        if !self.dimensions().contains(&ShardingDimension::Unconstrained) {
+            return Ok(self.clone());
+        }
+        Ok(self.with_dimensions(self.dimensions_with_unconstrained_replicated().to_vec())?)
+    }
+
+    #[inline]
     fn dimensions_with_unconstrained_replicated(&self) -> Rc<[ShardingDimension]> {
         self.dimensions()
             .iter()
@@ -508,14 +515,9 @@ impl ShardingLoweringExtension for Sharding {
             })
             .collect()
     }
-
-    fn with_unconstrained_dimensions_replicated(&self) -> Result<Sharding, Error> {
-        if !self.dimensions().contains(&ShardingDimension::Unconstrained) {
-            return Ok(self.clone());
-        }
-        Ok(self.with_dimensions(self.dimensions_with_unconstrained_replicated().to_vec())?)
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns what `analyse` returns for the entry region of the program that lowering emits for `region` (refer to
 /// [`ProgramLoweringExtension::pruned_for_lowering`]), every output of `region` being used, which is `region` with its
