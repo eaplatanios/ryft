@@ -615,6 +615,367 @@ impl Array {
         )
     }
 
+    /// Performs the part of this process in `strategy`, which [`Self::device_placement_strategy`] chose
+    /// for placing this array on `mesh` according to `sharding`, with the parameters and the errors of
+    /// [`Self::try_reshard_on_devices`]. `process_index` is the index of this process. This function checks that this
+    /// array has a buffer on every device of this process only where this array itself is the input of a compiled
+    /// program, which reads every such buffer (refer to the documentation of this module). Any other strategy reads
+    /// only the shards that its moves name and serves a missing one from another replica of this process (refer to
+    /// [`Self::local_replica`]).
+    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn place_with_strategy(
+        self,
+        strategy: DevicePlacementStrategy,
+        process_index: usize,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        layout: Option<&Layout>,
+        donate: bool,
+    ) -> Result<Self, (Error, Option<Self>)> {
+        match strategy {
+            DevicePlacementStrategy::Bufferless => {
+                // Only the placement metadata changes, and the result keeps the fence of the execution that produced
+                // this array, so that its errors still surface through the result.
+                let r#type = self
+                    .r#type()
+                    .into_owned()
+                    .with_memory(memory)
+                    .with_sharding(None)
+                    .map_err(|error| (error.into(), None))?;
+                let mut placed = Self::zero(self.session(), r#type, Some(sharding.clone()), mesh.clone())
+                    .map_err(|error| (error, None))?;
+                placed.execution_fence = self.execution_fence().cloned();
+                Ok(placed)
+            }
+            DevicePlacementStrategy::ProcessLocalValue => {
+                match self.place_process_local_value(mesh, sharding, memory, layout) {
+                    Ok(output) => Ok(output),
+                    Err(error) => Err((error, Some(self))),
+                }
+            }
+            DevicePlacementStrategy::ExactShards { plan, cross_host_layouts } => self
+                .place_exact_shards(mesh, sharding, memory, &plan, &cross_host_layouts)
+                .map_err(|error| (error, None)),
+            DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts } => {
+                // The regions land in default device memory without a declared layout, and each process then moves its
+                // own shards to the requested storage, which needs no other process. A source shard in another declared
+                // layout is converted to the dense row-major layout only when a move reads it, and before the sends of
+                // this process only when a send reads it (refer to `Self::stage_region_source`).
+                let placed = self
+                    .place_shard_regions(mesh, sharding, &plan, &cross_host_layouts)
+                    .and_then(|output| output.place_storage(memory, layout.cloned()));
+                match placed {
+                    Ok(output) => Ok(output),
+                    Err(error) => Err((error, Some(self))),
+                }
+            }
+            DevicePlacementStrategy::CompiledReshard { program } => {
+                // The program reads the buffer of every device of this process, so a device without its own buffer
+                // first receives a copy of a local replica of its contribution, and a contribution without any local
+                // replica stops this process here (refer to `Self::with_filled_local_buffers`).
+                let array = match self.with_filled_local_buffers() {
+                    Ok(Some(served)) => {
+                        drop(self);
+                        served
+                    }
+                    Ok(None) => self,
+                    Err(error) => return Err((error, Some(self))),
+                };
+                match array.compile_reshard_on_same_mesh(&program, donate) {
+                    Ok(reshard) => {
+                        // Staging and compilation are behind us, so only a source that the execution cannot take is
+                        // returned (refer to `Self::fallback_source`).
+                        let source = array.fallback_source(donate);
+                        array.execute_reshard(&program, reshard.as_ref()).map_err(|error| (error, source))
+                    }
+                    Err(error) => Err((error, Some(array))),
+                }
+            }
+            DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard } => {
+                // A change of memory can use device storage for the intermediate compiled reshard. The target
+                // then moves the completed shards to the requested tier, without requiring SPMD execution there.
+                let source_memory = self.r#type().memory();
+                let intermediate_memory = if memory == source_memory { memory } else { Memory::Device };
+                self.reshard_across_meshes(
+                    gather.as_ref(),
+                    &replicas,
+                    &cross_host_layouts,
+                    &reshard,
+                    intermediate_memory,
+                )
+                .map_err(|error| (error, Some(self)))
+            }
+            DevicePlacementStrategy::IntroducedSums {
+                mesh: first_mesh,
+                sharding: first_sharding,
+                restrict_source,
+                first,
+                axis_indices,
+            } => {
+                // The first step places the value on the devices at coordinate zero along the introduced axes,
+                // from this array or from its restriction to those devices (which holds the same value, and which the
+                // host fallback can read back as well), and this process then gives its other devices the additive
+                // identity. An error of the first step returns its input, and a later one this array unless the first
+                // step may have donated its buffers, which only a compiled reshard does.
+                let donates =
+                    donate && matches!(first.as_deref(), Some(DevicePlacementStrategy::CompiledReshard { .. }));
+                let source = self.fallback_source(donates);
+
+                // The restricted view can read only the devices at coordinate zero. Fill their missing buffers from
+                // local replicas of the original array before passing the view to the first step.
+                let input = if restrict_source {
+                    match self.restricted_to(&first_mesh) {
+                        Ok(view) => {
+                            drop(self);
+                            view
+                        }
+                        Err(error) => return Err((error, Some(self))),
+                    }
+                } else {
+                    self
+                };
+
+                let first_is_none = first.is_none();
+                let placed = match first.map(|first| *first) {
+                    Some(DevicePlacementStrategy::HostRoundTrip { process_index: Some(owner), .. })
+                        if owner == process_index =>
+                    {
+                        // The host round trip of the first step goes to the devices at coordinate zero, which one
+                        // process owns together with the source, so the placement of this process onto them takes its
+                        // host fallback there.
+                        let target = Placement::new(first_mesh.clone(), first_sharding.clone())
+                            .map_err(|error| (Error::from(error), source.clone()))?
+                            .with_memory(memory);
+                        let target = match layout {
+                            Some(layout) => target.with_layout(layout.clone()),
+                            None => target,
+                        };
+                        let session = input.session().clone();
+                        input.place_within_client(&session, &target, donate).map_err(|error| (error, source.clone()))?
+                    }
+                    Some(first) => input.place_with_strategy(
+                        first,
+                        process_index,
+                        &first_mesh,
+                        &first_sharding,
+                        memory,
+                        layout,
+                        donate,
+                    )?,
+                    None if input.r#type().memory() == memory && input.layout() == layout => input,
+                    None => match input.restricted_to(&first_mesh) {
+                        Ok(view) => view,
+                        Err(error) => return Err((error, source)),
+                    },
+                };
+
+                // Without a first step, `placed` is the source or its restriction, whose sends belong to the placement
+                // that produced the source (refer to `Self::without_send_fence`).
+                let placed = if first_is_none { placed.without_send_fence() } else { placed };
+                placed
+                    .place_storage(memory, layout.cloned())
+                    .and_then(|placed| placed.with_introduced_sums(mesh, sharding, &axis_indices))
+                    .map_err(|error| (error, source))
+            }
+            DevicePlacementStrategy::HostRoundTrip { cause, process_index: owner } => match owner {
+                Some(owner) if owner == process_index => {
+                    // The caller reads this array back and uploads it with the target sharding.
+                    Err((cause.across_processes(), Some(self)))
+                }
+                _ => {
+                    // No target device belongs to this process, which only derives the metadata that the owning
+                    // process returns, as for a compiled reshard that this process does not run.
+                    let round_trip = Some((&cause, owner, mesh, sharding));
+                    self.place_elsewhere(round_trip, mesh, sharding, memory, layout).map_err(|error| (error, None))
+                }
+            },
+            DevicePlacementStrategy::OnOwner { strategy } => {
+                // This process takes no part in what the owner runs. It checks what the owner checks from metadata
+                // before it submits anything, which is only the upload of a host round trip, of the placement or of
+                // the first step of an introduced sum, and returns the metadata of the result.
+                let round_trip = match &*strategy {
+                    DevicePlacementStrategy::HostRoundTrip { cause, process_index } => {
+                        Some((cause, *process_index, mesh, sharding))
+                    }
+                    DevicePlacementStrategy::IntroducedSums {
+                        mesh: first_mesh,
+                        sharding: first_sharding,
+                        first: Some(first),
+                        ..
+                    } => match &**first {
+                        DevicePlacementStrategy::HostRoundTrip { cause, process_index } => {
+                            Some((cause, *process_index, first_mesh, first_sharding))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                self.place_elsewhere(round_trip, mesh, sharding, memory, layout).map_err(|error| (error, None))
+            }
+        }
+    }
+
+    /// Places this array, which has [locally assigned devices](Self::is_locally_assigned), on the devices of this
+    /// process in `mesh` according to `sharding` and in `memory`, with local work only. Every other process of the
+    /// placement does the same with its own such array, so the result holds the shards of this process, and the other
+    /// processes hold the rest. This is how JAX places an uncommitted array on devices of several processes, except
+    /// that JAX also checks that the processes hold equal values when the target includes every process. Nothing
+    /// compares the values here, so every process must pass an equal value, as for [`Array::from_host_buffer`],
+    /// and differing values leave the replicas inconsistent.
+    ///
+    /// A target shard that covers the whole array shares the buffer of this array when it is on the same device and
+    /// in the same memory, and is a copy otherwise. When a target shard covers only a part of the array, that part is
+    /// sliced on the device of this array, as for shard regions, and copied to its target. Slicing needs an array in
+    /// the default device memory without a declared layout, and every target device must hold one value per slice.
+    /// Otherwise (e.g., along an unreduced target axis, whose devices away from coordinate zero hold additive
+    /// identities), this process reads its value back and uploads the shards of its devices as
+    /// [`Array::from_host_buffer`] does, in the background when the PJRT plugin supports it. The execution fence of
+    /// the result joins the fence of this array with the readiness of the buffer of this array that it reads, of every
+    /// buffer that this function creates, and the fences of the slices (or, for the upload, the readiness that its
+    /// readback waits for). When no target device belongs to this process, it reads nothing back and its result joins
+    /// the fence of this array with the readiness of every buffer of this array, so the result still waits for and
+    /// reports the producer of this array.
+    ///
+    /// `layout` is the layout that the placement records for each target shard (refer to
+    /// [`Self::placement_layout`]). The upload uses it directly, and shared or sliced buffers record it only when they
+    /// have it, so this strategy records the layout that the other strategies of the placement record, whichever of
+    /// them another process takes.
+    fn place_process_local_value(
+        &self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        layout: Option<&Layout>,
+    ) -> Result<Self, Error> {
+        let session = self.session();
+        let client = session.client();
+        let process_index = client.process_index()?;
+        let shape = self.shape();
+        let target_layout = ShardLayout::new(&shape, mesh, sharding)?;
+        let targets = target_layout
+            .descriptors()
+            .iter()
+            .filter(|target| target.device().process_index() == process_index)
+            .collect::<Vec<_>>();
+        let host_type = ArrayType::new(self.data_type(), shape.clone().into())
+            .with_memory(memory)
+            .with_layout(layout.cloned());
+
+        let on_devices_with = |slices: bool| {
+            self.shards().len() == 1
+                && sharding.holds_one_value_per_slice()
+                && (!slices || (self.r#type().memory() == Memory::Device && self.layout().is_none()))
+        };
+
+        let slices = targets
+            .iter()
+            .any(|target| target.slice().iter().zip(shape.as_slice()).any(|(range, &extent)| range.len() != extent));
+
+        // Whether some process reads its value back and uploads it reads only metadata that every process shares (a
+        // process slices whenever some target shard covers a part of the value), so a process that does not upload
+        // itself (e.g., one without target devices) checks, in the same order, what the readback and the upload of
+        // another process check from metadata before they submit anything, and every process returns the same error.
+        // What depends on the buffers or the devices of one process (e.g., a missing local buffer) remains an error
+        // of that process.
+        let uploads_here = !targets.is_empty() && !on_devices_with(slices);
+        if !uploads_here
+            && !on_devices_with(
+                target_layout.descriptors().iter().any(|shard| {
+                    shard.slice().iter().zip(shape.as_slice()).any(|(range, &extent)| range.len() != extent)
+                }),
+            )
+        {
+            if !shape.as_slice().contains(&0) {
+                validate_one_value_per_contribution(
+                    self.mesh(),
+                    self.sharding(),
+                    self.shards().iter().map(ArrayShard::descriptor),
+                )?;
+            }
+            Self::validate_host_upload(session, host_type.clone(), mesh, sharding)?;
+        }
+
+        // A process without target devices takes no part, so it reads nothing back and returns the metadata of the
+        // result, which waits for and reports the buffers of this array and its producer. A process that is not the
+        // owner of a target on which the owner runs a shared strategy takes `DevicePlacementStrategy::OnOwner`
+        // instead, and never gets here (refer to `Self::device_placement_strategy`).
+        if targets.is_empty() {
+            return self.metadata_only_placement(session, host_type, mesh, sharding);
+        }
+
+        let source = match self.shards() {
+            [source] if source.buffer().is_some() => Some(source),
+            _ => None,
+        };
+
+        if let Some(source) = source.filter(|_| on_devices_with(slices)) {
+            let devices = self.addressable_devices_by_id(process_index)?;
+
+            // The source buffer can be the only completion of the work that produced it (e.g., of a pending host
+            // upload, which has no execution fence), and no target buffer reads it when no target device belongs to
+            // this process, so the result waits for it directly.
+            let mut completion = PlacementCompletion::default();
+            completion.track_buffer(source.buffer().unwrap())?;
+            let mut work = session.reserve_work();
+            let mut buffers = Vec::with_capacity(targets.len());
+            for target in targets {
+                let device = devices.get(target.device().id())?;
+                let source_buffer = Arc::clone(source.buffer().unwrap());
+                let buffer = Self::prepare_shard_region(
+                    session,
+                    self.data_type(),
+                    source,
+                    source_buffer,
+                    target.slice(),
+                    None,
+                    &mut completion,
+                )?;
+
+                let target_memory = device.memory(memory)?;
+                if buffer.memory()? == target_memory {
+                    buffers.push(buffer);
+                    continue;
+                }
+
+                buffers.push(self.copy_shard_to_memory(
+                    Some(&buffer),
+                    &buffer,
+                    target,
+                    target_memory,
+                    || self.layout().filter(|_| source.slice() == target.slice()).map(ToPjrt::to_pjrt).transpose(),
+                    &mut work,
+                    &mut completion,
+                )?);
+            }
+
+            // Whole shards keep the physical layout of this array and slices have the default layout, so the result
+            // declares the layout of this array only when that is also `layout`, and declares none otherwise, which
+            // leaves the conversion to `layout` to the caller (e.g., `Self::place_storage`).
+            let recorded_layout = self.layout().filter(|current| Some(*current) == layout).cloned();
+            let r#type = self.r#type().into_owned().with_memory(memory).with_layout(recorded_layout);
+            let mut output = Self::from_addressable_buffers_internal(
+                session,
+                r#type.with_sharding(None)?,
+                Some(sharding.clone()),
+                mesh.clone(),
+                None,
+                buffers,
+                false,
+            )?;
+            output.execution_fence = completion.join(self.execution_fence().cloned());
+            return Ok(output);
+        }
+
+        // Read the value back and upload the shards of the devices of this process. The early return of
+        // `Self::upload_host_readback` is never taken from here, because a `DataType::Zero` source is placed as
+        // `DevicePlacementStrategy::Bufferless` before `ProcessLocalValue` can be chosen, and `targets` holds a
+        // target device of this process.
+        let (mesh, sharding) = (mesh.clone(), sharding.clone());
+        self.upload_host_readback(session, mesh, sharding, memory, layout.cloned(), Error::into_pjrt_error)
+    }
+
     /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
     /// required layout or the plugin cannot copy it, reads `source_buffer` through host memory and uploads the
     /// shard into `memory` with `fallback_layout`. An individual shard readback preserves its contribution.
@@ -1057,150 +1418,6 @@ impl Array {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Places this array, which has [locally assigned devices](Self::is_locally_assigned) (refer to
-    /// [`Self::device_placement_strategy`]), on the devices of this process in `mesh` according to `sharding` and in
-    /// `memory`, with local work only. Every other process of the placement does the same with its own such array, so
-    /// the result holds the shards of this process, and the other processes hold the rest. This is how JAX places an
-    /// uncommitted array on devices of several processes, except that JAX also checks that the processes hold equal
-    /// values when the target includes every process. Nothing compares the values here, so every process must
-    /// pass an equal value, as for [`Array::from_host_buffer`], and differing values leave the replicas inconsistent.
-    ///
-    /// A target shard that covers the whole array shares the buffer of this array when it is on the same device
-    /// and in the same memory, and is a copy otherwise. When a target shard covers only a part of the array, that
-    /// part is sliced on the device of this array, as for shard regions, and copied to its target. Slicing needs
-    /// an array in the default device memory without a declared layout, and every target device must hold one
-    /// value per slice. Otherwise (e.g., along an unreduced target axis, whose devices away from coordinate zero
-    /// hold additive identities), this process reads its value back and uploads the shards of its devices as
-    /// [`Array::from_host_buffer`] does, in the background when the PJRT plugin supports it. The execution fence of the
-    /// result joins the fence of this array with the readiness of the buffer of this array that it reads, of every
-    /// buffer that this function creates, and the fences of the slices (or, for the upload, the readiness that its
-    /// readback waits for). When no target device belongs to this process, it reads nothing back and its result
-    /// joins the fence of this array with the readiness of every buffer of this array, so the result still waits for
-    /// and reports the producer of this array.
-    ///
-    /// `layout` is the layout that the placement records for each target shard (refer to
-    /// [`Self::placement_layout`]). The upload uses it directly, and shared or sliced buffers record it only when they
-    /// have it, so this strategy records the layout that the other strategies of the placement record, whichever of
-    /// them another process takes.
-    fn place_process_local_value(
-        &self,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        layout: Option<&Layout>,
-    ) -> Result<Self, Error> {
-        let session = self.session();
-        let client = session.client();
-        let process_index = client.process_index()?;
-        let shape = self.shape();
-        let target_layout = ShardLayout::new(&shape, mesh, sharding)?;
-        let targets = target_layout
-            .descriptors()
-            .iter()
-            .filter(|target| target.device().process_index() == process_index)
-            .collect::<Vec<_>>();
-        let host_type = ArrayType::new(self.data_type(), shape.clone().into())
-            .with_memory(memory)
-            .with_layout(layout.cloned());
-        let whole =
-            |slice: &[Range<usize>]| slice.iter().zip(shape.as_slice()).all(|(range, &extent)| range.len() == extent);
-        let on_devices_with = |slices: bool| {
-            self.shards().len() == 1
-                && sharding.holds_one_value_per_slice()
-                && (!slices || (self.r#type().memory() == Memory::Device && self.layout().is_none()))
-        };
-        let slices = targets.iter().any(|target| !whole(target.slice()));
-        // Whether some process reads its value back and uploads it reads only metadata that every process shares (a
-        // process slices whenever some target shard covers a part of the value), so a process that does not
-        // upload itself (e.g., one without target devices) checks, in the same order, what the readback and the
-        // upload of another process check from metadata before they submit anything (refer to
-        // `validate_one_value_per_contribution` and `Self::validate_host_upload`), and every process returns the
-        // same error. What depends on the buffers or the devices of one process (e.g., a missing local buffer) remains
-        // an error of that process.
-        let uploads_here = !targets.is_empty() && !on_devices_with(slices);
-        if !uploads_here && !on_devices_with(target_layout.descriptors().iter().any(|shard| !whole(shard.slice()))) {
-            if !shape.as_slice().contains(&0) {
-                validate_one_value_per_contribution(
-                    self.mesh(),
-                    self.sharding(),
-                    self.shards().iter().map(ArrayShard::descriptor),
-                )?;
-            }
-            Self::validate_host_upload(session, host_type.clone(), mesh, sharding)?;
-        }
-        // A process without target devices takes no part, so it reads nothing back and returns the metadata of the
-        // result, which waits for and reports the buffers of this array and its producer. A process that is not the
-        // owner of a target on which the owner runs a shared strategy takes `DevicePlacementStrategy::OnOwner`
-        // instead, and never gets here (refer to `Self::device_placement_strategy`).
-        if targets.is_empty() {
-            return self.metadata_only_placement(session, host_type, mesh, sharding);
-        }
-        let source = match self.shards() {
-            [source] if source.buffer().is_some() => Some(source),
-            _ => None,
-        };
-        if let Some(source) = source.filter(|_| on_devices_with(slices)) {
-            let devices = self.addressable_devices_by_id(process_index)?;
-            // The source buffer can be the only completion of the work that produced it (e.g., of a pending host
-            // upload, which has no execution fence), and no target buffer reads it when no target device
-            // belongs to this process, so the result waits for it directly.
-            let mut completion = PlacementCompletion::default();
-            completion.track_buffer(source.buffer().unwrap())?;
-            let mut work = session.reserve_work();
-            let mut buffers = Vec::with_capacity(targets.len());
-            for target in targets {
-                let device = devices.get(target.device().id())?;
-                let source_buffer = Arc::clone(source.buffer().unwrap());
-                let buffer = Self::prepare_shard_region(
-                    session,
-                    self.data_type(),
-                    source,
-                    source_buffer,
-                    target.slice(),
-                    None,
-                    &mut completion,
-                )?;
-                let target_memory = device.memory(memory)?;
-                if buffer.memory()? == target_memory {
-                    buffers.push(buffer);
-                    continue;
-                }
-                buffers.push(self.copy_shard_to_memory(
-                    Some(&buffer),
-                    &buffer,
-                    target,
-                    target_memory,
-                    || self.layout().filter(|_| source.slice() == target.slice()).map(ToPjrt::to_pjrt).transpose(),
-                    &mut work,
-                    &mut completion,
-                )?);
-            }
-            // Whole shards keep the physical layout of this array and slices have the default layout, so the result
-            // declares the layout of this array only when that is also `layout`, and declares none otherwise, which
-            // leaves the conversion to `layout` to the caller (e.g., `Self::place_storage`).
-            let recorded_layout = self.layout().filter(|current| Some(*current) == layout).cloned();
-            let r#type = self.r#type().into_owned().with_memory(memory).with_layout(recorded_layout);
-            let mut output = Self::from_addressable_buffers_internal(
-                session,
-                r#type.with_sharding(None)?,
-                Some(sharding.clone()),
-                mesh.clone(),
-                None,
-                buffers,
-                false,
-            )?;
-            output.execution_fence = completion.join(self.execution_fence().cloned());
-            return Ok(output);
-        }
-
-        // Read the value back and upload the shards of the devices of this process. The early return of
-        // `Self::upload_host_readback` is never taken from here, because a `DataType::Zero` source is placed as
-        // `DevicePlacementStrategy::Bufferless` before `ProcessLocalValue` can be chosen (refer to
-        // `Self::device_placement_strategy`), and `targets` holds a target device of this process.
-        let (mesh, sharding) = (mesh.clone(), sharding.clone());
-        self.upload_host_readback(session, mesh, sharding, memory, layout.cloned(), Error::into_pjrt_error)
-    }
 
     /// Places this array on `mesh` according to `sharding` and in `memory` by sharing, copying, and transferring the
     /// whole shards that `plan` describes, which [`Self::device_placement_strategy`] chose with `cross_host_layouts`.
@@ -1863,201 +2080,6 @@ impl Array {
             values = joined;
         }
         Ok(Arc::clone(values[0].1.shards()[0].buffer().unwrap()))
-    }
-
-    /// Performs the part of this process in `strategy`, which [`Self::device_placement_strategy`] chose for placing
-    /// this array on `mesh` according to `sharding`, with the parameters and the errors of
-    /// [`Self::try_reshard_on_devices`].
-    ///
-    /// `process_index` is the index of this process. This function checks that this array has a buffer on every device
-    /// of this process only where this array itself is the input of a compiled program, which reads every such buffer
-    /// (refer to the documentation of this module). Any other strategy reads only the shards that its moves name and
-    /// serves a missing one from another replica of this process (refer to [`Self::local_replica`]).
-    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
-    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    fn place_with_strategy(
-        self,
-        strategy: DevicePlacementStrategy,
-        process_index: usize,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        layout: Option<&Layout>,
-        donate: bool,
-    ) -> Result<Self, (Error, Option<Self>)> {
-        match strategy {
-            DevicePlacementStrategy::Bufferless => {
-                // Only the placement metadata changes, and the result keeps the fence of the execution that produced
-                // this array, so that its errors still surface through the result.
-                let place = || {
-                    let r#type = self.r#type().into_owned().with_memory(memory).with_sharding(None)?;
-                    let mut placed = Self::zero(self.session(), r#type, Some(sharding.clone()), mesh.clone())?;
-                    placed.execution_fence = self.execution_fence().cloned();
-                    Ok::<_, Error>(placed)
-                };
-                place().map_err(|error| (error, None))
-            }
-            DevicePlacementStrategy::ProcessLocalValue => {
-                match self.place_process_local_value(mesh, sharding, memory, layout) {
-                    Ok(output) => Ok(output),
-                    Err(error) => Err((error, Some(self))),
-                }
-            }
-            DevicePlacementStrategy::ExactShards { plan, cross_host_layouts } => self
-                .place_exact_shards(mesh, sharding, memory, &plan, &cross_host_layouts)
-                .map_err(|error| (error, None)),
-            DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts } => {
-                // The regions land in default device memory without a declared layout, and each process then moves its
-                // own shards to the requested storage, which needs no other process. A source shard in another declared
-                // layout is converted to the dense row-major layout only when a move reads it, and before the sends of
-                // this process only when a send reads it (refer to `Self::stage_region_source`).
-                let placed = self
-                    .place_shard_regions(mesh, sharding, &plan, &cross_host_layouts)
-                    .and_then(|output| output.place_storage(memory, layout.cloned()));
-                match placed {
-                    Ok(output) => Ok(output),
-                    Err(error) => Err((error, Some(self))),
-                }
-            }
-            DevicePlacementStrategy::CompiledReshard { program } => {
-                // The program reads the buffer of every device of this process, so a device without its own buffer
-                // first receives a copy of a local replica of its contribution, and a contribution without any local
-                // replica stops this process here (refer to `Self::with_filled_local_buffers`).
-                let array = match self.with_filled_local_buffers() {
-                    Ok(Some(served)) => {
-                        drop(self);
-                        served
-                    }
-                    Ok(None) => self,
-                    Err(error) => return Err((error, Some(self))),
-                };
-                match array.compile_reshard_on_same_mesh(&program, donate) {
-                    Ok(reshard) => {
-                        // Staging and compilation are behind us, so only a source that the execution cannot take is
-                        // returned (refer to `Self::fallback_source`).
-                        let source = array.fallback_source(donate);
-                        array.execute_reshard(&program, reshard.as_ref()).map_err(|error| (error, source))
-                    }
-                    Err(error) => Err((error, Some(array))),
-                }
-            }
-            DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard } => {
-                // A change of memory can use device storage for the intermediate compiled reshard. The target
-                // then moves the completed shards to the requested tier, without requiring SPMD execution there.
-                let source_memory = self.r#type().memory();
-                let intermediate_memory = if memory == source_memory { memory } else { Memory::Device };
-                self.reshard_across_meshes(
-                    gather.as_ref(),
-                    &replicas,
-                    &cross_host_layouts,
-                    &reshard,
-                    intermediate_memory,
-                )
-                .map_err(|error| (error, Some(self)))
-            }
-            DevicePlacementStrategy::IntroducedSums {
-                mesh: first_mesh,
-                sharding: first_sharding,
-                restrict_source,
-                first,
-                axis_indices,
-            } => {
-                // The first step places the value on the devices at coordinate zero along the introduced axes, from
-                // this array or from its restriction to those devices (which holds the same value, and which the
-                // host fallback can read back as well), and this process then gives its other devices the additive
-                // identity. An error of the first step returns its input, and a later one this array unless the first
-                // step may have donated its buffers, which only a compiled reshard does.
-                let donates =
-                    donate && matches!(first.as_deref(), Some(DevicePlacementStrategy::CompiledReshard { .. }));
-                let source = self.fallback_source(donates);
-                // The restricted view can read only the devices at coordinate zero. Fill their missing buffers from
-                // local replicas of the original array before passing the view to the first step.
-                let input = if restrict_source {
-                    match self.restricted_to(&first_mesh) {
-                        Ok(view) => {
-                            drop(self);
-                            view
-                        }
-                        Err(error) => return Err((error, Some(self))),
-                    }
-                } else {
-                    self
-                };
-                let first_is_none = first.is_none();
-                let placed = match first.map(|first| *first) {
-                    // The host round trip of the first step goes to the devices at coordinate zero, which one process
-                    // owns together with the source, so the placement of this process onto them takes its host
-                    // fallback there.
-                    Some(DevicePlacementStrategy::HostRoundTrip { process_index: Some(owner), .. })
-                        if owner == process_index =>
-                    {
-                        let target = Placement::new(first_mesh.clone(), first_sharding.clone())
-                            .map_err(|error| (Error::from(error), source.clone()))?
-                            .with_memory(memory);
-                        let target = match layout {
-                            Some(layout) => target.with_layout(layout.clone()),
-                            None => target,
-                        };
-                        let session = input.session().clone();
-                        input.place_within_client(&session, &target, donate).map_err(|error| (error, source.clone()))?
-                    }
-                    Some(first) => input.place_with_strategy(
-                        first,
-                        process_index,
-                        &first_mesh,
-                        &first_sharding,
-                        memory,
-                        layout,
-                        donate,
-                    )?,
-                    None if input.r#type().memory() == memory && input.layout() == layout => input,
-                    None => match input.restricted_to(&first_mesh) {
-                        Ok(view) => view,
-                        Err(error) => return Err((error, source)),
-                    },
-                };
-                // Without a first step, `placed` is the source or its restriction, whose sends belong to the placement
-                // that produced the source (refer to `Self::without_send_fence`).
-                let placed = if first_is_none { placed.without_send_fence() } else { placed };
-                placed
-                    .place_storage(memory, layout.cloned())
-                    .and_then(|placed| placed.with_introduced_sums(mesh, sharding, &axis_indices))
-                    .map_err(|error| (error, source))
-            }
-            DevicePlacementStrategy::HostRoundTrip { cause, process_index: owner } => match owner {
-                // The caller reads this array back and uploads it with the target sharding.
-                Some(owner) if owner == process_index => Err((cause.across_processes(), Some(self))),
-                // No target device belongs to this process, which only derives the metadata that the owning
-                // process returns, as for a compiled reshard that this process does not run.
-                _ => {
-                    let round_trip = Some((&cause, owner, mesh, sharding));
-                    self.place_elsewhere(round_trip, mesh, sharding, memory, layout).map_err(|error| (error, None))
-                }
-            },
-            DevicePlacementStrategy::OnOwner { strategy } => {
-                // This process takes no part in what the owner runs. It checks what the owner checks from metadata
-                // before it submits anything, which is only the upload of a host round trip, of the placement or of
-                // the first step of an introduced sum, and returns the metadata of the result.
-                let round_trip = match &*strategy {
-                    DevicePlacementStrategy::HostRoundTrip { cause, process_index } => {
-                        Some((cause, *process_index, mesh, sharding))
-                    }
-                    DevicePlacementStrategy::IntroducedSums {
-                        mesh: first_mesh,
-                        sharding: first_sharding,
-                        first: Some(first),
-                        ..
-                    } => match &**first {
-                        DevicePlacementStrategy::HostRoundTrip { cause, process_index } => {
-                            Some((cause, *process_index, first_mesh, first_sharding))
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                self.place_elsewhere(round_trip, mesh, sharding, memory, layout).map_err(|error| (error, None))
-            }
-        }
     }
 
     /// Returns the result of placing this array on `mesh` according to `sharding` in `memory` in a process that takes
