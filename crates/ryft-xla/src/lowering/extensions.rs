@@ -320,7 +320,7 @@ where
         constant_sharding: F,
     ) -> Vec<Option<OutputShardingSource>> {
         /// Returns the source of the sharding of each output of `region`, which
-        /// [`ProgramLoweringExtension::output_sharding_sources`] describes, with [`OutputShardingSource::Argument`]
+        /// [`ProgramLoweringExtension::output_sharding_sources`] describes, with [`OutputShardingSource::Input`]
         /// naming an input of `region`. An output that returns a [`RetainedArray`] has the placement of that array,
         /// which enters the executable as a hidden argument with that placement, and which has no buffer whose
         /// placement the compiler could report when it has the zero data type. The placements of the callee regions
@@ -354,7 +354,7 @@ where
                             return Some(OutputShardingSource::Determined(constant_sharding(constant)));
                         }
 
-                        return input_positions[value_id.index()].map(OutputShardingSource::Argument);
+                        return input_positions[value_id.index()].map(OutputShardingSource::Input);
                     };
 
                     let instruction = &region.instructions()[instruction_index];
@@ -443,7 +443,7 @@ where
                             OutputShardingSource::Determined(sharding) => {
                                 return Some(OutputShardingSource::Determined(sharding.clone()));
                             }
-                            OutputShardingSource::Argument(index) => {
+                            OutputShardingSource::Input(index) => {
                                 let actual = region.atoms()[instruction.inputs().get(*index)?.index()].r#type();
                                 let callee = region.with_id(callee).ok()?;
                                 let declared = callee.input_types();
@@ -574,8 +574,8 @@ pub(crate) enum OutputShardingSource {
     /// The program determines the sharding of the output.
     Determined(Sharding),
 
-    /// The output is the entry argument at this index, which it returns where that argument enters the program.
-    Argument(usize),
+    /// The output inherits the sharding of the region input at this index.
+    Input(usize),
 }
 
 /// Merges `mesh`, the devices that a placement request of the operation named `operation` names, into `requested`, the
@@ -664,9 +664,7 @@ pub(crate) fn entry_output_shardings(
             .map(|(output_type, source)| {
                 let stated = match source {
                     Some(OutputShardingSource::Determined(sharding)) => Some(sharding),
-                    Some(OutputShardingSource::Argument(index)) => {
-                        argument_shardings.get(*index).and_then(Option::as_ref)
-                    }
+                    Some(OutputShardingSource::Input(index)) => argument_shardings.get(*index).and_then(Option::as_ref),
                     None => None,
                 };
                 let (unreduced_axes, reduced_axes) = (output_type.unreduced_axes(), output_type.reduced_axes());

@@ -112,10 +112,10 @@ use ryft_core::{
     EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance, InterpretableOperation,
     LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis, NestedTracingContext,
     Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramBuilder, ProgramError, Provenance,
-    ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementRequests, RegionRef, RegionRole,
-    RequestedPlacement, Sharding, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics,
-    TracingContext, Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection,
-    Zero, ZeroOperation, declared_input_sharding, decode_logical_bytes,
+    ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementRequests, RegionRole, RequestedPlacement,
+    Sharding, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform,
+    TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation,
+    declared_input_sharding, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -1593,7 +1593,29 @@ impl Context for Session {
                 .map(|(_, region)| {
                     let Ok(artifact) = region.transform::<OwnedSessionConstantsAnalysis, _, Infallible>(
                         target_platform.map(str::to_owned),
-                        OwnedSessionConstantsAnalysis::derive,
+                        |region, target_platform| {
+                            let has_session_constants = region.computation_regions().any(|region| {
+                                region
+                                    .atoms()
+                                    .iter()
+                                    .any(|atom| matches!(atom.as_constant(), Some(Constant::Session(_))))
+                            });
+
+                            let constants = if has_session_constants {
+                                let program = region.to_program();
+                                let pruned =
+                                    program.clone().into_pruned().and_then(|program| program.into_simplified());
+
+                                // Use the original program if either transform fails so the analysis sees its captures.
+                                let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
+                                let target_platform = target_platform.as_deref();
+                                let regions = emitted_regions_entering_calls(entry, target_platform, false);
+                                Arc::from(partition_region_session_constants(regions, target_platform).0)
+                            } else {
+                                Arc::from([])
+                            };
+                            Ok(TransformArtifact::new(Vec::new(), constants))
+                        },
                     );
                     artifact.metadata().clone()
                 })
@@ -3056,34 +3078,6 @@ impl Transform<Region<Constant, Operation>> for OwnedSessionConstantsAnalysis {
     const DEFAULT_CACHE_CAPACITY: usize = 1;
 }
 
-impl OwnedSessionConstantsAnalysis {
-    /// Collects the distinct session constants read by the capture scope of `region`, in traversal order, after
-    /// pruning and simplifying with every output of `region` treated as used. Traversal follows the computation
-    /// regions that lowering emits for the target platform and stops at nested call boundaries, because each call
-    /// owns the captures of its callee. A constant passed only as a capture to callees that never read it has no
-    /// executable argument and is skipped. Instructions with observable effects keep their constants live.
-    fn derive(
-        region: RegionRef<'_, Constant, Operation>,
-        target_platform: &Option<String>,
-    ) -> Result<TransformArtifact<Constant, Operation, Arc<[RetainedArray]>>, Infallible> {
-        let has_session_constants = region
-            .computation_regions()
-            .any(|region| region.atoms().iter().any(|atom| matches!(atom.as_constant(), Some(Constant::Session(_)))));
-        let constants = if has_session_constants {
-            let program = region.to_program();
-            let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
-            // If pruning or simplification fails, inspect the original program so the failed transform hides no captures.
-            let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
-            let target_platform = target_platform.as_deref();
-            let regions = emitted_regions_entering_calls(entry, target_platform, false);
-            Arc::from(partition_region_session_constants(regions, target_platform).0)
-        } else {
-            Arc::from([])
-        };
-        Ok(TransformArtifact::new(Vec::new(), constants))
-    }
-}
-
 /// Marker of the devices that the placement requests of one attached region and its computation
 /// descendants name, together with the name of the operation that makes the first such request (refer to
 /// `RegionPlacementRequestsExtension::requested_mesh`), for the target platform that its arguments name. They depend
@@ -3222,14 +3216,15 @@ pub(crate) mod tests {
         DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalar,
         DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
         DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout, LinearizationTracer,
-        Memory, MeshAxisType, Mul, MulOperation, NamedComposite, Neg, NegOperation, OneOperation,
+        Memory, MeshAxisType, Mul, MulOperation, NamedComposite, Neg, NegOperation, NothingSavable, OneOperation,
         ParallelReduceOperation, Place, PlaceDispatch, PlaceOperation, Placeholder, Placement, PlacementRequest,
         ProjectedContext, ProjectedValue, Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceType, Reshape, Round, ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary,
-        ShardMapError, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin,
-        StaticShape, StopGradient, SubOperation, TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue,
-        WhileOperation, WhileOptions, ZeroOperation, batch, differentiate_at, i4, rematerialize, scan, shard_map,
-        shard_map_along, shard_map_with_inferred_input_shardings, r#while,
+        ReferenceType, RematerializeOperation, Reshape, ResidualPolicyReference, Round, ScanOperation, ScanOptions,
+        SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding,
+        ShardingDimension, ShardingError, Sin, StaticShape, StopGradient, SubOperation, TiledLayout,
+        Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, WhileOptions, ZeroOperation, batch,
+        differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        r#while,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -3262,16 +3257,19 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// Returns the cached captures of `region` on the target platform used by the eager placement analysis.
-    fn owned_region_captures(
-        region: RegionRef<'_, Constant, Operation>,
-        target_platform: Option<&str>,
-    ) -> Vec<RetainedArray> {
-        let Ok(artifact) = region.transform::<OwnedSessionConstantsAnalysis, _, Infallible>(
-            target_platform.map(str::to_owned),
-            OwnedSessionConstantsAnalysis::derive,
-        );
-        artifact.metadata().to_vec()
+    /// Runs a scalar body through eager rematerialization and reports its output placement and elements.
+    fn bind_capture_test_body(
+        session: &Session,
+        body: FlatProgram<Session>,
+        input: &Array,
+    ) -> (Vec<Device>, bool, Vec<f32>) {
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
+        let outputs =
+            session.bind(Operation::Rematerialize(operation), [body], &[Value::Array(input.clone())]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output = program_array(&outputs[0]);
+        let elements = output.copy_to_host().unwrap().elements::<f32>().unwrap();
+        (output.mesh().devices().to_vec(), output.is_committed(), elements)
     }
 
     /// Declaration of the devices of other processes on a [`SessionBuilder`], for tests that stand for several
@@ -4805,54 +4803,52 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_owned_session_constants_skips_bodies_that_the_target_replaces() {
-        // A session constant that only the body of a named composite call refers to is owned by the enclosing region
-        // where lowering emits the body, and not for a target whose backend implementation replaces the whole call
-        // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), as the eager placement of
-        // the enclosing operation must not read it. The result is retained for each platform separately.
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
-        let scalar_type = Type::Array(constant.r#type().into_owned());
+    fn test_session_bind_skips_captures_in_composite_bodies_that_the_target_replaces() {
+        // When the nested composite lowers to a square, the enclosing operation stays on the input device.
+        // With the portable body it uses the committed capture and runs there.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.devices().unwrap();
+        let input = session.place(3f32, PlacementOptions::default()).unwrap();
+        let captured = session.place(2f32, PlacementOptions::to(devices[1])).unwrap();
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let body = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
-            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let constant = builder.add_constant(Constant::Session(RetainedArray::new(&captured)));
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
         };
-        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
-        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
-        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("adding").with_named_composite(named));
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let input = builder.add_input(scalar_type);
-        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
-        let regions = vec![builder.intern_callee(&body, None).unwrap()];
-        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
-        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
-        let program = program.unwrap();
-        let owned = |target_platform| owned_region_captures(program.entry_region_ref(), target_platform);
-        assert_eq!(owned(None), vec![constant.clone()]);
-        assert_eq!(owned(Some("cuda")), vec![]);
-        assert_eq!(owned(Some("cpu")), vec![constant.clone()]);
-        assert_eq!(owned(Some("cuda")), vec![]);
+        let cases = [(1, (vec![devices[0]], false, vec![9.0])), (2, (vec![devices[1]], true, vec![5.0]))];
+        for (version, expected) in cases {
+            let key = CompositeKey::new("ryft.tests.xla_cpu_named_square".to_string(), version);
+            let named =
+                NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+            let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("adding").with_named_composite(named));
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let value = builder.add_input(scalar_type.clone());
+            let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let output = builder.add_instruction(operation, regions, vec![value], None).unwrap()[0];
+            let program = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+            assert_eq!(bind_capture_test_body(&session, program, &input), expected);
+        }
     }
 
     #[test]
-    fn test_owned_session_constants_skips_the_bodies_of_scans_without_iterations() {
-        // A session constant that only the body of a scan refers to is owned by the enclosing region when the length
-        // of the scan admits an iteration, and not on any target when its length is zero, because lowering then emits
-        // nothing of its body (refer to `omits_regions`), so its array is neither placed nor passed.
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
-        let scalar_type = Type::Array(constant.r#type().into_owned());
+    fn test_session_bind_skips_captures_in_scans_without_iterations() {
+        // Only an iteration of the nested scan reads the capture. The enclosing region negates the final carry
+        // in both cases, so even the zero-iteration case executes on the device chosen by eager placement.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.devices().unwrap();
+        let input = session.place(3f32, PlacementOptions::default()).unwrap();
+        let captured = session.place(2f32, PlacementOptions::to(devices[1])).unwrap();
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let body = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone());
-            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let constant = builder.add_constant(Constant::Session(RetainedArray::new(&captured)));
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, constant], None).unwrap()[0];
             Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
@@ -4862,30 +4858,24 @@ pub(crate) mod tests {
             let input = builder.add_input(scalar_type.clone());
             let regions = vec![builder.intern_callee(&body, None).unwrap()];
             let scan = ScanOperation::<Type>::new(1, length);
-            let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+            let carry = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+            let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![carry], None).unwrap()[0];
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let owned =
-            |length, target_platform| owned_region_captures(program(length).entry_region_ref(), target_platform);
-        assert_eq!(owned(0, None), vec![]);
-        assert_eq!(owned(0, Some("cpu")), vec![]);
-        assert_eq!(owned(1, None), vec![constant.clone()]);
-        assert_eq!(owned(1, Some("cpu")), vec![constant.clone()]);
+        assert_eq!(bind_capture_test_body(&session, program(0), &input), (vec![devices[0]], false, vec![-3.0]));
+        assert_eq!(bind_capture_test_body(&session, program(1), &input), (vec![devices[1]], true, vec![-5.0]));
     }
 
     #[test]
-    fn test_owned_session_constants_skips_captures_that_calls_never_read() {
-        // A session constant that a region only passes on to a call as a capture which the callee never reads is not
-        // owned by the region, as a compiled execution of the region has no argument for it (refer to
-        // `partition_session_constants`), so the eager placement of the enclosing operation does not read it either.
-        // Before, it was owned, so that it could commit the operation to its devices or have it rejected. A capture
-        // that the callee reads is owned.
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
-        let scalar_type = Type::Array(constant.r#type().into_owned());
+    fn test_session_bind_skips_captures_that_nested_calls_never_read() {
+        // A capture forwarded to a nested call affects eager placement only if the callee reads it.
+        let session = Session::builder().client(cpu_client(2)).build().unwrap();
+        let devices = session.devices().unwrap();
+        let input = session.place(3f32, PlacementOptions::default()).unwrap();
+        let captured = session.place(2f32, PlacementOptions::to(devices[1])).unwrap();
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
         let callee = |reads_capture: bool| {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let capture = builder.add_input(scalar_type.clone());
@@ -4900,7 +4890,7 @@ pub(crate) mod tests {
         let program = |reads_capture: bool| {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone());
-            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let constant = builder.add_constant(Constant::Session(RetainedArray::new(&captured)));
             let regions = vec![builder.intern_callee(&callee(reads_capture), None).unwrap()];
             let operation = Operation::Call(CallOperation::new(1));
             let output = builder.add_instruction(operation, regions, vec![constant, input], None).unwrap()[0];
@@ -4908,13 +4898,8 @@ pub(crate) mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let owned = |reads_capture, target_platform| {
-            owned_region_captures(program(reads_capture).entry_region_ref(), target_platform)
-        };
-        assert_eq!(owned(false, None), vec![]);
-        assert_eq!(owned(false, Some("cpu")), vec![]);
-        assert_eq!(owned(true, None), vec![constant.clone()]);
-        assert_eq!(owned(true, Some("cpu")), vec![constant]);
+        assert_eq!(bind_capture_test_body(&session, program(false), &input), (vec![devices[0]], false, vec![-3.0]));
+        assert_eq!(bind_capture_test_body(&session, program(true), &input), (vec![devices[1]], true, vec![5.0]));
     }
 
     #[test]
