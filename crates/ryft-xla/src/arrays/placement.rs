@@ -640,6 +640,199 @@ impl Placeable for Array {
 }
 
 impl Array {
+    /// Moves or copies this array to the provided placement without donating the source buffers, so the original
+    /// [`Array`] remains fully usable after the call returns.
+    ///
+    /// When the placement and storage already match, the result is this array (i.e., the same logical array, refer to
+    /// the identity rules of [`RetainedArray`](crate::RetainedArray)). If each process chose the devices of this array
+    /// on its own, a target that names devices gives a new array on every process instead, which shares the buffers of
+    /// this array where they already are, so that independent placements remain distinct when captured. Every other
+    /// placement gives a new array. A change of devices or sharding takes the first device strategy that applies of
+    /// those that [`crate::arrays::resharding`] describes (i.e., moves of exact shards, shard regions, or a compiled
+    /// reshard) and otherwise the host fallback. A source with [locally assigned devices](Self::is_locally_assigned)
+    /// (e.g., the result of [`Array::from_host_buffer`] without a mesh) takes none of them, and every process places
+    /// its own such array on its own target devices with local work only, as that module describes.
+    ///
+    /// The host fallback copies the global array to the host as [`Array::copy_to_host`] does and uploads it again as
+    /// [`Array::from_host_buffer`] does, so the result has the shards that a host upload of the same values with the
+    /// target sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy supports
+    /// a manual target, or when a compiled reshard would change the value of an array whose reduction state the
+    /// placement changes), when the target mesh is fully addressable from this process, and when this process can
+    /// read the source back. That is the case when this process holds a buffer for one replica of every distinct
+    /// contribution to the value with elements (i.e., of every tile and, along unreduced axes, of every per-device
+    /// value of a tile), whatever the other processes hold, and when no two devices that hold one such contribution
+    /// differ along a varying manual mesh axis, because those devices can hold different values for the same slice that
+    /// a dense host copy cannot represent. Devices that differ along a manual axis which splits the array hold distinct
+    /// tiles, so they read back like any other tiles. A placement that keeps the contributions of a pending reduction
+    /// or of manual variation within a tile requires a device strategy, because the host fallback combines
+    /// contributions. The readback and the upload continue in the background, and a failure of that work, whose error
+    /// also describes the failure of the device work, surfaces through the readiness functions and the readbacks of the
+    /// result and through [`Session::synchronize`].
+    ///
+    /// When the target is shared across processes and this array is locally assigned, every process must hold the same
+    /// value, because each process places its own value on the devices that it owns. For uncommitted inputs, a mesh or
+    /// sharding target whose devices belong to exactly the processes of a run of more than one process compares the
+    /// per-process values based on [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison):
+    /// each process reads its value back on the calling thread, hashes it, and submits a comparison before anything
+    /// else depends on the value. The comparison uses a compiled all-reduce on a shared native PJRT topology. Explicit
+    /// remote device declarations return
+    /// [`SessionError::PlacementComparisonUnavailable`](crate::SessionError::PlacementComparisonUnavailable) before
+    /// readback when the placement requires a comparison. A digest that differs (including when data types or shapes
+    /// differ) or cannot be computed causes a [`ryft_pjrt::Error::FailedPrecondition`] on every process. The same
+    /// sequence of comparing placements on every process remains a precondition (refer to [`Session::place`]).
+    /// For any other target shared across processes, equal values remain an unchecked precondition.
+    ///
+    /// The host fallback reads back the combined value of an array with unreduced axes and uploads it again
+    /// as [`Array::from_host_buffer`] does, so when the target keeps an unreduced axis, it redistributes the
+    /// contributions along that axis. With [`UnreducedKind::Sum`], the devices at coordinate zero along it hold the
+    /// whole value and the others hold the additive identity. With [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
+    /// every device along it holds the whole value, which is its own extremum. The logical value is the same, but the
+    /// shards of the result can then differ from those that a device strategy would produce.
+    ///
+    /// The result always belongs to `session`, even when it is this array or shares its buffers. An array of another
+    /// PJRT client (e.g., of another backend) is read back and uploaded onto the devices that `target` names, because
+    /// PJRT copies buffers only within one client, as JAX places an array onto the devices of another backend. That
+    /// uses the host path directly. For an array with bytes, the placement must keep no distinct contributions apart,
+    /// each target owner must be able to read the value back, and the target must lie on the devices of one process
+    /// unless this array is locally assigned. The memory follows the same rule as a transfer within one client.
+    /// The request must name the target devices, and the result is [committed](Self::is_committed) to them.
+    ///
+    /// When the host fallback also cannot satisfy the request, typically because some source shards that the value
+    /// needs live on a remote process or because the source varies along manual mesh axes, the original error of the
+    /// device work is propagated as the most informative diagnostic.
+    ///
+    /// The target uses the requested [`Memory`](ryft_core::Memory). When the memory is omitted, a target that names a
+    /// single device (i.e., a [`PlacementRequest::Device`]) uses the default memory of that device for every source,
+    /// including one in pinned host memory, and a mesh or sharding target keeps the memory of the source. PJRT
+    /// cross-host receives land in device memory and can then be copied to the requested memory on that device. An
+    /// explicit [`Layout`](ryft_core::Layout) applies to each target shard. When the layout is omitted, the result
+    /// keeps the layout of the source only while that layout still describes each target shard (e.g., the strides of a
+    /// column shard do not describe the whole value that a gather produces), and declares no layout otherwise. Layout
+    /// changes use a compiled conversion on each shard's device when supported. Otherwise, each affected local shard is
+    /// read back and uploaded in the requested layout in the background, as for the host fallback. Both paths preserve
+    /// the separate contributions along unreduced axes.
+    ///
+    /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
+    /// lets PJRT reuse the source buffers for the target where it can, which may avoid an extra allocation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
+    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] describing where to place the array.
+    #[inline]
+    pub fn to_placement<P: Into<PlacementRequest>>(&self, session: &Session, target: P) -> Result<Self, Error> {
+        self.clone()
+            .place_with_request(session, target.into(), false, ValueComparison::of_session(session)?)
+    }
+
+    /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the target.
+    ///
+    /// Donation is best effort. Only the compiled reshard on the mesh of this array donates its input, and PJRT may
+    /// then reuse a source buffer for a target shard, which can save the memory of the source array for large training
+    /// tensors. Nothing guarantees that saving. A buffer can be reused only when every device holds a shard of the same
+    /// type before and after the reshard, which is when the lowering pairs the output of the reshard with its donated
+    /// input (e.g., completing a pending sum keeps the buffers of a uniquely owned array on the CPU plugin), and not
+    /// when the shards change shape (e.g., moving a uniquely owned `64x64` array from row shards to replicas on four
+    /// devices allocates four new buffers). The other strategies (e.g., moves of whole shards, shard regions, a reshard
+    /// across meshes, or the host fallback) do not donate, a buffer that another handle shares is never donated, and
+    /// PJRT may still allocate new output buffers. Because `self` is consumed at the language boundary, the donated
+    /// buffers are not observable to the caller after this function returns.
+    ///
+    /// The strategies follow [`Self::to_placement`], and donation never changes which of them is chosen, so the
+    /// compiled reshard of an array with a pending reduction (i.e., unreduced axes in its runtime sharding) completes
+    /// or keeps the reduction on the devices with or without donation, and a change of reduction state that the
+    /// compiled reshard cannot make (e.g., introducing a pending maximum, or completing a pending maximum of floating
+    /// point values) takes the host fallback from both entry points. Donation changes only what follows a compiled
+    /// reshard whose execution fails while this array holds its buffers exclusively, which may have handed them to
+    /// PJRT. [`Self::to_placement`] then still falls back to a host transfer, whereas this function returns the error.
+    /// When another handle shares the buffers of this array (e.g., a clone that the caller keeps), nothing can be
+    /// donated, and this function falls back as [`Self::to_placement`] does.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
+    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] describing where to place the array.
+    #[inline]
+    pub fn into_placement<P: Into<PlacementRequest>>(self, session: &Session, target: P) -> Result<Self, Error> {
+        self.place_with_request(session, target.into(), true, ValueComparison::of_session(session)?)
+    }
+
+    /// Places this array as `request` asks, which [`Self::to_placement`] and [`Self::into_placement`]
+    /// do with the [`ValueComparison`] of `session`. The request is resolved against this array (refer to
+    /// [`Self::resolve_placement_request`]) and placed with [`Self::place_within_client`], or with
+    /// [`Self::place_across_clients`] for an array of another PJRT client than that of `session`. Only a request
+    /// that names neither devices nor a sharding (i.e., an [`PlacementRequest::InPlace`] request, which names only a
+    /// memory or a layout) leaves the result on the devices that this process chose on its own when this array has such
+    /// devices, because every other request names the devices of the result (refer to [`Self::is_locally_assigned`]).
+    ///
+    /// Every process places its own value of such an array, so when `comparison` applies to `request` (refer to
+    /// [`ValueComparison::applies`]), this function submits one comparison before executing the placement. It submits
+    /// the digest of the value or a poison contribution if the local request is invalid or the readback fails. Each
+    /// process participates before returning its local error, and the result joins the verdict. [`Session::place`]
+    /// places its leaves with `comparison` set to [`None`], because it compares the values of all of them at once.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
+    ///   - `request`: [`PlacementRequest`] that specifies the target.
+    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array
+    ///     for its output (refer to [`Self::place_within_client`]).
+    ///   - `comparison`: [`ValueComparison`] of the values of the processes, if this placement makes one.
+    pub(super) fn place_with_request(
+        self,
+        session: &Session,
+        request: PlacementRequest,
+        donate: bool,
+        comparison: Option<&ValueComparison>,
+    ) -> Result<Self, Error> {
+        let in_place = matches!(request, PlacementRequest::InPlace { .. });
+        let locally_assigned = self.is_locally_assigned();
+        let collective = comparison
+            .filter(|comparison| locally_assigned && comparison.applies(Some(&request)))
+            .map(|comparison| comparison.collective(session))
+            .transpose()?;
+        let same_client = std::ptr::eq(self.client(), session.client());
+        let target = self
+            .validate_placement_client(session, Some(&request))
+            .and_then(|_| self.checked_target(session, request, collective.is_some()));
+        let verdict = collective
+            .map(|collective| {
+                let digest = target.as_ref().ok().and_then(|_| combined_digest([array_value_digest(&self)]));
+                collective.submit(session, digest)
+            })
+            .transpose();
+        let target = target?;
+        let verdict = verdict?;
+        let output = match same_client {
+            true => self.place_within_client(session, &target, donate)?,
+            false => self.place_across_clients(session, &target)?,
+        };
+
+        // A target that names devices can already hold the input that this process chose on its own, while another
+        // process must move its input there, so such a placement is a new array on every process (refer to the identity
+        // rules of `RetainedArray`).
+        let output = if locally_assigned && !in_place { output.with_new_identity() } else { output };
+        Ok(output.with_locally_assigned(locally_assigned && in_place).with_value_comparison(verdict))
+    }
+
+    /// Checks that `session` can place this array onto `request`, which [`Self::place_with_request`] and the
+    /// admission of an [`Array`] leaf of [`Session::place`] both check before anything else that concerns this array.
+    /// A same-client placement first checks that `session` can bind the source (refer to [`Self::with_session`]).
+    /// An array of another PJRT client can be placed only onto a `request` that names devices of the client of
+    /// `session` (refer to [`Self::place_across_clients`]).
+    fn validate_placement_client(&self, session: &Session, request: Option<&PlacementRequest>) -> Result<(), Error> {
+        match request {
+            _ if std::ptr::eq(self.client(), session.client()) => self.validate_session_placement(session),
+            Some(PlacementRequest::InPlace { .. }) => Err(PjrtError::invalid_argument(
+                "cannot place an array of another PJRT client without naming the devices of the target, \
+                 because the result must live on devices of the client of the session",
+            )
+            .into()),
+            Some(_) => Ok(()),
+            None => self.validate_session_placement(session),
+        }
+    }
+
     /// Checks the placement of this array as [`Placeable::place_parameter`] does before it resolves its destination,
     /// and returns `target` with a sharding that is padded to the rank of this array. Both [`Placeable`] functions of
     /// [`Array`] call this function, so that they accept the same placements.
