@@ -127,7 +127,7 @@ use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDisp
 use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::emissions::{emitted_regions, omits_operation_regions};
 use crate::lowering::extensions::{
-    RequestedPlacement, merge_requested_placement, owned_session_constants, placement_requests,
+    RegionPlacementSummary, RequestedPlacement, merge_requested_placement, owned_session_constants,
     requested_placement_mesh,
 };
 use crate::lowering::modules::render_devices;
@@ -1611,15 +1611,15 @@ impl Context for Session {
         };
 
         // An operation with regions whose regions request placements onto devices names those devices, as a compiled
-        // function that names devices does (refer to `requested_placement_mesh`), so without committed operands it
-        // runs on them. Committed operands decide the mesh instead, and the compilation of the program rejects a
-        // region that places a value onto other devices. An operation without regions, which is the common case, pays
-        // for the first test alone, and one whose regions request no devices behaves as if they requested none. Only
-        // the regions that lowering emits for the platform of this session request anything (refer to
-        // `placement_requests`), so an operation whose regions lowering omits requests nothing. The devices that each
-        // attached region requests depend on that region and on the platform alone, so they are derived once for each
-        // region and retained with it (refer to `RequestedPlacementMesh`), and repeated applications only look them
-        // up and merge them.
+        // function that names devices does (refer to `requested_placement_mesh`), so without committed operands it runs
+        // on them. Committed operands decide the mesh instead, and the compilation of the program rejects a region that
+        // places a value onto other devices. An operation without regions, which is the common case, pays for the first
+        // test alone, and one whose regions request no devices behaves as if they requested none. Only the regions that
+        // lowering emits for the platform of this session request anything (refer to
+        // `RegionPlacementSummary::requests`), so an operation whose regions lowering omits requests nothing. The
+        // devices that each attached region requests depend on that region and on the platform alone, so they are
+        // derived once for each region and retained with it (refer to `RequestedPlacementMesh`), and repeated
+        // applications only look them up and merge them.
         let requested_mesh = if has_regions
             && !is_call
             && !omits_own_regions
@@ -1655,7 +1655,8 @@ impl Context for Session {
         // the devices of the operation instead (e.g., a value committed in place in its memory whose regions place it
         // onto the device where it already is), so that a later transfer of the results to another process is planned
         // as a shared transfer (refer to `Self::assigns_placement_locally`). The requests are retained with each region
-        // (refer to `placement_requests`), so this costs a look-up for each region and nothing without regions.
+        // (refer to `RegionPlacementSummary::requests`), so this costs a look-up for each region and nothing without
+        // regions.
         let named = requested_mesh.is_some()
             || (has_regions
                 && !is_call
@@ -1665,7 +1666,8 @@ impl Context for Session {
                     .enumerate()
                     .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
                     .any(|(_, region)| {
-                        placement_requests(region, target_platform)
+                        RegionPlacementSummary::new(region, target_platform)
+                            .requests()
                             .iter()
                             .any(|(request, _)| matches!(request, RequestedPlacement::Devices(_)))
                     }));

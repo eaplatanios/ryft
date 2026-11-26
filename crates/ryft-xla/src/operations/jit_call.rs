@@ -681,9 +681,9 @@ impl<T: CoreType> JitCallOperation<T> {
     /// `ProgramLoweringExtension::pruned_for_lowering`) can record a mesh that only a request of a dropped output
     /// named, which this function no longer reports, as JAX lowers a nested `jit` function pruned to the outputs that
     /// its caller uses and so without the shardings of the dropped ones. The analysis of a program (refer to
-    /// `placement_requests` and `ProgramLoweringExtension::pruned_for_lowering`) answers `callee_names_devices` with
-    /// the facts of the callee that it derives in the same pass over the program, so that it never analyses a callee
-    /// again for each call that encloses it.
+    /// `RegionPlacementSummary::requests` and `ProgramLoweringExtension::pruned_for_lowering`) answers
+    /// `callee_names_devices` with the facts of the callee that it derives in the same pass over the program, so that
+    /// it never analyses a callee again for each call that encloses it.
     pub(crate) fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
@@ -1366,16 +1366,16 @@ impl JitCallOperation<Type> {
         validate_input_reduction(array, &expected, index, self.capture_count)
     }
 
-    /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the call
-    /// names devices (refer to [`Self::names_devices`]) or the callee requests a placement anywhere in the regions that
+    /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the call names
+    /// devices (refer to [`Self::names_devices`]) or the callee requests a placement anywhere in the regions that
     /// lowering emits for it, including one that only moves a value to another memory (refer to
     /// `has_placement_requests_in_region`). Every such request commits every result of the call (refer to
     /// [`commits_public_outputs`]), which the placement decision of an eager application (refer to
     /// [`Self::eager_decision`]) and the forwarding of partial evaluation (refer to [`Self::returns_input_unchanged`])
     /// read from here, for the platform `target_platform` that the call is lowered for ([`None`] for no target). The
     /// requests of a callee depend on the callee and the platform alone, so they are derived once for each callee and
-    /// platform and retained with the callee (refer to `placement_requests`), and repeated applications only look them
-    /// up.
+    /// platform and retained with the callee (refer to `RegionPlacementSummary::requests`), and repeated applications
+    /// only look them up.
     pub(crate) fn requests_placement<V, O>(&self, callee: RegionRef<'_, V, O>, target_platform: Option<&str>) -> bool
     where
         V: CoreValue<Type = Type> + 'static,
