@@ -106,16 +106,16 @@ use std::sync::{Arc, OnceLock};
 use ryft_core::macros::check_count;
 use ryft_core::{
     Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Atom, AttachedRegions, COMPOSITE_OPERATION_NAME,
-    CapturePlacement, CapturePlacementContext, CapturingContext, CastType, Compare, CompilationCache, Concretizable,
-    Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar,
-    DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache, Domain, DomainTracer, EagerContext,
-    EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance, InterpretableOperation,
-    LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis, NestedTracingContext,
-    Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramBuilder, ProgramError, Provenance,
-    ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementRequests, RegionRole, RequestedPlacement,
-    Sharding, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform,
-    TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation,
-    declared_input_sharding, decode_logical_bytes,
+    CallOperation, CapturePlacement, CapturePlacementContext, CapturingContext, CastType, Compare, CompilationCache,
+    Concretizable, Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh,
+    DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache, Domain,
+    DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance,
+    InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
+    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramBuilder,
+    ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementRequests, RegionRole,
+    RequestedPlacement, Sharding, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics,
+    TracingContext, Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection,
+    Zero, ZeroOperation, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -2235,8 +2235,9 @@ impl Context for Session {
                         // (refer to `receivable_argument_sharding`). The executable of a call whose callee has input
                         // overrides therefore declares every input as a direct execution of its callee does: an input
                         // with an override at that override, and every other input at its eager placement, or as its
-                        // declared type places it (refer to `declared_input_sharding`), which the admission of the call
-                        // has made free of such reductions (refer to `CallEagerExtension::eager_decision`).
+                        // declared type places it (refer to `CallOperation::declared_input_sharding`), which the
+                        // admission of the call has made free of such reductions (refer to
+                        // `CallEagerExtension::eager_decision`).
                         let input_shardings = match (&operation, &callee_input_types, &input_placements, operand_mesh) {
                             (Operation::Call(call), Some(declared), Some(placements), Some(mesh))
                                 if (0..inputs.len()).any(|index| call.input_sharding(index).is_some()) =>
@@ -2259,7 +2260,9 @@ impl Context for Session {
                                         .zip(declared)
                                         .map(|(placement, declared)| match placement {
                                             Some(placement) => placement.clone(),
-                                            None => declared_input_sharding(declared, mesh.logical_mesh()),
+                                            None => {
+                                                CallOperation::declared_input_sharding(declared, mesh.logical_mesh())
+                                            }
                                         })
                                         .collect::<Vec<_>>(),
                                 )

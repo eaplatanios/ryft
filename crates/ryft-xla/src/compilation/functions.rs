@@ -245,14 +245,14 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{
     ArrayIrBatchingPolicy, ArrayType, Batch, BatchAxis, BatchAxisSpecification, BatchingError, BatchingTracer,
-    CapturePlacementContext, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
+    CallOperation, CapturePlacementContext, ClosedProgram, Compile, CompiledFunction as CoreCompiledFunction,
     CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher, ConstrainSharding, Context, ContextProjection,
     DeviceMesh, DifferentiableType, Dimension, DimensionValue, DispatcherStatistics, DomainTracingContext,
     ExecutableFunction as CoreExecutableFunction, ForwardModeDifferentiate, ImportingContext, MeshAxisType,
     MeshContext, NamedAxes, Parameter, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
     ProjectedValue, Reshard, ReverseModeDifferentiate, Sharding, ShardingDimension,
     StagedFunction as CoreStagedFunction, StatefulExecution, Tracer, TypeError, Typed, Value as CoreValue,
-    ValueProjection, boundary_input_type, declared_input_sharding,
+    ValueProjection,
 };
 use ryft_pjrt::Execution;
 
@@ -1656,13 +1656,13 @@ where
 
         // Insert the batch axis into the type of every mapped input leaf with the requested placement, normalizing it
         // against the batched rank as `batch` does for its inputs. The requested placement is first validated against
-        // the placement with which this function receives the item (refer to `declared_input_sharding`), whatever the
-        // item type records, so that a request that no placement can satisfy (e.g., one that names a mesh axis that
-        // the mesh of this function lacks, or one that the placement of the item already uses) is rejected with the
-        // error of `Sharding::batched`, as it is for an item type that records a sharding. An item type that records
-        // no sharding is then refined by that placement (refer to `boundary_input_type`), as the batching rule of a
-        // call of this function refines it, so that the batch axis keeps its placement. A valid placement that no type
-        // can record (i.e., along an auto mesh axis) leaves the item type as it is.
+        // the placement with which this function receives the item (refer to `CallOperation::declared_input_sharding`),
+        // whatever the item type records, so that a request that no placement can satisfy (e.g., one that names a mesh
+        // axis that the mesh of this function lacks, or one that the placement of the item already uses) is rejected
+        // with the error of `Sharding::batched`, as it is for an item type that records a sharding. An item type that
+        // records no sharding is then refined by that placement (refer to `CallOperation::boundary_input_type`), as the
+        // batching rule of a call of this function refines it, so that the batch axis keeps its placement. A valid
+        // placement that no type can record (i.e., along an auto mesh axis) leaves the item type as it is.
         let batch_sharding = sharding.clone().unwrap_or_else(ShardingDimension::replicated);
         let mesh = staged.options().mesh().logical_mesh().clone();
         let batched_input_types = input_types
@@ -1675,10 +1675,10 @@ where
                     let dimension = Dimension::Static(extent);
                     let refined = match &sharding {
                         Some(_) => {
-                            let boundary = declared_input_sharding(&r#type, &mesh);
+                            let boundary = CallOperation::declared_input_sharding(&r#type, &mesh);
                             match boundary.batched(position, batch_sharding.clone())?.references_auto_axis() {
                                 true => None,
-                                false => boundary_input_type(&r#type, &boundary),
+                                false => CallOperation::boundary_input_type(&r#type, &boundary),
                             }
                         }
                         None => None,
@@ -9631,7 +9631,7 @@ mod tests {
         // The requested placement splits the batch items across `x`, exactly like uncompiled batching of an input
         // whose batch dimension is sharded along `x`, whether or not the item type records a sharding, because an item
         // type without one is first refined by the placement with which the function receives it, as the batching rule
-        // of a call refines it (refer to `boundary_input_type`), and as JAX splits the batch of
+        // of a call refines it (refer to `CallOperation::boundary_input_type`), and as JAX splits the batch of
         // `jit(vmap(jit(sin), spmd_axis_name='x'))`. A replicated input or output override of the function places each
         // batch item as its replicated type does and says nothing about the batch dimension, so it changes nothing.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);

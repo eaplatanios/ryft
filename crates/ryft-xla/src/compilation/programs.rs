@@ -10,9 +10,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ryft_core::{
-    ArrayType, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram, declared_input_sharding,
-};
+use ryft_core::{ArrayType, CallOperation, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram};
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 use ryft_pjrt::{ExecutionFence, LoadedExecutable};
 
@@ -192,7 +190,7 @@ impl RemoteEagerProgram {
                 }
                 Some(match physical_index {
                     Some(index) => program.expected_argument_shardings[*index].clone(),
-                    None => declared_input_sharding(input_type, program.mesh.logical_mesh()),
+                    None => CallOperation::declared_input_sharding(input_type, program.mesh.logical_mesh()),
                 })
             })
             .collect();

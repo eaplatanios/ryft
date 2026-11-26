@@ -60,10 +60,7 @@ pub use attention::{
     DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DifferentiableDotProductAttention, DotProductAttention,
     differentiable_dot_product_attention, dot_product_attention,
 };
-pub use call::{
-    CALL_OPERATION_NAME, CallOperation, RegionPlacementRequests, RequestedPlacement, boundary_input_type,
-    declared_input_sharding,
-};
+pub use call::{CALL_OPERATION_NAME, CallOperation, RegionPlacementRequests, RequestedPlacement};
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,
     CollectiveOperations, CollectiveOptions, HiddenAxes, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,

@@ -197,9 +197,9 @@ pub use operations::{
     TrigonometricOperations, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation,
     VjpComposite, WHILE_OPERATION_NAME, WeakCustomRuleReference, While, WhileOperation, WhileOptions, WhilePredicate,
     WhileType, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation, associative_scan, auto_axes, block_scaled_dot, boundary_input_type, composite,
-    declared_input_sharding, differentiable_dot_product_attention, dot_product_attention, einsum, einsum_with_options,
-    explicit_axes, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, softmax,
+    ZeroLikeOperation, ZeroOperation, associative_scan, auto_axes, block_scaled_dot, composite,
+    differentiable_dot_product_attention, dot_product_attention, einsum, einsum_with_options, explicit_axes, scan,
+    shard_map, shard_map_along, shard_map_with_inferred_input_shardings, softmax,
     softmax_cross_entropy_with_target_logits, r#while,
 };
 pub use parameters::{

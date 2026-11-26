@@ -7,13 +7,13 @@
 //! differentiation, and transposition. Every rule keeps a call boundary on the calls that it derives instead of
 //! inlining the callee, so a transformed call still runs its callee as one function.
 //!
-//! A backend lowers calls and applies them on its own runtime. It reads the boundary through the functions
-//! of [`CallOperation`] and through the free functions of this module (e.g., [`declared_input_sharding`]), so that
-//! every entry point of the backend agrees with these rules on where a call places its inputs. The interpretation of
-//! a call in the eager contexts of this crate (i.e., [`EagerContext`] and the [`LockstepDomain`] of the `shard_map`
-//! emulation) is the reference semantics of a call, which runs the callee region on the inputs that the type rule
-//! of the call accepts and returns the outputs of the callee. A backend with a device runtime implements the
-//! interpretation for its own context instead (e.g., by compiling the callee and executing it).
+//! A backend lowers calls and applies them on its own runtime. It reads the boundary through the functions of
+//! [`CallOperation`] (e.g., [`CallOperation::declared_input_sharding`]), so that every entry point of the backend
+//! agrees with these rules on where a call places its inputs. The interpretation of a call in the eager contexts
+//! of this crate (i.e., [`EagerContext`] and the [`LockstepDomain`] of the `shard_map` emulation) is the reference
+//! semantics of a call, which runs the callee region on the inputs that the type rule of the call accepts and returns
+//! the outputs of the callee. A backend with a device runtime implements the interpretation for its own context instead
+//! (e.g., by compiling the callee and executing it).
 
 use std::any::TypeId;
 use std::borrow::Cow;
@@ -656,7 +656,7 @@ impl<T: ArrayMemberType> CallOperation<T> {
                     Some(mesh) => mesh.logical_mesh(),
                     None => actual.sharding()?.mesh(),
                 };
-                Cow::Owned(declared_input_sharding(declared, mesh))
+                Cow::Owned(CallOperation::declared_input_sharding(declared, mesh))
             }
         };
 
@@ -665,6 +665,21 @@ impl<T: ArrayMemberType> CallOperation<T> {
 }
 
 impl CallOperation<ArrayIrType> {
+    /// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places
+    /// a public argument of declared type `input_type` that has no input sharding override and no runtime placement
+    /// (e.g., of a Just-In-Time compilation dispatcher), which is the sharding of that type, and otherwise replicated
+    /// over `mesh`. A call of a function compiled for its input types places its inputs by this same rule (i.e., using
+    /// [`Self::boundary_input_sharding`]), so that a direct execution, an eager call, and a nested call place an input
+    /// alike. This function takes no call, because a backend also applies the rule where it executes or compiles a
+    /// function directly.
+    #[inline]
+    pub fn declared_input_sharding(input_type: &ArrayType, mesh: &LogicalMesh) -> Sharding {
+        input_type
+            .sharding()
+            .cloned()
+            .unwrap_or_else(|| Sharding::replicated(mesh.clone(), input_type.shape().rank()))
+    }
+
     /// Returns the sharding to which an eager application of this call places callee input `index`, which receives
     /// an argument of type `actual`, on the devices of that argument before the callee runs. This is the effective
     /// boundary sharding of the input (i.e., [`Self::boundary_input_sharding`]), and, for an argument on one device,
@@ -682,6 +697,26 @@ impl CallOperation<ArrayIrType> {
     ) -> Option<Cow<'s, Sharding>> {
         let includes_single_device = actual.sharding().is_some_and(|sharding| sharding.mesh().device_count() == 1);
         self.boundary_input_sharding_with(index, actual, declared, includes_single_device)
+    }
+
+    /// Returns `input_type`, the declared type of an input of a compiled function, refined by `boundary`,
+    /// the placement with which the executable of the function receives it (e.g., the input override or
+    /// [`Self::declared_input_sharding`]), when `input_type` records no sharding, and [`None`] when it records one or
+    /// when `boundary` states more than such a type can (e.g., a pending reduction, which a type without a sharding
+    /// never describes). The refined type records the placement of `boundary` without its auto mesh axes, which types
+    /// never record. A transform that inserts a dimension into each item of an input (e.g., batching, which places the
+    /// new dimension as its batch specification requests, refer to [`ArrayType::batched`]) starts from this type, so
+    /// that the placement of the new dimension is kept for an item type that records none. Every entry point that
+    /// batches a compiled function (i.e., the batching of a compiled function by a backend and the batching rule
+    /// of a call of one) refines its item types by this rule. This function takes no call for the same reason as
+    /// [`Self::declared_input_sharding`].
+    #[inline]
+    pub fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Option<ArrayType> {
+        if input_type.sharding().is_some() {
+            return None;
+        }
+        let boundary_type = input_type.clone().with_sharding(boundary.without_auto_axes()).ok()?;
+        input_type.is_refined_by(&boundary_type).then_some(boundary_type)
     }
 
     /// Returns the effective boundary sharding of callee input `index` (i.e., [`Self::boundary_input_sharding`]) when
@@ -2027,37 +2062,6 @@ impl RegionPlacementRequests {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
-/// public argument of declared type `input_type` that has no input sharding override and no runtime placement (e.g.,
-/// of a `jit` dispatcher), which is the sharding of that type, and otherwise replicated over `mesh`. A call of a
-/// function compiled for its input types places its inputs by this same rule (refer to
-/// [`CallOperation::boundary_input_sharding`]), so that a direct execution, an eager call, and a nested call place
-/// an input alike.
-pub fn declared_input_sharding(input_type: &ArrayType, mesh: &LogicalMesh) -> Sharding {
-    input_type
-        .sharding()
-        .cloned()
-        .unwrap_or_else(|| Sharding::replicated(mesh.clone(), input_type.shape().rank()))
-}
-
-/// Returns `input_type`, the declared type of an input of a compiled function, refined by `boundary`, the placement
-/// with which the executable of the function receives it (e.g., the input override or [`declared_input_sharding`]),
-/// when `input_type` records no sharding, and [`None`] when it records one or when `boundary` states more than such a
-/// type can (e.g., a pending reduction, which a type without a sharding never describes). The refined type records the
-/// placement of `boundary` without its auto mesh axes, which types never record. A transform that inserts a dimension
-/// into each item of an input (e.g., batching, which places the new dimension as its batch specification requests,
-/// refer to [`ArrayType::batched`]) starts from this type, so that the placement of the new dimension is kept for an
-/// item type that records none, as JAX places the batch of `jit(vmap(jit(f), spmd_axis_name='x'))` along `x`. Every
-/// entry point that batches a compiled function (i.e., the batching of a compiled function by a backend and the
-/// batching rule of a call of one) refines its item types by this rule.
-pub fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Option<ArrayType> {
-    if input_type.sharding().is_some() {
-        return None;
-    }
-    let boundary_type = input_type.clone().with_sharding(boundary.without_auto_axes()).ok()?;
-    input_type.is_refined_by(&boundary_type).then_some(boundary_type)
-}
-
 /// Formal callee input types and caller result types that bind [`TypeIdentity`](crate::TypeIdentity)s across one
 /// sealed call boundary. The bindings are encoded in these two type signatures, and the stored metadata contains no
 /// runtime values.
@@ -2682,8 +2686,9 @@ fn placement_request<O: Operation<Type = ArrayIrType> + OperationPayloadProjecti
 ///   - An input of a callee input type without a sharding is placed at its boundary sharding, which is its sharding
 ///     override, its derived sharding, or the sharding that replicates it over the mesh of the call, including the
 ///     logical mesh of a placement over a single device, as far as its type records that sharding (refer to
-///     [`boundary_input_type`]). Placement along auto mesh axes is runtime state that neither types nor the values of
-///     the reference backend record (refer to [`Placed`](crate::operations::sharding::place::Placed)), so a backend
+///     [`CallOperation::boundary_input_type`]). Placement along auto mesh axes is runtime state that neither types
+///     nor the values of the reference backend record (refer to
+///     [`Placed`](crate::operations::sharding::place::Placed)), so a backend
 ///     applies it while this rule, as the reference rules of `place` and `constrain_sharding` do, keeps only the part
 ///     that types record. A boundary sharding that states more than a placement (e.g., a pending reduction) or that
 ///     `reshard` rejects (e.g., one that places a dimension along a manual mesh axis) is not applied at all. An input
@@ -2722,7 +2727,9 @@ fn interpret_call<C: Domain<Type = ArrayIrType>, D: InterpretationDriver<C>>(
                     Some(sharding) => Some(Cow::Borrowed(sharding)),
                     None => call
                         .eager_boundary_input_sharding(index, actual, declared)
-                        .and_then(|boundary| boundary_input_type(declared_type, &boundary)?.sharding().cloned())
+                        .and_then(|boundary| {
+                            CallOperation::boundary_input_type(declared_type, &boundary)?.sharding().cloned()
+                        })
                         .filter(|sharding| {
                             let reshard = ReshardOperation::new(sharding.clone());
                             reshard.infer_output_types(&[actual.clone()], &[]).is_ok()
@@ -3149,7 +3156,7 @@ where
         let (Ok(array_type), Some(sharding)) = (declared_type.as_array_type(), sharding) else { continue };
         // A boundary that states more than a placement (e.g., a pending reduction) does not refine a type without a
         // sharding, which describes a reduced value, and is left to the boundary of the batched call.
-        let Some(boundary_type) = boundary_input_type(array_type, sharding) else { continue };
+        let Some(boundary_type) = CallOperation::boundary_input_type(array_type, sharding) else { continue };
         refined.get_or_insert_with(|| declared.to_vec())[index] = T::from(boundary_type);
     }
     refined.map(|refined| callee.to_program().specialize(&refined)).transpose()
@@ -4551,6 +4558,53 @@ mod tests {
                 ))),
             );
         }
+    }
+
+    #[test]
+    fn test_call_operation_declared_input_sharding() {
+        // An executable places an argument of a declared type without a sharding replicated over its own mesh, and an
+        // argument of a declared type with a sharding at that sharding, whatever its own mesh is.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(
+            CallOperation::declared_input_sharding(&f32_vector_type(4), &mesh),
+            Sharding::replicated(mesh.clone(), 1),
+        );
+        assert_eq!(
+            CallOperation::declared_input_sharding(
+                &f32_vector_type(4).with_sharding(split.clone()).unwrap(),
+                &other_mesh,
+            ),
+            split,
+        );
+    }
+
+    #[test]
+    fn test_call_operation_boundary_input_type() {
+        // A declared type without a sharding takes the placement of its boundary without the auto mesh axes, which
+        // types never record.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let split = |axes: &[&str]| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]);
+        let item_type = f32_vector_type(4);
+        let split_type = item_type.clone().with_sharding(split(&["x"]).unwrap()).unwrap();
+        let replicated_type = item_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        assert_eq!(CallOperation::boundary_input_type(&item_type, &split(&["x"]).unwrap()), Some(split_type.clone()));
+        assert_eq!(
+            CallOperation::boundary_input_type(&item_type, &split(&["x", "a"]).unwrap()),
+            Some(split_type.clone()),
+        );
+        assert_eq!(CallOperation::boundary_input_type(&item_type, &split(&["a"]).unwrap()), Some(replicated_type));
+
+        // A declared type that records a sharding keeps it, and a boundary with a pending reduction states more than
+        // a type without a sharding can.
+        assert_eq!(CallOperation::boundary_input_type(&split_type, &split(&["x"]).unwrap()), None);
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(CallOperation::boundary_input_type(&item_type, &unreduced), None);
     }
 
     #[test]
@@ -10666,44 +10720,6 @@ mod tests {
         assert_eq!(RegionPlacementRequests::for_target(entry, "keeping", |_, _| false).requests(), &placed);
         assert_eq!(RegionPlacementRequests::new(entry).requests(), &placed);
         assert_eq!(RegionPlacementRequests::for_target(entry, "omitting", omits_scans).requests(), &[]);
-    }
-
-    #[test]
-    fn test_declared_input_sharding() {
-        // An executable places an argument of a declared type without a sharding replicated over its own mesh, and an
-        // argument of a declared type with a sharding at that sharding, whatever its own mesh is.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(declared_input_sharding(&f32_vector_type(4), &mesh), Sharding::replicated(mesh.clone(), 1));
-        assert_eq!(
-            declared_input_sharding(&f32_vector_type(4).with_sharding(split.clone()).unwrap(), &other_mesh),
-            split,
-        );
-    }
-
-    #[test]
-    fn test_boundary_input_type() {
-        // A declared type without a sharding takes the placement of its boundary without the auto mesh axes, which
-        // types never record.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let split = |axes: &[&str]| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]);
-        let item_type = f32_vector_type(4);
-        let split_type = item_type.clone().with_sharding(split(&["x"]).unwrap()).unwrap();
-        let replicated_type = item_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
-        assert_eq!(boundary_input_type(&item_type, &split(&["x"]).unwrap()), Some(split_type.clone()));
-        assert_eq!(boundary_input_type(&item_type, &split(&["x", "a"]).unwrap()), Some(split_type.clone()));
-        assert_eq!(boundary_input_type(&item_type, &split(&["a"]).unwrap()), Some(replicated_type));
-
-        // A declared type that records a sharding keeps it, and a boundary with a pending reduction states more than
-        // a type without a sharding can.
-        assert_eq!(boundary_input_type(&split_type, &split(&["x"]).unwrap()), None);
-        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(boundary_input_type(&item_type, &unreduced), None);
     }
 
     #[test]

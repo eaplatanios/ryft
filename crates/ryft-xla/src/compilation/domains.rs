@@ -16,7 +16,6 @@ use ryft_core::{
     LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized,
     PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME,
     Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
-    declared_input_sharding,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -620,7 +619,7 @@ impl Session {
                 };
                 match placement {
                     Some(placement) => receivable_argument_sharding(placement),
-                    None => Ok(declared_input_sharding(array_type, options.mesh().logical_mesh())),
+                    None => Ok(CallOperation::declared_input_sharding(array_type, options.mesh().logical_mesh())),
                 }
             })
             .collect::<Result<Vec<_>, Error>>()?;

@@ -34,7 +34,7 @@ use ryft_core::{
     AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, ConstrainShardingOperation, Device,
     DeviceMesh, EagerContext, FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation,
     Parameterized, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
-    RematerializationOptimizationBarrier, ShardMapOperation, Sharding, Typed, TypedProgram, declared_input_sharding,
+    RematerializationOptimizationBarrier, ShardMapOperation, Sharding, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -744,12 +744,13 @@ impl CallEagerExtension for CallOperation<Type> {
 /// Validates that `array`, the argument at `index` of an eager application of `call` for a callee input of type
 /// `declared`, carries no pending reduction that the executable of the callee cannot receive, by the rule with which an
 /// execution admits its arguments (refer to [`validate_input_reduction`]). That executable receives the argument at its
-/// eager placement (refer to [`CallEagerExtension::eager_input_placement`]), or else as `declared` places it (refer
-/// to [`declared_input_sharding`]). An input override of the callee is the argument sharding of that executable as
-/// stated, including a pending reduction over auto mesh axes that it states, which the executable completes where the
-/// argument enters, as a direct execution of the callee does. Any other placement is received without the pending
-/// reductions over auto mesh axes, which no type records (refer to [`Sharding::without_auto_axes`]), so such an
-/// argument is rejected. An argument without a pending reduction, which is the common case, costs one branch.
+/// eager placement (refer to [`CallEagerExtension::eager_input_placement`]), or else as `declared` places it (refer to
+/// [`CallOperation::declared_input_sharding`]). An input override of the callee is the argument sharding of that
+/// executable as stated, including a pending reduction over auto mesh axes that it states, which the executable
+/// completes where the argument enters, as a direct execution of the callee does. Any other placement is received
+/// without the pending reductions over auto mesh axes, which no type records (refer to
+/// [`Sharding::without_auto_axes`]), so such an argument is rejected. An argument without a pending reduction, which is
+/// the common case, costs one branch.
 ///
 /// # Errors
 ///
@@ -767,7 +768,7 @@ fn validate_input_admission(
     let expected = match (call.eager_input_placement(index, array, declared), declared) {
         (Some(placement), _) if call.input_sharding(index).is_some() => placement,
         (Some(placement), _) => placement.without_auto_axes(),
-        (None, Type::Array(declared)) => declared_input_sharding(declared, array.sharding().mesh()),
+        (None, Type::Array(declared)) => CallOperation::declared_input_sharding(declared, array.sharding().mesh()),
         (None, Type::Dimension(_) | Type::Reference(_)) => return Ok(()),
     };
     validate_input_reduction(array, &expected, index, call.capture_count())
