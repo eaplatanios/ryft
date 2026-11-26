@@ -2804,6 +2804,10 @@ impl Array {
 
 /// Device work that places an [`Array`] on a mesh with a sharding, which [`Array::device_placement_strategy`] chooses
 /// from information that every process shares, so that the processes of a placement agree on it.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "placement strategies are short-lived and keeping the gather plan inline avoids an extra allocation"
+)]
 enum DevicePlacementStrategy {
     /// Changes only the placement metadata of an array of [`DataType::Zero`], which has no buffers.
     Bufferless,
