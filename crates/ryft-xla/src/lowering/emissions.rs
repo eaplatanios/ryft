@@ -6,25 +6,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, AtomId, Instruction, Parameterized, Program, RegionRef, RegionRole, ScanOperation, Typed, TypedProgram,
-    Value,
+    ArrayType, AtomId, CallOperation, Instruction, Parameterized, Program, RegionRef, RegionRole, ScanOperation, Typed,
+    TypedProgram, Value,
 };
 
 use crate::lowering::LowerableOperationFamily;
-use crate::lowering::types::stable_hlo_dynamic_dimension_bound;
 use crate::operations::call::CallFunctionMap;
-use crate::{CallOperation, Constant, RetainedArray, Type};
+use crate::{Constant, RetainedArray, Type};
 
 // TODO(eaplatanios): Review this module.
-
-/// Returns `true` if the length of `scan` admits an iteration, which is false for a static length of zero and for a
-/// dynamic length whose bounds admit only zero. The lowering of a scan that admits no iteration emits nothing of its
-/// body, and this is the one decision of that, which the walks that follow the regions that lowering emits read
-/// (refer to `omits_regions`).
-pub(crate) fn admits_iterations(scan: &ScanOperation<Type>) -> bool {
-    let length = scan.iteration_count();
-    length.value() != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0)
-}
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
 /// named composite call, which `LowerableOperation::composite_key` identifies, that a backend implementation replaces
@@ -46,15 +36,15 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 
 /// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
 /// for a named composite call whose backend implementation replaces the whole call for that target (refer to
-/// `LowerableOperation::has_composite_implementation`) and, on every target, for a scan whose length admits no iteration (refer
-/// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
-/// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
-/// functions that calls share (refer to `collect_call_functions`), the traversal of the regions that lowering emits
-/// (refer to `emitted_regions`, which compilation admission also reads), the summaries of the placement requests and of
-/// the session constants of a region, and the validation of the placements of a compiled program (refer to
-/// `validate_placements`), so that a placement request or a captured array inside a region that lowering omits is never
-/// validated, placed, or passed. The eager application of an operation asks the same question of that operation (refer
-/// to [`omits_operation_regions`]).
+/// `LowerableOperation::has_composite_implementation`) and, on every target, for a scan with zero iterations (refer
+/// to [`ScanOperation::has_zero_iterations`], which its lowering reads). This is the one test of whether lowering
+/// for a target emits the regions of an instruction, which the walks that follow the regions that lowering
+/// emits read: the collector of the functions that calls share (refer to `collect_call_functions`), the traversal of
+/// the regions that lowering emits (refer to `emitted_regions`, which compilation admission also reads), the summaries
+/// of the placement requests and of the session constants of a region, and the validation of the placements of a
+/// compiled program (refer to `validate_placements`), so that a placement request or a captured array inside a region
+/// that lowering omits is never validated, placed, or passed. The eager application of an operation asks the same
+/// question of that operation (refer to [`omits_operation_regions`]).
 pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
@@ -80,7 +70,7 @@ pub(crate) fn omits_operation_regions<O: LowerableOperationFamily>(
     boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
     target_platform: Option<&str>,
 ) -> bool {
-    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(|scan| !admits_iterations(scan)) {
+    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
         return true;
     }
     let Some(key) = operation.composite_key() else {
@@ -142,7 +132,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 /// its instructions or as one of its outputs. Every region names a capture through a constant whose
 /// [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e., when
 /// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
-/// that only the body of a scan that admits no iteration reads) is neither admitted when a function is compiled nor
+/// that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor
 /// passed to its executable, whose signature erases it (refer to `lower_mlir_module_for_program_with_effect_boundary`),
 /// so that admission and lowering read this one decision. A capture that a region only passes on to a call as a
 /// capture which the callee never reads is not read either (refer to [`visit_emitted_reads`]). The regions of the

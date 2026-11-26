@@ -1034,6 +1034,13 @@ impl<T: Type> ScanOperation<T> {
         &self.iteration_count
     }
 
+    /// Returns whether the declared iteration count proves that this [`ScanOperation`] never runs its body.
+    /// This holds for a static count of zero and for a dynamic count whose bounds are `[0, 1)`.
+    #[inline]
+    pub fn has_zero_iterations(&self) -> bool {
+        self.iteration_count().bounds().extent() == Some(0)
+    }
+
     /// Returns `true` when iterations of this [`ScanOperation`] visit the stacked slices in reverse order.
     #[inline]
     pub fn reverse(&self) -> bool {
@@ -25238,7 +25245,7 @@ mod tests {
 
         impl CapturePlacementContext for RecordingContext {}
 
-        let mesh =LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type =
             ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let varying_type = ArrayType::scalar(DataType::F32)

@@ -387,7 +387,7 @@ pub(crate) mod tests {
         AddOperation, Array as CoreArray, ArrayIrBatchingPolicy, ArrayIrOperation as CoreArrayIrOperation,
         ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, AtomId,
         AttentionConfiguration, AttentionImplementation, AttentionInputs, AxisIndex, AxisIndexOperation, BatchAxis,
-        BatchAxisSpecification, BatchedProgram, BatchingContext, BroadcastOperation, CollectiveOptions,
+        BatchAxisSpecification, BatchedProgram, BatchingContext, BroadcastOperation, CallOperation, CollectiveOptions,
         CompareOperation, ComparisonDirection, CompositeOperation, ConstantOperation, Context, ConvertElementType,
         ConvertElementTypeOperation, Cos, CotangentDestinationKind, CustomCallOperation, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionValue, DomainTracer,
@@ -643,6 +643,10 @@ pub(crate) mod tests {
 
         /// Map that doubles a reference replicated along the manual axis `x` on every device and reads it back.
         ReplicatedReference,
+
+        /// Map that calls a callee traced at the invariant type of its shard, which sums its input across the manual
+        /// axis `x` after `parallel_vary`, on that shard, which varies along `x`, and sums the result across `x`.
+        InvariantTracedCall,
     }
 
     /// Builds a program over `input_types` whose outputs are the atoms that `build` adds to it.
@@ -852,6 +856,28 @@ pub(crate) mod tests {
                     builder.add_instruction(vary, Vec::new(), vec![state], None).unwrap().to_vec()
                 });
                 (boundary, vec![ReferenceType::new(global_type).into()], body)
+            }
+            ShardMapDifferentialCase::InvariantTracedCall => {
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![sharded("x")], vec![replicated.clone()], vec!["x".into()])
+                        .unwrap();
+                let global_type = f32_type(&[2], &sharded("x"));
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let invariant_type = f32_type(&[1], &replicated);
+                let callee = build_differential_program::<V, O>(vec![invariant_type.into()], |builder, inputs| {
+                    let vary = array_operation(ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".into())));
+                    let varying = builder.add_instruction(vary, Vec::new(), inputs.to_vec(), None).unwrap()[0];
+                    let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x.clone()));
+                    builder.add_instruction(sum, Vec::new(), vec![varying], None).unwrap().to_vec()
+                });
+                let body = build_differential_program::<V, O>(vec![local_type.into()], |builder, inputs| {
+                    let callee = builder.import_program(callee);
+                    let call = CoreArrayIrOperation::<A>::Call(CallOperation::new(0));
+                    let call = builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap()[0];
+                    let sum = array_operation(ArrayOperation::ParallelReduce(sum_over_x));
+                    builder.add_instruction(sum, Vec::new(), vec![call], None).unwrap().to_vec()
+                });
+                (boundary, vec![global_type.into()], body)
             }
         };
         let operation = ShardMapOperation::from_program(&body, global_input_types, boundary).unwrap();
@@ -3287,7 +3313,9 @@ pub(crate) mod tests {
         // The reference backend's lockstep emulation of `shard_map` and XLA's manual computation agree exactly on
         // boundary splitting and assembly, on every collective over the manual axis, and on reference accesses and
         // write-back (e.g., reads of a replicated reference at indices that vary across devices and invariant mutations
-        // of a replicated reference).
+        // of a replicated reference). They also agree on a call of a callee traced at invariant types on a value that
+        // varies across devices, which the emulation runs at those types and XLA lowers as traced, so that both compute
+        // its collectives on the value of every device.
         let client = cpu_client(2);
         assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::IdentityAndSum);
         assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::AxisIndex);
@@ -3297,6 +3325,7 @@ pub(crate) mod tests {
         assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::Reference);
         assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::VaryingIndexReference);
         assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::ReplicatedReference);
+        assert_shard_map_emulation_matches_execution(client, ShardMapDifferentialCase::InvariantTracedCall);
     }
 
     #[test]

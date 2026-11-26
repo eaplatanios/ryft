@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, AtomId, BroadcastOperation, DeviceMesh, Instruction, LogicalMesh, MeshAxisType,
+    ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, Instruction, LogicalMesh, MeshAxisType,
     Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily, PlaceOperation,
     PlacementRequest, Program, ProgramError, Region as CoreRegion, RegionId, RegionPlacementSummary, RegionRef,
     RequestedPlacement, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
@@ -17,7 +17,7 @@ use crate::lowering::emissions::{
 };
 use crate::lowering::modules::{lower_mlir_module_for_program_with_value_shardings, render_devices};
 use crate::lowering::{LowerableOperationFamily, LoweringError};
-use crate::{CallOperation, Constant, Error, Operation, RetainedArray, Type};
+use crate::{Constant, Error, Operation, RetainedArray, Type};
 
 /// Exports staged [`Program`]s of the XLA backend whose inputs and outputs are arrays (e.g., a
 /// [`TracedProgram`](crate::TracedProgram)) as StableHLO/Shardy MLIR modules. The export reads the global input and
@@ -255,12 +255,15 @@ where
         let program = self.clone().into_pruned()?.into_simplified()?;
 
         // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
-        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and
-        // it is lowered as a call that names none. Whether a callee names devices is read from the summary of its
-        // placement requests (refer to `RegionPlacementSummaryExtension::for_lowering`), which is derived once for each
-        // callee region of the pruned program, and which derives what each call nested in that callee reads of its own
-        // callee in the same pass. Most programs have no call that records a mesh and pay one scan of their calls.
+        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
+        // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
+        // pruned program (refer to `RegionPlacementSummary::device_naming`), so that nested calls cost one pass over
+        // the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
+        // that lowering omits are those of `RegionPlacementSummaryExtension::for_lowering`.
         let arena = program.entry_region_ref().arena();
+        let omitted: &dyn Fn(RegionRef<'_, Constant, Operation>, &Instruction<Operation>) -> bool =
+            &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
+        let mut names_devices = RegionPlacementSummary::device_naming(program.entry_region_ref(), omitted);
         let mut stale = HashSet::new();
         for (index, region) in program.regions().iter().enumerate() {
             let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
@@ -268,11 +271,7 @@ where
                 let Operation::Call(call) = instruction.operation() else { continue };
                 if call.mesh().is_some()
                     && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
-                    && call
-                        .names_devices(|| {
-                            RegionPlacementSummary::for_lowering(callee, target_platform).has_requests(false)
-                        })
-                        .is_none()
+                    && call.names_devices(|| names_devices(callee)).is_none()
                 {
                     stale.insert((index, position));
                 }
@@ -824,12 +823,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayType, CompositeKey, CompositeOperation, ConstrainSharding, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionValue, DomainTracingContext,
-        EffectClass, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
-        NegOperation, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print,
-        ProgramBuilder, Reshape, Reshard, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin,
-        StopGradient, Tag, TransferToMemory, Typed, ValueProjection, shard_map,
+        AddOperation, ArrayType, CALL_OPERATION_NAME, CallOperation, CompositeKey, CompositeOperation,
+        ConstrainSharding, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension,
+        DimensionValue, DomainTracingContext, EffectClass, FlatProgram, ImportingContext, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, NamedComposite, NegOperation, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder,
+        Placement, PlacementRequest, Print, ProgramBuilder, Reshape, Reshard, ScanOperation, Shape, ShardMapOptions,
+        Sharding, ShardingDimension, Sin, StopGradient, Tag, TransferToMemory, Typed, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -837,9 +836,9 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CALL_OPERATION_NAME, CallOperation, CompileTracer, CompiledFunction, Constant, Operation,
-        Options, RetainedArray, Session, StagedFunction, ThroughSession, TracedProgram, Tracer, Type, Value, compile,
-        ensure_print_handler_registered, stage, trace, trace_with_context, with_captured_prints,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, Operation, Options, RetainedArray, Session,
+        StagedFunction, ThroughSession, TracedProgram, Tracer, Type, Value, compile, ensure_print_handler_registered,
+        stage, trace, trace_with_context, with_captured_prints,
     };
 
     use super::*;

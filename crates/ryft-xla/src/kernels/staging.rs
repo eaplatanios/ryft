@@ -1664,15 +1664,15 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayIrOperation, ArrayOperation, ArrayType, AssertOperation,
-        AttachedRegions, CompilationTracer, ConditionOperation, CotangentDestinationKind, CustomCallOperation,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass, LiftedCustomRules,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedAxis, NothingSavable, PartialEvaluation, PartitionedProgram,
-        ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionDriver, RegionRef, RematerializeOperation,
-        ReshapeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation, ShardMapBoundary,
-        ShardMapOperation, Sharding, ShardingDimension, StagedFunction, StagingContext, TransferToMemoryOperation,
-        TypedProgram, WhileOperation,
+        AttachedRegions, CallOperation, CompilationTracer, ConditionOperation, CotangentDestinationKind,
+        CustomCallOperation, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh,
+        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, EffectClass,
+        LiftedCustomRules, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedAxis, NothingSavable, PartialEvaluation,
+        PartitionedProgram, ProgramBuilder as CoreProgramBuilder, RecursiveBatchingDriver, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionDriver, RegionRef,
+        RematerializeOperation, ReshapeOperation, ResidualPolicyReference, ReverseModeDifferentiate, ScanOperation,
+        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StagedFunction, StagingContext,
+        TransferToMemoryOperation, TypedProgram, WhileOperation,
     };
     use ryft_kernels::{
         BlockMapping, BoundaryPolicy, Grid, KernelCompilationError, KernelCompiler, KernelParameter,
@@ -1688,7 +1688,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::{Array, ArrayConstant, CallOperation, FromPjrt, Options, Platform, Session, Value};
+    use crate::{Array, ArrayConstant, FromPjrt, Options, Platform, Session, Value};
 
     use super::*;
 

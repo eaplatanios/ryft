@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, BroadcastLikeOperation, BroadcastOperation, CastOperation, ConstrainShardingOperation, Device,
-    Dimension, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, ExternalReferenceBinding,
+    ArrayType, BroadcastLikeOperation, BroadcastOperation, CallOperation, CastOperation, ConstrainShardingOperation,
+    Device, Dimension, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, ExternalReferenceBinding,
     FillLikeOperation, GatherOperation, IotaLikeOperation, IotaOperation, LogicalMesh, Memory, MeshAxisType,
     OneLikeOperation, OneOperation, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError,
     ReshapeOperation, ReshardOperation, ScatterOperation, Shape, ShardMapOperation, Sharding, ShardingDimension,
@@ -41,8 +41,8 @@ use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call
 use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
 use crate::sharding::{OpenDimensions, ShardySharding};
 use crate::{
-    CallOperation, CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement,
-    SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
+    CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME,
+    ToMlir, Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -1684,7 +1684,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array, ArrayOperation, ArrayType, CaptureReference, CastOperation, CompositeKey,
+        AddOperation, Array, ArrayOperation, ArrayType, CallOperation, CaptureReference, CastOperation, CompositeKey,
         CompositeOperation, ConditionOperation, Context, Cos, CustomRuleDefinition, CustomRuleRegistration, DataType,
         Device, DeviceMesh, Differentiate, Dimension, DimensionBounds, DimensionToScalarOperation, DimensionType,
         DimensionValue, DimensionVariable, Dot, DotDimensionNumbers, EagerContext, EffectClass, EffectClasses,
@@ -1704,7 +1704,7 @@ mod tests {
 
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::{ArrayConstant, CallOperation, Constant, Error, ExecutionError, Operation, Session, Type};
+    use crate::{ArrayConstant, Constant, Error, ExecutionError, Operation, Session, Type};
 
     use crate::lowering::{LoweringError, RaggedDotLoweringStrategy, token_threaded_effects};
 

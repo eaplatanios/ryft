@@ -793,7 +793,7 @@ impl Array {
         let same_client = std::ptr::eq(self.client(), session.client());
         let target = self
             .validate_placement_client(session, Some(&request))
-            .and_then(|_| self.checked_target(session, request, collective.is_some()));
+            .and_then(|_| self.validate_placement_target(session, request, collective.is_some()));
         let verdict = collective
             .map(|collective| {
                 let digest = target.as_ref().ok().and_then(|_| combined_digest([array_value_digest(&self)]));
@@ -883,7 +883,7 @@ impl Array {
         // array that an in-place target leaves where it is.
         let output = match target {
             Some(target) => self.place_with_request(session, target, donate, None)?,
-            None => self.with_session(session)?.without_previous_sends(),
+            None => self.with_session(session)?.without_send_fence(),
         };
 
         // The result is this leaf when the placement does not change, and it otherwise shares the buffers of the

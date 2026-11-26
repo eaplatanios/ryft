@@ -547,6 +547,16 @@ impl Array {
         self
     }
 
+    /// Returns this array without the completion fence of the cross-host sends of the placement that produced it.
+    /// Those sends belong to that placement, so every placement that returns this array, its buffers, or copies of them
+    /// without sending anything itself (e.g., one that keeps the devices and the sharding of this array, with or
+    /// without a target, and with or without a forced copy) returns it through this function.
+    #[inline]
+    pub(crate) fn without_send_fence(mut self) -> Self {
+        self.send_fence = None;
+        self
+    }
+
     /// Returns this [`Array`] with its commitment set to `committed`, keeping its storage, placement, session, and
     /// completion fences. Refer to [`Self::is_committed`] for what commitment means and which arrays are committed.
     #[inline]

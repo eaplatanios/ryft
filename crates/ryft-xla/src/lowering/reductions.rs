@@ -404,7 +404,7 @@ pub(crate) fn validate_declared_pending_reduction(
 
 /// Validates the whole transition of a pending reduction of `kind` to a value of `data_type` that the lowering of
 /// `sharding` completes along the mesh axes `completed` and keeps along the mesh axes `pending`, with the rule of
-/// [`partial_completion_rejection`], which the device placements of [`crate::arrays::resharding`] read as well. Those
+/// [`partial_completion_rejection`], which the device placements of [`crate::arrays::transfers`] read as well. Those
 /// placements take a host round trip where the rule rejects the transition, while a compiled program has no exact
 /// alternative, so it is rejected before anything is compiled. Every site where the lowering completes a pending
 /// reduction (i.e., an entry argument with an input sharding override, and the user-stated shardings of
@@ -448,7 +448,7 @@ pub(super) fn validate_partial_completion<'a>(
 /// compiled program has no exact alternative (refer to the section on pending reductions of [`crate::arrays::host`]).
 /// Every other change computes another number, fails to compile, aborts or crashes the process, or has no meaning, and
 /// is rejected before anything is compiled. A reduction over an axis of size one changes no value, so such axes are
-/// exempt, as they are for the device placements of [`crate::arrays::resharding`].
+/// exempt, as they are for the device placements of [`crate::arrays::transfers`].
 ///
 /// # Errors
 ///

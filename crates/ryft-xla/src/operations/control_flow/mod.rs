@@ -510,7 +510,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, CompositeJvpRule,
+        AddOperation, ArrayOperation, AtomId, CallOperation, CompareOperation, ComparisonDirection, CompositeJvpRule,
         CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionType,
         DimensionValue, DimensionVariable, Error as CoreError, LogicalMesh, MeshAxis, Placeholder, PrintOperation,
         ProgramBuilder, Sharding, ZeroLikeOperation,
@@ -523,9 +523,7 @@ mod tests {
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{
-        Array, CallOperation, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program,
-    };
+    use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program};
 
     use super::*;
 

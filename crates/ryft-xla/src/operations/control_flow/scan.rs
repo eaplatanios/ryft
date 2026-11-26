@@ -12,9 +12,9 @@
 //! Each loop trip runs `unroll` consecutive logical iterations, and the iterations that do not fill a whole trip follow
 //! the loop. They become straight-line body copies at static iteration indices for a static length, and a second loop
 //! with one body copy per trip for a dynamic length. A scan whose unroll factor covers its static length lowers to
-//! straight-line body copies only, and a scan whose length admits no iteration lowers to its initial carries and empty
-//! accumulators. On every path, an entry guard first checks the input relationships that the actual input types leave
-//! unproven, including those with the runtime length of a scan of dynamic length. Every ordered effect class that the
+//! straight-line body copies only, and a scan with zero iterations lowers to its initial carries and empty accumulators.
+//! On every path, an entry guard first checks the input relationships that the actual input types leave unproven,
+//! including those with the runtime length of a scan of dynamic length. Every ordered effect class that the
 //! body uses is threaded through the loop state as one trailing token, the results are normalized to the refined output
 //! types of the scan, and results whose types place them over explicit mesh axes are constrained to that placement.
 //! Reference state is discharged before lowering.
@@ -32,7 +32,6 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::emissions::admits_iterations;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
@@ -82,8 +81,8 @@ impl LowerableOperation for ScanOperation<Type> {
         //   2. An entry guard checks the input relationships that the actual input types leave unproven, including
         //      those with the runtime length. Eager entry validation checks them whatever the trip count is, so the
         //      guard precedes every path below.
-        //   3. A scan whose length admits no iteration returns its carries and empty accumulators, and a scan whose
-        //      unroll factor covers its static length runs straight-line body copies. Any other scan runs a loop whose
+        //   3. A scan with zero iterations returns its carries and empty accumulators. A scan whose unroll factor
+        //      covers its static length runs straight-line body copies. Any other scan runs a loop whose
         //      trips run `unroll` body copies each, followed by its remaining iterations, as `ScanLoopInputs` emits
         //      them.
         //   4. The carries and the accumulators are normalized to the refined `output_types` of the scan, and each
@@ -112,11 +111,11 @@ impl LowerableOperation for ScanOperation<Type> {
 
         // Each iteration reads and writes one slice per stack at a static shape. A body that was not specialized to the
         // scan's input types may still declare dynamic slice types, which are refined only at the instruction boundary
-        // and which this lowering does not adapt per iteration. A scan whose length admits no iteration never slices,
-        // so it is lowered without its body.
+        // and which this lowering does not adapt per iteration. A scan with zero iterations never slices, so lowering
+        // omits its body.
         let static_length = length.value();
-        let admits_iterations = admits_iterations(self);
-        if admits_iterations {
+        let has_zero_iterations = self.has_zero_iterations();
+        if !has_zero_iterations {
             let slice_types = body_input_types[1 + carry_count..]
                 .iter()
                 .enumerate()
@@ -214,11 +213,10 @@ impl LowerableOperation for ScanOperation<Type> {
             location,
         )?;
 
-        let results = if !admits_iterations {
-            // A scan whose length admits no iteration returns its initial carries and empty stacked outputs. This also
-            // applies to a dynamic length whose bounds admit only zero, because constructing a loop body would
-            // otherwise emit slice reads or writes of length one against empty physical stacks, which are invalid even
-            // in a dead body.
+        let results = if has_zero_iterations {
+            // A scan with zero iterations returns its initial carries and empty stacked outputs. This also applies to
+            // a dynamic length whose bounds admit only zero. Constructing a loop body would emit slice reads or writes
+            // of length one against empty physical stacks, which are invalid even in a dead body.
             carries.extend(inputs.lower_accumulators(block)?);
             carries
         } else if let Some(length) = static_length.filter(|length| unroll >= *length) {

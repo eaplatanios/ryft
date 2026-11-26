@@ -1097,14 +1097,15 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, Cast, ConditionOperation,
-        ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalar,
-        DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, Error as CoreError,
-        GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder,
-        Placement, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramBuilder as ArrayIrProgramBuilder,
-        ProgramError, ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding,
-        ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
-        Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection, WhileOperation,
+        Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, CallOperation, Cast,
+        ConditionOperation, ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds,
+        DimensionFromScalar, DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass,
+        Error as CoreError, GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation,
+        Placeholder, Placement, PrintOperation, ProgramBatchingOutputAxesPolicy,
+        ProgramBuilder as ArrayIrProgramBuilder, ProgramError, ProjectedValue, ReducePrecision, ScanOperation, Shape,
+        ShardMap, ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile,
+        TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection,
+        WhileOperation,
     };
     use ryft_mlir::{Location, OperationResultRef};
     use ryft_pjrt::extensions::ffi::{
@@ -1124,7 +1125,7 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, CallOperation, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
+        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
         to_mlir_module_for_program,
     };
 

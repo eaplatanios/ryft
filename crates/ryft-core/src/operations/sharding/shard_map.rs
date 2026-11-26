@@ -243,18 +243,21 @@
 //!     A collective over other axes binds per device like an ordinary operation.
 //!   - **Region operations that communicate run in lockstep.** An operation whose region closure contains no collective
 //!     over an emulated axis binds per device, so its regions run through the ordinary eager rules. Otherwise, its
-//!     regions run in lockstep. `while`, `condition`, and `scan` run their eager rules over values that hold the value
-//!     of every device, whose regions the emulator replays in lockstep, so that they validate, iterate, and select
-//!     exactly as eager interpretation does on every device. Every device must take the same path through them. Their
-//!     inputs have the same data type and extents on every device, as every value does (including the iteration count
-//!     of a `scan`, whose extent is its trip count), and the devices must agree on every `while` and `condition`
-//!     predicate. Either way, a `scan` slice whose manual variation differs from that of its stack widens both to the
-//!     join of their variation, as eager interpretation does. `composite`, `linear_call`, and `rematerialize` run their
-//!     region once on their inputs, and a nested `shard_map` extends the device set by its own active manual axes. Each
-//!     of these operations has a rule over all devices (refer to [`LockstepOperation`]), through which the emulator
-//!     runs it, and a collective that has attached regions runs them through its rule as well. Devices that disagree on
-//!     a predicate cannot run such regions in lockstep, and a region operation without such a rule that needs lockstep
-//!     execution is rejected, both with [`ProgramError::UnsupportedOperation`].
+//!     regions run in lockstep, and so do those of an operation with an input that varies along an emulated axis along
+//!     which the region input that receives it does not (e.g., a `call` of a function whose declared input types do not
+//!     vary), whose outputs then vary along that axis as well. `while`, `condition`, and `scan` run their eager rules
+//!     over values that hold the value of every device, whose regions the emulator replays in lockstep, so that they
+//!     validate, iterate, and select exactly as eager interpretation does on every device. Every device must take the
+//!     same path through them. Their inputs have the same data type and extents on every device, as every value does
+//!     (including the iteration count of a `scan`, whose extent is its trip count), and the devices must agree on every
+//!     `while` and `condition` predicate. Either way, a `scan` slice whose manual variation differs from that of its
+//!     stack widens both to the join of their variation, as eager interpretation does. `call`, `composite`,
+//!     `linear_call`, and `rematerialize` run their region once on their inputs, and a nested `shard_map` extends the
+//!     device set by its own active manual axes. Each of these operations has a rule over all devices (refer to
+//!     [`LockstepOperation`]), through which the emulator runs it, and a collective that has attached regions runs them
+//!     through its rule as well. Devices that disagree on a predicate cannot run such regions in lockstep, and a region
+//!     operation without such a rule that needs lockstep execution is rejected, both with
+//!     [`ProgramError::UnsupportedOperation`].
 //!
 //! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region operation
 //! in lockstep requires knowing how it uses its regions (e.g., how many times it runs them, and what it computes from
@@ -6714,10 +6717,14 @@ where
         // An instruction communicates across the emulated devices when its computation regions, or their computation
         // descendants, contain a collective over an emulated axis. Dormant rule regions (e.g., the custom forward mode
         // rule of a composite) are not considered, because interpretation never executes them, so a collective that
-        // only such a rule uses requires no lockstep. Any other instruction runs on every device independently, so its
-        // operation is bound once per device, in device order, with the inputs of that device and the regions of the
-        // instruction. No `shard_map` makes an emulated axis manual again, because the body validation of every
-        // enclosing map rejects that nesting.
+        // only such a rule uses requires no lockstep. An instruction also runs in lockstep when one of its inputs
+        // varies along an emulated axis along which the computation region input that receives it does not (e.g., a
+        // `call` of a function whose declared input types do not vary, which the type rule of a call accepts), because
+        // its outputs then vary along that axis as well, which only a rule over all devices can add (a value of one
+        // device cannot gain variation, refer to `ParallelVary`), and because the region entry of an eager rule rejects
+        // such an input. Any other instruction runs on every device independently, so its operation is bound once per
+        // device, in device order, with the inputs of that device and the regions of the instruction. No `shard_map`
+        // makes an emulated axis manual again, because the body validation of every enclosing map rejects that nesting.
         let uses_emulated_axes = regions
             .iter()
             .enumerate()
@@ -6725,7 +6732,31 @@ where
             .flat_map(|(_, region)| region.computation_regions())
             .flat_map(|region| region.instructions())
             .any(|nested| nested.operation().axes().names().iter().any(|name| self.domain.grid().axis(name).is_some()));
-        if !uses_emulated_axes {
+        let varying_axes = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(r#type) => r#type.sharding().map(Sharding::varying_manual_axes).cloned(),
+            _ => None,
+        };
+        let varies_beyond_regions = regions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
+            .any(|(region_index, region)| {
+                region.interface().input_types().iter().enumerate().any(|(position, declared)| {
+                    let InputRegionProvenance::Input { index } =
+                        operation.input_region_provenance(region_index, position)
+                    else {
+                        return false;
+                    };
+                    let declared = varying_axes(declared).unwrap_or_default();
+                    inputs.get(index).and_then(|values| values.first()).is_some_and(|value| {
+                        varying_axes(&value.r#type())
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|axis| !declared.contains(axis) && self.domain.grid().axis(axis).is_some())
+                    })
+                })
+            });
+        if !uses_emulated_axes && !varies_beyond_regions {
             let device_count = self.domain.grid().device_count();
             let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
             for device in 0..device_count {
@@ -6741,10 +6772,11 @@ where
             return Ok(outputs);
         }
 
-        // The regions of the instruction communicate across the emulated devices, so they must run in lockstep, which
-        // only the rule of the operation over all devices can do, because only the operation knows how it uses its
-        // regions (e.g., how many times it runs them, and what it computes from its inputs before and from their
-        // outputs after). A nested `shard_map` extends the device set by its own active manual axes.
+        // The regions of the instruction communicate across the emulated devices, or receive inputs that vary beyond
+        // them, so they must run in lockstep, which only the rule of the operation over all devices can do, because
+        // only the operation knows how it uses its regions (e.g., how many times it runs them, and what it computes
+        // from its inputs before and from their outputs after). A nested `shard_map` extends the device set by its
+        // own active manual axes.
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
         if let Some(outputs) = operation.interpret_in_lockstep(&self.domain, &driver, &lockstep_inputs()?) {

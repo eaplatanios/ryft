@@ -669,11 +669,11 @@ impl Session {
         committed || captures.iter().any(RetainedArray::is_committed)
     }
 
-    /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays `captures`
-    /// lives on devices that this process chose on its own (i.e., [`Array::is_locally_assigned`] returns `true`), which
-    /// is decided by what selected those devices. This is the one rule of every eager application, including eager
-    /// calls of compiled functions (refer to `CallOperation::eager_decision`), so that a later transfer of the value
-    /// to another process is planned as a shared transfer whenever every process takes part in it. The value is locally
+    /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays `captures` lives
+    /// on devices that this process chose on its own (i.e., [`Array::is_locally_assigned`] returns `true`), which is
+    /// decided by what selected those devices. This is the one rule of every eager application, including eager calls
+    /// of compiled functions (refer to `CallEagerExtension::eager_decision`), so that a later transfer of the value to
+    /// another process is planned as a shared transfer whenever every process takes part in it. The value is locally
     /// assigned only when everything that could have selected its devices was itself locally assigned, which errs in
     /// the safe direction: a value that is wrongly marked as shared costs a transfer plan in which every process takes
     /// part, while a value that is wrongly marked as locally assigned is placed by each process on its own, so that a
@@ -1476,8 +1476,8 @@ impl Context for Session {
 
         // A call takes its placement decision, which states where the call runs, which arguments it admits and where
         // they move, whether its arguments commit its results, and whether its devices were chosen by this process
-        // alone (refer to `CallOperation::eager_decision`). Nothing below derives any of these facts again for a
-        // call.
+        // alone (refer to `CallEagerExtension::eager_decision`). Nothing below derives any of these facts again
+        // for a call.
         let decision = match &operation {
             Operation::Call(call) => Some(
                 call.eager_decision(self, inputs, regions.region(0)?)
@@ -1573,7 +1573,7 @@ impl Context for Session {
         // body with the constants that they use as operands. A constant that only dead instructions use is not used.
         // A constant of the callee of a call nested in a region belongs to that call, which never runs where the
         // arrays that its callee closes over are nor commits its results because of them (refer to
-        // `CallOperation::eager_decision`), and neither do the arrays that the callee of this application closes
+        // `CallEagerExtension::eager_decision`), and neither do the arrays that the callee of this application closes
         // over if it is a call, so execution places all of them on the devices of the application (refer to
         // `placed_constant`). Lowering never emits the regions that the implementation of a named composite replaces
         // for the platform of this session, nor the body of a scan that admits no iteration (refer to `omits_regions`),
@@ -2174,7 +2174,7 @@ impl Context for Session {
 
                         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
                         // types never record. The arguments of a call are instead placed as an execution of its callee
-                        // places them, which `CallOperation::eager_input_placement` decides for every array input
+                        // places them, which `CallEagerExtension::eager_input_placement` decides for every array input
                         // (e.g., a call that a program transform created leaves the residuals that the transform added
                         // where they are, rather than gathering them to the placement of their traced types). Either
                         // way the call returns what that execution returns. A capture that the callee never reads has
@@ -2207,7 +2207,7 @@ impl Context for Session {
                         // overrides therefore declares every input as a direct execution of its callee does: an input
                         // with an override at that override, and every other input at its eager placement, or as its
                         // declared type places it (refer to `declared_input_sharding`), which the admission of the call
-                        // has made free of such reductions (refer to `CallOperation::eager_decision`).
+                        // has made free of such reductions (refer to `CallEagerExtension::eager_decision`).
                         let input_shardings = match (&operation, &callee_input_types, &input_placements, operand_mesh) {
                             (Operation::Call(call), Some(declared), Some(placements), Some(mesh))
                                 if (0..inputs.len()).any(|index| call.input_sharding(index).is_some()) =>
@@ -2410,7 +2410,7 @@ impl Context for Session {
         // An operation with regions also commits its results when a region requests a placement (refer to
         // `CompiledProgram::committed_outputs`), as an execution of a compiled function commits them and as JAX commits
         // the result of a `lax.cond` whose branches place their values. The results of a call are committed exactly as
-        // its decision states (refer to `CallOperation::eager_decision`), so that neither the mesh of this session
+        // its decision states (refer to `CallEagerExtension::eager_decision`), so that neither the mesh of this session
         // nor a capture commits them. The commitment of the results of an
         // operation without regions follows its inputs alone, even when the operation is itself a placement request
         // (e.g., a sharding constraint).
@@ -3168,21 +3168,22 @@ pub(crate) mod tests {
 
     use ryft_core::{
         AbsOperation, Add, AddOperation, AndOperation, Array as CoreArray, ArrayOperation, ArrayReference,
-        Atan2Operation, AttachedRegions, BatchAxis, BatchingError, CaptureReference, Cast, CastOperation,
-        CompareOperation, ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, Condition,
-        ConditionOperation, ConstantOperation, ConstrainSharding, DataType, DenseDifferentiableType, Device,
-        DifferentiableType, Differentiate, DifferentiationError, Dimension as CoreDimension, DimensionAddOperation,
-        DimensionBounds, DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionSizeOperation,
-        DimensionToScalar, DimensionToScalarOperation, DimensionValue, DimensionVariable, DivOperation, DomainTracer,
-        DynamicBroadcastOperation, DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout, LinearizationTracer,
-        Memory, MeshAxisType, Mul, MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Place,
-        PlaceDispatch, PlaceOperation, Placeholder, Placement, PlacementRequest, ProjectedContext, ProjectedValue,
-        Reduce, ReductionKind, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, Reshape, Round,
-        ScanOperation, ScanOptions, SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation,
-        ShardMapOptions, Sharding, ShardingDimension, ShardingError, Sin, StaticShape, StopGradient, SubOperation,
-        TiledLayout, Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, WhileOptions, ZeroOperation,
-        batch, differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along,
-        shard_map_with_inferred_input_shardings, r#while,
+        Atan2Operation, AttachedRegions, BatchAxis, BatchingError, CallOperation, CaptureReference, Cast,
+        CastOperation, CompareOperation, ComparisonDirection, CompilationCacheDomain, CompositeJvpRule,
+        CompositeOperation, Condition, ConditionOperation, ConstantOperation, ConstrainSharding, DataType,
+        DenseDifferentiableType, Device, DifferentiableType, Differentiate, DifferentiationError,
+        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation, DimensionError,
+        DimensionFromScalarOperation, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation,
+        DimensionValue, DimensionVariable, DivOperation, DomainTracer, DynamicBroadcastOperation,
+        DynamicReshapeOperation, Error as CoreError, Exp, Fill, Layout, LinearizationTracer, Memory, MeshAxisType, Mul,
+        MulOperation, Neg, NegOperation, OneOperation, ParallelReduceOperation, Place, PlaceDispatch, PlaceOperation,
+        Placeholder, Placement, PlacementRequest, ProjectedContext, ProjectedValue, Reduce, ReductionKind,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, Reshape, Round, ScanOperation, ScanOptions,
+        SelectOperation, Shape, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, Sharding,
+        ShardingDimension, ShardingError, Sin, StaticShape, StopGradient, SubOperation, TiledLayout,
+        Tracer as CoreTracer, Typed, Value as CoreValue, WhileOperation, WhileOptions, ZeroOperation, batch,
+        differentiate_at, i4, rematerialize, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        r#while,
     };
     use ryft_pjrt::protos::Precision;
     use ryft_pjrt::{CpuClientOptions, ExecutionFence, load_cpu_plugin};
@@ -3206,8 +3207,8 @@ pub(crate) mod tests {
         peer_devices, replicated_array, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        CallOperation, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError,
-        FromPjrt, LoweringError, PlacementOptions, Reference, compile, jit,
+        CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FromPjrt,
+        LoweringError, PlacementOptions, Reference, compile, jit,
     };
 
     #[cfg(feature = "cuda-13")]

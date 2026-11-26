@@ -199,9 +199,8 @@ pub use operations::{
     WhileType, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation, associative_scan, auto_axes, block_scaled_dot, boundary_input_type, composite,
     declared_input_sharding, differentiable_dot_product_attention, dot_product_attention, einsum, einsum_with_options,
-    entered_argument_sharding, explicit_axes, scan, shard_map, shard_map_along,
-    shard_map_with_inferred_input_shardings, softmax, softmax_cross_entropy_with_target_logits,
-    states_boundary_placement, transpose_primal_call, r#while,
+    explicit_axes, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, softmax,
+    softmax_cross_entropy_with_target_logits, states_boundary_placement, transpose_primal_call, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

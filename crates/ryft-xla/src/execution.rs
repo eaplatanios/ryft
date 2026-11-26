@@ -718,8 +718,9 @@ impl Session {
         // validation against the declared type cannot see it. Every execution path prepares its arguments here. Every
         // logical input is admitted, also one that has no executable argument (i.e., a static input of the zero data
         // type, which is erased below), because the admission concerns the logical value and not its buffers, and an
-        // eager call admits the same input alike (refer to `CallOperation::eager_decision`). The executable receives
-        // such an input as its declared type states. A capture that the executable never reads is not admitted.
+        // eager call admits the same input alike (refer to `CallEagerExtension::eager_decision`). The executable
+        // receives such an input as its declared type states. A capture that the executable never reads is not
+        // admitted.
         for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
             match physical_index {
                 Some(physical_index) => {
@@ -758,7 +759,7 @@ impl Session {
                 None => inputs.iter().map(|input| input.r#type().into_owned()).collect(),
             };
             // Place every argument on the sharding with which the executable receives it before padding it, as an
-            // eager call does (refer to `CallOperation::eager_decision`), because padding an input that arrives
+            // eager call does (refer to `CallEagerExtension::eager_decision`), because padding an input that arrives
             // split unevenly would compile that uneven split. Arguments of the zero data type carry no payload to pad,
             // and `Self::materialize_zero_space_carriers` builds their carriers on the receiving placement. Placing
             // first would also introduce a pending reduction that the receiving sharding has and an argument below its
@@ -1489,10 +1490,10 @@ impl Session {
     fn convert_argument_storage(&self, argument: Array, layout: &Layout) -> Result<Array, Error> {
         let (committed, locally_assigned) = (argument.is_committed(), argument.is_locally_assigned());
         // A placement onto the mesh and the sharding of an array only places its storage (refer to
-        // `Array::run_placement_dispatch`), so it consults neither the reduction state nor the variation of the array.
+        // `Array::place_within_client`), so it consults neither the reduction state nor the variation of the array.
         let target = Placement::new(argument.mesh().clone(), argument.sharding().clone())?.with_layout(layout.clone());
         Ok(argument
-            .run_placement_dispatch(self, &target, false)?
+            .place_within_client(self, &target, false)?
             .with_committed(committed)
             .with_locally_assigned(locally_assigned))
     }
@@ -1502,7 +1503,7 @@ impl Session {
     /// `mesh`, because the same sharding assigns its shards to other devices on another device mesh (e.g., one that
     /// lists the same devices in another order). An executable reads the buffer of every device of this process, so a
     /// matching input that lacks some of them receives a copy of a local replica of the same contribution for each
-    /// (refer to [`Array::serves_missing_local_buffers`] and [`Array::with_local_replicas`]), also with a pending
+    /// (refer to [`Array::can_fill_missing_local_buffers`] and [`Array::with_filled_local_buffers`]), also with a pending
     /// reduction or with manual variation, and a placement serves the missing buffers of the other inputs. A matching
     /// input with a missing contribution that no local replica holds is passed as it is and keeps the error of the
     /// executable.
@@ -1515,7 +1516,7 @@ impl Session {
         let process_index = self.client().process_index()?;
         let matches = |array: &Array, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
         let ready = |array: &Array, expected: &Sharding| {
-            matches(array, expected) && !array.serves_missing_local_buffers(process_index)
+            matches(array, expected) && !array.can_fill_missing_local_buffers(process_index)
         };
         if inputs.iter().zip(expected_shardings).all(|(array, expected)| ready(array, expected)) {
             return Ok(inputs);
@@ -1527,10 +1528,10 @@ impl Session {
                 if !matches(&array, expected) {
                     return array.reshard_on_devices(self, mesh, expected, false);
                 }
-                if !array.serves_missing_local_buffers(process_index) {
+                if !array.can_fill_missing_local_buffers(process_index) {
                     return Ok(array);
                 }
-                Ok(array.with_local_replicas()?.unwrap_or(array))
+                Ok(array.with_filled_local_buffers()?.unwrap_or(array))
             })
             .collect()
     }
@@ -1906,7 +1907,7 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
 /// must never reach PJRT, and nothing else tells them apart, because two clients can number their devices alike, so
 /// that the mesh, the sharding, and the layout of such an array can match those that a call expects. This is the client
 /// admission of every call boundary: of an execution (refer to `Session::prepare_compiled_execution`) and of an eager
-/// call (refer to `CallOperation::eager_decision`), so that they reject such an array alike.
+/// call (refer to `CallEagerExtension::eager_decision`), so that they reject such an array alike.
 pub(crate) fn validate_input_clients<'a>(
     session: &Session,
     inputs: impl IntoIterator<Item = Option<&'a Array>>,

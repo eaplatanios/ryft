@@ -31,10 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    AtomId, AttachedRegions, CompositeKey, ConstrainShardingOperation, Device, DeviceMesh, EagerContext, FlatProgram,
-    InterpretableOperation, InterpretationDriver, Operation as CoreOperation, Parameterized, Program, ProgramError,
-    RegionId, RegionPlacementSummary, RegionRef, RegionRole, RematerializationOptimizationBarrier, ShardMapOperation,
-    Sharding, Typed, TypedProgram, declared_input_sharding, entered_argument_sharding,
+    AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, ConstrainShardingOperation, Device,
+    DeviceMesh, EagerContext, FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation,
+    Parameterized, Program, ProgramError, RegionId, RegionPlacementSummary, RegionRef, RegionRole,
+    RematerializationOptimizationBarrier, ShardMapOperation, Sharding, Typed, TypedProgram, declared_input_sharding,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -55,8 +55,8 @@ use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{Operation, unread_lifted_captures};
 use crate::{
-    Array, CallOperation, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer,
-    LoweringError, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    Session, Type, Value,
 };
 
 /// Structural identity of a flat callee program attached behind a `call`, used to deduplicate repeated nested
@@ -402,7 +402,7 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
 /// the actual arguments. It states the facts that the types of the arguments omit, and the application consumes it
 /// instead of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which
 /// sees types only, forwards an input through a call only where this decision returns it unchanged whatever the
-/// arguments are (refer to [`CallOperation::returns_input_unchanged`]).
+/// arguments are (refer to `CallOperation::returns_input_unchanged`).
 pub(crate) struct EagerCallDecision<'o> {
     /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
     /// their committed public arguments agree on their devices, and none carries a pending reduction that its boundary
@@ -534,10 +534,10 @@ pub(crate) trait CallEagerExtension {
     /// Returns the placement that the executable of an eager call must give callee input `index`, which receives
     /// `array` for a callee input of type `declared`. This is the effective boundary sharding of the input when the
     /// call has one (refer to [`CallOperation::boundary_input_sharding`]). Otherwise, for a call that a program
-    /// transform created (refer to `with_derived_boundary_shardings`) or that keeps its input placements (refer to
-    /// [`CallOperation::with_kept_input_placements`]), it is the runtime sharding of `array`, because such a call
-    /// leaves that input where it is and its executable must not move it to the placement that its traced input type
-    /// would give it. A call of a `jit` dispatcher keeps no relocatable argument where it is (refer to
+    /// transform created (refer to [`CallOperation::derived_input_shardings`]) or that keeps its input placements
+    /// (refer to [`CallOperation::with_kept_input_placements`]), it is the runtime sharding of `array`, because such a
+    /// call leaves that input where it is and its executable must not move it to the placement that its traced input
+    /// type would give it. A call of a `jit` dispatcher keeps no relocatable argument where it is (refer to
     /// `argument_type`), because the executions of the dispatcher do not specialize on its placement either. It is
     /// [`None`] for any other input, whose placement the executable chooses by its own rule.
     fn eager_input_placement(&self, index: usize, array: &Array, declared: &Type) -> Option<Sharding>;
@@ -930,16 +930,16 @@ impl LowerableOperation for CallOperation<Type> {
                 }
                 let callee = lowerer.regions()[0].entry_region_ref();
                 let declared = &callee.interface().input_types()[index];
-                // The callee receives the operand as its entry function holds an argument that arrives at the
-                // boundary sharding, with the reduction state over auto mesh axes that an override may state completed
-                // (refer to `entered_argument_sharding`). An operand is a value of the caller, which never carries such
-                // a state, because the entry of the outermost program completes it or admission rejects it, so the
+                // The callee receives the operand as its entry function holds an argument that arrives at the boundary
+                // sharding, with the reduction state over auto mesh axes that an override may state completed (refer to
+                // `Sharding::without_auto_reduction_axes`). An operand is a value of the caller, which never carries
+                // such a state, because the entry of the outermost program completes it or admission rejects it, so the
                 // constraint neither introduces nor completes a reduction over auto mesh axes, of any kind. Only the
                 // outputs of a call can still introduce one (refer to `lower_boundary_constraint`).
                 let Some(sharding) = self.boundary_input_placement(index, actual, declared).map(Cow::into_owned) else {
                     return Ok(value);
                 };
-                lower_boundary_constraint(lowerer, value, ty, entered_argument_sharding(&sharding)?.as_ref())
+                lower_boundary_constraint(lowerer, value, ty, &sharding.without_auto_reduction_axes())
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
@@ -1393,7 +1393,7 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         array_type.sharding(),
         array_type.data_type(),
         bound_manual_axes,
-        "call",
+        CALL_OPERATION_NAME,
     )?;
     let constraint = ConstrainShardingOperation::new(declared);
     let types = std::slice::from_ref(&untracked_type);
@@ -3310,12 +3310,12 @@ mod tests {
     fn test_call_operation_lower_rejects_boundaries_that_introduce_pending_extrema() {
         // XLA aborts the process when it exports a sharding that introduces a pending maximum or minimum, so the
         // boundary of a nested call rejects one that its result does not carry, as the result shardings of an entry
-        // function do. The caller uses the result of the call, so the override does not reach its own result
-        // shardings. An input override introduces nothing: the callee holds its argument as it has entered, with the
-        // pending reduction over auto mesh axes that the override states completed (refer to
-        // `entered_argument_sharding`), and the operand of the call is a completed value of the caller, so the call
-        // lowers and constrains the operand replicated. Lowering alone is checked here, so that a missing rejection
-        // cannot abort the test process.
+        // function do. The caller uses the result of the call, so the override does not reach its own result shardings.
+        // An input override introduces nothing: the callee holds its argument as it has entered, with the pending
+        // reduction over auto mesh axes that the override states completed (refer to
+        // `Sharding::without_auto_reduction_axes`), and the operand of the call is a completed value of the caller, so
+        // the call lowers and constrains the operand replicated. Lowering alone is checked here, so that a missing
+        // rejection cannot abort the test process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = ArrayType::new_static(DataType::F32, [4]);

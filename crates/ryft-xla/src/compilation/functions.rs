@@ -71,7 +71,7 @@
 //!     [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
 //!     on the devices it was compiled for. Both fixed execution and a device-pinned call require committed public
 //!     arguments on the same ordered physical devices. Captures and uncommitted arguments can move to those devices.
-//!     See [`CallOperation`](crate::CallOperation).
+//!     See [`CallOperation`](ryft_core::CallOperation).
 //!   - A staging parent (e.g., the trace of an enclosing [`compile`] or [`stage`]) records the call, and the enclosing
 //!     program lowers it as part of its own computation.
 //!   - Batching, differentiation, and partial evaluation parents rewrite the call through the ordinary rules of the
@@ -2316,22 +2316,23 @@ mod tests {
     use ryft_core::{
         Add, AddOperation, Array as CoreArray, ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex,
         ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast,
-        CaptureReference, Compare, ComparisonDirection, CompilationDomain, CompositeKey, Condition, Context,
-        ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, Device, DifferentiableType,
-        Differentiate, DifferentiationError, Dimension, DimensionBounds, DimensionSize, DimensionSizeOperation,
-        DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable, EagerInterpretationDriver,
-        ErasedOperation, Error as CoreError, EverythingSavable, ForwardModeDifferentiate, Hessian, ImportingContext,
-        InterpretableOperation, Jacobian, LogicalMesh, MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, Neg,
-        NothingSavable, Parameter, PartialEvaluationOutput, PartitionedProgram, Place, Placeholder, Placement, Program,
-        ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation, ResidualCandidate, ResidualDecision,
-        ResidualInputSource, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection,
-        ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, ShardMapOptions, Sharding,
-        ShardingDimension, Sin, Slice, Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation,
-        Trace, Tracer, TracingContext, TranspositionContext, Typed, TypedProgram, UnreducedKind, Value as CoreValue,
-        ValueProjection, WhileOptions, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at,
-        rematerialize, scan, shard_map, softmax_cross_entropy_with_target_logits, r#while,
+        CallOperation, CaptureReference, Compare, ComparisonDirection, CompilationDomain, CompositeKey, Condition,
+        Context, ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, Device,
+        DifferentiableType, Differentiate, DifferentiationError, Dimension, DimensionBounds, DimensionSize,
+        DimensionSizeOperation, DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable,
+        EagerInterpretationDriver, ErasedOperation, Error as CoreError, EverythingSavable, ForwardModeDifferentiate,
+        Hessian, ImportingContext, InterpretableOperation, Jacobian, LogicalMesh, MaybeZero, Memory, MeshAxis,
+        MeshAxisType, Mul, Neg, NothingSavable, Parameter, PartialEvaluationOutput, PartitionedProgram, Place,
+        Placeholder, Placement, Program, ProgramBuilder, ProgramError, ProjectedContext, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, ReshapeOperation,
+        ResidualCandidate, ResidualDecision, ResidualInputSource, ResidualPolicy, ResidualPolicyError,
+        ResidualPolicyReference, ResidualRejection, ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation,
+        ScanOptions, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, Slice, Softmax,
+        StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation, Trace, Tracer, TracingContext,
+        TranspositionContext, Typed, TypedProgram, UnreducedKind, Value as CoreValue, ValueProjection, WhileOptions,
+        batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
+        shard_map, softmax_cross_entropy_with_target_logits, r#while,
     };
     use ryft_macros::Parameterized;
 
@@ -2347,8 +2348,8 @@ mod tests {
         assert_send_sync, cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayShard, CallOperation, Constant, Error, ExecutionError, FromPjrt, Operation,
-        RaggedDotLoweringStrategy, Reference, Session, ThroughSession, Type, Value,
+        Array, ArrayShard, Constant, Error, ExecutionError, FromPjrt, Operation, RaggedDotLoweringStrategy, Reference,
+        Session, ThroughSession, Type, Value,
     };
 
     use super::*;
@@ -6796,26 +6797,26 @@ mod tests {
         // JAX places the tangents and cotangents of a `jit` call: a tangent takes the output override and the devices
         // of the callee, and so does a cotangent that the call moves onto those devices, committed there. An eager
         // uncommitted input enters the VJP without a sharding (refer to `Value::relocatable_type`), so it gets its
-        // cotangent back on the mesh of the call, as JAX returns the cotangent of a `jit` call under `set_mesh`.
-        // A placement in the body sends the cotangent to the devices of the call, which moved the input there, as JAX
+        // cotangent back on the mesh of the call, as JAX returns the cotangent of a `jit` call under `set_mesh`. A
+        // placement in the body sends the cotangent to the devices of the call, which moved the input there, as JAX
         // returns the cotangent of a `jit` call to the devices of the call, whereas the function that the callee was
         // compiled from, an uncompiled `place`, transposes it back to the device of the input. Likewise, a placement
         // onto an unconstrained target in the body returns the cotangent replicated, as the callee places it, whereas
-        // an uncompiled `place` transposes it back to the split placement of the input. The tangent of a call
-        // whose boundary leaves a dimension unconstrained keeps that dimension unconstrained in its sharding and type,
-        // as the result of the call does, and stores it replicated, while the cotangent of its input takes the type of
-        // that input, as a cotangent of a replicated input override does, because both store the dimension replicated.
-        // The tangent of a call whose callee declares a split input that it returns is split like the result of the
-        // call, and the cotangent of the replicated argument is resharded back to the placement of that argument, as
-        // JAX returns the cotangent of a `jit` argument with the sharding of the argument. A callee that declares a
+        // an uncompiled `place` transposes it back to the split placement of the input. The tangent of a call whose
+        // boundary leaves a dimension unconstrained keeps that dimension unconstrained in its sharding and type, as the
+        // result of the call does, and stores it replicated, while the cotangent of its input takes the type of that
+        // input, as a cotangent of a replicated input override does, because both store the dimension replicated. The
+        // tangent of a call whose callee declares a split input that it returns is split like the result of the call,
+        // and the cotangent of the replicated argument is resharded back to the placement of that argument, as JAX
+        // returns the cotangent of a `jit` argument with the sharding of the argument. A callee that declares a
         // replicated input over auto axes, or an input without a sharding on a mesh of several devices, replicates the
         // tangent and the cotangent of a split argument, as an input override does, except that the cotangent of an
         // argument whose type records its split is resharded back to that split. A compiled gradient follows the eager
         // cotangent, except where a caller compiled for other devices calls the callee and where the sum of a
         // bufferless value does not lower. The tangent of an argument with a pending sum or maximum over an auto mesh
-        // axis that the input override of the callee states is completed at the boundary like the argument (the
-        // maximum by the collective, which drops a NaN), and so is the cotangent of a pending sum, which carries no
-        // reduction state over the auto axis either (refer to `entered_argument_sharding`), whereas the function that
+        // axis that the input override of the callee states is completed at the boundary like the argument (the maximum
+        // by the collective, which drops a NaN), and so is the cotangent of a pending sum, which carries no reduction
+        // state over the auto axis either (refer to `Sharding::without_auto_reduction_axes`), whereas the function that
         // the callee was compiled from returns both with the pending reduction of the argument. A pending maximum has
         // no cotangent, and a compiled gradient rejects such an argument where its caller receives it.
         let differences = |fields: &[(&str, &str, &str)]| {
@@ -7024,7 +7025,7 @@ mod tests {
         // record. Every entry point that runs the call on the arguments themselves agrees with an execution of the
         // callee, which rejects arguments committed to different devices and arguments of another client, including
         // partial evaluation, which may forward an argument through the call only where the call provably returns it
-        // unchanged (refer to `CallOperation::eager_decision` and `CallOperation::returns_input_unchanged`).
+        // unchanged (refer to `CallEagerExtension::eager_decision` and `CallOperation::returns_input_unchanged`).
         let pair_type = vector_type.clone();
         let pair_callee: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compile(|pair| pair, (pair_type.clone(), pair_type.clone()), &session, second_canonical_mesh.clone())
@@ -7115,7 +7116,7 @@ mod tests {
         // the interpretation rule of the call, partial evaluation, which may forward the argument through the call, a
         // `jit` caller, which is specialized for the argument, and the interpretation of a caller that drops the result
         // of the call), because a call admits its arguments before, and independently of, any decision to move one of
-        // them (refer to `CallOperation::eager_decision` and `CallOperation::returns_input_unchanged`).
+        // them (refer to `CallEagerExtension::eager_decision` and `CallOperation::returns_input_unchanged`).
         let pending_sum = |mesh: &DeviceMesh| {
             let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
             let r#type = vector_type.clone().with_sharding(sharding.without_auto_axes()).unwrap();

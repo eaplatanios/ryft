@@ -160,7 +160,7 @@ impl<T, P: Parameter + Capability, S: Reshard<P, T> + ConstrainSharding<P, T>> S
 ///   - `input_mesh`: [`LogicalMesh`] over which the input's state is recorded.
 ///   - `preserved_axes`: Names of the mesh axes of `input_mesh` that carry the preserved state.
 ///   - `target_mesh`: [`LogicalMesh`] that must define each preserved axis identically.
-fn validate_preserved_mesh_axes<'o, I: IntoIterator<Item = &'o String>>(
+pub(crate) fn validate_preserved_mesh_axes<'o, I: IntoIterator<Item = &'o String>>(
     operation_name: &str,
     input_mesh: &LogicalMesh,
     preserved_axes: I,

@@ -3360,12 +3360,12 @@ impl Encoder {
                 self.fallback(portable, format!("`{}`", portable.name()))?
             }
             ArrayIrOperation::Rematerialize(_) => return Err(self.rematerialize_error()),
-            ArrayIrOperation::LinearCall(_) | ArrayIrOperation::RngBitGenerator(_) | ArrayIrOperation::Assert(_) => {
+            ArrayIrOperation::LinearCall(_)
+            | ArrayIrOperation::Call(_)
+            | ArrayIrOperation::RngBitGenerator(_)
+            | ArrayIrOperation::Assert(_) => {
                 // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers linear calls,
                 // random bit generation, and assertions.
-                self.fallback(portable, format!("`{}`", portable.name()))?
-            }
-            ArrayIrOperation::Call(_) => {
                 // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers calls.
                 self.fallback(portable, format!("`{}`", portable.name()))?
             }

@@ -1,11 +1,11 @@
 //! XLA backend operation family and the StableHLO lowering of its operations.
 //!
 //! [`Operation`] is the universe of staged operations that the XLA backend owns. It flattens the core array operation
-//! payloads of [`ArrayIrOperation`], including the call of a staged program (i.e., [`call`](CallOperation)),
-//! into one family, together with backend operations such as portable kernel instructions, so that the regions of
-//! higher-order instructions can contain backend operations. Each submodule implements [`LowerableOperation`] for one group of operations, and
-//! this module also provides the elementwise operand normalization and the result accuracy conversion that those
-//! lowerings share.
+//! payloads of [`ArrayIrOperation`], including the call of a staged program (i.e., [`call`](CallOperation)), into one
+//! family, together with backend operations such as portable kernel instructions, so that the regions of higher-order
+//! instructions can contain backend operations. Each submodule implements [`LowerableOperation`] for one group of
+//! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
+//! that those lowerings share.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -14,8 +14,8 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     AbsOperation, Accuracy as CoreAccuracy, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array,
     ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, Atan2Operation,
-    AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CastOperation, CeilOperation, ClampOperation,
-    CompareOperation, ComplexOperation, CompositeConversion, CompositeKey, CompositeOperation,
+    AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CallOperation, CastOperation, CeilOperation,
+    ClampOperation, CompareOperation, ComplexOperation, CompositeConversion, CompositeKey, CompositeOperation,
     CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation,
     ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation,
     Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
@@ -70,7 +70,7 @@ pub(crate) mod assertions;
 pub(crate) mod attention;
 /// Lowering and eager application of the `call` operation of `ryft-core`, which calls staged programs, including
 /// the deduplication of call sites.
-pub mod call;
+pub(crate) mod call;
 /// StableHLO lowering of collective operations.
 pub(crate) mod collectives;
 /// StableHLO lowering of comparison operations.
@@ -135,14 +135,13 @@ pub(crate) mod trigonometric;
 pub use debugging::{
     PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
-pub use ryft_core::{CALL_OPERATION_NAME, CallOperation, transpose_primal_call};
 
 /// Ordinary universe of staged operations that the XLA backend owns.
 ///
 /// This enum flattens the core array operation payloads directly into the operation family that the backend owns.
 /// Higher-order instructions attach their nested computations as regions of the containing XLA program, so those
-/// regions can contain operations specific to the backend such as [`call`](CallOperation) and
-/// [`shard_map`](ShardMapOperation).
+/// regions can contain any operation of this family, including the core operations [`call`](CallOperation) and
+/// [`shard_map`](ShardMapOperation), which this crate lowers and applies eagerly.
 ///
 /// The [`CoreOperation`](ryft_core::Operation) contract, the interpretation and partial evaluation dispatchers, the
 /// forward mode and transposition dispatchers, the projections onto the member operation families, and the payload
@@ -340,7 +339,7 @@ where
         >,
     ),
 
-    /// Call to a flat staged program, which this crate lowers and applies eagerly (refer to [`call`]).
+    /// Call to a flat staged program, which this crate lowers and applies eagerly (refer to `operations::call`).
     Call(CallOperation<Type>),
 
     /// Core `shard_map` operation, i.e., a [`ShardMapOperation`], which lowering emits as a Shardy
@@ -1105,7 +1104,7 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 /// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
 /// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
 /// `lower_mlir_module_for_program_with_effect_boundary`), or [`None`] when the callee has no such capture. An eager
-/// application of the call (refer to `CallOperation::eager_decision`) requires nothing of such a capture, as an
+/// application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a capture, as an
 /// execution of the callee requires nothing of it. The flags depend on the callee, the number of its captures, and the
 /// platform alone, so they are derived once for each of them and retained with the callee, and repeated applications
 /// only look them up.
@@ -1273,24 +1272,25 @@ mod tests {
         Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
         ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
-        BatchingContext, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
-        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate, ConditionOperation, Context,
-        Cos, CumulativeKind, CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension,
-        DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionOperations,
-        DimensionType, DimensionValue, DimensionVariable, DivOperation, DomainTracingContext, DotDimensionNumbers,
-        DotsSavable, DotsWithNoBatchDimensionsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses,
-        EmptyRegionDriver, ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, FlatProgram,
-        LiftedCustomRules, Log, MaybeZero, Memory, MulOperation, NothingSavable, OffloadDotsWithNoBatchDimensions,
-        Operation as CoreOperation, OperationPayloadProjection, OrOperation, PartialValue, Placeholder, Pow,
-        ProgramBuilder as CoreProgramBuilder, ProgramError, ReductionKind, ReferenceAddUpdateOperation,
-        ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem, RematerializationOptimizationBarrier,
-        RematerializeOperation, ResidualPolicy, ResidualPolicyReference, ResidualZeroProvider, Rsqrt,
-        SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, ScanOperation, SelectOperation, Shape,
-        Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh, Tolerance, Tracer as CoreTracer,
-        TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed, TypedProgram, UnreducedKind,
-        ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
+        BatchingContext, CallOperation, CaptureReference, CapturingContext, Compare, CompareOperation,
+        ComparisonDirection, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate,
+        ConditionOperation, Context, Cos, CumulativeKind, CustomRuleDefinition, CustomRuleRegistration, DataType,
+        DifferentiableType, Dimension, DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation,
+        DimensionOperation, DimensionOperations, DimensionType, DimensionValue, DimensionVariable, DivOperation,
+        DomainTracingContext, DotDimensionNumbers, DotsSavable, DotsWithNoBatchDimensionsSavable,
+        DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver, ErasedOperation, EverythingSavable,
+        Exp, ExternalReferenceBinding, FlatProgram, LiftedCustomRules, Log, MaybeZero, Memory, MulOperation,
+        NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation, OperationPayloadProjection,
+        OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder, ProgramError, ReductionKind,
+        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
+        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
+        RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
+        ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+        ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
+        Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
+        TypedProgram, UnreducedKind, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation,
+        rematerialize,
     };
 
     use crate::lowering::tests::{
@@ -1299,9 +1299,7 @@ mod tests {
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
-    use crate::{
-        Array, ArrayConstant, ArrayTracer, CallOperation, Constant, Session, Tracer, Type, to_mlir_module_for_program,
-    };
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, Type, to_mlir_module_for_program};
 
     use super::*;
 

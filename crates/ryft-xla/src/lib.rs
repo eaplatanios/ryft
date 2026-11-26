@@ -76,8 +76,7 @@ pub use lowering::{
 };
 pub use mlir::ToMlir;
 pub use operations::{
-    CALL_OPERATION_NAME, CallOperation, Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE,
-    ensure_print_handler_registered, transpose_primal_call, with_captured_prints,
+    Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
 pub use pjrt::{FromPjrt, ToPjrt};
 pub use sessions::{

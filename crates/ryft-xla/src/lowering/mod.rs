@@ -31,10 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array, ArrayType, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh, EagerContext,
-    EffectClass, EffectClasses, FlatProgram, Instruction, LogicalMesh, Memory, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef,
-    RematerializationOptimizationBarrier, Sharding, ShardingDimension, Type as CoreType, Typed, Value,
+    Array, ArrayType, CALL_OPERATION_NAME, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh,
+    EagerContext, EffectClass, EffectClasses, FlatProgram, Instruction, LogicalMesh, Memory,
+    Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError,
+    RegionRef, RematerializationOptimizationBarrier, Sharding, ShardingDimension, Type as CoreType, Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -52,7 +52,7 @@ use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{lower_captured_constant, lower_literal_value};
 use crate::operations::call::CallFunctionMap;
-use crate::{ArrayConstant, CALL_OPERATION_NAME, Constant, Error, Operation, RuntimeRequirement, Type};
+use crate::{ArrayConstant, Constant, Error, Operation, RuntimeRequirement, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -1107,8 +1107,8 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, ArrayOperations, ArrayType, AtomId, CaptureReference, CastOperation, Complex,
-        ConstantOperation, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable,
+        Array, ArrayOperation, ArrayOperations, ArrayType, AtomId, CallOperation, CaptureReference, CastOperation,
+        Complex, ConstantOperation, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable,
         DomainTracingContext, EagerContext, ErasedOperation, Error as CoreError, LinearCallOperation, LogicalMesh,
         Memory, MeshAxis, MeshAxisType, MulOperation, NegOperation, Operation as CoreOperation,
         OperationPayloadProjection, Parameterized, ParameterizedFamily, Placeholder, Program,
@@ -1129,8 +1129,8 @@ pub(crate) mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::{
-        ArrayConstant, ArrayTracer, CallOperation, CompileTracer, CompiledFunction, Constant, Error, FromPjrt,
-        Operation, Options, ProgramExtension, Session, ToMlir, Type, compile, trace_with_context,
+        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options,
+        ProgramExtension, Session, ToMlir, Type, compile, trace_with_context,
     };
 
     use crate::devices::MemoryExtension;

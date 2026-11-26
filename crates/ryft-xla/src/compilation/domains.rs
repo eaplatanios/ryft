@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
-    ArrayOperation, ArrayType, CapturePlacement, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh,
-    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
-    ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError,
-    StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram, declared_input_sharding,
-    entered_argument_sharding, states_boundary_placement,
+    ArrayOperation, ArrayType, CALL_OPERATION_NAME, CallOperation, CapturePlacement, CompilationCacheDomain,
+    CompilationDomain, Device, DeviceMesh, Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram,
+    LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized,
+    PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME,
+    Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
+    declared_input_sharding, states_boundary_placement,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -43,8 +43,8 @@ use crate::lowering::extensions::{
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
 use crate::lowering::signatures::ExecutableSignature;
 use crate::{
-    Array, CALL_OPERATION_NAME, CallOperation, Constant, Error, ExecutionError, LoweringError, OpShardingExtension,
-    Operation, RetainedArray, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
+    Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -995,7 +995,7 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
     if sharding.unreduced_axes().is_empty() {
         return Ok(sharding);
     }
-    Ok(entered_argument_sharding(&sharding)?.into_owned())
+    Ok(sharding.without_auto_reduction_axes())
 }
 
 /// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
@@ -1102,7 +1102,7 @@ pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
 /// one whose type records more keep their types, so the mesh of a function still rejects them when their logical
 /// meshes differ. The dispatch signature uses this rule for both executions and eager calls, so they trace the function
 /// alike. The rule also determines which arguments an eager call of a dispatcher
-/// leaves only an argument that is not relocatable where it is (refer to `CallOperation::eager_input_placement`).
+/// leaves only an argument that is not relocatable where it is (refer to `CallEagerExtension::eager_input_placement`).
 /// A relocatable argument has no placement over auto mesh axes for the function to specialize on (e.g., an uncommitted
 /// split along an auto axis of one device), because an execution moves it.
 pub(crate) fn argument_type(array: &Array, array_type: &ArrayType) -> Option<ArrayType> {
@@ -1209,7 +1209,7 @@ pub(crate) fn placed_constant(
         (mesh.clone(), sharding)
     };
     // A destination that assigns a device to another process than the one that owns it is rejected on every process
-    // before it can consume a placement attempt, as a direct placement rejects it (refer to `run_placement_dispatch`).
+    // before it can consume a placement attempt, as a direct placement rejects it (refer to `place_within_client`).
     validate_mesh_devices(session, &target)?;
     // The placed copy lives on devices that the mesh of the function names for every process, so it is committed to
     // them and not locally assigned, as an array that a placement onto named devices gives is, whatever the commitment
@@ -1369,7 +1369,7 @@ pub(crate) fn jit_compilation_options(
 ///
 /// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
 /// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
-/// for the mesh on which the application runs (refer to `CallOperation::eager_decision`), so that `.call`, the
+/// for the mesh on which the application runs (refer to `CallEagerExtension::eager_decision`), so that `.call`, the
 /// interpretation of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an
 /// execution does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
 pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, requests_placement: bool) -> bool {
@@ -1718,8 +1718,8 @@ fn validate_placements(
                     // The effective boundary of an input is its override or otherwise where the executable of the
                     // callee places it (refer to `CallOperation::boundary_input_sharding`), and the lowering of the
                     // call constrains the operand to it as the callee holds it once it has entered, without reduction
-                    // state over auto mesh axes (refer to `entered_argument_sharding`), which is what the replicas
-                    // must enforce.
+                    // state over auto mesh axes (refer to `Sharding::without_auto_reduction_axes`), which is what the
+                    // replicas must enforce.
                     let callee = region.with_id(instruction.regions()[0])?;
                     let mut shardings = Vec::new();
                     for (index, (input, declared)) in
@@ -1728,7 +1728,7 @@ fn validate_placements(
                         if let Type::Array(actual) = region.atoms()[input.index()].r#type().as_ref()
                             && let Some(sharding) = call.boundary_input_sharding(index, actual, declared)
                         {
-                            shardings.push(entered_argument_sharding(&sharding)?.into_owned());
+                            shardings.push(sharding.without_auto_reduction_axes());
                         }
                     }
                     shardings.extend(
@@ -1889,7 +1889,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, Array as CoreArray, ArrayIrValue, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArraySliceAxis, ArrayType, AttachedRegions, CaptureReference, CompilationArtifactExchange,
+        ArraySliceAxis, ArrayType, AttachedRegions, CallOperation, CaptureReference, CompilationArtifactExchange,
         CompilationArtifactExchangeError, CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain,
         CompilationTracer, CompiledFunction, CompositeKey, CompositeOperation, ConditionOperation, ConstantOperation,
         Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomRuleDefinition,
@@ -1922,8 +1922,8 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayError, CallOperation, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FromPjrt,
-        Operation, Options, PlacementOptions, RetainedArray, Session, StatefulCompiledFunction, Type, Value, compile,
+        Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FromPjrt, Operation, Options,
+        PlacementOptions, RetainedArray, Session, StatefulCompiledFunction, Type, Value, compile,
         compile_statefully_with_captures, jit_with_options,
     };
 
@@ -6298,10 +6298,10 @@ mod tests {
 
     #[test]
     fn test_placed_constant_rejects_misattributed_devices_before_the_placement_attempt() {
-        // A destination that assigns the device of this process to another process, or a device that this process
-        // cannot address to this process, is rejected as a direct placement rejects it (refer to
-        // `test_array_to_placement_rejects_misattributed_destination_devices`), before any placement attempt, so
-        // every process rejects it alike. Before, the process that owns the device accepted it.
+        // Like direct placement (refer to `test_array_to_placement_rejects_misattributed_target_devices`), this
+        // rejects a target that assigns this process's device to another process or assigns an unaddressable device
+        // to this process. Every process rejects the target before attempting placement. Previously, the process
+        // that owns the device accepted it.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();

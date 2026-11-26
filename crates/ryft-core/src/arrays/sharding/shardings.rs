@@ -673,6 +673,21 @@ impl Sharding {
         Self { unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
     }
 
+    /// Returns a [`Sharding`] with every [`MeshAxisType::Auto`] mesh axis removed from its reduction state (i.e.,
+    /// from [`Self::unreduced_axes`] and [`Self::reduced_axes`]), keeping its dimension placements, including their
+    /// splits along auto mesh axes, and its varying manual axes unchanged, unlike [`Self::without_auto_axes`], which
+    /// also drops those splits. Types never record reduction state over auto mesh axes, so no value of a program
+    /// carries it: a backend completes such a pending reduction where an argument enters its entry function, and a
+    /// completed-reduction marker states nothing about the buffers. This is therefore the sharding with which the body
+    /// of a function holds an input that arrives with this sharding (e.g., with an input sharding override), and with
+    /// which every output that returns that input holds it.
+    pub fn without_auto_reduction_axes(&self) -> Self {
+        let is_not_auto = |name: &&String| self.mesh.axis_type(name) != Some(MeshAxisType::Auto);
+        let unreduced_axes = self.unreduced_axes.iter().filter(is_not_auto).cloned().collect();
+        let reduced_axes = self.reduced_axes.iter().filter(is_not_auto).cloned().collect();
+        Self { unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
+    }
+
     /// Returns a [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`, shifting all
     /// subsequent dimensions one position to the right. Batching rules use this to extend an explicit output sharding
     /// with an entry for a newly introduced batch dimension. The resulting sharding is revalidated, and so inserting
@@ -1454,6 +1469,56 @@ mod tests {
         );
         let explicit = sharding.without_manual_reduction_axes();
         assert_eq!(explicit.without_manual_reduction_axes(), explicit);
+    }
+
+    #[test]
+    fn test_sharding_without_auto_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("pending", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("completed", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("split", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("explicit", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["split"])])
+            .unwrap()
+            .with_unreduced_axes(["pending", "explicit"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap()
+            .with_reduced_axes(["completed", "manual"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+
+        // Auto reduction state is removed, while explicit and manual reduction state, the kind of the pending
+        // reduction that remains, the split along an auto axis, and variation are kept.
+        assert_eq!(
+            sharding.without_auto_reduction_axes(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["split"])])
+                .unwrap()
+                .with_unreduced_axes(["explicit"])
+                .unwrap()
+                .with_unreduced_kind(UnreducedKind::Max)
+                .unwrap()
+                .with_reduced_axes(["manual"])
+                .unwrap()
+                .with_varying_manual_axes(["varying"])
+                .unwrap(),
+        );
+
+        // The kind of the pending reduction is the canonical one once no pending reduction remains, and a sharding
+        // without reduction state over auto mesh axes is unchanged.
+        let pending = Sharding::replicated(mesh.clone(), 1)
+            .with_unreduced_axes(["pending"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap();
+        assert_eq!(pending.without_auto_reduction_axes(), Sharding::replicated(mesh, 1));
+        let unchanged = sharding.without_auto_reduction_axes();
+        assert_eq!(unchanged.without_auto_reduction_axes(), unchanged);
     }
 
     #[test]
