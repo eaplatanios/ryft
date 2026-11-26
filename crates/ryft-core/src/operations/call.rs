@@ -246,6 +246,13 @@ impl<T: Type> CallOperation<T> {
         self
     }
 
+    /// Returns this call without the mesh of its function, for a call that a transform places into a program,
+    /// where it follows its caller.
+    #[inline]
+    pub fn without_function_mesh(&self) -> Self {
+        Self { function_mesh: None, ..self.clone() }
+    }
+
     /// Returns this call as a call that a program transform derived from another call, whose callee input at each
     /// position without a sharding override has the effective boundary sharding at that position of `shardings`, where
     /// [`None`] marks an input that the call leaves where it is (refer to [`Self::derived_input_shardings`]). Such a
@@ -304,6 +311,123 @@ impl<T: Type> CallOperation<T> {
         Ok(self)
     }
 
+    /// Returns `derived` with the boundary shardings of this call at the positions that `input_indices` and
+    /// `output_indices` select. An index of [`None`] gives the derived position no override. The derived call inherits
+    /// this call's mesh, if any, because it executes part of the same callee on the devices that the callee names. It
+    /// also inherits whether this call keeps the placement of its inputs. The derived call retains the function mesh
+    /// of `derived` (refer to [`Self::function_mesh`]). A caller can copy a function mesh to a transformed call
+    /// explicitly.
+    ///
+    /// `boundary` is the effective boundary sharding of each input of this call without an override (refer to
+    /// `effective_input_boundary`), which the derived call receives as its own at the selected positions, so that a
+    /// call that a program transform creates places the inputs of the original call as that call does, and leaves the
+    /// inputs that the transform adds (e.g., residuals, tangents of inactive inputs, or cotangent references) where
+    /// they are, as the declared types of its callee, which are only traced types, say nothing about where an execution
+    /// of the original function places them. [`None`] keeps the kind of this call, for a derived call whose callee
+    /// keeps the declared input types of the callee of this call (i.e., a pruned call).
+    fn with_derived_boundary_shardings<
+        U: Type,
+        I: IntoIterator<Item = Option<usize>>,
+        O: IntoIterator<Item = Option<usize>>,
+    >(
+        &self,
+        derived: CallOperation<U>,
+        boundary: Option<&[Option<Sharding>]>,
+        input_indices: I,
+        output_indices: O,
+    ) -> CallOperation<U> {
+        let input_indices = input_indices.into_iter().collect::<Vec<_>>();
+        let boundary = boundary.or(self.derived_input_shardings.as_deref());
+        let derived_input_shardings = boundary.map(|boundary| {
+            input_indices.iter().map(|index| index.and_then(|index| boundary.get(index)?.clone())).collect()
+        });
+        let derived =
+            CallOperation { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..derived };
+        let Some(mesh) = &self.mesh else {
+            return derived;
+        };
+        let input_shardings = input_indices
+            .into_iter()
+            .map(|index| index.and_then(|index| self.input_sharding(index)).cloned())
+            .collect();
+        let output_shardings = output_indices
+            .into_iter()
+            .map(|index| index.and_then(|index| self.output_sharding(index)).cloned())
+            .collect();
+        derived.with_boundary(Some(mesh), input_shardings, output_shardings)
+    }
+
+    /// Returns `known_call` and `residual_call`, the calls of the two sides of a partial evaluation split of this call,
+    /// with the boundary shardings of the inputs and outputs of this call that they receive and return. Residual edges
+    /// have none.
+    ///
+    /// # Parameters
+    ///
+    ///   - `boundary`: Effective boundary sharding of each input of this call (refer to `effective_input_boundary`).
+    ///   - `known_input_indices`: Input of this call that each known callee input receives.
+    ///   - `residual_inputs`: Source of each residual callee input.
+    ///   - `outputs`: Outputs of the split, each as the index of the output of this call that it computes together with
+    ///     its position among the outputs of the known or the residual callee. A split on residual demand computes
+    ///     each demanded output twice, once in the known callee and once more in the residual callee.
+    ///   - `known_output_count`: Number of outputs of the known callee, including its residual edges.
+    ///   - `residual_output_count`: Number of outputs of the residual callee.
+    ///   - `eager`: Whether the known program's parent is eager.
+    #[allow(clippy::too_many_arguments)]
+    fn with_split_boundary_shardings<O: IntoIterator<Item = (usize, PartialEvaluationOutput<usize>)>>(
+        &self,
+        known_call: Self,
+        residual_call: Self,
+        boundary: &[Option<Sharding>],
+        known_input_indices: &[usize],
+        residual_inputs: &[ResidualInputSource],
+        outputs: O,
+        known_output_count: usize,
+        residual_output_count: usize,
+        eager: bool,
+    ) -> (Self, Self) {
+        let mut known_outputs = vec![None; known_output_count];
+        let mut residual_outputs = vec![None; residual_output_count];
+        for (index, output) in outputs {
+            let position = match output {
+                PartialEvaluationOutput::Known(position) => known_outputs.get_mut(position),
+                PartialEvaluationOutput::Unknown(position) => residual_outputs.get_mut(position),
+            };
+            if let Some(position) = position {
+                *position = Some(index);
+            }
+        }
+
+        let residual_input_indices = residual_inputs.iter().map(|source| match *source {
+            ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => Some(index),
+            ResidualInputSource::KnownOutput(_) | ResidualInputSource::ResidualEdge(_) => None,
+        });
+
+        let mut known_call = self.with_derived_boundary_shardings(
+            known_call,
+            Some(boundary),
+            known_input_indices.iter().copied().map(Some),
+            known_outputs,
+        );
+
+        let mut residual_call = self.with_derived_boundary_shardings(
+            residual_call,
+            Some(boundary),
+            residual_input_indices,
+            residual_outputs,
+        );
+
+        if eager && let Some(mesh) = &self.function_mesh {
+            // A named function fixes the devices independently of the inputs available to each side of the split.
+            // The residual side also keeps an anonymous function mesh for later application (e.g., a pullback).
+            if mesh.logical_mesh().is_named() {
+                known_call.function_mesh = Some(mesh.clone());
+            }
+            residual_call.function_mesh = Some(mesh.clone());
+        }
+
+        (known_call, residual_call)
+    }
+
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
     #[inline]
     pub fn capture_count(&self) -> usize {
@@ -322,6 +446,13 @@ impl<T: Type> CallOperation<T> {
         self.output_shardings.as_deref().and_then(|shardings| shardings.get(index)?.as_ref())
     }
 
+    /// Returns whether the callee has any boundary sharding override. [`Self::with_boundary`] stores lists without
+    /// overrides as absent.
+    #[inline]
+    fn has_boundary_shardings(&self) -> bool {
+        self.input_shardings.is_some() || self.output_shardings.is_some()
+    }
+
     /// Returns every sharding override of the boundary of the callee, inputs first.
     #[inline]
     pub fn boundary_shardings(&self) -> impl Iterator<Item = &Sharding> {
@@ -337,20 +468,19 @@ impl<T: Type> CallOperation<T> {
         self.mesh.as_ref()
     }
 
-    /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
-    /// it states a placement at its boundary (refer to [`states_boundary_placement`]) or when its callee requests a
-    /// placement that names devices (i.e., any request except one that only moves a value to another memory), which
-    /// `callee_names_devices` says and which is asked only when the call records a mesh and states no placement at its
-    /// boundary, and [`None`] otherwise. The mesh is recorded when the function is staged, from its whole program, so a
-    /// call whose outputs pruning dropped can record a mesh that only a request of a dropped output named, which this
-    /// function no longer reports. The analyses of a program (i.e., [`RegionPlacementRequests::requests`] and
+    /// Returns the recorded mesh (refer to [`Self::mesh`]) when the call has an input or output sharding override or
+    /// its callee requests a placement that names devices (i.e., any request except one that only moves a value to
+    /// another memory). Otherwise it returns [`None`]. This function only asks `callee_names_devices` when the call
+    /// records a mesh and has no overrides. Staging records the mesh from the whole program. If pruning drops the
+    /// last request that names it, this function no longer reports it.
+    /// The analyses of a program (i.e., [`RegionPlacementRequests::requests`] and
     /// [`RegionPlacementRequests::device_naming`]) answer `callee_names_devices` with the facts of the callee that they
     /// derive in the same pass over the program, so that they never analyze a callee again for each call that encloses
     /// it.
     #[inline]
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
-        (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
+        (self.has_boundary_shardings() || callee_names_devices()).then_some(mesh)
     }
 
     /// Returns whether this call leaves each input without a sharding override placed as it is.
@@ -370,6 +500,12 @@ impl<T: Type> CallOperation<T> {
         self.derived_input_shardings.as_deref()
     }
 
+    /// Returns the derived boundary sharding of callee input `index`.
+    #[inline]
+    pub fn derived_input_sharding(&self, index: usize) -> Option<&Sharding> {
+        self.derived_input_shardings.as_deref().and_then(|shardings| shardings.get(index)?.as_ref())
+    }
+
     /// Returns the device mesh that the called function was compiled for (refer to [`Self::with_function_mesh`]), or
     /// [`None`] for a call that a program transform creates. Only the placement decision of an eager application by a
     /// backend reads it. A call nested in another compiled function runs where its caller runs whatever this mesh is.
@@ -378,162 +514,15 @@ impl<T: Type> CallOperation<T> {
         self.function_mesh.as_ref()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns whether this call states a placement at the boundary of its callee, which is when an input or an output
-    /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
-    /// [`states_boundary_placement`]).
-    #[inline]
-    fn states_boundary_placement(&self) -> bool {
-        states_boundary_placement(self.boundary_shardings())
-    }
-
-    /// Returns this call without the mesh of its function (refer to [`Self::function_mesh`]), for a call that a
-    /// transform places into a program, where it follows its caller.
-    #[inline]
-    fn without_function_mesh(&self) -> Self {
-        Self { function_mesh: None, ..self.clone() }
-    }
-
-    /// Returns whether the callee has any boundary sharding override.
-    #[inline]
-    fn has_boundary_shardings(&self) -> bool {
-        self.input_shardings.is_some() || self.output_shardings.is_some()
-    }
-
-    /// Returns the input overrides at `indices` and the output overrides at `output_indices`, where [`None`] selects
-    /// a position without one, for a call that is derived from this one (e.g., by a program transform).
-    fn derived_boundary_shardings(
-        &self,
-        input_indices: impl IntoIterator<Item = Option<usize>>,
-        output_indices: impl IntoIterator<Item = Option<usize>>,
-    ) -> (Vec<Option<Sharding>>, Vec<Option<Sharding>>) {
-        let inputs = input_indices.into_iter().map(|index| index.and_then(|index| self.input_sharding(index)).cloned());
-        let outputs =
-            output_indices.into_iter().map(|index| index.and_then(|index| self.output_sharding(index)).cloned());
-        (inputs.collect(), outputs.collect())
-    }
-
-    /// Returns `derived` with the boundary shardings of this call at the positions that `input_indices` and
-    /// `output_indices` select (refer to `derived_boundary_shardings`), with the mesh of this call, if any, because
-    /// the derived call runs a part of the callee of this call, which an execution runs on the devices that it names,
-    /// and with the placement of its inputs that this call keeps (refer to [`Self::with_kept_input_placements`]). The
-    /// derived call keeps the mesh of the function of `derived` (refer to [`Self::function_mesh`]), which a call that a
-    /// transform creates does not have, so a caller that wants it copies it.
-    ///
-    /// `boundary` is the effective boundary sharding of each input of this call without an override (refer to
-    /// `effective_input_boundary`), which the derived call receives as its own at the selected positions, so that a
-    /// call that a program transform creates places the inputs of the original call as that call does, and leaves
-    /// the inputs that the transform adds (e.g., residuals, tangents of inactive inputs, or cotangent references)
-    /// where they are, as the declared types of its callee, which are only traced types, say nothing about where an
-    /// execution of the original function places them. [`None`] keeps the kind of this call, for a derived call
-    /// whose callee keeps the declared input types of the callee of this call (i.e., a pruned call).
-    fn with_derived_boundary_shardings<U: Type>(
-        &self,
-        derived: CallOperation<U>,
-        boundary: Option<&[Option<Sharding>]>,
-        input_indices: impl IntoIterator<Item = Option<usize>>,
-        output_indices: impl IntoIterator<Item = Option<usize>>,
-    ) -> CallOperation<U> {
-        let input_indices = input_indices.into_iter().collect::<Vec<_>>();
-        let boundary = boundary.or(self.derived_input_shardings.as_deref());
-        let derived_input_shardings = boundary.map(|boundary| {
-            input_indices.iter().map(|index| index.and_then(|index| boundary.get(index)?.clone())).collect()
-        });
-        let derived =
-            CallOperation { keeps_input_placements: self.keeps_input_placements, derived_input_shardings, ..derived };
-        let Some(mesh) = &self.mesh else {
-            return derived;
-        };
-        let (inputs, outputs) = self.derived_boundary_shardings(input_indices, output_indices);
-        derived.with_boundary(Some(mesh), inputs, outputs)
-    }
-
-    /// Returns the derived boundary sharding of callee input `index` (refer to `with_derived_boundary_shardings`).
-    #[inline]
-    fn derived_input_sharding(&self, index: usize) -> Option<&Sharding> {
-        self.derived_input_shardings.as_deref().and_then(|shardings| shardings.get(index)?.as_ref())
-    }
-
-    /// Returns `known_call` and `residual_call`, the calls of the two sides of a partial evaluation split of this call,
-    /// with the boundary shardings of the inputs and outputs of this call that they receive and return, as JAX keeps
-    /// the shardings of the known and unknown inputs and outputs of a split `pjit`. Residual edges have none.
-    ///
-    /// # Parameters
-    ///
-    ///   - `boundary`: Effective boundary sharding of each input of this call (refer to `effective_input_boundary`).
-    ///   - `known_input_indices`: Input of this call that each known callee input receives.
-    ///   - `residual_inputs`: Source of each residual callee input.
-    ///   - `outputs`: Outputs of the split, each as the index of the output of this call that it computes together with
-    ///     its position among the outputs of the known or the residual callee. A split on residual demand computes
-    ///     each demanded output twice, once in the known callee and once more in the residual callee.
-    ///   - `known_output_count`: Number of outputs of the known callee, including its residual edges.
-    ///   - `residual_output_count`: Number of outputs of the residual callee.
-    ///   - `eager`: Whether the known program's parent is eager.
-    fn with_split_boundary_shardings(
-        &self,
-        known_call: Self,
-        residual_call: Self,
-        boundary: &[Option<Sharding>],
-        known_input_indices: &[usize],
-        residual_inputs: &[ResidualInputSource],
-        outputs: impl IntoIterator<Item = (usize, PartialEvaluationOutput<usize>)>,
-        known_output_count: usize,
-        residual_output_count: usize,
-        eager: bool,
-    ) -> (Self, Self) {
-        let mut known_outputs = vec![None; known_output_count];
-        let mut residual_outputs = vec![None; residual_output_count];
-        for (index, output) in outputs {
-            let position = match output {
-                PartialEvaluationOutput::Known(position) => known_outputs.get_mut(position),
-                PartialEvaluationOutput::Unknown(position) => residual_outputs.get_mut(position),
-            };
-            if let Some(position) = position {
-                *position = Some(index);
-            }
-        }
-        let residual_input_indices = residual_inputs.iter().map(|source| match *source {
-            ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => Some(index),
-            ResidualInputSource::KnownOutput(_) | ResidualInputSource::ResidualEdge(_) => None,
-        });
-        let mut known_call = self.with_derived_boundary_shardings(
-            known_call,
-            Some(boundary),
-            known_input_indices.iter().copied().map(Some),
-            known_outputs,
-        );
-        let mut residual_call = self.with_derived_boundary_shardings(
-            residual_call,
-            Some(boundary),
-            residual_input_indices,
-            residual_outputs,
-        );
-        if eager && let Some(mesh) = &self.function_mesh {
-            // A named function fixes the devices independently of the inputs available to each side of the split.
-            // The residual side also keeps an anonymous function mesh for later application (e.g., a pullback).
-            if mesh.logical_mesh().is_named() {
-                known_call.function_mesh = Some(mesh.clone());
-            }
-            residual_call.function_mesh = Some(mesh.clone());
-        }
-        (known_call, residual_call)
-    }
-
     /// Checks that the lexical capture namespace is a valid prefix of this callee's actual boundary.
     fn validate_capture_prefix(&self, input_count: usize) -> Result<(), TypeError> {
         if self.capture_count > input_count {
             return Err(TypeError::invalid(format!(
-                "`{CALL_OPERATION_NAME}` lifted capture prefix {} exceeds its {input_count} callee inputs",
-                self.capture_count,
+                "`{}` lifted capture prefix {} exceeds its {} callee inputs",
+                CALL_OPERATION_NAME, self.capture_count, input_count,
             )));
         }
         Ok(())
-    }
-
-    /// Rebinds forwarded result names from the retained formal input scope to this callee instantiation.
-    fn instantiated_output_types(&self, inputs: &[T]) -> Result<Option<Vec<T>>, TypeError> {
-        self.output_types.as_ref().map(|types| types.instantiated(inputs)).transpose()
     }
 
     /// Validates exact local-result instantiation and returns the callee-to-caller result correspondence.
@@ -545,6 +534,7 @@ impl<T: Type> CallOperation<T> {
         if let Some(types) = &self.output_types {
             return types.renaming(inputs, callee_outputs);
         }
+
         if callee_outputs
             .iter()
             .flat_map(Type::identities)
@@ -554,9 +544,12 @@ impl<T: Type> CallOperation<T> {
                 "`{CALL_OPERATION_NAME}` with callee-local result identities requires `with_callee_type_signature`",
             )));
         }
+
         Ok(TypeIdentityRenaming::new())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: ArrayMemberType> CallOperation<T> {
     /// Returns the effective boundary sharding of callee input `index`, an input of type `actual` for a callee input of
@@ -884,9 +877,11 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         self.validate_capture_prefix(callee_interface.input_types().len())?;
         let variation = validate_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
         self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
-        let output_types = self
-            .instantiated_output_types(callee_interface.input_types())?
-            .unwrap_or_else(|| callee_interface.output_types().to_vec());
+        let output_types = if let Some(types) = &self.output_types {
+            types.instantiated(callee_interface.input_types())?
+        } else {
+            callee_interface.output_types().to_vec()
+        };
         if callee_interface.input_types() == input_types {
             return Ok(output_types);
         }
@@ -2052,16 +2047,6 @@ pub fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Optio
     }
     let boundary_type = input_type.clone().with_sharding(boundary.without_auto_axes()).ok()?;
     input_type.is_refined_by(&boundary_type).then_some(boundary_type)
-}
-
-/// Returns whether a function whose boundary has the sharding overrides `overrides` (i.e., those of its inputs and of
-/// its outputs) states a placement at its boundary, which is when it has at least one. A list of overrides that is
-/// present but states nothing (i.e., an empty list, or a list without an override at any position) states no
-/// placement, so it neither commits the results of the function nor makes it name devices. This is the one test of a
-/// placement stated at the boundary of a function, which a backend that compiles a function and a call of one (refer
-/// to [`CallOperation::names_devices`]) read.
-pub fn states_boundary_placement<'s>(overrides: impl IntoIterator<Item = &'s Sharding>) -> bool {
-    overrides.into_iter().next().is_some()
 }
 
 /// Formal callee input types and caller result types that bind [`TypeIdentity`](crate::TypeIdentity)s across one
@@ -4292,7 +4277,12 @@ mod tests {
                 .unwrap(),
             outputs
         );
-        assert_ne!(other.infer_output_types(std::slice::from_ref(&input_type), &[interface]).unwrap(), outputs);
+        assert_ne!(
+            other
+                .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
+                .unwrap(),
+            outputs
+        );
         let actual = ArrayType::new_static(DataType::F32, [2]);
         let callee_outputs = output_types
             .iter()
@@ -4309,7 +4299,7 @@ mod tests {
         let retained = CallOperation::<ArrayType>::new(0)
             .with_caller_output_types(std::slice::from_ref(&input_type), &output_types, outputs.clone())
             .unwrap();
-        assert_eq!(retained.instantiated_output_types(&[input_type]).unwrap(), Some(outputs));
+        assert_eq!(retained.infer_output_types(&[input_type], &[interface]).unwrap(), outputs);
     }
 
     #[test]
@@ -4420,15 +4410,15 @@ mod tests {
         };
         let rows = [
             ("empty lists", call(vec![], vec![])),
-            ("no input override", call(vec![None], vec![])),
+            ("no input override", call(vec![None, None], vec![])),
             ("no output override", call(vec![], vec![None])),
-            ("one input override", call(vec![Some(replicated.clone())], vec![None])),
+            ("one input override", call(vec![None, Some(replicated.clone()), None], vec![None])),
             ("one output override", call(vec![None], vec![Some(replicated.clone())])),
         ];
         let observed = rows
             .iter()
             .map(|(name, call)| {
-                (*name, call.states_boundary_placement(), call.names_devices(|| false), call.names_devices(|| true))
+                (*name, call.has_boundary_shardings(), call.names_devices(|| false), call.names_devices(|| true))
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -10686,19 +10676,6 @@ mod tests {
         assert_eq!(boundary_input_type(&split_type, &split(&["x"]).unwrap()), None);
         let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
         assert_eq!(boundary_input_type(&item_type, &unreduced), None);
-    }
-
-    #[test]
-    fn test_states_boundary_placement() {
-        // A boundary states a placement exactly when it has at least one sharding override, so an empty list of
-        // overrides and a list that holds none state nothing.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let replicated = Sharding::replicated(mesh, 1);
-        let overrides = [None, Some(replicated.clone()), None];
-        assert!(!states_boundary_placement([]));
-        assert!(!states_boundary_placement([None::<Sharding>, None].iter().flatten()));
-        assert!(states_boundary_placement([&replicated]));
-        assert!(states_boundary_placement(overrides.iter().flatten()));
     }
 
     #[test]
