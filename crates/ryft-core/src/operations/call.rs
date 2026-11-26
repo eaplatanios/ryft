@@ -2046,8 +2046,12 @@ impl RegionPlacementRequests {
 
         let arguments = target_platform.map(str::to_owned);
         let Ok(artifact) = region.transform::<RegionPlacementAnalysis, _, Infallible>(arguments, |region, _| {
+            // A request of the program that the backend runs is also a request of the program as it is, so a region
+            // without any skips pruning. The same analysis classifies both, so that they never disagree on which
+            // instructions request a placement.
+            let mut naming = DeviceNamingAnalysis::new(region.arena().len(), omits_regions);
             let has_requests = region.computation_regions().any(|region| {
-                region.instructions().iter().any(|instruction| placement_request(instruction.operation()).is_some())
+                region.instructions().iter().any(|instruction| naming.request(region, instruction).is_some())
             });
             let summary = if !has_requests {
                 Self { requests: Arc::from([]) }
@@ -2312,23 +2316,6 @@ impl<T: Type> CallTypeBindings<T> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Placement request that one instruction makes explicitly, as [`placement_request`] classifies it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum InstructionPlacementRequest<'o> {
-    /// A `place` with a device target, which names that device.
-    Device(Device),
-
-    /// A `place` whose target is a resolved placement, or a `call` whose callee names devices (refer to
-    /// [`CallOperation::with_boundary`]), which name the devices of this mesh.
-    Mesh(&'o DeviceMesh),
-
-    /// A `place` with an in-place target, which only moves a value to another memory and names no devices.
-    Memory,
-
-    /// A `constrain_sharding`, which names a sharding over a logical mesh but no devices.
-    Sharding,
-}
-
 /// Whether each region of one program requests a placement that names devices (i.e., any request except one that only
 /// moves a value to another memory) in the regions that the backend runs, which is what a call that records a mesh
 /// reads of its callee (refer to [`CallOperation::names_devices`]). Each region of the program is analyzed at most
@@ -2381,36 +2368,40 @@ where
         names_devices
     }
 
-    /// Returns the placement request that `instruction` of `region` makes (refer to [`placement_request`]), with a
-    /// device target resolved as [`RequestedPlacement::Devices`] documents, and with a call that records a mesh
-    /// resolved by whether it names devices, which a call that pruning left without the request that made it name
-    /// devices does not.
+    /// Returns the placement request that `instruction` of `region` makes explicitly, if any, which is the one
+    /// classification of the placement requests of a program. A `place` with a device target is resolved as
+    /// [`RequestedPlacement::Devices`] documents, and a call that records a mesh requests a placement only when it
+    /// names devices, which a call that pruning left without the request that made it name devices does not.
     fn request(&mut self, region: RegionRef<'_, V, O>, instruction: &Instruction<O>) -> Option<RequestedPlacement> {
-        match placement_request(instruction.operation())? {
-            InstructionPlacementRequest::Device(device) => {
-                let input_mesh = instruction.inputs().first().and_then(|input| {
-                    let input_type = region.atoms()[input.index()].r#type();
-                    let ArrayIrType::Array(array_type) = input_type.as_ref() else { return None };
-                    array_type.sharding().map(|sharding| sharding.mesh().clone())
-                });
-                let logical_mesh =
-                    input_mesh.filter(|mesh| mesh.device_count() == 1).unwrap_or_else(LogicalMesh::single_device);
-                // A logical mesh of one device always forms a mesh with one device.
-                Some(RequestedPlacement::Devices(DeviceMesh::new(logical_mesh, vec![device]).unwrap()))
-            }
-            InstructionPlacementRequest::Mesh(mesh) => {
-                match instruction.operation().projected_payload::<CallOperation<ArrayIrType>>() {
-                    Some(call) => {
-                        let callee = region.with_id(instruction.regions()[0]).ok()?;
-                        let mesh = call.names_devices(|| self.names_devices(callee))?;
-                        Some(RequestedPlacement::Devices(mesh.clone()))
-                    }
-                    None => Some(RequestedPlacement::Devices(mesh.clone())),
+        let operation = instruction.operation();
+        if let Some(place) = operation.projected_payload::<PlaceOperation>() {
+            return match place.target()? {
+                PlacementRequest::InPlace { .. } => Some(RequestedPlacement::Memory),
+                PlacementRequest::Device { device, .. } => {
+                    let input_mesh = instruction.inputs().first().and_then(|input| {
+                        let input_type = region.atoms()[input.index()].r#type();
+                        let ArrayIrType::Array(array_type) = input_type.as_ref() else { return None };
+                        array_type.sharding().map(|sharding| sharding.mesh().clone())
+                    });
+                    let logical_mesh =
+                        input_mesh.filter(|mesh| mesh.device_count() == 1).unwrap_or_else(LogicalMesh::single_device);
+
+                    // A logical mesh of one device always forms a mesh with one device.
+                    Some(RequestedPlacement::Devices(DeviceMesh::new(logical_mesh, vec![*device]).unwrap()))
                 }
-            }
-            InstructionPlacementRequest::Memory => Some(RequestedPlacement::Memory),
-            InstructionPlacementRequest::Sharding => Some(RequestedPlacement::Sharding),
+                PlacementRequest::Resolved(placement) => Some(RequestedPlacement::Devices(placement.mesh().clone())),
+            };
         }
+
+        if operation.projected_payload::<ConstrainShardingOperation>().is_some() {
+            return Some(RequestedPlacement::Sharding);
+        }
+
+        let call = operation.projected_payload::<CallOperation<ArrayIrType>>()?;
+        call.mesh()?;
+        let callee = region.with_id(instruction.regions()[0]).ok()?;
+        let mesh = call.names_devices(|| self.names_devices(callee))?;
+        Some(RequestedPlacement::Devices(mesh.clone()))
     }
 }
 
@@ -2616,25 +2607,6 @@ where
         .projected_payload::<ScanOperation<ArrayIrType>>()
         .is_some_and(ScanOperation::has_zero_iterations)
         || omits_regions(region, instruction)
-}
-
-/// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
-/// placement requests of a program, which [`RegionPlacementRequests`] reads.
-fn placement_request<O: Operation<Type = ArrayIrType> + OperationPayloadProjection>(
-    operation: &O,
-) -> Option<InstructionPlacementRequest<'_>> {
-    if let Some(place) = operation.projected_payload::<PlaceOperation>() {
-        return match place.target()? {
-            PlacementRequest::InPlace { .. } => Some(InstructionPlacementRequest::Memory),
-            PlacementRequest::Device { device, .. } => Some(InstructionPlacementRequest::Device(*device)),
-            PlacementRequest::Resolved(placement) => Some(InstructionPlacementRequest::Mesh(placement.mesh())),
-        };
-    }
-    if operation.projected_payload::<ConstrainShardingOperation>().is_some() {
-        return Some(InstructionPlacementRequest::Sharding);
-    }
-    let mesh = operation.projected_payload::<CallOperation<ArrayIrType>>()?.mesh()?;
-    Some(InstructionPlacementRequest::Mesh(mesh))
 }
 
 /// Interprets `call` in `context` on `inputs` by the reference semantics of a call. The type rule of the call validates
@@ -10834,16 +10806,6 @@ mod tests {
                 lambda  .
                 in ()"},
         );
-    }
-
-    #[test]
-    fn test_placement_request() {
-        // A call whose callee names devices names the devices of its mesh, and a call without a mesh requests nothing.
-        let device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(1, 0)]).unwrap();
-        let call = CallOperation::<ArrayIrType>::new(0).with_boundary(Some(&device_mesh), Vec::new(), Vec::new());
-        let call = TestOperation::Call(call);
-        assert_eq!(placement_request(&call), Some(InstructionPlacementRequest::Mesh(&device_mesh)));
-        assert_eq!(placement_request(&TestOperation::Call(CallOperation::new(0))), None);
     }
 
     #[test]
