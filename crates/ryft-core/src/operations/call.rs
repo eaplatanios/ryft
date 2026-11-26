@@ -549,30 +549,44 @@ impl<T: Type> CallOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: ArrayMemberType> CallOperation<T> {
+    /// Validates that this call accepts inputs of types `input_types` for a callee whose input types are
+    /// `callee_input_types`, in count and position, by the type rule of the call. A call accepts an input of exactly
+    /// the callee input type and every input whose type refines it up to the placement that its sharding describes,
+    /// with the same unreduced and reduced axes and with manual variation along at most more manual mesh axes of one
+    /// mesh, where a callee input type with a sharding must define every mesh axis that carries that state as the input
+    /// type does. This is the only owner of that rule, so that every context that binds a call (e.g., the eager
+    /// application of a backend, staging, and the transforms of a call) accepts the same inputs. An execution
+    /// of the callee by a backend accepts a reduced argument as well, because it reshards its arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] that names the first input that the call rejects.
+    #[inline]
+    pub fn validate_input_types(&self, callee_input_types: &[T], input_types: &[T]) -> Result<(), TypeError> {
+        validate_call_input_types(CALL_OPERATION_NAME, callee_input_types, input_types).map(|_| ())
+    }
+
     /// Returns the effective boundary sharding of callee input `index`, an input of type `actual` for a callee input of
     /// type `declared`, which is where an execution of the callee places that input. This is the sharding override of
     /// the input when the callee has one, which replaces its declared sharding. Otherwise, for a call of a function
-    /// compiled for its input types, it is where the executable of that function places the input (refer to
-    /// [`declared_input_sharding`]), which is the sharding of the declared input type, including over the auto mesh
-    /// axes that the type does not record (e.g., a declared replicated input stays replicated over them), and for a
-    /// declared input type without a sharding, replicated over the mesh of the call, which is the mesh that the callee
-    /// names, if any, and otherwise the mesh of `actual`, on whose devices the call runs. A call that a program
-    /// transform derives from another call instead has the effective boundary of the original call for the inputs that
-    /// it receives from it and none for the inputs that the transform adds (refer to
-    /// `with_derived_boundary_shardings`), because the declared types of its callee are only traced types.
+    /// compiled for its input types, it is where the executable of that function places the input, which is the
+    /// sharding of the declared input type, including over the auto mesh axes that the type does not record (e.g.,
+    /// a declared replicated input stays replicated over them), and for a declared input type without a sharding,
+    /// replicated over the mesh of the call, which is the mesh that the callee names, if any, and otherwise the mesh
+    /// of `actual`, on whose devices the call runs. A call that a program transform derives from another call instead
+    /// has the effective boundary of the original call for the inputs that it receives from it and none for the inputs
+    /// that the transform adds, because the declared types of its callee are only traced types.
     ///
-    /// There is none for an input of the lifted capture prefix, for an input that a call of a `jit` dispatcher keeps
-    /// placed as it is (refer to [`Self::with_kept_input_placements`]), for an input that varies along manual mesh
-    /// axes that the declared type does not declare, which the declared sharding does not describe, for a declared
-    /// input type without a sharding when the mesh of the call is unknown (i.e., `actual` has no sharding), and for a
-    /// placement over a single device, which places nothing that the devices of the call do not. Every entry point of a
-    /// backend that places the inputs of a call (e.g., its eager application, its lowering, and the result placements
-    /// of its compiled programs) consults this function, so that they agree on where a call places its inputs. Only an
-    /// eager application also gives an argument on one device the logical mesh of a declared placement over a single
-    /// device (refer to [`CallOperation::eager_boundary_input_sharding`]).
+    /// There is none for an input of the lifted capture prefix, for an input that a call of a Just-In-Time (JIT)
+    /// compilation dispatcher keeps placed as it is, for an input that varies along manual mesh axes that the declared
+    /// type does not declare, which the declared sharding does not describe, for a declared input type without a
+    /// sharding when the mesh of the call is unknown (i.e., `actual` has no sharding), and for a placement over a
+    /// single device, which places nothing that the devices of the call do not. Every entry point of a backend that
+    /// places the inputs of a call (e.g., its eager application, its lowering, and the result placements of its
+    /// compiled programs) consults this function, so that they agree on where a call places its inputs. Only an eager
+    /// application also gives an argument on one device the logical mesh of a declared placement over a single device.
+    #[inline]
     pub fn boundary_input_sharding<'s>(
         &'s self,
         index: usize,
@@ -582,66 +596,10 @@ impl<T: ArrayMemberType> CallOperation<T> {
         self.boundary_input_sharding_over(index, actual, declared, false)
     }
 
-    /// Validates that this call accepts inputs of types `input_types` for a callee whose input types are
-    /// `callee_input_types`, in count and position, by the type rule of the call (refer to
-    /// [`Operation::infer_output_types`]). A call accepts an input of exactly the callee input type and every input
-    /// whose type refines it up to the placement that its sharding describes, with the same unreduced and reduced axes
-    /// and with manual variation along at most more manual mesh axes of one mesh, where a callee input type with a
-    /// sharding must define every mesh axis that carries that state as the input type does. This is the only owner of
-    /// that rule, so that every context that binds a call (e.g., the eager application of a backend, staging, and the
-    /// transforms of a call) accepts the same inputs. An execution of the callee by a backend accepts a reduced
-    /// argument as well, because it reshards its arguments.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] that names the first input that the call rejects.
-    pub fn validate_input_types(&self, callee_input_types: &[T], input_types: &[T]) -> Result<(), TypeError> {
-        validate_call_input_types(CALL_OPERATION_NAME, callee_input_types, input_types).map(|_| ())
-    }
-
-    /// Returns the effective boundary sharding of callee input `index` (refer to [`Self::boundary_input_sharding`]),
-    /// which, with `single_device`, includes a placement over a single device.
-    fn boundary_input_sharding_over<'s>(
-        &'s self,
-        index: usize,
-        actual: &ArrayType,
-        declared: &'s T,
-        single_device: bool,
-    ) -> Option<Cow<'s, Sharding>> {
-        if index < self.capture_count {
-            return None;
-        }
-        if let Some(sharding) = self.input_sharding(index) {
-            return Some(Cow::Borrowed(sharding));
-        }
-        if self.keeps_input_placements {
-            return None;
-        }
-        if self.derived_input_shardings.is_some() {
-            return self.derived_input_sharding(index).map(Cow::Borrowed);
-        }
-        let Ok(declared) = declared.as_array_type() else { return None };
-        if !call_input_variation(declared, actual).is_some_and(|axes| axes.is_empty()) {
-            return None;
-        }
-        let sharding = match declared.sharding() {
-            Some(sharding) => Cow::Borrowed(sharding),
-            None => {
-                let mesh = match &self.mesh {
-                    Some(mesh) => mesh.logical_mesh(),
-                    None => actual.sharding()?.mesh(),
-                };
-                Cow::Owned(declared_input_sharding(declared, mesh))
-            }
-        };
-        (single_device || sharding.mesh().device_count() > 1).then_some(sharding)
-    }
-
-    /// Returns the effective boundary sharding of each callee input without a sharding override (refer to
-    /// [`Self::boundary_input_sharding`]), for a call of a callee whose declared input types are `declared` with inputs
-    /// of types `actual`, which a call that a program transform derives from this call receives (refer to
-    /// `with_derived_boundary_shardings`).
-    fn effective_input_boundary<'t>(
+    /// Returns the effective boundary sharding of each callee input without a sharding override, for a call of a callee
+    /// whose declared input types are `declared` with inputs of types `actual`, which a call that a program transform
+    /// derives from this call receives.
+    fn effective_input_boundary_sharding<'t>(
         &self,
         declared: &[T],
         actual: impl IntoIterator<Item = Cow<'t, T>>,
@@ -661,7 +619,53 @@ impl<T: ArrayMemberType> CallOperation<T> {
             })
             .collect()
     }
+
+    /// Returns the effective boundary sharding of callee input `index`, which, with `single_device`,
+    /// includes a placement over a single device.
+    fn boundary_input_sharding_over<'s>(
+        &'s self,
+        index: usize,
+        actual: &ArrayType,
+        declared: &'s T,
+        single_device: bool,
+    ) -> Option<Cow<'s, Sharding>> {
+        if index < self.capture_count {
+            return None;
+        }
+
+        if let Some(sharding) = self.input_sharding(index) {
+            return Some(Cow::Borrowed(sharding));
+        }
+
+        if self.keeps_input_placements {
+            return None;
+        }
+
+        if self.derived_input_shardings.is_some() {
+            return self.derived_input_sharding(index).map(Cow::Borrowed);
+        }
+
+        let Ok(declared) = declared.as_array_type() else { return None };
+        if !call_input_variation(declared, actual).is_some_and(|axes| axes.is_empty()) {
+            return None;
+        }
+
+        let sharding = match declared.sharding() {
+            Some(sharding) => Cow::Borrowed(sharding),
+            None => {
+                let mesh = match &self.mesh {
+                    Some(mesh) => mesh.logical_mesh(),
+                    None => actual.sharding()?.mesh(),
+                };
+                Cow::Owned(declared_input_sharding(declared, mesh))
+            }
+        };
+
+        (single_device || sharding.mesh().device_count() > 1).then_some(sharding)
+    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CallOperation<ArrayIrType> {
     /// Returns the sharding to which an eager application of this call places callee input `index`, which receives an
@@ -1280,8 +1284,10 @@ where
             &partition.residual_program().input_types(),
             &partition.residual_program().output_types(),
         )?;
-        let boundary =
-            self.effective_input_boundary(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
+        let boundary = self.effective_input_boundary_sharding(
+            &callee.input_types(),
+            inputs.iter().map(PartialEvaluationValue::r#type),
+        );
         let (known_call, residual_call) = self.with_split_boundary_shardings(
             known_call,
             residual_call,
@@ -1370,7 +1376,7 @@ where
         // the extent input, and an eager parent compiles the call as a standalone program, whose results must be
         // arrays.
         let original = driver.region(0)?;
-        let boundary = self.effective_input_boundary(
+        let boundary = self.effective_input_boundary_sharding(
             &original.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
@@ -1461,7 +1467,7 @@ where
         // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
         // (refer to its gate G8), through a batching policy hook returning `Option<key>` where `None` keeps a policy
         // uncached, so that soundness stays opt-in per policy.
-        let boundary = self.effective_input_boundary(
+        let boundary = self.effective_input_boundary_sharding(
             &driver.region(0)?.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
@@ -1661,8 +1667,8 @@ where
             // Each tangent has the boundary sharding of its primal, as JAX's `_pjit_jvp` gives each tangent the
             // sharding of its primal.
             let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
-            let boundary =
-                self.effective_input_boundary(&input_types, inputs.iter().map(|input| input.primal().r#type()));
+            let boundary = self
+                .effective_input_boundary_sharding(&input_types, inputs.iter().map(|input| input.primal().r#type()));
             // The fused call replaces the whole call in the same context, so it keeps the mesh of the function and an
             // eager JVP runs where the call runs.
             let operation = C::Operation::from(CallOperation {
@@ -1748,7 +1754,8 @@ where
         // `CallOperation::function_mesh`). An uncommitted argument enters an eager linearization without the
         // placement that it happens to have (refer to `Value::relocatable_type`), so the tangent and the cotangent of
         // such an argument may live on the devices of the function.
-        let boundary = self.effective_input_boundary(&input_types, primal_inputs.iter().map(|input| input.r#type()));
+        let boundary =
+            self.effective_input_boundary_sharding(&input_types, primal_inputs.iter().map(|input| input.r#type()));
         let primal_call = C::Operation::from(CallOperation {
             function_mesh: self.function_mesh.clone(),
             ..self.with_derived_boundary_shardings(
@@ -3031,8 +3038,8 @@ where
     let split = artifact.metadata();
 
     // The effective boundary of the call follows the types of its inputs before they are guarded.
-    let boundary =
-        operation.effective_input_boundary(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
+    let boundary = operation
+        .effective_input_boundary_sharding(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
 
     // Partitioning seeds both callees at the declared input types of the callee, so neither checks a relationship that
     // the entry of the callee checks between a known and an unknown input. Both calls therefore consume guarded inputs.
@@ -3413,7 +3420,8 @@ where
     // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
     // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
     // leaves its residuals where they are.
-    let boundary = operation.effective_input_boundary(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
+    let boundary =
+        operation.effective_input_boundary_sharding(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
     // Seed inputs enter on the tangent result's cotangent sharding when the call already knows its devices.
     // Eager admission checks device commitments before applying these boundary shardings. The callee can then
     // transpose any placement-only result cast using the seed's admitted type.
