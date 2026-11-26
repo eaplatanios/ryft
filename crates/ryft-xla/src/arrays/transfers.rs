@@ -537,7 +537,6 @@ impl Array {
         // choosing a strategy. Consuming `self` keeps the buffers uniquely owned for a donation.
         let array = self.with_session(session)?;
         let layout = array.validate_placement_layout(session, target)?;
-        let layout_resolver = cross_host_layout_resolver(session.client());
         let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
         let memory = target.memory().unwrap_or_else(|| array.r#type().memory());
         let placed = |array: Self| array.with_committed(true).with_locally_assigned(false);
@@ -551,19 +550,12 @@ impl Array {
         validate_mesh_devices(session, &mesh)?;
 
         // Keep the error of the device work, which is the most informative one if the host fallback fails too.
-        let (compiled_error, source) = match array.try_reshard_on_devices(
-            &layout_resolver,
-            &mesh,
-            &sharding,
-            memory,
-            layout.as_ref(),
-            donate,
-            true,
-        ) {
-            Ok(array) => return Ok(placed(array.place_storage(memory, layout)?)),
-            Err((error, Some(source))) => (error, source),
-            Err((error, None)) => return Err(error),
-        };
+        let (compiled_error, source) =
+            match array.try_reshard_on_devices(&mesh, &sharding, memory, layout.as_ref(), donate, true) {
+                Ok(array) => return Ok(placed(array.place_storage(memory, layout)?)),
+                Err((error, Some(source))) => (error, source),
+                Err((error, None)) => return Err(error),
+            };
 
         // The fallback uploads the dense readback directly into the requested storage. If it cannot complete from this
         // process, surface the original device error. That includes a source whose devices hold one slice but vary
@@ -658,12 +650,11 @@ impl Array {
         let layout = self.placement_layout(None, mesh, sharding)?;
         let (committed, locally_assigned) = (self.is_committed(), self.is_locally_assigned());
         let array = self.with_session(session)?;
-        let layout_resolver = cross_host_layout_resolver(session.client());
 
         // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout
         // of this array as the public placement path gives a result its storage, whatever strategy placed it.
         array
-            .try_reshard_on_devices(&layout_resolver, mesh, sharding, memory, layout.as_ref(), donate, false)
+            .try_reshard_on_devices(mesh, sharding, memory, layout.as_ref(), donate, false)
             .map_err(|(error, _)| error)
             .and_then(|output| output.place_storage(memory, layout))
             .map(|output| output.commit_if(committed).with_locally_assigned(locally_assigned))
@@ -686,10 +677,9 @@ impl Array {
     /// that only a host round trip makes exactly is an error right after the planning, whichever process could make
     /// it (refer to [`HostRoundTripCause::without_host_route`]).
     // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
-    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     fn try_reshard_on_devices(
         self,
-        layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
         sharding: &Sharding,
         memory: Memory,
@@ -707,7 +697,8 @@ impl Array {
         // as one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
         // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
         // for that fallback.
-        let strategy = match self.device_placement_strategy(layout_resolver, mesh, sharding, process_index) {
+        let layout_resolver = cross_host_layout_resolver(self.client());
+        let strategy = match self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index) {
             Ok(strategy) => strategy,
             Err(error) => return Err((error, None)),
         };
