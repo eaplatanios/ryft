@@ -2030,6 +2030,20 @@ impl RegionPlacementRequests {
         V: 'static + Value<Type = ArrayIrType>,
         O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
     {
+        /// [`Transform`] marker under which [`RegionPlacementRequests::for_target`] retains the summary of a region
+        /// with it, for the target platform that its arguments name ([`None`] for no target), held as a [`String`]
+        /// because the region-owned cache only retains owned arguments. Two summaries are retained, because an eager
+        /// call reads the requests of its callee for the platform of its backend while partial evaluation and
+        /// compilation read them for no target, and one summary would be derived again at every alternation.
+        struct RegionPlacementAnalysis;
+
+        impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for RegionPlacementAnalysis {
+            type Arguments = Option<String>;
+            type Artifact = TransformArtifact<V, O, RegionPlacementRequests>;
+
+            const DEFAULT_CACHE_CAPACITY: usize = 2;
+        }
+
         let arguments = target_platform.map(str::to_owned);
         let Ok(artifact) = region.transform::<RegionPlacementAnalysis, _, Infallible>(arguments, |region, _| {
             let has_requests = region.computation_regions().any(|region| {
@@ -2297,20 +2311,6 @@ impl<T: Type> CallTypeBindings<T> {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// [`Transform`] marker under which [`RegionPlacementRequests::for_target`] retains the summary of a region with it, for
-/// the target platform that its arguments name ([`None`] for no target), held as a [`String`] because the region-owned
-/// cache only retains owned arguments. Two summaries are retained, because an eager call reads the requests of its
-/// callee for the platform of its backend while partial evaluation and compilation read them for no target, and one
-/// summary would be derived again at every alternation.
-struct RegionPlacementAnalysis;
-
-impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for RegionPlacementAnalysis {
-    type Arguments = Option<String>;
-    type Artifact = TransformArtifact<V, O, RegionPlacementRequests>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 2;
-}
 
 /// Placement request that one instruction makes explicitly, as [`placement_request`] classifies it.
 #[derive(Clone, Copy, Debug, PartialEq)]
