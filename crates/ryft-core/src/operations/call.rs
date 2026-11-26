@@ -1510,46 +1510,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Capture-free forward mode rule (i.e., JVP rule) for [`CallOperation`]. When the primal and tangent contexts are
-// shared (e.g., for `jvp` and for the fused program that a `rematerialize` rule partitions), the rule binds one fused
-// `call` over the callee's forward mode program, projected onto the primal outputs and the live output tangents,
-// as JAX's `_pjit_jvp` does. An enclosing partial evaluation then splits that call with its own residual policy.
-// Otherwise, it binds a primal `call` and a tangent `call` as ordinary operations of the family of the active
-// context. A staging context stages both calls over its shared builder, while an eager context (e.g., the eager context
-// of a backend, which compiles and executes them) applies them immediately.
-//
-// Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`. Rather than capturing the primal inputs as residual
-// factors and staging a linear `call`, the separate form keeps the compilation boundary and threads every residual
-// as a plain primal input edge between two `call`s, so no symbolic capture is ever introduced. The enclosing
-// partial evaluation split then discovers the residual input edges structurally, exactly as it does for the
-// condition and rematerialize rules.
-//
-// For separate contexts, the rule linearizes the callee program capture-free through
-// [`Program::linearize`](crate::Program::linearize) under the activity mask of the inputs, giving a primal sub-program
-// `inputs -> [outputs..., residuals...]` and a tangent sub-program
-// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. An input with a
-// live tangent is active, while the capture prefix, an input with a structurally zero tangent, and a plumbing reference
-// input that receives no tangent reference are not, as under JAX's `which_nz`. Tangents for zero differential spaces
-// are omitted from both compact boundaries, and the tangent sub-program is projected onto the output tangents that
-// depend on an active input tangent (refer to [`Program::output_dependence`](crate::Program::output_dependence) and
-// [`Program::with_outputs`](crate::Program::with_outputs)), since every other output tangent is a structural zero, as
-// under JAX's `which_nz_out`. When no output tangent is live and the projected tangent sub-program has no observable
-// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it
-// takes the following steps.
-//
-//   1. Wraps the primal sub-program in a fresh `call` and stages it over the primal inputs, recovering the primal
-//      outputs followed by the residual values, which are program variables that the staged primal call produces.
-//   2. Wraps the projected tangent sub-program in a fresh `call` and stages it over the active input tangents
-//      followed by those residual values, recovering the live output tangents.
-//   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an output
-//      without a live tangent, into a [`DifferentiationDual`].
-//
-// The callee program is materialized from the instruction's callee region in the constant universe of the context, so
-// the split halves ride the fresh primal and tangent calls as shared callee regions. Preserving both `call`
-// boundaries keeps the callee body out of the caller's program, so forward mode over a `call` operation stays
-// compiled rather than inlined.
 impl<C> DifferentiableOperation<C> for CallOperation<ArrayIrType>
 where
     C: Context<
@@ -1565,21 +1525,60 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // This is a capture-free forward mode differentiation rule (i.e., Jacobian-Vector Product, or JVP, rule) for
+        // `CallOperation`. When the primal and tangent contexts are shared (e.g., for `jvp` and for the fused program
+        // that a `rematerialize` rule partitions), the rule binds one fused `call` over the callee's forward mode
+        // program, projected onto the primal outputs and the live output tangents. An enclosing partial evaluation then
+        // splits that call with its own residual policy. Otherwise, it binds a primal `call` and a tangent `call` as
+        // ordinary operations of the family of the active context. A staging context stages both calls over its shared
+        // builder, while an eager context (e.g., the eager context of a backend, which compiles and executes them)
+        // applies them immediately.
+        //
+        // Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`. Rather than capturing the primal inputs as
+        // residual factors and staging a linear `call`, the separate form keeps the compilation boundary and threads
+        // every residual as a plain primal input edge between two `call`s, so no symbolic capture is ever introduced.
+        // The enclosing partial evaluation split then discovers the residual input edges structurally, exactly as it
+        // does for the condition and rematerialize rules.
+        //
+        // For separate contexts, the rule linearizes the callee program capture-free through `Program::linearize` under
+        // the activity mask of the inputs, giving a primal sub-program `inputs -> [outputs..., residuals...]` and a
+        // tangent sub-program `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the
+        // residual count. An input with a live tangent is active, while the capture prefix, an input with a
+        // structurally zero tangent, and a plumbing reference input that receives no tangent reference are not.
+        // Tangents for zero differential spaces are omitted from both compact boundaries, and the tangent sub-program
+        // is projected onto the output tangents that depend on an active input tangent (refer to
+        // `Program::output_dependence` and `Program::with_outputs`), since every other output tangent is a structural
+        // zero.  When no output tangent is live and the projected tangent sub-program has no observable effects, the
+        // rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it takes
+        // the following steps:
+        //
+        //   1. Wraps the primal sub-program in a fresh `call` and stages it over the primal inputs, recovering the
+        //      primal outputs followed by the residual values, which are program variables that the staged primal
+        //      call produces.
+        //   2. Wraps the projected tangent sub-program in a fresh `call` and stages it over the active input tangents
+        //      followed by those residual values, recovering the live output tangents.
+        //   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an
+        //      output without a live tangent, into a `DifferentiationDual`.
+        //
+        // The callee program is materialized from the instruction's callee region in the constant universe of the
+        // context, so the split halves ride the fresh primal and tangent calls as shared callee regions. Preserving
+        // both `call` boundaries keeps the callee body out of the caller's program, so forward mode over a `call`
+        // operation stays compiled rather than inlined.
         let callee = driver.region(0)?;
         let input_types = callee.input_types();
         let output_types = callee.output_types();
         let output_count = output_types.len();
         check_count!("input", inputs, input_types.len(), ProgramError);
 
-        // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
-        // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
-        // nondifferentiated plumbing that receives no tangent input. The remaining inputs take the activity of their
+        // Linearize the callee through the instruction-scoped driver under the call's activity mask. The
+        // callee's leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
+        // non-differentiated plumbing that receives no tangent input. The remaining inputs take the activity of their
         // duals. An input with a live tangent is active, while an input with a structurally zero tangent is inactive
-        // like a missing one (i.e., JAX's `which_nz`), so it gets no tangent callee slot instead of being
-        // materialized as a zero input. A plumbing reference input, whose structurally zero tangent is a missing
-        // tangent reference, is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]`
-        // and the tangent sub-program consumes `[active(input_tangents)..., residuals...]`. The residual count is the
-        // number of trailing outputs of the primal sub-program beyond the original callee outputs.
+        // like a missing one (i.e., JAX's `which_nz`), so it gets no tangent callee slot instead of being materialized
+        // as a zero input. A plumbing reference input, whose structurally zero tangent is a missing tangent reference,
+        // is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]` and the tangent
+        // sub-program consumes `[active(input_tangents)..., residuals...]`. The residual count is the number of
+        // trailing outputs of the primal sub-program beyond the original callee outputs.
         let capture_count = self.capture_count();
         let activity = inputs
             .iter()
@@ -1591,6 +1590,7 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
+
         // A shared primal/tangent destination binds one fused call over the callee's forward mode program, projected
         // onto its primal outputs and live output tangents, as JAX's `_pjit_jvp` does. An enclosing partial evaluation
         // then splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
@@ -1610,12 +1610,14 @@ where
                     .map(DifferentiationDual::new_with_zero_tangent)
                     .collect();
             }
+
             let outputs = (0..output_count).chain(live_tangent_slots.iter().map(|&slot| output_count + slot));
             let program = if outputs.clone().eq(0..program.output_count()) {
                 program.clone()
             } else {
                 Arc::new(program.as_ref().clone().with_outputs(&outputs.collect::<Vec<_>>())?)
             };
+
             fused_inputs.extend(
                 activity.input_indices().iter().map(|&index| inputs[index].tangent().as_value().unwrap().clone()),
             );
@@ -1626,6 +1628,7 @@ where
             let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
             let boundary = self
                 .effective_boundary_input_shardings(&input_types, inputs.iter().map(|input| input.primal().r#type()));
+
             // The fused call replaces the whole call in the same context, so it keeps the mesh of the function and an
             // eager JVP runs where the call runs.
             let operation = C::Operation::from(CallOperation {
@@ -1637,8 +1640,10 @@ where
                     (0..output_count).chain(live_outputs).map(Some),
                 )
             });
+
             let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &fused_inputs)?;
             check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
+
             let mut tangents = outputs.split_off(output_count).into_iter();
             return outputs
                 .into_iter()
@@ -1649,10 +1654,11 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>();
         }
+
         let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
 
-        // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
-        // output computed only from inactive inputs) is a structural zero, as under JAX's `which_nz_out`, so the
+        // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of
+        // an output computed only from inactive inputs) is a structural zero, as under JAX's `which_nz_out`, so the
         // tangent callee is projected onto the live output tangents, and every other output is paired with a
         // structurally zero tangent. When no output tangent is live and the tangent callee has no observable effects,
         // no tangent call is bound, and the source callee is bound as the primal call, since nothing would consume its
@@ -1707,10 +1713,9 @@ where
         //
         // The primal and the tangent call carry the mesh of the function, and so does the transposed call that a
         // pullback derives from them, so an eager linearization (e.g., of an eager VJP) runs each of them where the
-        // call runs, as JAX runs the linearized calls of a `jit` function under `set_mesh` (refer to
-        // `CallOperation::function_mesh`). An uncommitted argument enters an eager linearization without the
-        // placement that it happens to have (refer to `Value::relocatable_type`), so the tangent and the cotangent of
-        // such an argument may live on the devices of the function.
+        // call runs. An uncommitted argument enters an eager linearization without the placement that it happens to
+        // have (refer to `Value::relocatable_type`), so the tangent and the cotangent of such an argument may live
+        // on the devices of the function.
         let boundary =
             self.effective_boundary_input_shardings(&input_types, primal_inputs.iter().map(|input| input.r#type()));
         let primal_call = C::Operation::from(CallOperation {
@@ -1726,9 +1731,10 @@ where
             context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_inputs)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "`{CALL_OPERATION_NAME}` primal program produced {} outputs which is fewer than its {output_count} \
-                 primal output(s)",
+                "`{}` primal program produced {} outputs which is fewer than its {} primal output(s)",
+                CALL_OPERATION_NAME,
                 primal_call_outputs.len(),
+                output_count,
             ))
             .into());
         }
@@ -1748,15 +1754,17 @@ where
         tangent_inputs.extend(
             residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
         );
+
         // The tangent callee's inputs are live input tangents followed by residuals and never a lifted-capture prefix.
         // Attached region capture constants cannot appear in it because fresh-root region traces reject bodies that
         // register captures with `ProgramError::DiscardedCaptures`, and a stale reference that slipped in anyway would
         // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
-        // value. Each active input tangent and each live output tangent has the boundary sharding of its primal, and
-        // the trailing residual inputs have none.
+        // value. Each active input tangent and each live output tangent has the boundary sharding of its primal,
+        // and the trailing residual inputs have none.
         let active_inputs = activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
         let live_outputs =
             output_activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
+
         // Only the tangent call of an eager linearization keeps the mesh of the function, because only an eager context
         // applies it and the transposed call that a pullback derives from it, so that transposition may read that mesh
         // as where its cotangents live (refer to `refined_derived_value`). The tangent call of a staged linearization
@@ -1796,10 +1804,6 @@ where
     }
 }
 
-// Transpose rule for a primal tangent [`CallOperation`], forwarding to [`transpose_primal_call`] with the
-// cotangent references of its linear reference inputs resolved, and allocated on first use, through the enclosing
-// [`TranspositionContext`]. The callee is transposed through the driver, so instantiating this implementation
-// introduces no recursive [`TransposableOperation`] obligation on the operation family `O`.
 impl<V, O> TransposableOperation<V, O> for CallOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1820,6 +1824,10 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // This is the transpose rule for a primal tangent `CallOperation`, forwarding to `transpose_primal_call` with
+        // the cotangent references of its linear reference inputs resolved, and allocated on first use, through the
+        // enclosing `TranspositionContext`. The callee is transposed through the driver, so instantiating this
+        // implementation introduces no recursive `TransposableOperation` obligation on the operation family `O`.
         check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions = (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -1834,6 +1842,8 @@ where
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Placement request of one instruction of a program, as [`RegionPlacementRequests::requests`] returns it.
 #[derive(Clone, Debug, PartialEq)]
