@@ -889,9 +889,13 @@ impl<C: Context> PartialEvaluationContext<C> {
         // effect-based deferral restriction: replay can fold away effects, so that restriction is conservative.
         // Regions that need no specialization are imported as attached (e.g., shared callees are interned by `Arc`
         // identity, as when staging), so that residualized calls of one shared body keep sharing one region, while
-        // specialized regions are new programs that are moved into the residual builder.
-        let specialized = if regions.region_count() == 0 {
-            None
+        // specialized regions are new programs that are moved into the residual builder. An attached region still has
+        // its type identities instantiated at the materialized inputs wherever one structural substitution expresses
+        // them, as when staging, so that its boundary agrees with this application before the residual builder infers
+        // the output types (e.g., a residual call that receives a dimension which a known call returns under an
+        // identity of its own, while its callee declares that dimension under the identity of the source callee).
+        let (specialized, region_input_types) = if regions.region_count() == 0 {
+            (None, Vec::new())
         } else {
             let interfaces = regions.region_interfaces();
             operation.validate_region_interfaces(&interfaces)?;
@@ -908,7 +912,24 @@ impl<C: Context> PartialEvaluationContext<C> {
                     })
                     .collect::<Result<Vec<_>, _>>()?
             };
-            FlatProgram::<C>::specialize_attached_regions(&operation, &input_types, regions.regions())?
+            let specialized =
+                FlatProgram::<C>::specialize_attached_regions(&operation, &input_types, regions.regions())?;
+            let region_input_types = match &specialized {
+                Some(_) => Vec::new(),
+                None => operation
+                    .infer_region_input_types(&input_types, &interfaces)?
+                    .into_iter()
+                    .zip(interfaces.iter())
+                    .map(|(requested, interface)| match requested {
+                        Some(requested) => {
+                            Ok(FlatProgram::<C>::region_requires_specialization(interface.input_types(), &requested)?
+                                .and(Some(requested)))
+                        }
+                        None => Ok(None),
+                    })
+                    .collect::<Result<Vec<_>, TypeError>>()?,
+            };
+            (specialized, region_input_types)
         };
 
         // Specialization replays the regions, which may introduce ordered work that their original effects did not
@@ -934,10 +955,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 let mut builder = self.state.builder.borrow_mut();
                 specialized.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
             }
-            None => {
-                let region_count = regions.region_count();
-                regions.import_into(&self.state.builder, &vec![None; region_count])?
-            }
+            None => regions.import_into(&self.state.builder, &region_input_types)?,
         };
         let output_atoms = self
             .state
@@ -2359,10 +2377,11 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_guardless_operation;
     use crate::operations::{
-        AddOperation, ConditionOperation, CustomCallOperation, DimensionAddOperation, DimensionSizeOperation,
-        DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PlaceOperation, PrintOperation,
-        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, RematerializeOperation, SubOperation, WhileOperation, Zero, ZeroOperation,
+        AddOperation, CallOperation, ConditionOperation, CustomCallOperation, DimensionAddOperation,
+        DimensionSizeOperation, DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PlaceOperation,
+        PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation, RematerializeOperation, SubOperation, WhileOperation, Zero,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
@@ -3787,6 +3806,46 @@ mod tests {
         assert_eq!(
             context.residualize(WhileOperation::new(), vec![condition, body], &[input]).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid("type f64[] cannot instantiate declared type f32[]"))),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_instantiates_region_type_identities() {
+        // The callee declares its dimension input under one identity and receives a dimension of another identity
+        // with the same bounds, which needs no specialization. The attached callee is still instantiated at that
+        // input, so the call accepts it and returns the dimension of the caller.
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let callee_type = ArrayIrType::Dimension(DimensionType::from(DimensionVariable::new("rows", bounds)));
+        let caller_type = ArrayIrType::Dimension(DimensionType::from(DimensionVariable::new("rows", bounds)));
+        let mut callee = ProgramBuilder::<TestValue, TestOperation>::new();
+        let dimension = callee.add_input(callee_type);
+        let callee = Arc::new(
+            callee
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![dimension], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let input = context.unknown_input(caller_type.clone(), 0);
+        let outputs = context
+            .residualize(
+                CallOperation::<ArrayIrType>::new(0),
+                AttachedRegions::Callees(std::slice::from_ref(&callee)),
+                &[input],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].r#type().into_owned(), caller_type);
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:dimension<rows ∈ [0, 8)> .
+                let %1:dimension<rows ∈ [0, 8)> = call %0 [
+                    callee={
+                        lambda %0:dimension<rows ∈ [0, 8)> .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
         );
     }
 

@@ -177,7 +177,7 @@ pub use operations::{
     ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
     ReferenceNew, ReferenceNewOperation, ReferenceOperations, ReferenceRead, ReferenceReadOperation,
     ReferenceReadTransposition, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
-    RegionPlacementSummary, Rem, RemOperation, RematerializationOptimizationBarrier, RematerializeOperation,
+    RegionPlacementRequests, Rem, RemOperation, RematerializationOptimizationBarrier, RematerializeOperation,
     RequestedPlacement, Reshape, ReshapeOperation, Reshard, ReshardDispatch, ReshardOperation,
     ResidualStorageOperation, Reverse, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, Round,
     RoundOperation, RoundingOperations, Rsqrt, RsqrtOperation, SATURATING_SUB_OPERATION_NAME,
@@ -200,7 +200,7 @@ pub use operations::{
     ZeroLikeOperation, ZeroOperation, associative_scan, auto_axes, block_scaled_dot, boundary_input_type, composite,
     declared_input_sharding, differentiable_dot_product_attention, dot_product_attention, einsum, einsum_with_options,
     explicit_axes, scan, shard_map, shard_map_along, shard_map_with_inferred_input_shardings, softmax,
-    softmax_cross_entropy_with_target_logits, states_boundary_placement, transpose_primal_call, r#while,
+    softmax_cross_entropy_with_target_logits, states_boundary_placement, r#while,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

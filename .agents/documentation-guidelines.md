@@ -92,6 +92,9 @@ code comments. Preserve the documented contract, technical rationale, and links 
   spelling requires them (e.g., "non-empty") or in established names (e.g., "Jacobian-Vector Product"). When an
   unhyphenated pair would be ambiguous, rephrase the sentence instead (e.g., "a zero constructed from its type alone"
   rather than "a type-only zero").
+- Use American spelling in documentation, comments, diagnostics, and identifiers (e.g., "analyze", "analyzes", and
+  "analyzed" rather than "analyse", "analyses", and "analysed", and likewise "behavior", "color", and "initialize").
+  The plural noun "analyses" (i.e., more than one analysis) is the same in both spellings and stays.
 - When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.

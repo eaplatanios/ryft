@@ -61,8 +61,8 @@ pub use attention::{
     differentiable_dot_product_attention, dot_product_attention,
 };
 pub use call::{
-    CALL_OPERATION_NAME, CallOperation, RegionPlacementSummary, RequestedPlacement, boundary_input_type,
-    declared_input_sharding, states_boundary_placement, transpose_primal_call,
+    CALL_OPERATION_NAME, CallOperation, RegionPlacementRequests, RequestedPlacement, boundary_input_type,
+    declared_input_sharding, states_boundary_placement,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use ryft_core::{
     AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, ConstrainShardingOperation, Device,
     DeviceMesh, EagerContext, FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation,
-    Parameterized, Program, ProgramError, RegionId, RegionPlacementSummary, RegionRef, RegionRole,
+    Parameterized, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
     RematerializationOptimizationBarrier, ShardMapOperation, Sharding, Typed, TypedProgram, declared_input_sharding,
 };
 use ryft_mlir::dialects::func;
@@ -46,7 +46,7 @@ use crate::compilation::domains::{argument_type, commits_public_outputs};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
-use crate::lowering::extensions::{RegionPlacementSummaryExtension, ShardingLoweringExtension};
+use crate::lowering::extensions::{RegionPlacementRequestsExtension, ShardingLoweringExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
@@ -560,7 +560,7 @@ impl CallEagerExtension for CallOperation<Type> {
         // hold buffers here, as an execution of the callee requires nothing of it. A callee without captures pays one
         // comparison, and one with captures a look-up.
         let target_platform = session.target()?.platform_name();
-        let callee_summary = || RegionPlacementSummary::for_lowering(callee, Some(target_platform));
+        let callee_requests = || RegionPlacementRequests::for_lowering(callee, Some(target_platform));
         let unread_captures = match self.capture_count() {
             0 => None,
             capture_count => unread_lifted_captures(callee, capture_count, Some(target_platform)),
@@ -593,11 +593,11 @@ impl CallEagerExtension for CallOperation<Type> {
         // `commits_public_outputs`).
         let committed = |mesh: &DeviceMesh, function_mesh: bool| {
             public_arrays.clone().any(Array::is_committed)
-                || commits_public_outputs(mesh, function_mesh, self.requests_placement(callee_summary))
+                || commits_public_outputs(mesh, function_mesh, self.requests_placement(callee_requests))
         };
         // The call records its mesh when it is staged, for no target, so whether it still names devices is read for the
         // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
-        let names_devices = || callee_summary().has_requests(false);
+        let names_devices = || callee_requests().has_requests(false);
         let function_assignment = || {
             let mesh = self.function_mesh()?;
             if mesh.logical_mesh().is_named() {

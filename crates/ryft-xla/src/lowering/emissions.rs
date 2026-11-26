@@ -284,7 +284,7 @@ pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
 
 /// Returns the distinct [`RetainedArray`]s that `regions` reference, in the order of their first occurrence in them,
 /// split into those that they read and those that they only pass on to calls as captures which the callees never read
-/// (refer to [`partition_session_constants`] and `entry_session_constants`).
+/// (refer to [`partition_session_constants`]).
 pub(crate) fn partition_region_session_constants<'r, O: LowerableOperationFamily + 'r>(
     regions: impl Iterator<Item = RegionRef<'r, Constant, O>>,
     target_platform: Option<&str>,

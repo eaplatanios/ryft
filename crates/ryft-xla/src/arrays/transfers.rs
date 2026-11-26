@@ -1126,7 +1126,7 @@ impl Array {
                         // The send moves the whole device allocation. Stage host buffers in device memory,
                         // then match the static shape and default layout that the receiver allocates.
                         let buffer =
-                            Self::device_memory_buffer(session, self.r#type().memory(), buffer, &mut completion)?;
+                            Self::buffer_in_device_memory(session, self.r#type().memory(), buffer, &mut completion)?;
                         let buffer = Self::cross_host_sendable_buffer(
                             session,
                             self.data_type(),
@@ -2056,16 +2056,13 @@ impl Array {
         completion.track_new(&mut work, copied)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns `buffer`, which holds a shard of an array whose type declares `memory`, in the default memory of its
     /// device, copying it there unless `memory` is [`Memory::Device`]. `completion` records the readiness of the copy.
-    ///
     /// Cross-host transfers and the programs that slice shard regions read device buffers (e.g., a cross-host transfer
     /// of the CUDA plugin waits for the GPU completion events of its buffer, which a buffer in host memory does not
     /// have, as an unpinned host buffer is a plain CPU allocation). The declared memory is information that every
     /// process shares, so every process stages the same shards, and the copy is local to the device of `buffer`.
-    fn device_memory_buffer(
+    fn buffer_in_device_memory(
         session: &Session,
         memory: Memory,
         buffer: Arc<Buffer<'static>>,
@@ -2078,6 +2075,8 @@ impl Array {
         let staged = buffer.copy_to_memory(buffer.device()?.default_memory()?)?;
         completion.track_new(&mut work, staged)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns `buffer`, which holds a shard or a region with `shape` of an array of `data_type` on `device`, in the
     /// default memory of that device, as a buffer that a cross-host send can move to a receiver that allocates a static
@@ -2139,7 +2138,7 @@ impl Array {
         if self.layout().is_some_and(|layout| *layout != dense) {
             return self.place_shard_storage(shard, &buffer, Memory::Device, Some(&dense), work, completion);
         }
-        Self::device_memory_buffer(self.session(), self.r#type().memory(), buffer, completion)
+        Self::buffer_in_device_memory(self.session(), self.r#type().memory(), buffer, completion)
     }
 
     /// Produces the region with `slice`, in global array coordinates, from `source_buffer`, which holds the shard
@@ -7272,7 +7271,8 @@ mod tests {
                 assert_ne!(original.memory().unwrap().kind().unwrap(), "device");
             }
             let mut completion = PlacementCompletion::default();
-            let buffer = Array::device_memory_buffer(&session, memory, Arc::clone(original), &mut completion).unwrap();
+            let buffer =
+                Array::buffer_in_device_memory(&session, memory, Arc::clone(original), &mut completion).unwrap();
             let sent = Array::cross_host_sendable_buffer(
                 &session,
                 DataType::F32,
