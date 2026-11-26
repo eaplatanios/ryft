@@ -504,20 +504,18 @@ impl Array {
         Ok(())
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Places this array on the devices, with the sharding, and in the storage that `target` names, with the memory,
     /// layout, and host fallback rules of [`Self::to_placement`]. A request resolves its default memory into `target`
     /// (refer to [`PlacementRequest::target_memory`]), so a memory that `target` omits keeps the memory of this array.
     /// The result always belongs to `session`, so this array is first associated with `session`, which rejects an
     /// array of another PJRT client, even when the placement leaves the array where it is. The result is
-    /// [committed](Self::is_committed) to the devices that `target` names, so it never has [locally assigned
-    /// devices](Self::is_locally_assigned), even when they are the devices of this array, and a caller whose request
-    /// named only a memory or a layout restores that fact (refer to [`Self::place_with_request`]).
+    /// [committed](Self::is_committed) to the devices that `target` names, so it never has
+    /// [locally assigned devices](Self::is_locally_assigned), even when they are the devices of this array, and a
+    /// caller whose request named only a memory or a layout restores that fact (refer to [`Self::place_with_request`]).
     ///
     /// The requested layout (refer to [`Self::validate_placement_layout`]) and the target devices (refer to
-    /// [`validate_mesh_devices`]) are checked before any device work, because a placement without buffers (e.g., of a
-    /// [`DataType::Zero`] array) would otherwise never check the layout, and a device that the target
+    /// [`validate_mesh_devices`]) are checked before any device work, because a placement without buffers (e.g.,
+    /// of a [`DataType::Zero`] array) would otherwise never check the layout, and a device that the target
     /// misattributes would receive no buffer in any process. When the device work fails and returns this array, the
     /// host fallback runs [`Self::upload_host_readback`]. Whatever this function can reject before reading back (e.g.,
     /// a target mesh that this process does not fully address or a source that this process cannot read back) is
@@ -539,20 +537,22 @@ impl Array {
         // choosing a strategy. Consuming `self` keeps the buffers uniquely owned for a donation.
         let array = self.with_session(session)?;
         let layout = array.validate_placement_layout(session, target)?;
-        let resolve_layout = cross_host_layout_resolver(session.client());
+        let layout_resolver = cross_host_layout_resolver(session.client());
         let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
         let memory = target.memory().unwrap_or_else(|| array.r#type().memory());
         let placed = |array: Self| array.with_committed(true).with_locally_assigned(false);
+
         if array.mesh() == &mesh && array.sharding() == &sharding {
             // A placement that only changes the storage of this array, or nothing, does not inherit the sends of the
             // placement that produced it (refer to `Self::without_send_fence`).
             return Ok(placed(array.without_send_fence().place_storage(memory, layout)?));
         }
+
         validate_mesh_devices(session, &mesh)?;
 
         // Keep the error of the device work, which is the most informative one if the host fallback fails too.
         let (compiled_error, source) = match array.try_reshard_on_devices(
-            &resolve_layout,
+            &layout_resolver,
             &mesh,
             &sharding,
             memory,
@@ -571,6 +571,7 @@ impl Array {
         // than silently replacing the values of the other devices with one of them.
         let source_session = source.session();
         let local_process = source_session.client().process_index()?;
+
         // A placement that keeps some contributions of a pending reduction or of manual variation within a tile never
         // reads back their combined value (refer to `keeps_some_contributions`), so the failure of its device work is
         // final.
@@ -591,31 +592,31 @@ impl Array {
                 failed with: {device_error})",
             ))
         };
+
         match source.upload_host_readback(source_session, mesh, sharding, memory, layout, poison) {
             Ok(array) => Ok(placed(array)),
             Err(_) => Err(compiled_error),
         }
     }
 
-    /// Places this array, whose PJRT client is not that of `session`, onto `target` as an array of `session`, as JAX
-    /// places an array onto the devices of another backend. PJRT copies buffers only within one client, so this
-    /// process reads the value back and uploads it with the host fallback of [`Self::place_within_client`] (refer
-    /// to [`Self::upload_host_readback`]), whose upload waits for the work that produces this array and reports its
-    /// failures. The result is [committed](Self::is_committed), not [locally assigned](Self::is_locally_assigned), and
-    /// in the memory that `target` names, or in the memory of this array otherwise, as within one client (refer to
-    /// [`PlacementRequest::target_memory`], which resolves the default memory of a request for a device into `target`).
-    /// A target device without that memory is an [`ArrayError::UnsupportedMemory`] error of the process that owns
-    /// it. Donation never applies, because no buffer of this array can become a buffer of the result. A process that
-    /// owns no device of `target` reads nothing back and returns the placement without buffers. The caller checks the
-    /// placement first with [`Self::validate_placement_from_other_client`].
+    /// Places this array, whose PJRT client is not that of `session`, onto `target` as an array of `session`.
+    /// PJRT copies buffers only within one client, so this process reads the value back and uploads it with the host
+    /// fallback of [`Self::place_within_client`] (refer to [`Self::upload_host_readback`]), whose upload waits for the
+    /// work that produces this array and reports its failures. The result is [committed](Self::is_committed), not
+    /// [locally assigned](Self::is_locally_assigned), and in the memory that `target` names, or in the memory of this
+    /// array otherwise, as within one client (refer to [`PlacementRequest::target_memory`], which resolves the default
+    /// memory of a request for a device into `target`). A target device without that memory is an
+    /// [`ArrayError::UnsupportedMemory`] error of the process that owns it. Donation never applies, because no buffer
+    /// of this array can become a buffer of the result. A process that owns no device of `target` reads nothing back
+    /// and returns the placement without buffers. The caller checks the placement first with
+    /// [`Self::validate_placement_from_other_client`].
     pub(super) fn place_across_clients(self, session: &Session, target: &Placement) -> Result<Self, Error> {
         let (mesh, sharding) = (target.mesh().clone(), target.sharding().clone());
         let memory = target.memory().unwrap_or_else(|| self.r#type().memory());
         let layout = self.placement_layout(target.layout(), &mesh, &sharding)?;
-        let poison = |error: Error| {
+        let uploaded = self.upload_host_readback(session, mesh, sharding, memory, layout, |error: Error| {
             PjrtError::internal(format!("the transfer of an array from another PJRT client failed with: {error}"))
-        };
-        let uploaded = self.upload_host_readback(session, mesh, sharding, memory, layout, poison)?;
+        })?;
         Ok(uploaded.with_committed(true).with_locally_assigned(false))
     }
 
@@ -627,15 +628,6 @@ impl Array {
     /// program uses it for inputs whose sharding differs from the one that the program was compiled for. Refer to
     /// [`Self::try_reshard_on_devices`] for the strategies that it tries.
     ///
-    /// # Parameters
-    ///
-    ///   - `session`: [`Session`] that executes the reshard and owns the resulting array. It must use the same PJRT
-    ///     client as this array.
-    ///   - `mesh`: Target [`DeviceMesh`].
-    ///   - `sharding`: Target [`Sharding`].
-    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
-    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
-    ///
     /// The result has the memory of this array and the layout that [`Self::placement_layout`] keeps for the target
     /// shards, which a device reshard changes neither, as [`Self::place_within_client`] gives its result the storage
     /// that it promises (e.g., an executable that declares the layout of its input accepts the result of a reshard of
@@ -644,9 +636,17 @@ impl Array {
     /// A result on a single device keeps the [commitment](Self::is_committed) of this array, because this is how arrays
     /// move to the devices that an operation runs on rather than to devices that a caller chose. A result on more than
     /// one device is committed, like every eager result on more than one device (refer to [`Self::commit_if`]). For the
-    /// same reason, a result on devices of this process only keeps the [locally assigned
-    /// devices](Self::is_locally_assigned) of this array, while a result on devices of other processes never has
-    /// them.
+    /// same reason, a result on devices of this process only keeps the locally assigned devices of this array, while a
+    /// result on devices of other processes never has them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `session`: [`Session`] that executes the reshard and owns the resulting array. It must use the same PJRT
+    ///     client as this array.
+    ///   - `mesh`: Target [`DeviceMesh`].
+    ///   - `sharding`: Target [`Sharding`].
+    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
+    ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     pub(crate) fn reshard_on_devices(
         self,
         session: &Session,
@@ -658,15 +658,77 @@ impl Array {
         let layout = self.placement_layout(None, mesh, sharding)?;
         let (committed, locally_assigned) = (self.is_committed(), self.is_locally_assigned());
         let array = self.with_session(session)?;
-        let resolve_layout = cross_host_layout_resolver(session.client());
-        // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout of
-        // this array as the public placement path gives a result its storage, whatever strategy placed it.
+        let layout_resolver = cross_host_layout_resolver(session.client());
+
+        // Some strategies (e.g., a compiled reshard) record no layout, so the result takes the memory and the layout
+        // of this array as the public placement path gives a result its storage, whatever strategy placed it.
         array
-            .try_reshard_on_devices(&resolve_layout, mesh, sharding, memory, layout.as_ref(), donate, false)
+            .try_reshard_on_devices(&layout_resolver, mesh, sharding, memory, layout.as_ref(), donate, false)
             .map_err(|(error, _)| error)
             .and_then(|output| output.place_storage(memory, layout))
             .map(|output| output.commit_if(committed).with_locally_assigned(locally_assigned))
     }
+
+    /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this
+    /// array when a host fallback may still place it. [`Self::device_placement_strategy`] chooses the strategy (refer
+    /// to the documentation of this module), and [`Self::place_with_strategy`] performs the part of this process in it.
+    /// The errors of a planning and of moves of exact shards are final, so they come without this array. A donated
+    /// array is still returned when its compiled reshard fails to stage or to compile, and after a failed execution
+    /// only as [`Self::fallback_source`] allows.
+    ///
+    /// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`] (refer to
+    /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation,
+    /// and execution failures propagate through [`Error`] without losing their typed payloads.
+    ///
+    /// `layout` is the layout of each target shard that the placement records (refer to [`Self::placement_layout`]),
+    /// which [`Self::place_process_local_value`] uploads into directly. `host_fallback` is whether the caller falls
+    /// back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a change of reduction state
+    /// that only a host round trip makes exactly is an error right after the planning, whichever process could make
+    /// it (refer to [`HostRoundTripCause::without_host_route`]).
+    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn try_reshard_on_devices(
+        self,
+        layout_resolver: &CrossHostLayoutResolver<'_>,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        layout: Option<&Layout>,
+        donate: bool,
+        host_fallback: bool,
+    ) -> Result<Self, (Error, Option<Self>)> {
+        let process_index = match self.session().client().process_index() {
+            Ok(process_index) => process_index,
+            Err(error) => return Err((error.into(), None)),
+        };
+
+        // A planning error reads only shared metadata, so every process meets it alike, and no process recovers from
+        // it with a host fallback of its own (a decline that one process can make with a host round trip is planned
+        // as one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
+        // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
+        // for that fallback.
+        let strategy = match self.device_placement_strategy(layout_resolver, mesh, sharding, process_index) {
+            Ok(strategy) => strategy,
+            Err(error) => return Err((error, None)),
+        };
+
+        if let Some(cause) = strategy.host_round_trip_cause().filter(|_| !host_fallback) {
+            return Err((cause.without_host_route(), None));
+        }
+
+        let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
+            match self.moved_to_owner_view(mesh) {
+                Ok(moved) => moved,
+                Err(error) => return Err((error, Some(self))),
+            }
+        } else {
+            self
+        };
+
+        array.place_with_strategy(strategy, process_index, mesh, sharding, memory, layout, donate)
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies storage requirements to the shards already on their target devices. A layout change first tries a
     /// compiled conversion on the device of each shard, and uses a host round trip for that shard when the plugin
@@ -1799,61 +1861,6 @@ impl Array {
             values = joined;
         }
         Ok(Arc::clone(values[0].1.shards()[0].buffer().unwrap()))
-    }
-
-    /// Places this array on `mesh` according to `sharding` with device work only, and on failure also returns this
-    /// array when a host fallback may still place it. [`Self::device_placement_strategy`] chooses the strategy (refer
-    /// to the documentation of this module), and [`Self::place_with_strategy`] performs the part of this process in
-    /// it. The errors of a planning and of moves of exact shards are final, so they come without this array. A
-    /// donated array is still returned when its compiled reshard fails to stage or to compile, and after a failed
-    /// execution only as [`Self::fallback_source`] allows.
-    ///
-    /// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`] (refer to
-    /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation, and
-    /// execution failures propagate through [`Error`] without losing their typed payloads.
-    ///
-    /// `layout` is the layout of each target shard that the placement records (refer to
-    /// [`Self::placement_layout`]), which [`Self::place_process_local_value`] uploads into directly. `host_fallback`
-    /// is whether the caller falls back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a
-    /// change of reduction state that only a host round trip makes exactly is an error right after the planning,
-    /// whichever process could make it (refer to [`HostRoundTripCause::without_host_route`]).
-    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
-    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    fn try_reshard_on_devices(
-        self,
-        resolve_layout: &CrossHostLayoutResolver<'_>,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        layout: Option<&Layout>,
-        donate: bool,
-        host_fallback: bool,
-    ) -> Result<Self, (Error, Option<Self>)> {
-        let process_index = match self.session().client().process_index() {
-            Ok(process_index) => process_index,
-            Err(error) => return Err((error.into(), None)),
-        };
-        // A planning error reads only shared metadata, so every process meets it alike, and no process recovers from it
-        // with a host fallback of its own (a decline that one process can make with a host round trip is planned as
-        // one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
-        // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
-        // for that fallback.
-        let strategy = match self.device_placement_strategy(resolve_layout, mesh, sharding, process_index) {
-            Ok(strategy) => strategy,
-            Err(error) => return Err((error, None)),
-        };
-        if let Some(cause) = strategy.host_round_trip_cause().filter(|_| !host_fallback) {
-            return Err((cause.without_host_route(), None));
-        }
-        let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
-            match self.moved_to_owner_view(mesh) {
-                Ok(moved) => moved,
-                Err(error) => return Err((error, Some(self))),
-            }
-        } else {
-            self
-        };
-        array.place_with_strategy(strategy, process_index, mesh, sharding, memory, layout, donate)
     }
 
     /// Performs the part of this process in `strategy`, which [`Self::device_placement_strategy`] chose for placing
