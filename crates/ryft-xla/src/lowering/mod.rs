@@ -51,8 +51,8 @@ use crate::lowering::reductions::{
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{lower_captured_constant, lower_literal_value};
-use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{ArrayConstant, Constant, Error, JIT_CALL_OPERATION_NAME, Operation, RuntimeRequirement, Type};
+use crate::operations::call::CallFunctionMap;
+use crate::{ArrayConstant, CALL_OPERATION_NAME, Constant, Error, Operation, RuntimeRequirement, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -120,7 +120,7 @@ pub enum LoweringError {
     #[error(
         "`{}` cannot call a function compiled for the devices {} of mesh `{}` inside a program compiled for the \
          devices {} of mesh `{}`",
-        JIT_CALL_OPERATION_NAME,
+        CALL_OPERATION_NAME,
         render_devices(.callee.devices()),
         .callee.logical_mesh(),
         render_devices(.mesh.devices()),
@@ -282,9 +282,9 @@ pub struct Lowerer<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type> = Operation
     /// Attached regions of the instruction currently being lowered, materialized as flat programs in region-slot order.
     regions: Vec<FlatProgram<EagerContext<Constant, O>>>,
 
-    /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
+    /// Shared private functions emitted for deduplicated `call` callees, consulted at `call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
-    nested_functions: Option<Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<Rc<CallFunctionMap<O>>>,
 
     /// Hidden capture arguments of the function currently being lowered, in capture-table order.
     captured_values: Vec<ValueRef<'b, 'c, 't>>,
@@ -322,8 +322,8 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self
     }
 
-    /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
-    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap<O>>>) -> Self {
+    /// Attaches the shared deduplicated `call` functions consulted while lowering.
+    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<CallFunctionMap<O>>>) -> Self {
         self.nested_functions = nested_functions;
         self
     }
@@ -346,10 +346,10 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self
     }
 
-    /// Returns the shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call`
+    /// Returns the shared private functions emitted for deduplicated `call` callees, consulted at `call`
     /// lowering sites. Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
     #[inline]
-    pub(crate) fn nested_functions(&self) -> Option<&Rc<JitCallFunctionMap<O>>> {
+    pub(crate) fn nested_functions(&self) -> Option<&Rc<CallFunctionMap<O>>> {
         self.nested_functions.as_ref()
     }
 
@@ -373,7 +373,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     }
 
     /// Returns the effect tokens of the lowering scope mutably, together with the attached regions, the captured
-    /// values, the shared `jit_call` functions, and the collective lowering state of this lowerer, in that order.
+    /// values, the shared `call` functions, and the collective lowering state of this lowerer, in that order.
     /// Lowering helpers thread the tokens while they read the rest of that state, which the separate accessors cannot
     /// provide, because the mutable borrow of [`Self::effect_tokens_mut`] covers the whole lowerer.
     #[allow(clippy::type_complexity)]
@@ -383,7 +383,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         &mut EffectTokens<'b, 'c, 't>,
         &[FlatProgram<EagerContext<Constant, O>>],
         &[ValueRef<'b, 'c, 't>],
-        Option<&Rc<JitCallFunctionMap<O>>>,
+        Option<&Rc<CallFunctionMap<O>>>,
         &CollectiveLoweringState,
     ) {
         (
@@ -578,7 +578,7 @@ pub trait LowerableOperation: CoreOperation {
         }
     }
 
-    /// Returns, for each input of `callee`, the callee of a `jit_call` of this family whose first `capture_count`
+    /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
     /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
     /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
     /// requires no buffer in place of such a capture, and the function that makes the call reads the operand only
@@ -601,7 +601,7 @@ pub trait LowerableOperation: CoreOperation {
 
 /// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`Type`],
 /// and its payloads can be recognized through [`OperationPayloadProjection`] by the module-level lowering passes
-/// (e.g., the `jit_call` deduplication and the Shardy mesh declaration passes). Every type that satisfies these bounds
+/// (e.g., the `call` deduplication and the Shardy mesh declaration passes). Every type that satisfies these bounds
 /// is an operation family, so downstream families only need to implement [`LowerableOperation`].
 pub trait LowerableOperationFamily: LowerableOperation<Type = Type> + OperationPayloadProjection {}
 
@@ -926,7 +926,7 @@ pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
@@ -1129,7 +1129,7 @@ pub(crate) mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::{
-        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, JitCallOperation,
+        ArrayConstant, ArrayTracer, CallOperation, CompileTracer, CompiledFunction, Constant, Error, FromPjrt,
         Operation, Options, ProgramExtension, Session, ToMlir, Type, compile, trace_with_context,
     };
 
@@ -1544,15 +1544,15 @@ pub(crate) mod tests {
         program.into_unprojected::<Constant, Operation>().unwrap()
     }
 
-    /// Stages one `jit_call` to `callee`, which is interned as a shared callee root region, over `inputs` in `builder`.
-    pub(crate) fn add_jit_call(
+    /// Stages one `call` to `callee`, which is interned as a shared callee root region, over `inputs` in `builder`.
+    pub(crate) fn add_call(
         builder: &mut CoreProgramBuilder<Constant, Operation>,
         callee: &Arc<FlatProgram<Session>>,
         inputs: Vec<AtomId>,
     ) -> AtomId {
         let callee_region = builder.intern_callee(callee, None).unwrap();
         builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], inputs, None)
+            .add_instruction(Operation::Call(CallOperation::new(0)), vec![callee_region], inputs, None)
             .unwrap()[0]
     }
 

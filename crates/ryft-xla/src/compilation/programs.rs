@@ -10,14 +10,15 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ryft_core::{ArrayType, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram};
+use ryft_core::{
+    ArrayType, DeviceMesh, ExternalReferenceBinding, ProgramError, Sharding, TypedProgram, declared_input_sharding,
+};
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 use ryft_pjrt::{ExecutionFence, LoadedExecutable};
 
 use crate::arrays::metadata::ArrayOutputPlan;
 use crate::compilation::CompilationError;
 use crate::compilation::analysis::{CompilationAnalysis, OptimizedProgram};
-use crate::compilation::domains::declared_input_sharding;
 use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::{ExecutionPlan, validate_input_reduction};

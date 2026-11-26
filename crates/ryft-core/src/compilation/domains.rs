@@ -7,6 +7,7 @@ use crate::compilation::functions::{
     CompilationTracer, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 use crate::contexts::{Domain, StagingContext};
+use crate::operations::CallOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{FlatProgram, ProgramError, TypedProgram, Value};
 use crate::tracing::DomainTracingContext;
@@ -137,11 +138,10 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Ok(None)
     }
 
-    /// Returns the operation that calls a staged function whose lifted program is
-    /// `callee` and whose options are `options`, given `operation`, which is the call that
-    /// [`StagedCallOperation::staged_call`](crate::StagedCallOperation::staged_call) constructs for the capture prefix
-    /// of `callee`. A backend uses it to record facts about the boundary of the called function that its options hold
-    /// or that only a walk of its whole program can tell (e.g., an output sharding override that stages nothing, or
+    /// Returns the operation that calls a staged function whose lifted program is `callee` and whose options are
+    /// `options`, given `operation`, which is the call that [`CallOperation::new`] constructs for the capture prefix of
+    /// `callee`. A backend uses it to record facts about the boundary of the called function that its options hold or
+    /// that only a walk of its whole program can tell (e.g., an output sharding override that stages nothing, or
     /// whether the function places a value on devices of its own), so that the call keeps the boundary contract of the
     /// function. `dispatched` tells whether the function is a staged specialization of a [`CompiledFunctionDispatcher`]
     /// whose executables the dispatcher specializes on the runtime values of their inputs (i.e., through
@@ -152,9 +152,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Core calls this function once for each staged function, the first time that
     /// [`StagedFunction::call_flat_in_context`] (which every staged call goes through) turns that function into a
     /// call, and reuses the returned operation for every later call, after it instantiates the result identities of
-    /// each call (refer to [`StagedCallOperation::with_call_types`](crate::StagedCallOperation::with_call_types)).
-    /// Work that this function does therefore costs nothing per call. The default returns `operation` unchanged,
-    /// which suits backends whose callee programs show their whole boundary.
+    /// each call (refer to [`CallOperation::with_callee_type_signature`]). Work that this function does therefore costs
+    /// nothing per call. The default returns `operation` unchanged, which suits backends whose callee programs show
+    /// their whole boundary.
     ///
     /// The returned operation must be a call of the same callee with the same capture prefix, inputs, outputs, and
     /// types as `operation`, because core binds it with the callee program and the inputs of the staged function. Like
@@ -162,11 +162,11 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// retained dispatcher to have selected its execution domain.
     #[inline]
     fn call_operation(
-        operation: Self::Operation,
+        operation: CallOperation<Self::Type>,
         callee: &FlatProgram<Self>,
         options: &Self::Options,
         dispatched: bool,
-    ) -> Self::Operation {
+    ) -> CallOperation<Self::Type> {
         let _ = (callee, options, dispatched);
         operation
     }

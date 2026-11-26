@@ -2284,7 +2284,7 @@ pub(crate) trait ResidualRounding<T: Type> {
 /// [`PartialEvaluationContext`](crate::PartialEvaluationContext) configured with
 /// [`with_rounded_residual_policy`](crate::PartialEvaluationContext::with_rounded_residual_policy) carries it into the
 /// split rules of region-carrying operations, so it also rounds the values that the partitions of their regions save
-/// (e.g., the per-branch values of a `condition`, the per-iteration values of a `scan`, or the values of a `jit_call`
+/// (e.g., the per-branch values of a `condition`, the per-iteration values of a `scan`, or the values of a `call`
 /// callee), including the known parts of their splits on residual demand, right after their producers inside the known
 /// region and before the known work of that region consumes them. Rounding them only where the enclosing program
 /// receives them would leave that known work using values that a backend computed at a higher precision while the
@@ -2374,7 +2374,7 @@ where
 ///
 /// Each distinct set of demanded outputs costs a liveness query whose time is proportional to the boundaries of the
 /// visited regions, and every output of a call is asked about separately. A call whose callee returns the residuals of
-/// nested calls (e.g., the known side of a nested `jit_call` split, which returns the residuals of every call that it
+/// nested calls (e.g., the known side of a nested `call` split, which returns the residuals of every call that it
 /// contains) would therefore cost time quadratic in its boundary. The analysis instead first bounds what the traversal
 /// would classify with [`ReplayBounds`], which it computes once per region in time proportional to the size of that
 /// region, and only traverses the regions when these bounds do not settle the answer.
@@ -7321,9 +7321,9 @@ mod tests {
     #[test]
     fn test_residual_replay_analysis_allows_replay_settles_wide_calls_with_bounds() {
         // The body returns values that alternate between dot products, which `save_dots` saves, and sines, which it
-        // recomputes, like the known callee of a `jit_call` split that returns the residuals of the calls that it
-        // contains. Traversing the body once per output would take time quadratic in its boundary, so the replay
-        // bounds must settle every answer without traversing any region.
+        // recomputes, like the known callee of a `call` split that returns the residuals of the calls that it contains.
+        // Traversing the body once per output would take time quadratic in its boundary, so the replay bounds must
+        // settle every answer without traversing any region.
         let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = body.add_input(vector_type());
         let outputs = (0..64)

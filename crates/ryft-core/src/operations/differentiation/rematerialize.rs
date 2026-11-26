@@ -412,7 +412,7 @@ where
         // differentiated (e.g., the residual side of a linearization, whose known inputs are the saved values)
         // therefore re-plans its body with the same policy rather than hoisting its recomputation. A body with effects,
         // deferred work, or references stays whole instead, because replaying its known side outside of the call would
-        // bypass the effect ordering and the reference placement of the active partial evaluation, as for `jit_call`.
+        // bypass the effect ordering and the reference placement of the active partial evaluation, as for `call`.
         let body = driver.region(0)?;
         check_count!("input", inputs, body.input_types().len(), ProgramError);
         let effects = body.effects();

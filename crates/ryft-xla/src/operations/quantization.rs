@@ -17,8 +17,8 @@ use crate::lowering::types::{
     lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
     lower_tensor_type, physical_bound_type,
 };
+use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
-use crate::operations::jit_call::lower_shared_function_call;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
@@ -549,7 +549,7 @@ mod tests {
 
     use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
+        MixedValue, ProgramBuilder, add_call, execute_mixed_program, unproject_plain_program,
     };
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
@@ -1047,8 +1047,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot_operation_lower_emits_block_scaled_dot_custom_call_in_shared_jit_call_callee() {
-        // A block scaled dot custom call nested inside a shared `jit_call` callee is emitted once, because the CUDA
+    fn test_scaled_dot_operation_lower_emits_block_scaled_dot_custom_call_in_shared_call_callee() {
+        // A block scaled dot custom call nested inside a shared `call` callee is emitted once, because the CUDA
         // target platform reaches the callee body, while both outer call sites reuse the same function.
 
         let element_type =
@@ -1087,8 +1087,8 @@ mod tests {
             builder.add_input(scale_type.clone().into()),
             builder.add_input(scale_type.clone().into()),
         ];
-        let first = add_jit_call(&mut builder, &callee, inputs.clone());
-        let second = add_jit_call(&mut builder, &callee, inputs);
+        let first = add_call(&mut builder, &callee, inputs.clone());
+        let second = add_call(&mut builder, &callee, inputs);
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
@@ -1111,7 +1111,7 @@ mod tests {
             module,
             indoc! {"
                 module {
-                  func.func private @jit_call_0(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: \
+                  func.func private @callee_0(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: \
                       tensor<2x1xf8E4M3FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
                     %0:4 = stablehlo.optimization_barrier %arg0, %arg1, %arg2, %arg3 : tensor<2x16xf4E2M1FN>, \
                         tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>
@@ -1124,9 +1124,9 @@ mod tests {
                   }
                   func.func @main(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: \
                       tensor<2x1xf8E4M3FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
-                    %0 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
+                    %0 = call @callee_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
                         tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
-                    %1 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
+                    %1 = call @callee_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
                         tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
                     %2 = stablehlo.add %0, %1 : tensor<2x2xf32>
                     return %2 : tensor<2x2xf32>

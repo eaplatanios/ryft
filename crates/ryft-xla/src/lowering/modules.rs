@@ -24,9 +24,10 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{emitted_regions, partition_session_constants, unread_entry_arguments};
+use crate::lowering::extensions::ShardingLoweringExtension;
 use crate::lowering::reductions::{
-    closed_dimensions, lower_pending_reduction_constraint, validate_declared_pending_reduction,
-    validate_partial_completion, validate_pending_reduction_change,
+    lower_pending_reduction_constraint, validate_declared_pending_reduction, validate_partial_completion,
+    validate_pending_reduction_change,
 };
 use crate::lowering::regions::lower_program_outputs_with_inputs;
 use crate::lowering::signatures::ExecutableSignature;
@@ -36,11 +37,11 @@ use crate::lowering::types::{
     validate_boundary_memory,
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
+use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
 use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
-use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions, emit_jit_call_function};
 use crate::sharding::{OpenDimensions, ShardySharding};
 use crate::{
-    CompilationError, Constant, Error, ExecutionError, JitCallOperation, RetainedArray, RuntimeRequirement,
+    CallOperation, CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement,
     SHARDY_MESH_SYMBOL_NAME, ToMlir, Type, normalize_runtime_requirements,
 };
 
@@ -414,7 +415,7 @@ pub(crate) fn render_devices(devices: &[Device]) -> String {
 
 /// Collects the module mesh from the meshes referenced by emitted sharding constraints and nested-computation
 /// boundaries, starting from `existing`, and rejects every mesh whose topology differs from it with
-/// [`LoweringError::MismatchedMeshTopology`]. The constraints include those of the boundary overrides of `jit_call`s,
+/// [`LoweringError::MismatchedMeshTopology`]. The constraints include those of the boundary overrides of `call`s,
 /// whose shardings no type records. A constraint that this function does not recognize but that lowering emits over
 /// the sharding of a type still finds its mesh, because the module declares the mesh of those types whenever the
 /// lowered module refers to a mesh that this function did not find (refer to `declare_constrained_mesh`).
@@ -460,7 +461,7 @@ where
                 .or_else(|| {
                     // A call constrains its operands and results that the boundary of its callee overrides.
                     operation
-                        .projected_payload::<JitCallOperation<Type>>()
+                        .projected_payload::<CallOperation<Type>>()
                         .and_then(|call| call.boundary_shardings().next())
                         .map(Sharding::mesh)
                 });
@@ -1156,7 +1157,7 @@ fn lower_entry_function_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O:
     argument_shardings: &[Option<Sharding>],
     supports_shardy: bool,
     function_block: &'b DetachedBlock<'c, 't>,
-    nested_functions: &Rc<JitCallFunctionMap<O>>,
+    nested_functions: &Rc<CallFunctionMap<O>>,
     collective_state: &CollectiveLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -1234,7 +1235,10 @@ where
         // through the program keep that split (refer to `constrained_dimensions`).
         let states_auto_split = |sharding: &Sharding| {
             !array_type.unreduced_axes().is_empty()
-                && array_type.sharding().is_some_and(|stated| closed_dimensions(stated) != closed_dimensions(sharding))
+                && array_type.sharding().is_some_and(|stated| {
+                    stated.dimensions_with_unconstrained_replicated()
+                        != sharding.dimensions_with_unconstrained_replicated()
+                })
         };
         let value = match &argument_shardings[logical_index] {
             Some(sharding)
@@ -1440,11 +1444,11 @@ where
             &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
         );
 
-    // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
+    // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
     // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
-    // calls, in which case every `jit_call` inlines exactly as before.
-    let nested_functions = Rc::new(collect_jit_call_functions(program, target_platform)?);
+    // calls, in which case every `call` inlines exactly as before.
+    let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
     {
         let mut module_block = module.body()?;
         for key in named_compositions.order() {
@@ -1459,7 +1463,7 @@ where
         }
         for key in nested_functions.order() {
             let function = nested_functions.functions().get(key).unwrap();
-            emit_jit_call_function(
+            emit_call_function(
                 &mut module_block,
                 function,
                 &nested_functions,
@@ -1700,7 +1704,7 @@ mod tests {
 
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::{ArrayConstant, Constant, Error, ExecutionError, JitCallOperation, Operation, Session, Type};
+    use crate::{ArrayConstant, CallOperation, Constant, Error, ExecutionError, Operation, Session, Type};
 
     use crate::lowering::{LoweringError, RaggedDotLoweringStrategy, token_threaded_effects};
 
@@ -3347,7 +3351,7 @@ mod tests {
         // override is over an auto mesh axis, so the module declares the mesh of the override even when it is lowered
         // without signature shardings, both for a static program and for one with a bounded dynamic value. The call
         // also constrains its operand replicated over that mesh, as an execution of its callee, whose input type has no
-        // sharding, places its argument (refer to `JitCallOperation::boundary_input_sharding`).
+        // sharding, places its argument (refer to `CallOperation::boundary_input_sharding`).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 1);
@@ -3365,9 +3369,9 @@ mod tests {
             let input = builder.add_input(array_type.clone().into());
             let callee_region = builder.intern_callee(&callee, None).unwrap();
             let call =
-                JitCallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated.clone())]);
+                CallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated.clone())]);
             let output =
-                builder.add_instruction(Operation::JitCall(call), vec![callee_region], vec![input], None).unwrap()[0];
+                builder.add_instruction(Operation::Call(call), vec![callee_region], vec![input], None).unwrap()[0];
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();

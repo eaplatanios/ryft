@@ -718,7 +718,7 @@ impl Session {
         // validation against the declared type cannot see it. Every execution path prepares its arguments here. Every
         // logical input is admitted, also one that has no executable argument (i.e., a static input of the zero data
         // type, which is erased below), because the admission concerns the logical value and not its buffers, and an
-        // eager call admits the same input alike (refer to `JitCallOperation::eager_decision`). The executable receives
+        // eager call admits the same input alike (refer to `CallOperation::eager_decision`). The executable receives
         // such an input as its declared type states. A capture that the executable never reads is not admitted.
         for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
             match physical_index {
@@ -758,7 +758,7 @@ impl Session {
                 None => inputs.iter().map(|input| input.r#type().into_owned()).collect(),
             };
             // Place every argument on the sharding with which the executable receives it before padding it, as an
-            // eager call does (refer to `JitCallOperation::eager_decision`), because padding an input that arrives
+            // eager call does (refer to `CallOperation::eager_decision`), because padding an input that arrives
             // split unevenly would compile that uneven split. Arguments of the zero data type carry no payload to pad,
             // and `Self::materialize_zero_space_carriers` builds their carriers on the receiving placement. Placing
             // first would also introduce a pending reduction that the receiving sharding has and an argument below its
@@ -1906,7 +1906,7 @@ pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment
 /// must never reach PJRT, and nothing else tells them apart, because two clients can number their devices alike, so
 /// that the mesh, the sharding, and the layout of such an array can match those that a call expects. This is the client
 /// admission of every call boundary: of an execution (refer to `Session::prepare_compiled_execution`) and of an eager
-/// call (refer to `JitCallOperation::eager_decision`), so that they reject such an array alike.
+/// call (refer to `CallOperation::eager_decision`), so that they reject such an array alike.
 pub(crate) fn validate_input_clients<'a>(
     session: &Session,
     inputs: impl IntoIterator<Item = Option<&'a Array>>,
@@ -1999,8 +1999,8 @@ fn validate_reduction(
 /// Validates runtime refinement of a declared logical input type, excluding the placement that a sharding describes,
 /// because an execution reshards its arguments as its executable expects. A reshard cannot change a pending reduction
 /// (i.e., the unreduced axes of a sharding and their kind), so the two types must agree on it. This is the rule by
-/// which an executable accepts its arguments. The type rule of a `jit_call` accepts the inputs of a call by a stricter
-/// rule, because a call does not reshard its inputs (refer to `JitCallOperation::validate_input_types`).
+/// which an executable accepts its arguments. The type rule of a `call` accepts the inputs of a call by a stricter
+/// rule, because a call does not reshard its inputs (refer to `CallOperation::validate_input_types`).
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
     if declared == actual {

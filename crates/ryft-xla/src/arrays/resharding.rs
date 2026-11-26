@@ -217,6 +217,13 @@ use crate::{
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Diagnostic for a placement that can only combine contributions it must keep separate.
+const COMBINED_CONTRIBUTIONS_ERROR_MESSAGE: &str = "cannot place an array with a pending reduction or with manual variation within a tile when neither \
+     whole shards nor regions of shards can move its contributions as they are (e.g., when the PJRT \
+     plugin does not report the default layout that a cross-host receive allocates), because the \
+     placement would have to combine the contributions of the pending reduction (complete the reduction \
+     first)";
+
 impl Array {
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
     /// [`Array`] remains fully usable after the call returns. This is the `ryft` analogue of JAX's
@@ -1453,8 +1460,15 @@ impl Array {
         // recorded layout reads the cross-host moves of every process, not only the receives of this one, so that every
         // process records the same layout, and the steps that later prepare the result (e.g., the inputs of a compiled
         // program) take the same path on every process.
-        let received_layouts = plan.cross_host_moves().map(|movement| &cross_host_layouts[&movement.shape()]);
-        let layout = exact_shards_layout(self.layout(), received_layouts)?;
+        let layout = match self.layout() {
+            Some(layout) => {
+                let expected = layout.to_pjrt()?;
+                plan.cross_host_moves()
+                    .all(|movement| cross_host_layouts[&movement.shape()] == expected)
+                    .then(|| layout.clone())
+            }
+            None => None,
+        };
         Ok((addressable_buffers, layout, send_fence))
     }
 
@@ -1551,8 +1565,8 @@ impl Array {
 
     /// Returns `buffer`, which is the buffer that this process sends to another process for `shard`, an addressable
     /// shard of this array (refer to [`Self::cross_host_source_buffer`]), as a buffer that the cross-host send can
-    /// move as it is (refer to [`is_cross_host_sendable`]), in the default memory of the device of that shard and in
-    /// `layout`, which is the default layout that the receiver allocates for its shape. The buffer is first staged in
+    /// move as it is, in the default memory of the device of that shard and in `layout`, the default layout that
+    /// the receiver allocates for its shape. The buffer is first staged in
     /// device memory with [`Self::device_memory_buffer`] and then converted with [`Self::cross_host_sendable_buffer`],
     /// whose conversion may compile a program on the device of the shard.
     ///
@@ -1602,8 +1616,8 @@ impl Array {
 
     /// Returns `buffer`, which holds a shard or a region with `shape` of an array of `data_type` on `device`, in the
     /// default memory of that device, as a buffer that a cross-host send can move to a receiver that allocates a static
-    /// buffer of `shape` in `layout`. This is `buffer` itself when [`is_cross_host_sendable`] accepts it, and otherwise
-    /// a static buffer of `shape` in `layout` with the same elements, which every sender of a cross-host transfer uses.
+    /// buffer of `shape` in `layout`. A static `buffer` of that shape and layout is reused. Otherwise, this function
+    /// prepares a static buffer with the same elements, as every sender of a cross-host transfer does.
     ///
     /// The conversion runs on `device` with [`Self::try_relayout_shard_on_device`], whose program has the static type
     /// of `shape` and so also drops the trailer of a buffer whose type has dynamic dimensions, and `completion` then
@@ -1619,7 +1633,12 @@ impl Array {
         layout: &ryft_pjrt::Layout,
         completion: &mut PlacementCompletion,
     ) -> Result<Arc<Buffer<'static>>, Error> {
-        if is_cross_host_sendable(&buffer, &shape, layout)? {
+        // A send moves the whole allocation. Bounded-dynamic buffers can carry an extent trailer even when their
+        // physical dimensions equal the shard shape, while the receiver allocates a static buffer with no trailer.
+        if buffer.dynamic_dimensions()?.is_empty()
+            && buffer.dimensions()?.iter().map(|&size| size as usize).eq(shape.as_slice().iter().copied())
+            && buffer.specification()?.layout == *layout
+        {
             return Ok(buffer);
         }
         let current_layout = Layout::from_pjrt(buffer.specification()?.layout)?;
@@ -1827,8 +1846,8 @@ impl Array {
     /// `source` on its device, on that device. `source_buffer` must be in the default memory of that device. A region
     /// that a remote transfer sends (i.e., with `remote_layout`, which is the default layout of the plugin for its
     /// shape) is a static buffer of its shape in that layout, because a cross-host send moves the whole allocation of
-    /// its buffer, so a region that [`is_cross_host_sendable`] rejects (e.g., a whole source shard of a bounded-dynamic
-    /// result) is converted with [`Self::cross_host_sendable_buffer`]. `completion` records the fences of the programs
+    /// its buffer, so [`Self::cross_host_sendable_buffer`] converts a region whose allocation differs from the
+    /// receiver's (e.g., a whole source shard of a bounded-dynamic result). `completion` records the fences of the programs
     /// and the readiness of the buffers that produce it.
     fn prepare_shard_region(
         session: &Session,
@@ -2386,7 +2405,10 @@ impl Array {
         let one_owner = mesh.devices().iter().all(|device| device.process_index() == owner);
         let keeps = keeps_some_contributions(self.sharding(), sharding);
         if !one_owner && keeps {
-            return Err(combined_contributions_error());
+            return Err(ProgramError::UnsupportedOperation {
+                message: COMBINED_CONTRIBUTIONS_ERROR_MESSAGE.to_string(),
+            }
+            .into());
         }
         if !one_owner {
             return Ok(DevicePlacementStrategy::ProcessLocalValue);
@@ -3075,8 +3097,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     ///      for its receive.
     ///   2. [`DevicePlacementStrategy::ShardRegions`], when the placement keeps the contributions of this array (refer
     ///      to [`keeps_contributions`] and [`Self::shard_region_plan`]).
-    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the destination introduces a pending sum (refer to
-    ///      [`split_introduced_sums`]).
+    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the destination introduces a pending sum along a
+    ///      non-manual axis.
     ///   4. [`DevicePlacementStrategy::ShardRegions`], when the meshes differ and this array declares no layout other
     ///      than the dense row-major one, or uneven shards or manual destination axes rule out a compiled reshard (in
     ///      any layout), and [`Self::shard_region_plan`] accepts the placement.
@@ -3133,14 +3155,37 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 && self.sharding().unreduced_kind() == sharding.unreduced_kind()
                 && self.sharding().varying_manual_axes() == sharding.varying_manual_axes();
             if !keeps_state_by_name {
-                return Err(combined_contributions_error());
+                return Err(ProgramError::UnsupportedOperation {
+                    message: COMBINED_CONTRIBUTIONS_ERROR_MESSAGE.to_string(),
+                }
+                .into());
             }
         }
 
         // A pending sum that the destination introduces is written as additive identities after a first step that
         // places the value without it on the devices at coordinate zero along the introduced axes only.
-        let introduction = split_introduced_sums(self.data_type(), &shape, self.sharding(), mesh, sharding)?;
-        if let Some((first_sharding, axis_indices)) = introduction {
+        let sum = ReductionState::Unreduced(UnreducedKind::Sum);
+        let kept = kept_unreduced_axes(self.sharding(), sharding);
+        let (mut axis_indices, mut introduced) = (Vec::new(), Vec::new());
+        for (index, axis) in mesh.logical_mesh().axes().iter().enumerate() {
+            if axis.r#type() != MeshAxisType::Manual
+                && ReductionState::of(sharding, axis.name()) == sum
+                && !kept.contains(&axis.name())
+            {
+                axis_indices.push(index);
+                introduced.push(axis.name());
+            }
+        }
+        if !axis_indices.is_empty() {
+            // Empty shards and axes of size one need no identity elements. Check for an identity only when the
+            // destination layout requires one, then leave the sums along the kept axes pending in the first step.
+            if requires_unreduced_sum_identity(mesh, &ShardLayout::new(&shape, mesh, sharding)?, &axis_indices) {
+                let data_type = self.data_type();
+                unreduced_sum_identity(data_type)?
+                    .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?;
+            }
+            let remaining = sharding.unreduced_axes().iter().filter(|axis| !introduced.contains(&axis.as_str()));
+            let first_sharding = sharding.clone().with_unreduced_axes(remaining.cloned().collect::<Vec<_>>())?;
             return self.introduced_sums_strategy(resolve_layout, mesh, &first_sharding, axis_indices);
         }
 
@@ -3179,10 +3224,31 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // (refer to `keeps_some_contributions`) fails here, alike on every process, rather than replacing them.
         if let Some(cause) = cause {
             if keeps {
-                return Err(combined_contributions_error());
+                return Err(ProgramError::UnsupportedOperation {
+                    message: COMBINED_CONTRIBUTIONS_ERROR_MESSAGE.to_string(),
+                }
+                .into());
             }
             if keeps_some_contributions(self.sharding(), sharding) {
-                return Err(partially_kept_contributions_error(self.sharding(), sharding, &cause));
+                let kept = kept_unreduced_axes(self.sharding(), sharding)
+                    .iter()
+                    .map(|axis| format!("`{axis}`"))
+                    .collect::<Vec<_>>();
+                let (reason, remedy) = match cause {
+                    HostRoundTripCause::Reduction { transition, .. } => (transition, "complete the reduction first"),
+                    HostRoundTripCause::Device(error) => {
+                        (error.to_string(), "complete the reduction first, or place the array onto an even split")
+                    }
+                };
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "cannot place an array whose pending reduction the placement keeps along the mesh axes {} and changes \
+                         along others when no device strategy applies ({reason}), because the host round trip that remains would \
+                         combine the contributions that the placement keeps; {remedy}",
+                        kept.join(", "),
+                    ),
+                }
+                .into());
             }
             return Ok(self.host_round_trip(mesh, cause));
         }
@@ -3267,7 +3333,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     }
 
     /// Chooses [`DevicePlacementStrategy::IntroducedSums`] for placing this array on `mesh` with a sharding that is
-    /// `first_sharding` plus pending sums along the mesh axes at `axis_indices` (refer to [`split_introduced_sums`]).
+    /// `first_sharding` plus pending sums along the mesh axes at `axis_indices` (refer to [`Self::strategy`]).
     /// Its first step places the value with `first_sharding` on the devices at coordinate zero along those axes only
     /// (i.e., on [`DeviceMeshExtension::at_coordinate_zero`]), because every other device receives the additive
     /// identity and needs nothing else. It starts from the first of the following that applies:
@@ -3506,8 +3572,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     }
 
     /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, which
-    /// introduces no pending sum (refer to [`split_introduced_sums`]), and returns the reason why it would not preserve
-    /// the value of this array, if any (refer to [`validate_reduction_transition`]), in which case the placement takes
+    /// introduces no pending sum after [`Self::strategy`] handles introduced sums, and returns the reason why it
+    /// would not preserve the value of this array, if any (refer to [`validate_reduction_transition`]). The placement takes
     /// a host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the mesh of one of its
     /// programs (i.e., the destination mesh, or the mesh of this array for the gather of a reshard across meshes) has a
     /// `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
@@ -4175,7 +4241,7 @@ fn contribution_member(
 ///     (refer to [`Array::copy_to_host_bytes`]), whatever the names, sizes, and order of the unreduced axes, as JAX
 ///     keeps the flattened order of the shards (e.g., `(x=2, y=3)` onto `(y=3, x=2)`, onto `(z=6)`, or onto
 ///     `(x=2, y=3, u=1)` with `u` pending too). Adding a pending reduction to a value without one, even along axes of
-///     size one, is not a move (refer to [`split_introduced_sums`]).
+///     size one, is not a move (refer to [`PlacementPlanningView::strategy`]).
 ///   - **Reduced axes:** They hold replicas of a completed reduction, so they do not take part. Whether a placement
 ///     may change them is decided where the reduction state of a placement is validated (refer to
 ///     [`validate_reduction_transition`]).
@@ -4229,18 +4295,10 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
         let gathered = source_varying
             .iter()
             .copied()
-            .filter(|axis| !splits_along(input, axis.name()) || output.varying_manual_axes().contains(axis.name()))
+            .filter(|axis| !input.splits_along(axis.name()) || output.varying_manual_axes().contains(axis.name()))
             .collect::<Vec<_>>();
         (gathered.len() != source_varying.len()).then(|| paired(&gathered)).flatten()
     })
-}
-
-/// Returns whether `sharding` splits a dimension along the mesh axis named `axis`.
-fn splits_along(sharding: &Sharding, axis: &str) -> bool {
-    sharding
-        .dimensions()
-        .iter()
-        .any(|dimension| matches!(dimension, ShardingDimension::Sharded(axes) if axes.iter().any(|name| name == axis)))
 }
 
 /// Returns whether a value placed as `input`, which has a pending reduction or manual variation within a tile (i.e.,
@@ -4266,7 +4324,7 @@ fn keeps_some_contributions(input: &Sharding, output: &Sharding) -> bool {
     let has_distinct_contributions = input.mesh().axes().iter().any(|axis| {
         axis.size() > 1
             && (input.unreduced_axes().contains(axis.name())
-                || (input.varying_manual_axes().contains(axis.name()) && !splits_along(input, axis.name())))
+                || (input.varying_manual_axes().contains(axis.name()) && !input.splits_along(axis.name())))
     });
     let kept = kept_unreduced_axes(input, output);
     (has_distinct_contributions && keeps_contributions(input, output))
@@ -4322,42 +4380,6 @@ fn validate_kept_contributions(input: &Sharding, keeps_all: bool) -> Result<(), 
     .into())
 }
 
-/// Returns the error of a placement that keeps the contributions of its source (refer to [`keeps_contributions`]) when
-/// only strategies that combine those contributions remain.
-fn combined_contributions_error() -> Error {
-    ProgramError::UnsupportedOperation {
-        message: "cannot place an array with a pending reduction or with manual variation within a tile when neither \
-                  whole shards nor regions of shards can move its contributions as they are (e.g., when the PJRT \
-                  plugin does not report the default layout that a cross-host receive allocates), because the \
-                  placement would have to combine the contributions of the pending reduction (complete the reduction \
-                  first)"
-            .to_string(),
-    }
-    .into()
-}
-
-/// Returns the error of a placement of a value placed as `input` with the sharding `output` that keeps some of its
-/// contributions but not all of them (refer to [`keeps_some_contributions`]) when only a host round trip for `cause`
-/// remains, which would combine them.
-fn partially_kept_contributions_error(input: &Sharding, output: &Sharding, cause: &HostRoundTripCause) -> Error {
-    let kept = kept_unreduced_axes(input, output).iter().map(|axis| format!("`{axis}`")).collect::<Vec<_>>();
-    let (reason, remedy) = match cause {
-        HostRoundTripCause::Reduction { transition, .. } => (transition.clone(), "complete the reduction first"),
-        HostRoundTripCause::Device(error) => {
-            (error.to_string(), "complete the reduction first, or place the array onto an even split")
-        }
-    };
-    ProgramError::UnsupportedOperation {
-        message: format!(
-            "cannot place an array whose pending reduction the placement keeps along the mesh axes {} and changes \
-             along others when no device strategy applies ({reason}), because the host round trip that remains would \
-             combine the contributions that the placement keeps; {remedy}",
-            kept.join(", "),
-        ),
-    }
-    .into()
-}
-
 /// Returns the cross-host shape, attaching the destination shard and dimension to any encoding failure.
 fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<i64>, Error> {
     shape
@@ -4376,35 +4398,23 @@ fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<
         .collect()
 }
 
-/// Returns a lazy resolver for the layout that a cross-host receive allocates. On each call the resolver checks for
-/// the PJRT cross-host transfers extension before calling [`default_buffer_layout`].
+/// Returns a lazy resolver for the default layout that a cross-host receive allocates. Each lookup checks for the
+/// PJRT cross-host transfers extension, then asks the plugin for its default layout. A missing default layout
+/// query returns [`None`], and an unrepresentable shape reports the destination shard and dimension.
 fn cross_host_layout_resolver<'o>(
     client: &'o Client<'_>,
 ) -> impl Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o {
     move |element_type, shard_index, shape| {
         client.cross_host_transfers_extension()?;
-        default_buffer_layout(client, element_type, shard_index, shape)
-    }
-}
-
-/// Returns the default layout that the PJRT plugin of `client` uses for a buffer of `element_type` with `shape`, or
-/// `None` when the plugin cannot report it. This lookup is independent of cross-host transfer support.
-/// [`cross_host_layout_resolver`] checks the extension for placement. `shard_index` identifies the shard in the
-/// error for a shape that PJRT cannot represent.
-fn default_buffer_layout(
-    client: &Client<'_>,
-    element_type: BufferType,
-    shard_index: ShardIndex,
-    shape: &StaticShape,
-) -> Result<Option<ryft_pjrt::Layout>, Error> {
-    let dimensions = cross_host_shape(shard_index, shape)?
-        .into_iter()
-        .map(|dimension| dimension as u64)
-        .collect::<Vec<_>>();
-    match client.default_layout(element_type, dimensions).and_then(|layout| layout.proto()) {
-        Ok(layout) => Ok(Some(ryft_pjrt::Layout::from_proto(layout)?)),
-        Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => Ok(None),
-        Err(error) => Err(error.into()),
+        let dimensions = cross_host_shape(shard_index, shape)?
+            .into_iter()
+            .map(|dimension| dimension as u64)
+            .collect::<Vec<_>>();
+        match client.default_layout(element_type, dimensions).and_then(|layout| layout.proto()) {
+            Ok(layout) => Ok(Some(ryft_pjrt::Layout::from_proto(layout)?)),
+            Err(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -4431,23 +4441,6 @@ fn cross_host_layouts(
         }
     }
     Ok(Some(layouts))
-}
-
-/// Returns the layout that an array placed as whole shards records, given the declared `layout` of its source and the
-/// layouts of the buffers that the cross-host moves of every process receive for it. Local copies keep the layout of
-/// their source shards, so the declared layout holds for them, and it is kept only when every received buffer has it
-/// too. Otherwise, the buffers of the array can have different layouts, and the array records no layout rather than a
-/// wrong one. Reading the moves of every process rather than only the receives of one makes every process record the
-/// same layout, even one whose buffers all keep the declared layout.
-fn exact_shards_layout<'o>(
-    layout: Option<&Layout>,
-    mut received_layouts: impl Iterator<Item = &'o ryft_pjrt::Layout>,
-) -> Result<Option<Layout>, Error> {
-    let Some(layout) = layout else {
-        return Ok(None);
-    };
-    let expected = layout.to_pjrt()?;
-    Ok(received_layouts.all(|received| *received == expected).then(|| layout.clone()))
 }
 
 /// Returns the deterministic cross-host transfer key for moving data from `source_shard_index` to the
@@ -4566,26 +4559,6 @@ fn issue_cross_host_transfers(
     Ok((send_fence, received_buffers))
 }
 
-/// Returns whether a cross-host transfer can send `buffer` as it is to a receiver that allocates a static buffer of
-/// `shape` (i.e., the shape of the shard or the region that `buffer` holds) in `layout`. A send moves the whole
-/// allocation of its buffer and some plugins (e.g., CUDA) take its size from the allocation of the sender, so the
-/// sender must send exactly the allocation that the receiver makes, which is the case exactly when `buffer` is a static
-/// buffer of `shape` in `layout` on the same plugin. Every sender of a cross-host transfer decides with this predicate
-/// whether it converts its buffer first (refer to [`Array::cross_host_send_buffer`] and
-/// [`Array::prepare_shard_region`]).
-///
-/// Dimensions alone do not establish that. A buffer whose type has dynamic dimensions (e.g., the result of a
-/// bounded-dynamic execution) is allocated for the bound of each such dimension with a trailer that records its
-/// runtime extents, so it is larger than a static buffer of `shape` even at its maximum extent, where its physical
-/// dimensions equal `shape` (e.g., `4,096` bytes rather than `4,092` for `f32[1023]` on the CPU plugin). Such a buffer
-/// is therefore always converted. Only the process that holds `buffer` knows these facts, so they change which buffer
-/// this process sends but never the strategy or the transfers that the processes agree on.
-fn is_cross_host_sendable(buffer: &Buffer<'_>, shape: &StaticShape, layout: &ryft_pjrt::Layout) -> Result<bool, Error> {
-    Ok(buffer.dynamic_dimensions()?.is_empty()
-        && buffer.dimensions()?.iter().map(|&size| size as usize).eq(shape.as_slice().iter().copied())
-        && buffer.specification()?.layout == *layout)
-}
-
 /// Returns the dense row-major [`Layout`] of rank `rank` (i.e., the tiled layout without tiles whose minor-to-major
 /// order is the reverse of the order of the dimensions), which is the default layout of dense buffers of the CPU and
 /// CUDA plugins and the layout of the slices and of the received regions of [`Array::reshard_shard_regions`].
@@ -4606,48 +4579,6 @@ fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, ra
         return Ok(replicated);
     }
     Ok(replicated.with_unreduced_axes(kept)?.with_unreduced_kind(input.unreduced_kind())?)
-}
-
-/// Returns how a placement of a value of `data_type` and `shape` placed as `input` onto `mesh` with the sharding
-/// `output` introduces pending sums, or [`None`] when it introduces none. A placement that only moves the contributions
-/// of the value (refer to [`moves_contributions`]) never gets here, because it moves them as whole shards or as
-/// regions of shards (refer to [`PlacementPlanningView::strategy`]), so the placements that get here really
-/// change the reduction (i.e., they complete it, introduce it, or change its kind or its number of contributions). The
-/// placement introduces a pending sum along each non-manual axis of `mesh` along which `output` has a pending sum that
-/// the placement does not keep (refer to [`kept_unreduced_axes`]), whatever the other axes of either mesh. The result
-/// is the sharding of the first step of [`DevicePlacementStrategy::IntroducedSums`] (i.e., `output` without those axes
-/// among its unreduced axes, along which the value is then replicated, which keeps the kept ones pending) and the
-/// indices of those axes within `mesh`. Pending sums along axes of size one are introduced as well, which writes no
-/// identity.
-fn split_introduced_sums(
-    data_type: DataType,
-    shape: &StaticShape,
-    input: &Sharding,
-    mesh: &DeviceMesh,
-    output: &Sharding,
-) -> Result<Option<(Sharding, Vec<usize>)>, Error> {
-    let sum = ReductionState::Unreduced(UnreducedKind::Sum);
-    let (mut axis_indices, mut introduced) = (Vec::new(), Vec::new());
-    let kept = kept_unreduced_axes(input, output);
-    for (axis_index, axis) in mesh.logical_mesh().axes().iter().enumerate() {
-        if axis.r#type() != MeshAxisType::Manual
-            && ReductionState::of(output, axis.name()) == sum
-            && !kept.contains(&axis.name())
-        {
-            axis_indices.push(axis_index);
-            introduced.push(axis.name());
-        }
-    }
-    if axis_indices.is_empty() {
-        return Ok(None);
-    }
-    if requires_unreduced_sum_identity(mesh, &ShardLayout::new(shape, mesh, output)?, &axis_indices) {
-        unreduced_sum_identity(data_type)?
-            .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?;
-    }
-    let kept = output.unreduced_axes().iter().filter(|axis| !introduced.contains(&axis.as_str())).cloned();
-    let first = output.clone().with_unreduced_axes(kept.collect::<Vec<_>>())?;
-    Ok(Some((first, axis_indices)))
 }
 
 /// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with
@@ -4674,8 +4605,8 @@ fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding,
 ///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
 ///     [`CollectiveReduction::Exact`] (a maximum or minimum that drops NaN values is not).
 ///   - **Introducing a pending sum:** No program of a placement does, because the planner introduces pending sums with
-///     additive identities after a placement without them (refer to [`split_introduced_sums`]), so `output` must not
-///     introduce one, and only the completion of a pending reduction of `input` along such an axis is validated.
+///     additive identities after a placement without them (refer to [`PlacementPlanningView::strategy`]). This
+///     check validates only the completion of a pending reduction of `input` along such an axis.
 ///   - **Introducing a pending maximum or minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
 ///     `crate::lowering`, whose check would reject the program).
 ///   - **Completing or introducing a completed reduction:** This changes no value.
@@ -4969,6 +4900,19 @@ mod tests {
     ) -> Result<Option<ryft_pjrt::Layout>, Error> {
         let minor_to_major = (0..shape.rank()).rev().collect();
         Ok(Some(Layout::Tiled(TiledLayout::new(minor_to_major, vec![])).to_pjrt()?))
+    }
+
+    /// Plans a reduction transition from shard metadata, without constructing buffers or executing a transfer.
+    fn plan_reduction_transition(
+        data_type: DataType,
+        shape: &StaticShape,
+        mesh: &DeviceMesh,
+        input: &Sharding,
+        output: &Sharding,
+    ) -> Result<DevicePlacementStrategy, Error> {
+        let r#type = ArrayType::new(data_type, shape.clone().into());
+        let (metadata, shards) = ArrayMetadata::new(r#type, Some(input.clone()), mesh.clone(), None)?;
+        PlacementPlanningView::new(&metadata, shards.iter()).strategy(&simulated_cross_host_layout, mesh, output)
     }
 
     /// Returns the work that crosses processes, which the process with index `process_index` plans when it places
@@ -7972,7 +7916,7 @@ mod tests {
         // `-448`, which sum to zero, have the partial sums `896` and `-896`, which are NaN in `f8e4m3fn`, and the
         // `bf16` contributions `256`, `1`, `-256`, and `1` have the partial sum `257`, which rounds to `256`). The
         // host round trip that remains would combine the partial sums that the destination keeps, so both entry points
-        // return the error of `partially_kept_contributions_error`, which the rows list as `error` and `errors` in
+        // return the partial-contribution error, which the rows list as `error` and `errors` in
         // full. A data type that accumulates its sums in itself keeps them on the devices: integers are exact, and an
         // `f32` partial completion fixes the order of accumulation to its partial sums first, as the contract of
         // floating point sums allows, so the `f32` contributions `2^24`, `1`, `-2^24`, and `1`, which read back as
@@ -12002,9 +11946,7 @@ mod tests {
         let values = [1f32, 2., 3., 4., 5., 6.];
         let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let default_layout =
-            default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3])).unwrap().unwrap();
-        assert_eq!(default_layout, row_major.to_pjrt().unwrap());
+        let default_layout = row_major.to_pjrt().unwrap();
         let upload = |session: &Session, layout: &Layout| {
             let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout.clone());
             Array::from_host_buffer(session, r#type, mesh.clone(), None, values_to_bytes(&values)).unwrap()
@@ -12071,10 +12013,8 @@ mod tests {
             assert_eq!(padded_buffer.unpadded_dimensions().unwrap(), [size as u64]);
             assert_eq!(padded_buffer.dynamic_dimensions().unwrap(), [0]);
             assert_eq!(padded_buffer.on_device_size_in_bytes().unwrap(), padded_size);
-            let default_layout =
-                default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![size])).unwrap().unwrap();
+            let default_layout = dense_row_major_layout(1).to_pjrt().unwrap();
             assert_eq!(padded_buffer.specification().unwrap().layout, default_layout);
-            assert!(!is_cross_host_sendable(padded_buffer, &StaticShape::new(vec![size]), &default_layout).unwrap());
             let mut completion = PlacementCompletion::default();
             let buffer = Arc::clone(padded_buffer);
             let sent = padded.cross_host_send_buffer(shard, buffer, &default_layout, &mut completion).unwrap();
@@ -12092,11 +12032,11 @@ mod tests {
             completion.join(None).unwrap().block_until_ready().unwrap();
             region_completion.join(None).unwrap().block_until_ready().unwrap();
             for sent in [sent, region] {
+                assert!(!Arc::ptr_eq(padded_buffer, &sent));
                 assert_eq!(sent.dimensions().unwrap(), [size as u64]);
                 assert_eq!(sent.dynamic_dimensions().unwrap(), Vec::<u64>::new());
                 assert_eq!(sent.on_device_size_in_bytes().unwrap(), 4 * size, "extent {size}");
                 assert_eq!(sent.specification().unwrap().layout, default_layout);
-                assert!(is_cross_host_sendable(&sent, &StaticShape::new(vec![size]), &default_layout).unwrap());
                 assert_eq!(sent.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&values));
             }
         }
@@ -13431,37 +13371,59 @@ mod tests {
     }
 
     #[test]
-    fn test_default_buffer_layout() {
-        // The CPU plugin reports row-major layouts through the default layout query.
+    fn test_cross_host_layout_resolver_requires_transfer_support() {
+        // The CPU plugin reports row-major layouts, but they are usable for a remote receive only when the plugin
+        // also supports cross-host transfers.
         let client = cpu_client(1);
-        assert_eq!(
-            default_buffer_layout(client, BufferType::F32, 0, &StaticShape::new(vec![2, 3])).unwrap(),
-            Some(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])).to_pjrt().unwrap()),
-        );
-        assert_eq!(
-            default_buffer_layout(client, BufferType::Predicate, 0, &StaticShape::new(vec![4])).unwrap(),
-            Some(Layout::Tiled(TiledLayout::new(vec![0], vec![])).to_pjrt().unwrap()),
-        );
+        let resolve = cross_host_layout_resolver(client);
+        for (element_type, shape) in [(BufferType::F32, vec![2, 3]), (BufferType::Predicate, vec![4])] {
+            let dimensions = shape.iter().map(|&size| size as u64).collect::<Vec<_>>();
+            let layout = client.default_layout(element_type, dimensions).unwrap().proto().unwrap();
+            assert_eq!(
+                ryft_pjrt::Layout::from_proto(layout).unwrap(),
+                dense_row_major_layout(shape.len()).to_pjrt().unwrap(),
+            );
+            assert!(matches!(
+                resolve(element_type, 0, &StaticShape::new(shape)),
+                Err(Error::Pjrt(PjrtError::Unimplemented { .. })),
+            ));
+        }
     }
 
     #[test]
-    fn test_exact_shards_layout() {
+    fn test_array_exact_shard_buffers_records_layout_across_processes() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
         let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let received_row_major = row_major.to_pjrt().unwrap();
         let received_column_major = column_major.to_pjrt().unwrap();
+        let recorded_layout = |layout: Option<&Layout>, receives: &[&ryft_pjrt::Layout]| {
+            let r#type = ArrayType::new_static(DataType::F32, [3, 3]).with_layout(layout.cloned());
+            let source = Array::from_host_buffer(&session, r#type, mesh.clone(), None, [0u8; 36]).unwrap();
+            // These moves involve other processes only. This process still records their layouts, without posting
+            // any PJRT transfers of its own.
+            let moves = receives.iter().enumerate().map(|(index, _)| ShardMove {
+                source_shard_index: index,
+                source_device: Device::new(index + 10, 1),
+                destination_shard_index: index,
+                destination_device: Device::new(index + 20, 2),
+                slice: vec![[0..1, 1..3][index].clone(), 0..3],
+                transfer_key: index as CrossHostTransferKey,
+            });
+            let plan = ShardMovePlan::new(BufferType::F32, moves.collect()).unwrap();
+            let layouts = plan.moves.iter().zip(receives).map(|(movement, &layout)| (movement.shape(), layout.clone()));
+            let (_, layout, _) = source
+                .exact_shard_buffers(&plan, &layouts.collect(), Memory::Device, &mut PlacementCompletion::default())
+                .unwrap();
+            layout
+        };
 
-        // A source without a declared layout places an array without one, whatever this process receives.
-        assert_eq!(exact_shards_layout(None, [&received_row_major].into_iter()).unwrap(), None);
-
-        // The declared layout holds for local copies, and for received buffers only when they have it as well.
-        assert_eq!(exact_shards_layout(Some(&column_major), std::iter::empty()).unwrap(), Some(column_major.clone()));
-        assert_eq!(exact_shards_layout(Some(&row_major), [&received_row_major].into_iter()).unwrap(), Some(row_major));
-        assert_eq!(
-            exact_shards_layout(Some(&column_major), [&received_column_major, &received_row_major].into_iter())
-                .unwrap(),
-            None,
-        );
+        assert_eq!(recorded_layout(None, &[&received_row_major]), None);
+        assert_eq!(recorded_layout(Some(&column_major), &[]), Some(column_major.clone()));
+        assert_eq!(recorded_layout(Some(&row_major), &[&received_row_major]), Some(row_major));
+        assert_eq!(recorded_layout(Some(&column_major), &[&received_column_major, &received_row_major]), None);
     }
 
     #[test]
@@ -13523,17 +13485,17 @@ mod tests {
         ];
         let shape = StaticShape::new(vec![4]);
         let decide = |data_type: DataType, mesh: &DeviceMesh, input: &Sharding, output: &Sharding| {
-            let introduction = split_introduced_sums(data_type, &shape, input, mesh, output);
-            match introduction {
+            match plan_reduction_transition(data_type, &shape, mesh, input, output) {
                 Err(error) => format!("error: {error}"),
-                Ok(Some((first, _))) => match validate_reduction_transition(data_type, mesh, input, &first) {
-                    Some(cause) => format!("host round trip: {}", cause.across_processes()),
-                    None => "additive identities".to_string(),
-                },
-                Ok(None) => match validate_reduction_transition(data_type, mesh, input, output) {
-                    Some(cause) => format!("host round trip: {}", cause.across_processes()),
-                    None => "compiled reshard".to_string(),
-                },
+                Ok(strategy) => {
+                    if let Some(cause) = strategy.host_round_trip_cause() {
+                        format!("host round trip: {}", cause.across_processes())
+                    } else if matches!(strategy, DevicePlacementStrategy::IntroducedSums { .. }) {
+                        "additive identities".to_string()
+                    } else {
+                        "compiled reshard".to_string()
+                    }
+                }
             }
         };
         let code = |decision: String| match decision.split(':').next().unwrap() {
@@ -13643,16 +13605,19 @@ mod tests {
         let pending = |kind: UnreducedKind| {
             replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
         };
-        let empty = split_introduced_sums(
+        let empty = plan_reduction_transition(
             DataType::F8E8M0FNU,
             &StaticShape::new(vec![0]),
-            &replicated,
             &mesh,
+            &replicated,
             &pending(UnreducedKind::Sum),
         )
-        .unwrap()
-        .map(|(first, axis_indices)| (first.to_string(), axis_indices));
-        assert_eq!(empty, Some((replicated.to_string(), vec![0])));
+        .unwrap();
+        let DevicePlacementStrategy::IntroducedSums { sharding, axis_indices, .. } = empty else {
+            panic!("an empty placement must still introduce the pending sum");
+        };
+        assert_eq!(axis_indices, vec![0]);
+        assert_eq!(sharding_on_mesh(&sharding, mesh.logical_mesh()).unwrap(), replicated);
         let host = "and the host round trip that makes it exactly needs one process that owns every device of the \
                     destination and can read the source back from its own devices";
         let complete = "complete the reduction while the devices of one process hold the value, or in another data \
@@ -13736,8 +13701,7 @@ mod tests {
         // mesh of `ReshardProgram::compiled_mesh`, for every data type with values, both axis types, and every pair of
         // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a
         // pending sum plans the program of its placement without that sum, whose identities are written without a
-        // program (refer to `split_introduced_sums`). Only lowering runs, so that a wrong plan cannot abort the test
-        // process.
+        // program. Only lowering runs, so that a wrong plan cannot abort the test process.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
         let data_types = [
@@ -13794,12 +13758,14 @@ mod tests {
                 for input in &states {
                     for output in &states {
                         let first;
-                        let output = match split_introduced_sums(data_type, &shape, input, &mesh, output) {
-                            Ok(Some((sharding, _))) => {
-                                first = sharding;
+                        let output = match plan_reduction_transition(data_type, &shape, &mesh, input, output) {
+                            Ok(DevicePlacementStrategy::IntroducedSums { sharding, .. }) => {
+                                // Check the reduction rules on the full mesh even if the plan puts the first step
+                                // on its coordinate-zero submesh.
+                                first = sharding_on_mesh(&sharding, mesh.logical_mesh()).unwrap();
                                 &first
                             }
-                            Ok(None) => output,
+                            Ok(_) => output,
                             Err(_) => {
                                 declined += 1;
                                 continue;

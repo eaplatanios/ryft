@@ -24,7 +24,7 @@ use crate::lowering::types::lower_array_ir_type;
 use crate::operations::attention::{
     lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
 };
-use crate::operations::jit_call::lower_shared_function_call;
+use crate::operations::call::lower_shared_function_call;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
 };
@@ -220,7 +220,7 @@ where
             }
 
             // Calls whose key and boundary are shared by calls with another body are not indexed, so they find their
-            // shared function by their own body instead, as `JitCallFunctionMap::named` explains.
+            // shared function by their own body instead, as `CallFunctionMap::named` explains.
             let function = lowerer.nested_functions().zip(lowerer.regions().first()).and_then(|(functions, primal)| {
                 functions.get(primal).filter(|function| function.input_types().len() == input_values.len())
             });
@@ -532,7 +532,7 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
             location,
             &[],
             &RematerializationOptimizationBarrier::None,
-            // Decompositions are traced independently of the lowered program and contain no `jit_call` sharing.
+            // Decompositions are traced independently of the lowered program and contain no `call` sharing.
             None,
             collective_state,
             &mut effect_tokens,

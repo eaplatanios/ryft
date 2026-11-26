@@ -39,12 +39,12 @@ use crate::lowering::types::{
     lower_array_ir_type, lower_compare_to_mlir, lower_constant_output, lower_static_index_constants, lower_tensor_type,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
+use crate::operations::call::CallFunctionMap;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
-use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ScanOperation<ArrayType> {
@@ -344,8 +344,8 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
     /// Lowered values of the enclosing function's captures.
     captured_values: &'o [ValueRef<'b, 'c, 't>],
 
-    /// Nested functions that `jit_call` operations in the body lower against.
-    nested_functions: Option<&'o Rc<JitCallFunctionMap<O>>>,
+    /// Nested functions that `call` operations in the body lower against.
+    nested_functions: Option<&'o Rc<CallFunctionMap<O>>>,
 
     /// Collective lowering state shared with the enclosing function.
     collective_state: &'o CollectiveLoweringState,

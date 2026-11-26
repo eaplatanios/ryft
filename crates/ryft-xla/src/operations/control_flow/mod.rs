@@ -22,7 +22,7 @@ use crate::lowering::types::{
 };
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
-use crate::operations::jit_call::JitCallFunctionMap;
+use crate::operations::call::CallFunctionMap;
 use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
@@ -357,7 +357,7 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     entry_effect_tokens: EffectTokens<'b, 'c, 't>,
     threaded_effects: EffectClasses,
@@ -522,9 +522,10 @@ mod tests {
     use crate::lowering::tests::{dynamic_dimension, test_vector_type};
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
-    use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program};
+    use crate::{
+        Array, CallOperation, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program,
+    };
 
     use super::*;
 
@@ -1149,12 +1150,7 @@ mod tests {
         let input = builder.add_input(scalar_f32.clone().into());
         let items = builder.add_input(vector_f32.clone().into());
         let outputs = builder
-            .add_instruction(
-                Operation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![predicate, input, items],
-                None,
-            )
+            .add_instruction(Operation::Call(CallOperation::new(0)), vec![callee], vec![predicate, input, items], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -1193,7 +1189,7 @@ mod tests {
             primal.to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[], %2:f32[2] .
-                let %3:f32[], %4:f32[2], %5:bool[], %6:bool[2] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
+                let %3:f32[], %4:f32[2], %5:bool[], %6:bool[2] = call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee={
                         lambda %0:bool[], %1:f32[], %2:f32[2] .
                         let %3:f32[] = condition %0 %1 [
@@ -1318,7 +1314,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
-                let %4:f32[], %5:f32[2] = jit_call [derived_input_shardings=[_, _, _, _]] %0 %1 %2 %3 [
+                let %4:f32[], %5:f32[2] = call [derived_input_shardings=[_, _, _, _]] %0 %1 %2 %3 [
                     callee={
                         lambda %0:f32[], %1:f32[2], %2:bool[], %3:bool[2] .
                         let %4:f32[] = scan [carry_count=1, iteration_count=2, reverse=true] %0 %3 [

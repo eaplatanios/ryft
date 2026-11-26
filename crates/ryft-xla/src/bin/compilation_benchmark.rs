@@ -10,7 +10,7 @@
 //!   - **`transforms`**: Measures, on one CPU device, the cold and warm calls of a [`jit`] dispatcher whose function
 //!     runs an eager reverse mode gradient, the repeated construction of [`CompiledFunction::gradient`] and
 //!     [`CompiledFunction::jvp`], which retain their derived functions after the first construction, and the cost of
-//!     transforming one shared `jit_call` callee for several distinct outer functions. The latter is split into the
+//!     transforming one shared `call` callee for several distinct outer functions. The latter is split into the
 //!     backend compilation time that the shared compilation cache records and the remaining frontend time, for a
 //!     short and a long callee, so that the frontend cost that grows with the callee is visible.
 //!   - **`attention`**: Measures the staging, lowering, and compilation times and the synchronized execution time and
@@ -43,7 +43,7 @@ use ryft_xla::{
 
 // TODO(eaplatanios): Review this module.
 
-/// Number of distinct outer functions that stage a `jit_call` of one shared callee in the `transforms` scenario.
+/// Number of distinct outer functions that stage a `call` of one shared callee in the `transforms` scenario.
 const CALLEE_OUTER_SPECIALIZATIONS: usize = 4;
 
 /// Lengths of the short and long callee chains compared by the `transforms` scenario.
@@ -415,13 +415,13 @@ fn jit_eager_gradient(
     }))
 }
 
-/// Measures the forward mode and reverse mode transformation of one shared `jit_call` callee of `callee_operations`
+/// Measures the forward mode and reverse mode transformation of one shared `call` callee of `callee_operations`
 /// alternating `sin` and `cos` operations across [`CALLEE_OUTER_SPECIALIZATIONS`] distinct outer functions, and returns
 /// the measurement as JSON.
 ///
-/// Every outer function stages a `jit_call` of the same callee and appends a different number of `sin` operations, so
+/// Every outer function stages a `call` of the same callee and appends a different number of `sin` operations, so
 /// the outer functions are distinct specializations that cannot share the derived functions that a
-/// [`CompiledFunction`] retains. Each [`CompiledFunction::jvp`] runs the forward mode rule of the `jit_call` operation
+/// [`CompiledFunction`] retains. Each [`CompiledFunction::jvp`] runs the forward mode rule of the `call` operation
 /// over the callee, and each [`CompiledFunction::gradient`] runs both its forward mode rule and its transposition rule.
 /// The transform cache of the callee region derives its linearizations and transpositions once and serves them to every
 /// later outer function, so the frontend cost that still grows with the callee is the work outside of the retained
@@ -464,19 +464,19 @@ fn shared_callee_transforms(
             mesh.clone(),
         )?;
 
-        // The callee must stay behind a `jit_call` boundary for the measurement to be meaningful, so the outer program
-        // must hold exactly one `jit_call` and none of the `cos` operations of the callee, which its epilogue of `sin`
+        // The callee must stay behind a `call` boundary for the measurement to be meaningful, so the outer program
+        // must hold exactly one `call` and none of the `cos` operations of the callee, which its epilogue of `sin`
         // operations never produces.
         let instructions = outer.source_program().program().instructions();
-        let jit_call_count = instructions
+        let call_count = instructions
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+            .filter(|instruction| matches!(instruction.operation(), Operation::Call(_)))
             .count();
         let inlined_cosine_count = instructions
             .iter()
             .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Cos(_))))
             .count();
-        assert_eq!(jit_call_count, 1, "each outer function must stage one `jit_call` boundary");
+        assert_eq!(call_count, 1, "each outer function must stage one `call` boundary");
         assert_eq!(inlined_cosine_count, 0, "the outer functions must not inline the callee body");
         outers.push(outer);
     }

@@ -12,6 +12,7 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 pub mod arithmetic;
 pub mod assertions;
 pub mod attention;
+pub mod call;
 pub mod collectives;
 pub mod comparisons;
 pub mod complex;
@@ -58,6 +59,10 @@ pub use attention::{
     DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
     DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DifferentiableDotProductAttention, DotProductAttention,
     differentiable_dot_product_attention, dot_product_attention,
+};
+pub use call::{
+    CALL_OPERATION_NAME, CallOperation, RegionPlacementSummary, RequestedPlacement, boundary_input_type,
+    declared_input_sharding, entered_argument_sharding, states_boundary_placement, transpose_primal_call,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,

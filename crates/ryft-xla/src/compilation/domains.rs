@@ -6,17 +6,17 @@
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
-use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
     ArrayOperation, ArrayType, CapturePlacement, CompilationCacheDomain, CompilationDomain, Device, DeviceMesh,
-    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, MeshAxisType,
-    Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation,
-    PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME, Sharding,
-    ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
+    Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError,
+    ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError,
+    StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram, declared_input_sharding,
+    entered_argument_sharding, states_boundary_placement,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -42,10 +42,9 @@ use crate::lowering::extensions::{
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
 use crate::lowering::signatures::ExecutableSignature;
-use crate::sharding::LogicalMeshExtension;
 use crate::{
-    Array, Constant, Error, ExecutionError, JIT_CALL_OPERATION_NAME, JitCallOperation, LoweringError,
-    OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
+    Array, CALL_OPERATION_NAME, CallOperation, Constant, Error, ExecutionError, LoweringError, OpShardingExtension,
+    Operation, RetainedArray, Session, Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -82,8 +81,8 @@ impl CompilationDomain for Session {
         Ok(Some(Constant::Session(RetainedArray::new(array).with_declared_type(captured_type))))
     }
 
-    // A `jit_call` of a compiled function carries the boundary of that function (i.e., its sharding overrides and the
-    // device mesh that the function names, refer to `JitCallOperation::with_boundary`), because the callee cannot show
+    // A `call` of a compiled function carries the boundary of that function (i.e., its sharding overrides and the
+    // device mesh that the function names, refer to `CallOperation::with_boundary`), because the callee cannot show
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
     // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when it
     // requests a placement that names devices (refer to `requests_placement`), which a request that only moves a value
@@ -91,37 +90,26 @@ impl CompilationDomain for Session {
     // select the devices, even for a function with committed captures. A dispatcher without input overrides also
     // keeps each argument's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
     // (refer to `dispatch_signature`). Every call also records the mesh of its function, named or not, which only an
-    // application of the call by a session reads, to run there (refer to `JitCallOperation::with_function_mesh`), and
+    // application of the call by a session reads, to run there (refer to `CallOperation::with_function_mesh`), and
     // which a call nested in a compiled caller never reads. Core constructs the call operation once for each staged
     // function.
     fn call_operation(
-        operation: Operation,
+        call: CallOperation<Type>,
         callee: &FlatProgram<Session>,
         options: &Options,
         dispatched: bool,
-    ) -> Operation {
-        match operation {
-            Operation::JitCall(call) => {
-                // The lifted capture prefix of the callee precedes its inputs and has no overrides.
-                let input_shardings = std::iter::repeat_n(None, call.capture_count())
-                    .chain(options.input_shardings().into_iter().flatten().cloned().map(Some))
-                    .collect();
-                let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
-                // No session is at hand here, so the callee is read for no target, and the pruning of the program
-                // that lowering emits for its target drops the mesh of a call whose callee names devices only inside a
-                // body that the target replaces (refer to `ProgramLoweringExtension::pruned_for_lowering`).
-                let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
-                let call =
-                    call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
-                let call = if dispatched && options.input_shardings().is_none() {
-                    call.with_kept_input_placements()
-                } else {
-                    call
-                };
-                Operation::JitCall(call)
-            }
-            operation => operation,
-        }
+    ) -> CallOperation<Type> {
+        // The lifted capture prefix of the callee precedes its inputs and has no overrides.
+        let input_shardings = std::iter::repeat_n(None, call.capture_count())
+            .chain(options.input_shardings().into_iter().flatten().cloned().map(Some))
+            .collect();
+        let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
+        // No session is at hand here, so the callee is read for no target, and the pruning of the program that
+        // lowering emits for its target drops the mesh of a call whose callee names devices only inside a body that
+        // the target replaces (refer to `ProgramLoweringExtension::pruned_for_lowering`).
+        let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
+        let call = call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
+        if dispatched && options.input_shardings().is_none() { call.with_kept_input_placements() } else { call }
     }
 
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<LoweredProgram, Self::Error> {
@@ -651,11 +639,11 @@ impl Session {
         }
         // An argument is annotated as its runtime array stores it, which replicates the dimensions that its placement
         // leaves unconstrained, as the StableHLO export of traced programs annotates it (refer to
-        // `ShardingLoweringExtension::entry_boundary_sharding`). Execution still expects the placement itself, which
-        // describes the same buffers.
+        // `ShardingLoweringExtension::with_unconstrained_dimensions_replicated`). Execution still expects the placement
+        // itself, which describes the same buffers.
         let argument_annotations = logical_argument_shardings
             .iter()
-            .map(ShardingLoweringExtension::entry_boundary_sharding)
+            .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
             .collect::<Result<Vec<_>, _>>()?;
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
@@ -690,7 +678,7 @@ impl Session {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        // A public output that a `place` in the entry region or in the callee of a `jit_call` produces, directly or
+        // A public output that a `place` in the entry region or in the callee of a `call` produces, directly or
         // through operations that return its value and placement unchanged, has the placement of its target, which
         // states the placement along every mesh axis, and one that returns an argument in the same way is placed where
         // that argument enters the executable (refer to `ProgramLoweringExtension::output_sharding_sources`). Its
@@ -1007,33 +995,7 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
     if sharding.unreduced_axes().is_empty() {
         return Ok(sharding);
     }
-    entered_argument_sharding(&sharding).map(Cow::into_owned)
-}
-
-/// Returns `sharding`, the placement with which an argument arrives at a function (e.g., an input sharding override),
-/// as the body of the function holds that argument once it has entered: without its reduction state over auto mesh
-/// axes (i.e., its pending reductions and its completed-reduction markers over them), which no value of a program
-/// carries, because types never record reduction state over auto mesh axes. The lowering of the entry function
-/// completes such a pending reduction where the argument enters (refer to the lowering of entry arguments in
-/// `crate::lowering`), and a completed-reduction marker states nothing about the buffers, so the body of a function,
-/// and every result that returns the argument, holds the completed value without either. The lowering of a nested
-/// call receives an operand at this sharding for the same reason (refer to
-/// [`JitCallOperation::boundary_input_sharding`]). The dimensions, including their splits along auto mesh axes, and the
-/// reduction state that a type records (i.e., over explicit or manual mesh axes) are kept, unlike
-/// [`Sharding::without_auto_axes`], which also drops the splits along auto mesh axes. A sharding without reduction state
-/// over auto mesh axes, which is the common case, is returned without a copy.
-///
-/// # Errors
-///
-/// Returns the error of removing the axes from `sharding`, which never fails for a valid sharding.
-pub(crate) fn entered_argument_sharding(sharding: &Sharding) -> Result<Cow<'_, Sharding>, Error> {
-    let is_auto = |axis: &String| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto);
-    if !sharding.unreduced_axes().iter().chain(sharding.reduced_axes()).any(is_auto) {
-        return Ok(Cow::Borrowed(sharding));
-    }
-    let kept = |axes: &BTreeSet<String>| axes.iter().filter(|axis| !is_auto(axis)).cloned().collect::<Vec<_>>();
-    let unreduced = sharding.clone().with_unreduced_axes(kept(sharding.unreduced_axes()))?;
-    Ok(Cow::Owned(unreduced.with_reduced_axes(kept(sharding.reduced_axes()))?))
+    Ok(entered_argument_sharding(&sharding)?.into_owned())
 }
 
 /// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
@@ -1061,8 +1023,9 @@ pub(crate) fn admit_capture(sharding: &Sharding, index: usize, capture_count: us
 /// capture over a logical mesh of another topology is received replicated over `mesh` when its runtime array stores
 /// what its type records as replicated, which includes a capture that is split along auto mesh axes only, which types
 /// never record, and the dimensions that its type leaves unconstrained, which a runtime array stores replicated (refer
-/// to `entry_boundary_sharding`). This is how JAX runs a `jit` function on the devices of its arguments whatever the
-/// devices of the arrays that it closes over. `description` names the capture in the error (e.g., "capture #0").
+/// to `with_unconstrained_dimensions_replicated`). This is how JAX runs a `jit` function on the devices of its
+/// arguments whatever the devices of the arrays that it closes over. `description` names the capture in the error
+/// (e.g., "capture #0").
 ///
 /// Only the captures that survive the pruning of the staged program are resolved, so that a capture that the
 /// function does not use places nothing and fails nothing. A capture over a logical mesh of another topology that the
@@ -1083,7 +1046,10 @@ pub(crate) fn capture_sharding(
     if sharding.mesh().has_same_topology(mesh) {
         return Ok(sharding.clone());
     }
-    let stored = array_type.sharding().map(ShardingLoweringExtension::entry_boundary_sharding).transpose()?;
+    let stored = array_type
+        .sharding()
+        .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
+        .transpose()?;
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return Err(Error::from(ProgramError::InvalidArgument {
             message: format!(
@@ -1100,20 +1066,24 @@ pub(crate) fn capture_sharding(
 /// an array whose type is `array_type`, or [`None`] when the function must keep the placement that the type records. A
 /// capture follows the call of the function. A type without sharding, including that of a capture on the anonymous mesh
 /// of one device, stays unsharded. When its type records only replication (refer to
-/// `ShardingLoweringExtension::entry_boundary_sharding`), the function receives it without sharding, as it receives a
-/// public argument whose type declares none. The types of the values that it computes from the capture then name no
-/// mesh of the capture. A call of a function that names no devices therefore runs where its caller runs whatever the
-/// devices of its captures, as JAX computes `jit(lambda x: x + c)` on the devices of `x` whether `c` is uncommitted or
-/// committed elsewhere. A capture whose type records more (i.e., a split, a pending reduction, or manual variation), or
-/// whose stored placement cannot be computed, keeps its own type, and lowering checks that the function can receive it
-/// on the mesh of its options (refer to [`capture_sharding`]). This is the single rule for the type of a captured array
-/// inside a compiled function, which every route by which an array enters the trace of a compiled function shares
-/// (refer to `Session::capture_constant` and [`imported_constant`]). Lowering binds a session constant to its placed
-/// argument (refer to [`placed_constant`]). An uncommitted public argument follows the call as a capture does, so a
-/// `jit` dispatcher specializes for such an argument with the type that this function returns as well (refer to
-/// [`argument_type`]).
+/// `ShardingLoweringExtension::with_unconstrained_dimensions_replicated`), the function receives it without sharding,
+/// as it receives a public argument whose type declares none. The types of the values that it computes from the capture
+/// then name no mesh of the capture. A call of a function that names no devices therefore runs where its caller runs
+/// whatever the devices of its captures, as JAX computes `jit(lambda x: x + c)` on the devices of `x` whether `c` is
+/// uncommitted or committed elsewhere. A capture whose type records more (i.e., a split, a pending reduction, or manual
+/// variation), or whose stored placement cannot be computed, keeps its own type, and lowering checks that the function
+/// can receive it on the mesh of its options (refer to [`capture_sharding`]). This is the single rule for the type of a
+/// captured array inside a compiled function, which every route by which an array enters the trace of a compiled
+/// function shares (refer to `Session::capture_constant` and [`imported_constant`]). Lowering binds a session constant
+/// to its placed argument (refer to [`placed_constant`]). An uncommitted public argument follows the call as a capture
+/// does, so a `jit` dispatcher specializes for such an argument with the type that this function returns as well (refer
+/// to [`argument_type`]).
 pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
-    let stored = array_type.sharding().map(ShardingLoweringExtension::entry_boundary_sharding).transpose().ok()?;
+    let stored = array_type
+        .sharding()
+        .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
+        .transpose()
+        .ok()?;
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return None;
     }
@@ -1132,7 +1102,7 @@ pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
 /// one whose type records more keep their types, so the mesh of a function still rejects them when their logical
 /// meshes differ. The dispatch signature uses this rule for both executions and eager calls, so they trace the function
 /// alike. The rule also determines which arguments an eager call of a dispatcher
-/// leaves only an argument that is not relocatable where it is (refer to `JitCallOperation::eager_input_placement`).
+/// leaves only an argument that is not relocatable where it is (refer to `CallOperation::eager_input_placement`).
 /// A relocatable argument has no placement over auto mesh axes for the function to specialize on (e.g., an uncommitted
 /// split along an auto axis of one device), because an execution moves it.
 pub(crate) fn argument_type(array: &Array, array_type: &ArrayType) -> Option<ArrayType> {
@@ -1274,37 +1244,6 @@ pub(crate) fn placed_constant(
     Ok(Some(placed))
 }
 
-/// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
-/// public argument of declared type `input_type` that has no input sharding override and no runtime placement (e.g.,
-/// of a `jit` dispatcher), which is the sharding of that type, and otherwise replicated over `mesh`. A call of a
-/// function compiled for its input types places its inputs by this same rule (refer to
-/// [`JitCallOperation::boundary_input_sharding`]), so that a direct execution, an eager call, and a nested call place
-/// an input alike.
-pub(crate) fn declared_input_sharding(input_type: &ArrayType, mesh: &LogicalMesh) -> Sharding {
-    input_type
-        .sharding()
-        .cloned()
-        .unwrap_or_else(|| Sharding::replicated(mesh.clone(), input_type.shape().rank()))
-}
-
-/// Returns `input_type`, the declared type of an input of a compiled function, refined by `boundary`, the placement
-/// with which the executable of the function receives it (e.g., the input override or [`declared_input_sharding`]),
-/// when `input_type` records no sharding, and [`None`] when it records one or when `boundary` states more than such a
-/// type can (e.g., a pending reduction, which a type without a sharding never describes). The refined type records the
-/// placement of `boundary` without its auto mesh axes, which types never record. A transform that inserts a dimension
-/// into each item of an input (e.g., batching, which places the new dimension as its batch specification requests,
-/// refer to [`ArrayType::batched`]) starts from this type, so that the placement of the new dimension is kept for an
-/// item type that records none, as JAX places the batch of `jit(vmap(jit(f), spmd_axis_name='x'))` along `x`. Every
-/// entry point that batches a compiled function (i.e., `CompiledFunction::batch` and the batching rule of a call of
-/// one) refines its item types by this rule.
-pub(crate) fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Option<ArrayType> {
-    if input_type.sharding().is_some() {
-        return None;
-    }
-    let boundary_type = input_type.clone().with_sharding(boundary.without_auto_axes()).ok()?;
-    input_type.is_refined_by(&boundary_type).then_some(boundary_type)
-}
-
 /// Applies the input sharding overrides of `options` (i.e., [`Options::input_shardings`]) through the `input_type`
 /// projection of each input. The overrides must be applied before tracing, because tracers carry their input types
 /// and sharding-aware operations read them. Retained dispatch applies them through
@@ -1423,14 +1362,14 @@ pub(crate) fn jit_compilation_options(
 /// arguments of an eager application or of an eager operation. This is the case when the program requests a placement,
 /// as JAX commits every result of a `jit` function with any explicit sharding, when it runs on more than one device, as
 /// JAX commits every result of a computation on more than one device, and when it runs on the named mesh of its
-/// function (refer to [`LogicalMeshExtension::is_named`]), as JAX commits every result of a `jit` function under
+/// function (refer to [`LogicalMesh::is_named`]), as JAX commits every result of a `jit` function under
 /// `set_mesh`, on one device too. A result of a function on a named mesh of one device is therefore committed to that
 /// mesh, so combining it with a value committed to other devices is an error, as under `set_mesh`. On an anonymous
 /// mesh, results are committed only by the other rules or by a committed public argument.
 ///
 /// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
 /// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
-/// for the mesh on which the application runs (refer to `JitCallOperation::eager_decision`), so that `.call`, the
+/// for the mesh on which the application runs (refer to `CallOperation::eager_decision`), so that `.call`, the
 /// interpretation of a call, and the calls that eager JVP, eager VJP, and `vmap` derive from a call commit as an
 /// execution does. A call nested in a compiled caller does not read it, because the executable of its caller decides.
 pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, requests_placement: bool) -> bool {
@@ -1447,7 +1386,7 @@ pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, req
 /// the inputs of a call decide where the call runs, as JAX runs a `jit` function whose body only moves a value to
 /// another memory where its arguments are. The arrays that the function captures are not among them, whether they are
 /// committed or not, as JAX ignores where the arrays that a `jit` function closes over live (refer to
-/// `JitCallOperation`).
+/// `CallOperation`).
 fn requests_placement(
     program: &FlatProgram<Session>,
     options: &Options,
@@ -1460,16 +1399,6 @@ fn requests_placement(
         .flatten()
         .chain(options.output_shardings().into_iter().flatten());
     states_boundary_placement(overrides) || program.has_placement_requests(target_platform, includes_memory_requests)
-}
-
-/// Returns whether a function whose boundary has the sharding overrides `overrides` (i.e., those of its inputs and of
-/// its outputs) states a placement at its boundary, which is when it has at least one. A list of overrides that is
-/// present but states nothing (i.e., an empty list, or a list without an override at any position) states no
-/// placement, so it neither commits the results of the function nor makes it name devices. This is the one test of a
-/// placement stated at the boundary of a function, which a compiled function (refer to `requests_placement`) and a
-/// call of one (refer to [`JitCallOperation::states_boundary_placement`]) read.
-pub(crate) fn states_boundary_placement<'s>(overrides: impl IntoIterator<Item = &'s Sharding>) -> bool {
-    overrides.into_iter().next().is_some()
 }
 
 /// Validates that the staged `output_types` carry the output sharding overrides of `options` (i.e.,
@@ -1693,17 +1622,17 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
     })
 }
 
-/// Validates that every `place` and every `jit_call` that is lowered as part of `program`, including inside executed
+/// Validates that every `place` and every `call` that is lowered as part of `program`, including inside executed
 /// nested regions, can be compiled for `mesh`, which is the device mesh that `program` is compiled for, with or
 /// without the Shardy partitioner, depending on `use_shardy_partitioner`.
 ///
-/// A `jit_call` whose callee boundary has sharding overrides places values on the devices of the mesh that its callee
-/// was compiled for (refer to [`JitCallOperation`]), so it is accepted exactly when that mesh has the devices of `mesh`
+/// A `call` whose callee boundary has sharding overrides places values on the devices of the mesh that its callee
+/// was compiled for (refer to [`CallOperation`]), so it is accepted exactly when that mesh has the devices of `mesh`
 /// in the same order and its topology, as JAX rejects a nested `jit` whose shardings name devices other than those of
 /// the computation that calls it. Without the Shardy partitioner and on more than one device, every override must also
 /// be fully replicated once its unconstrained dimensions are (refer to
-/// [`ShardingLoweringExtension::entry_boundary_sharding`]), which is the constraint that lowering emits for it, because
-/// replicas cannot enforce a split.
+/// [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), which is the constraint that lowering
+/// emits for it, because replicas cannot enforce a split.
 ///
 /// A compiled program runs on the devices of one mesh, so a `place` inside it can only redistribute a value over those
 /// devices and change its storage. Lowering only knows the logical mesh of the module, so the devices are checked
@@ -1741,13 +1670,13 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
 /// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`] for
 /// the first `place` whose device target is not the only device of `mesh`, [`LoweringError::CallOutsideProgramMesh`]
-/// for the first `jit_call` whose callee mesh differs from `mesh` in the same ways, and
-/// [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `jit_call` whose effective
+/// for the first `call` whose callee mesh differs from `mesh` in the same ways, and
+/// [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `call` whose effective
 /// boundary sharding (i.e., an override or where the executable of the callee places an input, refer to
-/// [`JitCallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
+/// [`CallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
 /// its unconstrained dimensions are read as replicated (refer to
-/// [`ShardingLoweringExtension::entry_boundary_sharding`]), when `use_shardy_partitioner` is not set and `mesh` has
-/// more than one device.
+/// [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), when `use_shardy_partitioner` is not set
+/// and `mesh` has more than one device.
 fn validate_placements(
     program: &FlatProgram<Session>,
     mesh: &DeviceMesh,
@@ -1775,7 +1704,7 @@ fn validate_placements(
             // A call places values on the devices that its callee was compiled for, so it is valid exactly when those
             // are the devices of `mesh`, and the replicas of a bounded dynamic program cannot enforce an override that
             // splits a value, whose lowered constraint is the annotation of the corresponding callee boundary.
-            if let Some(call) = instruction.operation().projected_payload::<JitCallOperation<Type>>() {
+            if let Some(call) = instruction.operation().projected_payload::<CallOperation<Type>>() {
                 if let Some(call_mesh) = call.mesh()
                     && (call_mesh.devices() != mesh.devices()
                         || !call_mesh.logical_mesh().has_same_topology(mesh.logical_mesh()))
@@ -1787,7 +1716,7 @@ fn validate_placements(
                 }
                 if !use_shardy_partitioner && mesh.devices().len() > 1 {
                     // The effective boundary of an input is its override or otherwise where the executable of the
-                    // callee places it (refer to `JitCallOperation::boundary_input_sharding`), and the lowering of the
+                    // callee places it (refer to `CallOperation::boundary_input_sharding`), and the lowering of the
                     // call constrains the operand to it as the callee holds it once it has entered, without reduction
                     // state over auto mesh axes (refer to `entered_argument_sharding`), which is what the replicas
                     // must enforce.
@@ -1806,9 +1735,9 @@ fn validate_placements(
                         (0..instruction.outputs().len()).filter_map(|index| call.output_sharding(index).cloned()),
                     );
                     for sharding in &shardings {
-                        if !sharding.entry_boundary_sharding()?.is_replicated() {
+                        if !sharding.with_unconstrained_dimensions_replicated()?.is_replicated() {
                             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                                operation: JIT_CALL_OPERATION_NAME.to_string(),
+                                operation: CALL_OPERATION_NAME.to_string(),
                                 reason: "bounded-dynamic multi-device programs currently require fully replicated \
                                          boundary shardings of called functions because Shardy rejects dynamic \
                                          tensors"
@@ -1849,7 +1778,7 @@ fn validate_placements(
                     // An unconstrained dimension is stored replicated, as at the boundary of a call.
                     if !use_shardy_partitioner
                         && mesh.devices().len() > 1
-                        && !placement.sharding().entry_boundary_sharding()?.is_replicated()
+                        && !placement.sharding().with_unconstrained_dimensions_replicated()?.is_replicated()
                     {
                         return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                             operation: PLACE_OPERATION_NAME.to_string(),
@@ -1993,7 +1922,7 @@ mod tests {
         cpu_client, execution_client, other_cpu_client, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayError, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FromPjrt, JitCallOperation,
+        Array, ArrayError, CallOperation, CompileTracer, CompiledFunctionDispatcher, Constant, Error, FromPjrt,
         Operation, Options, PlacementOptions, RetainedArray, Session, StatefulCompiledFunction, Type, Value, compile,
         compile_statefully_with_captures, jit_with_options,
     };
@@ -2691,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_lower_program_places_outputs_of_jit_calls_as_their_callees() {
+    fn test_session_lower_program_places_outputs_of_calls_as_their_callees() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 2);
@@ -2722,7 +2651,7 @@ mod tests {
         let sharded_input = builder.add_input(input_type.clone().into());
         let call = |builder: &mut ProgramBuilder<Constant, Operation>, callee, input| {
             builder
-                .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+                .add_instruction(Operation::Call(CallOperation::new(0)), vec![callee], vec![input], None)
                 .unwrap()[0]
         };
         let placed = call(&mut builder, placing_callee, replicated_input);
@@ -2731,7 +2660,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![placed, forwarded], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        // A `jit_call` whose callee places its result or returns one of its inputs places its own result as the callee
+        // A `call` whose callee places its result or returns one of its inputs places its own result as the callee
         // does. A result of the zero data type has no buffer whose placement the compiler could report, so it takes
         // its placement from the `place` in the callee or from the argument that the call forwards.
         let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone(), sharded.clone()]);
@@ -2817,14 +2746,14 @@ mod tests {
         let callee = builder.import_region(callee.entry_region_ref());
         let returned = builder.add_constant(Constant::Session(retained));
         let called = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], Vec::new(), None)
+            .add_instruction(Operation::Call(CallOperation::new(0)), vec![callee], Vec::new(), None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![returned, called], Vec::new(), vec![Placeholder; 2])
             .unwrap();
 
         // A retained array of the zero data type has no buffer whose placement the compiler could report, so a result
-        // that returns it, directly or from the callee of a `jit_call`, takes the placement of the retained array.
+        // that returns it, directly or from the callee of a `call`, takes the placement of the retained array.
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         // The executable receives the retained array as its hidden session constant argument.
@@ -3152,10 +3081,9 @@ mod tests {
             let input = builder.add_input(vector_type.clone().into());
             let extra = builder.add_input(extra_type.clone().into());
             let callee_region = builder.intern_callee(&callee, None).unwrap();
-            let call =
-                JitCallOperation::new(0).with_boundary(Some(callee_mesh), Vec::new(), vec![Some(sharding.clone())]);
+            let call = CallOperation::new(0).with_boundary(Some(callee_mesh), Vec::new(), vec![Some(sharding.clone())]);
             let output =
-                builder.add_instruction(Operation::JitCall(call), vec![callee_region], vec![input], None).unwrap()[0];
+                builder.add_instruction(Operation::Call(call), vec![callee_region], vec![input], None).unwrap()[0];
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output, extra], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -3176,7 +3104,7 @@ mod tests {
                 mesh: first_mesh.clone()
             })
             .to_string(),
-            "`jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
+            "`call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
              compiled for the devices [0] of mesh `['x'=1:explicit]`",
         );
         assert!(
@@ -3194,7 +3122,7 @@ mod tests {
         assert!(matches!(
             session.lower_program(&program(&mesh, &sharded, &dynamic_type), 0, &Options::new(mesh.clone())),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == JIT_CALL_OPERATION_NAME
+                if operation == CALL_OPERATION_NAME
                     && reason == "bounded-dynamic multi-device programs currently require fully replicated boundary \
                                   shardings of called functions because Shardy rejects dynamic tensors",
         ));
@@ -5145,7 +5073,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_lower_program_discharges_local_reference_state_through_nested_jit_call() {
+    fn test_session_lower_program_discharges_local_reference_state_through_nested_call() {
         let client = cpu_client(1);
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
@@ -5171,7 +5099,7 @@ mod tests {
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
+            .add_instruction(Operation::Call(CallOperation::new(0)), vec![callee], vec![reference, update], None)
             .unwrap()[0];
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -5181,7 +5109,7 @@ mod tests {
 
         assert!(matches!(
             program.entry_region_ref().instructions()[1].operation(),
-            Operation::JitCall(operation) if operation.capture_count() == 0,
+            Operation::Call(operation) if operation.capture_count() == 0,
         ));
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
@@ -5952,9 +5880,9 @@ mod tests {
             let call = program
                 .instructions()
                 .iter()
-                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                 .unwrap();
-            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let Operation::Call(operation) = call.operation() else { unreachable!("selected a `call`") };
             let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
             let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
             operation
@@ -6118,9 +6046,9 @@ mod tests {
                 let call = program
                     .instructions()
                     .iter()
-                    .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                    .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                     .unwrap();
-                let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+                let Operation::Call(operation) = call.operation() else { unreachable!("selected a `call`") };
                 let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
                 let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
                 operation

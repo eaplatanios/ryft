@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use crate::axes::{MeshContext, NamedAxes};
 use crate::captures::{CapturePlacementContext, CapturingContext, ClosedProgram, ImportingContext};
 use crate::compilation::domains::{CompilationDomain, DispatchInputs, StatefulCompilationDomain};
-use crate::compilation::operations::StagedCallOperation;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
+use crate::operations::CallOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AttachedRegions, FlatProgram, ProgramError, ReferenceCompletion, Type, TypeError, TypeRefinements, Typed,
@@ -46,7 +46,7 @@ pub struct StagedProgram<C: CompilationDomain> {
 
     /// Memoized operation that calls this program, before the result identities of any one call are instantiated.
     /// Refer to [`CompilationDomain::call_operation`] for more information.
-    call_operation: OnceLock<C::Operation>,
+    call_operation: OnceLock<CallOperation<C::Type>>,
 
     /// Whether this program is a staged specialization of a [`CompiledFunctionDispatcher`].
     /// Refer to [`CompilationDomain::call_operation`] for more information.
@@ -427,7 +427,7 @@ where
     #[inline]
     pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         V::Domain:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
@@ -456,7 +456,7 @@ where
         inputs: Input::To<V>,
     ) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
@@ -481,7 +481,7 @@ where
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
@@ -506,7 +506,7 @@ where
             .program
             .call_operation
             .get_or_init(|| {
-                let operation = C::Operation::staged_call(capture_count);
+                let operation = CallOperation::new(capture_count);
                 C::call_operation(operation, &callee, self.options(), self.state.program.dispatched)
             })
             .clone();
@@ -514,10 +514,10 @@ where
         let operation = if callee.entry_region_ref().type_identity_signature().identities().is_empty() {
             operation
         } else {
-            operation.with_call_types(&callee.input_types(), &callee.output_types())?
+            operation.with_callee_type_signature(&callee.input_types(), &callee.output_types())?
         };
 
-        context.bind(operation, AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
+        context.bind(C::Operation::from(operation), AttachedRegions::Callees(&[callee]), flat_inputs.as_slice())
     }
 
     /// Returns the lifted program of this function (i.e., [`Self::lifted_program`]) for embedding as the callee of a
@@ -665,7 +665,7 @@ where
     #[inline]
     pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         V::Domain:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
@@ -691,7 +691,7 @@ where
         inputs: Input::To<V>,
     ) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
@@ -1013,7 +1013,7 @@ where
     #[inline]
     pub fn call<V, Path>(&self, inputs: Input::To<V>) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         V::Domain:
             Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
@@ -1039,7 +1039,7 @@ where
         inputs: Input::To<V>,
     ) -> Result<Output::To<V>, ProgramError>
     where
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>,
@@ -1497,7 +1497,7 @@ where
     pub fn call<V, Path>(&self, static_parameters: Static, inputs: Input::To<V>) -> Result<Output::To<V>, C::Error>
     where
         C::Options: Clone,
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         V::Domain: Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
@@ -1553,7 +1553,7 @@ where
     ) -> Result<Output::To<V>, C::Error>
     where
         C::Options: Clone,
-        C::Operation: StagedCallOperation<C::Constant>,
+        C::Operation: From<CallOperation<C::Type>>,
         V: Value<Type = C::Type>,
         CallerContext: Context<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>
             + ImportingContext<C, Path>
@@ -2147,11 +2147,12 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_macros::Operation;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionBounds, DimensionError,
-        DimensionType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, DimensionBounds,
+        DimensionError, DimensionType, DimensionValue, LogicalMesh, MeshAxis, MeshAxisType, Shape,
     };
     use crate::axes::NamedAxis;
     use crate::captures::{CapturePlacement, CaptureReference};
@@ -2162,7 +2163,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{NegOperation, ZeroOperation};
-    use crate::programs::{EmptyRegionDriver, Operation, OperationFormatter, RegionInterface, RegionSlot, TypeError};
+    use crate::programs::{EmptyRegionDriver, TypeError};
 
     use super::*;
 
@@ -2249,66 +2250,12 @@ mod tests {
         }
     }
 
-    /// Call to a staged function, whose results are the results of its callee.
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct TestCallOperation {
-        /// Number of leading inputs that hold the lifted captures of the callee.
-        capture_count: usize,
-
-        /// Marker of the options of the callee that [`TestMarkedCallDomain`] records, rendered as a `marker` field.
-        marker: Option<usize>,
-
-        /// Whether [`TestMarkedCallDomain`] recorded the callee as a staged specialization of a dispatcher, rendered as
-        /// a `dispatched` field when it did.
-        dispatched: bool,
-    }
-
-    impl Operation for TestCallOperation {
-        type Type = ArrayType;
-
-        fn name(&self) -> &'static str {
-            "call"
-        }
-
-        fn region_slots(&self) -> &'static [RegionSlot] {
-            const { &[RegionSlot::computation("callee")] }
-        }
-
-        fn infer_output_types(
-            &self,
-            _input_types: &[ArrayType],
-            region_interfaces: &[RegionInterface<ArrayType>],
-        ) -> Result<Vec<ArrayType>, TypeError> {
-            Ok(region_interfaces[0].output_types().to_vec())
-        }
-
-        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-            let operation_formatter = OperationFormatter::new(formatter, indentation, self.name())?;
-            match self.marker {
-                Some(marker) => operation_formatter.bracketed(|contents| {
-                    contents.field("marker", marker)?;
-                    if self.dispatched {
-                        contents.field("dispatched", true)?;
-                    }
-                    Ok(())
-                }),
-                None => Ok(()),
-            }
-        }
-    }
-
     /// Operation family of [`TestCallDomain`], which negates values and calls staged functions.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type(ArrayType), constant(CaptureReference<ArrayType>))]
     enum TestCallFamily {
         Neg(NegOperation<ArrayType>),
-        Call(TestCallOperation),
-    }
-
-    impl StagedCallOperation<CaptureReference<ArrayType>> for TestCallFamily {
-        fn staged_call(capture_count: usize) -> Self {
-            Self::Call(TestCallOperation { capture_count, marker: None, dispatched: false })
-        }
+        Call(CallOperation<ArrayType>),
     }
 
     /// Compilation domain over [`Array`] values whose operation family can stage calls to staged functions. The tests
@@ -2354,8 +2301,9 @@ mod tests {
     }
 
     /// Compilation domain like [`TestCallDomain`], whose calls record the marker of the [`CarriedOptions`] of their
-    /// callee through [`CompilationDomain::call_operation`]. The tests that use it only stage programs, so it rejects
-    /// lowering.
+    /// callee through [`CompilationDomain::call_operation`] as the identifier of the only device of the mesh of the
+    /// callee, and keep the placements of their inputs when the callee is a staged specialization of a dispatcher. The
+    /// tests that use it only stage programs, so it rejects lowering.
     #[derive(Clone)]
     struct TestMarkedCallDomain;
 
@@ -2382,18 +2330,16 @@ mod tests {
         }
 
         fn call_operation(
-            operation: TestCallFamily,
+            operation: CallOperation<ArrayType>,
             callee: &FlatProgram<Self>,
             options: &CarriedOptions,
             dispatched: bool,
-        ) -> TestCallFamily {
+        ) -> CallOperation<ArrayType> {
             let _ = callee;
-            match operation {
-                TestCallFamily::Call(call) => {
-                    TestCallFamily::Call(TestCallOperation { marker: Some(options.marker), dispatched, ..call })
-                }
-                operation => operation,
-            }
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+            let mesh = DeviceMesh::new(mesh, vec![Device::new(options.marker, 0)]).unwrap();
+            let operation = operation.with_boundary(Some(&mesh), Vec::new(), Vec::new());
+            if dispatched { operation.with_kept_input_placements() } else { operation }
         }
 
         fn lower(&self, _staged: &StagedProgram<Self>) -> Result<FlatProgram<Self>, ProgramError> {
@@ -2602,7 +2548,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[], %3:f64[] = call %1 %0 [
+                    %2:f64[], %3:f64[] = call [capture_count=1] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = neg %1
@@ -2654,7 +2600,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call %1 [
+                    %2:f64[] = call [capture_count=1] %1 [
                         callee={
                             lambda %0:f64[] .
                             in (%0)
@@ -2690,7 +2636,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call [marker=3] %1 %0 [
+                    %2:f64[] = call [capture_count=1, devices=[3]] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             in (%0)
@@ -2727,7 +2673,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call %1 %0 [
+                    %2:f64[] = call [capture_count=1] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             in (%0)
@@ -2764,7 +2710,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call [marker=3] %1 %0 [
+                    %2:f64[] = call [capture_count=1, devices=[3]] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             in (%0)
@@ -2846,7 +2792,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[], %3:f64[] = call %1 %0 [
+                    %2:f64[], %3:f64[] = call [capture_count=1] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = neg %1
@@ -2882,7 +2828,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call %1 [
+                    %2:f64[] = call [capture_count=1] %1 [
                         callee={
                             lambda %0:f64[] .
                             in (%0)
@@ -3018,7 +2964,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[], %3:f64[] = call %1 %0 [
+                    %2:f64[], %3:f64[] = call [capture_count=1] %1 %0 [
                         callee={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = neg %1
@@ -3054,7 +3000,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = const capture#0:f64[]
-                    %2:f64[] = call %1 [
+                    %2:f64[] = call [capture_count=1] %1 [
                         callee={
                             lambda %0:f64[] .
                             in (%0)
@@ -3884,7 +3830,7 @@ mod tests {
         };
         let expected = indoc! {"
             lambda %0:f64[] .
-            let %1:f64[] = call [marker=4, dispatched=true] %0 [
+            let %1:f64[] = call [devices=[4], keeps_input_placements=true] %0 [
                 callee={
                     lambda %0:f64[] .
                     let %1:f64[] = neg %0

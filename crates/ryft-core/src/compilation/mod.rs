@@ -103,10 +103,10 @@
 //! [`CapturingContext`](crate::CapturingContext) lets ordinary and transform contexts register captures
 //! through their parent. A nested call brings the captures of its callee into the calling context through
 //! [`ImportingContext`](crate::ImportingContext), so an eager context uses them as they are, a trace captures them,
-//! and a transform context imports them through its parent and wraps them like constants. To embed a staged function
-//! in a larger trace, an operation family implements [`StagedCallOperation`], and that operation then owns how the
-//! nested call behaves under lowering, batching, differentiation, partial evaluation, and interpretation.
-//! Core constructs that operation from the signature of the callee alone and passes it through
+//! and a transform context imports them through its parent and wraps them like constants. A staged function embeds in
+//! a larger trace as a [`CallOperation`](crate::CallOperation), which the operation family converts from, and that
+//! operation owns how the nested call behaves under lowering, batching, differentiation, partial evaluation, and
+//! interpretation. Core constructs that operation from the signature of the callee alone and passes it through
 //! [`CompilationDomain::call_operation`] with the options of the staged function, which lets a backend
 //! record facts about the boundary of the callee that its options hold but that its program does not show.
 //!
@@ -165,8 +165,8 @@
 //! [`CompilationCache::compile`], so that every compilation resolves through the cache and every reused program
 //! is validated against the requesting lowered program. Optional hooks add that validation, persistent keying,
 //! and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or memory
-//! analysis without recompilation, and implement [`StagedCallOperation`] on the operation
-//! family when staged functions must compose inside other traces.
+//! analysis without recompilation, and convert [`CallOperation`](crate::CallOperation) into
+//! the operation family when staged functions must compose inside other traces.
 //!
 //! Core owns flat staging through the inherent [`StagedProgram::stage`] constructor. It traces exactly the input types
 //! that it receives and invokes the closure exactly once on success. Backends apply options that change input types
@@ -181,7 +181,6 @@ pub mod caching;
 pub mod domains;
 pub mod exchange;
 pub mod functions;
-pub mod operations;
 
 pub use caching::{
     CompilationCache, CompilationCacheStatistics, CompilationCacheTier, CompilationEvent, CompilationLookupOutcome,
@@ -197,7 +196,6 @@ pub use functions::{
     CompilationTracer, CompiledFunction, CompiledFunctionDispatcher, DispatcherStatistics, ExecutableFunction,
     LoweredFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
-pub use operations::StagedCallOperation;
 
 #[cfg(test)]
 mod tests {

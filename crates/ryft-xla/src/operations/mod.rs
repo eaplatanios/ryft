@@ -1,9 +1,9 @@
 //! XLA backend operation family and the StableHLO lowering of its operations.
 //!
 //! [`Operation`] is the universe of staged operations that the XLA backend owns. It flattens the core array operation
-//! payloads of [`ArrayIrOperation`] into one family, together with backend operations such as
-//! [`jit_call`](JitCallOperation) and portable kernel instructions, so that the regions of higher-order instructions
-//! can contain backend operations. Each submodule implements [`LowerableOperation`] for one group of operations, and
+//! payloads of [`ArrayIrOperation`], including the call of a staged program (i.e., [`call`](CallOperation)),
+//! into one family, together with backend operations such as portable kernel instructions, so that the regions of
+//! higher-order instructions can contain backend operations. Each submodule implements [`LowerableOperation`] for one group of operations, and
 //! this module also provides the elementwise operand normalization and the result accuracy conversion that those
 //! lowerings share.
 
@@ -68,6 +68,9 @@ pub(crate) mod arithmetic;
 pub(crate) mod assertions;
 /// StableHLO lowering of dot product attention operations.
 pub(crate) mod attention;
+/// Lowering and eager application of the `call` operation of `ryft-core`, which calls staged programs, including
+/// the deduplication of call sites.
+pub mod call;
 /// StableHLO lowering of collective operations.
 pub(crate) mod collectives;
 /// StableHLO lowering of comparison operations.
@@ -104,9 +107,6 @@ pub mod dot;
 pub(crate) mod exponential;
 /// StableHLO lowering of extrema operations (i.e., `min`, `max`, and `clamp`).
 pub(crate) mod extrema;
-/// The `jit_call` operation that the backend owns, which calls staged XLA programs, and its lowering, including the
-/// deduplication of call sites.
-pub mod jit_call;
 /// StableHLO lowering of logical operations.
 pub(crate) mod logical;
 /// StableHLO lowering of array manipulation operations.
@@ -135,13 +135,13 @@ pub(crate) mod trigonometric;
 pub use debugging::{
     PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
-pub use jit_call::{JIT_CALL_OPERATION_NAME, JitCallOperation, transpose_primal_jit_call};
+pub use ryft_core::{CALL_OPERATION_NAME, CallOperation, transpose_primal_call};
 
 /// Ordinary universe of staged operations that the XLA backend owns.
 ///
 /// This enum flattens the core array operation payloads directly into the operation family that the backend owns.
 /// Higher-order instructions attach their nested computations as regions of the containing XLA program, so those
-/// regions can contain operations specific to the backend such as [`jit_call`](JitCallOperation) and
+/// regions can contain operations specific to the backend such as [`call`](CallOperation) and
 /// [`shard_map`](ShardMapOperation).
 ///
 /// The [`CoreOperation`](ryft_core::Operation) contract, the interpretation and partial evaluation dispatchers, the
@@ -340,8 +340,8 @@ where
         >,
     ),
 
-    /// Call to a flat staged XLA program.
-    JitCall(JitCallOperation<Type>),
+    /// Call to a flat staged program, which this crate lowers and applies eagerly (refer to [`call`]).
+    Call(CallOperation<Type>),
 
     /// Core `shard_map` operation, i.e., a [`ShardMapOperation`], which lowering emits as a Shardy
     /// `sdy.manual_computation` through its dedicated path rather than through the core array IR lowering.
@@ -481,6 +481,7 @@ where
             ArrayIrOperation::While(operation) => Self::While(operation),
             ArrayIrOperation::Scan(operation) => Self::Scan(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
+            ArrayIrOperation::Call(operation) => Self::Call(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
             ArrayIrOperation::ShardMap(operation) => Self::from(operation),
             // Composite calls and carriers with attached rules follow their regions into the native variants. Converted
@@ -822,7 +823,7 @@ impl LowerableOperation for Operation {
             | Self::CompositeTranspose(_)
             | Self::LiftedComposite(_)
             | Self::LiftedCompositeTranspose(_)
-            | Self::JitCall(_) => Propagated,
+            | Self::Call(_) => Propagated,
         }
     }
 
@@ -890,7 +891,7 @@ impl LowerableOperation for Operation {
             Rematerialize,
             LiftedComposite,
             LiftedCompositeTranspose,
-            JitCall,
+            Call,
             ShardMap => boxed,
         )
     }
@@ -1104,7 +1105,7 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 /// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
 /// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
 /// `lower_mlir_module_for_program_with_effect_boundary`), or [`None`] when the callee has no such capture. An eager
-/// application of the call (refer to `JitCallOperation::eager_decision`) requires nothing of such a capture, as an
+/// application of the call (refer to `CallOperation::eager_decision`) requires nothing of such a capture, as an
 /// execution of the callee requires nothing of it. The flags depend on the callee, the number of its captures, and the
 /// platform alone, so they are derived once for each of them and retained with the callee, and repeated applications
 /// only look them up.
@@ -1296,10 +1297,11 @@ mod tests {
         PlainProgram, ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput,
         lower_unreduced_application, lowered_unary_module, to_mlir_module_for_plain_program,
     };
-    use crate::operations::jit_call::JitCallOperation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, Type, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, ArrayTracer, CallOperation, Constant, Session, Tracer, Type, to_mlir_module_for_program,
+    };
 
     use super::*;
 
@@ -1790,8 +1792,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_recomputes_known_jit_calls_in_its_body() {
-        // A rematerialized body squares its input inside a `jit_call` operation and squares the result of the call
+    fn test_rematerialize_recomputes_known_calls_in_its_body() {
+        // A rematerialized body squares its input inside a `call` operation and squares the result of the call
         // outside of it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure
         // primal call, whose inputs are all known, keeps its boundary, and the residual body replays that call to
         // recompute the multiplication.
@@ -1807,7 +1809,7 @@ mod tests {
         };
         let function = rematerialize(move |x: Tracer| -> Result<Tracer, ProgramError> {
             let context = x.context().clone();
-            let called = context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
+            let called = context.bind(Operation::Call(CallOperation::new(0)), vec![callee.clone()], &[x])?;
             let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
             Ok(outputs.remove(0))
         })
@@ -1818,7 +1820,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = jit_call [derived_input_shardings=[_]] %0 [
+                let %1:f64[] = call [derived_input_shardings=[_]] %0 [
                     callee={
                         lambda %0:f64[] .
                         let %1:f64[] = mul %0 %0
@@ -1831,14 +1833,14 @@ mod tests {
                 let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
                     body={
                         lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = jit_call [derived_input_shardings=[_]] %1 [
+                        let %2:f64[] = call [derived_input_shardings=[_]] %1 [
                             callee={
                                 lambda %0:f64[] .
                                 let %1:f64[] = mul %0 %0
                                 in (%1)
                             },
                         ]
-                            %3:f64[] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                            %3:f64[] = call [derived_input_shardings=[_, _]] %0 %1 [
                                 callee={
                                     lambda %0:f64[], %1:f64[] .
                                     let %2:f64[] = mul %1 %0

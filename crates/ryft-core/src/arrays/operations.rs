@@ -10,34 +10,34 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::Context;
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
-    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, Capability,
-    CastOperation, CeilOperation, ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation,
-    ComplexOperations, CompositeConversion, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation,
-    ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation,
-    ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall, CustomCallOperation,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, Dropout,
-    DropoutOperation, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
-    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Einsum, Erf, ErfOperation,
-    ExpM1Operation, ExpOperation, ExponentialOperations, ExtremaOperations, FillLikeOperation, FloorOperation,
-    GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation,
-    ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation,
-    ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation,
-    ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation, Place, PlaceOperation, Placed,
-    PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation, ReduceOperation, ReducePrecisionOperation,
-    ReductionOperations, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceOperations, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
-    ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation, RoundingOperations, RsqrtOperation,
-    SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterOperation, Select,
-    SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation, Softmax, Sort,
-    SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation,
-    TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CallOperation,
+    Capability, CastOperation, CeilOperation, ClampOperation, CollectiveOperations, Compare, CompareOperation,
+    ComplexOperation, ComplexOperations, CompositeConversion, CompositeOperation, CompositeTransposeOperation,
+    ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations,
+    ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall,
+    CustomCallOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
+    DotOperation, DotOperations, Dropout, DropoutOperation, DynamicBroadcastOperation, DynamicManipulationOperations,
+    DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Einsum, Erf,
+    ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations, ExtremaOperations, FillLikeOperation,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation,
+    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
+    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
+    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
+    ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
+    ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
+    Place, PlaceOperation, Placed, PowOperation, Print, PrintOperation, RaggedDotOperation, RealOperation,
+    ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
+    RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub,
+    SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
+    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::{PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue};
 use crate::programs::{OperationProjection, ProgramError, Value, ValueProjection};
@@ -486,6 +486,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
     #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayIrType>),
+
+    /// Staged call of a flat array IR program whose callee is attached as a region, which keeps the boundary of the
+    /// compiled function whose program the callee is. Refer to [`CallOperation`] for its boundary and type rule.
+    #[ryft(lockstep)]
+    Call(CallOperation<ArrayIrType>),
 
     /// Bit generator with trailing dimension inputs for its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
@@ -1228,7 +1233,7 @@ mod tests {
                 let signatures = operations.iter().map(member_kind_signature).collect::<Vec<_>>();
 
                 // Exhaustive dispatch forbids omissions, and the denied unreachable-pattern lint forbids duplicates.
-                assert_eq!(operations.len(), 40);
+                assert_eq!(operations.len(), 41);
                 assert_eq!(
                     signatures
                         .iter()
@@ -1466,6 +1471,10 @@ mod tests {
             ),
             LinearCall => (
                 ArrayIrOperation::LinearCall(LinearCallOperation::new(0)),
+                RegionForwarding,
+            ),
+            Call => (
+                ArrayIrOperation::Call(CallOperation::new(0)),
                 RegionForwarding,
             ),
             RngBitGenerator => (

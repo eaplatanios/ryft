@@ -57,7 +57,7 @@
 //!
 //! # Calling Compiled Functions
 //!
-//! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `jit_call`
+//! [`StagedFunction::call`], [`CompiledFunction::call`], and [`CompiledFunctionDispatcher::call`] bind a `call`
 //! operation, which carries the retained source program of the called function, in the context that their inputs belong
 //! to. These inputs and outputs are the `ArrayType` leaves of a [`ProjectedContext`] over an array IR context, which
 //! the call recovers from the first input. They are [`Array`]s under a [`Session`] and [`ProjectedValue`]s of
@@ -71,11 +71,11 @@
 //!     [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
 //!     on the devices it was compiled for. Both fixed execution and a device-pinned call require committed public
 //!     arguments on the same ordered physical devices. Captures and uncommitted arguments can move to those devices.
-//!     See [`JitCallOperation`](crate::JitCallOperation).
+//!     See [`CallOperation`](crate::CallOperation).
 //!   - A staging parent (e.g., the trace of an enclosing [`compile`] or [`stage`]) records the call, and the enclosing
 //!     program lowers it as part of its own computation.
 //!   - Batching, differentiation, and partial evaluation parents rewrite the call through the ordinary rules of the
-//!     `jit_call` operation, so a compilation boundary does not change the meaning of these transforms. Transforms
+//!     `call` operation, so a compilation boundary does not change the meaning of these transforms. Transforms
 //!     nest in any order, and a transformed call can itself be staged and compiled again.
 //!
 //! A call validates public arguments before applying the callee's sharding overrides. Inputs can therefore arrive
@@ -133,7 +133,7 @@
 //! # Transforming Compiled Functions
 //!
 //! [`CompiledFunction::batch`], [`CompiledFunction::gradient`], and [`CompiledFunction::jvp`] are thin conveniences.
-//! Each stages the corresponding [`ryft_core`] transform around a `jit_call` of the function and compiles the result
+//! Each stages the corresponding [`ryft_core`] transform around a `call` of the function and compiles the result
 //! through the ordinary lifecycle, so the derived function is itself transformable and the captures of the original
 //! function become its captures. [`CompiledFunction::batch`] requires an explicit static batch extent. Runtime extents
 //! are available by calling [`batch`](ryft_core::batch) inside a function that is staged with the extent as an
@@ -252,12 +252,12 @@ use ryft_core::{
     MeshContext, NamedAxes, Parameter, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
     ProjectedValue, Reshard, ReverseModeDifferentiate, Sharding, ShardingDimension,
     StagedFunction as CoreStagedFunction, StatefulExecution, Tracer, TypeError, Typed, Value as CoreValue,
-    ValueProjection,
+    ValueProjection, boundary_input_type, declared_input_sharding,
 };
 use ryft_pjrt::Execution;
 
 use crate::compilation::CompilationError;
-use crate::compilation::domains::{boundary_input_type, declared_input_sharding, with_input_shardings};
+use crate::compilation::domains::with_input_shardings;
 use crate::compilation::options::Options;
 use crate::compilation::profile_guided::{AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions};
 use crate::compilation::programs::CompiledProgram;
@@ -288,7 +288,7 @@ pub type StatefulValue = Value;
 /// executions dispatch directly to the retained executable. Static values should be configuration with a low
 /// cardinality, such as axes, shapes, or Boolean branch choices, while arrays remain dynamic.
 ///
-/// [`Self::call`] instead calls the closure as a `jit_call` operation in any context, including eager, staging, and
+/// [`Self::call`] instead calls the closure as a `call` operation in any context, including eager, staging, and
 /// transform contexts. Executables retain no source program, so a call traces the closure again on demand into a source
 /// specialization, which is additionally keyed by the named axes and default mesh of the calling context and retained
 /// in a cache separate from the executables. Transformed calls therefore never evict executables, and warm executions
@@ -365,7 +365,7 @@ where
     }
 
     /// Calls the staged specialization of this dispatcher for `static_parameters` and the abstract types of `inputs` as
-    /// a `jit_call` operation in the array IR context recovered from `inputs`. Unlike [`Self::execute`], it works under
+    /// a `call` operation in the array IR context recovered from `inputs`. Unlike [`Self::execute`], it works under
     /// any context, including eager, staging, and transform contexts, so this dispatcher's closure composes with
     /// enclosing transforms and compilations. Inputs and outputs are `ArrayType` values of a [`ProjectedContext`] over
     /// that context (e.g., [`Array`]s under a [`Session`] and [`ProjectedValue`]s under traces and transforms),
@@ -852,7 +852,7 @@ where
 /// Holds the traced source [`Program`](ryft_core::programs::Program) of one closure together with its captured
 /// runtime [`Array`]s and input and output type metadata, without compiling a PJRT executable. This is the right
 /// handle for functions that are only composed into larger programs. [`Self::call`] calls it in any context as a
-/// `jit_call` boundary that carries its source program (refer to the
+/// `call` boundary that carries its source program (refer to the
 /// [module documentation](crate::compilation::functions)), and [`Session::compile_staged_function`] produces a
 /// [`CompiledFunction`] when an executable is needed. Executable cache identity is derived from the complete lowered
 /// computation and the backend state that affects compilation, so equivalent lowerings can share an executable even
@@ -890,10 +890,10 @@ where
         self.function.source_program()
     }
 
-    /// Calls this function as a `jit_call` operation in the array IR context `C` recovered from `inputs`.
+    /// Calls this function as a `call` operation in the array IR context `C` recovered from `inputs`.
     ///
     /// The call binds a boundary that carries this function's retained source program, so enclosing transforms
-    /// rewrite it through the ordinary rules of the `jit_call` operation. Inputs and outputs are `ArrayType` values of
+    /// rewrite it through the ordinary rules of the `call` operation. Inputs and outputs are `ArrayType` values of
     /// a [`ProjectedContext`] over `C`, which the call recovers from the first input. Under a [`Session`], they
     /// are [`Array`]s and the call executes immediately through eager dispatch. Under a trace or a transform (e.g.,
     /// forward mode differentiation), they are [`ProjectedValue`]s of its tracers and the call is recorded or
@@ -1175,7 +1175,7 @@ impl Session {
 /// [`ExecutableFunction`] that retains only runtime state and executes this signature directly.
 ///
 /// The retained staged function also keeps the source [`Program`](ryft_core::Program) that was compiled, which makes
-/// this handle transformable. [`Self::call`] calls the function in any context as a `jit_call` boundary that carries
+/// this handle transformable. [`Self::call`] calls the function in any context as a `call` boundary that carries
 /// this source (refer to the [module documentation](crate::compilation::functions)), so it composes with enclosing
 /// transforms and compilations. [`Self::batch`], [`Self::gradient`], and [`Self::jvp`] compile transformed functions
 /// around such a call, and [`Self::source_program`] exposes the source for program transforms and diagnostics (e.g.,
@@ -1243,7 +1243,7 @@ where
         self.function.compiled_program().mesh()
     }
 
-    /// Calls this compiled function as a `jit_call` operation in the array IR context recovered from `inputs`, exactly
+    /// Calls this compiled function as a `call` operation in the array IR context recovered from `inputs`, exactly
     /// as [`StagedFunction::call`] calls its retained staged function. Under a [`Session`], the call executes
     /// through eager dispatch rather than through the retained executable, so use [`ExecutableFunction::execute`] to
     /// run that executable directly on concrete arrays.
@@ -1350,7 +1350,7 @@ where
 
 // Reverse mode differentiation packaged as a function. Mirrors `jax.grad(jax.jit(f))`. The original closure is never
 // traced again. The derived trace calls the retained staged function through `call_flat_in_context`, which binds a
-// `jit_call` boundary that carries the sharding overrides of the function (refer to `Session::call_operation`) and that
+// `call` boundary that carries the sharding overrides of the function (refer to `Session::call_operation`) and that
 // reverse mode differentiation rewrites through its ordinary JVP and transpose rules.
 impl<In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledFunction<In, ArrayType>
 where
@@ -1371,7 +1371,7 @@ where
     /// This function is a thin adapter over the [`ryft_core`] differentiation builder. It stages a compilation that
     /// applies [`vjp`](ryft_core::ReverseModeDifferentiate::vjp) to a call of this function, seeds and applies the
     /// resulting pullback, and compiles the result through the ordinary lifecycle. The original closure is therefore
-    /// never traced again, the `jit_call` boundary is differentiated by its ordinary rules, and the captures of `self`
+    /// never traced again, the `call` boundary is differentiated by its ordinary rules, and the captures of `self`
     /// enter the new trace through [`ImportingContext`] and become captures of the derived function.
     ///
     /// The derived function is retained on this wrapper and shared across its clones. Repeated calls with an
@@ -1459,7 +1459,7 @@ where
 }
 
 // Forward mode differentiation packaged as a function. Mirrors `jax.jvp(jax.jit(f))`. The derived trace calls the
-// retained staged function through `call_flat_in_context`, which binds a `jit_call` boundary that carries the sharding
+// retained staged function through `call_flat_in_context`, which binds a `call` boundary that carries the sharding
 // overrides of the function (refer to `Session::call_operation`) and that forward mode differentiation rewrites through
 // its ordinary JVP rule.
 impl<In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
@@ -1480,7 +1480,7 @@ where
     ///
     /// This function is a thin adapter over the [`ryft_core`] differentiation builder. It stages a compilation that
     /// applies [`jvp`](ryft_core::ForwardModeDifferentiate::jvp) to a call of this function and compiles the result
-    /// through the ordinary lifecycle. The ordinary JVP rule of the `jit_call` operation therefore builds the tangent
+    /// through the ordinary lifecycle. The ordinary JVP rule of the `call` operation therefore builds the tangent
     /// call boundary over the array IR program, and array tracers are projected only at the boundary of the returned
     /// function. The captures of `self` enter the new trace through [`ImportingContext`] and become captures of the
     /// derived function.
@@ -1579,7 +1579,7 @@ where
 }
 
 // Batching packaged as a function. Mirrors `jax.jit(jax.vmap(f))` for a static batch extent. The derived trace calls
-// the retained staged function through `call_in_context` under `batch`, which rewrites the resulting `jit_call`
+// the retained staged function through `call_in_context` under `batch`, which rewrites the resulting `call`
 // boundary, which carries the sharding overrides of the function (refer to `Session::call_operation`), through its
 // ordinary batching rule.
 impl<In: Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>> CompiledFunction<In, Out>
@@ -1912,7 +1912,7 @@ where
 ///
 /// The closure receives capture tracers first and ordinary input tracers second, mirroring
 /// [`compile_with_captures`]. Captures are retained on the staged handle, and every [`StagedFunction::call`] imports
-/// them into the calling context as leading inputs of its `jit_call` boundary.
+/// them into the calling context as leading inputs of its `call` boundary.
 #[track_caller]
 pub fn stage_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
@@ -2347,7 +2347,7 @@ mod tests {
         assert_send_sync, cpu_client, execution_client, other_cpu_client, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayShard, Constant, Error, ExecutionError, FromPjrt, JitCallOperation, Operation,
+        Array, ArrayShard, CallOperation, Constant, Error, ExecutionError, FromPjrt, Operation,
         RaggedDotLoweringStrategy, Reference, Session, ThroughSession, Type, Value,
     };
 
@@ -3545,7 +3545,7 @@ mod tests {
 
     #[test]
     fn test_staged_function_call_repeated() {
-        // A function that calls the same staged block twice, whose two `jit_call`s deduplicate into one shared
+        // A function that calls the same staged block twice, whose two `call`s deduplicate into one shared
         // `func.func` at lowering, still compiles and computes the correct result through PJRT. Here
         // `g(x) = sin(x) + sin(x) = 2 sin(x)`.
         let client = execution_client();
@@ -4016,7 +4016,7 @@ mod tests {
         // A compiled function can be staged into another `compile` closure as a subroutine, which produces the same
         // result as if the whole computation were a single closure. This mirrors the JAX pattern
         // `jit(lambda x: jit(f)(x).cos())`. `CompiledFunction::call` stages the retained source program behind a
-        // `jit_call` boundary in the active outer trace.
+        // `call` boundary in the active outer trace.
 
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -4028,7 +4028,7 @@ mod tests {
         let inner: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        // Compile the outer function `g = |x| cos(inner(x))` by staging `inner` as one `jit_call` and applying `cos` to
+        // Compile the outer function `g = |x| cos(inner(x))` by staging `inner` as one `call` and applying `cos` to
         // its output.
         let outer: CompiledFunction<ArrayType, ArrayType> =
             compile(move |x| inner.call(x).unwrap().cos().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -4036,7 +4036,7 @@ mod tests {
             outer.source_program().program().to_string(),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] .
-                let %1:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] = jit_call %0 [
+                let %1:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] = call %0 [
                     callee={
                         lambda %0:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] .
                         let %1:f32[4][sharding={mesh<['x'=1:auto]>, [{}]}] = sin %0
@@ -4461,6 +4461,57 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_function_call_agrees_with_execution_on_device_assignment_origin() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let target = devices[1];
+        let default = session.with_default_device(target).unwrap();
+        let rebound = session.with_default_device(devices[0]).unwrap();
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![target]).unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let identity = |input: CompileTracer| input;
+        // The caller and committed inputs provide the assignment of an anonymous function mesh.
+        // The handles that originally compiled the functions do not affect that decision.
+        let shared = compile::<_, ArrayType, ArrayType>(identity, scalar_type.clone(), &session, mesh.clone()).unwrap();
+        let implicit =
+            compile::<_, ArrayType, ArrayType>(identity, scalar_type.clone(), &default, mesh.clone()).unwrap();
+        let explicit = compile::<_, ArrayType, ArrayType>(
+            move |input: CompileTracer| input.place(&target, None).unwrap(),
+            scalar_type.clone(),
+            &default,
+            mesh,
+        )
+        .unwrap();
+
+        for (caller, is_local_default) in [(&default, true), (&rebound, false)] {
+            let upload =
+                |handle| Array::from_host_buffer(handle, scalar_type.clone(), None, None, 5f32.to_ne_bytes()).unwrap();
+            let uncommitted = upload(caller);
+            let committed_shared = uncommitted.to_placement(caller, target).unwrap();
+            let committed_local = upload(&default).with_session(caller).unwrap().with_committed(true);
+            for (input, follows_caller) in
+                [(uncommitted, is_local_default), (committed_shared, false), (committed_local, true)]
+            {
+                for (function, commits_output, locally_assigned) in
+                    [(&shared, false, follows_caller), (&implicit, false, follows_caller), (&explicit, true, false)]
+                {
+                    let executable = function.executable();
+                    let called = function.call(input.clone()).unwrap();
+                    let executed = executable.execute(caller, input.clone()).unwrap();
+                    let executed_async = executable.execute_async(caller, input.clone()).unwrap().into_output();
+                    for output in [called, executed, executed_async] {
+                        assert_eq!(output.mesh().devices(), [target]);
+                        assert_eq!(output.is_committed(), commits_output || input.is_committed());
+                        assert_eq!(output.is_locally_assigned(), locally_assigned);
+                        assert_eq!(read_sharded_f32_array(&output), vec![5.0]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_compiled_function_call_places_captures_on_argument_devices() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4495,7 +4546,7 @@ mod tests {
             // which an eager call places on the devices of the call. A call that does not record the mesh of its
             // function (e.g., one built without `call_operation`) runs where its argument runs.
             let mut interpreted =
-                JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
+                CallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
             let interpreted = ValueProjection::<ArrayType>::into_projected(interpreted.remove(0)).unwrap();
             assert_eq!(captured_arrays(&function), (0, 1));
             assert_eq!(interpreted.mesh().devices(), input.mesh().devices());
@@ -4613,7 +4664,7 @@ mod tests {
         let callee = Arc::new(function.source_program().to_program_with_lifted_captures().unwrap());
         let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
         let driver = EagerInterpretationDriver::new(&regions);
-        let interpreted = JitCallOperation::new(0)
+        let interpreted = CallOperation::new(0)
             .interpret(&session, &driver, &[Value::Array(input.clone())])
             .unwrap()
             .remove(0);
@@ -4820,7 +4871,7 @@ mod tests {
             let regions = AttachedRegions::Callees(std::slice::from_ref(&callee));
             let driver = EagerInterpretationDriver::new(&regions);
             let interpret = || {
-                JitCallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
+                CallOperation::new(0).interpret(&session, &driver, &[Value::Array(input.clone())]).unwrap();
             };
             let paths: [&dyn Fn(); 3] = [
                 &|| drop(function.executable().execute(&session, input.clone()).unwrap()),
@@ -6409,9 +6460,9 @@ mod tests {
             let call = program
                 .instructions()
                 .iter()
-                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                 .unwrap();
-            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let Operation::Call(operation) = call.operation() else { unreachable!("selected a `call`") };
             let call_callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
             let call_regions = AttachedRegions::Callees(std::slice::from_ref(&call_callee));
             let policy = ResidualPolicyReference::new(NothingSavable);
@@ -6561,7 +6612,7 @@ mod tests {
             for (column, observation) in columns.iter().zip(observations) {
                 // The calls that eager JVP and eager VJP derive from the call carry the mesh of its function, so they
                 // run and commit as an execution does. The calls that partial evaluation places into a known or a
-                // residual program do not (refer to `JitCallOperation::function_mesh`), so they run where the
+                // residual program do not (refer to `CallOperation::function_mesh`), so they run where the
                 // uncommitted argument is, whose devices this process alone chose, for a callee that names no devices.
                 let expected = Observation {
                     locally_assigned: expected.locally_assigned
@@ -6686,9 +6737,9 @@ mod tests {
         let pending = "input override that states the pending reduction of an argument";
         let maximum = "input override that states the pending maximum of an argument";
         let other_devices = "fails with `\
-            `jit_call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
+            `call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
-        let split_replicas = "fails with `cannot lower `jit_call`: bounded-dynamic multi-device programs currently \
+        let split_replicas = "fails with `cannot lower `call`: bounded-dynamic multi-device programs currently \
                               require fully replicated boundary shardings of called functions because Shardy rejects \
                               dynamic tensors`";
         let replicated = "is placed as `{mesh<['x'=2:auto]>, [{}]}` instead of `{mesh<['x'=2:auto]>, [{'x'}]}`";
@@ -6973,7 +7024,7 @@ mod tests {
         // record. Every entry point that runs the call on the arguments themselves agrees with an execution of the
         // callee, which rejects arguments committed to different devices and arguments of another client, including
         // partial evaluation, which may forward an argument through the call only where the call provably returns it
-        // unchanged (refer to `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
+        // unchanged (refer to `CallOperation::eager_decision` and `CallOperation::returns_input_unchanged`).
         let pair_type = vector_type.clone();
         let pair_callee: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compile(|pair| pair, (pair_type.clone(), pair_type.clone()), &session, second_canonical_mesh.clone())
@@ -7022,9 +7073,9 @@ mod tests {
             let call = program
                 .instructions()
                 .iter()
-                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                 .unwrap();
-            let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+            let Operation::Call(operation) = call.operation() else { unreachable!("selected a `call`") };
             let call_callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
             let call_regions = AttachedRegions::Callees(std::slice::from_ref(&call_callee));
             let observations = [
@@ -7064,7 +7115,7 @@ mod tests {
         // the interpretation rule of the call, partial evaluation, which may forward the argument through the call, a
         // `jit` caller, which is specialized for the argument, and the interpretation of a caller that drops the result
         // of the call), because a call admits its arguments before, and independently of, any decision to move one of
-        // them (refer to `JitCallOperation::eager_decision` and `JitCallOperation::returns_input_unchanged`).
+        // them (refer to `CallOperation::eager_decision` and `CallOperation::returns_input_unchanged`).
         let pending_sum = |mesh: &DeviceMesh| {
             let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
             let r#type = vector_type.clone().with_sharding(sharding.without_auto_axes()).unwrap();
@@ -7181,9 +7232,9 @@ mod tests {
                 let call = program
                     .instructions()
                     .iter()
-                    .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                    .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                     .unwrap();
-                let Operation::JitCall(operation) = call.operation() else { unreachable!("selected a `jit_call`") };
+                let Operation::Call(operation) = call.operation() else { unreachable!("selected a `call`") };
                 let callee = Arc::new(program.entry_region_ref().with_id(call.regions()[0]).unwrap().to_program());
                 operation
                     .interpret(&session, &EagerInterpretationDriver::new(&AttachedRegions::Callees(&[callee])), &inputs)
@@ -7400,7 +7451,7 @@ mod tests {
                 values_to_bytes(&[1f32, 2., 3., 4.]),
             )
             .unwrap();
-            let expected = Err(format!("`jit_call` input #0 expected f32[4] but got {input_type}"));
+            let expected = Err(format!("`call` input #0 expected f32[4] but got {input_type}"));
             assert_eq!(
                 plain.call(input.clone()).map(|output| output.r#type().to_string()).map_err(|e| e.to_string()),
                 expected
@@ -7446,7 +7497,7 @@ mod tests {
                 executed,
                 Err(format!("runtime input type `{input_type}` does not refine declared type `f32[4]`"))
             );
-            assert_eq!(called, Err(format!("`jit_call` input #0 expected f32[4] but got {input_type}")));
+            assert_eq!(called, Err(format!("`call` input #0 expected f32[4] but got {input_type}")));
         }
         let reduced_type = vector_type
             .clone()
@@ -8067,16 +8118,16 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func private @jit_call_0(%arg0: tensor<4xi32>) -> tensor<4xi32> {
+                  func.func private @callee_0(%arg0: tensor<4xi32>) -> tensor<4xi32> {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{?}]> : tensor<4xi32>
                     return %0 : tensor<4xi32>
                   }
                   func.func @main(%arg0: tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
-                    %1 = call @jit_call_0(%0) : (tensor<4xi32>) -> tensor<4xi32>
+                    %1 = call @callee_0(%0) : (tensor<4xi32>) -> tensor<4xi32>
                     %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<4xi32>
                     %3 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
-                    %4 = call @jit_call_0(%3) : (tensor<4xi32>) -> tensor<4xi32>
+                    %4 = call @callee_0(%3) : (tensor<4xi32>) -> tensor<4xi32>
                     %5 = sdy.sharding_constraint %4 <@mesh, [{}]> : tensor<4xi32>
                     %6 = stablehlo.add %2, %5 : tensor<4xi32>
                     return %6 : tensor<4xi32>
@@ -8139,14 +8190,14 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
-                  func.func private @jit_call_0(%arg0: tensor<4xi32>) -> tensor<4xi32> {
+                  func.func private @callee_0(%arg0: tensor<4xi32>) -> tensor<4xi32> {
                     return %arg0 : tensor<4xi32>
                   }
                   func.func @main(%arg0: tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{?}]>}) {
                     %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
-                    %1 = call @jit_call_0(%0) : (tensor<4xi32>) -> tensor<4xi32>
+                    %1 = call @callee_0(%0) : (tensor<4xi32>) -> tensor<4xi32>
                     %2 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xi32>
-                    %3 = call @jit_call_0(%2) : (tensor<4xi32>) -> tensor<4xi32>
+                    %3 = call @callee_0(%2) : (tensor<4xi32>) -> tensor<4xi32>
                     %4 = stablehlo.add %1, %3 : tensor<4xi32>
                     return %4 : tensor<4xi32>
                   }
@@ -8693,7 +8744,7 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:bool[][sharding={mesh<['x'=1:auto]>, []}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:bool[][sharding={mesh<['x'=1:auto]>, []}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = neg %1
@@ -8713,7 +8764,7 @@ mod tests {
                             in (%4, %3, %5)
                         },
                     ]
-                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:bool[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = condition %1 %0 %2 [
@@ -8813,7 +8864,7 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:dimension<extent ∈ [1, 5)> = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:dimension<extent ∈ [1, 5)> = call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                             let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
@@ -8827,7 +8878,7 @@ mod tests {
                             in (%3, %2)
                         },
                     ]
-                    %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %4 %6 [
+                    %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _]] %4 %6 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<extent ∈ [1, 5)> .
                             let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = scan [carry_count=1, iteration_count=extent, reverse=true] %0 %1 [
@@ -8888,10 +8939,10 @@ mod tests {
                 let %2:dimension<extent ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = zero [type=f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}]] %2
                     %4:f32[][sharding={mesh<['x'=1:auto]>, []}] = one [type=f32[][sharding={mesh<['x'=1:auto]>, []}]]
-                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                    %5:f32[][sharding={mesh<['x'=1:auto]>, []}], %6:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %7:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
                             lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                            let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}], %4:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                            let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}], %4:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %5:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _]] %0 %1 [
                                 callee={
                                     lambda %0:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                     let %2:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}] = mul %0 %0
@@ -8902,10 +8953,10 @@ mod tests {
                             in (%3, %4, %5)
                         },
                     ]
-                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
+                    %8:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _, _]] %4 %6 %7 [
                         callee={
                             lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
+                            let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
                                 callee={
                                     lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[extent][sharding={mesh<['x'=1:auto]>, [{}]}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                                     let %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %2 %0
@@ -9170,7 +9221,7 @@ mod tests {
 
     #[test]
     fn test_compiled_function_jvp() {
-        // For `f = |x| x.sin()`, `f.jvp()` produces a compiled function that stages one fused `jit_call`, and executing
+        // For `f = |x| x.sin()`, `f.jvp()` produces a compiled function that stages one fused `call`, and executing
         // it at `(primal, tangent)` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -9187,7 +9238,7 @@ mod tests {
             jvp_compiled.source_program().program().to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
-                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call [derived_input_shardings=[_, _]] %0 %1 [
+                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}], %3:f32[][sharding={mesh<['x'=1:auto]>, []}] = call [derived_input_shardings=[_, _]] %0 %1 [
                     callee={
                         lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
                         let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = sin %0
@@ -9304,7 +9355,7 @@ mod tests {
 
     #[test]
     fn test_compiled_function_jvp_and_gradient_of_deep_callee_chain_on_default_stack() {
-        // Transforming and compiling a function whose `jit_call` callee contains a long elementwise chain used to
+        // Transforming and compiling a function whose `call` callee contains a long elementwise chain used to
         // overflow the default libtest thread stack in debug builds (around 150 chained operations aborted), because
         // linearization and transposition rebuilt programs by recursing along use-def chains. The rebuilds are driven
         // by worklists now, so deriving `jvp` and `gradient` functions across a callee chain well past that threshold
@@ -10024,12 +10075,7 @@ mod tests {
             let outputs = if nested {
                 let callee = builder.import_region(callee.entry_region_ref());
                 builder
-                    .add_instruction(
-                        Operation::JitCall(JitCallOperation::new(1)),
-                        vec![callee],
-                        vec![root, index],
-                        None,
-                    )
+                    .add_instruction(Operation::Call(CallOperation::new(1)), vec![callee], vec![root, index], None)
                     .unwrap()
                     .to_vec()
             } else {

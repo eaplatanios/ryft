@@ -1688,7 +1688,7 @@ pub(crate) mod tests {
     #[cfg(feature = "mosaic-gpu")]
     use crate::kernels::MosaicGpuEmbedding;
     use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
-    use crate::{Array, ArrayConstant, FromPjrt, JitCallOperation, Options, Platform, Session, Value};
+    use crate::{Array, ArrayConstant, CallOperation, FromPjrt, Options, Platform, Session, Value};
 
     use super::*;
 
@@ -3937,10 +3937,10 @@ pub(crate) mod tests {
         let binding = binding(1);
         for (operation, expected) in [
             (
-                Operation::JitCall(JitCallOperation::new(0)),
+                Operation::Call(CallOperation::new(0)),
                 indoc! {"
                     lambda %0:f32[] .
-                    let %1:f32[] = jit_call %0 [
+                    let %1:f32[] = call %0 [
                         callee={
                             lambda %0:f32[] .
                             let %1:f32[] = custom_call [

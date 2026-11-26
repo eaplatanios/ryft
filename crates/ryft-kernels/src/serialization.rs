@@ -3365,6 +3365,10 @@ impl Encoder {
                 // random bit generation, and assertions.
                 self.fallback(portable, format!("`{}`", portable.name()))?
             }
+            ArrayIrOperation::Call(_) => {
+                // TODO(eaplatanios): Replace this fallback with a wire record once the wire form covers calls.
+                self.fallback(portable, format!("`{}`", portable.name()))?
+            }
             ArrayIrOperation::Guard(operation) => {
                 self.guard(portable, operation, Self::r#type, WireKeyOnlyOperation::Guard)?
             }

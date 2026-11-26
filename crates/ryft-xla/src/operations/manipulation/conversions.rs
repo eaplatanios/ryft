@@ -1119,13 +1119,12 @@ mod tests {
     };
     use crate::operations::Operation;
     use crate::operations::debugging::with_captured_prints;
-    use crate::operations::jit_call::JitCallOperation;
     use crate::sessions::tests::{domain_mesh, f32_vector, read_first_shard};
     use crate::tests::{
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
+        Array, ArrayConstant, ArrayTracer, CallOperation, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
         to_mlir_module_for_program,
     };
 
@@ -1932,7 +1931,7 @@ mod tests {
                         for _ in 0..2 {
                             builder
                                 .add_instruction(
-                                    Operation::JitCall(JitCallOperation::new(0)),
+                                    Operation::Call(CallOperation::new(0)),
                                     vec![region],
                                     vec![input],
                                     None,

@@ -19,6 +19,7 @@ use crate::arrays::host::{
     partial_completion_rejection,
 };
 use crate::lowering::LoweringError;
+use crate::lowering::extensions::ShardingLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::sharding::{OpenDimensions, lower_sharding_constraint};
 use crate::{Error, Type};
@@ -212,9 +213,10 @@ fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[Shar
 
 /// Returns `dimensions`, dimension shardings over `mesh` that the program states for a value (e.g., with
 /// [`constrained_dimensions`]), if they agree with `stated`, the closed dimension shardings of the type of that value
-/// (refer to [`closed_dimensions`]), along every mesh axis that is not an auto axis, which is all that a type records,
-/// and `stated` otherwise. A value whose type tracks a placement is placed as its type says along those axes, so the
-/// program can only add the placement along auto mesh axes, which its type cannot record.
+/// (refer to [`ShardingLoweringExtension::dimensions_with_unconstrained_replicated`]), along every mesh axis that is
+/// not an auto axis, which is all that a type records, and `stated` otherwise. A value whose type tracks a placement is
+/// placed as its type says along those axes, so the program can only add the placement along auto mesh axes, which its
+/// type cannot record.
 fn dimensions_along_auto_axes(
     dimensions: Option<Rc<[ShardingDimension]>>,
     stated: Rc<[ShardingDimension]>,
@@ -330,14 +332,14 @@ pub(super) fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let closed = sharding
-        .with_dimensions(closed_dimensions(sharding).to_vec())
+        .with_dimensions(sharding.dimensions_with_unconstrained_replicated().to_vec())
         .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
     lower_sharding_constraint(value, &closed, OpenDimensions::None, bound_manual_axes, block, location)
 }
 
 /// Validates `declared`, a sharding that the lowering declares on a value of `data_type` (i.e., a result sharding of
 /// the entry function, the sharding of a `constrain_sharding`, or the boundary sharding of an operand or a result of a
-/// `jit_call`), against `carried`, the sharding that the type of that value records, if any. XLA exports a sharding
+/// `call`), against `carried`, the sharding that the type of that value records, if any. XLA exports a sharding
 /// that adds unreduced axes to a value as the introduction of a pending reduction, which it implements (by filling the
 /// other devices with an identity) only for [`UnreducedKind::Sum`] and otherwise aborts the process. A declared pending
 /// maximum or minimum must therefore be one that the value already carries, which is the case exactly when its type
@@ -511,19 +513,6 @@ pub(super) fn validate_pending_reduction_change<'a, I: IntoIterator<Item = &'a S
     }))
 }
 
-/// Returns the dimension shardings of `sharding`, with its unconstrained dimensions closed as replicated, which is how
-/// a runtime array stores them and how a constraint that must state its pending reduction can declare them.
-pub(crate) fn closed_dimensions(sharding: &Sharding) -> Rc<[ShardingDimension]> {
-    sharding
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            ShardingDimension::Unconstrained => ShardingDimension::Replicated,
-            dimension => dimension.clone(),
-        })
-        .collect()
-}
-
 /// Constrains the intermediate values that the lowering of one instruction emitted into `block` after `anchor` and that
 /// carry a pending reduction, for `lower_instruction_operation`. The `outputs` of the instruction, of types
 /// `output_types`, are left to [`constrain_unreduced_outputs`].
@@ -624,8 +613,11 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
             && let Some(sharding) = r#type.sharding()
             && pending_reductions.iter().any(|(candidate, _)| candidate == value)
         {
-            let dimensions =
-                dimensions_along_auto_axes(constrained_dimensions(*value)?, closed_dimensions(sharding), mesh);
+            let dimensions = dimensions_along_auto_axes(
+                constrained_dimensions(*value)?,
+                sharding.dimensions_with_unconstrained_replicated(),
+                mesh,
+            );
             forward_dimensions.push((*value, dimensions));
         }
     }
@@ -633,7 +625,9 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
         .iter()
         .zip(output_types)
         .filter_map(|(value, r#type)| match r#type {
-            Type::Array(r#type) => r#type.sharding().map(|sharding| (*value, closed_dimensions(sharding))),
+            Type::Array(r#type) => {
+                r#type.sharding().map(|sharding| (*value, sharding.dimensions_with_unconstrained_replicated()))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -791,8 +785,12 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
         {
             let dimensions = output_dimensions.get(index).cloned().flatten();
             let placed;
-            let sharding = match dimensions_along_auto_axes(dimensions, closed_dimensions(sharding), sharding.mesh()) {
-                dimensions if *dimensions != *closed_dimensions(sharding) => {
+            let sharding = match dimensions_along_auto_axes(
+                dimensions,
+                sharding.dimensions_with_unconstrained_replicated(),
+                sharding.mesh(),
+            ) {
+                dimensions if *dimensions != *sharding.dimensions_with_unconstrained_replicated() => {
                     placed = sharding
                         .with_dimensions(dimensions.to_vec())
                         .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;

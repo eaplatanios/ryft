@@ -131,8 +131,8 @@ use crate::lowering::extensions::{
     RegionPlacementSummaryExtension, merge_requested_placement, owned_session_constants,
 };
 use crate::lowering::modules::render_devices;
+use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::operations::jit_call::{EagerCallDecision, JitCallEagerExtension};
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};
 use crate::sessions::platforms::client_for_plugin;
 use crate::sessions::runtimes::RuntimeRegistry;
@@ -672,7 +672,7 @@ impl Session {
     /// Returns whether a value that is computed from the array inputs `inputs` and the captured arrays `captures`
     /// lives on devices that this process chose on its own (i.e., [`Array::is_locally_assigned`] returns `true`), which
     /// is decided by what selected those devices. This is the one rule of every eager application, including eager
-    /// calls of compiled functions (refer to `JitCallOperation::eager_decision`), so that a later transfer of the value
+    /// calls of compiled functions (refer to `CallOperation::eager_decision`), so that a later transfer of the value
     /// to another process is planned as a shared transfer whenever every process takes part in it. The value is locally
     /// assigned only when everything that could have selected its devices was itself locally assigned, which errs in
     /// the safe direction: a value that is wrongly marked as shared costs a transfer plan in which every process takes
@@ -1355,7 +1355,7 @@ impl Context for Session {
         // cache, and executed on this session's PJRT client. The compilation cache key contains the complete lowered
         // computation, its effective compilation options, and the derived mesh, so repeated eager binds of the same
         // lowering reuse one compiled executable without conflating distinct computations. Higher-order operations
-        // (e.g., `condition`, `while`, `scan`, `jit_call`, and `shard_map`) receive their nested programs as attached
+        // (e.g., `condition`, `while`, `scan`, `call`, and `shard_map`) receive their nested programs as attached
         // regions and flow through this same path, and the compiler handles their control flow, so no host interpreter
         // loops are needed.
         //
@@ -1426,7 +1426,7 @@ impl Context for Session {
         // `omits_regions`), all of them if this application is such an operation. Transforms that activate dormant
         // regions handle their references themselves. A call takes no platform (refer to its placement decision
         // below), and an operation without regions never queries it.
-        let is_call = matches!(operation, Operation::JitCall(_));
+        let is_call = matches!(operation, Operation::Call(_));
         let target_platform = if is_call || regions.regions().next().is_none() {
             None
         } else {
@@ -1476,10 +1476,10 @@ impl Context for Session {
 
         // A call takes its placement decision, which states where the call runs, which arguments it admits and where
         // they move, whether its arguments commit its results, and whether its devices were chosen by this process
-        // alone (refer to `JitCallOperation::eager_decision`). Nothing below derives any of these facts again for a
+        // alone (refer to `CallOperation::eager_decision`). Nothing below derives any of these facts again for a
         // call.
         let decision = match &operation {
-            Operation::JitCall(call) => Some(
+            Operation::Call(call) => Some(
                 call.eager_decision(self, inputs, regions.region(0)?)
                     .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?,
             ),
@@ -1573,7 +1573,7 @@ impl Context for Session {
         // body with the constants that they use as operands. A constant that only dead instructions use is not used.
         // A constant of the callee of a call nested in a region belongs to that call, which never runs where the
         // arrays that its callee closes over are nor commits its results because of them (refer to
-        // `JitCallOperation::eager_decision`), and neither do the arrays that the callee of this application closes
+        // `CallOperation::eager_decision`), and neither do the arrays that the callee of this application closes
         // over if it is a call, so execution places all of them on the devices of the application (refer to
         // `placed_constant`). Lowering never emits the regions that the implementation of a named composite replaces
         // for the platform of this session, nor the body of a scan that admits no iteration (refer to `omits_regions`),
@@ -2086,10 +2086,10 @@ impl Context for Session {
         // A call whose callee names devices or that has no array inputs runs on the mesh of its decision. Other calls
         // use the first array input the callee reads after the decision has placed the inputs.
         let call_mesh = match (&operation, &decision) {
-            (Operation::JitCall(call), Some(decision)) if call.mesh().is_some() || array_inputs.is_empty() => {
+            (Operation::Call(call), Some(decision)) if call.mesh().is_some() || array_inputs.is_empty() => {
                 Some(decision.mesh())
             }
-            (Operation::JitCall(_), Some(decision)) if let Some(unread) = decision.unread_captures() => Some(
+            (Operation::Call(_), Some(decision)) if let Some(unread) = decision.unread_captures() => Some(
                 inputs
                     .iter()
                     .enumerate()
@@ -2174,7 +2174,7 @@ impl Context for Session {
 
                         // Arguments are placed as their runtime arrays are, including over the auto mesh axes that
                         // types never record. The arguments of a call are instead placed as an execution of its callee
-                        // places them, which `JitCallOperation::eager_input_placement` decides for every array input
+                        // places them, which `CallOperation::eager_input_placement` decides for every array input
                         // (e.g., a call that a program transform created leaves the residuals that the transform added
                         // where they are, rather than gathering them to the placement of their traced types). Either
                         // way the call returns what that execution returns. A capture that the callee never reads has
@@ -2182,7 +2182,7 @@ impl Context for Session {
                         let unread_captures = decision.as_ref().and_then(EagerCallDecision::unread_captures);
                         let is_unread = |index: usize| unread_captures.is_some_and(|unread| unread[index]);
                         let input_placements = match (&operation, &callee_input_types) {
-                            (Operation::JitCall(call), Some(declared)) => Some(
+                            (Operation::Call(call), Some(declared)) => Some(
                                 inputs
                                     .iter()
                                     .zip(declared)
@@ -2207,9 +2207,9 @@ impl Context for Session {
                         // overrides therefore declares every input as a direct execution of its callee does: an input
                         // with an override at that override, and every other input at its eager placement, or as its
                         // declared type places it (refer to `declared_input_sharding`), which the admission of the call
-                        // has made free of such reductions (refer to `JitCallOperation::eager_decision`).
+                        // has made free of such reductions (refer to `CallOperation::eager_decision`).
                         let input_shardings = match (&operation, &callee_input_types, &input_placements, operand_mesh) {
-                            (Operation::JitCall(call), Some(declared), Some(placements), Some(mesh))
+                            (Operation::Call(call), Some(declared), Some(placements), Some(mesh))
                                 if (0..inputs.len()).any(|index| call.input_sharding(index).is_some()) =>
                             {
                                 let declared = inputs
@@ -2240,7 +2240,7 @@ impl Context for Session {
 
                         // The output overrides of the callee of a call, which the options of the program take below.
                         let output_overrides = match (&operation, regions.regions().next()) {
-                            (Operation::JitCall(call), Some(callee)) if is_call => {
+                            (Operation::Call(call), Some(callee)) if is_call => {
                                 (0..callee.interface().output_types().len())
                                     .map(|index| call.output_sharding(index).cloned())
                                     .collect::<Vec<_>>()
@@ -2410,7 +2410,7 @@ impl Context for Session {
         // An operation with regions also commits its results when a region requests a placement (refer to
         // `CompiledProgram::committed_outputs`), as an execution of a compiled function commits them and as JAX commits
         // the result of a `lax.cond` whose branches place their values. The results of a call are committed exactly as
-        // its decision states (refer to `JitCallOperation::eager_decision`), so that neither the mesh of this session
+        // its decision states (refer to `CallOperation::eager_decision`), so that neither the mesh of this session
         // nor a capture commits them. The commitment of the results of an
         // operation without regions follows its inputs alone, even when the operation is itself a placement request
         // (e.g., a sharding constraint).
@@ -3206,8 +3206,8 @@ pub(crate) mod tests {
         peer_devices, replicated_array, session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError, FromPjrt,
-        JitCallOperation, LoweringError, PlacementOptions, Reference, compile, jit,
+        CallOperation, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Dimension, ExecutionError,
+        FromPjrt, LoweringError, PlacementOptions, Reference, compile, jit,
     };
 
     #[cfg(feature = "cuda-13")]
@@ -5009,9 +5009,9 @@ pub(crate) mod tests {
             let instruction = caller
                 .instructions()
                 .iter()
-                .find(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+                .find(|instruction| matches!(instruction.operation(), Operation::Call(_)))
                 .unwrap();
-            let Operation::JitCall(call) = instruction.operation() else { unreachable!() };
+            let Operation::Call(call) = instruction.operation() else { unreachable!() };
             let regions = AttachedRegions::Owned(
                 instruction.regions().iter().map(|&id| caller.with_id(id).unwrap().to_program()).collect(),
             );
@@ -7540,13 +7540,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_session_bind_executes_jit_call_and_reuses_cached_executable() {
+    fn test_session_bind_executes_call_and_reuses_cached_executable() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let vector_type = replicated_vector_type(&mesh, 4);
 
-        // A `jit_call` operation with the callee `x -> x * x`, bound eagerly on concrete arrays, dispatches straight
+        // A `call` operation with the callee `x -> x * x`, bound eagerly on concrete arrays, dispatches straight
         // through the compiled eager path, mirroring JAX calling a JIT-compiled function from eager code.
         let callee = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -7556,7 +7556,7 @@ pub(crate) mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
         };
-        let operation = Operation::JitCall(JitCallOperation::new(0));
+        let operation = Operation::Call(CallOperation::new(0));
         let callee = Arc::new(callee);
 
         let input = f32_vector(&session, &mesh, &[1.0, 2.0, 3.0, 4.0]);
@@ -7571,10 +7571,10 @@ pub(crate) mod tests {
         assert_eq!(read_first_shard::<f32>(client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
         assert_eq!(session.cached_program_count(), 1);
 
-        // A repeated eager `jit_call` at the same input signature is a dispatch cache hit.
+        // A repeated eager `call` at the same input signature is a dispatch cache hit.
         let second = session.bind(operation, AttachedRegions::Callees(&[callee]), &[Value::Array(input)]).unwrap();
         assert_eq!(read_first_shard::<f32>(client, program_array(&second[0])), vec![1.0, 4.0, 9.0, 16.0]);
-        assert_eq!(session.cached_program_count(), 1, "a repeated eager `jit_call` must be a compilation cache hit");
+        assert_eq!(session.cached_program_count(), 1, "a repeated eager `call` must be a compilation cache hit");
     }
 
     #[test]

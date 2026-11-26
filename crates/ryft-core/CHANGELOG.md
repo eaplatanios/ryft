@@ -56,8 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Staging via `stage` and `Compile::stage`, followed by lowering, compilation, and execution through the
     `StagedFunction`, `LoweredFunction`, `CompiledFunction`, and `ExecutableFunction` lifecycle handles. Runtime
     captures are lifted into leading program inputs, and staged functions can be embedded as nested calls in enclosing
-    traces through `StagedCallOperation`s, on which `CompilationDomain::call_operation` lets a backend record the facts
-    about the boundary of the called function that only its options hold.
+    traces through `CallOperation`s, on which `CompilationDomain::call_operation` lets a backend record the facts about
+    the boundary of the called function that only its options hold. `CallOperation` provides rules for interpretation
+    and all of the above transforms, so that calls of staged functions can be transformed without inlining them.
   - Retained JIT dispatch via `jit` and `Compile::jit`, which return `CompiledFunctionDispatcher`s that keep the
     compiled executables of their specializations in a bounded LRU cache.
   - A shared `CompilationCache` that deduplicates backend compilation, with caching in memory, optional persistent

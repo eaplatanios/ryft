@@ -9417,7 +9417,7 @@ mod tests {
         }
 
         // A third-party call-shaped family participates in structured discharge by reaching the shared positional
-        // rewrite, exactly as the backend `jit_call` does, with no companion declaration surface beyond the generic
+        // rewrite, exactly as the backend `call` does, with no companion declaration surface beyond the generic
         // provenance hooks it already implements. Its reference primitives delegate to the universe-generic rules the
         // primitives own, and every other native payload replays as the enclosing enum, which is the same split a
         // dispatch derive generates.

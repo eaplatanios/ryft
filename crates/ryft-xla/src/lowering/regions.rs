@@ -15,7 +15,7 @@ use crate::lowering::types::lower_constant;
 use crate::lowering::{
     EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction, lower_instruction_operation,
 };
-use crate::operations::jit_call::JitCallFunctionMap;
+use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
@@ -45,7 +45,7 @@ pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperat
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     optimization_barrier: &RematerializationOptimizationBarrier,
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -85,7 +85,7 @@ pub(crate) fn lower_program_outputs_with_inputs<
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
@@ -137,7 +137,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     optimization_barrier: &RematerializationOptimizationBarrier,
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {

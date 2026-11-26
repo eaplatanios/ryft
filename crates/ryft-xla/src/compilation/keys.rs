@@ -145,7 +145,7 @@ impl LoweredProgram {
 ///
 /// The key must capture everything that the eager lowering reads besides the session itself, whose client, and thus
 /// [`Target`](crate::Target), is fixed. That is the operation including all of its attributes, the contents of every
-/// attached region (e.g., of `condition`, `while`, `scan`, `jit_call`, or `shard_map` operations), the physical type of
+/// attached region (e.g., of `condition`, `while`, `scan`, `call`, or `shard_map` operations), the physical type of
 /// every array input including its sharding, the extent of every dimension input, because eager binding bakes dimension
 /// inputs into the traced program as constants, and the device mesh that the lowering compiles against. The default
 /// compilation options of the session are immutable, so they are not part of the key. Attached regions are keyed by

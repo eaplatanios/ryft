@@ -358,6 +358,17 @@ impl Sharding {
             .collect()
     }
 
+    /// Returns whether any dimension of this [`Sharding`] is sharded along the mesh axis named `axis_name`, including
+    /// when that axis has size one. Use [`Self::distinguishes_shards_along`] to also include pending reductions and
+    /// manual variation.
+    #[inline]
+    pub fn splits_along(&self, axis_name: &str) -> bool {
+        self.dimensions.iter().any(|dimension| match dimension {
+            ShardingDimension::Sharded(axis_names) => axis_names.iter().any(|name| name == axis_name),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+        })
+    }
+
     /// Returns whether this [`Sharding`] describes one logical value per slice. Any unreduced axis retains pending
     /// reduction state, even if it has size one. A varying manual axis can give a slice multiple values only if it has
     /// more than one coordinate and does not split a dimension.
@@ -367,7 +378,7 @@ impl Sharding {
             && self
                 .varying_manual_axes
                 .iter()
-                .all(|axis| self.mesh.axis_size(axis).unwrap_or(1) == 1 || self.dimensions_use_axis(axis))
+                .all(|axis| self.mesh.axis_size(axis).unwrap_or(1) == 1 || self.splits_along(axis))
     }
 
     /// Returns whether this [`Sharding`] distinguishes shards along the mesh axis named `axis_name`. A dimension split,
@@ -375,7 +386,7 @@ impl Sharding {
     /// only as reduced holds replicas of the completed contribution with the other coordinates fixed.
     #[inline]
     pub fn distinguishes_shards_along(&self, axis_name: &str) -> bool {
-        self.dimensions_use_axis(axis_name)
+        self.splits_along(axis_name)
             || self.unreduced_axes.contains(axis_name)
             || self.varying_manual_axes.contains(axis_name)
     }
@@ -472,7 +483,7 @@ impl Sharding {
     pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
         let mut sharding = Self::new(self.mesh.clone(), dimensions)?;
         for axis_name in self.unreduced_axes.iter().chain(&self.reduced_axes) {
-            if sharding.dimensions_use_axis(axis_name) {
+            if sharding.splits_along(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
         }
@@ -496,7 +507,7 @@ impl Sharding {
             if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
-            if self.dimensions_use_axis(axis_name) || self.reduced_axes.contains(axis_name) {
+            if self.splits_along(axis_name) || self.reduced_axes.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -531,7 +542,7 @@ impl Sharding {
             if self.mesh.axis_index(axis_name).is_none() {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
             }
-            if self.dimensions_use_axis(axis_name) || self.unreduced_axes.contains(axis_name) {
+            if self.splits_along(axis_name) || self.unreduced_axes.contains(axis_name) {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis_name.clone() });
             }
             if self.varying_manual_axes.contains(axis_name) {
@@ -785,14 +796,6 @@ impl Sharding {
             self.unreduced_kind = UnreducedKind::Sum;
         }
         self
-    }
-
-    /// Returns `true` if any ranked dimension of this [`Sharding`] uses `axis_name` for sharding.
-    fn dimensions_use_axis(&self, axis_name: &str) -> bool {
-        self.dimensions.iter().any(|dimension| match dimension {
-            ShardingDimension::Sharded(axis_names) => axis_names.iter().any(|name| name == axis_name),
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-        })
     }
 
     /// Validates that `axis_name` can be used as a varying manual mesh axis in this [`Sharding`].

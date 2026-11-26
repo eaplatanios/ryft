@@ -12,8 +12,8 @@ use ryft_core::{
 
 use crate::lowering::LowerableOperationFamily;
 use crate::lowering::types::stable_hlo_dynamic_dimension_bound;
-use crate::operations::jit_call::JitCallFunctionMap;
-use crate::{Constant, JitCallOperation, RetainedArray, Type};
+use crate::operations::call::CallFunctionMap;
+use crate::{CallOperation, Constant, RetainedArray, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -34,7 +34,7 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     operation: &O,
     input_types: &[Type],
     output_types: &[Type],
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     target_platform: Option<&str>,
 ) -> bool {
     let Some(key) = operation.composite_key() else {
@@ -49,7 +49,7 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// `LowerableOperation::has_composite_implementation`) and, on every target, for a scan whose length admits no iteration (refer
 /// to [`admits_iterations`], which its lowering reads). This is the one test of whether lowering for a target emits the
 /// regions of an instruction, which the walks that follow the regions that lowering emits read: the collector of the
-/// functions that calls share (refer to `collect_jit_call_functions`), the traversal of the regions that lowering emits
+/// functions that calls share (refer to `collect_call_functions`), the traversal of the regions that lowering emits
 /// (refer to `emitted_regions`, which compilation admission also reads), the summaries of the placement requests and of
 /// the session constants of a region, and the validation of the placements of a compiled program (refer to
 /// `validate_placements`), so that a placement request or a captured array inside a region that lowering omits is never
@@ -104,10 +104,10 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
     emitted_regions_entering_calls(entry, target_platform, true)
 }
 
-/// Returns the regions of [`emitted_regions`], without the callees of the `jit_call`s among them and the regions below
+/// Returns the regions of [`emitted_regions`], without the callees of the `call`s among them and the regions below
 /// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
 /// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
-/// input `k` (refer to `lower_jit_call`), which the call receives as its operand `k`.
+/// input `k` (refer to `lower_call`), which the call receives as its operand `k`.
 pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,
@@ -124,7 +124,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
             let region = entry.with_id(id).unwrap();
             for instruction in region.instructions() {
                 if !omits_regions(region, instruction, target_platform)
-                    && (enters_calls || instruction.operation().projected_payload::<JitCallOperation<Type>>().is_none())
+                    && (enters_calls || instruction.operation().projected_payload::<CallOperation<Type>>().is_none())
                 {
                     pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
                         (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
@@ -178,7 +178,7 @@ pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
 }
 
 /// Calls `visit` with every atom that `region` reads, as an operand of one of its instructions or as one of its
-/// outputs, and with whether that read is live. Every read is live except an operand that a `jit_call` passes as a
+/// outputs, and with whether that read is live. Every read is live except an operand that a `call` passes as a
 /// lifted capture which its callee never reads (refer to [`unread_call_captures`]), which the lowering of the call
 /// replaces with a value that requires no buffer. This is the one rule by which the captures of a program (refer to
 /// [`emitted_capture_reads`]) and its session constants (refer to [`partition_session_constants`]) are read, so that
@@ -192,7 +192,7 @@ fn visit_emitted_reads<O: LowerableOperationFamily>(
     for instruction in region.instructions() {
         let unread = instruction
             .operation()
-            .projected_payload::<JitCallOperation<Type>>()
+            .projected_payload::<CallOperation<Type>>()
             .filter(|call| call.capture_count() != 0)
             .and_then(|call| {
                 let callee = region.with_id(*instruction.regions().first()?).ok()?;
