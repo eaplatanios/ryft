@@ -1,5 +1,5 @@
 //! Placement of runtime [`Array`]s on other devices, shardings, memories, and layouts. [`Array::to_placement`] copies
-//! an array to a destination and leaves the source usable, and [`Array::into_placement`] consumes the source so that a
+//! an array to a target and leaves the source usable, and [`Array::into_placement`] consumes the source so that a
 //! compiled reshard may reuse its buffers. Host values go through the uploads of [`crate::arrays::host`] instead. The
 //! same device work also moves the inputs of compiled programs and eager operations whose placement differs from the
 //! one that the program needs.
@@ -11,27 +11,27 @@
 //! conversion cannot be compiled. Any other placement chooses one device strategy, which is the first of the following
 //! that applies:
 //!
-//!   1. **Exact Shards:** Every destination shard with elements has the slices of one source shard, and both shardings
+//!   1. **Exact Shards:** Every target shard with elements has the slices of one source shard, and both shardings
 //!      hold one value per slice, or the placement only moves the contributions of a pending reduction or of manual
-//!      variation to other devices (e.g., onto another order of the same devices) and each destination shard holds the
+//!      variation to other devices (e.g., onto another order of the same devices) and each target shard holds the
 //!      contribution of one source shard, which keeps every contribution bit for bit and introduces or completes
-//!      nothing. Each process creates its own empty destination shards. Each destination shard with elements shares
-//!      the buffer of its source shard on the same device, copies it from another device of its process, or receives
-//!      it through a PJRT cross-host transfer. Moving the shards compiles nothing, but a sender compiles a conversion
-//!      on its device for a shard that it cannot send as it is (i.e., in another layout than the one that the receiver
+//!      nothing. Each process creates its own empty target shards. Each target shard with elements shares the buffer
+//!      of its source shard on the same device, copies it from another device of its process, or receives it through
+//!      a PJRT cross-host transfer. Moving the shards compiles nothing, but a sender compiles a conversion on its
+//!      device for a shard that it cannot send as it is (i.e., in another layout than the one that the receiver
 //!      allocates, or with a dynamic allocation).
-//!   2. **Shard Regions:** The source devices slice out the regions that each destination needs from device memory.
-//!      The destination devices join them and move them to the requested memory and layout. When both shardings hold
+//!   2. **Shard Regions:** The source devices slice out the regions that each target needs from device memory.
+//!      The target devices join them and move them to the requested memory and layout. When both shardings hold
 //!      one value per slice, regions apply across meshes for dense row-major sources or when uneven shards or manual
 //!      axes rule out a compiled reshard. Regions also move contributions of a pending reduction or of manual variation
 //!      within a tile without combining them. The source devices convert other declared layouts to dense row-major
 //!      before slicing.
 //!   3. **Compiled Reshard:** An identity program with input and output sharding annotations runs on the mesh of the
 //!      source. Across meshes, a replicated copy of the source (i.e., the source itself or its all-gather on its own
-//!      mesh) is first copied or transferred to every destination device as whole shards, and the program runs on the
-//!      destination mesh. Such a program keeps the reduction state that the destination keeps on the same mesh (i.e.,
+//!      mesh) is first copied or transferred to every target device as whole shards, and the program runs on the
+//!      target mesh. Such a program keeps the reduction state that the target keeps on the same mesh (i.e.,
 //!      it moves the contributions of a pending sum, maximum, or minimum as they are), and it completes a pending
-//!      reduction that the destination drops and introduces a pending sum or a completed reduction that the destination
+//!      reduction that the target drops and introduces a pending sum or a completed reduction that the target
 //!      adds, with the arithmetic of XLA. A process that owns no device of the mesh of such a program compiles and runs
 //!      nothing for it, and its result has the type and the placement of the results of the processes that run it,
 //!      without buffers.
@@ -40,18 +40,18 @@
 //!      result (refer to [`crate::arrays::host`]), only for some data types, kinds of reduction, and changes of
 //!      reduction state (e.g., not for a sum of one-bit integers, which XLA adds as predicates, nor for floating point
 //!      maxima and minima, from which XLA drops NaN values), and they cannot introduce a pending maximum or minimum.
-//!      Such a change, and a placement that no other strategy makes for a reason that every process predicts (i.e., a
-//!      manual destination axis or uneven shards that shard regions cannot place), takes the host fallback below, which
+//!      Such a change, and a placement that no other strategy makes for a reason that every process predicts (i.e.,
+//!      a manual target axis or uneven shards that shard regions cannot place), takes the host fallback below, which
 //!      reads the value back and uploads it with the host functions that define it, when one process owns every device
-//!      of the destination and one replica of every source contribution with elements (replicas of those contributions
+//!      of the target and one replica of every source contribution with elements (replicas of those contributions
 //!      on devices of other processes take no part). That process does the round trip, and every other process returns
 //!      the placement without buffers. Otherwise no process can read the value back alone, so every process returns the
-//!      same error before it does anything. A pending sum that the destination introduces for a data type without an
+//!      same error before it does anything. A pending sum that the target introduces for a data type without an
 //!      additive identity (i.e., [`DataType::F8E8M0FNU`]) is rejected before anything else, with the error that a host
 //!      upload of the same value reports, because no strategy can produce it.
 //!
 //! The choice reads only information that every process shares (i.e., the type and shard metadata of the source,
-//! whether the source has locally assigned devices, the destination, and the capabilities of the PJRT plugin of the
+//! whether the source has locally assigned devices, the target, and the capabilities of the PJRT plugin of the
 //! session, which do not depend on whether the session shares compilation artifacts with other processes), so all the
 //! processes of a distributed placement choose the same strategy and issue matching transfers and collectives. What
 //! only one process knows (e.g., the physical layout of a buffer when the type declares none, or which buffers it
@@ -72,24 +72,24 @@
 //!     on devices of this process only.
 //!   - **Sources:** Host uploads without a mesh of the caller or of the session set the fact, and so do uploads onto
 //!     the default device of the session (refer to [`Session::with_default_device`]), which only this process holds,
-//!     and [`Session::place`] uploads of host values without a destination or with a destination that names only a
+//!     and [`Session::place`] uploads of host values without a target or with a target that names only a
 //!     memory or a layout.
 //!   - **Propagation:** Placements that name only a memory or a layout, copies of an array on its own devices, moves of
 //!     an array between devices of this process for an operation, and eager operations whose array inputs all have the
 //!     fact keep it.
-//!   - **Clearing:** A placement onto a device, a mesh, or a sharding clears it, even when that destination holds the
+//!   - **Clearing:** A placement onto a device, a mesh, or a sharding clears it, even when that target holds the
 //!     devices of its source. Construction on a caller-supplied mesh and direct execution on a compiled mesh also clear
 //!     it. A call without a placement request inherits local assignment from its public arguments.
 //!
 //! The fact is separate from [commitment](Array::is_committed), which records whether the devices were chosen on
-//! purpose and which a destination that names only a memory or a layout also sets, as in JAX, so commitment cannot tell
+//! purpose and which a target that names only a memory or a layout also sets, as in JAX, so commitment cannot tell
 //! whether the other processes know the devices. Every process of a distributed program applies the same functions to
 //! the same kinds of inputs, so every process computes the same fact for its own source. Every process therefore
 //! chooses the same strategy for a locally assigned source. Each process places its full value on its own devices of
-//! the destination with local copies, slices, or a host upload, so no process transfers anything or runs a collective
-//! to place it. A process whose devices hold the whole destination may do that local work with the strategies above,
+//! the target with local copies, slices, or a host upload, so no process transfers anything or runs a collective
+//! to place it. A process whose devices hold the whole target may do that local work with the strategies above,
 //! because they then move nothing between processes. The values of the processes must therefore be equal. When the
-//! devices of the destination belong to exactly the processes of a run of more than one process, the processes compare
+//! devices of the target belong to exactly the processes of a run of more than one process, the processes compare
 //! the SHA-256 digests of their values before they place them, and the result fails on every process when they differ
 //! (refer to [`Array::to_placement`]), unless the session disables the check.
 //!
@@ -119,9 +119,9 @@
 //! transfers, so that a memory that only it lacks never leaves a sender waiting.
 //!
 //! When the device work that this process runs fails (e.g., a failed compilation or execution on its own devices),
-//! [`Array::to_placement`] and [`Array::into_placement`] fall back to a host round trip that reads the whole value back
-//! and uploads it again. This needs a destination that this process fully addresses and a source that this process can
-//! read back, which holds a local replica of every contribution to its value with elements (replicas on devices of
+//! [`Array::to_placement`] and [`Array::into_placement`] fall back to a host round trip that reads the whole value
+//! back and uploads it again. This needs a target that this process fully addresses and a source that this process
+//! can read back, which holds a local replica of every contribution to its value with elements (replicas on devices of
 //! other processes are fine) and whose devices that hold one contribution do not vary along a manual mesh axis (refer
 //! to [`Array::to_placement`]). Otherwise, they report the error of the device work. An error of the planning, which
 //! every process meets alike, is never recovered by one process alone (refer to the host round trip above).
@@ -148,10 +148,10 @@
 //! The CUDA plugin performs the first cross-host rendezvous between two devices on the calling thread. Host readbacks
 //! can block placement when the PJRT plugin lacks host to device transfer managers or their literal transfers. A
 //! completion fence waits synchronously when the PJRT plugin rejects its callback. Value comparison reads back a
-//! locally assigned source on the calling thread when its destination names devices of every process of a run.
-//! Whole-call admission waits for the collective verdict before placing any leaf that compares the inputs. A failure
-//! after the transfers (e.g., a destination memory that a device of the receiver lacks) is returned only once every
-//! transfer is issued, so the peers of the failing process complete their transfers.
+//! locally assigned source on the calling thread when its target names devices of every process of a run. Whole-call
+//! admission waits for the collective verdict before placing any leaf that compares the inputs. A failure after the
+//! transfers (e.g., a target memory that a device of the receiver lacks) is returned only once every transfer is
+//! issued, so the peers of the failing process complete their transfers.
 //!
 //! A process that fails before it issues its transfers returns its error, and its peers that already issued theirs
 //! wait for transfers that never come. The same holds for the later parameters of a [`Session::place`] of a tree, whose
@@ -230,20 +230,20 @@ impl Array {
     ///
     /// When the placement and storage already match, the result is this array (i.e., the same logical array, refer to
     /// the identity rules of [`RetainedArray`](crate::RetainedArray)). If each process chose the devices of this array
-    /// on its own, a destination that names devices gives a new array on every process instead, which shares the
+    /// on its own, a target that names devices gives a new array on every process instead, which shares the
     /// buffers of this array where they already are, so that independent placements remain distinct when captured.
     /// Every other placement gives a new array. A change of devices or sharding takes the first device strategy that
     /// applies of those that [`crate::arrays::resharding`] describes (i.e., moves of exact shards, shard regions, or a
     /// compiled reshard) and otherwise the host fallback. A source with [locally assigned
     /// devices](Self::is_locally_assigned) (e.g., the result of [`Array::from_host_buffer`] without a mesh) takes none
-    /// of them, and every process places its own such array on its own destination devices with local work only, as
+    /// of them, and every process places its own such array on its own target devices with local work only, as
     /// that module describes.
     ///
     /// The host fallback copies the global array to the host as [`Array::copy_to_host`] does and uploads it again as
     /// [`Array::from_host_buffer`] does, so the result has the shards that a host upload of the same values with the
-    /// destination sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy
-    /// supports a manual destination, or when a compiled reshard would change the value of an array whose reduction
-    /// state the placement changes), when the destination mesh is fully addressable from this process, and when this
+    /// target sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy
+    /// supports a manual target, or when a compiled reshard would change the value of an array whose reduction
+    /// state the placement changes), when the target mesh is fully addressable from this process, and when this
     /// process can read the source back. That is the case when this process holds a buffer for one replica of every
     /// distinct contribution to the value with elements (i.e., of every tile and, along unreduced axes, of every
     /// per-device value of a tile), whatever the other processes hold, and when no two devices that hold one such
@@ -256,9 +256,9 @@ impl Array {
     /// failure of the device work, surfaces through the readiness functions and the readbacks of the result and
     /// through [`Session::synchronize`].
     ///
-    /// When the destination is shared across processes and this array is locally assigned, every process must hold the
+    /// When the target is shared across processes and this array is locally assigned, every process must hold the
     /// same value, because each process places its own value on the devices that it owns. As JAX does for uncommitted
-    /// inputs, a mesh or sharding destination whose devices belong to exactly the processes of a run of more than one
+    /// inputs, a mesh or sharding target whose devices belong to exactly the processes of a run of more than one
     /// process compares the values of the processes (refer to
     /// [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)): each process reads its value
     /// back on the calling thread, hashes it, and submits a comparison before anything else depends on the value.
@@ -267,10 +267,10 @@ impl Array {
     /// before readback when the placement requires a comparison. A digest that differs (including when data types or
     /// shapes differ) or cannot be computed causes a [`ryft_pjrt::Error::FailedPrecondition`] on every process. The
     /// same sequence of comparing placements on every process remains a precondition (refer to [`Session::place`]).
-    /// For any other destination shared across processes, equal values remain an unchecked precondition.
+    /// For any other target shared across processes, equal values remain an unchecked precondition.
     ///
     /// The host fallback reads back the combined value of an array with unreduced axes and uploads it again as
-    /// [`Array::from_host_buffer`] does, so when the destination keeps an unreduced axis, it redistributes the
+    /// [`Array::from_host_buffer`] does, so when the target keeps an unreduced axis, it redistributes the
     /// contributions along that axis. With [`UnreducedKind::Sum`], the devices at coordinate zero along it hold the
     /// whole value and the others hold the additive identity. With [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
     /// every device along it holds the whole value, which is its own extremum. The logical value is the same, but the
@@ -280,34 +280,34 @@ impl Array {
     /// PJRT client (e.g., of another backend) is read back and uploaded onto the devices that `target` names, because
     /// PJRT copies buffers only within one client, as JAX places an array onto the devices of another backend. That
     /// uses the host path directly. For an array with bytes, the placement must keep no distinct contributions apart,
-    /// each destination owner must be able to read the value back, and the destination must lie on the devices of one
+    /// each target owner must be able to read the value back, and the target must lie on the devices of one
     /// process unless this array is locally assigned. The memory follows the same rule as a transfer within one client.
-    /// The target must name the destination devices, and the result is [committed](Self::is_committed) to them.
+    /// The request must name the target devices, and the result is [committed](Self::is_committed) to them.
     ///
     /// When the host fallback also cannot satisfy the request, typically because some source shards that the value
     /// needs live on a remote process or because the source varies along manual mesh axes, the original error of the
     /// device work is propagated as the most informative diagnostic.
     ///
-    /// The destination uses the requested [`Memory`]. When the memory is omitted, a destination that names a single
+    /// The target uses the requested [`Memory`]. When the memory is omitted, a target that names a single
     /// device (refer to [`PlacementRequest::Device`]) uses the default memory of that device for every source,
-    /// including one in pinned host memory, and a mesh or sharding destination keeps the memory of the source. This is
+    /// including one in pinned host memory, and a mesh or sharding target keeps the memory of the source. This is
     /// Ryft's contract, whatever JAX version it is compared with, because JAX handles a bare device and pinned inputs
     /// differently across releases (e.g., 0.12.0.1 accepted another bare CPU and a same-device forced copy, and 0.12.1
     /// rejected both). PJRT cross-host receives land in device memory and can then be copied to the requested memory on
-    /// that device. An explicit [`Layout`] applies to each destination shard. When the layout is omitted, the result
-    /// keeps the layout of the source only while that layout still describes each destination shard (e.g., the strides
+    /// that device. An explicit [`Layout`] applies to each target shard. When the layout is omitted, the result
+    /// keeps the layout of the source only while that layout still describes each target shard (e.g., the strides
     /// of a column shard do not describe the whole value that a gather produces), and declares no layout otherwise.
     /// Layout changes use a compiled conversion on each shard's device when supported. Otherwise, each affected local
     /// shard is read back and uploaded in the requested layout in the background, as for the host fallback. Both paths
     /// preserve the separate contributions along unreduced axes.
     ///
     /// Use [`Self::into_placement`] when the source array is no longer needed after the move. It consumes `self` and
-    /// lets PJRT reuse the source buffers for the destination where it can, which may avoid an extra allocation.
+    /// lets PJRT reuse the source buffers for the target where it can, which may avoid an extra allocation.
     ///
     /// # Parameters
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] specifying the destination.
+    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] describing where to place the array.
     #[inline]
     pub fn to_placement<P: Into<PlacementRequest>>(&self, session: &Session, target: P) -> Result<Self, Error> {
         self.clone()
@@ -315,10 +315,10 @@ impl Array {
     }
 
     /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the
-    /// destination. This is the `ryft` analogue of JAX's `jax.device_put(arr, sharding, donate=True)`.
+    /// target. This is the `ryft` analogue of JAX's `jax.device_put(arr, sharding, donate=True)`.
     ///
     /// Donation is best effort, as in JAX. Only the compiled reshard on the mesh of this array donates its input, and
-    /// PJRT may then reuse a source buffer for a destination shard, which can save the memory of the source array for
+    /// PJRT may then reuse a source buffer for a target shard, which can save the memory of the source array for
     /// large training tensors. Nothing guarantees that saving. A buffer can be reused only when every device holds a
     /// shard of the same type before and after the reshard, which is when the lowering pairs the output of the
     /// reshard with its donated input (e.g., completing a pending sum keeps the buffers of a uniquely owned array on
@@ -343,7 +343,7 @@ impl Array {
     /// # Parameters
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] specifying the destination.
+    ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] describing where to place the array.
     #[inline]
     pub fn into_placement<P: Into<PlacementRequest>>(self, session: &Session, target: P) -> Result<Self, Error> {
         self.place_with_request(session, target.into(), true, ValueComparison::of_session(session)?)
@@ -366,7 +366,7 @@ impl Array {
     /// # Parameters
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `request`: [`PlacementRequest`] that specifies the destination.
+    ///   - `request`: [`PlacementRequest`] that specifies the target.
     ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
     ///     its output (refer to [`Self::run_placement_dispatch`]).
     ///   - `comparison`: [`ValueComparison`] of the values of the processes, if this placement makes one.
@@ -384,23 +384,23 @@ impl Array {
             .map(|comparison| comparison.collective(session))
             .transpose()?;
         let same_client = std::ptr::eq(self.client(), session.client());
-        let destination = self
+        let target = self
             .validate_placement_client(session, Some(&request))
-            .and_then(|_| self.checked_destination(session, request, collective.is_some()));
+            .and_then(|_| self.checked_target(session, request, collective.is_some()));
         let verdict = collective
             .map(|collective| {
-                let digest = destination.as_ref().ok().and_then(|_| combined_digest([array_value_digest(&self)]));
+                let digest = target.as_ref().ok().and_then(|_| combined_digest([array_value_digest(&self)]));
                 collective.submit(session, digest)
             })
             .transpose();
-        let target = destination?;
+        let target = target?;
         let verdict = verdict?;
         let output = match same_client {
             true => self.run_placement_dispatch(session, &target, donate)?,
             false => self.place_from_other_client(session, &target)?,
         };
 
-        // A destination that names devices can already hold the input that this process chose on its own, while another
+        // A target that names devices can already hold the input that this process chose on its own, while another
         // process must move its input there, so such a placement is a new array on every process (refer to the identity
         // rules of `RetainedArray`).
         let output = if locally_assigned && !in_place { output.with_new_identity() } else { output };
@@ -420,7 +420,7 @@ impl Array {
         match request {
             _ if std::ptr::eq(self.client(), session.client()) => self.validate_session_placement(session),
             Some(PlacementRequest::InPlace { .. }) => Err(PjrtError::invalid_argument(
-                "cannot place an array of another PJRT client without naming the devices of the destination, because \
+                "cannot place an array of another PJRT client without naming the devices of the target, because \
                  the result must live on devices of the client of the session",
             )
             .into()),
@@ -432,12 +432,12 @@ impl Array {
     /// Checks, from metadata alone, a placement of this array, whose PJRT client is not that of `session`, onto
     /// `target`, which [`Self::place_from_other_client`] and the admission of an [`Array`] leaf of [`Session::place`]
     /// both call, so that they admit the same placements. PJRT copies buffers only within one client, so such a
-    /// placement reads the value back and uploads it. The destination session must recognize the mesh (refer to
+    /// placement reads the value back and uploads it. The target session must recognize the mesh (refer to
     /// [`validate_mesh_devices`]). For a value with bytes, the transfer must keep no distinct contributions apart
-    /// (refer to [`keeps_some_contributions`]). Each process that owns a destination device must be able to read
+    /// (refer to [`keeps_some_contributions`]). Each process that owns a target device must be able to read
     /// the full value back. A [locally assigned](Self::is_locally_assigned) source gives each process its own value.
     /// A standalone bridge between two fully local meshes permits different client process indices. Shared
-    /// distributed placement requires a common process numbering scheme and a single destination owner, which
+    /// distributed placement requires a common process numbering scheme and a single target owner, which
     /// every participant identifies and checks against the source shard metadata.
     fn validate_placement_from_other_client(&self, session: &Session, target: &Placement) -> Result<(), Error> {
         validate_mesh_devices(session, target.mesh())?;
@@ -448,7 +448,7 @@ impl Array {
         }
         if keeps_some_contributions(self.sharding(), target.sharding()) {
             return Err(PjrtError::invalid_argument(
-                "cannot place an array of another PJRT client onto a destination that keeps the contributions of its \
+                "cannot place an array of another PJRT client onto a target that keeps the contributions of its \
                  pending reduction or manual variation apart, because the transfer between the clients reads back \
                  their combined value",
             )
@@ -513,7 +513,7 @@ impl Array {
     /// failures. The result is [committed](Self::is_committed), not [locally assigned](Self::is_locally_assigned), and
     /// in the memory that `target` names, or in the memory of this array otherwise, as within one client (refer to
     /// [`PlacementRequest::target_memory`], which resolves the default memory of a request for a device into `target`).
-    /// A destination device without that memory is an [`ArrayError::UnsupportedMemory`] error of the process that owns
+    /// A target device without that memory is an [`ArrayError::UnsupportedMemory`] error of the process that owns
     /// it. Donation never applies, because no buffer of this array can become a buffer of the result. A process that
     /// owns no device of `target` reads nothing back and returns the placement without buffers. The caller checks the
     /// placement first with [`Self::validate_placement_from_other_client`].
@@ -532,9 +532,9 @@ impl Array {
     /// `mesh` according to `sharding`, in `memory` and `layout`, as an array of `session`. This is the host round trip
     /// that the host fallback of [`Self::run_placement_dispatch`], [`Self::place_from_other_client`], and the upload of
     /// [`Self::place_process_local_value`] share. The
-    /// destination buffers are created up front and the readback and the upload run in the background (refer to
+    /// target buffers are created up front and the readback and the upload run in the background (refer to
     /// [`Self::from_host_buffer_in_background`]), whose failures, including those of the work that produces this
-    /// array, `poison` converts into the error that the destination buffers report. Only when the PJRT plugin lacks
+    /// array, `poison` converts into the error that the target buffers report. Only when the PJRT plugin lacks
     /// host to device transfer managers or their literal transfers does this function read back and upload on the
     /// calling thread, and the execution fence of the result then joins the readiness of its uploads and the execution
     /// fence of this array. A process that owns no device of `mesh` reads nothing back, and a [`DataType::Zero`] value
@@ -589,12 +589,12 @@ impl Array {
     ///
     ///   - `session`: [`Session`] that executes the reshard and owns the resulting array. It must use the same PJRT
     ///     client as this array.
-    ///   - `mesh`: Destination [`DeviceMesh`].
-    ///   - `sharding`: Destination [`Sharding`].
+    ///   - `mesh`: Target [`DeviceMesh`].
+    ///   - `sharding`: Target [`Sharding`].
     ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
     ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     ///
-    /// The result has the memory of this array and the layout that [`Self::placement_layout`] keeps for the destination
+    /// The result has the memory of this array and the layout that [`Self::placement_layout`] keeps for the target
     /// shards, which a device reshard changes neither, as [`Self::run_placement_dispatch`] gives its result the storage
     /// that it promises (e.g., an executable that declares the layout of its input accepts the result of a reshard of
     /// that input).
@@ -629,7 +629,7 @@ impl Array {
     /// Returns this array without the completion fence of the cross-host sends of the placement that produced it (refer
     /// to `Array::send_fence`). Those sends belong to that placement, so every placement that returns this array, its
     /// buffers, or copies of them without sending anything itself (e.g., one that keeps the devices and the sharding of
-    /// this array, with or without a destination, and with or without a forced copy) returns it through this function.
+    /// this array, with or without a target, and with or without a forced copy) returns it through this function.
     pub(super) fn without_previous_sends(mut self) -> Self {
         self.send_fence = None;
         self
@@ -690,18 +690,18 @@ impl Array {
     /// devices](Self::is_locally_assigned), even when they are the devices of this array, and a caller whose request
     /// named only a memory or a layout restores that fact (refer to [`Self::place_with_request`]).
     ///
-    /// The requested layout (refer to [`Self::checked_placement_layout`]) and the destination devices (refer to
+    /// The requested layout (refer to [`Self::checked_placement_layout`]) and the target devices (refer to
     /// [`validate_mesh_devices`]) are checked before any device work, because a placement without buffers (e.g., of a
-    /// [`DataType::Zero`] array) would otherwise never check the layout, and a device that the destination
+    /// [`DataType::Zero`] array) would otherwise never check the layout, and a device that the target
     /// misattributes would receive no buffer in any process. When the device work fails and returns this array, the
     /// host fallback runs [`Self::upload_host_readback`]. Whatever this function can reject before reading back (e.g.,
-    /// a destination mesh that this process does not fully address or a source that this process cannot read back) is
+    /// a target mesh that this process does not fully address or a source that this process cannot read back) is
     /// reported with the error of the device work.
     ///
     /// # Parameters
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
-    ///   - `target`: Resolved destination [`Placement`] (refer to [`Self::resolve_placement_request`]).
+    ///   - `target`: Resolved [`Placement`] (refer to [`Self::resolve_placement_request`]).
     ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
     ///     its output. The donation only takes effect when this array is the only handle of its buffers.
     pub(crate) fn run_placement_dispatch(
@@ -710,7 +710,7 @@ impl Array {
         target: &Placement,
         donate: bool,
     ) -> Result<Self, Error> {
-        // A placement may return the input or share its buffers. Associate it with the destination session before
+        // A placement may return the input or share its buffers. Associate it with the target session before
         // choosing a strategy. Consuming `self` keeps the buffers uniquely owned for a donation.
         let array = self.with_session(session)?;
         let layout = array.checked_placement_layout(session, target)?;
@@ -749,9 +749,9 @@ impl Array {
         // A placement that keeps some contributions of a pending reduction or of manual variation within a tile never
         // reads back their combined value (refer to `keeps_some_contributions`), so the failure of its device work is
         // final.
-        let destination_fully_addressable = mesh.devices().iter().all(|device| device.process_index() == local_process);
+        let target_fully_addressable = mesh.devices().iter().all(|device| device.process_index() == local_process);
         if keeps_some_contributions(source.sharding(), &sharding)
-            || !destination_fully_addressable
+            || !target_fully_addressable
             || source.validate_host_readback().is_err()
         {
             return Err(compiled_error);
@@ -778,14 +778,14 @@ impl Array {
         self.placement_planning_view().communicates(self.is_locally_assigned(), mesh, sharding)
     }
 
-    /// Validates the destination and checks that required whole-shard moves from a shared array have local sources.
-    pub(super) fn validate_array_destination(
+    /// Validates the target and checks that required whole-shard moves from a shared array have local sources.
+    pub(super) fn validate_array_target(
         &self,
         session: &Session,
         target: Option<PlacementRequest>,
     ) -> Result<(), Error> {
         let Some(target) = target else { return Ok(()) };
-        let placement = self.checked_destination(session, target, true)?;
+        let placement = self.checked_target(session, target, true)?;
         if !std::ptr::eq(self.client(), session.client()) {
             return Ok(());
         }
@@ -807,19 +807,19 @@ impl Array {
             let replicas = LocalReplicas::new(process_index);
             for movement in plan.moves.iter().filter(|movement| movement.source_device.process_index() == process_index)
             {
-                self.local_replica(&replicas, movement.source_shard_index, movement.destination_device)?;
+                self.local_replica(&replicas, movement.source_shard_index, movement.target_device)?;
             }
         }
         Ok(())
     }
 
-    /// Resolves `request` into the destination of a placement of this array and checks it from metadata: a destination
-    /// of another PJRT client with [`Self::validate_placement_from_other_client`], and otherwise its devices with
-    /// [`validate_mesh_devices`] when `check_devices` is set and its layout with [`Self::checked_placement_layout`].
+    /// Resolves `request` into a target placement and validates it from metadata. For a target of another PJRT client,
+    /// validation uses [`Self::validate_placement_from_other_client`]. Otherwise it checks the devices with
+    /// [`validate_mesh_devices`] if `check_devices` is set and checks the layout with [`Self::checked_placement_layout`].
     /// The admission of [`Session::place`] and a placement that compares values, which submits its comparison before
     /// [`Self::run_placement_dispatch`] checks the devices, set `check_devices`. Any other placement leaves that check,
     /// and the order of its errors, to [`Self::run_placement_dispatch`].
-    fn checked_destination(
+    fn checked_target(
         &self,
         session: &Session,
         request: PlacementRequest,
@@ -837,7 +837,7 @@ impl Array {
         Ok(target)
     }
 
-    /// Resolves the destination layout and checks that the plugin can create it before this placement submits any
+    /// Resolves the target layout and checks that the plugin can create it before this placement submits any
     /// device work. A placement that keeps the devices, sharding, and storage can reuse its existing buffers.
     fn checked_placement_layout(&self, session: &Session, target: &Placement) -> Result<Option<Layout>, Error> {
         let layout = self.placement_layout(target.layout(), target.mesh(), target.sharding())?;
@@ -853,10 +853,10 @@ impl Array {
 
     /// Returns the layout that each shard of a placement of this array on `mesh` according to `sharding` has, which is
     /// `requested` when the placement names a layout, and the layout of this array otherwise, but only while that
-    /// layout still describes the destination shards, as the type rule of the placement keeps it (e.g., the strides of
+    /// layout still describes the target shards, as the type rule of the placement keeps it (e.g., the strides of
     /// a column shard do not describe the value that a gather produces). It reads only the type of this array and the
-    /// destination, which every process shares, so every process and every strategy of a placement record the same
-    /// layout. A requested layout is validated against the destination shards here, because a placement without
+    /// target, which every process shares, so every process and every strategy of a placement record the same
+    /// layout. A requested layout is validated against the target shards here, because a placement without
     /// buffers never meets a buffer that would reject it.
     fn placement_layout(
         &self,
@@ -905,7 +905,7 @@ impl Array {
         Ok(self)
     }
 
-    /// Applies storage requirements to the shards already on their destination devices. A layout change first tries a
+    /// Applies storage requirements to the shards already on their target devices. A layout change first tries a
     /// compiled conversion on the device of each shard, and uses a host round trip for that shard when the plugin
     /// cannot lower or compile that conversion (refer to [`Self::try_relayout_shard_on_device`]). Once a buffer
     /// has the requested layout, it can be reused or copied directly to the requested memory. The result keeps the
@@ -971,7 +971,7 @@ impl Array {
         let session = self.session();
         let target_layout = layout.map(ToPjrt::to_pjrt).transpose()?;
         let device = source_buffer.device()?;
-        let destination_memory = device.memory(memory)?;
+        let target_memory = device.memory(memory)?;
         let layout_change = match layout.zip(target_layout.as_ref()) {
             Some((layout, target_layout)) => {
                 let current_layout = source_buffer.specification()?.layout;
@@ -990,7 +990,7 @@ impl Array {
             None => Some(Arc::clone(source_buffer)),
         };
         if let Some(buffer) = &buffer
-            && buffer.memory()? == destination_memory
+            && buffer.memory()? == target_memory
         {
             return Ok(Arc::clone(buffer));
         }
@@ -998,7 +998,7 @@ impl Array {
             buffer.as_ref(),
             source_buffer,
             shard.descriptor(),
-            destination_memory,
+            target_memory,
             || Ok(target_layout),
             work,
             completion,
@@ -1133,23 +1133,23 @@ impl Array {
     /// `memory`, with local work only. Every other process of the placement does the same with its own such array, so
     /// the result holds the shards of this process, and the other processes hold the rest. This is how JAX places an
     /// uncommitted array on devices of several processes, except that JAX also checks that the processes hold equal
-    /// values when the destination includes every process. Nothing compares the values here, so every process must
+    /// values when the target includes every process. Nothing compares the values here, so every process must
     /// pass an equal value, as for [`Array::from_host_buffer`], and differing values leave the replicas inconsistent.
     ///
-    /// A destination shard that covers the whole array shares the buffer of this array when it is on the same device
-    /// and in the same memory, and is a copy otherwise. When a destination shard covers only a part of the array, that
-    /// part is sliced on the device of this array, as for shard regions, and copied to its destination. Slicing needs
-    /// an array in the default device memory without a declared layout, and every destination device must hold one
-    /// value per slice. Otherwise (e.g., along an unreduced destination axis, whose devices away from coordinate zero
+    /// A target shard that covers the whole array shares the buffer of this array when it is on the same device
+    /// and in the same memory, and is a copy otherwise. When a target shard covers only a part of the array, that
+    /// part is sliced on the device of this array, as for shard regions, and copied to its target. Slicing needs
+    /// an array in the default device memory without a declared layout, and every target device must hold one
+    /// value per slice. Otherwise (e.g., along an unreduced target axis, whose devices away from coordinate zero
     /// hold additive identities), this process reads its value back and uploads the shards of its devices as
     /// [`Array::from_host_buffer`] does, in the background when the PJRT plugin supports it. The execution fence of the
     /// result joins the fence of this array with the readiness of the buffer of this array that it reads, of every
     /// buffer that this function creates, and the fences of the slices (or, for the upload, the readiness that its
-    /// readback waits for). When no destination device belongs to this process, it reads nothing back and its result
+    /// readback waits for). When no target device belongs to this process, it reads nothing back and its result
     /// joins the fence of this array with the readiness of every buffer of this array, so the result still waits for
     /// and reports the producer of this array.
     ///
-    /// `layout` is the layout that the placement records for each destination shard (refer to
+    /// `layout` is the layout that the placement records for each target shard (refer to
     /// [`Self::placement_layout`]). The upload uses it directly, and shared or sliced buffers record it only when they
     /// have it, so this strategy records the layout that the other strategies of the placement record, whichever of
     /// them another process takes.
@@ -1164,11 +1164,11 @@ impl Array {
         let client = session.client();
         let process_index = client.process_index()?;
         let shape = self.shape();
-        let destination_layout = ShardLayout::new(&shape, mesh, sharding)?;
-        let destinations = destination_layout
+        let target_layout = ShardLayout::new(&shape, mesh, sharding)?;
+        let targets = target_layout
             .descriptors()
             .iter()
-            .filter(|destination| destination.device().process_index() == process_index)
+            .filter(|target| target.device().process_index() == process_index)
             .collect::<Vec<_>>();
         let host_type = ArrayType::new(self.data_type(), shape.clone().into())
             .with_memory(memory)
@@ -1180,17 +1180,16 @@ impl Array {
                 && sharding.holds_one_value_per_slice()
                 && (!slices || (self.r#type().memory() == Memory::Device && self.layout().is_none()))
         };
-        let slices = destinations.iter().any(|destination| !whole(destination.slice()));
+        let slices = targets.iter().any(|target| !whole(target.slice()));
         // Whether some process reads its value back and uploads it reads only metadata that every process shares (a
-        // process slices whenever some destination shard covers a part of the value), so a process that does not
-        // upload itself (e.g., one without destination devices) checks, in the same order, what the readback and the
+        // process slices whenever some target shard covers a part of the value), so a process that does not
+        // upload itself (e.g., one without target devices) checks, in the same order, what the readback and the
         // upload of another process check from metadata before they submit anything (refer to
         // `validate_one_value_per_contribution` and `Self::validate_host_upload`), and every process returns the
         // same error. What depends on the buffers or the devices of one process (e.g., a missing local buffer) remains
         // an error of that process.
-        let uploads_here = !destinations.is_empty() && !on_devices_with(slices);
-        if !uploads_here && !on_devices_with(destination_layout.descriptors().iter().any(|shard| !whole(shard.slice())))
-        {
+        let uploads_here = !targets.is_empty() && !on_devices_with(slices);
+        if !uploads_here && !on_devices_with(target_layout.descriptors().iter().any(|shard| !whole(shard.slice()))) {
             if !shape.as_slice().contains(&0) {
                 validate_one_value_per_contribution(
                     self.mesh(),
@@ -1200,11 +1199,11 @@ impl Array {
             }
             Self::validate_host_upload(session, host_type.clone(), mesh, sharding)?;
         }
-        // A process without destination devices takes no part, so it reads nothing back and returns the metadata of the
+        // A process without target devices takes no part, so it reads nothing back and returns the metadata of the
         // result, which waits for and reports the buffers of this array and its producer. A process that is not the
-        // owner of a destination on which the owner runs a shared strategy takes `DevicePlacementStrategy::OnOwner`
+        // owner of a target on which the owner runs a shared strategy takes `DevicePlacementStrategy::OnOwner`
         // instead, and never gets here (refer to `Self::device_placement_strategy`).
-        if destinations.is_empty() {
+        if targets.is_empty() {
             return self.metadata_only_placement(session, host_type, mesh, sharding);
         }
         let source = match self.shards() {
@@ -1214,35 +1213,35 @@ impl Array {
         if let Some(source) = source.filter(|_| on_devices_with(slices)) {
             let devices = self.addressable_devices_by_id(process_index)?;
             // The source buffer can be the only completion of the work that produced it (e.g., of a pending host
-            // upload, which has no execution fence), and no destination buffer reads it when no destination device
+            // upload, which has no execution fence), and no target buffer reads it when no target device
             // belongs to this process, so the result waits for it directly.
             let mut completion = PlacementCompletion::default();
             completion.track_buffer(source.buffer().unwrap())?;
             let mut work = session.reserve_work();
-            let mut buffers = Vec::with_capacity(destinations.len());
-            for destination in destinations {
-                let device = devices.get(destination.device().id())?;
+            let mut buffers = Vec::with_capacity(targets.len());
+            for target in targets {
+                let device = devices.get(target.device().id())?;
                 let source_buffer = Arc::clone(source.buffer().unwrap());
                 let buffer = Self::prepare_shard_region(
                     session,
                     self.data_type(),
                     source,
                     source_buffer,
-                    destination.slice(),
+                    target.slice(),
                     None,
                     &mut completion,
                 )?;
-                let destination_memory = device.memory(memory)?;
-                if buffer.memory()? == destination_memory {
+                let target_memory = device.memory(memory)?;
+                if buffer.memory()? == target_memory {
                     buffers.push(buffer);
                     continue;
                 }
                 buffers.push(self.copy_shard_to_memory(
                     Some(&buffer),
                     &buffer,
-                    destination,
-                    destination_memory,
-                    || self.layout().filter(|_| source.slice() == destination.slice()).map(ToPjrt::to_pjrt).transpose(),
+                    target,
+                    target_memory,
+                    || self.layout().filter(|_| source.slice() == target.slice()).map(ToPjrt::to_pjrt).transpose(),
                     &mut work,
                     &mut completion,
                 )?);
@@ -1268,14 +1267,14 @@ impl Array {
         // Read the value back and upload the shards of the devices of this process. The early return of
         // `Self::upload_host_readback` is never taken from here, because a `DataType::Zero` source is placed as
         // `DevicePlacementStrategy::Bufferless` before `ProcessLocalValue` can be chosen (refer to
-        // `Self::device_placement_strategy`), and `destinations` holds a destination device of this process.
+        // `Self::device_placement_strategy`), and `targets` holds a target device of this process.
         let (mesh, sharding) = (mesh.clone(), sharding.clone());
         self.upload_host_readback(session, mesh, sharding, memory, layout.cloned(), Error::into_pjrt_error)
     }
 
     /// Places this array on `mesh` according to `sharding` and in `memory` by sharing, copying, and transferring the
     /// whole shards that `plan` describes, which [`Self::device_placement_strategy`] chose with `cross_host_layouts`.
-    /// [`Self::exact_shard_buffers`] provides the destination shards and the layout that the result records. The
+    /// [`Self::exact_shard_buffers`] provides the target shards and the layout that the result records. The
     /// execution fence of the result joins the execution fence of this array, so that errors of the execution that
     /// produced this array still surface through the result, with the readiness of every buffer that this placement
     /// copies or receives and the fences of the conversions that it runs (refer to [`crate::arrays::resharding`]). The
@@ -1295,24 +1294,24 @@ impl Array {
             self.exact_shard_buffers(plan, cross_host_layouts, memory, &mut completion)?;
 
         // A shard without elements holds no contribution, so the plan moves nothing to it (refer to
-        // `plan_exact_shard_put`), and this process creates its own empty destination shards after its transfers, as
+        // `plan_exact_shard_put`), and this process creates its own empty target shards after its transfers, as
         // shard regions do. The buffers of its empty source shards, which no move reads, still report their failures.
         let client = session.client();
         let process_index = client.process_index()?;
         let is_empty = |slice: &[Range<usize>]| slice.iter().any(Range::is_empty);
         completion.track_empty_shard_buffers(self)?;
-        let destination_layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
-        let empty_destinations = destination_layout
+        let target_layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
+        let empty_targets = target_layout
             .descriptors()
             .iter()
             .filter(|shard| shard.device().process_index() == process_index && is_empty(shard.slice()))
             .collect::<Vec<_>>();
-        if !empty_destinations.is_empty() {
+        if !empty_targets.is_empty() {
             let devices = self.addressable_devices_by_id(process_index)?;
             let device_layout = layout.as_ref().map(ToPjrt::to_pjrt).transpose()?;
             let buffer_type = self.data_type().executable_buffer_type();
             let mut work = session.reserve_work();
-            for shard in empty_destinations {
+            for shard in empty_targets {
                 let device = devices.get(shard.device().id())?;
                 let dimensions = shard.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
                 let empty = Arc::<[u8]>::from([]);
@@ -1345,9 +1344,9 @@ impl Array {
         Ok(output)
     }
 
-    /// Returns the buffers of the destination shards that `session` can address for the moves of whole shards that
+    /// Returns the buffers of the target shards that `session` can address for the moves of whole shards that
     /// `plan` describes (refer to [`plan_exact_shard_put`]). A shard can share its source buffer when the device
-    /// and memory match. Other local source shards are copied to the destination memory, and remote source shards
+    /// and memory match. Other local source shards are copied to the target memory, and remote source shards
     /// arrive through the PJRT cross-host transfers extension. `cross_host_layouts` holds the default layout of the
     /// shape of every shard that crosses processes. A local copy may read another replica of this process than the one
     /// that `plan` names, when that one has no buffer, because no other process takes part in it (refer to
@@ -1364,7 +1363,7 @@ impl Array {
     /// records no layout, and the caller applies the requested layout afterwards (e.g., [`Self::place_storage`]).
     ///
     /// The buffers come with the recorded layout and with the completion fence of the cross-host sends that this
-    /// process issues for the destination shards of other processes, or `None` when it issues none. This function
+    /// process issues for the target shards of other processes, or `None` when it issues none. This function
     /// never waits for those sends (refer to [`crate::arrays::resharding`]), and the caller retains the fence in the
     /// placed array. Every process derives the same plan from global metadata, so each send has exactly one matching
     /// receive, and [`issue_cross_host_transfers`] issues the transfers of all processes in one global order.
@@ -1372,7 +1371,7 @@ impl Array {
     /// Before its first transfer, this function only prepares every buffer that it sends (i.e., a copy of a replica
     /// that serves a missing one and a conversion to the layout of the receiver, each once per source shard, however
     /// many processes receive that shard) and looks up the devices of its receives. It checks the replicas that serve
-    /// its local copies and the destination memory of its devices only after it issued every transfer, as the accepted
+    /// its local copies and the target memory of its devices only after it issued every transfer, as the accepted
     /// limitation of [`crate::arrays::resharding`] requires.
     ///
     /// `completion` records the readiness of every buffer that this function copies or receives and the fences of
@@ -1407,7 +1406,7 @@ impl Array {
             };
             transfers.push(CrossHostTransfer::Send {
                 source: movement.source_device.id(),
-                destination: movement.destination_device.id(),
+                target: movement.target_device.id(),
                 transfer_key: movement.transfer_key,
                 buffer,
             });
@@ -1415,11 +1414,11 @@ impl Array {
         for movement in plan.moves_with_role(process_index, MoveRole::Receive) {
             transfers.push(CrossHostTransfer::Receive {
                 source: movement.source_device.id(),
-                destination: movement.destination_device.id(),
+                target: movement.target_device.id(),
                 transfer_key: movement.transfer_key,
-                device: devices.get(movement.destination_device.id())?,
+                device: devices.get(movement.target_device.id())?,
                 element_type: plan.element_type,
-                dimensions: cross_host_shape(movement.destination_shard_index, &movement.shape())?,
+                dimensions: cross_host_shape(movement.target_shard_index, &movement.shape())?,
             });
         }
         let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, memory)?;
@@ -1429,21 +1428,20 @@ impl Array {
             addressable_buffers.push(Arc::new(received.buffer));
         }
 
-        // Arrays never mutate their buffers and donation skips buffers that are shared, so a destination shard on the
-        // device of its source shard shares the buffer of that shard instead of copying it. Copying to the destination
+        // Arrays never mutate their buffers and donation skips buffers that are shared, so a target shard on the
+        // device of its source shard shares the buffer of that shard instead of copying it. Copying to the target
         // device itself would always allocate in its default memory, so other copies go to the requested memory.
         let source_memory = self.r#type().memory();
         let mut work = session.reserve_work();
         for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
-            let (shard, buffer) =
-                self.local_replica(&replicas, movement.source_shard_index, movement.destination_device)?;
-            let same_device = shard.device() == movement.destination_device;
+            let (shard, buffer) = self.local_replica(&replicas, movement.source_shard_index, movement.target_device)?;
+            let same_device = shard.device() == movement.target_device;
             if same_device && memory == source_memory {
                 addressable_buffers.push(Arc::clone(buffer));
                 continue;
             }
-            let destination_memory = devices.get(movement.destination_device.id())?.memory(memory)?;
-            if same_device && buffer.memory()? == destination_memory {
+            let target_memory = devices.get(movement.target_device.id())?.memory(memory)?;
+            if same_device && buffer.memory()? == target_memory {
                 addressable_buffers.push(Arc::clone(buffer));
                 continue;
             }
@@ -1451,7 +1449,7 @@ impl Array {
                 Some(buffer),
                 buffer,
                 shard.descriptor(),
-                destination_memory,
+                target_memory,
                 || self.layout().map(ToPjrt::to_pjrt).transpose(),
                 &mut work,
                 completion,
@@ -1475,11 +1473,11 @@ impl Array {
     }
 
     /// Returns the shard of this array that serves a move between two devices of this process, whose process index is
-    /// `process_index`, to `destination`, together with its buffer. The move names the shard at `preferred`, which a
+    /// `process_index`, to `target`, together with its buffer. The move names the shard at `preferred`, which a
     /// plan chose from metadata that every process shares (e.g., the source of a local copy of whole shards or of a
     /// shard region), and that shard serves whenever it has a buffer. Otherwise, another replica of its slice on this
     /// process with a buffer serves instead (e.g., for an array that holds only some of its replicas), the one on
-    /// `destination` first and then the one with the lowest device identifier, so that the choice stays deterministic.
+    /// `target` first and then the one with the lowest device identifier, so that the choice stays deterministic.
     /// The replicas are the shards that hold the same contribution (i.e., of the same slice and with the same
     /// coordinates along unreduced and varying manual axes, refer to [`ShardContribution`]), so a replica holds the
     /// same bytes also for an array with a pending reduction (e.g., the source of an introduced sum, refer to
@@ -1487,7 +1485,7 @@ impl Array {
     /// may read another replica directly, because the peer of a cross-host transfer pairs it with the device of the
     /// preferred shard, so a cross-host send first copies that replica to that device (refer to
     /// [`Self::cross_host_source_buffer`]). `replicas` is the index of the local replicas of this array that the caller
-    /// keeps for the whole placement, so that many destinations of one resident replica cost linear work in all.
+    /// keeps for the whole placement, so that many targets of one resident replica cost linear work in all.
     ///
     /// # Errors
     ///
@@ -1497,7 +1495,7 @@ impl Array {
         &self,
         replicas: &LocalReplicas,
         preferred: ShardIndex,
-        destination: Device,
+        target: Device,
     ) -> Result<(&ArrayShard, &Arc<Buffer<'static>>), Error> {
         let preferred_shard = &self.shards()[preferred];
         if let Some(buffer) = preferred_shard.buffer() {
@@ -1517,14 +1515,14 @@ impl Array {
             index
         });
         let contribution = self.shard_contribution(preferred_shard.descriptor());
-        // The replica on `destination` serves first, and otherwise the one with the lowest device identifier.
-        let on_destination = self.device_shard(destination.id()).filter(|shard| {
+        // The replica on `target` serves first, and otherwise the one with the lowest device identifier.
+        let on_target = self.device_shard(target.id()).filter(|shard| {
             holds_buffer(shard)
-                && shard.device() == destination
+                && shard.device() == target
                 && self.shard_contribution(shard.descriptor()) == contribution
         });
         let first = || index.get(&contribution).and_then(|shards| shards.first()).map(|&shard| &self.shards()[shard]);
-        on_destination.or_else(first).map(|shard| (shard, shard.buffer().unwrap())).ok_or_else(|| {
+        on_target.or_else(first).map(|shard| (shard, shard.buffer().unwrap())).ok_or_else(|| {
             Error::from(ArrayError::MissingShardBuffer {
                 shard_index: preferred,
                 device_id: preferred_shard.device().id(),
@@ -1539,7 +1537,7 @@ impl Array {
     /// the replica of its slice that [`Self::local_replica`] selects (e.g., of an array imported with a buffer for only
     /// one of its local replicas) is copied to the memory of `device` that the type of this array declares.
     /// `completion` records the readiness of the returned buffer in both cases, so that the result of a placement that
-    /// only sends from this process (e.g., to a destination without devices of this process) still reports a failure of
+    /// only sends from this process (e.g., to a target without devices of this process) still reports a failure of
     /// the work that produced the sent buffer, which may have no other fence (e.g., a pending host upload, whose
     /// readiness only its buffer carries) and whose failure a plugin need not report through the send.
     ///
@@ -1658,8 +1656,8 @@ impl Array {
     }
 
     /// Places this array on `mesh` according to `sharding` by slicing on the source devices and joining the received
-    /// regions on the destination devices, which [`Self::device_placement_strategy`] chose with `plan` (i.e., the moves
-    /// of the regions of every destination shard) and `remote_layouts` (i.e., the default layout of the shape of every
+    /// regions on the target devices, which [`Self::device_placement_strategy`] chose with `plan` (i.e., the moves
+    /// of the regions of every target shard) and `remote_layouts` (i.e., the default layout of the shape of every
     /// region that crosses processes), both of which [`PlacementPlanningView::shard_region_plan`] derived. Every
     /// process derives the same plan, and each one performs only the part of each move that [`ShardMove::role`] assigns
     /// to it.
@@ -1678,7 +1676,7 @@ impl Array {
         remote_layouts: &HashMap<StaticShape, ryft_pjrt::Layout>,
     ) -> Result<Self, Error> {
         let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
-        let destinations = layout.descriptors();
+        let targets = layout.descriptors();
         let session = self.session();
         let client = session.client();
         let process_index = client.process_index()?;
@@ -1697,7 +1695,7 @@ impl Array {
         let mut transfers = Vec::new();
         let mut staged_buffers = HashMap::new();
         for movement in &plan.moves {
-            let device = movement.destination_device;
+            let device = movement.target_device;
             match movement.role(process_index) {
                 Some(MoveRole::Send) => {
                     let source = &self.shards()[movement.source_shard_index];
@@ -1726,27 +1724,27 @@ impl Array {
                     )?;
                     transfers.push(CrossHostTransfer::Send {
                         source: movement.source_device.id(),
-                        destination: device.id(),
+                        target: device.id(),
                         transfer_key: movement.transfer_key,
                         buffer,
                     });
                 }
                 Some(MoveRole::Receive) => transfers.push(CrossHostTransfer::Receive {
                     source: movement.source_device.id(),
-                    destination: device.id(),
+                    target: device.id(),
                     transfer_key: movement.transfer_key,
                     device: devices.get(device.id())?,
                     element_type: plan.element_type,
-                    dimensions: cross_host_shape(movement.destination_shard_index, &movement.shape())?,
+                    dimensions: cross_host_shape(movement.target_shard_index, &movement.shape())?,
                 }),
                 Some(MoveRole::Copy) | None => {}
             }
         }
         let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, Memory::Device)?;
-        let mut destination_buffers = HashMap::new();
+        let mut target_buffers = HashMap::new();
         for received in received_buffers {
             completion.track_buffer(&received.buffer)?;
-            destination_buffers.insert(received.transfer_key, Arc::new(received.buffer));
+            target_buffers.insert(received.transfer_key, Arc::new(received.buffer));
         }
 
         completion.track_empty_shard_buffers(self)?;
@@ -1756,7 +1754,7 @@ impl Array {
         // shard is the shard itself or a copy of a replica of its contribution on its device, so the regions of both
         // phases share one staged buffer for each shard.
         for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
-            let device = movement.destination_device;
+            let device = movement.target_device;
             let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index, device)?;
             let buffer = match staged_buffers.entry(source.index()) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -1772,38 +1770,38 @@ impl Array {
             } else {
                 completion.track_new(&mut work, buffer.copy_to_device(devices.get(device.id())?.clone())?)?
             };
-            destination_buffers.insert(movement.transfer_key, buffer);
+            target_buffers.insert(movement.transfer_key, buffer);
         }
 
-        let mut regions = vec![Vec::new(); destinations.len()];
+        let mut regions = vec![Vec::new(); targets.len()];
         for movement in &plan.moves {
-            regions[movement.destination_shard_index].push(movement);
+            regions[movement.target_shard_index].push(movement);
         }
         let mut buffers = Vec::new();
-        for (destination, regions) in destinations.iter().zip(regions) {
-            let device = destination.device();
+        for (target, regions) in targets.iter().zip(regions) {
+            let device = target.device();
             if device.process_index() != process_index {
                 continue;
             }
             // An empty shard has no intersections to transfer or concatenate. Its exact shape still belongs
             // to the result, even when another dimension of that shape is nonzero.
-            if destination.slice().iter().any(Range::is_empty) {
-                let dimensions = destination.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
+            if target.slice().iter().any(Range::is_empty) {
+                let dimensions = target.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
                 let specification = BufferSpecification::new(data_type.executable_buffer_type(), dimensions);
                 let buffer = client.uninitialized_buffer(specification, devices.get(device.id())?.clone())?;
                 buffers.push(completion.track_new(&mut work, buffer)?);
                 continue;
             }
-            // Every region of a local destination has exactly one local copy or cross-host receive.
-            let missing = ArrayError::MissingShardBuffer { shard_index: destination.index(), device_id: device.id() };
+            // Every region of a local target has exactly one local copy or cross-host receive.
+            let missing = ArrayError::MissingShardBuffer { shard_index: target.index(), device_id: device.id() };
             let pieces = regions
                 .into_iter()
                 .map(|movement| {
-                    let buffer = destination_buffers.remove(&movement.transfer_key).ok_or_else(|| missing.clone())?;
+                    let buffer = target_buffers.remove(&movement.transfer_key).ok_or_else(|| missing.clone())?;
                     Ok((movement.slice.as_slice(), buffer))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            buffers.push(Self::assemble_shard_regions(session, data_type, destination, pieces, &mut completion)?);
+            buffers.push(Self::assemble_shard_regions(session, data_type, target, pieces, &mut completion)?);
         }
         let r#type = self.r#type().into_owned().with_memory(Memory::Device).with_layout(None).with_sharding(None)?;
         let mut output = Self::from_addressable_buffers_internal(
@@ -1896,12 +1894,12 @@ impl Array {
         Ok(buffer)
     }
 
-    /// Concatenates the transferred regions of a shard on its destination device, each given with its slice in global
+    /// Concatenates the transferred regions of a shard on its target device, each given with its slice in global
     /// array coordinates. `completion` records the fences of the concatenations.
     fn assemble_shard_regions(
         session: &Session,
         data_type: DataType,
-        destination: &ShardDescriptor,
+        target: &ShardDescriptor,
         mut pieces: Vec<(&[Range<usize>], Arc<Buffer<'static>>)>,
         completion: &mut PlacementCompletion,
     ) -> Result<Arc<Buffer<'static>>, Error> {
@@ -1913,14 +1911,14 @@ impl Array {
             .map(|(slice, buffer)| {
                 let shape = StaticShape::new(slice.iter().map(Range::len).collect::<Vec<_>>());
                 let r#type = ArrayType::new(data_type, shape.into());
-                let value = Self::wrap_device_buffer(session, r#type, destination.device(), buffer)?;
+                let value = Self::wrap_device_buffer(session, r#type, target.device(), buffer)?;
                 Ok((slice, value))
             })
             .collect::<Result<Vec<_>, Error>>()?;
 
         // The intersections form a Cartesian grid, sorted by their starting coordinates. Join the innermost
         // dimension first so that the pieces agree along every other dimension for each concatenation.
-        for axis in (0..destination.slice().len()).rev() {
+        for axis in (0..target.slice().len()).rev() {
             let mut joined = Vec::new();
             for group in values.chunk_by(|(left, _), (right, _)| left[..axis] == right[..axis]) {
                 let value = if group.len() == 1 {
@@ -1965,7 +1963,7 @@ impl Array {
     /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation, and
     /// execution failures propagate through [`Error`] without losing their typed payloads.
     ///
-    /// `layout` is the layout of each destination shard that the placement records (refer to
+    /// `layout` is the layout of each target shard that the placement records (refer to
     /// [`Self::placement_layout`]), which [`Self::place_process_local_value`] uploads into directly. `host_fallback`
     /// is whether the caller falls back to a host round trip. Without one (e.g., for [`Self::reshard_on_devices`]), a
     /// change of reduction state that only a host round trip makes exactly is an error right after the planning,
@@ -2086,7 +2084,7 @@ impl Array {
                 }
             }
             DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard } => {
-                // A change of memory can use device storage for the intermediate compiled reshard. The destination
+                // A change of memory can use device storage for the intermediate compiled reshard. The target
                 // then moves the completed shards to the requested tier, without requiring SPMD execution there.
                 let source_memory = self.r#type().memory();
                 let intermediate_memory = if memory == source_memory { memory } else { Memory::Device };
@@ -2171,9 +2169,9 @@ impl Array {
                     .map_err(|error| (error, source))
             }
             DevicePlacementStrategy::HostRoundTrip { cause, process_index: owner } => match owner {
-                // The caller reads this array back and uploads it with the destination sharding.
+                // The caller reads this array back and uploads it with the target sharding.
                 Some(owner) if owner == process_index => Err((cause.across_processes(), Some(self))),
-                // No destination device belongs to this process, which only derives the metadata that the owning
+                // No target device belongs to this process, which only derives the metadata that the owning
                 // process returns, as for a compiled reshard that this process does not run.
                 _ => {
                     let round_trip = Some((&cause, owner, mesh, sharding));
@@ -2276,10 +2274,10 @@ impl Array {
         }
     }
 
-    /// Returns the source's logical mesh on the devices of the destination owner. Every process can derive this
+    /// Returns the source's logical mesh on the devices of the target owner. Every process can derive this
     /// mesh alike and use it to plan a placement of a locally assigned source (refer to
     /// [`Self::device_placement_strategy`]). When the source has more devices than `mesh`, the view fills it with
-    /// synthetic identifiers above the largest destination identifier and fails with [`Error::SizeLimitExceeded`]
+    /// synthetic identifiers above the largest target identifier and fails with [`Error::SizeLimitExceeded`]
     /// when they would not fit in a [`DeviceId`].
     fn owner_view_mesh(&self, mesh: &DeviceMesh) -> Result<DeviceMesh, Error> {
         let owner = mesh.devices()[0].process_index();
@@ -2306,7 +2304,7 @@ impl Array {
     /// (i.e., that is not `owner`, the process named by [`PlacementPlanningView::host_round_trip`]), what the owner
     /// checks from metadata before it uploads anything, so that every process returns the same error. That is
     /// the error of `cause` when no process owns the round trip, and when the upload of the owner rejects the
-    /// destination in `memory` and `layout` (refer to [`Self::validate_host_upload`] and
+    /// target in `memory` and `layout` (refer to [`Self::validate_host_upload`] and
     /// [`Self::run_placement_dispatch`]), which then returns the error of `cause` as well.
     fn admit_host_round_trip_elsewhere(
         &self,
@@ -2367,7 +2365,7 @@ impl Array {
     /// never reads a buffer or a physical layout, and it reads `process_index` only for a locally assigned array.
     ///
     /// An array with [locally assigned devices](Self::is_locally_assigned) is placed with
-    /// [`DevicePlacementStrategy::ProcessLocalValue`], except that when one process owns every destination device, that
+    /// [`DevicePlacementStrategy::ProcessLocalValue`], except that when one process owns every target device, that
     /// owner takes the strategy that [`PlacementPlanningView::strategy`] chooses for the view of its value on its
     /// devices (refer to [`Self::owner_view_mesh`]), if one applies, and every other process takes
     /// [`DevicePlacementStrategy::OnOwner`] with that plan, so that it admits exactly what the owner runs. Any other
@@ -2388,12 +2386,12 @@ impl Array {
 
         // Placing the value with local work only also handles every placement that no shared strategy supports (e.g.,
         // an uneven split whose regions need a cross-host layout that the plugin does not report), so it remains the
-        // choice when none applies. Its readback and upload would combine contributions that the destination keeps
+        // choice when none applies. Its readback and upload would combine contributions that the target keeps
         // (refer to `keeps_some_contributions`), so such a placement is made by the one process that owns every
-        // destination device, and a destination over several processes is the same error on every process. Whether
-        // one process owns the destination reads only the destination, so every process decides alike.
+        // target device, and a target over several processes is the same error on every process. Whether
+        // one process owns the target reads only the target, so every process decides alike.
         //
-        // When one process owns the destination, every process decides which strategy that owner runs from the plan of
+        // When one process owns the target, every process decides which strategy that owner runs from the plan of
         // the view of the value on the owner's devices (refer to `Self::owner_view_mesh`), which reads only metadata
         // that all of them hold. The owner runs a shared strategy whenever one applies, which for a placement that
         // keeps contributions is the only choice (so its rejection is the same error on every process), and otherwise
@@ -2401,7 +2399,7 @@ impl Array {
         // Every other process then takes no part and checks only what that strategy checks before it submits anything
         // (refer to `DevicePlacementStrategy::OnOwner`), or, when the owner uploads its own value, what that upload
         // checks (refer to `Self::place_process_local_value`). The owner runs the plan of the view over the logical
-        // mesh of the destination, after moving its value there when the placement keeps contributions (refer to
+        // mesh of the target, after moving its value there when the placement keeps contributions (refer to
         // `Self::moves_to_owner_view`), and plans its own value otherwise, whose admission is that of the view.
         let owner = mesh.devices()[0].process_index();
         let one_owner = mesh.devices().iter().all(|device| device.process_index() == owner);
@@ -2688,7 +2686,7 @@ impl Array {
     /// that `sharding` introduces along those axes on at least the devices at coordinate zero (i.e., on
     /// [`DeviceMeshExtension::at_coordinate_zero`], or on `mesh` with those axes replicated). Each other device of this
     /// process receives a new buffer of the identity (refer to [`unreduced_sum_identity`]), uploaded from the host in
-    /// the memory and the declared layout of this array and with the static shape of its destination shard, as a
+    /// the memory and the declared layout of this array and with the static shape of its target shard, as a
     /// cross-host receive allocates it, so the summands add up to the value of this array bit for bit, as a host upload
     /// with `sharding` splits a value. Only metadata that every process shares decides which devices hold an identity,
     /// and each process uploads only to its own devices, so no process waits for another. Nothing is read back and
@@ -2774,12 +2772,12 @@ impl Array {
     ///
     ///   1. `gather`, if any, is an all-gather on the mesh of this array, so that every device of that mesh ends up
     ///      with the full value. A replicated array needs none.
-    ///   2. The replicated value then moves to every device of the destination mesh as the whole shards that `replicas`
+    ///   2. The replicated value then moves to every device of the target mesh as the whole shards that `replicas`
     ///      describes (refer to [`Self::place_exact_shards`]), with copies between the devices of this process and
     ///      PJRT cross-host transfers between processes, into `memory`. `cross_host_layouts` holds the default layout
     ///      that a cross-host receive allocates for a replica, which the sender converts its replica to first (refer
     ///      to [`Self::cross_host_send_buffer`]).
-    ///   3. `reshard` reshards the replicated copy on the destination mesh, consuming it so that PJRT can reuse its
+    ///   3. `reshard` reshards the replicated copy on the target mesh, consuming it so that PJRT can reuse its
     ///      buffers for the output.
     ///
     /// Both compiled programs go through the compilation cache of `session`, so repeated calls with the same input and
@@ -2787,7 +2785,7 @@ impl Array {
     /// its mesh (refer to [`ReshardProgram::runs_on`]). The result completes and fails as the documentation of this
     /// module describes, and its execution fence joins the fences of both programs and the readiness of every copied
     /// or received replica, because the final reshard reads only those replicas. A failed replica that a device of the
-    /// destination mesh copies fails that copy and the final reshard that reads it, and the fence of the result reports
+    /// target mesh copies fails that copy and the final reshard that reads it, and the fence of the result reports
     /// whichever of these failures it observes first (refer to [`ExecutionFence::join`]), both of which name the cause
     /// of the failed replica.
     fn reshard_across_meshes(
@@ -2859,10 +2857,10 @@ enum DevicePlacementStrategy {
         cross_host_layouts: HashMap<StaticShape, ryft_pjrt::Layout>,
     },
 
-    /// Slices the source shards and joins the regions on the destination devices (refer to
+    /// Slices the source shards and joins the regions on the target devices (refer to
     /// [`Array::reshard_shard_regions`]).
     ShardRegions {
-        /// Plan of the moves of the regions of every destination shard of every process.
+        /// Plan of the moves of the regions of every target shard of every process.
         plan: ShardMovePlan,
 
         /// Default layout of the PJRT plugin for the shape of every region that crosses processes.
@@ -2881,27 +2879,27 @@ enum DevicePlacementStrategy {
         /// All-gather of a sharded array on its own mesh, or `None` for a replicated array.
         gather: Option<ReshardProgram>,
 
-        /// Plan of the moves of the replicas of the replicated array to every device of the destination mesh.
+        /// Plan of the moves of the replicas of the replicated array to every device of the target mesh.
         replicas: ShardMovePlan,
 
         /// Default layout of the PJRT plugin for the shape of the array when a replica crosses processes.
         cross_host_layouts: HashMap<StaticShape, ryft_pjrt::Layout>,
 
-        /// Program that reshards the replicated copy on the destination mesh.
+        /// Program that reshards the replicated copy on the target mesh.
         reshard: ReshardProgram,
     },
 
     /// Places an array on the devices at coordinate zero along the introduced mesh axes (at `axis_indices` within the
-    /// destination mesh) according to the destination sharding without the pending sums that the destination
-    /// introduces, and then gives the other devices of the destination the additive identity of the data type (refer
+    /// target mesh) according to the target sharding without the pending sums that the target
+    /// introduces, and then gives the other devices of the target the additive identity of the data type (refer
     /// to [`PlacementPlanningView::introduced_sums_strategy`] and [`Array::with_introduced_sums`]).
     IntroducedSums {
         /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
-        /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the destination mesh when the array cannot be placed
+        /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the target mesh when the array cannot be placed
         /// there directly.
         mesh: DeviceMesh,
 
-        /// Destination sharding without the pending sums that the destination introduces, over `mesh`.
+        /// Target sharding without the pending sums that the target introduces, over `mesh`.
         sharding: Sharding,
 
         /// Whether `first` starts from a restriction of the array to `mesh` (refer to [`Array::restricted_to`]).
@@ -2911,7 +2909,7 @@ enum DevicePlacementStrategy {
         /// to `mesh` already has `sharding`.
         first: Option<Box<DevicePlacementStrategy>>,
 
-        /// Indices within the destination mesh of the axes along which the destination introduces a pending sum.
+        /// Indices within the target mesh of the axes along which the target introduces a pending sum.
         axis_indices: Vec<usize>,
     },
 
@@ -2973,7 +2971,7 @@ enum HostRoundTripCause {
         /// Change, data type, mesh axis, and reason (e.g., "cannot take `u1` values from … on the devices, because …").
         transition: String,
 
-        /// What the user can do where no single process owns the source and the destination.
+        /// What the user can do where no single process owns the source and the target.
         remedy: &'static str,
     },
 
@@ -2985,14 +2983,14 @@ enum HostRoundTripCause {
 
 impl HostRoundTripCause {
     /// Returns the error of a placement (e.g., [`Array::to_placement`]) that no process can make with a host round
-    /// trip, which needs one process that owns every device of the destination and can read the source back from its
+    /// trip, which needs one process that owns every device of the target and can read the source back from its
     /// own devices (refer to [`PlacementPlanningView::host_round_trip`]).
     fn across_processes(&self) -> Error {
         match self {
             Self::Reduction { transition, remedy } => Error::from(ProgramError::UnsupportedOperation {
                 message: format!(
                     "{}, and the host round trip that makes it exactly needs one process that owns every device of the \
-                     destination and can read the source back from its own devices; {}",
+                     target and can read the source back from its own devices; {}",
                     transition, remedy,
                 ),
             }),
@@ -3008,7 +3006,7 @@ impl HostRoundTripCause {
                 message: format!(
                     "{}, and the preparation of the arguments of a program has no host round trip; place the argument \
                      with `Array::to_placement` first, which makes the change with a host round trip where one process \
-                     owns every device of the destination and a device of every source contribution with elements",
+                     owns every device of the target and a device of every source contribution with elements",
                     transition,
                 ),
             }),
@@ -3094,15 +3092,15 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     /// applies, or returns the error that rules out all of them. Each strategy carries the transfers and programs of
     /// every process.
     ///
-    ///   1. [`DevicePlacementStrategy::ExactShards`], when every destination shard with elements holds what one source
+    ///   1. [`DevicePlacementStrategy::ExactShards`], when every target shard with elements holds what one source
     ///      shard holds (refer to [`plan_exact_shard_put`]) and every shard that crosses processes has a default layout
     ///      for its receive.
     ///   2. [`DevicePlacementStrategy::ShardRegions`], when the placement keeps the contributions of this array (refer
     ///      to [`keeps_contributions`] and [`Self::shard_region_plan`]).
-    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the destination introduces a pending sum along a
+    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the target introduces a pending sum along a
     ///      non-manual axis.
     ///   4. [`DevicePlacementStrategy::ShardRegions`], when the meshes differ and this array declares no layout other
-    ///      than the dense row-major one, or uneven shards or manual destination axes rule out a compiled reshard (in
+    ///      than the dense row-major one, or uneven shards or manual target axes rule out a compiled reshard (in
     ///      any layout), and [`Self::shard_region_plan`] accepts the placement.
     ///   5. [`DevicePlacementStrategy::HostRoundTrip`], when a program of the compiled reshard below would change the
     ///      value of this array (refer to [`Self::validate_compiled_reshard`]) or item 4 declines a placement that
@@ -3134,7 +3132,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         )?;
         if let Some(plan) = exact {
             let cross_host_shards =
-                plan.cross_host_moves().map(|movement| (movement.destination_shard_index, movement.shape()));
+                plan.cross_host_moves().map(|movement| (movement.target_shard_index, movement.shape()));
             if let Some(cross_host_layouts) = cross_host_layouts(resolve_layout, element_type, cross_host_shards)? {
                 return Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts });
             }
@@ -3164,7 +3162,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
         }
 
-        // A pending sum that the destination introduces is written as additive identities after a first step that
+        // A pending sum that the target introduces is written as additive identities after a first step that
         // places the value without it on the devices at coordinate zero along the introduced axes only.
         let sum = ReductionState::Unreduced(UnreducedKind::Sum);
         let kept = kept_unreduced_axes(self.sharding(), sharding);
@@ -3180,7 +3178,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         }
         if !axis_indices.is_empty() {
             // Empty shards and axes of size one need no identity elements. Check for an identity only when the
-            // destination layout requires one, then leave the sums along the kept axes pending in the first step.
+            // target layout requires one, then leave the sums along the kept axes pending in the first step.
             if requires_unreduced_sum_identity(mesh, &ShardLayout::new(&shape, mesh, sharding)?, &axis_indices) {
                 let data_type = self.data_type();
                 unreduced_sum_identity(data_type)?
@@ -3261,10 +3259,10 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         }
 
         // A replicated copy of this array (i.e., this array itself or its all-gather on its own mesh) moves to every
-        // destination device as whole shards. Every process that owns a device of the mesh of this array holds such a
-        // replica, so a replica crosses processes exactly when a destination device belongs to a process that owns
+        // target device as whole shards. Every process that owns a device of the mesh of this array holds such a
+        // replica, so a replica crosses processes exactly when a target device belongs to a process that owns
         // none, and all replicas have the shape of this array. The gather completes only the pending reductions that
-        // the destination does not keep (refer to `gathered_sharding`), so a kept one moves as its contributions, which
+        // the target does not keep (refer to `gathered_sharding`), so a kept one moves as its contributions, which
         // correspond by their ordinals at both ends (refer to `moves_contributions`), and the final reshard keeps it.
         let rank = shape.rank();
         let replicated = gathered_sharding(self.sharding(), sharding, self.mesh().logical_mesh(), rank)?;
@@ -3273,9 +3271,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             input: self.sharding().clone(),
             output: replicated.clone(),
         });
-        let replicated_on_destination = gathered_sharding(self.sharding(), sharding, mesh.logical_mesh(), rank)?;
+        let replicated_on_target = gathered_sharding(self.sharding(), sharding, mesh.logical_mesh(), rank)?;
         let replica_layout = ShardLayout::new(&shape, self.mesh(), &replicated)?;
-        // Both shardings replicate the whole value and keep the same contributions, so every destination shard has the
+        // Both shardings replicate the whole value and keep the same contributions, so every target shard has the
         // slices of every source shard of the same contribution.
         let replicas = plan_exact_shard_put(
             element_type,
@@ -3284,20 +3282,20 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             &replicated,
             &shape,
             mesh,
-            &replicated_on_destination,
+            &replicated_on_target,
         )?
         .unwrap();
         let mut cross_host_layouts = HashMap::new();
         if let Some(movement) = replicas.cross_host_moves().next() {
             let shape = movement.shape();
-            let layout = resolve_layout(element_type, movement.destination_shard_index, &shape)?.ok_or_else(|| {
+            let layout = resolve_layout(element_type, movement.target_shard_index, &shape)?.ok_or_else(|| {
                 Error::Pjrt(PjrtError::unimplemented(
                     "the PJRT plugin does not report the default layout that a cross-host receive allocates",
                 ))
             })?;
             cross_host_layouts.insert(shape, layout);
         }
-        let reshard = ReshardProgram { mesh: mesh.clone(), input: replicated_on_destination, output: sharding.clone() };
+        let reshard = ReshardProgram { mesh: mesh.clone(), input: replicated_on_target, output: sharding.clone() };
         Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard })
     }
 
@@ -3344,14 +3342,14 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     ///      along that axis hold one contribution, refer to [`Sharding::distinguishes_shards_along`]), the shards at
     ///      coordinate zero already hold its whole value with the same placement along every other axis. The first
     ///      step starts from that restriction (refer to [`Array::restricted_to`]) on the same mesh, which keeps
-    ///      every pending reduction of this array that the destination keeps as a pure move. When the restriction
+    ///      every pending reduction of this array that the target keeps as a pure move. When the restriction
     ///      already has `first_sharding`, there is no first step at all, so nothing moves and nothing is compiled.
     ///   2. **One value per slice or kept contributions:** Otherwise, an array that holds one value per slice, or whose
     ///      contributions the first step keeps (refer to [`keeps_contributions`], e.g., onto another mesh that keeps
     ///      its pending sums and introduces another one), is placed from where it is onto the devices at coordinate
     ///      zero (e.g., with exact shards or shard regions, which move only what those devices need, or a gather and
     ///      copies of the gathered value to those devices).
-    ///   3. **Destination mesh:** Otherwise (i.e., an array with a pending reduction that it does not hold replicated
+    ///   3. **Target mesh:** Otherwise (i.e., an array with a pending reduction that it does not hold replicated
     ///      along the introduced axes, such as a pending maximum along one of them), the first step places the value
     ///      on all of `mesh` with the introduced axes replicated, whose strategy keeps or completes the pending
     ///      reductions of this array as a placement without introduced sums does, and the devices away from coordinate
@@ -3404,10 +3402,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         } else {
             // A host round trip can upload the value wherever it goes, so it goes to the devices at coordinate zero,
             // which needs one process that owns the source and those devices only.
-            let on_destination_mesh =
+            let on_target_mesh =
                 !self.sharding().holds_one_value_per_slice() && !keeps_contributions(self.sharding(), first_sharding);
-            let direct =
-                on_destination_mesh.then(|| self.strategy(resolve_layout, mesh, first_sharding)).transpose()?;
+            let direct = on_target_mesh.then(|| self.strategy(resolve_layout, mesh, first_sharding)).transpose()?;
             match direct {
                 Some(first) if !matches!(first, DevicePlacementStrategy::HostRoundTrip { .. }) => {
                     (mesh.clone(), first_sharding.clone(), false, Some(first))
@@ -3429,26 +3426,26 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     }
 
     /// Plans the moves of the regions that place this array on `mesh` according to `sharding`, which are the nonempty
-    /// intersections of its shards with the destination shards, for every process. When both shardings hold one value
+    /// intersections of its shards with the target shards, for every process. When both shardings hold one value
     /// per slice (refer to [`Sharding::holds_one_value_per_slice`]), identical source slices are replicas of one
     /// contribution. Otherwise, the array is a sequence of ordinary arrays, one for each contribution, and when the
     /// placement only moves contributions (refer to [`moves_contributions`]), each member is planned on its own: a
-    /// destination shard takes regions only from the source shards of the corresponding member (refer to
+    /// target shard takes regions only from the source shards of the corresponding member (refer to
     /// [`contribution_member`]), and identical source slices of one member are replicas. Each region moves from the
-    /// replica that [`SourceReplicas::preferred`] chooses. The moves are in destination shard order, and the regions of
-    /// each destination shard are in the order of their starting coordinates, which [`Array::assemble_shard_regions`]
+    /// replica that [`SourceReplicas::preferred`] chooses. The moves are in target shard order, and the regions of
+    /// each target shard are in the order of their starting coordinates, which [`Array::assemble_shard_regions`]
     /// needs.
     ///
-    /// Each destination shard looks up the source slices that it intersects among the combinations of the distinct
+    /// Each target shard looks up the source slices that it intersects among the combinations of the distinct
     /// source ranges that it intersects along each dimension, which it finds with two binary searches, so planning a
     /// one-dimensional placement of `n` shards costs `O(n log n)` rather than `O(n^2)`.
     ///
     /// Returns `None` when the placement changes contributions, or when the regions of the corresponding member do not
-    /// cover a destination shard (e.g., along a varying manual axis that splits a dimension at the source only).
+    /// cover a target shard (e.g., along a varying manual axis that splits a dimension at the source only).
     ///
     /// # Errors
     ///
-    /// Returns the error of [`validate_kept_contributions`] when the destination would leave a distinct source
+    /// Returns the error of [`validate_kept_contributions`] when the target would leave a distinct source
     /// contribution with elements out, and the error of [`ShardMovePlan::new`] for a device identifier that cross-host
     /// transfers cannot represent.
     fn plan_shard_regions(&self, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Option<ShardMovePlan>, Error> {
@@ -3456,7 +3453,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             return Ok(None);
         };
         let source_axes = axes.as_ref().map(|axes| axes.source.as_slice());
-        let destination_axes = axes.as_ref().map(|axes| axes.destination.as_slice());
+        let target_axes = axes.as_ref().map(|axes| axes.target.as_slice());
         let elements = |slice: &[Range<usize>]| -> Result<usize, Error> {
             Ok(StaticShape::new(slice.iter().map(Range::len).collect::<Vec<_>>()).element_count()?)
         };
@@ -3470,9 +3467,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             Ok(total)
         };
         let replicas = SourceReplicas::by_contribution(self.mesh(), self.sharding(), self.shards.clone(), source_axes);
-        let intersects = |source: &Range<usize>, destination: &Range<usize>| {
-            source.start.max(destination.start) < source.end.min(destination.end)
-        };
+        let intersects =
+            |source: &Range<usize>, target: &Range<usize>| source.start.max(target.start) < source.end.min(target.end);
         let mut source_ranges = vec![Vec::new(); self.shape().rank()];
         for (slice, _) in replicas.keys() {
             for (ranges, range) in source_ranges.iter_mut().zip(slice.iter()) {
@@ -3484,17 +3480,17 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             ranges.dedup();
         }
         let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
-        let destinations = layout.descriptors();
+        let targets = layout.descriptors();
         let mut moves = Vec::new();
         let mut received = HashSet::new();
-        for destination in destinations {
-            let member = contribution_member(mesh, sharding, destination, destination_axes);
+        for target in targets {
+            let member = contribution_member(mesh, sharding, target, target_axes);
             let mut candidates = vec![Vec::new()];
-            for (ranges, destination_range) in source_ranges.iter().zip(destination.slice()) {
-                // The ranges that intersect `destination_range` end after it starts and start before it ends.
-                let first = ranges.partition_point(|range| range.end <= destination_range.start);
-                let last = ranges.partition_point(|range| range.start < destination_range.end).max(first);
-                let intersecting = ranges[first..last].iter().filter(|range| intersects(range, destination_range));
+            for (ranges, target_range) in source_ranges.iter().zip(target.slice()) {
+                // The ranges that intersect `target_range` end after it starts and start before it ends.
+                let first = ranges.partition_point(|range| range.end <= target_range.start);
+                let last = ranges.partition_point(|range| range.start < target_range.end).max(first);
+                let intersecting = ranges[first..last].iter().filter(|range| intersects(range, target_range));
                 let intersecting = intersecting.collect::<Vec<_>>();
                 candidates = candidates
                     .into_iter()
@@ -3511,44 +3507,44 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 };
                 let slice = source_slice
                     .iter()
-                    .zip(destination.slice())
-                    .map(|(source, destination)| source.start.max(destination.start)..source.end.min(destination.end))
+                    .zip(target.slice())
+                    .map(|(source, target)| source.start.max(target.start)..source.end.min(target.end))
                     .collect::<Vec<_>>();
-                regions.push((source_shards.preferred(destination), slice));
+                regions.push((source_shards.preferred(target), slice));
             }
-            // The regions of one member are disjoint, so they cover the destination shard exactly when they hold as
+            // The regions of one member are disjoint, so they cover the target shard exactly when they hold as
             // many elements.
-            let destination_elements = elements(destination.slice())?;
-            if total(&mut regions.iter().map(|(_, slice)| elements(slice)))? != destination_elements {
+            let target_elements = elements(target.slice())?;
+            if total(&mut regions.iter().map(|(_, slice)| elements(slice)))? != target_elements {
                 return Ok(None);
             }
-            if destination_elements > 0 {
-                received.insert((destination.slice(), member));
+            if target_elements > 0 {
+                received.insert((target.slice(), member));
             }
             regions.sort_unstable_by(|(_, left), (_, right)| {
                 left.iter().map(|range| range.start).cmp(right.iter().map(|range| range.start))
             });
             for (source, slice) in regions {
-                let transfer_key = exact_shard_transfer_key(source.index(), destination.index(), destinations.len())?;
+                let transfer_key = exact_shard_transfer_key(source.index(), target.index(), targets.len())?;
                 moves.push(ShardMove {
                     source_shard_index: source.index(),
                     source_device: source.device(),
-                    destination_shard_index: destination.index(),
-                    destination_device: destination.device(),
+                    target_shard_index: target.index(),
+                    target_device: target.device(),
                     slice,
                     transfer_key,
                 });
             }
         }
-        // Every element of a destination member comes from the same element of the corresponding source member, so the
-        // destination keeps every source contribution exactly when it receives as many distinct elements.
+        // Every element of a target member comes from the same element of the corresponding source member, so the
+        // target keeps every source contribution exactly when it receives as many distinct elements.
         let source_elements = total(&mut replicas.keys().map(|(slice, _)| elements(slice)))?;
         let received_elements = total(&mut received.iter().map(|(slice, _)| elements(slice)))?;
         validate_kept_contributions(self.sharding(), source_elements == received_elements)?;
         Ok(Some(ShardMovePlan::new(self.data_type().executable_buffer_type(), moves)?))
     }
 
-    /// Returns the moves of the regions of every destination shard (refer to [`Self::plan_shard_regions`]) and the
+    /// Returns the moves of the regions of every target shard (refer to [`Self::plan_shard_regions`]) and the
     /// default layout of the shape of every region that crosses processes when [`Array::reshard_shard_regions`] can
     /// place this array on `mesh` according to `sharding`, or `None` when it cannot. That is the case when
     /// [`Self::plan_shard_regions`] declines the placement (e.g., when it changes the contributions of a pending
@@ -3567,19 +3563,18 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let Some(plan) = self.plan_shard_regions(mesh, sharding)? else {
             return Ok(None);
         };
-        let remote_regions =
-            plan.cross_host_moves().map(|movement| (movement.destination_shard_index, movement.shape()));
+        let remote_regions = plan.cross_host_moves().map(|movement| (movement.target_shard_index, movement.shape()));
         let layouts = cross_host_layouts(resolve_layout, plan.element_type, remote_regions)?;
         Ok(layouts.map(|layouts| (plan, layouts)))
     }
 
-    /// Checks that a compiled program can place this array on `destination_mesh` with `destination_sharding`, which
+    /// Checks that a compiled program can place this array on `target_mesh` with `target_sharding`, which
     /// introduces no pending sum after [`Self::strategy`] handles introduced sums, and returns the reason why it
     /// would not preserve the value of this array, if any (refer to [`validate_reduction_transition`]). The placement takes
     /// a host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the mesh of one of its
-    /// programs (i.e., the destination mesh, or the mesh of this array for the gather of a reshard across meshes) has a
+    /// programs (i.e., the target mesh, or the mesh of this array for the gather of a reshard across meshes) has a
     /// `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
-    /// the shards of this array or of the destination differ in size.
+    /// the shards of this array or of the target differ in size.
     ///
     /// The SPMD partitioner splits a dimension into parts of one size and pads the last parts, so a dimension whose
     /// extent the number of its parts does not divide (e.g., five elements over two devices) yields buffers whose
@@ -3587,32 +3582,32 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     /// can use whole shards or shard regions, both of which materialize those exact shapes.
     fn validate_compiled_reshard(
         &self,
-        destination_mesh: &DeviceMesh,
-        destination_sharding: &Sharding,
+        target_mesh: &DeviceMesh,
+        target_sharding: &Sharding,
     ) -> Result<Option<HostRoundTripCause>, Error> {
         // The programs are those of `PlacementPlanningView::strategy`, which on another mesh gathers this array
-        // into a replicated value that keeps the pending reductions that the destination keeps (refer to
-        // `gathered_sharding`) and reshards such a value on the destination mesh.
+        // into a replicated value that keeps the pending reductions that the target keeps (refer to
+        // `gathered_sharding`) and reshards such a value on the target mesh.
         let (data_type, shape) = (self.data_type(), self.shape());
-        let cause = if self.mesh() == destination_mesh {
-            validate_reduction_transition(data_type, destination_mesh, self.sharding(), destination_sharding)
+        let cause = if self.mesh() == target_mesh {
+            validate_reduction_transition(data_type, target_mesh, self.sharding(), target_sharding)
         } else {
-            let (input, output, rank) = (self.sharding(), destination_sharding, shape.rank());
+            let (input, output, rank) = (self.sharding(), target_sharding, shape.rank());
             let gathered = gathered_sharding(input, output, self.mesh().logical_mesh(), rank)?;
             let gather = validate_reduction_transition(data_type, self.mesh(), input, &gathered);
-            let gathered = gathered_sharding(input, output, destination_mesh.logical_mesh(), rank)?;
-            let reshard = validate_reduction_transition(data_type, destination_mesh, &gathered, output);
+            let gathered = gathered_sharding(input, output, target_mesh.logical_mesh(), rank)?;
+            let reshard = validate_reduction_transition(data_type, target_mesh, &gathered, output);
             gather.or(reshard)
         };
 
         // `Manual` axes are managed explicitly by the user (e.g., inside `shard_map`) and cannot be planned by the SPMD
         // partitioner from the top level. `Auto` and `Explicit` axes both go through SPMD partitioning, so both are
         // allowed. The rule holds for the mesh of every program alike, so a gather on the mesh of this array is checked
-        // as a reshard on the destination mesh is, before any process posts or compiles anything (e.g., a value that
+        // as a reshard on the target mesh is, before any process posts or compiles anything (e.g., a value that
         // varies along a manual axis cannot be gathered into one replicated value, and a process that owns only
-        // destination devices would otherwise post the receives of a gather that its peers cannot stage).
-        let gathers = self.mesh() != destination_mesh && !self.sharding().is_replicated();
-        let program_meshes = [destination_mesh].into_iter().chain(gathers.then(|| self.mesh()));
+        // target devices would otherwise post the receives of a gather that its peers cannot stage).
+        let gathers = self.mesh() != target_mesh && !self.sharding().is_replicated();
+        let program_meshes = [target_mesh].into_iter().chain(gathers.then(|| self.mesh()));
         for mesh in program_meshes {
             if let Some(axis) = mesh.logical_mesh().axes().iter().find(|axis| axis.r#type() == MeshAxisType::Manual) {
                 return Err(ArrayError::ManualReshardingAxis { axis_name: axis.name().to_string() }.into());
@@ -3620,20 +3615,20 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         }
 
         // The shards of one sharding have equal shapes exactly when every split divides its dimension evenly.
-        let destination_layout = ShardLayout::new(&shape, destination_mesh, destination_sharding)?;
+        let target_layout = ShardLayout::new(&shape, target_mesh, target_sharding)?;
         let has_uneven_shards = |shapes: Vec<StaticShape>| shapes.iter().any(|shape| shape != &shapes[0]);
         if has_uneven_shards(self.shards.clone().map(ShardDescriptor::shape).collect()) {
             return Err(ArrayError::UnevenReshardingShards { shape, sharding: self.sharding().clone() }.into());
         }
-        if has_uneven_shards(destination_layout.descriptors().iter().map(ShardDescriptor::shape).collect()) {
-            return Err(ArrayError::UnevenReshardingShards { shape, sharding: destination_sharding.clone() }.into());
+        if has_uneven_shards(target_layout.descriptors().iter().map(ShardDescriptor::shape).collect()) {
+            return Err(ArrayError::UnevenReshardingShards { shape, sharding: target_sharding.clone() }.into());
         }
         Ok(cause)
     }
 }
 
 /// Resolves the default layout that a cross-host receive allocates for a buffer of the given element type and shape.
-/// The destination shard index identifies the shard in diagnostics. Returns `None` when the plugin cannot report the
+/// The target shard index identifies the shard in diagnostics. Returns `None` when the plugin cannot report the
 /// layout and [`PjrtError::Unimplemented`] when it lacks the cross-host transfers extension. All processes of a
 /// placement use the same plugin, so they resolve the same layouts.
 type CrossHostLayoutResolver<'o> =
@@ -3811,7 +3806,7 @@ enum MoveRole {
     /// The process owns only the source device and sends the moved data with a PJRT cross-host transfer.
     Send,
 
-    /// The process owns only the destination device and receives the moved data with a PJRT cross-host transfer.
+    /// The process owns only the target device and receives the moved data with a PJRT cross-host transfer.
     Receive,
 }
 
@@ -3825,7 +3820,7 @@ struct ShardMovePlan {
     /// predicate for one-bit integers), because that is the buffer that a send transfers and a receive allocates.
     element_type: BufferType,
 
-    /// Moves of the plan, in destination shard order, and for each destination shard in the order of the starting
+    /// Moves of the plan, in target shard order, and for each target shard in the order of the starting
     /// coordinates of the moved slices.
     moves: Vec<ShardMove>,
 }
@@ -3842,7 +3837,7 @@ impl ShardMovePlan {
         let plan = Self { element_type, moves };
         for movement in plan.cross_host_moves() {
             cross_host_global_device_id(movement.source_device.id())?;
-            cross_host_global_device_id(movement.destination_device.id())?;
+            cross_host_global_device_id(movement.target_device.id())?;
         }
         Ok(plan)
     }
@@ -3859,7 +3854,7 @@ impl ShardMovePlan {
 }
 
 /// One move in a [`ShardMovePlan`] of the elements of a slice, which is a whole source shard or the intersection of a
-/// source shard with a destination shard, from the device of that source shard to the device of the destination shard.
+/// source shard with a target shard, from the device of that source shard to the device of the target shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShardMove {
     /// Index of the source shard in the source array.
@@ -3868,13 +3863,13 @@ struct ShardMove {
     /// Device of the source shard.
     source_device: Device,
 
-    /// Index of the destination shard in the destination array.
-    destination_shard_index: ShardIndex,
+    /// Index of the target shard in the target array.
+    target_shard_index: ShardIndex,
 
-    /// Device of the destination shard.
-    destination_device: Device,
+    /// Device of the target shard.
+    target_device: Device,
 
-    /// Moved slice in global array coordinates, which is the slice of the destination shard for a move of a whole
+    /// Moved slice in global array coordinates, which is the slice of the target shard for a move of a whole
     /// shard.
     slice: Vec<Range<usize>>,
 
@@ -3890,16 +3885,14 @@ impl ShardMove {
 
     /// Returns whether this move crosses processes, which needs a PJRT cross-host transfer.
     fn is_cross_host(&self) -> bool {
-        self.source_device.process_index() != self.destination_device.process_index()
+        self.source_device.process_index() != self.target_device.process_index()
     }
 
     /// Returns the part that the process with index `process_index` takes in this move, or `None` when it owns neither
     /// of its devices.
     fn role(&self, process_index: usize) -> Option<MoveRole> {
-        match (
-            self.source_device.process_index() == process_index,
-            self.destination_device.process_index() == process_index,
-        ) {
+        match (self.source_device.process_index() == process_index, self.target_device.process_index() == process_index)
+        {
             (true, true) => Some(MoveRole::Copy),
             (true, false) => Some(MoveRole::Send),
             (false, true) => Some(MoveRole::Receive),
@@ -3909,12 +3902,12 @@ impl ShardMove {
 }
 
 /// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
-/// replica for each destination shard without scanning all of them again (e.g., when a replicated array moves to
-/// another mesh, where every destination shard has the slice of every source shard).
+/// replica for each target shard without scanning all of them again (e.g., when a replicated array moves to
+/// another mesh, where every target shard has the slice of every source shard).
 ///
 /// The preference is deterministic and depends only on global shard metadata, so that every process chooses the same
-/// source shard for a given destination shard. It prefers a source shard on the device of the destination shard, then
-/// a source shard on the process of the destination shard, and finally breaks ties by device ID and shard index.
+/// source shard for a given target shard. It prefers a source shard on the device of the target shard, then
+/// a source shard on the process of the target shard, and finally breaks ties by device ID and shard index.
 struct SourceReplicas<'o> {
     /// Replica with the lowest shard index on each device.
     by_device: HashMap<Device, &'o ShardDescriptor>,
@@ -3967,9 +3960,9 @@ impl<'o> SourceReplicas<'o> {
             .collect()
     }
 
-    /// Returns the preferred replica for `destination_shard`.
-    fn preferred(&self, destination_shard: &ShardDescriptor) -> &'o ShardDescriptor {
-        let device = destination_shard.device();
+    /// Returns the preferred replica for `target_shard`.
+    fn preferred(&self, target_shard: &ShardDescriptor) -> &'o ShardDescriptor {
+        let device = target_shard.device();
         self.by_device
             .get(&device)
             .or_else(|| self.by_process.get(&device.process_index()))
@@ -3987,20 +3980,20 @@ struct ContributionAxes {
     /// Varying manual axes of the source in mesh order.
     source: Vec<String>,
 
-    /// Varying manual axes of the destination that correspond to those of [`Self::source`], in that order.
-    destination: Vec<String>,
+    /// Varying manual axes of the target that correspond to those of [`Self::source`], in that order.
+    target: Vec<String>,
 }
 
 /// One PJRT cross-host transfer that the current process takes part in, which [`issue_cross_host_transfers`] issues.
 enum CrossHostTransfer<'b> {
-    /// Send of `buffer` from its device `source` of the current process to the device `destination` of another
+    /// Send of `buffer` from its device `source` of the current process to the device `target` of another
     /// process.
     Send {
         /// ID of the source device.
         source: DeviceId,
 
-        /// ID of the destination device.
-        destination: DeviceId,
+        /// ID of the target device.
+        target: DeviceId,
 
         /// Transfer rendezvous key shared with the matching receive.
         transfer_key: CrossHostTransferKey,
@@ -4010,18 +4003,18 @@ enum CrossHostTransfer<'b> {
     },
 
     /// Receive of a buffer of `element_type` and `dimensions` from the device `source` of another process onto
-    /// `device`, which is the device `destination` of the current process.
+    /// `device`, which is the device `target` of the current process.
     Receive {
         /// ID of the source device.
         source: DeviceId,
 
-        /// ID of the destination device.
-        destination: DeviceId,
+        /// ID of the target device.
+        target: DeviceId,
 
         /// Transfer rendezvous key shared with the matching send.
         transfer_key: CrossHostTransferKey,
 
-        /// Destination device.
+        /// Target device.
         device: &'b PjrtDevice<'static>,
 
         /// Element type of the received buffer.
@@ -4033,12 +4026,10 @@ enum CrossHostTransfer<'b> {
 }
 
 impl CrossHostTransfer<'_> {
-    /// Returns the IDs of the source and destination devices of this transfer.
+    /// Returns the IDs of the source and target devices of this transfer.
     fn devices(&self) -> (DeviceId, DeviceId) {
         match self {
-            Self::Send { source, destination, .. } | Self::Receive { source, destination, .. } => {
-                (*source, *destination)
-            }
+            Self::Send { source, target, .. } | Self::Receive { source, target, .. } => (*source, *target),
         }
     }
 }
@@ -4076,7 +4067,7 @@ impl AddressableDevices {
 
 /// Index of the shards of an array that hold a buffer on the process with index [`Self::process_index`] by the
 /// contribution that they hold (refer to [`ShardContribution`]), which a placement keeps for all of its lookups of
-/// [`Array::local_replica`], so that many destinations of one resident replica cost linear rather than quadratic work.
+/// [`Array::local_replica`], so that many targets of one resident replica cost linear rather than quadratic work.
 /// The index is built on the first lookup that needs another replica, so a placement whose planned shards all have
 /// buffers never builds it.
 struct LocalReplicas {
@@ -4114,25 +4105,25 @@ fn is_standalone_session(session: &Session, process_index: ProcessIndex) -> Resu
 /// `element_type`. The plan depends only on global metadata (i.e., on the slices and devices of the source shards, on
 /// the meshes, and on the shardings, refer to [`ShardMovePlan`]).
 ///
-/// Each destination shard with elements receives a source shard that holds the same contribution (refer to
+/// Each target shard with elements receives a source shard that holds the same contribution (refer to
 /// [`ShardContribution`]), and the plan may move any replica of it, and a missing one is served from another replica of
 /// the same contribution (refer to [`Array::local_replica`]). When both shardings hold one value per slice (refer to
-/// [`Sharding::holds_one_value_per_slice`]), that is any source shard with the slices of the destination shard.
+/// [`Sharding::holds_one_value_per_slice`]), that is any source shard with the slices of the target shard.
 /// Otherwise, shards of one slice can hold different contributions (e.g., the summands of an unreduced value or the
 /// values along a varying manual axis that does not split the array). The placement must move each contribution
-/// unchanged (refer to [`moves_contributions`]). The destination shard receives the source shard that has the same
+/// unchanged (refer to [`moves_contributions`]). The target shard receives the source shard that has the same
 /// slices and belongs to the corresponding member of the sequence of arrays formed by the contributions (refer to
 /// [`contribution_member`]). No arithmetic changes the contributions, and the host readback combines them in the
 /// same order. Each process creates its own empty shards, which hold no contribution (refer to
 /// [`Array::place_exact_shards`]).
 ///
-/// Returns `None` when a destination shard with elements has no such source shard, which needs slicing or
+/// Returns `None` when a target shard with elements has no such source shard, which needs slicing or
 /// concatenating shards, or when the shards of one slice can hold different contributions and the placement changes
 /// them.
 ///
 /// # Errors
 ///
-/// Returns the error of [`validate_kept_contributions`] when the destination would leave a distinct source
+/// Returns the error of [`validate_kept_contributions`] when the target would leave a distinct source
 /// contribution with elements out, and the error of [`ShardMovePlan::new`] for a device identifier that cross-host
 /// transfers cannot represent. The plan covers the moves of every process, so every process returns these errors
 /// before any of them submits a transfer.
@@ -4149,39 +4140,35 @@ fn plan_exact_shard_put<'o>(
         return Ok(None);
     };
     let source_axes = axes.as_ref().map(|axes| axes.source.as_slice());
-    let destination_axes = axes.as_ref().map(|axes| axes.destination.as_slice());
+    let target_axes = axes.as_ref().map(|axes| axes.target.as_slice());
     let replicas_by_contributions =
         SourceReplicas::by_contribution(source_mesh, source_sharding, source_shards, source_axes);
 
-    let destination_layout = ShardLayout::new(shape, mesh, sharding)?;
-    let destination_shards = destination_layout.descriptors();
-    let destination_shard_count = destination_shards.len();
-    let mut moves = Vec::with_capacity(destination_shard_count);
+    let target_layout = ShardLayout::new(shape, mesh, sharding)?;
+    let target_shards = target_layout.descriptors();
+    let target_shard_count = target_shards.len();
+    let mut moves = Vec::with_capacity(target_shard_count);
     let mut received = HashSet::new();
-    for destination_shard in destination_shards {
-        if destination_shard.slice().iter().any(Range::is_empty) {
+    for target_shard in target_shards {
+        if target_shard.slice().iter().any(Range::is_empty) {
             continue;
         }
-        let key = (destination_shard.slice(), contribution_member(mesh, sharding, destination_shard, destination_axes));
+        let key = (target_shard.slice(), contribution_member(mesh, sharding, target_shard, target_axes));
         let Some(replicas) = replicas_by_contributions.get(&key) else {
             return Ok(None);
         };
         received.insert(key);
-        let source_shard = replicas.preferred(destination_shard);
+        let source_shard = replicas.preferred(target_shard);
         moves.push(ShardMove {
             source_shard_index: source_shard.index(),
             source_device: source_shard.device(),
-            destination_shard_index: destination_shard.index(),
-            destination_device: destination_shard.device(),
-            slice: destination_shard.slice().to_vec(),
-            transfer_key: exact_shard_transfer_key(
-                source_shard.index(),
-                destination_shard.index(),
-                destination_shard_count,
-            )?,
+            target_shard_index: target_shard.index(),
+            target_device: target_shard.device(),
+            slice: target_shard.slice().to_vec(),
+            transfer_key: exact_shard_transfer_key(source_shard.index(), target_shard.index(), target_shard_count)?,
         });
     }
-    // Every destination key names a distinct source key, so the destination keeps every source contribution exactly
+    // Every target key names a distinct source key, so the target keeps every source contribution exactly
     // when it receives as many distinct ones.
     let sources = replicas_by_contributions.keys().filter(|(slice, _)| !slice.iter().any(Range::is_empty)).count();
     validate_kept_contributions(source_sharding, sources == received.len())?;
@@ -4249,7 +4236,7 @@ fn contribution_member(
 ///     [`validate_reduction_transition`]).
 ///   - **Varying manual axes:** They correspond by name when both ends have the same names with the same sizes, and
 ///     otherwise in mesh order with the same sizes (e.g., along a renamed axis). A varying axis of the source that
-///     splits a dimension of the source and along which the destination does not vary takes no part, because its
+///     splits a dimension of the source and along which the target does not vary takes no part, because its
 ///     devices hold disjoint slices, so no two values compete for one slice (e.g., the summands of a pending sum split
 ///     along a varying `m` gather into replicas of each summand).
 ///
@@ -4261,24 +4248,22 @@ fn contribution_member(
 /// contributions.
 fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<ContributionAxes> {
     let names = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.name().to_string()).collect::<Vec<_>>();
-    let in_order = |source: &[&MeshAxis], destination: &[&MeshAxis]| {
-        let same_sizes = source.iter().zip(destination).all(|(axis, other)| axis.size() == other.size());
-        (source.len() == destination.len() && same_sizes).then(|| names(destination))
+    let in_order = |source: &[&MeshAxis], target: &[&MeshAxis]| {
+        let same_sizes = source.iter().zip(target).all(|(axis, other)| axis.size() == other.size());
+        (source.len() == target.len() && same_sizes).then(|| names(target))
     };
-    let by_name = |source: &[&MeshAxis], destination: &[&MeshAxis]| {
-        let found = |axis: &&MeshAxis| {
-            destination.iter().any(|other| other.name() == axis.name() && other.size() == axis.size())
-        };
-        (source.len() == destination.len() && source.iter().all(found)).then(|| names(source))
+    let by_name = |source: &[&MeshAxis], target: &[&MeshAxis]| {
+        let found =
+            |axis: &&MeshAxis| target.iter().any(|other| other.name() == axis.name() && other.size() == axis.size());
+        (source.len() == target.len() && source.iter().all(found)).then(|| names(source))
     };
     let count = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.size()).product::<usize>();
     let (source_unreduced, source_varying) = contribution_axes(input);
-    let (destination_unreduced, destination_varying) = contribution_axes(output);
-    let unreduced_correspond = match (source_unreduced.is_empty(), destination_unreduced.is_empty()) {
+    let (target_unreduced, target_varying) = contribution_axes(output);
+    let unreduced_correspond = match (source_unreduced.is_empty(), target_unreduced.is_empty()) {
         (true, true) => true,
         (false, false) => {
-            input.unreduced_kind() == output.unreduced_kind()
-                && count(&source_unreduced) == count(&destination_unreduced)
+            input.unreduced_kind() == output.unreduced_kind() && count(&source_unreduced) == count(&target_unreduced)
         }
         _ => false,
     };
@@ -4286,12 +4271,12 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
         return None;
     }
     let paired = |source: &[&MeshAxis]| {
-        let destination = by_name(source, &destination_varying).or_else(|| in_order(source, &destination_varying))?;
-        Some(ContributionAxes { source: names(source), destination })
+        let target = by_name(source, &target_varying).or_else(|| in_order(source, &target_varying))?;
+        Some(ContributionAxes { source: names(source), target })
     };
     paired(&source_varying).or_else(|| {
         // A source axis that splits a dimension holds disjoint slices, so its variation gives no slice two values, and
-        // a destination that does not vary along it takes the member of each slice from the one device that holds it.
+        // a target that does not vary along it takes the member of each slice from the one device that holds it.
         // Such an axis takes no part then, which is tried only when the varying axes do not pair as they are, so that
         // they still pair by name and in mesh order (e.g., along a renamed axis).
         let gathered = source_varying
@@ -4338,7 +4323,7 @@ fn keeps_some_contributions(input: &Sharding, output: &Sharding) -> bool {
 /// both meshes have an axis of that name with the same size. Every other axis of either mesh (e.g., a replicated or
 /// unused one of any size or type, or one that only one mesh has) does not matter, so the decision never depends on
 /// the equality of the meshes, and the remaining unreduced axes of `input` are completed and those of `output`
-/// introduced. An unreduced axis that the destination renames has no common name and is not kept, so a placement that
+/// introduced. An unreduced axis that the target renames has no common name and is not kept, so a placement that
 /// keeps it while it changes another part of the reduction state completes it and introduces it again. A placement
 /// whose whole reduction state corresponds under other names is a move instead (refer to [`moves_contributions`]),
 /// which never gets here.
@@ -4358,11 +4343,11 @@ fn kept_unreduced_axes<'o>(input: &Sharding, output: &'o Sharding) -> Vec<&'o st
 
 /// Checks that a placement of a value placed as `input` keeps every distinct contribution with elements of its source
 /// (refer to [`ShardContribution`]), which is the case when `keeps_all` holds. A placement whose contributions
-/// correspond (refer to [`corresponding_shards`]) takes each destination contribution from the source contribution
+/// correspond (refer to [`corresponding_shards`]) takes each target contribution from the source contribution
 /// with the same elements and member, so it can leave a source contribution out only along a varying manual axis that
 /// splits a dimension at one end and not at the other (e.g., the values `10`, `11`, `20`, and `21` of a vector of two
 /// elements split along `x` and varying along `m`, placed so that `m` splits it, which keeps only `10` and `21`). The
-/// destination cannot represent that value, so the placement is rejected rather than planned another way.
+/// target cannot represent that value, so the placement is rejected rather than planned another way.
 ///
 /// # Errors
 ///
@@ -4382,7 +4367,7 @@ fn validate_kept_contributions(input: &Sharding, keeps_all: bool) -> Result<(), 
     .into())
 }
 
-/// Returns the cross-host shape, attaching the destination shard and dimension to any encoding failure.
+/// Returns the cross-host shape, attaching the target shard and dimension to any encoding failure.
 fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<i64>, Error> {
     shape
         .as_slice()
@@ -4402,7 +4387,7 @@ fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<
 
 /// Returns a lazy resolver for the default layout that a cross-host receive allocates. Each lookup checks for the
 /// PJRT cross-host transfers extension, then asks the plugin for its default layout. A missing default layout
-/// query returns [`None`], and an unrepresentable shape reports the destination shard and dimension.
+/// query returns [`None`], and an unrepresentable shape reports the target shard and dimension.
 fn cross_host_layout_resolver<'o>(
     client: &'o Client<'_>,
 ) -> impl Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o {
@@ -4421,7 +4406,7 @@ fn cross_host_layout_resolver<'o>(
 }
 
 /// Uses `resolve_layout` to obtain the default layout for buffers of `element_type` with each shape of
-/// `shards` (i.e., of pairs of the index of a destination shard and a shape that crosses processes for it), or `None`
+/// `shards` (i.e., of pairs of the index of a target shard and a shape that crosses processes for it), or `None`
 /// when `shards` is not empty and the plugin lacks the cross-host transfers extension or cannot report one of those
 /// layouts. The first shard with each shape supplies the index for a single lookup of that shape. Every process derives
 /// the same `shards` for a placement and queries the same plugin, so all of them get the same result.
@@ -4446,31 +4431,31 @@ fn cross_host_layouts(
 }
 
 /// Returns the deterministic cross-host transfer key for moving data from `source_shard_index` to the
-/// destination shard `destination_shard_index`, which is `source_shard_index * destination_shard_count +
-/// destination_shard_index`, so that every pair of source and destination shards gets a unique key.
+/// target shard `target_shard_index`, which is `source_shard_index * target_shard_count +
+/// target_shard_index`, so that every pair of source and target shards gets a unique key.
 ///
 /// # Errors
 ///
 /// Returns [`Error::SizeLimitExceeded`] when the key overflows [`usize`] or [`i64`].
 fn exact_shard_transfer_key(
     source_shard_index: ShardIndex,
-    destination_shard_index: ShardIndex,
-    destination_shard_count: usize,
+    target_shard_index: ShardIndex,
+    target_shard_count: usize,
 ) -> Result<CrossHostTransferKey, Error> {
     let transfer_key = source_shard_index
-        .checked_mul(destination_shard_count)
-        .and_then(|key| key.checked_add(destination_shard_index))
+        .checked_mul(target_shard_count)
+        .and_then(|key| key.checked_add(target_shard_index))
         .ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
-                "cross-host transfer key for source shard #{source_shard_index} and destination shard \
-                 #{destination_shard_index} exceeds the maximum allowed size of {}",
+                "cross-host transfer key for source shard #{source_shard_index} and target shard \
+                 #{target_shard_index} exceeds the maximum allowed size of {}",
                 usize::MAX,
             ),
         })?;
     i64::try_from(transfer_key).map_err(|_| Error::SizeLimitExceeded {
         message: format!(
-            "cross-host transfer key {transfer_key} for source shard #{source_shard_index} and destination shard \
-             #{destination_shard_index} exceeds the maximum allowed size of {}",
+            "cross-host transfer key {transfer_key} for source shard #{source_shard_index} and target shard \
+             #{target_shard_index} exceeds the maximum allowed size of {}",
             i64::MAX,
         ),
     })
@@ -4486,12 +4471,12 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
 /// Issues `transfers`, which are the cross-host transfers that the current process takes part in for one placement,
 /// and returns a fence for the sends and the received buffers with their transfer keys and device IDs.
 ///
-/// PJRT delivers a received buffer to the default memory of its destination device, which every device has. When
+/// PJRT delivers a received buffer to the default memory of its target device, which every device has. When
 /// `memory` is another memory, each received buffer is therefore copied on its device to `memory` once every transfer
 /// is issued, and the copy is returned in its place. That copy is local to the device and does not wait for the
 /// transfer, so it does not affect the order described below.
 ///
-/// The transfers are issued one at a time in the order of their source and then destination device IDs, keeping the
+/// The transfers are issued one at a time in the order of their source and then target device IDs, keeping the
 /// given order of the transfers between the same two devices. The CUDA plugin carries the transfers between two
 /// devices over a communicator of that pair and pairs them by the order in which both sides issue them, ignoring their
 /// transfer keys, and the first transfer between two devices blocks the calling thread until the peer process issues
@@ -4518,18 +4503,18 @@ fn issue_cross_host_transfers(
     let transfers = transfers
         .into_iter()
         .map(|transfer| {
-            let (source, destination) = transfer.devices();
-            Ok((cross_host_global_device_id(source)?, cross_host_global_device_id(destination)?, transfer))
+            let (source, target) = transfer.devices();
+            Ok((cross_host_global_device_id(source)?, cross_host_global_device_id(target)?, transfer))
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let client = session.client();
     let mut sends = session.reserve_work();
     let mut receives = session.reserve_work();
     let mut received_buffers = Vec::new();
-    for (source, destination, transfer) in transfers {
+    for (source, target, transfer) in transfers {
         match transfer {
             CrossHostTransfer::Send { transfer_key, buffer, .. } => {
-                sends.track_events(client.cross_host_send_buffers(&[&buffer], &[destination], &[transfer_key], &[])?);
+                sends.track_events(client.cross_host_send_buffers(&[&buffer], &[target], &[transfer_key], &[])?);
             }
             CrossHostTransfer::Receive { transfer_key, device, element_type, dimensions, .. } => {
                 let buffers = client.cross_host_receive_buffers(
@@ -4572,7 +4557,7 @@ fn dense_row_major_layout(rank: usize) -> Layout {
 /// [`kept_unreduced_axes`]) and with every dimension replicated, over `mesh`, which has the axes that `output` keeps
 /// (i.e., the mesh of `input` or of `output`). This is the sharding of the value that a compiled reshard across meshes
 /// moves as whole shards (refer to [`DevicePlacementStrategy::CompiledReshardAcrossMeshes`]), so the gather on the mesh
-/// of the source completes only the reductions that the destination does not keep, and the kept ones move as their
+/// of the source completes only the reductions that the target does not keep, and the kept ones move as their
 /// contributions.
 fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, rank: usize) -> Result<Sharding, Error> {
     let replicated = Sharding::replicated(mesh.clone(), rank);
@@ -4669,7 +4654,7 @@ fn validate_reduction_transition(
             (Some(rejection), _) => Some(rejection),
             (None, ReductionState::Unreduced(kind @ (UnreducedKind::Max | UnreducedKind::Min))) => {
                 collective_reduction(data_type, ReductionChange::Introduce(kind)).reason().map(|reason| {
-                    let remedy = "make this placement where one process owns every device of the destination and a \
+                    let remedy = "make this placement where one process owns every device of the target and a \
                                   device of every source contribution with elements";
                     (reason, remedy)
                 })
@@ -4777,7 +4762,7 @@ mod tests {
     /// Renders the placements that two processes make of one value, those of process 0 first and each through two
     /// entry points, as the bytes of the shards that each process holds or as `error: <message>`. Asserts that the
     /// entry points of each process agree and that both processes return the same metadata when both succeed, so
-    /// that a process that owns no device of the destination still returns the result of the owner without buffers.
+    /// that a process that owns no device of the target still returns the result of the owner without buffers.
     /// Returns the outcomes of process 0 and of process 1.
     fn process_outcomes(placements: &[Result<Array, String>], context: &str) -> (String, String) {
         let rendered = placements
@@ -4880,7 +4865,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct PlannedTransfer {
         source: Device,
-        destination: Device,
+        target: Device,
         key: CrossHostTransferKey,
         shape: Vec<usize>,
     }
@@ -4972,7 +4957,7 @@ mod tests {
                 .into_iter()
                 .map(|movement| PlannedTransfer {
                     source: movement.source_device,
-                    destination: movement.destination_device,
+                    target: movement.target_device,
                     key: movement.transfer_key,
                     shape: movement.shape().as_slice().to_vec(),
                 })
@@ -4997,7 +4982,7 @@ mod tests {
     /// agree when every process fails alike before it posts anything or none fails, every send has exactly one
     /// matching receive on its peer, every receive has a matching send, and every process that owns a device of a
     /// program that one process runs runs the same program. The processes may choose different strategies only when
-    /// that holds (e.g., a process whose own value lies on its devices and whose devices hold the whole destination).
+    /// that holds (e.g., a process whose own value lies on its devices and whose devices hold the whole target).
     ///
     /// Agreeing plans are not enough when a process holds some buffers of the source, because what only it knows
     /// (i.e., which of its shards have buffers) could still stop it before it posts the transfers that its peers
@@ -5030,7 +5015,7 @@ mod tests {
         };
         for (process_index, work) in works.iter().enumerate() {
             for send in &work.sends {
-                let peer = send.destination.process_index();
+                let peer = send.target.process_index();
                 if works[peer].receives.iter().filter(|receive| *receive == send).count() != 1 {
                     return Err(format!(
                         "{planned}: process {process_index} sends {send:?} without one receive on process {peer}"
@@ -5428,14 +5413,14 @@ mod tests {
             }
         }
 
-        // `Session::place` admits and transfers the same arrays, while an in-place destination and no destination keep
+        // `Session::place` admits and transfers the same arrays, while an in-place target and no target keep
         // rejecting them, because a result of this session cannot live on the devices of the other client.
         let placed = session.place(source.clone(), PlacementOptions::to(devices[0])).unwrap();
         assert_eq!((placed.mesh().devices(), placed.is_committed()), (&devices[..1], true));
         assert_eq!(shard_values(&placed), vec![vec![1f32, 2., 3., 4.]]);
         let in_place = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
         let in_place_message = "cannot place an array of another PJRT client without naming the devices of the \
-                                destination, because the result must live on devices of the client of the session";
+                                target, because the result must live on devices of the client of the session";
         for result in [
             source.to_placement(&session, in_place.clone()),
             session.place(source.clone(), PlacementOptions::to(in_place.clone())),
@@ -5451,7 +5436,7 @@ mod tests {
                 if message == "cannot associate an array with a session of a different PJRT client",
         ));
 
-        // A pending sum is completed by the readback, so a destination that keeps it is rejected before anything is
+        // A pending sum is completed by the readback, so a target that keeps it is rejected before anything is
         // read back, both by `Session::place` and by the placement itself.
         let pending = Sharding::replicated(other_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let contributions = other_mesh
@@ -5470,7 +5455,7 @@ mod tests {
             .clone()
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
-        let kept_message = "cannot place an array of another PJRT client onto a destination that keeps the \
+        let kept_message = "cannot place an array of another PJRT client onto a target that keeps the \
                             contributions of its pending reduction or manual variation apart, because the transfer \
                             between the clients reads back their combined value";
         for result in [
@@ -5555,9 +5540,9 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let other_session = Session::builder().client(other_client).build().unwrap();
         let source = domain_mesh(other_client, "x", 1);
-        let destination = domain_mesh(client, "x", 1);
+        let target_mesh = domain_mesh(client, "x", 1);
         let sharding = Sharding::replicated(source.logical_mesh().clone(), 0).with_unreduced_axes(["x"]).unwrap();
-        let target = Placement::new(destination, sharding.clone()).unwrap();
+        let target = Placement::new(target_mesh, sharding.clone()).unwrap();
         for (data_type, bytes) in [(DataType::U8, vec![7]), (DataType::Zero, vec![])] {
             let value = Array::from_host_buffer(
                 &other_session,
@@ -5579,15 +5564,15 @@ mod tests {
     #[test]
     fn test_array_to_placement_transfers_zero_between_clients_on_shared_mesh() {
         let sources = [other_cpu_client(1), process_one_cpu_client(1)];
-        let destinations = [cpu_client(1), process_one_cpu_client(1)];
+        let targets = [cpu_client(1), process_one_cpu_client(1)];
         let source_sessions = sessions_of_processes(sources);
-        let destination_sessions = sessions_of_processes(destinations);
+        let target_sessions = sessions_of_processes(targets);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let source_mesh = DeviceMesh::new(logical_mesh.clone(), sources.map(first_device).to_vec()).unwrap();
-        let destination_mesh = DeviceMesh::new(logical_mesh.clone(), destinations.map(first_device).to_vec()).unwrap();
+        let target_mesh = DeviceMesh::new(logical_mesh.clone(), targets.map(first_device).to_vec()).unwrap();
         let sharding = Sharding::replicated(logical_mesh, 0).with_unreduced_axes(["x"]).unwrap();
-        let target = Placement::new(destination_mesh, sharding.clone()).unwrap();
-        for (source, session) in source_sessions.iter().zip(&destination_sessions) {
+        let target = Placement::new(target_mesh, sharding.clone()).unwrap();
+        for (source, session) in source_sessions.iter().zip(&target_sessions) {
             let (event, producer) = source.client().event(()).unwrap();
             let value = Array::from_host_buffer(
                 source,
@@ -5653,17 +5638,17 @@ mod tests {
 
     #[test]
     fn test_array_to_placement_from_another_client_agrees_across_processes() {
-        // Each of two processes sees a source client and a destination client with one device per process, and places
-        // `u8[2] = [7, 11]` onto the destination device of process 1, which reads the value back. A source that only
+        // Each of two processes sees a source client and a target client with one device per process, and places
+        // `u8[2] = [7, 11]` onto the target device of process 1, which reads the value back. A source that only
         // process 0 holds is the same error on both processes, before anything is read back, also on process 0, which
-        // owns no destination device. A source that process 1 also holds is placed by process 1, and process 0 returns
+        // owns no target device. A source that process 1 also holds is placed by process 1, and process 0 returns
         // the same metadata without buffers. Each entry point agrees.
         let source_clients = [cpu_client(1), process_one_cpu_client(1)];
-        let destination_clients = [other_cpu_client(1), process_one_cpu_client(1)];
+        let target_clients = [other_cpu_client(1), process_one_cpu_client(1)];
         let source_devices = source_clients.map(first_device);
-        let destination_device = first_device(destination_clients[1]);
+        let target_device = first_device(target_clients[1]);
         let target = Placement::new(
-            DeviceMesh::new(LogicalMesh::single_device(), vec![destination_device]).unwrap(),
+            DeviceMesh::new(LogicalMesh::single_device(), vec![target_device]).unwrap(),
             Sharding::replicated(LogicalMesh::single_device(), 1),
         )
         .unwrap();
@@ -5678,7 +5663,7 @@ mod tests {
         for process in 0..2 {
             let remote = [source_devices[1 - process]];
             let source_session = session_with_remote_devices(source_clients[process], remote);
-            let session = session_with_remote_devices(destination_clients[process], remote);
+            let session = session_with_remote_devices(target_clients[process], remote);
             let place = |mesh: &DeviceMesh| {
                 let source = Array::from_host_buffer(&source_session, r#type.clone(), mesh.clone(), None, [7u8, 11]);
                 place_through_entry_points(&session, &source.unwrap(), target.clone())
@@ -5706,7 +5691,7 @@ mod tests {
 
     #[test]
     fn test_array_to_placement_from_another_client_keeps_memory_of_source() {
-        // A destination that omits its memory keeps the pinned host memory of a source of another client, as within
+        // A target that omits its memory keeps the pinned host memory of a source of another client, as within
         // one client, and a request for a device selects its default memory.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -5739,7 +5724,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_reports_failed_sources_without_buffers_across_clients() {
         // A source of another client is replicated over a device of process 0 and a device of process 1, and its
-        // replica on process 0 is the buffer of a transfer manager. Process 0 owns no device of the destination on
+        // replica on process 0 is the buffer of a transfer manager. Process 0 owns no device of the target on
         // process 1, so it reads nothing back, and its result without buffers reports the failure of that replica
         // through each entry point.
         let other_client = other_cpu_client(1);
@@ -5804,7 +5789,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_ignores_earlier_sends_onto_the_same_devices() {
         // The session frontend and core dispatch each place an array that issued a send which fails later. Each
-        // places without a destination and onto the source device, with and without a forced copy. The new
+        // places without a target and onto the source device, with and without a forced copy. The new
         // placements send nothing, so only the source reports the failure.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -5821,8 +5806,8 @@ mod tests {
             PlacementOptions::to(PlacementRequest::from(device)).with_may_alias(false),
         ]
         .map(|options| session.place(sent.clone(), options).unwrap());
-        let destination = PlacementRequest::from(device);
-        let core = [(None, true), (None, false), (Some(&destination), true), (Some(&destination), false)].map(
+        let target_request = PlacementRequest::from(device);
+        let core = [(None, true), (None, false), (Some(&target_request), true), (Some(&target_request), false)].map(
             |(target, may_alias)| {
                 <ValueDomainDispatch as PlaceDispatch<ArrayType, Array>>::place(&sent, target, None, may_alias).unwrap()
             },
@@ -5849,7 +5834,7 @@ mod tests {
         let own_mesh = source.mesh().clone();
         let pinned = Memory::Host { pinned: true };
 
-        // A destination that names only a memory or a layout commits the result, as in JAX, but leaves it on the
+        // A target that names only a memory or a layout commits the result, as in JAX, but leaves it on the
         // devices that this process chose on its own.
         for placed in [
             source.to_placement(&session, pinned).unwrap(),
@@ -5869,7 +5854,7 @@ mod tests {
             assert!(placed.is_locally_assigned());
         }
 
-        // A destination that names devices or a sharding names the devices of the result, even when they are the
+        // A target that names devices or a sharding names the devices of the result, even when they are the
         // devices of the source, and commits it, while the source stays uncommitted.
         let devices = session.addressable_devices().unwrap();
         let same_devices = Placement::new(own_mesh.clone(), source.sharding().clone()).unwrap();
@@ -5991,7 +5976,7 @@ mod tests {
         assert!(source.device_shard(devices[1].id()).unwrap().buffer().is_none());
         assert_eq!(source.copy_to_host_bytes().unwrap(), [7]);
 
-        // The plan names the replica on the destination device, which this array lacks. Only this process takes part
+        // The plan names the replica on the target device, which this array lacks. Only this process takes part
         // in the move, so the replica on the other device of this process serves it instead.
         let source_buffer = Arc::clone(source.device_shard(devices[0].id()).unwrap().buffer().unwrap());
         for placed in place_through_entry_points(&session, &source, devices[1]) {
@@ -6117,7 +6102,7 @@ mod tests {
         };
 
         // A placement that keeps the reduction state and only changes where each contribution lives moves every
-        // contribution as it is, so the contribution at coordinate zero moves to the first device of the destination
+        // contribution as it is, so the contribution at coordinate zero moves to the first device of the target
         // mesh, which keeps the sum of two smallest subnormal `f32` values, the sum of two negative zeros, the `u8`
         // summands `3` and `5`, and the `f8e8m0fnu` summands of a type without an additive identity. Adding an unused
         // axis of size one changes no contribution either.
@@ -6128,15 +6113,15 @@ mod tests {
             (DataType::F8E8M0FNU, UnreducedKind::Sum, [vec![0x7f], vec![0x7f]]),
             (DataType::F32, UnreducedKind::Max, [values_to_bytes(&[1f32]), values_to_bytes(&[f32::NAN])]),
         ];
-        for destination in [&reversed, &unit] {
+        for target_mesh in [&reversed, &unit] {
             for (data_type, kind, contributions) in &contributions {
                 let source = import(*data_type, *kind, contributions);
                 let value = source.copy_to_host_bytes().unwrap();
-                let target = Placement::new(destination.clone(), pending(destination, *kind)).unwrap();
+                let target = Placement::new(target_mesh.clone(), pending(target_mesh, *kind)).unwrap();
                 for placed in place_through_entry_points(&session, &source, target) {
                     let placed = placed.unwrap();
-                    let context = format!("{data_type} {kind} onto {destination:?}");
-                    assert_eq!(device_bytes(&placed), moved_bytes(destination, contributions), "{context}");
+                    let context = format!("{data_type} {kind} onto {target_mesh:?}");
+                    assert_eq!(device_bytes(&placed), moved_bytes(target_mesh, contributions), "{context}");
                     assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
                 }
             }
@@ -6194,8 +6179,7 @@ mod tests {
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        let destination_mesh =
-            DeviceMesh::new(transposed, vec![devices[0], devices[2], devices[1], devices[3]]).unwrap();
+        let target_mesh = DeviceMesh::new(transposed, vec![devices[0], devices[2], devices[1], devices[3]]).unwrap();
         let pending = |mesh: &DeviceMesh, axes: &[&str]| {
             let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
             sharding.with_unreduced_axes(axes.iter().map(|axis| axis.to_string())).unwrap()
@@ -6222,7 +6206,7 @@ mod tests {
         // only moves contributions and keeps the sum of two smallest subnormal `f32` values.
         let contribution = vec![1u8, 0, 0, 0];
         let source = import(DataType::F32, &source_mesh, &["x"], std::array::from_fn(|_| contribution.clone()));
-        let target = Placement::new(destination_mesh.clone(), pending(&destination_mesh, &["x"])).unwrap();
+        let target = Placement::new(target_mesh.clone(), pending(&target_mesh, &["x"])).unwrap();
         let placed = source.to_placement(&session, target).unwrap();
         for shard in placed.shards() {
             assert_eq!(shard.copy_to_host_bytes().unwrap(), contribution);
@@ -6230,7 +6214,7 @@ mod tests {
         assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![2u8, 0, 0, 0]);
 
         // With pending sums along both axes, the contributions correspond by their ordinals (i.e., the k-th unreduced
-        // axis of the source in mesh order corresponds to the k-th one of the destination when their sizes are equal),
+        // axis of the source in mesh order corresponds to the k-th one of the target when their sizes are equal),
         // so the contributions at `(x, y) = (0, 1)` and `(1, 0)` swap devices and the readback combines every
         // contribution in the same order, which keeps the sum of `[MAX, -MAX, MAX, -MAX]` at zero and the sum of
         // `[2^24, 1, -2^24, 1]` at one.
@@ -6241,7 +6225,7 @@ mod tests {
             let bytes = contributions.map(|value| values_to_bytes(&[value]));
             let source = import(DataType::F32, &source_mesh, &both, bytes);
             let before = source.copy_to_host_bytes().unwrap();
-            let target = Placement::new(destination_mesh.clone(), pending(&destination_mesh, &["y", "x"])).unwrap();
+            let target = Placement::new(target_mesh.clone(), pending(&target_mesh, &["y", "x"])).unwrap();
             let placed = source.to_placement(&session, target).unwrap();
             let moved = [contributions[0], contributions[2], contributions[1], contributions[3]];
             assert_eq!(device_bytes(&placed), moved.map(|value| values_to_bytes(&[value])));
@@ -6273,9 +6257,9 @@ mod tests {
             LogicalMesh::new(axes.collect()).unwrap()
         };
         let source_mesh = DeviceMesh::new(logical_mesh([("x", 2), ("y", 3)]), devices.clone()).unwrap();
-        let destination_devices = [0, 3, 1, 4, 2, 5].map(|index| devices[index]).to_vec();
-        let destination_mesh = DeviceMesh::new(logical_mesh([("y", 3), ("x", 2)]), destination_devices).unwrap();
-        let target = Placement::new(destination_mesh.clone(), pending(&destination_mesh, &["y", "x"])).unwrap();
+        let target_devices = [0, 3, 1, 4, 2, 5].map(|index| devices[index]).to_vec();
+        let target_mesh = DeviceMesh::new(logical_mesh([("y", 3), ("x", 2)]), target_devices).unwrap();
+        let target = Placement::new(target_mesh.clone(), pending(&target_mesh, &["y", "x"])).unwrap();
         for (contributions, sum) in [
             ([f32::MAX, -f32::MAX, 0., f32::MAX, -f32::MAX, 0.], 0f32),
             ([16_777_216f32, 1., 0., -16_777_216., 1., 0.], 1.),
@@ -6295,8 +6279,8 @@ mod tests {
             assert_eq!(values_from_bytes::<f32>(&before), [sum]);
             for placed in place_through_entry_points(&session, &source, target.clone()) {
                 let placed = placed.unwrap();
-                // The device at position `k` of the destination mesh holds the contribution with ordinal `k`.
-                let moved = destination_mesh
+                // The device at position `k` of the target mesh holds the contribution with ordinal `k`.
+                let moved = target_mesh
                     .devices()
                     .iter()
                     .map(|device| placed.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
@@ -6332,7 +6316,7 @@ mod tests {
         // the partitioning axis renamed. It completes no sum, so each sum of two smallest subnormal `f32` values (i.e.,
         // the bits `0x00000002`) is kept, and `f8e8m0fnu`, which has no additive identity, moves as well. On the same
         // mesh, the placement moves regions as well, so that sparse and dense sources behave alike.
-        let destinations = [
+        let targets = [
             (mesh(&[("x", 2, explicit), ("y", 2, explicit)]), "y"),
             (mesh(&[("x", 2, explicit), ("y", 2, explicit), ("unit", 1, explicit)]), "y"),
             (mesh(&[("x", 2, explicit), ("z", 2, explicit)]), "z"),
@@ -6346,9 +6330,9 @@ mod tests {
             (DataType::F8E8M0FNU, [vec![0x7f; 4], vec![0x7f; 4]], vec![0x80; 4]),
             (DataType::U8, [vec![1, 2, 3, 4], vec![10, 20, 30, 40]], vec![11, 22, 33, 44]),
         ];
-        for (destination_mesh, axis) in &destinations {
+        for (target_mesh, axis) in &targets {
             let split = vec![ShardingDimension::sharded([*axis])];
-            let split = Sharding::new(destination_mesh.logical_mesh().clone(), split).unwrap();
+            let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
             let split = split.with_unreduced_axes(["x"]).unwrap();
             for (data_type, contributions, value) in &cases {
                 let source = Array::from_host_shards(
@@ -6364,13 +6348,13 @@ mod tests {
                 .unwrap();
                 assert_eq!(&source.copy_to_host_bytes().unwrap(), value, "{data_type}");
                 let strategy = source
-                    .device_placement_strategy(&cross_host_layout_resolver(client), destination_mesh, &split, 0)
+                    .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
                     .unwrap();
                 assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{data_type} {axis}");
                 // The device at `(x, s)` holds the half `s` of the contribution at `x`.
                 let halves = |x: usize| contributions[x].chunks(contributions[x].len() / 2).map(<[u8]>::to_vec);
                 let expected = halves(0).chain(halves(1)).collect::<Vec<_>>();
-                let target = Placement::new(destination_mesh.clone(), split.clone()).unwrap();
+                let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
                 for placed in place_through_entry_points(&session, &source, target) {
                     let placed = placed.unwrap();
                     assert_eq!(device_bytes(&placed), expected, "{data_type} along {axis}");
@@ -6463,7 +6447,7 @@ mod tests {
         // `y = 1`, for an uneven split of three rows and an even one of four, which a compiled reshard cannot make.
         // Every contribution keeps its value (e.g., the `u8` contributions `3` and `5` of three rows stay apart rather
         // than read back as `8` and `0`), and `f8e8m0fnu`, which has no additive identity, moves as well.
-        let destinations = [
+        let targets = [
             (mesh(&[("x", 2), ("y", 2)]), "y"),
             (mesh(&[("x", 2), ("y", 2), ("unit", 1)]), "y"),
             (mesh(&[("x", 2), ("z", 2)]), "z"),
@@ -6517,16 +6501,16 @@ mod tests {
                     let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
                     let source = Array::from_addressable_buffers(&session, r#type, mesh, sharding, buffers).unwrap();
                     assert_eq!(source.copy_to_host_bytes().unwrap(), value, "{data_type} {rows} {sparse}");
-                    for (destination_mesh, axis) in &destinations {
+                    for (target_mesh, axis) in &targets {
                         let split = vec![ShardingDimension::sharded([*axis]), ShardingDimension::replicated()];
-                        let split = Sharding::new(destination_mesh.logical_mesh().clone(), split).unwrap();
+                        let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
                         let split = split.with_unreduced_axes(["x"]).unwrap();
                         let context = format!("{data_type} with {rows} rows along {axis} (sparse: {sparse})");
                         let strategy = source
-                            .device_placement_strategy(&cross_host_layout_resolver(client), destination_mesh, &split, 0)
+                            .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
                             .unwrap();
                         assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{context}");
-                        let target = Placement::new(destination_mesh.clone(), split.clone()).unwrap();
+                        let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
                         for placed in place_through_entry_points(&session, &source, target) {
                             let placed = placed.unwrap();
                             assert_eq!(placed.layout(), Some(&column_major), "{context}");
@@ -6583,11 +6567,11 @@ mod tests {
         // of the other one, and copies regions between its own devices. Both processes plan the same transfers, and
         // process 0, which converts the shards that its sends read to the dense row-major layout first, reaches its
         // transfers, which fail here with the missing cross-host transfers extension of the CPU plugin.
-        let (session, destination_mesh) = two_process_mesh_2x2();
+        let (session, target_mesh) = two_process_mesh_2x2();
         let client = session.client();
         let pjrt_devices = client.addressable_devices().unwrap();
-        let logical_mesh = destination_mesh.logical_mesh().clone();
-        let devices = destination_mesh.devices();
+        let logical_mesh = target_mesh.logical_mesh().clone();
+        let devices = target_mesh.devices();
         let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0], devices[2], devices[1], devices[3]]);
         let source_mesh = source_mesh.unwrap();
         let sum = Sharding::replicated(logical_mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
@@ -6606,7 +6590,7 @@ mod tests {
         let peer = Array::from_addressable_buffers(&session, r#type, source_mesh, sharding, Vec::new()).unwrap();
         let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
         let split = Sharding::new(logical_mesh, split).unwrap().with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(placement_agreement(&[own, peer], &destination_mesh, &split), Ok("shard regions".to_string()));
+        assert_eq!(placement_agreement(&[own, peer], &target_mesh, &split), Ok("shard regions".to_string()));
     }
 
     #[test]
@@ -6661,7 +6645,7 @@ mod tests {
         let moves = plan
             .moves
             .iter()
-            .map(|movement| (movement.source_device, movement.destination_device, movement.slice.clone()))
+            .map(|movement| (movement.source_device, movement.target_device, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(moves, [(devices[0], remote, vec![0..1])]);
     }
@@ -6678,20 +6662,19 @@ mod tests {
             vec![devices[0], devices[1], remote],
         )
         .unwrap();
-        let destination_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("destination", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+        let target_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("target", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
             vec![devices[0], remote],
         )
         .unwrap();
         let replicated = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
         let split =
-            Sharding::new(destination_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["destination"])])
-                .unwrap();
-        let target = Placement::new(destination_mesh.clone(), split.clone()).unwrap();
+            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["target"])]).unwrap();
+        let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
 
-        // The source holds only one of its local replicas, and the plan names the replica on the destination device.
+        // The source holds only one of its local replicas, and the plan names the replica on the target device.
         // Only this process takes part in the region of that device, so whichever local replica holds a buffer serves
-        // it, sliced on its own device and copied to the destination device when that differs.
+        // it, sliced on its own device and copied to the target device when that differs.
         for (holder, holder_device) in client_devices.iter().zip(&devices) {
             let buffer =
                 client.buffer([10u8, 20, 30, 40].as_slice(), BufferType::U8, [4u64], None, holder.clone(), None);
@@ -6705,7 +6688,7 @@ mod tests {
             .unwrap();
             assert_eq!(source.copy_to_host_bytes().unwrap(), [10, 20, 30, 40]);
             let placed = source.to_placement(&session, target.clone()).unwrap();
-            assert_eq!(placed.mesh(), &destination_mesh);
+            assert_eq!(placed.mesh(), &target_mesh);
             assert_eq!(placed.sharding(), &split);
             assert!(placed.is_committed());
             assert_eq!(placed.addressable_shards().count(), 1);
@@ -6746,7 +6729,7 @@ mod tests {
     #[test]
     fn test_array_to_placement_combines_unreduced_device_values() {
         // The devices along the unreduced axis `x` hold summands of the logical value, and `y` tiles its only
-        // dimension. Every destination shard has the slices of a source shard, but a copy of that shard would hold
+        // dimension. Every target shard has the slices of a source shard, but a copy of that shard would hold
         // one summand instead of the logical value, so the placement completes the sum along `x` while `y` keeps
         // tiling the value.
         let client = cpu_client(4);
@@ -6782,7 +6765,7 @@ mod tests {
         // reduction of each kind, over an auto and over an explicit mesh axis, which a placement splits along that
         // axis, on the same mesh and onto two other devices. Completing a pending sum (e.g., of the partial sums of a
         // gradient) is a capability of the placement of an array, whether or not it donates its source, and it
-        // completes on the devices for either axis type, because the host round trip needs a destination that this
+        // completes on the devices for either axis type, because the host round trip needs a target that this
         // process fully addresses. On the same mesh, one compiled reshard completes it (i.e., one program with and one
         // without a donated input). Across meshes, the gather of the source completes it before its replicas move.
         // XLA's maximum and minimum reductions drop NaN values, so a pending maximum or minimum of floating point
@@ -6821,18 +6804,18 @@ mod tests {
                     let sharding = Some(unreduced.clone());
                     Array::from_host_shards(&session, r#type, mesh.clone(), sharding, contributions).unwrap()
                 };
-                for (entry_point, destination, consume) in
+                for (entry_point, target_mesh, consume) in
                     [("borrowed", &mesh, false), ("consumed", &mesh, true), ("across meshes", &other_mesh, false)]
                 {
                     let programs = session.cached_program_count();
-                    let target = Placement::new(destination.clone(), split.clone()).unwrap();
+                    let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
                     let placed = if consume {
                         source().into_placement(&session, target)
                     } else {
                         source().to_placement(&session, target)
                     };
                     let placed = placed.map(|placed| {
-                        assert_eq!((placed.mesh(), placed.sharding()), (destination, &split));
+                        assert_eq!((placed.mesh(), placed.sharding()), (target_mesh, &split));
                         shard_values(&placed)
                     });
                     let programs = session.cached_program_count() - programs;
@@ -6862,15 +6845,15 @@ mod tests {
         // Placements of an `f32[4]` value on a 2x2 mesh whose axes `x` and `y` are explicit or auto, from and to
         // shardings with reduction state, with the number of programs that each entry point compiles in a session of
         // its own (i.e., on the same mesh with and without donation, and onto the same devices in reverse order). A
-        // pending reduction that a destination keeps moves as regions of the shards of each contribution, on the same
+        // pending reduction that a target keeps moves as regions of the shards of each contribution, on the same
         // mesh too, so that sparse and dense sources behave alike, which slice or join the shards of every device
         // (`+4`) and complete nothing, whatever the type of the axes. On the same mesh, the compiled reshard is the
         // fallback when regions do not apply. A compiled reshard makes every other change over auto axes (i.e., it
         // completes a pending reduction and introduces a pending sum or a completed reduction). XLA cannot introduce a
-        // pending maximum or minimum, so a destination with one that the source does not keep compiles nothing and
+        // pending maximum or minimum, so a target with one that the source does not keep compiles nothing and
         // takes the host round trip (e.g., across meshes, where the gather completes the reduction that the final
         // reshard would have to introduce again). Every cell reads back the logical value of its source with the
-        // destination sharding, and every combination of axis types must give the same rows.
+        // target sharding, and every combination of axis types must give the same rows.
         let client = cpu_client(4);
         let devices = client
             .addressable_devices()
@@ -6962,7 +6945,7 @@ mod tests {
                 ("reduced(x) -> reduced(x) split(y)", &reduced_x, reduced(&split_y)),
                 // A completed reduction along `x` and a kept one along `y`.
                 ("sum(x, y) -> sum(y)", &sum_x_y, unreduced(&replicated, &["y"], UnreducedKind::Sum)),
-                // Destinations with a pending maximum.
+                // Targets with a pending maximum.
                 ("sum(x) -> max(x)", &sum_x, maximum.clone()),
                 ("max(x) -> max(x)", &max_x, maximum.clone()),
                 ("min(x) -> max(x)", &min_x, maximum.clone()),
@@ -6973,10 +6956,10 @@ mod tests {
                 ("reduced(x) -> max(x)", &reduced_x, maximum.clone()),
             ];
             let mut outcomes = Vec::new();
-            for (name, (source_sharding, contributions, logical_value), destination) in cells {
+            for (name, (source_sharding, contributions, logical_value), target_sharding) in cells {
                 let context = format!("{x_type:?}/{y_type:?} {name}");
                 let mut counts = Vec::new();
-                for (destination_mesh, consume) in [(&mesh, false), (&mesh, true), (&reversed_mesh, false)] {
+                for (target_mesh, consume) in [(&mesh, false), (&mesh, true), (&reversed_mesh, false)] {
                     let session = Session::builder().client(client).build().unwrap();
                     let contributions = devices
                         .iter()
@@ -6987,14 +6970,14 @@ mod tests {
                     let sharding = Some(source_sharding.clone());
                     let source =
                         Array::from_host_shards(&session, r#type, mesh.clone(), sharding, contributions).unwrap();
-                    let target = Placement::new(destination_mesh.clone(), destination.clone()).unwrap();
+                    let target = Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap();
                     let placed = if consume {
                         source.into_placement(&session, target)
                     } else {
                         source.to_placement(&session, target)
                     };
                     let placed = placed.unwrap();
-                    assert_eq!((placed.mesh(), placed.sharding()), (destination_mesh, &destination), "{context}");
+                    assert_eq!((placed.mesh(), placed.sharding()), (target_mesh, &target_sharding), "{context}");
                     assert_eq!(&placed.copy_to_host().unwrap().elements::<f32>().unwrap(), logical_value, "{context}");
                     counts.push(format!("+{}", session.cached_program_count()));
                 }
@@ -7139,7 +7122,7 @@ mod tests {
                     ("max -> max split", Some(UnreducedKind::Max), pending(&split_y, UnreducedKind::Max)),
                 ];
                 let mut outcomes = Vec::new();
-                for (name, source_kind, destination) in placements {
+                for (name, source_kind, target_sharding) in placements {
                     let mut results = Vec::new();
                     for consume in [false, true] {
                         let session = Session::builder().client(client).build().unwrap();
@@ -7157,7 +7140,7 @@ mod tests {
                         }
                         .unwrap();
                         let expected = source.copy_to_host_bytes().unwrap();
-                        let target = Placement::new(mesh.clone(), destination.clone()).unwrap();
+                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
                         let placed = if consume {
                             source.into_placement(&session, target)
                         } else {
@@ -7168,7 +7151,7 @@ mod tests {
                         // they introduce is exact.
                         let sum_contract = programs > 0 && name == "sum -> none";
                         results.push(placed.and_then(|placed| {
-                            assert_eq!(placed.sharding(), &destination, "{data_type} {name}");
+                            assert_eq!(placed.sharding(), &target_sharding, "{data_type} {name}");
                             let actual = placed.copy_to_host_bytes()?;
                             let differing = expected
                                 .chunks(element_size)
@@ -7353,8 +7336,8 @@ mod tests {
         // same name, size, and kind, whatever the other axes of either mesh, and completes or introduces only the
         // others (refer to `kept_unreduced_axes`). Each placement goes from its source mesh to the same mesh, to the
         // same devices with an unused axis `u` of size one, and to the same devices in reverse order, through both
-        // entry points, which must agree, and the three destinations must give the same row, which lists the elements
-        // of every destination shard in mesh order and the readback, which must equal that of the source. Minimum
+        // entry points, which must agree, and the three targets must give the same row, which lists the elements
+        // of every target shard in mesh order and the readback, which must equal that of the source. Minimum
         // subnormal `f32` contributions along `x` with a sum introduced along `y` stay as they are (a completion would
         // flush them on the CPU plugin). Integer contributions along `x` and `y` of which only `y` completes keep `7`
         // and `11` along `x`. The contributions of `f8e8m0fnu`, which has no additive identity, take a sum introduced
@@ -7383,7 +7366,7 @@ mod tests {
         let f32_bits = |bits: u32| bits.to_ne_bytes().to_vec();
         let i32_bytes = |value: i32| value.to_ne_bytes().to_vec();
         let (size_one, size_two) = (vec![("x", 2), ("y", 1)], vec![("x", 2), ("y", 2)]);
-        // Each case is its name, data type, source mesh axes, source and destination unreduced axes, and the bytes of
+        // Each case is its name, data type, source mesh axes, source and target unreduced axes, and the bytes of
         // the contributions of the devices of the source mesh in mesh order.
         let (x, x_y) = (vec!["x"], vec!["x", "y"]);
         let cases = [
@@ -7393,18 +7376,18 @@ mod tests {
             ("f8e8m0fnu sum(x) -> sum(x, y=2)", DataType::F8E8M0FNU, &size_two, &x, &x_y, vec![vec![0x7f]; 4]),
         ];
         let mut rows = Vec::new();
-        for (name, data_type, axes, source_axes, destination_axes, contributions) in cases {
+        for (name, data_type, axes, source_axes, target_axes, contributions) in cases {
             let devices = devices[..contributions.len()].to_vec();
             let source_mesh = mesh(axes, devices.clone());
             let with_unused = axes.iter().copied().chain([("u", 1)]).collect::<Vec<_>>();
-            let destinations = [
+            let targets = [
                 ("the same mesh", source_mesh.clone()),
                 ("an unused axis", mesh(&with_unused, devices.clone())),
                 ("reversed devices", mesh(axes, devices.iter().rev().copied().collect())),
             ];
-            let mut rows_by_destination = Vec::new();
-            for (destination_name, destination_mesh) in destinations {
-                let destination = pending(&destination_mesh, destination_axes);
+            let mut rows_by_target = Vec::new();
+            for (target_name, target_mesh) in targets {
+                let target_sharding = pending(&target_mesh, target_axes);
                 let mut results = Vec::new();
                 for consume in [false, true] {
                     let session = Session::builder().client(client).build().unwrap();
@@ -7417,7 +7400,7 @@ mod tests {
                     let source =
                         Array::from_host_shards(&session, r#type, source_mesh.clone(), sharding, shards).unwrap();
                     let expected = source.copy_to_host_bytes().unwrap();
-                    let target = Placement::new(destination_mesh.clone(), destination.clone()).unwrap();
+                    let target = Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap();
                     let placed = if consume {
                         source.into_placement(&session, target)
                     } else {
@@ -7425,9 +7408,9 @@ mod tests {
                     };
                     results.push(match placed {
                         Ok(placed) => {
-                            assert_eq!(placed.sharding(), &destination, "{name} onto {destination_name}");
+                            assert_eq!(placed.sharding(), &target_sharding, "{name} onto {target_name}");
                             let readback = placed.copy_to_host_bytes().unwrap();
-                            assert_eq!(readback, expected, "{name} onto {destination_name}");
+                            assert_eq!(readback, expected, "{name} onto {target_name}");
                             let shards = placed
                                 .shards()
                                 .iter()
@@ -7438,11 +7421,11 @@ mod tests {
                         Err(error) => format!("error: {error}"),
                     });
                 }
-                assert_eq!(results[0], results[1], "{name} onto {destination_name}");
-                rows_by_destination.push(results.swap_remove(0));
+                assert_eq!(results[0], results[1], "{name} onto {target_name}");
+                rows_by_target.push(results.swap_remove(0));
             }
-            assert_eq!(rows_by_destination[1..], [rows_by_destination[0].clone(), rows_by_destination[0].clone()]);
-            rows.push(format!("{name}: {}", rows_by_destination[0]));
+            assert_eq!(rows_by_target[1..], [rows_by_target[0].clone(), rows_by_target[0].clone()]);
+            rows.push(format!("{name}: {}", rows_by_target[0]));
         }
         let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
                                 unreduced axes";
@@ -7461,8 +7444,8 @@ mod tests {
         // A placement that introduces a pending sum places the value only on the devices at coordinate zero along the
         // introduced axes (here `y`, so devices 0 and 2 of the 2x2 mesh) and gives the others the additive identity
         // (negative zero for `f32`), uploaded on their own. A source that already holds the value there with the
-        // destination placement along the other axes (e.g., replicated, or with a pending sum along `x` that the
-        // destination keeps) needs no move and no program, so those devices keep the buffers of the source and the
+        // target placement along the other axes (e.g., replicated, or with a pending sum along `x` that the
+        // target keeps) needs no move and no program, so those devices keep the buffers of the source and the
         // placement creates only its result.
         let client = cpu_client(4);
         let devices = client
@@ -7485,7 +7468,7 @@ mod tests {
         let (value, other, zeros) = (vec![1f32, 2., 3., 4.], vec![10f32, 20., 30., 40.], vec![0f32; 4]);
         let (first_half, second_half) = (value[..2].to_vec(), value[2..].to_vec());
         // Each row is the name of the source, its mesh, its sharding, and the values of its devices in mesh order,
-        // and the destination sharding and the values that the devices hold after the placement in mesh order.
+        // and the target sharding and the values that the devices hold after the placement in mesh order.
         let rows = [
             (
                 "replicated",
@@ -7522,7 +7505,7 @@ mod tests {
         ];
         let r#type = ArrayType::new_static(DataType::F32, [4]);
         let mut outcomes = Vec::new();
-        for (name, source_mesh, source_sharding, source_values, destination, expected) in rows {
+        for (name, source_mesh, source_sharding, source_values, target, expected) in rows {
             let session = Session::builder().client(client).build().unwrap();
             let shards = devices
                 .iter()
@@ -7539,9 +7522,9 @@ mod tests {
             let source_buffers =
                 source.addressable_shards().filter_map(ArrayShard::buffer).cloned().collect::<Vec<_>>();
             let (programs, arrays) = (session.cached_program_count(), session.array_statistics().created_arrays);
-            let placed = source.to_placement(&session, Placement::new(mesh.clone(), destination.clone()).unwrap());
+            let placed = source.to_placement(&session, Placement::new(mesh.clone(), target.clone()).unwrap());
             let placed = placed.unwrap();
-            assert_eq!((placed.mesh(), placed.sharding()), (&mesh, &destination), "{name}");
+            assert_eq!((placed.mesh(), placed.sharding()), (&mesh, &target), "{name}");
             let shared = placed
                 .addressable_shards()
                 .enumerate()
@@ -7583,7 +7566,7 @@ mod tests {
         let client = session.client();
         let local = session.addressable_devices().unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let destination = replicated.clone().with_unreduced_axes(["y"]).unwrap();
+        let target = replicated.clone().with_unreduced_axes(["y"]).unwrap();
         let r#type = ArrayType::new_static(DataType::F32, [4]);
         let values = [1f32, 2., 3., 4.];
         let device = client.addressable_devices().unwrap()[1].clone();
@@ -7594,8 +7577,8 @@ mod tests {
         let source = source.unwrap();
         let source_buffer = Arc::clone(source.shards()[2].buffer().unwrap());
         let programs = session.cached_program_count();
-        let placed = source.to_placement(&session, Placement::new(mesh.clone(), destination.clone()).unwrap()).unwrap();
-        assert_eq!((placed.sharding(), session.cached_program_count() - programs), (&destination, 0));
+        let placed = source.to_placement(&session, Placement::new(mesh.clone(), target.clone()).unwrap()).unwrap();
+        assert_eq!((placed.sharding(), session.cached_program_count() - programs), (&target, 0));
         let held = placed
             .addressable_shards()
             .map(|shard| {
@@ -7607,7 +7590,7 @@ mod tests {
         assert_eq!(held, vec![(local[0], values.to_vec(), false), (local[1], values.to_vec(), true)]);
 
         let empty = Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(replicated), Vec::new());
-        let placed = empty.unwrap().to_placement(&session, Placement::new(mesh, destination).unwrap());
+        let placed = empty.unwrap().to_placement(&session, Placement::new(mesh, target).unwrap());
         assert_eq!(
             placed.map(|_| ()).map_err(|error| error.to_string()),
             Err(format!("array shard #0 on device {} has no addressable buffer", local[0].id())),
@@ -7638,7 +7621,7 @@ mod tests {
             ),
             (vec![1, 2], vec![42, 43], Sharding::new(logical_mesh, rows).unwrap(), columns, vec![vec![42], vec![43]]),
         ];
-        for (dimensions, bytes, source_sharding, destination, expected) in cases {
+        for (dimensions, bytes, source_sharding, target_sharding, expected) in cases {
             let device = client.addressable_devices().unwrap()[0].clone();
             let buffer = client.buffer(bytes.as_slice(), BufferType::U8, dimensions.clone(), None, device, None);
             let r#type =
@@ -7651,7 +7634,7 @@ mod tests {
                 vec![buffer.unwrap()],
             );
             let source = source.unwrap();
-            let target = Placement::new(mesh.clone(), destination).unwrap();
+            let target = Placement::new(mesh.clone(), target_sharding).unwrap();
             for placed in
                 [source.to_placement(&session, target.clone()), source.clone().into_placement(&session, target)]
             {
@@ -7688,8 +7671,8 @@ mod tests {
         let r#type = ArrayType::new_static(DataType::U8, [0]);
         let source =
             Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(replicated.clone()), buffers).unwrap();
-        let destination = Placement::new(mesh, replicated.with_unreduced_axes(["x"]).unwrap()).unwrap();
-        let placed = source.to_placement(&session, destination).unwrap();
+        let target = Placement::new(mesh, replicated.with_unreduced_axes(["x"]).unwrap()).unwrap();
+        let placed = source.to_placement(&session, target).unwrap();
         for manager in &managers {
             manager.set_error(0, PjrtError::aborted("empty upload failed")).unwrap();
         }
@@ -7739,7 +7722,7 @@ mod tests {
             Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded([axis])]).unwrap()
         };
         let varying_tiles = |mesh: &DeviceMesh| split(mesh, "m").with_varying_manual_axes(["m"]).unwrap();
-        // Each row has a source type, mesh, sharding, and the bytes of the device at each index, a destination, and
+        // Each row has a source type, mesh, sharding, and the bytes of the device at each index, a target, and
         // the sets of devices that hold buffers, the first of which holds all of them.
         let rows = [
             (
@@ -7917,7 +7900,7 @@ mod tests {
         // the element type would change the value (e.g., the `f8e4m3fn` contributions `448`, `448`, `-448`, and
         // `-448`, which sum to zero, have the partial sums `896` and `-896`, which are NaN in `f8e4m3fn`, and the
         // `bf16` contributions `256`, `1`, `-256`, and `1` have the partial sum `257`, which rounds to `256`). The
-        // host round trip that remains would combine the partial sums that the destination keeps, so both entry points
+        // host round trip that remains would combine the partial sums that the target keeps, so both entry points
         // return the partial-contribution error, which the rows list as `error` and `errors` in
         // full. A data type that accumulates its sums in itself keeps them on the devices: integers are exact, and an
         // `f32` partial completion fixes the order of accumulation to its partial sums first, as the contract of
@@ -7968,7 +7951,7 @@ mod tests {
                     let array = CoreArray::new(r#type.clone(), bytes.to_vec()).unwrap();
                     array.convert_element_type(DataType::F64).unwrap().elements::<f64>().unwrap()
                 };
-                for (name, source_axes, destination) in &transitions {
+                for (name, source_axes, target_sharding) in &transitions {
                     let mut results = Vec::new();
                     for consume in [false, true] {
                         let session = Session::builder().client(client).build().unwrap();
@@ -7988,16 +7971,16 @@ mod tests {
                         let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
                         let source = source.unwrap();
                         let expected = source.copy_to_host_bytes().unwrap();
-                        let strategy = planned_work(&source, &simulated_cross_host_layout, 0, &mesh, destination)
+                        let strategy = planned_work(&source, &simulated_cross_host_layout, 0, &mesh, target_sharding)
                             .map(|work| work.strategy);
-                        let target = Placement::new(mesh.clone(), destination.clone()).unwrap();
+                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
                         let placed = if consume {
                             source.into_placement(&session, target)
                         } else {
                             source.to_placement(&session, target)
                         };
                         let actual = placed.and_then(|placed| {
-                            assert_eq!(placed.sharding(), destination, "{data_type} {name}");
+                            assert_eq!(placed.sharding(), target_sharding, "{data_type} {name}");
                             placed.copy_to_host_bytes()
                         });
                         let actual = actual.map_err(|error| error.to_string());
@@ -8090,7 +8073,7 @@ mod tests {
         // The devices at `(0, 0)`, `(0, 1)`, `(1, 0)`, and `(1, 1)` of a 2x2 mesh hold the `f32` contributions `MAX`,
         // `0`, `MAX`, and `-MAX`, whose combined value is infinite, to a value of five elements with a pending sum
         // along `x` and `y`. Completing `y` keeps the partial sums `MAX` and `0` along `x`, which an untiled
-        // destination does with a compiled reshard. A destination split unevenly along `y` rules out every device
+        // target does with a compiled reshard. A target split unevenly along `y` rules out every device
         // strategy, and the host round trip that remains would combine the partial sums, so both entry points return
         // the same error, which every process derives from the shardings. Each row lists the shards in mesh order and
         // the readback of the result, with the equal elements of each as `value xcount`.
@@ -8125,7 +8108,7 @@ mod tests {
             format!("{value} x{}", elements.len())
         };
         let mut outcomes = Vec::new();
-        for (name, destination) in [("untiled", &untiled), ("split unevenly along y", &uneven)] {
+        for (name, target_sharding) in [("untiled", &untiled), ("split unevenly along y", &uneven)] {
             let mut results = Vec::new();
             for consume in [false, true] {
                 let session = Session::builder().client(client).build().unwrap();
@@ -8136,8 +8119,8 @@ mod tests {
                 let sharding = Some(source_sharding.clone());
                 let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
                 let source = source.unwrap();
-                let reason = source.placement_planning_view().validate_compiled_reshard(&mesh, destination).err();
-                let target = Placement::new(mesh.clone(), destination.clone()).unwrap();
+                let reason = source.placement_planning_view().validate_compiled_reshard(&mesh, target_sharding).err();
+                let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
                 let placed = if consume {
                     source.into_placement(&session, target)
                 } else {
@@ -8145,7 +8128,7 @@ mod tests {
                 };
                 let outcome = match placed {
                     Ok(placed) => {
-                        assert_eq!(placed.sharding(), destination);
+                        assert_eq!(placed.sharding(), target_sharding);
                         let shards = placed.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap());
                         let shards = shards.map(|bytes| render(&bytes)).collect::<Vec<_>>().join(", ");
                         format!("[{shards}] -> {}", render(&placed.copy_to_host_bytes().unwrap()))
@@ -8193,11 +8176,11 @@ mod tests {
             DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
         };
         let source_mesh = mesh_on(&[("x", 2), ("y", 2), ("r", 2)]);
-        let destination_mesh = mesh_on(&[("x", 2), ("y", 2), ("r", 2), ("u", 1)]);
+        let target_mesh = mesh_on(&[("x", 2), ("y", 2), ("r", 2), ("u", 1)]);
         let source_sharding =
             Sharding::replicated(source_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x", "y"]).unwrap();
-        let destination =
-            Sharding::replicated(destination_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let target_sharding =
+            Sharding::replicated(target_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let rows =
             [([f32::MAX, 0., f32::MAX, -f32::MAX], [f32::MAX, 0.], f32::MAX), ([3., 4., 5., 6.], [7., 11.], 18.)];
         for (values, partial_sums, value) in rows {
@@ -8213,13 +8196,13 @@ mod tests {
             let sharding = Some(source_sharding.clone());
             let source = Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), sharding, buffers);
             let source = source.unwrap();
-            let target = Placement::new(destination_mesh.clone(), destination.clone()).unwrap();
+            let target = Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap();
             let mut expected = vec![vec![partial_sums[0]; 4]; 4];
             expected.extend(vec![vec![partial_sums[1]; 4]; 4]);
             let borrowed = source.to_placement(&session, target.clone());
             for placed in [borrowed, source.clone().into_placement(&session, target)] {
                 let placed = placed.unwrap();
-                assert_eq!(placed.sharding(), &destination);
+                assert_eq!(placed.sharding(), &target_sharding);
                 assert_eq!(shard_values(&placed), expected);
                 assert_eq!(values_from_bytes::<f32>(&placed.copy_to_host_bytes().unwrap()), [value; 4]);
             }
@@ -8229,15 +8212,15 @@ mod tests {
     #[test]
     fn test_array_to_placement_admits_process_local_values_alike_on_every_process() {
         // Two processes, each with eight devices, upload the same value without naming a mesh, so that each places it
-        // on its own first devices, and place it on devices of process 0. Process 1 owns no destination device and
+        // on its own first devices, and place it on devices of process 0. Process 1 owns no target device and
         // returns the metadata of the result, and both processes return the same result or the same error, which
         // every process derives from metadata alone:
-        //   - `u8[n] = [3; n]` with a pending sum along `x` and `y` onto a destination that keeps `x` and splits the
+        //   - `u8[n] = [3; n]` with a pending sum along `x` and `y` onto a target that keeps `x` and splits the
         //     value along `y`, which needs a compiled reshard that cannot produce uneven shards, while a host round
         //     trip would combine the contributions along `x`, so `n = 5` is rejected. The value is on the four
-        //     destination devices, on them in reversed order (so process 0 first moves its value onto them), or on
+        //     target devices, on them in reversed order (so process 0 first moves its value onto them), or on
         //     eight devices along a further replicated axis `r` (so every process plans it on a view with devices
-        //     beyond the destination). Process 1 takes part in the admission, and it returns an array without shards
+        //     beyond the target). Process 1 takes part in the admission, and it returns an array without shards
         //     when the placement is admitted.
         //   - `f8e8m0fnu[1]`, which has no additive identity, onto two devices that introduce a pending sum along `x`,
         //     which process 0 uploads through its host and process 1 checks alike.
@@ -8386,9 +8369,9 @@ mod tests {
             .unwrap()
             .with_unreduced_kind(UnreducedKind::Max)
             .unwrap();
-        let destination_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![local[0]]).unwrap();
-        let destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), 0);
-        let target = Placement::new(destination_mesh, destination.clone()).unwrap();
+        let target_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![local[0]]).unwrap();
+        let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 0);
+        let target = Placement::new(target_mesh, target_sharding.clone()).unwrap();
         let session = session_with_remote_devices(remote_client, local.clone());
         let specification = BufferSpecification::new(BufferType::F32, Vec::<u64>::new());
         let manager = remote_client
@@ -8398,7 +8381,7 @@ mod tests {
         let r#type = ArrayType::scalar(DataType::F32);
         let source = Array::from_addressable_buffers(&session, r#type, source_mesh, Some(pending), buffers).unwrap();
         let placed = source.to_placement(&session, target).unwrap();
-        assert_eq!(placed.sharding(), &destination);
+        assert_eq!(placed.sharding(), &target_sharding);
         assert_eq!(placed.addressable_shards().count(), 0);
         manager.set_error(0, PjrtError::aborted("source upload failed")).unwrap();
         for array in [&source, &placed] {
@@ -8885,7 +8868,7 @@ mod tests {
         let source = Array::from_host_buffer(&session, r#type, None, None, values_to_bytes(&values)).unwrap();
         let strided = |strides: Vec<isize>| Layout::Strided(StridedLayout::new(strides));
 
-        // A target layout describes each destination shard, so the strides `[8, 4]` of a dense `f32[4, 2]` column
+        // A target layout describes each target shard, so the strides `[8, 4]` of a dense `f32[4, 2]` column
         // shard pass shape validation for the column shards of a global `[4, 4]` value, which they would overlap.
         // The CPU plugin cannot create buffers in that layout, so the placement rejects it before device work.
         let target = Placement::new(mesh.clone(), columns.clone()).unwrap().with_layout(strided(vec![8, 4]));
@@ -9103,7 +9086,7 @@ mod tests {
             ("across meshes", r#type.with_layout(column_major.clone()), &rows, &replicated, true),
         ];
         for (case, r#type, source_sharding, sharding, reversed) in cases {
-            let destination =
+            let target_mesh =
                 |[first, second]: [Device; 2]| if reversed { mesh([second, first]) } else { mesh([first, second]) };
             let process_index = local[0].process_index();
             let source = Array::from_host_buffer(
@@ -9116,7 +9099,7 @@ mod tests {
             .unwrap();
             let strategy = source.device_placement_strategy(
                 &cross_host_layout_resolver(session.client()),
-                &destination([local[0], local[1]]),
+                &target_mesh([local[0], local[1]]),
                 sharding,
                 process_index,
             );
@@ -9125,11 +9108,11 @@ mod tests {
             } else {
                 assert!(matches!(strategy, Ok(DevicePlacementStrategy::CompiledReshard { .. })), "{case}");
             }
-            let target = Placement::new(destination([local[0], local[1]]), sharding.clone()).unwrap();
+            let target = Placement::new(target_mesh([local[0], local[1]]), sharding.clone()).unwrap();
             let participant = source.to_placement(&session, target).unwrap();
             let participant_moved = source
                 .clone()
-                .reshard_on_devices(&session, &destination([local[0], local[1]]), sharding, false)
+                .reshard_on_devices(&session, &target_mesh([local[0], local[1]]), sharding, false)
                 .unwrap();
             assert_eq!(participant.addressable_shards().count(), 2, "{case}");
             assert_eq!(participant.copy_to_host().unwrap().elements::<f32>().unwrap(), [1., 2., 3., 4.], "{case}");
@@ -9145,12 +9128,12 @@ mod tests {
             )
             .unwrap();
             let cached_program_count = session.cached_program_count();
-            let target = Placement::new(destination(remote), sharding.clone()).unwrap();
+            let target = Placement::new(target_mesh(remote), sharding.clone()).unwrap();
             let placed = peer_source.to_placement(&session, target).unwrap();
             let moved =
-                peer_source.clone().reshard_on_devices(&session, &destination(remote), sharding, false).unwrap();
+                peer_source.clone().reshard_on_devices(&session, &target_mesh(remote), sharding, false).unwrap();
             for output in [&placed, &moved] {
-                assert_eq!(output.mesh(), &destination(remote), "{case}");
+                assert_eq!(output.mesh(), &target_mesh(remote), "{case}");
                 assert_eq!(output.sharding(), participant.sharding(), "{case}");
                 assert_eq!(output.addressable_shards().count(), 0, "{case}");
                 assert!(output.is_committed(), "{case}");
@@ -9198,7 +9181,7 @@ mod tests {
         }
 
         // This client is process 1 of a job of three processes, and both of its devices form the mesh of the source
-        // and of the destination, so it runs the compiled reshard, as process 2 would on a mesh that spans the devices
+        // and of the target, so it runs the compiled reshard, as process 2 would on a mesh that spans the devices
         // of both, while process 0 owns no device of that mesh and compiles nothing. Process 1 is therefore the leader
         // of the compilation, which compiles and publishes the program rather than waiting for process 0.
         let client = process_one_cpu_client(2);
@@ -9249,11 +9232,11 @@ mod tests {
             .plan_shard_regions(&target_mesh, &target_sharding)
             .unwrap()
             .unwrap();
-        // Each column needs two regions. Two of the eight regions are already on their destination devices.
+        // Each column needs two regions. Two of the eight regions are already on their target devices.
         let copied_bytes = regions
             .moves
             .iter()
-            .filter(|movement| movement.source_device != movement.destination_device)
+            .filter(|movement| movement.source_device != movement.target_device)
             .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
             .sum::<usize>();
         assert_eq!(regions.moves.len(), 8);
@@ -9328,7 +9311,7 @@ mod tests {
         let values = values_to_bytes(&[100f32, 101., 102., 103.]);
         let source = Array::from_host_buffer(&session, r#type, source_mesh, sharding, values).unwrap();
 
-        // Sending to the remote destination requires the extension even though local copies are possible.
+        // Sending to the remote target requires the extension even though local copies are possible.
         assert!(matches!(client.cross_host_transfers_extension(), Err(PjrtError::Unimplemented { .. })));
         let target_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -9370,14 +9353,14 @@ mod tests {
         let source = Array::from_addressable_buffers(&session, source_type, source_mesh, None, Vec::new()).unwrap();
         assert_eq!(source.addressable_shards().count(), 0);
         let target_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("destination", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            LogicalMesh::new(vec![MeshAxis::new("target", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![local_device],
         )
         .unwrap();
         let target_sharding = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
 
-        // This process only receives. Every destination is local, so there is no remote destination to blame for the
-        // missing extension. Preserve that error instead of searching for a nonexistent remote destination and
+        // This process only receives. Every target is local, so there is no remote target to blame for the
+        // missing extension. Preserve that error instead of searching for a nonexistent remote target and
         // panicking.
         assert!(matches!(
             source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()),
@@ -9399,9 +9382,9 @@ mod tests {
             DeviceMesh::new(logical_mesh.clone(), vec![local_devices[0], local_devices[1], remote_device]).unwrap();
         let values = [1f32, 2., 3., 4., 5., 6.];
 
-        // Each process uploads the same value without a destination, so its array lives uncommitted on its own first
+        // Each process uploads the same value without a target, so its array lives uncommitted on its own first
         // device. A remote process would have chosen its own device, so the source mesh is not shared, and each
-        // process places its own value on its own destination devices without planning any cross-host transfer. Both
+        // process places its own value on its own target devices without planning any cross-host transfer. Both
         // the borrowing and the consuming placement do so, as does the implicit reshard of a compiled input.
         let replicated = Sharding::replicated(logical_mesh.clone(), 1);
         let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -9479,7 +9462,7 @@ mod tests {
                 if message == "the cross-host transfers extension is not provided by the PJRT plugin",
         ));
 
-        // The upload along an unreduced destination axis uses the layout that the placement records, which is the
+        // The upload along an unreduced target axis uses the layout that the placement records, which is the
         // requested one here, so it lands in that layout directly, rather than in the default layout followed by a
         // compiled conversion of every shard, and every process records that layout whichever strategy it takes.
         let session = session_with_remote_devices(client, [remote_device]);
@@ -9527,9 +9510,9 @@ mod tests {
             (source, producer)
         };
 
-        // The value of this process goes through a host upload along the unreduced destination axis, and no
-        // destination device belongs to this process. The result still waits for and reports the producer of the
-        // source, which the uploads of the processes that hold the destination devices wait for.
+        // The value of this process goes through a host upload along the unreduced target axis, and no
+        // target device belongs to this process. The result still waits for and reports the producer of the
+        // source, which the uploads of the processes that hold the target devices wait for.
         let (source, producer) = pending_source();
         let placed = source.to_placement(&session, target.clone()).unwrap();
         assert_eq!(placed.mesh(), &mesh);
@@ -9549,7 +9532,7 @@ mod tests {
             Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "producer failed",
         ));
 
-        // Along a replicated destination, the value of this process is shared or copied on devices, and no destination
+        // Along a replicated target, the value of this process is shared or copied on devices, and no target
         // device belongs to this process. A source whose only completion is the readiness of its pending buffer (e.g.,
         // a host upload) has no execution fence, so the result waits for and reports that buffer.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -9572,7 +9555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_rejects_misattributed_destination_devices() {
+    fn test_array_to_placement_rejects_misattributed_target_devices() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let local_device = first_device(client);
@@ -9583,7 +9566,7 @@ mod tests {
         let bytes = values_to_bytes(&[7f32]);
         let source = Array::from_host_buffer(&session, ArrayType::scalar(DataType::F32), None, None, bytes).unwrap();
 
-        // The destination assigns the device of this process to another process, so every process would leave its
+        // The target assigns the device of this process to another process, so every process would leave its
         // shard to another one. Both placements reject it before any device work, and the source stays readable.
         let message =
             format!("device {device_id} reports process index {process_index}, but expected {}", process_index + 1);
@@ -9603,7 +9586,7 @@ mod tests {
         }
         assert_eq!(values_from_bytes::<f32>(&source.copy_to_host_bytes().unwrap()), [7.]);
 
-        // A destination device of this process that the client does not address would receive no buffer either, and
+        // A target device of this process that the client does not address would receive no buffer either, and
         // both placements reject it as an import or an upload onto that mesh does.
         let missing = DeviceMesh::new(logical_mesh.clone(), vec![Device::new(device_id + 999, process_index)]);
         let target = Placement::new(missing.unwrap(), Sharding::replicated(logical_mesh, 0)).unwrap();
@@ -9682,7 +9665,7 @@ mod tests {
                 .unwrap()
                 .with_execution_fence(ExecutionFence::new(vec![producer_event]));
 
-        // A destination with unreduced axes on a manual mesh has no device strategy, because shard regions need one
+        // A target with unreduced axes on a manual mesh has no device strategy, because shard regions need one
         // value per slice and a compiled reshard needs a mesh without manual axes, so the host fallback places it. The
         // readback waits for the pending producer of the source, so the placement can only return because the readback
         // and the upload continue in the background.
@@ -9734,12 +9717,12 @@ mod tests {
         )
         .unwrap()
         .with_execution_fence(ExecutionFence::new(vec![producer_event]));
-        // A destination with unreduced axes on a manual mesh has no device strategy (refer to
+        // A target with unreduced axes on a manual mesh has no device strategy (refer to
         // `test_array_to_placement_host_fallback_returns_before_readback`), so the host fallback places it.
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
         let placed = source.to_placement(&session, Placement::new(mesh, sharding).unwrap()).unwrap();
 
-        // The failure of the producer fails the readback, which poisons every destination buffer with an error that
+        // The failure of the producer fails the readback, which poisons every target buffer with an error that
         // also carries the failure of the device work.
         producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
         let Err(Error::Pjrt(PjrtError::Internal { message, .. })) = placed.block_until_ready() else {
@@ -9957,7 +9940,7 @@ mod tests {
             let reversed_mesh = explicit_mesh(&[devices[1], devices[0]]);
 
             // This checks whole-shard copies, slicing a region before sending it, and joining local and received
-            // regions on each destination. CUDA pairs sends with receives in issue order for each pair of devices.
+            // regions on each target. CUDA pairs sends with receives in issue order for each pair of devices.
             // The last copy exposes an unmatched send from an earlier placement by receiving its old bytes.
             let placements = [
                 (
@@ -10050,12 +10033,12 @@ mod tests {
         run_as_cuda_rank(|client| {
             let (rank, devices, session) = cuda_rank_session(client);
             let source_mesh = explicit_mesh(&devices[..1]);
-            let destination_mesh = explicit_mesh(&devices);
+            let target_mesh = explicit_mesh(&devices);
             let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
 
             // A column-major replica of `[[1, 2, 3], [4, 5, 6]]` on the device of rank 0 is split by rows over both
             // ranks. Neither whole shards nor shard regions apply, so rank 0 sends its replica to rank 1 for a
-            // compiled reshard on the destination mesh, and it must convert the replica to the row-major layout that
+            // compiled reshard on the target mesh, and it must convert the replica to the row-major layout that
             // the receive of rank 1 allocates, or rank 1 would decode its row as `[5, 3, 6]`.
             let r#type = ArrayType::new_static(DataType::F32, [2, 3])
                 .with_layout(column_major.clone())
@@ -10064,18 +10047,18 @@ mod tests {
             let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
             let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
             let rows = Sharding::new(
-                destination_mesh.logical_mesh().clone(),
+                target_mesh.logical_mesh().clone(),
                 vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
             )
             .unwrap();
-            let placed = source.to_placement(&session, Placement::new(destination_mesh.clone(), rows.clone()).unwrap());
+            let placed = source.to_placement(&session, Placement::new(target_mesh.clone(), rows.clone()).unwrap());
             let placed = placed.unwrap();
             placed.block_until_ready().unwrap();
-            assert_eq!(placed.mesh(), &destination_mesh);
+            assert_eq!(placed.mesh(), &target_mesh);
             assert_eq!(placed.sharding(), &rows);
             assert_eq!(placed.layout(), Some(&column_major));
 
-            // Each rank holds the row of the destination on its own device in a column-major buffer, which is
+            // Each rank holds the row of the target on its own device in a column-major buffer, which is
             // described by its slice, whether its physical layout is column-major, and its dense row-major values.
             let shards = placed
                 .addressable_shards()
@@ -10153,7 +10136,7 @@ mod tests {
             let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
             let replicated = Sharding::replicated(logical_mesh.clone(), 2);
             let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0]]).unwrap();
-            let destination_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
+            let target_mesh = DeviceMesh::new(logical_mesh, vec![devices[1]]).unwrap();
 
             // Rank 0 holds `[[1, 2, 3], [4, 5, 6]]` in a column-major buffer, which the type does not declare, so only
             // rank 0 knows that its buffer is not in the row-major layout that the receive of rank 1 allocates. Rank 1
@@ -10178,10 +10161,10 @@ mod tests {
             };
             let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated.clone()).unwrap();
             let source = Array::from_addressable_buffers(&session, r#type, source_mesh, None, buffers).unwrap();
-            let target = Placement::new(destination_mesh.clone(), replicated).unwrap();
+            let target = Placement::new(target_mesh.clone(), replicated).unwrap();
             let placed = source.to_placement(&session, target).unwrap();
             placed.block_until_ready().unwrap();
-            assert_eq!(placed.mesh(), &destination_mesh);
+            assert_eq!(placed.mesh(), &target_mesh);
             assert_eq!(session.cached_program_count(), if rank == 0 { 1 } else { 0 });
             let shards =
                 placed.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
@@ -10284,7 +10267,7 @@ mod tests {
         run_as_cuda_rank(|client| {
             let (rank, devices, session) = cuda_rank_session(client);
             let source_mesh = explicit_mesh(&devices[..1]);
-            let destination_mesh = explicit_mesh(&devices[1..]);
+            let target_mesh = explicit_mesh(&devices[1..]);
             let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
             let values = values_to_bytes(&[1f32, 2., 3., 4.]);
 
@@ -10371,7 +10354,7 @@ mod tests {
                 let r#type = r#type.with_memory(memory).with_sharding(replicated.clone()).unwrap();
                 let source =
                     Array::from_host_buffer(&session, r#type, source_mesh.clone(), None, values.as_slice()).unwrap();
-                let target = Placement::new(destination_mesh.clone(), replicated).unwrap();
+                let target = Placement::new(target_mesh.clone(), replicated).unwrap();
                 let target = match target_memory {
                     Some(target_memory) => target.with_memory(target_memory),
                     None => target,
@@ -10446,7 +10429,7 @@ mod tests {
         run_as_cuda_rank(|client| {
             let (rank, devices, session) = cuda_rank_session(client);
             let source_mesh = explicit_mesh(&devices[..1]);
-            let destination_mesh = explicit_mesh(&devices[1..]);
+            let target_mesh = explicit_mesh(&devices[1..]);
             let replicated = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
 
             // Rank 0 runs a bounded-dynamic identity whose result buffer is allocated for the bound of its dimension
@@ -10499,7 +10482,7 @@ mod tests {
                             });
                     (source, None)
                 };
-                let target = Placement::new(destination_mesh.clone(), replicated.clone()).unwrap();
+                let target = Placement::new(target_mesh.clone(), replicated.clone()).unwrap();
                 let placed = source
                     .to_placement(&session, target)
                     .and_then(|placed| placed.block_until_ready().map(|()| placed))
@@ -10566,7 +10549,7 @@ mod tests {
             let source = Array::from_host_buffer(&session, r#type, source_mesh, None, values).unwrap();
 
             // The declared layout rules out shard regions, so each placement gathers the source on the devices of both
-            // ranks, copies the gathered value to the destination device on the rank that owns it, and reshards it
+            // ranks, copies the gathered value to the target device on the rank that owns it, and reshards it
             // there. Only that rank compiles and runs the final reshard, and the other rank returns the same metadata
             // without buffers. A rank that compiled for the device of its peer would fail, and a rank that skipped the
             // gather would leave its peer waiting in it.
@@ -10623,8 +10606,8 @@ mod tests {
             .into_iter();
             let mut shards = Vec::new();
 
-            // Each rank uploads `[1, 2, 3, 4]` without a destination, so its array lives uncommitted on its own
-            // device, which the other rank does not know. A destination on the device of one rank is placed by that
+            // Each rank uploads `[1, 2, 3, 4]` without a target, so its array lives uncommitted on its own
+            // device, which the other rank does not know. A target on the device of one rank is placed by that
             // rank with the strategy of a shared source, which moves nothing between the ranks, and by the other rank
             // with local work only, which places nothing on its devices, and both ranks must still record the same
             // metadata.
@@ -10650,7 +10633,7 @@ mod tests {
                 shards.push((step, place_step(rank, step, &session, &source, target, r#type)));
             }
 
-            // A destination over the devices of both ranks is placed by each rank with local work only, also once the
+            // A target over the devices of both ranks is placed by each rank with local work only, also once the
             // value is placed into device memory, which commits it to its own device, because each rank still chose
             // that device on its own.
             let mesh = explicit_mesh(&devices);
@@ -10682,8 +10665,8 @@ mod tests {
             shards.push((step, place_step(rank, step, &session, &committed, target, r#type)));
             assert!(steps.next().is_none());
 
-            // The rank that owns the device of a destination on one device holds its shard, and each rank holds the
-            // shard of its own device of a destination over the devices of both ranks.
+            // The rank that owns the device of a target on one device holds its shard, and each rank holds the
+            // shard of its own device of a target over the devices of both ranks.
             let expected: [Vec<(&str, Vec<ShardObservation>)>; 2] = [
                 vec![
                     ("onto rank 0", vec![(vec![0..4], "device".to_string(), vec![1.0, 2.0, 3.0, 4.0])]),
@@ -10764,9 +10747,9 @@ mod tests {
 
             // `[[1, 2], [3, 4]]` is split by rows over the device of one rank alone, in a column-major layout. Its
             // shards differ from those of a split over both ranks, and the declared layout rules out shard regions, so
-            // the owner gathers the value on its own device, keeps that replica for its own device of the destination
+            // the owner gathers the value on its own device, keeps that replica for its own device of the target
             // mesh and sends it to the other rank, which only receives it, and both ranks then run the final reshard
-            // on the destination mesh. `test_array_device_placement_strategy_agrees_across_processes` plans the same
+            // on the target mesh. `test_array_device_placement_strategy_agrees_across_processes` plans the same
             // strategy for the row `shared sharded with a declared layout -> sharded over both processes`.
             for owner in [0, 1] {
                 let source_mesh = explicit_mesh(&devices[owner..owner + 1]);
@@ -10785,7 +10768,7 @@ mod tests {
             }
             assert!(steps.next().is_none());
 
-            // Each rank holds the row of the destination on its own device, which is the first row on the forward mesh
+            // Each rank holds the row of the target on its own device, which is the first row on the forward mesh
             // and the second one on the reversed mesh for rank 0, whichever rank owned the source.
             let expected: [Vec<(&str, Vec<ShardObservation>)>; 2] = [
                 vec![
@@ -11211,7 +11194,7 @@ mod tests {
                        `x` on the devices, because XLA can only introduce a pending `sum` reduction, and the \
                        preparation of the arguments of a program has no host round trip; place the argument with \
                        `Array::to_placement` first, which makes the change with a host round trip where one process \
-                       owns every device of the destination and a device of every source contribution with elements";
+                       owns every device of the target and a device of every source contribution with elements";
         assert_eq!(placed.map(|_| ()).map_err(|error| error.to_string()), Err(message.to_string()));
     }
 
@@ -11237,7 +11220,7 @@ mod tests {
             (&replicated, &split, [vec![1f32, 2., 3., 4.], vec![1., 2., 3., 4.]], halves),
             (&split, &replicated, [vec![1., 2.], vec![3., 4.]], vec![vec![1., 2., 3., 4.]; 4]),
         ];
-        for (source, destination, tiles, expected) in cases {
+        for (source, target_sharding, tiles, expected) in cases {
             let buffers = [1, 3]
                 .into_iter()
                 .map(|index| {
@@ -11250,10 +11233,10 @@ mod tests {
             let (mesh, sharding) = (mesh.clone(), Some(source.clone()));
             let input = Array::from_addressable_buffers(&session, r#type, mesh.clone(), sharding, buffers).unwrap();
             let resolve_layout = cross_host_layout_resolver(client);
-            let strategy = input.device_placement_strategy(&resolve_layout, &mesh, destination, 0).unwrap();
+            let strategy = input.device_placement_strategy(&resolve_layout, &mesh, target_sharding, 0).unwrap();
             assert!(matches!(strategy, DevicePlacementStrategy::CompiledReshard { .. }), "{source:?}");
-            let target = Placement::new(mesh.clone(), destination.clone()).unwrap();
-            let placed = input.clone().reshard_on_devices(&session, &mesh, destination, false);
+            let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
+            let placed = input.clone().reshard_on_devices(&session, &mesh, target_sharding, false);
             for placed in [placed, input.to_placement(&session, target)] {
                 assert_eq!(shard_values(&placed.unwrap()), expected, "{source:?}");
             }
@@ -11584,7 +11567,7 @@ mod tests {
                 [7u8],
             )
             .unwrap();
-            // Each process serves both destinations from the replica on its own device, so neither placement
+            // Each process serves both targets from the replica on its own device, so neither placement
             // communicates, alone or grouped with others.
             let one_device = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
             let one_device_sharding = Sharding::replicated(LogicalMesh::single_device(), 1);
@@ -11847,9 +11830,7 @@ mod tests {
             plan_exact_shard_put(BufferType::F32, sources, source_mesh, source_sharding, &shape, &mesh, &replicated);
         let plan = plan.unwrap().unwrap();
         assert_eq!(
-            plan.moves_with_role(0, MoveRole::Send)
-                .map(|movement| movement.destination_device)
-                .collect::<Vec<_>>(),
+            plan.moves_with_role(0, MoveRole::Send).map(|movement| movement.target_device).collect::<Vec<_>>(),
             remote,
         );
         let cross_host_layouts = HashMap::from([(StaticShape::new(vec![2, 3]), row_major.to_pjrt().unwrap())]);
@@ -11885,8 +11866,8 @@ mod tests {
         // first device copies that replica to the first device, in the memory that the type declares, because the
         // receiver pairs the transfer with the first device.
         for (memory, kind) in [(Memory::Device, "device"), (Memory::Host { pinned: true }, "pinned_host")] {
-            let destination = client_devices[1].memory(memory).unwrap();
-            let buffer = client.buffer(values.as_slice(), BufferType::F32, [3u64], None, destination, None).unwrap();
+            let target = client_devices[1].memory(memory).unwrap();
+            let buffer = client.buffer(values.as_slice(), BufferType::F32, [3u64], None, target, None).unwrap();
             let r#type = ArrayType::new_static(DataType::F32, [3]).with_memory(memory);
             let source =
                 Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(replicated.clone()), vec![buffer])
@@ -12097,7 +12078,7 @@ mod tests {
 
     #[test]
     fn test_array_owner_view_mesh_rejects_device_identifiers_that_overflow() {
-        // A locally assigned value on two devices that a destination with one device of the largest identifier
+        // A locally assigned value on two devices that a target with one device of the largest identifier
         // receives is planned on a view with one more device, whose identifier would exceed that one, which is an
         // error rather than an overflow.
         let client = cpu_client(2);
@@ -12162,9 +12143,9 @@ mod tests {
         // which needs the missing cross-host transfers extension. Every process therefore declines whole shards and
         // shard regions alike, and all of them report the missing extension, instead of this process returning after
         // its local copy while the others switch to another strategy.
-        let destination_mesh = DeviceMesh::new(logical_mesh, vec![local, second_remote]).unwrap();
-        let destination_sharding =
-            Sharding::new(destination_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target_mesh = DeviceMesh::new(logical_mesh, vec![local, second_remote]).unwrap();
+        let target_sharding =
+            Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let sources = held.shards().iter().map(ArrayShard::descriptor);
         let plan = plan_exact_shard_put(
             BufferType::F32,
@@ -12172,8 +12153,8 @@ mod tests {
             held.mesh(),
             &sharding,
             &held.shape(),
-            &destination_mesh,
-            &destination_sharding,
+            &target_mesh,
+            &target_sharding,
         )
         .unwrap()
         .unwrap();
@@ -12183,7 +12164,7 @@ mod tests {
         assert_eq!(plan.cross_host_moves().count(), 1);
         for source in [&held, &metadata_only] {
             assert!(matches!(
-                source.device_placement_strategy(&resolve_layout, &destination_mesh, &destination_sharding, process_index),
+                source.device_placement_strategy(&resolve_layout, &target_mesh, &target_sharding, process_index),
                 Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                     if message == "the cross-host transfers extension is not provided by the PJRT plugin",
             ));
@@ -12191,7 +12172,7 @@ mod tests {
         assert!(matches!(
             held.to_placement(
                 &session,
-                Placement::new(destination_mesh.clone(), destination_sharding.clone()).unwrap(),
+                Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap(),
             ),
             Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                 if message == "the cross-host transfers extension is not provided by the PJRT plugin",
@@ -12199,8 +12180,8 @@ mod tests {
 
         // An array on devices that this process chose on its own holds a full value that every process holds on
         // devices of its own choice, so it is placed with local work only, whether or not it is committed, by every
-        // process when the destination spans several processes. A process that owns no device of a destination on
-        // devices of one other process (e.g., the second remote process for a destination on this process) takes no
+        // process when the target spans several processes. A process that owns no device of a target on
+        // devices of one other process (e.g., the second remote process for a target on this process) takes no
         // part in the strategy of that owner. The same array on devices that every process knows plans its transfers
         // as usual.
         let uploaded = Array::from_host_buffer(
@@ -12219,7 +12200,7 @@ mod tests {
         let local_sharding = Sharding::replicated(local_mesh.logical_mesh().clone(), 1);
         for source in [uploaded.clone(), uploaded.clone().with_committed(true)] {
             assert!(source.is_locally_assigned());
-            let (mesh, sharding) = (&destination_mesh, &destination_sharding);
+            let (mesh, sharding) = (&target_mesh, &target_sharding);
             let strategy = source.device_placement_strategy(&resolve_layout, mesh, sharding, process_index);
             assert!(matches!(strategy, Ok(DevicePlacementStrategy::ProcessLocalValue)));
             assert!(matches!(
@@ -12236,15 +12217,15 @@ mod tests {
         assert!(matches!(
             uploaded.clone().with_locally_assigned(false).device_placement_strategy(
                 &resolve_layout,
-                &destination_mesh,
-                &destination_sharding,
+                &target_mesh,
+                &target_sharding,
                 process_index,
             ),
             Err(Error::Pjrt(PjrtError::Unimplemented { message, .. }))
                 if message == "the cross-host transfers extension is not provided by the PJRT plugin",
         ));
 
-        // A destination on devices of this process alone moves nothing between processes, so this process places such
+        // A target on devices of this process alone moves nothing between processes, so this process places such
         // an array there with the strategy of an array on devices that every process knows.
         assert!(matches!(
             uploaded.device_placement_strategy(&resolve_layout, &local_mesh, &local_sharding, process_index),
@@ -12292,8 +12273,8 @@ mod tests {
             [&ShardMove {
                 source_shard_index: 1,
                 source_device: remote,
-                destination_shard_index: 1,
-                destination_device: local,
+                target_shard_index: 1,
+                target_device: local,
                 slice: vec![2..4],
                 transfer_key: 3
             }],
@@ -12413,7 +12394,7 @@ mod tests {
             ("process-local uncommitted", locally_assigned(false, None, &remote[..1])),
             ("process-local on two devices", locally_assigned(true, Some(multi_device_sharding), &remote)),
         ];
-        let destinations = [
+        let targets = [
             (
                 "replicated over both processes",
                 explicit_mesh(&[local[0], remote[0]]),
@@ -12435,25 +12416,25 @@ mod tests {
         let outcomes = sources
             .iter()
             .flat_map(|(source, views)| {
-                destinations.iter().map(move |(destination, mesh, sharding)| {
+                targets.iter().map(move |(target, mesh, sharding)| {
                     let outcome = match placement_agreement(views, mesh, sharding) {
                         Ok(strategy) => strategy,
                         Err(disagreement) => format!("DISAGREE: {disagreement}"),
                     };
-                    format!("{source} -> {destination}: {outcome}")
+                    format!("{source} -> {target}: {outcome}")
                 })
             })
             .collect::<Vec<_>>();
         // Every transfer and program that one process plans has its counterpart on the other process. The processes
         // choose the same strategy, except that a process whose own value lies on its devices and whose devices hold
-        // the whole destination places it with the strategy of a shared source, which moves nothing between processes.
+        // the whole target places it with the strategy of a shared source, which moves nothing between processes.
         // A partial import reaches its first transfer in production whenever another local replica serves a missing one
         // or a missing tile is only copied locally, which in pinned host memory includes the staging of each sent
         // replica in device memory. A disagreement names the strategy of each process. The partially addressable
         // sharded import has no local buffer at all for its first tile, so process 0 stops before its transfers
         // wherever that tile must leave the process or feed a gather, while process 1 waits for its receive, which is
         // the accepted limit of the PJRT cross-host transfers that `.tasks/plan_placement_decisions.md` records. The
-        // destination with a pending sum is the exception, because a placement that introduces one puts the value
+        // target with a pending sum is the exception, because a placement that introduces one puts the value
         // only on the devices at coordinate zero along the summed axis, which are those of process 0 here, so process
         // 1 only writes its additive identity, receives nothing, and waits for nothing.
         assert_eq!(
@@ -12573,8 +12554,8 @@ mod tests {
         // `u8[5,2]` split unevenly over the explicit axis `x`, on devices that process 1 owns alone, take shard
         // regions, which convert each source shard that they read to the dense row-major layout on its own device,
         // because a compiled reshard supports neither manual axes nor uneven shards. Every process tells so from
-        // shared metadata, and process 0, which holds no destination device, returns the placement without buffers.
-        // A pending sum that a destination over both processes introduces along `s`, whose devices at coordinate
+        // shared metadata, and process 0, which holds no target device, returns the placement without buffers.
+        // A pending sum that a target over both processes introduces along `s`, whose devices at coordinate
         // zero are those of process 1, first places the uneven split on those devices with regions, and process 0
         // only writes its additive identities.
         let manual_mesh = DeviceMesh::new(
@@ -12603,11 +12584,11 @@ mod tests {
         ];
         let outcomes = cases
             .iter()
-            .map(|(name, dimensions, destination_mesh, destination)| {
+            .map(|(name, dimensions, target_mesh, target)| {
                 let r#type = ArrayType::new_static(DataType::U8, *dimensions).with_layout(column_major.clone());
                 let views = shared_views(&session, &r#type, &remote, &replicated);
-                let planned = placement_agreement(&views, destination_mesh, destination);
-                let placed = place_on_process_zero(&views[0], destination_mesh, destination);
+                let planned = placement_agreement(&views, target_mesh, target);
+                let placed = place_on_process_zero(&views[0], target_mesh, target);
                 format!("{name}: {planned:?}, process 0 {placed:?}")
             })
             .collect::<Vec<_>>();
@@ -12634,10 +12615,7 @@ mod tests {
         else {
             panic!("a replica that crosses processes must move as a whole shard");
         };
-        let sends = plan
-            .moves_with_role(0, MoveRole::Send)
-            .map(|movement| movement.destination_device)
-            .collect::<Vec<_>>();
+        let sends = plan.moves_with_role(0, MoveRole::Send).map(|movement| movement.target_device).collect::<Vec<_>>();
         assert_eq!(sends, [remote[0]]);
         assert_eq!(
             plan.moves_with_role(1, MoveRole::Receive)
@@ -12672,7 +12650,7 @@ mod tests {
                 };
                 match strategy {
                     DevicePlacementStrategy::HostRoundTrip { process_index, .. } => process_index,
-                    _ => panic!("the destination needs a host round trip"),
+                    _ => panic!("the target needs a host round trip"),
                 }
             };
             views.iter().enumerate().map(owner).collect()
@@ -12701,11 +12679,11 @@ mod tests {
         let mut outcomes = Vec::new();
         for (name, devices) in [("over both processes", [local[0], remote[0]]), ("on process 1", remote)] {
             let views = shared_views(&session, &r#type, &devices, &maximum);
-            let destination_mesh = explicit_mesh(&devices);
-            let destination = replicated(&destination_mesh);
-            let planned = placement_agreement(&views, &destination_mesh, &destination);
-            let owners = owners(&views, &destination_mesh, &destination);
-            let placed = place_on_process_zero(&views[0], &destination_mesh, &destination);
+            let target_mesh = explicit_mesh(&devices);
+            let target = replicated(&target_mesh);
+            let planned = placement_agreement(&views, &target_mesh, &target);
+            let owners = owners(&views, &target_mesh, &target);
+            let placed = place_on_process_zero(&views[0], &target_mesh, &target);
             outcomes.push(format!("{name}: {planned:?}, owners {owners:?}, process 0 {placed:?}"));
         }
         assert_eq!(
@@ -12715,24 +12693,21 @@ mod tests {
                  values from a pending `max` reduction to no reduction state along mesh axis `x` on the devices, \
                  because XLA's maximum and minimum reductions drop NaN values, which the maximum and minimum of a \
                  compiled program propagate, and the host round trip that makes it exactly needs one process that \
-                 owns every device of the destination and can read the source back from its own devices; complete \
+                 owns every device of the target and can read the source back from its own devices; complete \
                  the reduction while the devices of one process hold the value, or in a compiled program, which drops \
                  NaN values as the collective does\")",
                 "on process 1: Ok(\"host round trip\"), owners [Some(1), Some(1)], process 0 Ok(\"0 buffers\")",
             ],
         );
 
-        // A pending maximum of `f32` values on the devices of process 0 that a destination over both processes turns
+        // A pending maximum of `f32` values on the devices of process 0 that a target over both processes turns
         // into a pending sum needs a host round trip only onto the device at coordinate zero, which process 0 owns
         // with the source, so both processes plan process 0 as its owner, and process 1 only writes its identity.
         let views = shared_views(&session, &r#type, &local, &maximum);
-        let destination_mesh = explicit_mesh(&[local[0], remote[0]]);
-        let destination = replicated(&destination_mesh).with_unreduced_axes(["x"]).unwrap();
+        let target_mesh = explicit_mesh(&[local[0], remote[0]]);
+        let target = replicated(&target_mesh).with_unreduced_axes(["x"]).unwrap();
         assert_eq!(
-            (
-                placement_agreement(&views, &destination_mesh, &destination),
-                owners(&views, &destination_mesh, &destination),
-            ),
+            (placement_agreement(&views, &target_mesh, &target), owners(&views, &target_mesh, &target),),
             (Ok("host round trip with additive identities".to_string()), vec![Some(0), Some(0)]),
         );
 
@@ -12740,7 +12715,7 @@ mod tests {
         // replicated value, nor read back as one host value, which every process can tell from the metadata that
         // they share, including the manual axes of the source mesh. Both processes therefore plan a host round trip
         // without an owner and return the same error before either posts or compiles anything, whether the
-        // destination is on process 1 or over both processes.
+        // target is on process 1 or over both processes.
         let manual_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
             local.clone(),
@@ -12760,18 +12735,18 @@ mod tests {
         let views = [own.unwrap(), peer.unwrap()];
         let outcomes = [explicit_mesh(&remote[..1]), explicit_mesh(&[local[0], remote[0]])]
             .iter()
-            .map(|destination_mesh| {
-                let destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), 0);
-                let planned = placement_agreement(&views, destination_mesh, &destination);
-                (planned, owners(&views, destination_mesh, &destination))
+            .map(|target_mesh| {
+                let target = Sharding::replicated(target_mesh.logical_mesh().clone(), 0);
+                let planned = placement_agreement(&views, target_mesh, &target);
+                (planned, owners(&views, target_mesh, &target))
             })
             .collect::<Vec<_>>();
         let planned = (Ok("host round trip".to_string()), vec![None, None]);
         assert_eq!(outcomes, [planned.clone(), planned]);
-        let destination_mesh = explicit_mesh(&[local[0], remote[0]]);
-        let destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), 0);
+        let target_mesh = explicit_mesh(&[local[0], remote[0]]);
+        let target = Sharding::replicated(target_mesh.logical_mesh().clone(), 0);
         assert_eq!(
-            place_on_process_zero(&views[0], &destination_mesh, &destination),
+            place_on_process_zero(&views[0], &target_mesh, &target),
             Err("compiled reshard does not support `Manual` mesh axis m".to_string()),
         );
 
@@ -12795,11 +12770,11 @@ mod tests {
         );
         let peer = Array::from_addressable_buffers(&session, scalar, mixed_mesh, Some(maximum), Vec::new());
         let views = [own.unwrap(), peer.unwrap()];
-        let destination_mesh = explicit_mesh(&local[..1]);
-        let destination = Sharding::replicated(destination_mesh.logical_mesh().clone(), 0);
-        let owners = owners(&views, &destination_mesh, &destination);
-        let planned = placement_agreement(&views, &destination_mesh, &destination);
-        let placed = views[0].to_placement(&session, Placement::new(destination_mesh, destination).unwrap());
+        let target_mesh = explicit_mesh(&local[..1]);
+        let target = Sharding::replicated(target_mesh.logical_mesh().clone(), 0);
+        let owners = owners(&views, &target_mesh, &target);
+        let planned = placement_agreement(&views, &target_mesh, &target);
+        let placed = views[0].to_placement(&session, Placement::new(target_mesh, target).unwrap());
         let placed = f32::from_ne_bytes(placed.unwrap().copy_to_host_bytes().unwrap().try_into().unwrap());
         assert_eq!(
             (planned, owners, placed.is_nan()),
@@ -12811,10 +12786,10 @@ mod tests {
     #[test]
     fn test_array_device_placement_strategy_agrees_on_kept_contributions_of_process_local_values() {
         // Two processes, each with two devices, upload `u8[2] = [7, 11]` with a pending sum or maximum along `x`
-        // without naming a mesh, so that each places its value on its own devices. A destination on the devices of
+        // without naming a mesh, so that each places its value on its own devices. A target on the devices of
         // process 0 that keeps those contributions is placed by process 0 alone, while process 1 takes no part and
-        // returns the metadata of the result without buffers, as for a destination without a pending reduction,
-        // because one process owns every destination device. A destination over the devices of both processes is the
+        // returns the metadata of the result without buffers, as for a target without a pending reduction,
+        // because one process owns every target device. A target over the devices of both processes is the
         // same error on both processes. Each row lists the agreed plan and the shard bytes that each process holds
         // after `Array::to_placement` and `Session::place`, which agree.
         let clients = [cpu_client(2), process_one_cpu_client(2)];
@@ -12828,7 +12803,7 @@ mod tests {
                         (complete the reduction first)";
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let r#type = ArrayType::new_static(DataType::U8, [2]);
-        let destinations = [
+        let targets = [
             ("on process 0", vec![local[0], local[1]]),
             ("reversed on process 0", vec![local[1], local[0]]),
             ("over both processes", vec![local[0], remote[0]]),
@@ -12846,8 +12821,8 @@ mod tests {
                     Array::from_host_buffer(session, r#type.clone(), None, Some(pending.clone()), [7u8, 11]).unwrap()
                 })
                 .collect::<Vec<_>>();
-            for (name, destination_devices) in &destinations {
-                let mesh = DeviceMesh::new(logical_mesh.clone(), destination_devices.clone()).unwrap();
+            for (name, target_devices) in &targets {
+                let mesh = DeviceMesh::new(logical_mesh.clone(), target_devices.clone()).unwrap();
                 let planned = placement_agreement(&sources, &mesh, &pending)
                     .unwrap_or_else(|disagreement| format!("DISAGREE: {disagreement}"));
                 let target = Placement::new(mesh, pending.clone()).unwrap();
@@ -12881,7 +12856,7 @@ mod tests {
         // either process, so the array statistics and the live arrays of each session are unchanged by it, and a
         // placement changes them only by the arrays that it creates: process 1 creates only its result without
         // buffers, and process 0 its committed result and, in reversed order, also the copy of its value onto the
-        // destination devices. Each row also names the strategy that the process plans.
+        // target devices. Each row also names the strategy that the process plans.
         let clients = [cpu_client(2), process_one_cpu_client(2)];
         let sessions = clients.map(|client| {
             let builder = Session::builder().client(client).live_array_tracking(true);
@@ -12892,8 +12867,8 @@ mod tests {
         let varying = Sharding::replicated(logical_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
         let mut outcomes = Vec::new();
         let orders = [("in order", devices.clone()), ("reversed", vec![devices[1], devices[0]])];
-        for (order, destination_devices) in orders {
-            let mesh = DeviceMesh::new(logical_mesh.clone(), destination_devices).unwrap();
+        for (order, target_devices) in orders {
+            let mesh = DeviceMesh::new(logical_mesh.clone(), target_devices).unwrap();
             let target = Placement::new(mesh.clone(), varying.clone()).unwrap();
             for (process_index, session) in sessions.iter().enumerate() {
                 let r#type = ArrayType::new_static(DataType::U8, [1]);
@@ -13053,7 +13028,7 @@ mod tests {
         let moves = plan
             .moves
             .iter()
-            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
+            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
             moves,
@@ -13069,8 +13044,8 @@ mod tests {
             ],
         );
 
-        // A replicated source has one slice, which every destination shard intersects, and each region moves from the
-        // replica on the device of its destination shard, also for the shards of different sizes of a split of five
+        // A replicated source has one slice, which every target shard intersects, and each region moves from the
+        // replica on the device of its target shard, also for the shards of different sizes of a split of five
         // elements over four devices.
         let replicated_mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
         let replicated = Sharding::replicated(replicated_mesh.logical_mesh().clone(), 1);
@@ -13082,13 +13057,13 @@ mod tests {
         let moves = plan
             .moves
             .iter()
-            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
+            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(moves, vec![(0, 0, vec![0..2]), (1, 1, vec![2..3]), (2, 2, vec![3..4]), (3, 3, vec![4..5])]);
 
         // The boundaries of a split of six elements over four devices (i.e., `[0, 2)`, `[2, 4)`, `[4, 5)`, and
         // `[5, 6)`) are offset from those of a split over two devices (i.e., `[0, 3)` and `[3, 6)`), so each
-        // destination shard joins the parts of the source shards that it intersects, in the order of their starts.
+        // target shard joins the parts of the source shards that it intersects, in the order of their starts.
         let r#type = ArrayType::new_static(DataType::F32, [6]);
         let source = Array::from_addressable_buffers(&session, r#type, rows_mesh, Some(split), Vec::new()).unwrap();
         let halves_mesh = DeviceMesh::new(
@@ -13102,7 +13077,7 @@ mod tests {
         let moves = plan
             .moves
             .iter()
-            .map(|movement| (movement.source_shard_index, movement.destination_shard_index, movement.slice.clone()))
+            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
             moves,
@@ -13126,19 +13101,19 @@ mod tests {
         let sources = sources.descriptors().iter().collect::<Vec<_>>();
         let replicas = SourceReplicas::new(sources.as_slice());
 
-        // A destination prefers the replica on its own device, then the one with the lowest device ID on its process,
+        // A target prefers the replica on its own device, then the one with the lowest device ID on its process,
         // and then the one with the lowest device ID of all processes.
-        let destinations = replicated_shards(vec![
+        let targets = replicated_shards(vec![
             Device::new(1, 0),
             Device::new(2, 1),
             Device::new(5, 0),
             Device::new(7, 1),
             Device::new(9, 2),
         ]);
-        let preferred = destinations
+        let preferred = targets
             .descriptors()
             .iter()
-            .map(|destination| (replicas.preferred(destination).device(), replicas.preferred(destination).index()))
+            .map(|target| (replicas.preferred(target).device(), replicas.preferred(target).index()))
             .collect::<Vec<_>>();
         assert_eq!(
             preferred,
@@ -13168,16 +13143,16 @@ mod tests {
         let send = ShardMove {
             source_shard_index: 0,
             source_device: local,
-            destination_shard_index: 0,
-            destination_device: remote,
+            target_shard_index: 0,
+            target_device: remote,
             slice: vec![0..2],
             transfer_key: 0,
         };
         let receive = ShardMove {
             source_shard_index: 1,
             source_device: remote,
-            destination_shard_index: 1,
-            destination_device: local,
+            target_shard_index: 1,
+            target_device: local,
             slice: vec![2..4],
             transfer_key: 3,
         };
@@ -13232,9 +13207,9 @@ mod tests {
                 .with_varying_manual_axes(axes.iter().map(|axis| axis.to_string()))
                 .unwrap()
         };
-        let axes = |source: &[&str], destination: &[&str]| {
+        let axes = |source: &[&str], target: &[&str]| {
             let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
-            Some(ContributionAxes { source: names(source), destination: names(destination) })
+            Some(ContributionAxes { source: names(source), target: names(target) })
         };
         let (auto, explicit, manual) = (MeshAxisType::Auto, MeshAxisType::Explicit, MeshAxisType::Manual);
         let xy = mesh(&[("x", 2, auto), ("y", 2, auto)]);
@@ -13303,7 +13278,7 @@ mod tests {
             ),
             (varying(mesh(&[("a", 2, manual)]), &["a"]), varying(mesh(&[("c", 3, manual)]), &["c"]), None),
             // A varying axis of the source that splits a dimension holds disjoint slices, so it takes no part unless
-            // the destination varies along it as well.
+            // the target varies along it as well.
             (
                 Sharding::new(xm.clone(), vec![ShardingDimension::sharded(["m"])])
                     .unwrap()
@@ -13322,7 +13297,7 @@ mod tests {
                 Sharding::replicated(xm.clone(), 1).with_varying_manual_axes(["m"]).unwrap(),
                 axes(&["m"], &["m"]),
             ),
-            // A varying axis that splits a dimension pairs in mesh order with a renamed axis of the destination that
+            // A varying axis that splits a dimension pairs in mesh order with a renamed axis of the target that
             // splits the same dimension.
             (
                 Sharding::new(xm, vec![ShardingDimension::sharded(["m"])])
@@ -13409,8 +13384,8 @@ mod tests {
             let moves = receives.iter().enumerate().map(|(index, _)| ShardMove {
                 source_shard_index: index,
                 source_device: Device::new(index + 10, 1),
-                destination_shard_index: index,
-                destination_device: Device::new(index + 20, 2),
+                target_shard_index: index,
+                target_device: Device::new(index + 20, 2),
                 slice: vec![[0..1, 1..3][index].clone(), 0..3],
                 transfer_key: index as CrossHostTransferKey,
             });
@@ -13436,7 +13411,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "cross-host transfer key for source shard #{} and destination shard #0 exceeds the maximum allowed \
+                "cross-host transfer key for source shard #{} and target shard #0 exceeds the maximum allowed \
                  size of {}",
                 usize::MAX,
                 usize::MAX,
@@ -13621,12 +13596,12 @@ mod tests {
         assert_eq!(axis_indices, vec![0]);
         assert_eq!(sharding_on_mesh(&sharding, mesh.logical_mesh()).unwrap(), replicated);
         let host = "and the host round trip that makes it exactly needs one process that owns every device of the \
-                    destination and can read the source back from its own devices";
+                    target and can read the source back from its own devices";
         let complete = "complete the reduction while the devices of one process hold the value, or in another data \
                         type";
         let compiled = "complete the reduction while the devices of one process hold the value, or in a compiled \
                         program, which drops NaN values as the collective does";
-        let anywhere = "make this placement where one process owns every device of the destination and a device of \
+        let anywhere = "make this placement where one process owns every device of the target and a device of \
                         every source contribution with elements";
         // Returns the diagnostic of a completion of a pending reduction of `kind` of `data_type` values.
         let completion = |data_type: &str, kind: &str, reason: &str, remedy: &str| {

@@ -572,7 +572,7 @@ impl PlaceableParameter<Array> for Array {
         may_alias: Option<bool>,
     ) -> Result<(), Error> {
         let target = self.validate_placement_requests(session, target.cloned(), source.cloned(), donate, may_alias)?;
-        self.validate_array_destination(session, target)
+        self.validate_array_target(session, target)
     }
 
     #[inline]
@@ -1849,7 +1849,7 @@ pub(crate) fn place_operation_bindings(
         PlaceOperation::new(target.clone(), source).infer_output_type_of_value(array, Some(array.sharding()), true)?;
         context.validate_input_placement(std::slice::from_ref(array), &[])?;
         array.validate_placement_client(context, target.as_ref())?;
-        array.validate_array_destination(context, target)
+        array.validate_array_target(context, target)
     });
 
     admit_and_place_arguments(
@@ -5596,7 +5596,7 @@ mod tests {
                 (
                     "in-place target of a foreign array leaf",
                     failed(
-                        "cannot place an array of another PJRT client without naming the devices of the destination, \
+                        "cannot place an array of another PJRT client without naming the devices of the target, \
                          because the result must live on devices of the client of the session",
                     ),
                     0,
