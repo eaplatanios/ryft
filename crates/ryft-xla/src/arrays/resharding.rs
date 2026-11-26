@@ -215,14 +215,13 @@ use crate::{
     CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt, Type, stage,
 };
 
-// TODO(eaplatanios): Review from here onwards.
+/// Diagnostic message for a placement that can only combine contributions it must keep separate.
+const COMBINED_CONTRIBUTIONS_ERROR_MESSAGE: &str = "cannot place an array with a pending reduction or with manual \
+     variation within a tile when neither whole shards nor regions of shards can move its contributions as they are \
+     (e.g., when the PJRT plugin does not report the default layout that a cross-host receive allocates), because the \
+     placement would have to combine the contributions of the pending reduction (complete the reduction first)";
 
-/// Diagnostic for a placement that can only combine contributions it must keep separate.
-const COMBINED_CONTRIBUTIONS_ERROR_MESSAGE: &str = "cannot place an array with a pending reduction or with manual variation within a tile when neither \
-     whole shards nor regions of shards can move its contributions as they are (e.g., when the PJRT \
-     plugin does not report the default layout that a cross-host receive allocates), because the \
-     placement would have to combine the contributions of the pending reduction (complete the reduction \
-     first)";
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
@@ -309,6 +308,7 @@ impl Array {
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] specifying the destination.
+    #[inline]
     pub fn to_placement<P: Into<PlacementRequest>>(&self, session: &Session, target: P) -> Result<Self, Error> {
         self.clone()
             .place_with_request(session, target.into(), false, ValueComparison::of_session(session)?)
@@ -344,6 +344,7 @@ impl Array {
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `target`: Resolved [`Placement`] or a [`PlacementRequest`] specifying the destination.
+    #[inline]
     pub fn into_placement<P: Into<PlacementRequest>>(self, session: &Session, target: P) -> Result<Self, Error> {
         self.place_with_request(session, target.into(), true, ValueComparison::of_session(session)?)
     }
@@ -398,9 +399,10 @@ impl Array {
             true => self.run_placement_dispatch(session, &target, donate)?,
             false => self.place_from_other_client(session, &target)?,
         };
-        // A destination that names devices can already hold the input that this process chose on its own, while
-        // another process must move its input there, so such a placement is a new array on every process (refer to
-        // the identity rules of `RetainedArray`).
+
+        // A destination that names devices can already hold the input that this process chose on its own, while another
+        // process must move its input there, so such a placement is a new array on every process (refer to the identity
+        // rules of `RetainedArray`).
         let output = if locally_assigned && !in_place { output.with_new_identity() } else { output };
         Ok(output.with_locally_assigned(locally_assigned && in_place).with_value_comparison(verdict))
     }
