@@ -4746,1625 +4746,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_moves_pending_contributions_to_other_devices() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let on = |axis: &str, devices: Vec<Device>| {
-            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, 2, MeshAxisType::Explicit).unwrap()]);
-            DeviceMesh::new(logical_mesh.unwrap(), devices).unwrap()
-        };
-        let original = on("x", devices.clone());
-        let reversed = on("x", vec![devices[1], devices[0]]);
-        let renamed = on("y", devices.clone());
-        let auto_reversed = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let auto_reversed = DeviceMesh::new(auto_reversed, vec![devices[1], devices[0]]).unwrap();
-        let unit = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("u", 1, MeshAxisType::Explicit).unwrap(),
-        ]);
-        let unit = DeviceMesh::new(unit.unwrap(), devices.clone()).unwrap();
-        let pending = |mesh: &DeviceMesh, kind: UnreducedKind| {
-            let axis = mesh.logical_mesh().axes()[0].name().to_string();
-            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0).with_unreduced_axes([axis]).unwrap();
-            sharding.with_unreduced_kind(kind).unwrap()
-        };
-        // Returns the bytes that each device holds, in the order of the device identifiers.
-        let device_bytes = |array: &Array| {
-            let mut bytes = array
-                .shards()
-                .iter()
-                .map(|shard| (shard.device().id(), shard.copy_to_host_bytes().unwrap()))
-                .collect::<Vec<_>>();
-            bytes.sort();
-            bytes
-        };
-        // Returns the bytes that each device of `mesh` holds after a placement that moves the contribution at each
-        // coordinate to the device at the same coordinate of `mesh`, in the order of the device identifiers.
-        let moved_bytes = |mesh: &DeviceMesh, contributions: &[Vec<u8>; 2]| {
-            let bytes = mesh.devices().iter().zip(contributions).map(|(device, bytes)| (device.id(), bytes.clone()));
-            let mut bytes = bytes.collect::<Vec<_>>();
-            bytes.sort();
-            bytes
-        };
-        let import = |data_type: DataType, kind: UnreducedKind, contributions: &[Vec<u8>; 2]| {
-            Array::from_host_shards(
-                &session,
-                ArrayType::scalar(data_type),
-                original.clone(),
-                Some(pending(&original, kind)),
-                devices
-                    .iter()
-                    .zip(contributions)
-                    .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(&bytes[..]))),
-            )
-            .unwrap()
-        };
-
-        // A placement that keeps the reduction state and only changes where each contribution lives moves every
-        // contribution as it is, so the contribution at coordinate zero moves to the first device of the target
-        // mesh, which keeps the sum of two smallest subnormal `f32` values, the sum of two negative zeros, the `u8`
-        // summands `3` and `5`, and the `f8e8m0fnu` summands of a type without an additive identity. Adding an unused
-        // axis of size one changes no contribution either.
-        let contributions = [
-            (DataType::F32, UnreducedKind::Sum, [vec![1u8, 0, 0, 0], vec![1, 0, 0, 0]]),
-            (DataType::F32, UnreducedKind::Sum, [vec![0, 0, 0, 0x80], vec![0, 0, 0, 0x80]]),
-            (DataType::U8, UnreducedKind::Sum, [vec![3], vec![5]]),
-            (DataType::F8E8M0FNU, UnreducedKind::Sum, [vec![0x7f], vec![0x7f]]),
-            (DataType::F32, UnreducedKind::Max, [values_to_bytes(&[1f32]), values_to_bytes(&[f32::NAN])]),
-        ];
-        for target_mesh in [&reversed, &unit] {
-            for (data_type, kind, contributions) in &contributions {
-                let source = import(*data_type, *kind, contributions);
-                let value = source.copy_to_host_bytes().unwrap();
-                let target = Placement::new(target_mesh.clone(), pending(target_mesh, *kind)).unwrap();
-                for placed in place_through_entry_points(&session, &source, target) {
-                    let placed = placed.unwrap();
-                    let context = format!("{data_type} {kind} onto {target_mesh:?}");
-                    assert_eq!(device_bytes(&placed), moved_bytes(target_mesh, contributions), "{context}");
-                    assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
-                }
-            }
-        }
-
-        // An explicit axis onto an auto one changes no contribution either.
-        let source = import(DataType::F32, UnreducedKind::Sum, &[vec![1, 0, 0, 0], vec![1, 0, 0, 0]]);
-        let target = Placement::new(auto_reversed.clone(), pending(&auto_reversed, UnreducedKind::Sum)).unwrap();
-        let placed = source.to_placement(&session, target).unwrap();
-        assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![1, 0, 0, 0]), (devices[1].id(), vec![1, 0, 0, 0])]);
-        assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![2, 0, 0, 0]);
-
-        // Renaming the axis of a pending sum is a pure move too, which the device planner serves with whole shards,
-        // although the type rule of `place` rejects it before any planning because it redefines an axis that carries
-        // reduction state.
-        let source = import(DataType::U8, UnreducedKind::Sum, &[vec![3], vec![5]]);
-        let sharding = pending(&renamed, UnreducedKind::Sum);
-        let resolve_layout = cross_host_layout_resolver(client);
-        let strategy = source.device_placement_strategy(&resolve_layout, &renamed, &sharding, 0).unwrap();
-        assert!(matches!(strategy, DevicePlacementStrategy::ExactShards { .. }));
-        let placed = source.place_with_strategy(strategy, 0, &renamed, &sharding, Memory::Device, None, false);
-        let placed = placed.map_err(|(error, _)| error).unwrap();
-        assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![3]), (devices[1].id(), vec![5])]);
-
-        // Adding a pending axis of size one keeps the number of contributions, so it is a pure move as well, which
-        // keeps the summands of every data type as they are. Only the physical placements reach it, because the type
-        // rule of `place` rejects a change of reduction state.
-        let pending_unit = Sharding::replicated(unit.logical_mesh().clone(), 0).with_unreduced_axes(["x", "u"]);
-        let target = Placement::new(unit.clone(), pending_unit.unwrap()).unwrap();
-        for (data_type, contributions) in [
-            (DataType::U8, [vec![3u8], vec![5]]),
-            (DataType::F32, [vec![1, 0, 0, 0], vec![1, 0, 0, 0]]),
-            (DataType::F8E8M0FNU, [vec![0x7f], vec![0x7f]]),
-        ] {
-            let source = import(data_type, UnreducedKind::Sum, &contributions);
-            let value = source.copy_to_host_bytes().unwrap();
-            for placed in
-                [source.to_placement(&session, target.clone()), source.clone().into_placement(&session, target.clone())]
-            {
-                let placed = placed.unwrap();
-                assert_eq!(device_bytes(&placed), moved_bytes(&unit, &contributions), "{data_type}");
-                assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{data_type}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_array_to_placement_moves_pending_contributions_as_shard_regions() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
-            let axes = axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap());
-            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
-        };
-        let explicit = MeshAxisType::Explicit;
-        let source_mesh = mesh(&[("x", 2, explicit), ("y", 2, explicit)]);
-        let sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        // Returns the bytes that each device holds, in the order of `devices`.
-        let device_bytes = |array: &Array| {
-            devices
-                .iter()
-                .map(|device| array.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
-                .collect::<Vec<_>>()
-        };
-
-        // A vector of four elements with a pending sum along `x` is split along a second axis, which only moves each
-        // of its two contributions as regions of their shards, also onto a mesh with an unused axis of size one or with
-        // the partitioning axis renamed. It completes no sum, so each sum of two smallest subnormal `f32` values (i.e.,
-        // the bits `0x00000002`) is kept, and `f8e8m0fnu`, which has no additive identity, moves as well. On the same
-        // mesh, the placement moves regions as well, so that sparse and dense sources behave alike.
-        let targets = [
-            (mesh(&[("x", 2, explicit), ("y", 2, explicit)]), "y"),
-            (mesh(&[("x", 2, explicit), ("y", 2, explicit), ("unit", 1, explicit)]), "y"),
-            (mesh(&[("x", 2, explicit), ("z", 2, explicit)]), "z"),
-        ];
-        let cases = [
-            (
-                DataType::F32,
-                [values_to_bytes(&[1u32, 2, 3, 4]), values_to_bytes(&[1u32; 4])],
-                values_to_bytes(&[2u32, 3, 4, 5]),
-            ),
-            (DataType::F8E8M0FNU, [vec![0x7f; 4], vec![0x7f; 4]], vec![0x80; 4]),
-            (DataType::U8, [vec![1, 2, 3, 4], vec![10, 20, 30, 40]], vec![11, 22, 33, 44]),
-        ];
-        for (target_mesh, axis) in &targets {
-            let split = vec![ShardingDimension::sharded([*axis])];
-            let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
-            let split = split.with_unreduced_axes(["x"]).unwrap();
-            for (data_type, contributions, value) in &cases {
-                let source = Array::from_host_shards(
-                    &session,
-                    ArrayType::new_static(*data_type, [4]),
-                    source_mesh.clone(),
-                    Some(sum.clone()),
-                    devices
-                        .iter()
-                        .enumerate()
-                        .map(|(index, device)| (device.id(), Arc::<[u8]>::from(contributions[index / 2].as_slice()))),
-                )
-                .unwrap();
-                assert_eq!(&source.copy_to_host_bytes().unwrap(), value, "{data_type}");
-                let strategy = source
-                    .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
-                    .unwrap();
-                assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{data_type} {axis}");
-                // The device at `(x, s)` holds the half `s` of the contribution at `x`.
-                let halves = |x: usize| contributions[x].chunks(contributions[x].len() / 2).map(<[u8]>::to_vec);
-                let expected = halves(0).chain(halves(1)).collect::<Vec<_>>();
-                let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
-                for placed in place_through_entry_points(&session, &source, target) {
-                    let placed = placed.unwrap();
-                    assert_eq!(device_bytes(&placed), expected, "{data_type} along {axis}");
-                    assert_eq!(&placed.copy_to_host_bytes().unwrap(), value, "{data_type} along {axis}");
-                }
-            }
-        }
-        // A sparse source that holds only the replicas at `y = 1` of each contribution moves on the same mesh as on
-        // any other, by regions, which keep each contribution as it is.
-        let pjrt_devices = client.addressable_devices().unwrap();
-        let split_y = Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["y"])]);
-        let split_y = split_y.unwrap().with_unreduced_axes(["x"]).unwrap();
-        for (data_type, contribution, value) in [(DataType::U8, 3u8, 6u8), (DataType::F8E8M0FNU, 0x7f, 0x80)] {
-            let buffers = [1, 3]
-                .into_iter()
-                .map(|index| {
-                    let buffer_type = data_type.executable_buffer_type();
-                    let device = pjrt_devices[index].clone();
-                    client.buffer(&[contribution; 2], buffer_type, [2], None, device, None).unwrap()
-                })
-                .collect::<Vec<_>>();
-            let r#type = ArrayType::new_static(data_type, [2]);
-            let source =
-                Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), Some(sum.clone()), buffers);
-            let source = source.unwrap();
-            let target = Placement::new(source_mesh.clone(), split_y.clone()).unwrap();
-            let borrowed = source.to_placement(&session, target.clone());
-            for placed in [borrowed, source.clone().into_placement(&session, target)] {
-                let placed = placed.unwrap();
-                assert_eq!(device_bytes(&placed), vec![vec![contribution]; 4], "{data_type}");
-                assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![value; 2], "{data_type}");
-            }
-        }
-
-        // A vector of two elements split along `x` and varying along the manual axis `m` holds four distinct values,
-        // which a placement that splits it along `m` instead cannot represent, so the placement is rejected rather than
-        // keep only some of those values.
-        let manual = MeshAxisType::Manual;
-        let manual_mesh = mesh(&[("x", 2, explicit), ("m", 2, manual)]);
-        let along = |axis: &str| {
-            let sharding = Sharding::along(manual_mesh.logical_mesh().clone(), axis, Some(0), 1).unwrap();
-            sharding.with_varying_manual_axes(["m"]).unwrap()
-        };
-        let source = Array::from_host_shards(
-            &session,
-            ArrayType::new_static(DataType::U8, [2]),
-            manual_mesh.clone(),
-            Some(along("x")),
-            devices
-                .iter()
-                .zip([10u8, 11, 20, 21])
-                .map(|(device, value)| (device.id(), Arc::<[u8]>::from([value]))),
-        )
-        .unwrap();
-        let target = Placement::new(manual_mesh.clone(), along("m")).unwrap();
-        for placed in [source.to_placement(&session, target.clone()), source.clone().into_placement(&session, target)] {
-            assert_eq!(
-                placed.unwrap_err().to_string(),
-                "cannot place an array that varies along the manual mesh axes `m` onto this sharding, because the \
-                 placement would discard values that differ along those axes",
-            );
-        }
-    }
-
-    #[test]
-    fn test_array_to_placement_moves_pending_contributions_in_declared_layouts() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let pjrt_devices = client.addressable_devices().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let mesh = |axes: &[(&str, usize)]| {
-            let axes = axes.iter().map(|(name, size)| MeshAxis::new(*name, *size, MeshAxisType::Explicit).unwrap());
-            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
-        };
-        let source_mesh = mesh(&[("x", 2), ("y", 2)]);
-        let sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
-        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let device_bytes = |array: &Array| {
-            devices
-                .iter()
-                .map(|device| array.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
-                .collect::<Vec<_>>()
-        };
-
-        // A column-major `[rows, 2]` matrix with a pending sum along `x`, whose devices at `x = 0` hold the first
-        // contribution and those at `x = 1` the second one, keeps that sum and splits its rows along a second axis, on
-        // the same mesh, onto a mesh with an unused axis of size one, and onto a mesh with that axis renamed. Each
-        // process converts the shards that its moves read to the dense row-major layout on their devices and moves the
-        // regions of each contribution, from a dense source and from a sparse one that holds only the replicas at
-        // `y = 1`, for an uneven split of three rows and an even one of four, which a compiled reshard cannot make.
-        // Every contribution keeps its value (e.g., the `u8` contributions `3` and `5` of three rows stay apart rather
-        // than read back as `8` and `0`), and `f8e8m0fnu`, which has no additive identity, moves as well.
-        let targets = [
-            (mesh(&[("x", 2), ("y", 2)]), "y"),
-            (mesh(&[("x", 2), ("y", 2), ("unit", 1)]), "y"),
-            (mesh(&[("x", 2), ("z", 2)]), "z"),
-        ];
-        // The elements of the contribution at `x` of `rows` rows, in row-major order, and the value of both.
-        let u8_contribution = |x: usize, rows: usize| {
-            (0..rows * 2)
-                .map(|index| [3u8, 5][x] + 10 * (index / 2) as u8 + (index % 2) as u8)
-                .collect::<Vec<_>>()
-        };
-        let u8_value = |rows: usize| {
-            u8_contribution(0, rows)
-                .iter()
-                .zip(u8_contribution(1, rows))
-                .map(|(a, b)| a + b)
-                .collect::<Vec<_>>()
-        };
-        let f8_contribution = |_: usize, rows: usize| vec![0x7fu8; rows * 2];
-        let f8_value = |rows: usize| vec![0x80u8; rows * 2];
-        // The device at `(x, s)` holds the rows of part `s` of the contribution at `x`.
-        let parts = |contribution: &dyn Fn(usize, usize) -> Vec<u8>, rows: usize| {
-            let upper = rows.div_ceil(2);
-            (0..4)
-                .map(|index| {
-                    let range = if index % 2 == 0 { 0..upper * 2 } else { upper * 2..rows * 2 };
-                    contribution(index / 2, rows)[range].to_vec()
-                })
-                .collect::<Vec<_>>()
-        };
-        type Elements<'a> = &'a dyn Fn(usize, usize) -> Vec<u8>;
-        let cases: [(DataType, Elements<'_>, &dyn Fn(usize) -> Vec<u8>); 2] =
-            [(DataType::U8, &u8_contribution, &u8_value), (DataType::F8E8M0FNU, &f8_contribution, &f8_value)];
-        for rows in [3, 4] {
-            for &(data_type, contribution, value) in &cases {
-                let value = value(rows);
-                for sparse in [false, true] {
-                    let device_layout = column_major.to_pjrt().unwrap();
-                    let buffers = pjrt_devices
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, _)| !sparse || index % 2 == 1)
-                        .map(|(index, device)| {
-                            let bytes = contribution(index / 2, rows);
-                            let buffer_type = data_type.executable_buffer_type();
-                            let (device, layout) = (device.clone(), Some(device_layout.clone()));
-                            let dimensions = [rows as u64, 2];
-                            client.buffer(bytes.as_slice(), buffer_type, dimensions, None, device, layout).unwrap()
-                        })
-                        .collect::<Vec<_>>();
-                    let r#type = ArrayType::new_static(data_type, [rows, 2]).with_layout(Some(column_major.clone()));
-                    let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
-                    let source = Array::from_addressable_buffers(&session, r#type, mesh, sharding, buffers).unwrap();
-                    assert_eq!(source.copy_to_host_bytes().unwrap(), value, "{data_type} {rows} {sparse}");
-                    for (target_mesh, axis) in &targets {
-                        let split = vec![ShardingDimension::sharded([*axis]), ShardingDimension::replicated()];
-                        let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
-                        let split = split.with_unreduced_axes(["x"]).unwrap();
-                        let context = format!("{data_type} with {rows} rows along {axis} (sparse: {sparse})");
-                        let strategy = source
-                            .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
-                            .unwrap();
-                        assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{context}");
-                        let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
-                        for placed in place_through_entry_points(&session, &source, target) {
-                            let placed = placed.unwrap();
-                            assert_eq!(placed.layout(), Some(&column_major), "{context}");
-                            assert_eq!(device_bytes(&placed), parts(contribution, rows), "{context}");
-                            assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // The same `u8` source in pinned host memory converts its shards into device memory, where the CPU plugin can
-        // hold the dense row-major layout, and the result takes the requested memory and the column-major layout.
-        let pinned = Memory::Host { pinned: true };
-        let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
-        let split = Sharding::new(source_mesh.logical_mesh().clone(), split).unwrap().with_unreduced_axes(["x"]);
-        let split = split.unwrap();
-        for rows in [3, 4] {
-            let source = Array::from_host_shards(
-                &session,
-                ArrayType::new_static(DataType::U8, [rows, 2]),
-                source_mesh.clone(),
-                Some(sum.clone()),
-                devices.iter().enumerate().map(|(index, device)| {
-                    (device.id(), Arc::<[u8]>::from(u8_contribution(index / 2, rows).as_slice()))
-                }),
-            )
-            .unwrap();
-            let target = Placement::new(source_mesh.clone(), sum.clone()).unwrap();
-            let target = target.with_memory(pinned).with_layout(column_major.clone());
-            let source = source.to_placement(&session, target).unwrap();
-            assert_eq!((source.r#type().memory(), source.layout()), (pinned, Some(&column_major)));
-            let strategy = source
-                .device_placement_strategy(&cross_host_layout_resolver(client), &source_mesh, &split, 0)
-                .unwrap();
-            assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{rows}");
-            for memory in [pinned, Memory::Device] {
-                let target = Placement::new(source_mesh.clone(), split.clone()).unwrap().with_memory(memory);
-                for placed in place_through_entry_points(&session, &source, target) {
-                    let placed = placed.unwrap();
-                    let context = format!("{rows} rows into {memory:?}");
-                    assert_eq!((placed.r#type().memory(), placed.layout()), (memory, Some(&column_major)), "{context}");
-                    assert_eq!(device_bytes(&placed), parts(&u8_contribution, rows), "{context}");
-                    assert_eq!(placed.copy_to_host_bytes().unwrap(), u8_value(rows), "{context}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_array_to_placement_moves_column_major_contributions_across_processes_as_shard_regions() {
-        // A column-major `u8[2, 2]` with a pending sum along `x` moves its contributions as regions onto a mesh that
-        // pairs each local device with a remote one, so process 0 sends regions of its contribution, receives regions
-        // of the other one, and copies regions between its own devices. Both processes plan the same transfers, and
-        // process 0, which converts the shards that its sends read to the dense row-major layout first, reaches its
-        // transfers, which fail here with the missing cross-host transfers extension of the CPU plugin.
-        let (session, target_mesh) = two_process_mesh_2x2();
-        let client = session.client();
-        let pjrt_devices = client.addressable_devices().unwrap();
-        let logical_mesh = target_mesh.logical_mesh().clone();
-        let devices = target_mesh.devices();
-        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0], devices[2], devices[1], devices[3]]);
-        let source_mesh = source_mesh.unwrap();
-        let sum = Sharding::replicated(logical_mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
-        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let r#type = ArrayType::new_static(DataType::U8, [2, 2]).with_layout(Some(column_major.clone()));
-        let buffers = pjrt_devices
-            .iter()
-            .map(|device| {
-                let layout = Some(column_major.to_pjrt().unwrap());
-                client.buffer([1u8, 2, 3, 4].as_slice(), BufferType::U8, [2u64, 2], None, device.clone(), layout)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
-        let own = Array::from_addressable_buffers(&session, r#type.clone(), mesh, sharding.clone(), buffers).unwrap();
-        let peer = Array::from_addressable_buffers(&session, r#type, source_mesh, sharding, Vec::new()).unwrap();
-        let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
-        let split = Sharding::new(logical_mesh, split).unwrap().with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(placement_agreement(&[own, peer], &target_mesh, &split), Ok("shard regions".to_string()));
-    }
-
-    #[test]
-    fn test_array_to_placement_creates_empty_exact_shards_on_every_process() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let on = |axis: &str, devices: Vec<Device>| {
-            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, 2, MeshAxisType::Explicit).unwrap()]);
-            DeviceMesh::new(logical_mesh.unwrap(), devices).unwrap()
-        };
-        let split = |mesh: &DeviceMesh| {
-            let axis = mesh.logical_mesh().axes()[0].name().to_string();
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded([axis])]).unwrap()
-        };
-
-        // The `u8[1]` split over two devices has an empty slice on the second device, which this import holds no
-        // buffer for. A renamed axis keeps every slice where it is, and each process creates its own empty shards
-        // rather than requiring a buffer to move, through every entry point.
-        let original = on("x", devices.clone());
-        let renamed = on("y", devices.clone());
-        let client_devices = client.addressable_devices().unwrap();
-        let buffer = client.buffer([42u8].as_slice(), BufferType::U8, [1u64], None, client_devices[0].clone(), None);
-        let r#type = ArrayType::new_static(DataType::U8, [1]);
-        let sharding = Some(split(&original));
-        let source =
-            Array::from_addressable_buffers(&session, r#type.clone(), original, sharding, vec![buffer.unwrap()]);
-        let source = source.unwrap();
-        assert!(source.device_shard(devices[1].id()).unwrap().buffer().is_none());
-        let target = Placement::new(renamed.clone(), split(&renamed)).unwrap();
-        for placed in place_through_entry_points(&session, &source, target) {
-            let placed = placed.unwrap();
-            let bytes = placed.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
-            assert_eq!(bytes, [vec![42], vec![]]);
-            assert_eq!(placed.block_until_ready().map_err(|error| error.to_string()), Ok(()));
-            assert_eq!(placed.copy_to_host_bytes().unwrap(), [42]);
-        }
-
-        // Across processes, the empty slice moves nowhere, so neither process waits for a transfer of it, and only the
-        // slice with elements crosses from process 0 to process 1.
-        let remote = Device::new(devices.iter().map(Device::id).max().unwrap() + 1, 1);
-        let session = session_with_remote_devices(client, [remote]);
-        let both = on("x", vec![devices[0], remote]);
-        let reversed = on("x", vec![remote, devices[0]]);
-        let view = Array::from_addressable_buffers(&session, r#type, both.clone(), Some(split(&both)), Vec::new());
-        let strategy =
-            view.unwrap()
-                .device_placement_strategy(&simulated_cross_host_layout, &reversed, &split(&reversed), 0);
-        let Ok(DevicePlacementStrategy::ExactShards { plan, .. }) = strategy else {
-            panic!("the slices of the split must move as whole shards");
-        };
-        let moves = plan
-            .moves
-            .iter()
-            .map(|movement| (movement.source_device, movement.target_device, movement.slice.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(moves, [(devices[0], remote, vec![0..1])]);
-    }
-
-    #[test]
-    fn test_array_to_placement_preserves_value_across_reduction_state_changes() {
-        // Placements that complete, introduce, keep, or change the kind of a pending reduction along the axis `x` of a
-        // 2x2 mesh, for a data type of every class of `validate_reduction_transition`, compared with the host readback
-        // of their source, which defines the value (refer to `crate::arrays::host`). The contributions along `x` are
-        // every pair of some elements of each data type (e.g., negative zeros, NaN values, infinities, and extreme
-        // integers, but no subnormal `f32` values, which the CPU plugin flushes in any addition). Each row lists, per
-        // placement, the programs that `to_placement` and `into_placement` compile in sessions of their own, which is
-        // `+0` for a host round trip, and asserts that both read back the value of their source bit for bit, where
-        // every NaN encoding of a format counts as one value, or lists their common error. A sum of floating point or
-        // complex values that the devices complete is compared as the contract of such sums states (refer to
-        // `crate::arrays::host`), so a negative zero also matches a positive one there, and the end of this test pins
-        // that difference. A sum that a placement introduces is compared bit for bit for every data type with an
-        // additive identity (e.g., `f32` and `c64` negative zeros and `f6e2m3fn` values), which it writes without a
-        // compiled program. The axis type does not change the outcome, so both axis types must give the same row.
-        let client = cpu_client(4);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let f32_elements = [0f32, -0., 1., -1., f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1e-3, 3., f32::MAX];
-        let c64_elements = [(0f32, 0f32), (-0., -0.), (1., -1.), (f32::NAN, 0.), (f32::INFINITY, 1.), (-1., 2.)];
-        let elements = |data_type: DataType| -> Vec<Vec<u8>> {
-            let bytes = |values: &[u8]| values.iter().map(|value| vec![*value]).collect();
-            match data_type {
-                DataType::Boolean | DataType::U1 | DataType::I1 => bytes(&[0, 1]),
-                DataType::U2 => bytes(&[0, 1, 2, 3]),
-                DataType::I4 => bytes(&(0..16).collect::<Vec<_>>()),
-                DataType::U8 => bytes(&[0, 1, 127, 128, 254, 255]),
-                DataType::I32 => {
-                    [0i32, 1, -1, i32::MAX, i32::MIN, 2].map(|value| value.to_ne_bytes().to_vec()).to_vec()
-                }
-                DataType::F32 => f32_elements.map(|value| value.to_ne_bytes().to_vec()).to_vec(),
-                DataType::F8E5M2 => bytes(&[0x00, 0x80, 0x3c, 0xbc, 0x7c, 0xfc, 0x7e, 0x01, 0x7b, 0xfb]),
-                DataType::F8E4M3FNUZ => bytes(&[0x00, 0x80, 0x01, 0x40, 0xc0, 0x7f, 0xff, 0x38]),
-                DataType::F6E2M3FN => bytes(&[0x00, 0x20, 0x01, 0x08, 0x2a, 0x1f, 0x3f, 0x10]),
-                DataType::F8E8M0FNU => bytes(&[0, 1, 42, 127, 128, 255]),
-                DataType::C64 => c64_elements
-                    .map(|(real, imaginary)| [real.to_ne_bytes(), imaginary.to_ne_bytes()].concat())
-                    .to_vec(),
-                _ => unreachable!(),
-            }
-        };
-        // Replaces every NaN encoding of a format with one marker, so that NaN payloads do not count, and with
-        // `signless_zero`, also a negative zero with a positive one.
-        let canonical = |data_type: DataType, element: &[u8], signless_zero: bool| -> Vec<u8> {
-            let f32_value = |value: f32| match value {
-                value if value.is_nan() => vec![0xff; 5],
-                value if signless_zero && value == 0. => 0f32.to_ne_bytes().to_vec(),
-                value => value.to_ne_bytes().to_vec(),
-            };
-            match data_type {
-                DataType::F32 => f32_value(f32::from_ne_bytes(element.try_into().unwrap())),
-                DataType::C64 => element
-                    .chunks(4)
-                    .flat_map(|bytes| f32_value(f32::from_ne_bytes(bytes.try_into().unwrap())))
-                    .collect(),
-                DataType::F8E5M2 if element[0] & 0x7c == 0x7c && element[0] & 0x03 != 0 => vec![0xff; 2],
-                DataType::F8E5M2 if signless_zero && element[0] == 0x80 => vec![0x00],
-                DataType::F8E4M3FNUZ if element[0] == 0x80 => vec![0xff; 2],
-                DataType::F8E8M0FNU if element[0] == 0xff => vec![0xff; 2],
-                _ => element.to_vec(),
-            }
-        };
-        let data_types = [
-            DataType::Boolean,
-            DataType::U1,
-            DataType::I1,
-            DataType::U2,
-            DataType::I4,
-            DataType::U8,
-            DataType::I32,
-            DataType::F32,
-            DataType::F8E5M2,
-            DataType::F8E4M3FNUZ,
-            DataType::F6E2M3FN,
-            DataType::F8E8M0FNU,
-            DataType::C64,
-        ];
-        let mut rows = Vec::new();
-        for data_type in data_types {
-            let elements = elements(data_type);
-            let count = elements.len() * elements.len();
-            let element_size = elements[0].len();
-            // The devices at `x = 0` hold the first element of each pair and the devices at `x = 1` the second one.
-            let first = (0..count).flat_map(|index| elements[index / elements.len()].clone()).collect::<Vec<_>>();
-            let second = (0..count).flat_map(|index| elements[index % elements.len()].clone()).collect::<Vec<_>>();
-            let mut outcomes_by_axis_type = Vec::new();
-            for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
-                let logical_mesh = LogicalMesh::new(vec![
-                    MeshAxis::new("x", 2, axis_type).unwrap(),
-                    MeshAxis::new("y", 2, axis_type).unwrap(),
-                ])
-                .unwrap();
-                let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
-                let replicated = Sharding::replicated(logical_mesh.clone(), 1);
-                let split_y = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
-                let pending = |sharding: &Sharding, kind: UnreducedKind| {
-                    sharding.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
-                };
-                let placements = [
-                    ("sum -> none", Some(UnreducedKind::Sum), replicated.clone()),
-                    ("max -> none", Some(UnreducedKind::Max), replicated.clone()),
-                    ("min -> none", Some(UnreducedKind::Min), replicated.clone()),
-                    ("none -> sum", None, pending(&replicated, UnreducedKind::Sum)),
-                    ("none -> max", None, pending(&replicated, UnreducedKind::Max)),
-                    ("max -> sum", Some(UnreducedKind::Max), pending(&replicated, UnreducedKind::Sum)),
-                    ("sum -> sum split", Some(UnreducedKind::Sum), pending(&split_y, UnreducedKind::Sum)),
-                    ("max -> max split", Some(UnreducedKind::Max), pending(&split_y, UnreducedKind::Max)),
-                ];
-                let mut outcomes = Vec::new();
-                for (name, source_kind, target_sharding) in placements {
-                    let mut results = Vec::new();
-                    for consume in [false, true] {
-                        let session = Session::builder().client(client).build().unwrap();
-                        let r#type = ArrayType::new_static(data_type, [count]);
-                        let source = match source_kind {
-                            Some(kind) => {
-                                let contributions = devices
-                                    .iter()
-                                    .zip([&first, &first, &second, &second])
-                                    .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(bytes.as_slice())));
-                                let sharding = Some(pending(&replicated, kind));
-                                Array::from_host_shards(&session, r#type, mesh.clone(), sharding, contributions)
-                            }
-                            None => Array::from_host_buffer(&session, r#type, mesh.clone(), None, &first),
-                        }
-                        .unwrap();
-                        let expected = source.copy_to_host_bytes().unwrap();
-                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
-                        let placed = if consume {
-                            source.into_placement(&session, target)
-                        } else {
-                            source.to_placement(&session, target)
-                        };
-                        let programs = session.cached_program_count();
-                        // A sum that the devices complete follows the contract of floating point sums, and one that
-                        // they introduce is exact.
-                        let sum_contract = programs > 0 && name == "sum -> none";
-                        results.push(placed.and_then(|placed| {
-                            assert_eq!(placed.sharding(), &target_sharding, "{data_type} {name}");
-                            let actual = placed.copy_to_host_bytes()?;
-                            let differing = expected
-                                .chunks(element_size)
-                                .zip(actual.chunks(element_size))
-                                .filter(|(expected, actual)| {
-                                    canonical(data_type, expected, sum_contract)
-                                        != canonical(data_type, actual, sum_contract)
-                                })
-                                .count();
-                            assert_eq!(differing, 0, "{axis_type:?} {data_type} {name}: {expected:?} != {actual:?}");
-                            Ok(programs)
-                        }));
-                    }
-                    let outcome = match results.as_slice() {
-                        [Ok(borrowed), Ok(consumed)] => format!("+{borrowed} +{consumed}"),
-                        [Err(borrowed), Err(consumed)] if borrowed.to_string() == consumed.to_string() => {
-                            format!("error: {borrowed}")
-                        }
-                        results => panic!("{data_type} {name}: the entry points disagree: {results:?}"),
-                    };
-                    outcomes.push(format!("{data_type} {name}: {outcome}"));
-                }
-                outcomes_by_axis_type.push(outcomes);
-            }
-            assert_eq!(outcomes_by_axis_type[0], outcomes_by_axis_type[1], "{data_type}");
-            rows.extend(outcomes_by_axis_type.swap_remove(0));
-        }
-        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
-                                unreduced axes";
-        assert_eq!(
-            rows.join("\n"),
-            formatdoc! {"
-                bool sum -> none: +1 +1
-                bool max -> none: +1 +1
-                bool min -> none: +1 +1
-                bool none -> sum: +0 +0
-                bool none -> max: +0 +0
-                bool max -> sum: +1 +1
-                bool sum -> sum split: +4 +4
-                bool max -> max split: +4 +4
-                u1 sum -> none: +0 +0
-                u1 max -> none: +1 +1
-                u1 min -> none: +1 +1
-                u1 none -> sum: +0 +0
-                u1 none -> max: +0 +0
-                u1 max -> sum: +1 +1
-                u1 sum -> sum split: +4 +4
-                u1 max -> max split: +4 +4
-                i1 sum -> none: +0 +0
-                i1 max -> none: +0 +0
-                i1 min -> none: +0 +0
-                i1 none -> sum: +0 +0
-                i1 none -> max: +0 +0
-                i1 max -> sum: +0 +0
-                i1 sum -> sum split: +4 +4
-                i1 max -> max split: +4 +4
-                u2 sum -> none: +0 +0
-                u2 max -> none: +0 +0
-                u2 min -> none: +0 +0
-                u2 none -> sum: +0 +0
-                u2 none -> max: +0 +0
-                u2 max -> sum: +0 +0
-                u2 sum -> sum split: +4 +4
-                u2 max -> max split: +4 +4
-                i4 sum -> none: +1 +1
-                i4 max -> none: +1 +1
-                i4 min -> none: +1 +1
-                i4 none -> sum: +0 +0
-                i4 none -> max: +0 +0
-                i4 max -> sum: +1 +1
-                i4 sum -> sum split: +4 +4
-                i4 max -> max split: +4 +4
-                u8 sum -> none: +1 +1
-                u8 max -> none: +1 +1
-                u8 min -> none: +1 +1
-                u8 none -> sum: +0 +0
-                u8 none -> max: +0 +0
-                u8 max -> sum: +1 +1
-                u8 sum -> sum split: +4 +4
-                u8 max -> max split: +4 +4
-                i32 sum -> none: +1 +1
-                i32 max -> none: +1 +1
-                i32 min -> none: +1 +1
-                i32 none -> sum: +0 +0
-                i32 none -> max: +0 +0
-                i32 max -> sum: +1 +1
-                i32 sum -> sum split: +4 +4
-                i32 max -> max split: +4 +4
-                f32 sum -> none: +1 +1
-                f32 max -> none: +0 +0
-                f32 min -> none: +0 +0
-                f32 none -> sum: +0 +0
-                f32 none -> max: +0 +0
-                f32 max -> sum: +0 +0
-                f32 sum -> sum split: +4 +4
-                f32 max -> max split: +4 +4
-                f8e5m2 sum -> none: +1 +1
-                f8e5m2 max -> none: +0 +0
-                f8e5m2 min -> none: +0 +0
-                f8e5m2 none -> sum: +0 +0
-                f8e5m2 none -> max: +0 +0
-                f8e5m2 max -> sum: +0 +0
-                f8e5m2 sum -> sum split: +4 +4
-                f8e5m2 max -> max split: +4 +4
-                f8e4m3fnuz sum -> none: +1 +1
-                f8e4m3fnuz max -> none: +0 +0
-                f8e4m3fnuz min -> none: +0 +0
-                f8e4m3fnuz none -> sum: +0 +0
-                f8e4m3fnuz none -> max: +0 +0
-                f8e4m3fnuz max -> sum: +0 +0
-                f8e4m3fnuz sum -> sum split: +4 +4
-                f8e4m3fnuz max -> max split: +4 +4
-                f6e2m3fn sum -> none: +0 +0
-                f6e2m3fn max -> none: +0 +0
-                f6e2m3fn min -> none: +0 +0
-                f6e2m3fn none -> sum: +0 +0
-                f6e2m3fn none -> max: +0 +0
-                f6e2m3fn max -> sum: +0 +0
-                f6e2m3fn sum -> sum split: +4 +4
-                f6e2m3fn max -> max split: +4 +4
-                f8e8m0fnu sum -> none: +0 +0
-                f8e8m0fnu max -> none: +0 +0
-                f8e8m0fnu min -> none: +0 +0
-                f8e8m0fnu none -> sum: error: {missing_identity}
-                f8e8m0fnu none -> max: +0 +0
-                f8e8m0fnu max -> sum: error: {missing_identity}
-                f8e8m0fnu sum -> sum split: +4 +4
-                f8e8m0fnu max -> max split: +4 +4
-                c64 sum -> none: +1 +1
-                c64 max -> none: +0 +0
-                c64 min -> none: +0 +0
-                c64 none -> sum: +0 +0
-                c64 none -> max: +0 +0
-                c64 max -> sum: +0 +0
-                c64 sum -> sum split: +4 +4
-                c64 max -> max split: +4 +4"},
-        );
-
-        // The two differences that the contract of floating point sums allows, pinned on the CPU plugin with the bit
-        // patterns of `f32` values. Completing a sum of two negative zeros on the devices gives positive zero, because
-        // the collective starts from positive zero, and the plugin flushes a subnormal sum to zero, as it does in every
-        // addition. Introducing a sum compiles nothing and writes negative zero, the additive identity, to the other
-        // device, so a negative zero reads back as it was.
-        let session = Session::builder().client(client).build().unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
-        let replicated = Sharding::replicated(logical_mesh, 1);
-        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [3]);
-        let bits = |array: &Array| {
-            let values = values_from_bytes::<f32>(&array.copy_to_host_bytes().unwrap());
-            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
-        };
-        let contributions = [[-0f32, 1e-45, 1.], [-0., 0., 2.]]
-            .iter()
-            .zip(&devices)
-            .map(|(values, device)| (device.id(), Arc::<[u8]>::from(values_to_bytes(values))))
-            .collect::<Vec<_>>();
-        let sharding = Some(unreduced.clone());
-        let summands =
-            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, contributions).unwrap();
-        let target = Placement::new(mesh.clone(), replicated.clone()).unwrap();
-        let completed = summands.to_placement(&session, target).unwrap();
-        let bytes = values_to_bytes(&[-0f32, 1e-45, 1.]);
-        let value = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated), bytes).unwrap();
-        let introduced = value.to_placement(&session, Placement::new(mesh, unreduced).unwrap()).unwrap();
-        assert_eq!(session.cached_program_count(), 1);
-        assert_eq!(
-            [bits(&summands), bits(&completed), bits(&value), bits(&introduced)],
-            [
-                vec![0x8000_0000, 1, 0x4040_0000],
-                vec![0, 0, 0x4040_0000],
-                vec![0x8000_0000, 1, 0x3f80_0000],
-                vec![0x8000_0000, 1, 0x3f80_0000],
-            ],
-        );
-    }
-
-    #[test]
-    fn test_array_to_placement_keeps_pending_axes_that_both_meshes_share() {
-        // A placement that changes part of the reduction state keeps every pending axis that both ends have with the
-        // same name, size, and kind, whatever the other axes of either mesh, and completes or introduces only the
-        // others (refer to `kept_unreduced_axes`). Each placement goes from its source mesh to the same mesh, to the
-        // same devices with an unused axis `u` of size one, and to the same devices in reverse order, through both
-        // entry points, which must agree, and the three targets must give the same row, which lists the elements
-        // of every target shard in mesh order and the readback, which must equal that of the source. Minimum
-        // subnormal `f32` contributions along `x` with a sum introduced along `y` stay as they are (a completion would
-        // flush them on the CPU plugin). Integer contributions along `x` and `y` of which only `y` completes keep `7`
-        // and `11` along `x`. The contributions of `f8e8m0fnu`, which has no additive identity, take a sum introduced
-        // along an axis `y` of size one, which writes no identity, but not along one of size two.
-        let client = cpu_client(4);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let mesh = |axes: &[(&str, usize)], devices: Vec<Device>| {
-            let axes = axes.iter().map(|&(name, size)| MeshAxis::new(name, size, MeshAxisType::Auto).unwrap());
-            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices).unwrap()
-        };
-        let pending = |mesh: &DeviceMesh, axes: &[&str]| {
-            Sharding::replicated(mesh.logical_mesh().clone(), 1)
-                .with_unreduced_axes(axes.iter().copied())
-                .unwrap()
-        };
-        let render = |data_type: DataType, bytes: &[u8]| match data_type {
-            DataType::F32 => format!("{:#010x}", u32::from_ne_bytes(bytes.try_into().unwrap())),
-            DataType::I32 => i32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
-            _ => format!("{:#04x}", bytes[0]),
-        };
-        let f32_bits = |bits: u32| bits.to_ne_bytes().to_vec();
-        let i32_bytes = |value: i32| value.to_ne_bytes().to_vec();
-        let (size_one, size_two) = (vec![("x", 2), ("y", 1)], vec![("x", 2), ("y", 2)]);
-        // Each case is its name, data type, source mesh axes, source and target unreduced axes, and the bytes of
-        // the contributions of the devices of the source mesh in mesh order.
-        let (x, x_y) = (vec!["x"], vec!["x", "y"]);
-        let cases = [
-            ("f32 sum(x) -> sum(x, y)", DataType::F32, &size_two, &x, &x_y, vec![f32_bits(1); 4]),
-            ("i32 sum(x, y) -> sum(x)", DataType::I32, &size_two, &x_y, &x, [3, 4, 5, 6].map(i32_bytes).to_vec()),
-            ("f8e8m0fnu sum(x) -> sum(x, y=1)", DataType::F8E8M0FNU, &size_one, &x, &x_y, vec![vec![0x7f]; 2]),
-            ("f8e8m0fnu sum(x) -> sum(x, y=2)", DataType::F8E8M0FNU, &size_two, &x, &x_y, vec![vec![0x7f]; 4]),
-        ];
-        let mut rows = Vec::new();
-        for (name, data_type, axes, source_axes, target_axes, contributions) in cases {
-            let devices = devices[..contributions.len()].to_vec();
-            let source_mesh = mesh(axes, devices.clone());
-            let with_unused = axes.iter().copied().chain([("u", 1)]).collect::<Vec<_>>();
-            let targets = [
-                ("the same mesh", source_mesh.clone()),
-                ("an unused axis", mesh(&with_unused, devices.clone())),
-                ("reversed devices", mesh(axes, devices.iter().rev().copied().collect())),
-            ];
-            let mut rows_by_target = Vec::new();
-            for (target_name, target_mesh) in targets {
-                let target_sharding = pending(&target_mesh, target_axes);
-                let mut results = Vec::new();
-                for consume in [false, true] {
-                    let session = Session::builder().client(client).build().unwrap();
-                    let shards = devices
-                        .iter()
-                        .zip(&contributions)
-                        .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(bytes.as_slice())));
-                    let r#type = ArrayType::new_static(data_type, [1]);
-                    let sharding = Some(pending(&source_mesh, source_axes));
-                    let source =
-                        Array::from_host_shards(&session, r#type, source_mesh.clone(), sharding, shards).unwrap();
-                    let expected = source.copy_to_host_bytes().unwrap();
-                    let target = Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap();
-                    let placed = if consume {
-                        source.into_placement(&session, target)
-                    } else {
-                        source.to_placement(&session, target)
-                    };
-                    results.push(match placed {
-                        Ok(placed) => {
-                            assert_eq!(placed.sharding(), &target_sharding, "{name} onto {target_name}");
-                            let readback = placed.copy_to_host_bytes().unwrap();
-                            assert_eq!(readback, expected, "{name} onto {target_name}");
-                            let shards = placed
-                                .shards()
-                                .iter()
-                                .map(|shard| render(data_type, &shard.copy_to_host_bytes().unwrap()))
-                                .collect::<Vec<_>>();
-                            format!("{} = {}", shards.join(" "), render(data_type, &readback))
-                        }
-                        Err(error) => format!("error: {error}"),
-                    });
-                }
-                assert_eq!(results[0], results[1], "{name} onto {target_name}");
-                rows_by_target.push(results.swap_remove(0));
-            }
-            assert_eq!(rows_by_target[1..], [rows_by_target[0].clone(), rows_by_target[0].clone()]);
-            rows.push(format!("{name}: {}", rows_by_target[0]));
-        }
-        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
-                                unreduced axes";
-        assert_eq!(
-            rows.join("\n"),
-            formatdoc! {"
-                f32 sum(x) -> sum(x, y): 0x00000001 0x80000000 0x00000001 0x80000000 = 0x00000002
-                i32 sum(x, y) -> sum(x): 7 7 11 11 = 18
-                f8e8m0fnu sum(x) -> sum(x, y=1): 0x7f 0x7f = 0x80
-                f8e8m0fnu sum(x) -> sum(x, y=2): error: {missing_identity}"},
-        );
-    }
-
-    #[test]
-    fn test_array_to_placement_serves_missing_replicas_from_the_same_contribution() {
-        // Sources on a 2x2 mesh of four CPU devices imported with buffers for only some of their replicas (`held` lists
-        // the devices in mesh order), placed with `to_placement` and `into_placement`, which must agree, with the bytes
-        // that each device holds afterwards. A placement serves a missing replica only from a replica of the same
-        // contribution (`ShardContribution`), so each sparse import gives the bytes of the full one or an error:
-        //   - A scalar that varies along the manual axis `m` (`11` at `m = 0` and `22` at `m = 1`) and introduces a
-        //     pending sum along `x` from devices 0 and 3 keeps both values (`[11, 22, 0, 0]`), because each is served
-        //     only from a replica of its own contribution.
-        //   - A replicated `[7, 8]` held only on devices 1 and 3 that a placement splits along `x` while introducing
-        //     a pending sum along `y` serves the devices at `y = 0` from those replicas, also when they are missing.
-        //   - A vector split along `m` that varies along it varies only between tiles, so moving it to a mesh that
-        //     renames `x` moves whole shards from any replica of each tile.
-        //   - A scalar that varies within a tile keeps its variation on the renamed mesh, so that move only moves its
-        //     contributions, also as whole shards.
-        //   - A completion on a mesh with a manual axis has no device strategy and plans a host round trip that no
-        //     process owns (its value has no one host readback), so it is rejected alike for every import.
-        let client = cpu_client(4);
-        let devices = client.addressable_devices().unwrap();
-        let mesh_devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let mesh = |names: [(&str, MeshAxisType); 2]| {
-            let axes = names.iter().map(|(name, r#type)| MeshAxis::new(*name, 2, *r#type).unwrap()).collect();
-            DeviceMesh::new(LogicalMesh::new(axes).unwrap(), mesh_devices.clone()).unwrap()
-        };
-        let manual = mesh([("x", MeshAxisType::Explicit), ("m", MeshAxisType::Manual)]);
-        let renamed = mesh([("z", MeshAxisType::Explicit), ("m", MeshAxisType::Manual)]);
-        let explicit = mesh([("x", MeshAxisType::Explicit), ("y", MeshAxisType::Explicit)]);
-        let scalar = ArrayType::scalar(DataType::U8);
-        let vector = ArrayType::new_static(DataType::U8, [2]);
-        let varying = |mesh: &DeviceMesh, rank| {
-            Sharding::replicated(mesh.logical_mesh().clone(), rank).with_varying_manual_axes(["m"]).unwrap()
-        };
-        let split = |mesh: &DeviceMesh, axis: &str| {
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded([axis])]).unwrap()
-        };
-        let varying_tiles = |mesh: &DeviceMesh| split(mesh, "m").with_varying_manual_axes(["m"]).unwrap();
-        // Each row has a source type, mesh, sharding, and the bytes of the device at each index, a target, and
-        // the sets of devices that hold buffers, the first of which holds all of them.
-        let rows = [
-            (
-                "varying along m -> sum along x",
-                (&scalar, &manual, varying(&manual, 0), [vec![11], vec![22], vec![11], vec![22]]),
-                (&manual, varying(&manual, 0).with_unreduced_axes(["x"]).unwrap()),
-                vec![vec![0, 1, 2, 3], vec![0, 3], vec![1, 2], vec![0]],
-            ),
-            (
-                "varying along m -> renamed mesh",
-                (&scalar, &manual, varying(&manual, 0), [vec![11], vec![22], vec![11], vec![22]]),
-                (&renamed, varying(&renamed, 0)),
-                vec![vec![0, 1, 2, 3], vec![0, 3]],
-            ),
-            (
-                "sum along x, varying along m -> completed",
-                (
-                    &scalar,
-                    &manual,
-                    varying(&manual, 0).with_unreduced_axes(["x"]).unwrap(),
-                    [vec![1], vec![2], vec![10], vec![20]],
-                ),
-                (&manual, varying(&manual, 0)),
-                vec![vec![0, 1, 2, 3], vec![0, 3]],
-            ),
-            (
-                "tiles varying along m -> renamed mesh",
-                (&vector, &manual, varying_tiles(&manual), [vec![7], vec![9], vec![7], vec![9]]),
-                (&renamed, varying_tiles(&renamed)),
-                vec![vec![0, 1, 2, 3], vec![2, 3], vec![0, 3]],
-            ),
-            (
-                "replicated -> split along x, sum along y",
-                (
-                    &vector,
-                    &explicit,
-                    Sharding::replicated(explicit.logical_mesh().clone(), 1),
-                    [vec![7, 8], vec![7, 8], vec![7, 8], vec![7, 8]],
-                ),
-                (&explicit, split(&explicit, "x").with_unreduced_axes(["y"]).unwrap()),
-                vec![vec![0, 1, 2, 3], vec![1, 3]],
-            ),
-        ];
-        let mut outcomes = Vec::new();
-        for (name, (r#type, source_mesh, source_sharding, bytes), (mesh, sharding), helds) in rows {
-            for held in helds {
-                let (mut results, mut strategy) = (Vec::new(), String::new());
-                for consume in [false, true] {
-                    let session = Session::builder().client(client).build().unwrap();
-                    let buffers = held
-                        .iter()
-                        .map(|&index| {
-                            let rank = r#type.static_shape().unwrap().rank();
-                            let dimensions = if rank == 0 { Vec::new() } else { vec![bytes[index].len() as u64] };
-                            let device = devices[index].clone();
-                            client.buffer(bytes[index].as_slice(), BufferType::U8, dimensions, None, device, None)
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap();
-                    let source = Array::from_addressable_buffers(
-                        &session,
-                        r#type.clone(),
-                        source_mesh.clone(),
-                        Some(source_sharding.clone()),
-                        buffers,
-                    )
-                    .unwrap();
-                    strategy = planned_work(&source, &simulated_cross_host_layout, 0, mesh, &sharding)
-                        .map_or_else(|_| "no device strategy".to_string(), |work| work.strategy);
-                    let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
-                    let placed = if consume {
-                        source.into_placement(&session, target)
-                    } else {
-                        source.to_placement(&session, target)
-                    };
-                    results.push(
-                        placed
-                            .and_then(|placed| {
-                                assert_eq!(placed.sharding(), &sharding, "{name}");
-                                placed
-                                    .shards()
-                                    .iter()
-                                    .map(ArrayShard::copy_to_host_bytes)
-                                    .collect::<Result<Vec<_>, _>>()
-                            })
-                            .map_err(|error| error.to_string()),
-                    );
-                }
-                assert_eq!(results[0], results[1], "{name} held {held:?}: the entry points disagree");
-                let outcome = match &results[0] {
-                    Ok(bytes) => format!("{bytes:?}"),
-                    Err(error) => format!("error: {error}"),
-                };
-                outcomes.push(format!("{name} held {held:?}: {strategy}: {outcome}"));
-            }
-        }
-        assert_eq!(
-            outcomes.join("\n"),
-            indoc! {"
-                varying along m -> sum along x held [0, 1, 2, 3]: additive identities: [[11], [22], [0], [0]]
-                varying along m -> sum along x held [0, 3]: additive identities: [[11], [22], [0], [0]]
-                varying along m -> sum along x held [1, 2]: additive identities: [[11], [22], [0], [0]]
-                varying along m -> sum along x held [0]: additive identities: error: array shard #1 on device 1 has no addressable buffer
-                varying along m -> renamed mesh held [0, 1, 2, 3]: exact shards: [[11], [22], [11], [22]]
-                varying along m -> renamed mesh held [0, 3]: exact shards: [[11], [22], [11], [22]]
-                sum along x, varying along m -> completed held [0, 1, 2, 3]: host round trip: error: compiled reshard does not support `Manual` mesh axis m
-                sum along x, varying along m -> completed held [0, 3]: host round trip: error: compiled reshard does not support `Manual` mesh axis m
-                tiles varying along m -> renamed mesh held [0, 1, 2, 3]: exact shards: [[7], [9], [7], [9]]
-                tiles varying along m -> renamed mesh held [2, 3]: exact shards: [[7], [9], [7], [9]]
-                tiles varying along m -> renamed mesh held [0, 3]: exact shards: [[7], [9], [7], [9]]
-                replicated -> split along x, sum along y held [0, 1, 2, 3]: compiled reshard with additive identities: [[7], [0], [8], [0]]
-                replicated -> split along x, sum along y held [1, 3]: compiled reshard with additive identities: [[7], [0], [8], [0]]"},
-        );
-    }
-
-    #[test]
-    fn test_array_to_placement_preserves_value_across_partial_completions() {
-        // Transitions of pending sums along the axes `x` and `y` of a 2x2 mesh that complete some of them and keep or
-        // introduce others, with contributions whose partial sums overflow or round in the element type (element 0 sums
-        // along `y` first and element 1 along `x`), each placed with `to_placement` and `into_placement`, which must
-        // agree. Each row lists the strategy, the programs that each entry point compiles, and the host readbacks of
-        // the source and of the result, which are equal bit for bit for every data type but `f32`. A partial completion
-        // of a data type that accumulates its sums in a wider type cannot run on the devices, because partial sums in
-        // the element type would change the value (e.g., the `f8e4m3fn` contributions `448`, `448`, `-448`, and
-        // `-448`, which sum to zero, have the partial sums `896` and `-896`, which are NaN in `f8e4m3fn`, and the
-        // `bf16` contributions `256`, `1`, `-256`, and `1` have the partial sum `257`, which rounds to `256`). The
-        // host round trip that remains would combine the partial sums that the target keeps, so both entry points
-        // return the partial-contribution error, which the rows list as `error` and `errors` in
-        // full. A data type that accumulates its sums in itself keeps them on the devices: integers are exact, and an
-        // `f32` partial completion fixes the order of accumulation to its partial sums first, as the contract of
-        // floating point sums allows, so the `f32` contributions `2^24`, `1`, `-2^24`, and `1`, which read back as
-        // `1`, read back as `2` after completing `x`. Moving a pending sum from `x` to `y` only moves its contributions
-        // (refer to `moves_contributions`), so it takes exact shards without arithmetic.
-        let client = cpu_client(4);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let rows = [
-            (DataType::F8E4M3FN, [448f64, 448., -448., -448.]),
-            (DataType::BF16, [256., 1., -256., 1.]),
-            (DataType::F32, [16777216., 1., -16777216., 1.]),
-            (DataType::I32, [f64::from(i32::MAX), 1., f64::from(i32::MIN), -1.]),
-        ];
-        let (mut outcomes, mut errors) = (Vec::new(), Vec::new());
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
-            let logical_mesh = LogicalMesh::new(vec![
-                MeshAxis::new("x", 2, axis_type).unwrap(),
-                MeshAxis::new("y", 2, axis_type).unwrap(),
-            ])
-            .unwrap();
-            let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
-            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
-            let split_x = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-            let pending = |sharding: &Sharding, axes: &[&str]| {
-                sharding.clone().with_unreduced_axes(axes.iter().copied()).unwrap()
-            };
-            let transitions = [
-                ("sum(x, y) -> sum(x)", &["x", "y"][..], pending(&replicated, &["x"])),
-                ("sum(x, y) -> sum(y)", &["x", "y"][..], pending(&replicated, &["y"])),
-                ("sum(x, y) -> none", &["x", "y"][..], replicated.clone()),
-                ("sum(x, y) -> sum(y) split along x", &["x", "y"][..], pending(&split_x, &["y"])),
-                ("sum(x) -> none", &["x"][..], replicated.clone()),
-                ("sum(x) -> sum(y)", &["x"][..], pending(&replicated, &["y"])),
-                ("sum(x) -> sum(x, y)", &["x"][..], pending(&replicated, &["x", "y"])),
-            ];
-            for (data_type, values) in rows {
-                let r#type = ArrayType::new_static(data_type, [2]);
-                let encode = |value: f64| {
-                    CoreArray::scalar(value).unwrap().convert_element_type(data_type).unwrap().logical_bytes()
-                };
-                let decode = |bytes: &[u8]| {
-                    let array = CoreArray::new(r#type.clone(), bytes.to_vec()).unwrap();
-                    array.convert_element_type(DataType::F64).unwrap().elements::<f64>().unwrap()
-                };
-                for (name, source_axes, target_sharding) in &transitions {
-                    let mut results = Vec::new();
-                    for consume in [false, true] {
-                        let session = Session::builder().client(client).build().unwrap();
-                        // The device at `(x, y)` holds `values[2 * x + y]` in element 0 and `values[x + 2 * y]` in
-                        // element 1, or, for a source with a pending sum along `x` only, `values[2 * x]` and
-                        // `values[2 * x + 1]`, so that its replicas along `y` hold equal contributions.
-                        let shards = devices.iter().enumerate().map(|(index, device)| {
-                            let (x, y) = (index / 2, index % 2);
-                            let elements = match source_axes.len() {
-                                2 => [values[2 * x + y], values[x + 2 * y]],
-                                _ => [values[2 * x], values[2 * x + 1]],
-                            };
-                            let bytes = elements.map(encode).concat();
-                            (device.id(), Arc::<[u8]>::from(bytes))
-                        });
-                        let sharding = Some(pending(&replicated, source_axes));
-                        let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
-                        let source = source.unwrap();
-                        let expected = source.copy_to_host_bytes().unwrap();
-                        let strategy = planned_work(&source, &simulated_cross_host_layout, 0, &mesh, target_sharding)
-                            .map(|work| work.strategy);
-                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
-                        let placed = if consume {
-                            source.into_placement(&session, target)
-                        } else {
-                            source.to_placement(&session, target)
-                        };
-                        let actual = placed.and_then(|placed| {
-                            assert_eq!(placed.sharding(), target_sharding, "{data_type} {name}");
-                            placed.copy_to_host_bytes()
-                        });
-                        let actual = actual.map_err(|error| error.to_string());
-                        results.push((strategy, session.cached_program_count(), expected, actual));
-                    }
-                    let [(strategy, programs, expected, actual), (_, consumed_programs, _, consumed)] =
-                        results.try_into().unwrap();
-                    assert_eq!(actual, consumed, "{axis_type:?} {data_type} {name}: the entry points disagree");
-                    let programs = format!("+{programs} +{consumed_programs}");
-                    let outcome = match (strategy, actual) {
-                        (Ok(strategy), Ok(actual)) => {
-                            if data_type != DataType::F32 {
-                                assert_eq!(expected, actual, "{axis_type:?} {data_type} {name}");
-                            }
-                            format!("{strategy} {programs}: {:?} -> {:?}", decode(&expected), decode(&actual))
-                        }
-                        (Err(planned), Err(error)) => {
-                            assert_eq!(planned, error, "{axis_type:?} {data_type} {name}");
-                            errors.push(format!("{axis_type:?} {data_type} {name}: {error}"));
-                            format!("error {programs}")
-                        }
-                        (strategy, actual) => panic!("{axis_type:?} {data_type} {name}: {strategy:?} {actual:?}"),
-                    };
-                    outcomes.push(format!("{axis_type:?} {data_type} {name}: {outcome}"));
-                }
-            }
-        }
-        let mut expected_errors = Vec::new();
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
-            for (data_type, accumulation_type) in [(DataType::F8E4M3FN, DataType::F16), (DataType::BF16, DataType::F32)]
-            {
-                for (name, completed, kept) in [
-                    ("sum(x, y) -> sum(x)", "y", "x"),
-                    ("sum(x, y) -> sum(y)", "x", "y"),
-                    ("sum(x, y) -> sum(y) split along x", "x", "y"),
-                ] {
-                    expected_errors.push(format!(
-                        "{axis_type:?} {data_type} {name}: cannot place an array whose pending reduction the placement \
-                         keeps along the mesh axes `{kept}` and changes along others when no device strategy applies \
-                         (cannot complete a pending `sum` of `{data_type}` values along mesh axis `{completed}` and \
-                         keep it along mesh axis `{kept}` on the devices, because the partial sums would be rounded \
-                         to `{data_type}`, while the sum accumulates in `{accumulation_type}`), because the host \
-                         round trip that remains would combine the contributions that the placement keeps; complete \
-                         the reduction first",
-                    ));
-                }
-            }
-        }
-        assert_eq!(errors, expected_errors);
-        let outcomes = outcomes.into_iter().map(|outcome| outcome.replacen("Auto ", "", 1)).collect::<Vec<_>>();
-        let (explicit, auto) = outcomes.split_at(outcomes.len() / 2);
-        let explicit = explicit.iter().map(|outcome| outcome.replacen("Explicit ", "", 1)).collect::<Vec<_>>();
-        assert_eq!(explicit, auto, "both axis types must give the same rows");
-        assert_eq!(
-            auto.join("\n"),
-            indoc! {"
-                f8e4m3fn sum(x, y) -> sum(x): error +0 +0
-                f8e4m3fn sum(x, y) -> sum(y): error +0 +0
-                f8e4m3fn sum(x, y) -> none: compiled reshard +1 +1: [0.0, 0.0] -> [0.0, 0.0]
-                f8e4m3fn sum(x, y) -> sum(y) split along x: error +0 +0
-                f8e4m3fn sum(x) -> none: compiled reshard +1 +1: [0.0, 0.0] -> [0.0, 0.0]
-                f8e4m3fn sum(x) -> sum(y): exact shards +0 +0: [0.0, 0.0] -> [0.0, 0.0]
-                f8e4m3fn sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 0.0] -> [0.0, 0.0]
-                bf16 sum(x, y) -> sum(x): error +0 +0
-                bf16 sum(x, y) -> sum(y): error +0 +0
-                bf16 sum(x, y) -> none: compiled reshard +1 +1: [2.0, 2.0] -> [2.0, 2.0]
-                bf16 sum(x, y) -> sum(y) split along x: error +0 +0
-                bf16 sum(x) -> none: compiled reshard +1 +1: [0.0, 2.0] -> [0.0, 2.0]
-                bf16 sum(x) -> sum(y): exact shards +0 +0: [0.0, 2.0] -> [0.0, 2.0]
-                bf16 sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 2.0] -> [0.0, 2.0]
-                f32 sum(x, y) -> sum(x): compiled reshard +1 +1: [1.0, 2.0] -> [1.0, 2.0]
-                f32 sum(x, y) -> sum(y): compiled reshard +1 +1: [1.0, 2.0] -> [2.0, 1.0]
-                f32 sum(x, y) -> none: compiled reshard +1 +1: [1.0, 2.0] -> [1.0, 2.0]
-                f32 sum(x, y) -> sum(y) split along x: compiled reshard +1 +1: [1.0, 2.0] -> [2.0, 1.0]
-                f32 sum(x) -> none: compiled reshard +1 +1: [0.0, 2.0] -> [0.0, 2.0]
-                f32 sum(x) -> sum(y): exact shards +0 +0: [0.0, 2.0] -> [0.0, 2.0]
-                f32 sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 2.0] -> [0.0, 2.0]
-                i32 sum(x, y) -> sum(x): compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
-                i32 sum(x, y) -> sum(y): compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
-                i32 sum(x, y) -> none: compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
-                i32 sum(x, y) -> sum(y) split along x: compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
-                i32 sum(x) -> none: compiled reshard +1 +1: [-1.0, 0.0] -> [-1.0, 0.0]
-                i32 sum(x) -> sum(y): exact shards +0 +0: [-1.0, 0.0] -> [-1.0, 0.0]
-                i32 sum(x) -> sum(x, y): additive identities +0 +0: [-1.0, 0.0] -> [-1.0, 0.0]"},
-        );
-    }
-
-    #[test]
-    fn test_array_to_placement_keeps_partial_sums_or_rejects_the_placement() {
-        // The devices at `(0, 0)`, `(0, 1)`, `(1, 0)`, and `(1, 1)` of a 2x2 mesh hold the `f32` contributions `MAX`,
-        // `0`, `MAX`, and `-MAX`, whose combined value is infinite, to a value of five elements with a pending sum
-        // along `x` and `y`. Completing `y` keeps the partial sums `MAX` and `0` along `x`, which an untiled
-        // target does with a compiled reshard. A target split unevenly along `y` rules out every device
-        // strategy, and the host round trip that remains would combine the partial sums, so both entry points return
-        // the same error, which every process derives from the shardings. Each row lists the shards in mesh order and
-        // the readback of the result, with the equal elements of each as `value xcount`.
-        let client = cpu_client(4);
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
-        let source_sharding = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x", "y"]).unwrap();
-        let untiled = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
-        let uneven = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])])
-            .unwrap()
-            .with_unreduced_axes(["x"])
-            .unwrap();
-        let values = [f32::MAX, 0., f32::MAX, -f32::MAX];
-        let r#type = ArrayType::new_static(DataType::F32, [5]);
-        let render = |bytes: &[u8]| {
-            let elements = values_from_bytes::<f32>(bytes);
-            assert_eq!(elements, vec![elements[0]; elements.len()]);
-            let value = match elements[0] {
-                value if value == f32::MAX => "MAX".to_string(),
-                value => value.to_string(),
-            };
-            format!("{value} x{}", elements.len())
-        };
-        let mut outcomes = Vec::new();
-        for (name, target_sharding) in [("untiled", &untiled), ("split unevenly along y", &uneven)] {
-            let mut results = Vec::new();
-            for consume in [false, true] {
-                let session = Session::builder().client(client).build().unwrap();
-                let shards = devices
-                    .iter()
-                    .zip(values)
-                    .map(|(device, value)| (device.id(), Arc::<[u8]>::from(values_to_bytes(&[value; 5]))));
-                let sharding = Some(source_sharding.clone());
-                let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
-                let source = source.unwrap();
-                let reason = source.placement_planning_view().validate_compiled_reshard(&mesh, target_sharding).err();
-                let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
-                let placed = if consume {
-                    source.into_placement(&session, target)
-                } else {
-                    source.to_placement(&session, target)
-                };
-                let outcome = match placed {
-                    Ok(placed) => {
-                        assert_eq!(placed.sharding(), target_sharding);
-                        let shards = placed.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap());
-                        let shards = shards.map(|bytes| render(&bytes)).collect::<Vec<_>>().join(", ");
-                        format!("[{shards}] -> {}", render(&placed.copy_to_host_bytes().unwrap()))
-                    }
-                    Err(error) => {
-                        assert_eq!(
-                            error.to_string(),
-                            format!(
-                                "cannot place an array whose pending reduction the placement keeps along the mesh \
-                                 axes `x` and changes along others when no device strategy applies ({}), because the \
-                                 host round trip that remains would combine the contributions that the placement \
-                                 keeps; complete the reduction first, or place the array onto an even split",
-                                reason.as_ref().unwrap(),
-                            ),
-                        );
-                        "error".to_string()
-                    }
-                };
-                results.push(outcome);
-            }
-            assert_eq!(results[0], results[1], "{name}: the entry points disagree");
-            outcomes.push(format!("{name}: {}", results[0]));
-        }
-        assert_eq!(
-            outcomes.join("\n"),
-            indoc! {"
-                untiled: [MAX x5, MAX x5, 0 x5, 0 x5] -> MAX x5
-                split unevenly along y: error"},
-        );
-    }
-
-    #[test]
-    fn test_array_to_placement_compiled_reshard_on_mesh_of_other_processes() {
-        let client = cpu_client(2);
-        let local = Session::builder().client(client).build().unwrap().addressable_devices().unwrap();
-        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
-        let remote = [Device::new(next_id, 1), Device::new(next_id + 1, 1)];
-        let session = session_with_remote_devices(client, remote);
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = |devices: [Device; 2]| DeviceMesh::new(logical_mesh.clone(), devices.to_vec()).unwrap();
-        let replicated = Sharding::replicated(logical_mesh.clone(), 2);
-        let rows = Sharding::new(
-            logical_mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
-
-        // Each case places a source with the given type and sharding on its own mesh onto the given sharding over the
-        // given devices with a compiled strategy, once on the devices of this process, which runs every program, and
-        // once on the devices of another process, of which this process holds only metadata. The first case reshards
-        // on the mesh of the source, and the second one gathers the source on its mesh, copies it to the reversed mesh,
-        // and reshards it there, because the declared layout rules out shard regions.
-        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
-        let cases = [
-            ("same mesh", r#type.clone(), &replicated, &rows, false),
-            ("across meshes", r#type.with_layout(column_major.clone()), &rows, &replicated, true),
-        ];
-        for (case, r#type, source_sharding, sharding, reversed) in cases {
-            let target_mesh =
-                |[first, second]: [Device; 2]| if reversed { mesh([second, first]) } else { mesh([first, second]) };
-            let process_index = local[0].process_index();
-            let source = Array::from_host_buffer(
-                &session,
-                r#type.clone(),
-                mesh([local[0], local[1]]),
-                Some(source_sharding.clone()),
-                &values,
-            )
-            .unwrap();
-            let strategy = source.device_placement_strategy(
-                &cross_host_layout_resolver(session.client()),
-                &target_mesh([local[0], local[1]]),
-                sharding,
-                process_index,
-            );
-            if reversed {
-                assert!(matches!(strategy, Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { .. })), "{case}");
-            } else {
-                assert!(matches!(strategy, Ok(DevicePlacementStrategy::CompiledReshard { .. })), "{case}");
-            }
-            let target = Placement::new(target_mesh([local[0], local[1]]), sharding.clone()).unwrap();
-            let participant = source.to_placement(&session, target).unwrap();
-            let participant_moved = source
-                .clone()
-                .reshard_on_devices(&session, &target_mesh([local[0], local[1]]), sharding, false)
-                .unwrap();
-            assert_eq!(participant.addressable_shards().count(), 2, "{case}");
-            assert_eq!(participant.copy_to_host().unwrap().elements::<f32>().unwrap(), [1., 2., 3., 4.], "{case}");
-
-            // This process owns no device of either mesh, so it compiles and runs nothing, and it returns the type, the
-            // placement, and the commitment that the processes which own those devices compute for their results.
-            let peer_source = Array::from_addressable_buffers(
-                &session,
-                r#type,
-                mesh(remote),
-                Some(source_sharding.clone()),
-                Vec::new(),
-            )
-            .unwrap();
-            let cached_program_count = session.cached_program_count();
-            let target = Placement::new(target_mesh(remote), sharding.clone()).unwrap();
-            let placed = peer_source.to_placement(&session, target).unwrap();
-            let moved =
-                peer_source.clone().reshard_on_devices(&session, &target_mesh(remote), sharding, false).unwrap();
-            for output in [&placed, &moved] {
-                assert_eq!(output.mesh(), &target_mesh(remote), "{case}");
-                assert_eq!(output.sharding(), participant.sharding(), "{case}");
-                assert_eq!(output.addressable_shards().count(), 0, "{case}");
-                assert!(output.is_committed(), "{case}");
-                assert_eq!(output.block_until_ready().map_err(|error| error.to_string()), Ok(()), "{case}");
-            }
-            assert_eq!(placed.r#type(), participant.r#type(), "{case}");
-            assert_eq!(moved.r#type(), participant_moved.r#type(), "{case}");
-            assert_eq!(session.cached_program_count(), cached_program_count, "{case}");
-        }
-    }
-
-    #[test]
-    fn test_array_to_placement_moves_only_required_cross_mesh_regions() {
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let source_mesh = two_device_mesh(client, MeshAxisType::Auto);
-        let source_sharding = Sharding::new(
-            source_mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
-        let source = Array::from_host_buffer(
-            &session,
-            ArrayType::new_static(DataType::F32, [4, 4]),
-            source_mesh,
-            Some(source_sharding),
-            values_to_bytes(&values),
-        )
-        .unwrap();
-        let target_mesh = four_device_mesh_x(client);
-        let target_sharding = Sharding::new(
-            target_mesh.logical_mesh().clone(),
-            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
-        )
-        .unwrap();
-        let regions = source
-            .placement_planning_view()
-            .plan_shard_regions(&target_mesh, &target_sharding)
-            .unwrap()
-            .unwrap();
-        // Each column needs two regions. Two of the eight regions are already on their target devices.
-        let copied_bytes = regions
-            .moves
-            .iter()
-            .filter(|movement| movement.source_device != movement.target_device)
-            .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
-            .sum::<usize>();
-        assert_eq!(regions.moves.len(), 8);
-        assert_eq!(copied_bytes, 48);
-
-        // The strategy keeps the regions that it derived to choose itself, which the placement then executes.
-        let process_index = client.process_index().unwrap();
-        let Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts }) = source.device_placement_strategy(
-            &cross_host_layout_resolver(session.client()),
-            &target_mesh,
-            &target_sharding,
-            process_index,
-        ) else {
-            panic!("a placement on another mesh of this process must use shard regions");
-        };
-        assert!(cross_host_layouts.is_empty());
-        assert_eq!(plan, regions);
-
-        let output = source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()).unwrap();
-        output.block_until_ready().unwrap();
-        assert_ne!(session.eager_dispatch_statistics().misses, 0);
-        assert!(output.execution_fence().is_some());
-        assert_eq!(
-            shard_values(&output),
-            vec![vec![0., 4., 8., 12.], vec![1., 5., 9., 13.], vec![2., 6., 10., 14.], vec![3., 7., 11., 15.]],
-        );
-        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
-    }
-
-    #[test]
-    fn test_array_into_placement_reuses_donated_buffers_when_every_device_keeps_its_shard_type() {
-        // A donated array whose compiled reshard leaves every device with a shard of the type that it held there (e.g.,
-        // one that completes a pending sum) gives its buffers to the result, because the lowering pairs the input and
-        // the output of that reshard (refer to `has_same_shard_types`), as JAX pairs a donated argument of `jit` with a
-        // result of the same shard shape. Each row lists, per device in the order of the mesh, whether the result holds
-        // the buffer that the source held there, with donation and without it (i.e., with `to_placement`, which keeps
-        // the source), and the values of every shard. A row marked as forced runs the compiled reshard although
-        // another strategy (moves of whole shards) places it otherwise.
-        let client = cpu_client(4);
-        let session = Session::builder().client(client).build().unwrap();
-        let devices = session.addressable_devices().unwrap();
-        let square = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
-        let auto = two_device_mesh(client, MeshAxisType::Auto);
-        let explicit = two_device_mesh(client, MeshAxisType::Explicit);
-        let renamed_axes = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let renamed = DeviceMesh::new(renamed_axes, devices[..2].to_vec()).unwrap();
-        let split = |mesh: &DeviceMesh, axes: &[&str]| {
-            let dimension = match axes {
-                [] => ShardingDimension::replicated(),
-                axes => ShardingDimension::sharded(axes.iter().copied()),
-            };
-            Sharding::new(mesh.logical_mesh().clone(), vec![dimension]).unwrap()
-        };
-        let r#type = ArrayType::new_static(DataType::F32, [4]);
-        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
-        let dense = |mesh: &DeviceMesh, sharding: Sharding| {
-            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), Some(sharding), values.as_slice()).unwrap()
-        };
-        let pending = |mesh: &DeviceMesh, sharding: Sharding, contributions: &[&[f32]]| {
-            let sharding = sharding.with_unreduced_axes(["x"]).unwrap();
-            let shards = contributions
-                .iter()
-                .zip(mesh.devices())
-                .map(|(values, device)| (device.id(), Arc::<[u8]>::from(values_to_bytes(values))))
-                .collect::<Vec<_>>();
-            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), Some(sharding), shards).unwrap()
-        };
-        // Native addresses of the buffers of `array`, which are ready and alive while they are read, and are only
-        // compared and never dereferenced.
-        let addresses = |array: &Array| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| {
-                    let buffer = shard.buffer().unwrap();
-                    buffer.ready().unwrap().r#await().unwrap();
-                    unsafe { buffer.unsafe_pointer().unwrap() }
-                })
-                .collect::<Vec<_>>()
-        };
-        let place = |source: Array, target: &Placement, forced: bool, donate: bool| {
-            let before = addresses(&source);
-            let placed = match (forced, donate) {
-                (true, _) => {
-                    let (mesh, sharding) = (target.mesh(), target.sharding());
-                    let (input, output) = (source.sharding().clone(), sharding.clone());
-                    let program = ReshardProgram { mesh: mesh.clone(), input, output };
-                    let strategy = DevicePlacementStrategy::CompiledReshard { program };
-                    let placed = source.place_with_strategy(strategy, 0, mesh, sharding, Memory::Device, None, donate);
-                    placed.map_err(|(error, _)| error).unwrap()
-                }
-                (false, true) => source.into_placement(&session, target.clone()).unwrap(),
-                (false, false) => source.to_placement(&session, target.clone()).unwrap(),
-            };
-            let reused = before.iter().zip(addresses(&placed)).map(|(before, after)| *before == after);
-            let reused = reused.collect::<Vec<_>>();
-            (reused, shard_values(&placed))
-        };
-
-        let sums: &[&[f32]] = &[&[1., 2., 3., 4.], &[10., 20., 30., 40.]];
-        let split_sums: &[&[f32]] = &[&[1., 2.], &[3., 4.], &[10., 20.], &[30., 40.]];
-        type Source<'a> = Box<dyn Fn() -> Array + 'a>;
-        let cases: Vec<(&str, Source<'_>, Placement, bool)> = vec![
-            (
-                "completed sum on an auto axis",
-                Box::new(|| pending(&auto, split(&auto, &[]), sums)),
-                Placement::new(auto.clone(), split(&auto, &[])).unwrap(),
-                false,
-            ),
-            (
-                "completed sum on an explicit axis",
-                Box::new(|| pending(&explicit, split(&explicit, &[]), sums)),
-                Placement::new(explicit.clone(), split(&explicit, &[])).unwrap(),
-                false,
-            ),
-            (
-                "completed sum of a split",
-                Box::new(|| pending(&square, split(&square, &["y"]), split_sums)),
-                Placement::new(square.clone(), split(&square, &["y"])).unwrap(),
-                false,
-            ),
-            (
-                "split to replicated",
-                Box::new(|| dense(&explicit, split(&explicit, &["x"]))),
-                Placement::new(explicit.clone(), split(&explicit, &[])).unwrap(),
-                false,
-            ),
-            (
-                "split along another axis, forced",
-                Box::new(|| dense(&square, split(&square, &["x"]))),
-                Placement::new(square.clone(), split(&square, &["y"])).unwrap(),
-                true,
-            ),
-            (
-                "renamed mesh",
-                Box::new(|| dense(&explicit, split(&explicit, &["x"]))),
-                Placement::new(renamed.clone(), split(&renamed, &["a"])).unwrap(),
-                false,
-            ),
-        ];
-        let outcomes = cases
-            .into_iter()
-            .map(|(name, source, target, forced)| {
-                let (donated, values) = place(source(), &target, forced, true);
-                let (borrowed, borrowed_values) = place(source(), &target, forced, false);
-                assert_eq!(values, borrowed_values, "{name}");
-                format!("{name}: donated {donated:?}, borrowed {borrowed:?}, values {values:?}")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes.join("\n"),
-            indoc! {"
-                completed sum on an auto axis: donated [true, true], borrowed [false, false], values [[11.0, 22.0, 33.0, 44.0], [11.0, 22.0, 33.0, 44.0]]
-                completed sum on an explicit axis: donated [true, true], borrowed [false, false], values [[11.0, 22.0, 33.0, 44.0], [11.0, 22.0, 33.0, 44.0]]
-                completed sum of a split: donated [true, true, true, true], borrowed [false, false, false, false], values [[11.0, 22.0], [33.0, 44.0], [11.0, 22.0], [33.0, 44.0]]
-                split to replicated: donated [false, false], borrowed [false, false], values [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]
-                split along another axis, forced: donated [true, true, true, true], borrowed [false, false, false, false], values [[1.0, 2.0], [3.0, 4.0], [1.0, 2.0], [3.0, 4.0]]
-                renamed mesh: donated [true, true], borrowed [true, true], values [[1.0, 2.0], [3.0, 4.0]]"},
-        );
-    }
-
-    #[test]
     fn test_array_reshard_on_devices() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -6901,6 +5282,1625 @@ mod tests {
                     (_, Error::Pjrt(PjrtError::Aborted { message: second, .. })),
                 ] if first == "second replica failed" && second == "second replica failed"),
         ));
+    }
+
+    #[test]
+    fn test_array_place_within_client_moves_pending_contributions_to_other_devices() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let on = |axis: &str, devices: Vec<Device>| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, 2, MeshAxisType::Explicit).unwrap()]);
+            DeviceMesh::new(logical_mesh.unwrap(), devices).unwrap()
+        };
+        let original = on("x", devices.clone());
+        let reversed = on("x", vec![devices[1], devices[0]]);
+        let renamed = on("y", devices.clone());
+        let auto_reversed = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let auto_reversed = DeviceMesh::new(auto_reversed, vec![devices[1], devices[0]]).unwrap();
+        let unit = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("u", 1, MeshAxisType::Explicit).unwrap(),
+        ]);
+        let unit = DeviceMesh::new(unit.unwrap(), devices.clone()).unwrap();
+        let pending = |mesh: &DeviceMesh, kind: UnreducedKind| {
+            let axis = mesh.logical_mesh().axes()[0].name().to_string();
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0).with_unreduced_axes([axis]).unwrap();
+            sharding.with_unreduced_kind(kind).unwrap()
+        };
+        // Returns the bytes that each device holds, in the order of the device identifiers.
+        let device_bytes = |array: &Array| {
+            let mut bytes = array
+                .shards()
+                .iter()
+                .map(|shard| (shard.device().id(), shard.copy_to_host_bytes().unwrap()))
+                .collect::<Vec<_>>();
+            bytes.sort();
+            bytes
+        };
+        // Returns the bytes that each device of `mesh` holds after a placement that moves the contribution at each
+        // coordinate to the device at the same coordinate of `mesh`, in the order of the device identifiers.
+        let moved_bytes = |mesh: &DeviceMesh, contributions: &[Vec<u8>; 2]| {
+            let bytes = mesh.devices().iter().zip(contributions).map(|(device, bytes)| (device.id(), bytes.clone()));
+            let mut bytes = bytes.collect::<Vec<_>>();
+            bytes.sort();
+            bytes
+        };
+        let import = |data_type: DataType, kind: UnreducedKind, contributions: &[Vec<u8>; 2]| {
+            Array::from_host_shards(
+                &session,
+                ArrayType::scalar(data_type),
+                original.clone(),
+                Some(pending(&original, kind)),
+                devices
+                    .iter()
+                    .zip(contributions)
+                    .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(&bytes[..]))),
+            )
+            .unwrap()
+        };
+
+        // A placement that keeps the reduction state and only changes where each contribution lives moves every
+        // contribution as it is, so the contribution at coordinate zero moves to the first device of the target
+        // mesh, which keeps the sum of two smallest subnormal `f32` values, the sum of two negative zeros, the `u8`
+        // summands `3` and `5`, and the `f8e8m0fnu` summands of a type without an additive identity. Adding an unused
+        // axis of size one changes no contribution either.
+        let contributions = [
+            (DataType::F32, UnreducedKind::Sum, [vec![1u8, 0, 0, 0], vec![1, 0, 0, 0]]),
+            (DataType::F32, UnreducedKind::Sum, [vec![0, 0, 0, 0x80], vec![0, 0, 0, 0x80]]),
+            (DataType::U8, UnreducedKind::Sum, [vec![3], vec![5]]),
+            (DataType::F8E8M0FNU, UnreducedKind::Sum, [vec![0x7f], vec![0x7f]]),
+            (DataType::F32, UnreducedKind::Max, [values_to_bytes(&[1f32]), values_to_bytes(&[f32::NAN])]),
+        ];
+        for target_mesh in [&reversed, &unit] {
+            for (data_type, kind, contributions) in &contributions {
+                let source = import(*data_type, *kind, contributions);
+                let value = source.copy_to_host_bytes().unwrap();
+                let target = Placement::new(target_mesh.clone(), pending(target_mesh, *kind)).unwrap();
+                for placed in place_through_entry_points(&session, &source, target) {
+                    let placed = placed.unwrap();
+                    let context = format!("{data_type} {kind} onto {target_mesh:?}");
+                    assert_eq!(device_bytes(&placed), moved_bytes(target_mesh, contributions), "{context}");
+                    assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
+                }
+            }
+        }
+
+        // An explicit axis onto an auto one changes no contribution either.
+        let source = import(DataType::F32, UnreducedKind::Sum, &[vec![1, 0, 0, 0], vec![1, 0, 0, 0]]);
+        let target = Placement::new(auto_reversed.clone(), pending(&auto_reversed, UnreducedKind::Sum)).unwrap();
+        let placed = source.to_placement(&session, target).unwrap();
+        assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![1, 0, 0, 0]), (devices[1].id(), vec![1, 0, 0, 0])]);
+        assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![2, 0, 0, 0]);
+
+        // Renaming the axis of a pending sum is a pure move too, which the device planner serves with whole shards,
+        // although the type rule of `place` rejects it before any planning because it redefines an axis that carries
+        // reduction state.
+        let source = import(DataType::U8, UnreducedKind::Sum, &[vec![3], vec![5]]);
+        let sharding = pending(&renamed, UnreducedKind::Sum);
+        let resolve_layout = cross_host_layout_resolver(client);
+        let strategy = source.device_placement_strategy(&resolve_layout, &renamed, &sharding, 0).unwrap();
+        assert!(matches!(strategy, DevicePlacementStrategy::ExactShards { .. }));
+        let placed = source.place_with_strategy(strategy, 0, &renamed, &sharding, Memory::Device, None, false);
+        let placed = placed.map_err(|(error, _)| error).unwrap();
+        assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![3]), (devices[1].id(), vec![5])]);
+
+        // Adding a pending axis of size one keeps the number of contributions, so it is a pure move as well, which
+        // keeps the summands of every data type as they are. Only the physical placements reach it, because the type
+        // rule of `place` rejects a change of reduction state.
+        let pending_unit = Sharding::replicated(unit.logical_mesh().clone(), 0).with_unreduced_axes(["x", "u"]);
+        let target = Placement::new(unit.clone(), pending_unit.unwrap()).unwrap();
+        for (data_type, contributions) in [
+            (DataType::U8, [vec![3u8], vec![5]]),
+            (DataType::F32, [vec![1, 0, 0, 0], vec![1, 0, 0, 0]]),
+            (DataType::F8E8M0FNU, [vec![0x7f], vec![0x7f]]),
+        ] {
+            let source = import(data_type, UnreducedKind::Sum, &contributions);
+            let value = source.copy_to_host_bytes().unwrap();
+            for placed in
+                [source.to_placement(&session, target.clone()), source.clone().into_placement(&session, target.clone())]
+            {
+                let placed = placed.unwrap();
+                assert_eq!(device_bytes(&placed), moved_bytes(&unit, &contributions), "{data_type}");
+                assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{data_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_place_within_client_moves_pending_contributions_as_shard_regions() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
+            let axes = axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap());
+            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
+        };
+        let explicit = MeshAxisType::Explicit;
+        let source_mesh = mesh(&[("x", 2, explicit), ("y", 2, explicit)]);
+        let sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        // Returns the bytes that each device holds, in the order of `devices`.
+        let device_bytes = |array: &Array| {
+            devices
+                .iter()
+                .map(|device| array.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // A vector of four elements with a pending sum along `x` is split along a second axis, which only moves each
+        // of its two contributions as regions of their shards, also onto a mesh with an unused axis of size one or with
+        // the partitioning axis renamed. It completes no sum, so each sum of two smallest subnormal `f32` values (i.e.,
+        // the bits `0x00000002`) is kept, and `f8e8m0fnu`, which has no additive identity, moves as well. On the same
+        // mesh, the placement moves regions as well, so that sparse and dense sources behave alike.
+        let targets = [
+            (mesh(&[("x", 2, explicit), ("y", 2, explicit)]), "y"),
+            (mesh(&[("x", 2, explicit), ("y", 2, explicit), ("unit", 1, explicit)]), "y"),
+            (mesh(&[("x", 2, explicit), ("z", 2, explicit)]), "z"),
+        ];
+        let cases = [
+            (
+                DataType::F32,
+                [values_to_bytes(&[1u32, 2, 3, 4]), values_to_bytes(&[1u32; 4])],
+                values_to_bytes(&[2u32, 3, 4, 5]),
+            ),
+            (DataType::F8E8M0FNU, [vec![0x7f; 4], vec![0x7f; 4]], vec![0x80; 4]),
+            (DataType::U8, [vec![1, 2, 3, 4], vec![10, 20, 30, 40]], vec![11, 22, 33, 44]),
+        ];
+        for (target_mesh, axis) in &targets {
+            let split = vec![ShardingDimension::sharded([*axis])];
+            let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
+            let split = split.with_unreduced_axes(["x"]).unwrap();
+            for (data_type, contributions, value) in &cases {
+                let source = Array::from_host_shards(
+                    &session,
+                    ArrayType::new_static(*data_type, [4]),
+                    source_mesh.clone(),
+                    Some(sum.clone()),
+                    devices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, device)| (device.id(), Arc::<[u8]>::from(contributions[index / 2].as_slice()))),
+                )
+                .unwrap();
+                assert_eq!(&source.copy_to_host_bytes().unwrap(), value, "{data_type}");
+                let strategy = source
+                    .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
+                    .unwrap();
+                assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{data_type} {axis}");
+                // The device at `(x, s)` holds the half `s` of the contribution at `x`.
+                let halves = |x: usize| contributions[x].chunks(contributions[x].len() / 2).map(<[u8]>::to_vec);
+                let expected = halves(0).chain(halves(1)).collect::<Vec<_>>();
+                let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
+                for placed in place_through_entry_points(&session, &source, target) {
+                    let placed = placed.unwrap();
+                    assert_eq!(device_bytes(&placed), expected, "{data_type} along {axis}");
+                    assert_eq!(&placed.copy_to_host_bytes().unwrap(), value, "{data_type} along {axis}");
+                }
+            }
+        }
+        // A sparse source that holds only the replicas at `y = 1` of each contribution moves on the same mesh as on
+        // any other, by regions, which keep each contribution as it is.
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let split_y = Sharding::new(source_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["y"])]);
+        let split_y = split_y.unwrap().with_unreduced_axes(["x"]).unwrap();
+        for (data_type, contribution, value) in [(DataType::U8, 3u8, 6u8), (DataType::F8E8M0FNU, 0x7f, 0x80)] {
+            let buffers = [1, 3]
+                .into_iter()
+                .map(|index| {
+                    let buffer_type = data_type.executable_buffer_type();
+                    let device = pjrt_devices[index].clone();
+                    client.buffer(&[contribution; 2], buffer_type, [2], None, device, None).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let r#type = ArrayType::new_static(data_type, [2]);
+            let source =
+                Array::from_addressable_buffers(&session, r#type, source_mesh.clone(), Some(sum.clone()), buffers);
+            let source = source.unwrap();
+            let target = Placement::new(source_mesh.clone(), split_y.clone()).unwrap();
+            let borrowed = source.to_placement(&session, target.clone());
+            for placed in [borrowed, source.clone().into_placement(&session, target)] {
+                let placed = placed.unwrap();
+                assert_eq!(device_bytes(&placed), vec![vec![contribution]; 4], "{data_type}");
+                assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![value; 2], "{data_type}");
+            }
+        }
+
+        // A vector of two elements split along `x` and varying along the manual axis `m` holds four distinct values,
+        // which a placement that splits it along `m` instead cannot represent, so the placement is rejected rather than
+        // keep only some of those values.
+        let manual = MeshAxisType::Manual;
+        let manual_mesh = mesh(&[("x", 2, explicit), ("m", 2, manual)]);
+        let along = |axis: &str| {
+            let sharding = Sharding::along(manual_mesh.logical_mesh().clone(), axis, Some(0), 1).unwrap();
+            sharding.with_varying_manual_axes(["m"]).unwrap()
+        };
+        let source = Array::from_host_shards(
+            &session,
+            ArrayType::new_static(DataType::U8, [2]),
+            manual_mesh.clone(),
+            Some(along("x")),
+            devices
+                .iter()
+                .zip([10u8, 11, 20, 21])
+                .map(|(device, value)| (device.id(), Arc::<[u8]>::from([value]))),
+        )
+        .unwrap();
+        let target = Placement::new(manual_mesh.clone(), along("m")).unwrap();
+        for placed in [source.to_placement(&session, target.clone()), source.clone().into_placement(&session, target)] {
+            assert_eq!(
+                placed.unwrap_err().to_string(),
+                "cannot place an array that varies along the manual mesh axes `m` onto this sharding, because the \
+                 placement would discard values that differ along those axes",
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_place_within_client_moves_pending_contributions_in_declared_layouts() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let mesh = |axes: &[(&str, usize)]| {
+            let axes = axes.iter().map(|(name, size)| MeshAxis::new(*name, *size, MeshAxisType::Explicit).unwrap());
+            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices.clone()).unwrap()
+        };
+        let source_mesh = mesh(&[("x", 2), ("y", 2)]);
+        let sum = Sharding::replicated(source_mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let device_bytes = |array: &Array| {
+            devices
+                .iter()
+                .map(|device| array.device_shard(device.id()).unwrap().copy_to_host_bytes().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // A column-major `[rows, 2]` matrix with a pending sum along `x`, whose devices at `x = 0` hold the first
+        // contribution and those at `x = 1` the second one, keeps that sum and splits its rows along a second axis, on
+        // the same mesh, onto a mesh with an unused axis of size one, and onto a mesh with that axis renamed. Each
+        // process converts the shards that its moves read to the dense row-major layout on their devices and moves the
+        // regions of each contribution, from a dense source and from a sparse one that holds only the replicas at
+        // `y = 1`, for an uneven split of three rows and an even one of four, which a compiled reshard cannot make.
+        // Every contribution keeps its value (e.g., the `u8` contributions `3` and `5` of three rows stay apart rather
+        // than read back as `8` and `0`), and `f8e8m0fnu`, which has no additive identity, moves as well.
+        let targets = [
+            (mesh(&[("x", 2), ("y", 2)]), "y"),
+            (mesh(&[("x", 2), ("y", 2), ("unit", 1)]), "y"),
+            (mesh(&[("x", 2), ("z", 2)]), "z"),
+        ];
+        // The elements of the contribution at `x` of `rows` rows, in row-major order, and the value of both.
+        let u8_contribution = |x: usize, rows: usize| {
+            (0..rows * 2)
+                .map(|index| [3u8, 5][x] + 10 * (index / 2) as u8 + (index % 2) as u8)
+                .collect::<Vec<_>>()
+        };
+        let u8_value = |rows: usize| {
+            u8_contribution(0, rows)
+                .iter()
+                .zip(u8_contribution(1, rows))
+                .map(|(a, b)| a + b)
+                .collect::<Vec<_>>()
+        };
+        let f8_contribution = |_: usize, rows: usize| vec![0x7fu8; rows * 2];
+        let f8_value = |rows: usize| vec![0x80u8; rows * 2];
+        // The device at `(x, s)` holds the rows of part `s` of the contribution at `x`.
+        let parts = |contribution: &dyn Fn(usize, usize) -> Vec<u8>, rows: usize| {
+            let upper = rows.div_ceil(2);
+            (0..4)
+                .map(|index| {
+                    let range = if index % 2 == 0 { 0..upper * 2 } else { upper * 2..rows * 2 };
+                    contribution(index / 2, rows)[range].to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        type Elements<'a> = &'a dyn Fn(usize, usize) -> Vec<u8>;
+        let cases: [(DataType, Elements<'_>, &dyn Fn(usize) -> Vec<u8>); 2] =
+            [(DataType::U8, &u8_contribution, &u8_value), (DataType::F8E8M0FNU, &f8_contribution, &f8_value)];
+        for rows in [3, 4] {
+            for &(data_type, contribution, value) in &cases {
+                let value = value(rows);
+                for sparse in [false, true] {
+                    let device_layout = column_major.to_pjrt().unwrap();
+                    let buffers = pjrt_devices
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !sparse || index % 2 == 1)
+                        .map(|(index, device)| {
+                            let bytes = contribution(index / 2, rows);
+                            let buffer_type = data_type.executable_buffer_type();
+                            let (device, layout) = (device.clone(), Some(device_layout.clone()));
+                            let dimensions = [rows as u64, 2];
+                            client.buffer(bytes.as_slice(), buffer_type, dimensions, None, device, layout).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let r#type = ArrayType::new_static(data_type, [rows, 2]).with_layout(Some(column_major.clone()));
+                    let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
+                    let source = Array::from_addressable_buffers(&session, r#type, mesh, sharding, buffers).unwrap();
+                    assert_eq!(source.copy_to_host_bytes().unwrap(), value, "{data_type} {rows} {sparse}");
+                    for (target_mesh, axis) in &targets {
+                        let split = vec![ShardingDimension::sharded([*axis]), ShardingDimension::replicated()];
+                        let split = Sharding::new(target_mesh.logical_mesh().clone(), split).unwrap();
+                        let split = split.with_unreduced_axes(["x"]).unwrap();
+                        let context = format!("{data_type} with {rows} rows along {axis} (sparse: {sparse})");
+                        let strategy = source
+                            .device_placement_strategy(&cross_host_layout_resolver(client), target_mesh, &split, 0)
+                            .unwrap();
+                        assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{context}");
+                        let target = Placement::new(target_mesh.clone(), split.clone()).unwrap();
+                        for placed in place_through_entry_points(&session, &source, target) {
+                            let placed = placed.unwrap();
+                            assert_eq!(placed.layout(), Some(&column_major), "{context}");
+                            assert_eq!(device_bytes(&placed), parts(contribution, rows), "{context}");
+                            assert_eq!(placed.copy_to_host_bytes().unwrap(), value, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // The same `u8` source in pinned host memory converts its shards into device memory, where the CPU plugin can
+        // hold the dense row-major layout, and the result takes the requested memory and the column-major layout.
+        let pinned = Memory::Host { pinned: true };
+        let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
+        let split = Sharding::new(source_mesh.logical_mesh().clone(), split).unwrap().with_unreduced_axes(["x"]);
+        let split = split.unwrap();
+        for rows in [3, 4] {
+            let source = Array::from_host_shards(
+                &session,
+                ArrayType::new_static(DataType::U8, [rows, 2]),
+                source_mesh.clone(),
+                Some(sum.clone()),
+                devices.iter().enumerate().map(|(index, device)| {
+                    (device.id(), Arc::<[u8]>::from(u8_contribution(index / 2, rows).as_slice()))
+                }),
+            )
+            .unwrap();
+            let target = Placement::new(source_mesh.clone(), sum.clone()).unwrap();
+            let target = target.with_memory(pinned).with_layout(column_major.clone());
+            let source = source.to_placement(&session, target).unwrap();
+            assert_eq!((source.r#type().memory(), source.layout()), (pinned, Some(&column_major)));
+            let strategy = source
+                .device_placement_strategy(&cross_host_layout_resolver(client), &source_mesh, &split, 0)
+                .unwrap();
+            assert!(matches!(strategy, DevicePlacementStrategy::ShardRegions { .. }), "{rows}");
+            for memory in [pinned, Memory::Device] {
+                let target = Placement::new(source_mesh.clone(), split.clone()).unwrap().with_memory(memory);
+                for placed in place_through_entry_points(&session, &source, target) {
+                    let placed = placed.unwrap();
+                    let context = format!("{rows} rows into {memory:?}");
+                    assert_eq!((placed.r#type().memory(), placed.layout()), (memory, Some(&column_major)), "{context}");
+                    assert_eq!(device_bytes(&placed), parts(&u8_contribution, rows), "{context}");
+                    assert_eq!(placed.copy_to_host_bytes().unwrap(), u8_value(rows), "{context}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_place_within_client_moves_column_major_contributions_across_processes_as_shard_regions() {
+        // A column-major `u8[2, 2]` with a pending sum along `x` moves its contributions as regions onto a mesh that
+        // pairs each local device with a remote one, so process 0 sends regions of its contribution, receives regions
+        // of the other one, and copies regions between its own devices. Both processes plan the same transfers, and
+        // process 0, which converts the shards that its sends read to the dense row-major layout first, reaches its
+        // transfers, which fail here with the missing cross-host transfers extension of the CPU plugin.
+        let (session, target_mesh) = two_process_mesh_2x2();
+        let client = session.client();
+        let pjrt_devices = client.addressable_devices().unwrap();
+        let logical_mesh = target_mesh.logical_mesh().clone();
+        let devices = target_mesh.devices();
+        let source_mesh = DeviceMesh::new(logical_mesh.clone(), vec![devices[0], devices[2], devices[1], devices[3]]);
+        let source_mesh = source_mesh.unwrap();
+        let sum = Sharding::replicated(logical_mesh.clone(), 2).with_unreduced_axes(["x"]).unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let r#type = ArrayType::new_static(DataType::U8, [2, 2]).with_layout(Some(column_major.clone()));
+        let buffers = pjrt_devices
+            .iter()
+            .map(|device| {
+                let layout = Some(column_major.to_pjrt().unwrap());
+                client.buffer([1u8, 2, 3, 4].as_slice(), BufferType::U8, [2u64, 2], None, device.clone(), layout)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let (mesh, sharding) = (source_mesh.clone(), Some(sum.clone()));
+        let own = Array::from_addressable_buffers(&session, r#type.clone(), mesh, sharding.clone(), buffers).unwrap();
+        let peer = Array::from_addressable_buffers(&session, r#type, source_mesh, sharding, Vec::new()).unwrap();
+        let split = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
+        let split = Sharding::new(logical_mesh, split).unwrap().with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(placement_agreement(&[own, peer], &target_mesh, &split), Ok("shard regions".to_string()));
+    }
+
+    #[test]
+    fn test_array_place_within_client_creates_empty_exact_shards_on_every_process() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let on = |axis: &str, devices: Vec<Device>| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, 2, MeshAxisType::Explicit).unwrap()]);
+            DeviceMesh::new(logical_mesh.unwrap(), devices).unwrap()
+        };
+        let split = |mesh: &DeviceMesh| {
+            let axis = mesh.logical_mesh().axes()[0].name().to_string();
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded([axis])]).unwrap()
+        };
+
+        // The `u8[1]` split over two devices has an empty slice on the second device, which this import holds no
+        // buffer for. A renamed axis keeps every slice where it is, and each process creates its own empty shards
+        // rather than requiring a buffer to move, through every entry point.
+        let original = on("x", devices.clone());
+        let renamed = on("y", devices.clone());
+        let client_devices = client.addressable_devices().unwrap();
+        let buffer = client.buffer([42u8].as_slice(), BufferType::U8, [1u64], None, client_devices[0].clone(), None);
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let sharding = Some(split(&original));
+        let source =
+            Array::from_addressable_buffers(&session, r#type.clone(), original, sharding, vec![buffer.unwrap()]);
+        let source = source.unwrap();
+        assert!(source.device_shard(devices[1].id()).unwrap().buffer().is_none());
+        let target = Placement::new(renamed.clone(), split(&renamed)).unwrap();
+        for placed in place_through_entry_points(&session, &source, target) {
+            let placed = placed.unwrap();
+            let bytes = placed.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>();
+            assert_eq!(bytes, [vec![42], vec![]]);
+            assert_eq!(placed.block_until_ready().map_err(|error| error.to_string()), Ok(()));
+            assert_eq!(placed.copy_to_host_bytes().unwrap(), [42]);
+        }
+
+        // Across processes, the empty slice moves nowhere, so neither process waits for a transfer of it, and only the
+        // slice with elements crosses from process 0 to process 1.
+        let remote = Device::new(devices.iter().map(Device::id).max().unwrap() + 1, 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let both = on("x", vec![devices[0], remote]);
+        let reversed = on("x", vec![remote, devices[0]]);
+        let view = Array::from_addressable_buffers(&session, r#type, both.clone(), Some(split(&both)), Vec::new());
+        let strategy =
+            view.unwrap()
+                .device_placement_strategy(&simulated_cross_host_layout, &reversed, &split(&reversed), 0);
+        let Ok(DevicePlacementStrategy::ExactShards { plan, .. }) = strategy else {
+            panic!("the slices of the split must move as whole shards");
+        };
+        let moves = plan
+            .moves
+            .iter()
+            .map(|movement| (movement.source_device, movement.target_device, movement.slice.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(moves, [(devices[0], remote, vec![0..1])]);
+    }
+
+    #[test]
+    fn test_array_place_within_client_preserves_value_across_reduction_state_changes() {
+        // Placements that complete, introduce, keep, or change the kind of a pending reduction along the axis `x` of a
+        // 2x2 mesh, for a data type of every class of `validate_reduction_transition`, compared with the host readback
+        // of their source, which defines the value (refer to `crate::arrays::host`). The contributions along `x` are
+        // every pair of some elements of each data type (e.g., negative zeros, NaN values, infinities, and extreme
+        // integers, but no subnormal `f32` values, which the CPU plugin flushes in any addition). Each row lists, per
+        // placement, the programs that `to_placement` and `into_placement` compile in sessions of their own, which is
+        // `+0` for a host round trip, and asserts that both read back the value of their source bit for bit, where
+        // every NaN encoding of a format counts as one value, or lists their common error. A sum of floating point or
+        // complex values that the devices complete is compared as the contract of such sums states (refer to
+        // `crate::arrays::host`), so a negative zero also matches a positive one there, and the end of this test pins
+        // that difference. A sum that a placement introduces is compared bit for bit for every data type with an
+        // additive identity (e.g., `f32` and `c64` negative zeros and `f6e2m3fn` values), which it writes without a
+        // compiled program. The axis type does not change the outcome, so both axis types must give the same row.
+        let client = cpu_client(4);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let f32_elements = [0f32, -0., 1., -1., f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1e-3, 3., f32::MAX];
+        let c64_elements = [(0f32, 0f32), (-0., -0.), (1., -1.), (f32::NAN, 0.), (f32::INFINITY, 1.), (-1., 2.)];
+        let elements = |data_type: DataType| -> Vec<Vec<u8>> {
+            let bytes = |values: &[u8]| values.iter().map(|value| vec![*value]).collect();
+            match data_type {
+                DataType::Boolean | DataType::U1 | DataType::I1 => bytes(&[0, 1]),
+                DataType::U2 => bytes(&[0, 1, 2, 3]),
+                DataType::I4 => bytes(&(0..16).collect::<Vec<_>>()),
+                DataType::U8 => bytes(&[0, 1, 127, 128, 254, 255]),
+                DataType::I32 => {
+                    [0i32, 1, -1, i32::MAX, i32::MIN, 2].map(|value| value.to_ne_bytes().to_vec()).to_vec()
+                }
+                DataType::F32 => f32_elements.map(|value| value.to_ne_bytes().to_vec()).to_vec(),
+                DataType::F8E5M2 => bytes(&[0x00, 0x80, 0x3c, 0xbc, 0x7c, 0xfc, 0x7e, 0x01, 0x7b, 0xfb]),
+                DataType::F8E4M3FNUZ => bytes(&[0x00, 0x80, 0x01, 0x40, 0xc0, 0x7f, 0xff, 0x38]),
+                DataType::F6E2M3FN => bytes(&[0x00, 0x20, 0x01, 0x08, 0x2a, 0x1f, 0x3f, 0x10]),
+                DataType::F8E8M0FNU => bytes(&[0, 1, 42, 127, 128, 255]),
+                DataType::C64 => c64_elements
+                    .map(|(real, imaginary)| [real.to_ne_bytes(), imaginary.to_ne_bytes()].concat())
+                    .to_vec(),
+                _ => unreachable!(),
+            }
+        };
+        // Replaces every NaN encoding of a format with one marker, so that NaN payloads do not count, and with
+        // `signless_zero`, also a negative zero with a positive one.
+        let canonical = |data_type: DataType, element: &[u8], signless_zero: bool| -> Vec<u8> {
+            let f32_value = |value: f32| match value {
+                value if value.is_nan() => vec![0xff; 5],
+                value if signless_zero && value == 0. => 0f32.to_ne_bytes().to_vec(),
+                value => value.to_ne_bytes().to_vec(),
+            };
+            match data_type {
+                DataType::F32 => f32_value(f32::from_ne_bytes(element.try_into().unwrap())),
+                DataType::C64 => element
+                    .chunks(4)
+                    .flat_map(|bytes| f32_value(f32::from_ne_bytes(bytes.try_into().unwrap())))
+                    .collect(),
+                DataType::F8E5M2 if element[0] & 0x7c == 0x7c && element[0] & 0x03 != 0 => vec![0xff; 2],
+                DataType::F8E5M2 if signless_zero && element[0] == 0x80 => vec![0x00],
+                DataType::F8E4M3FNUZ if element[0] == 0x80 => vec![0xff; 2],
+                DataType::F8E8M0FNU if element[0] == 0xff => vec![0xff; 2],
+                _ => element.to_vec(),
+            }
+        };
+        let data_types = [
+            DataType::Boolean,
+            DataType::U1,
+            DataType::I1,
+            DataType::U2,
+            DataType::I4,
+            DataType::U8,
+            DataType::I32,
+            DataType::F32,
+            DataType::F8E5M2,
+            DataType::F8E4M3FNUZ,
+            DataType::F6E2M3FN,
+            DataType::F8E8M0FNU,
+            DataType::C64,
+        ];
+        let mut rows = Vec::new();
+        for data_type in data_types {
+            let elements = elements(data_type);
+            let count = elements.len() * elements.len();
+            let element_size = elements[0].len();
+            // The devices at `x = 0` hold the first element of each pair and the devices at `x = 1` the second one.
+            let first = (0..count).flat_map(|index| elements[index / elements.len()].clone()).collect::<Vec<_>>();
+            let second = (0..count).flat_map(|index| elements[index % elements.len()].clone()).collect::<Vec<_>>();
+            let mut outcomes_by_axis_type = Vec::new();
+            for axis_type in [MeshAxisType::Auto, MeshAxisType::Explicit] {
+                let logical_mesh = LogicalMesh::new(vec![
+                    MeshAxis::new("x", 2, axis_type).unwrap(),
+                    MeshAxis::new("y", 2, axis_type).unwrap(),
+                ])
+                .unwrap();
+                let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+                let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+                let split_y = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+                let pending = |sharding: &Sharding, kind: UnreducedKind| {
+                    sharding.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap()
+                };
+                let placements = [
+                    ("sum -> none", Some(UnreducedKind::Sum), replicated.clone()),
+                    ("max -> none", Some(UnreducedKind::Max), replicated.clone()),
+                    ("min -> none", Some(UnreducedKind::Min), replicated.clone()),
+                    ("none -> sum", None, pending(&replicated, UnreducedKind::Sum)),
+                    ("none -> max", None, pending(&replicated, UnreducedKind::Max)),
+                    ("max -> sum", Some(UnreducedKind::Max), pending(&replicated, UnreducedKind::Sum)),
+                    ("sum -> sum split", Some(UnreducedKind::Sum), pending(&split_y, UnreducedKind::Sum)),
+                    ("max -> max split", Some(UnreducedKind::Max), pending(&split_y, UnreducedKind::Max)),
+                ];
+                let mut outcomes = Vec::new();
+                for (name, source_kind, target_sharding) in placements {
+                    let mut results = Vec::new();
+                    for consume in [false, true] {
+                        let session = Session::builder().client(client).build().unwrap();
+                        let r#type = ArrayType::new_static(data_type, [count]);
+                        let source = match source_kind {
+                            Some(kind) => {
+                                let contributions = devices
+                                    .iter()
+                                    .zip([&first, &first, &second, &second])
+                                    .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(bytes.as_slice())));
+                                let sharding = Some(pending(&replicated, kind));
+                                Array::from_host_shards(&session, r#type, mesh.clone(), sharding, contributions)
+                            }
+                            None => Array::from_host_buffer(&session, r#type, mesh.clone(), None, &first),
+                        }
+                        .unwrap();
+                        let expected = source.copy_to_host_bytes().unwrap();
+                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
+                        let placed = if consume {
+                            source.into_placement(&session, target)
+                        } else {
+                            source.to_placement(&session, target)
+                        };
+                        let programs = session.cached_program_count();
+                        // A sum that the devices complete follows the contract of floating point sums, and one that
+                        // they introduce is exact.
+                        let sum_contract = programs > 0 && name == "sum -> none";
+                        results.push(placed.and_then(|placed| {
+                            assert_eq!(placed.sharding(), &target_sharding, "{data_type} {name}");
+                            let actual = placed.copy_to_host_bytes()?;
+                            let differing = expected
+                                .chunks(element_size)
+                                .zip(actual.chunks(element_size))
+                                .filter(|(expected, actual)| {
+                                    canonical(data_type, expected, sum_contract)
+                                        != canonical(data_type, actual, sum_contract)
+                                })
+                                .count();
+                            assert_eq!(differing, 0, "{axis_type:?} {data_type} {name}: {expected:?} != {actual:?}");
+                            Ok(programs)
+                        }));
+                    }
+                    let outcome = match results.as_slice() {
+                        [Ok(borrowed), Ok(consumed)] => format!("+{borrowed} +{consumed}"),
+                        [Err(borrowed), Err(consumed)] if borrowed.to_string() == consumed.to_string() => {
+                            format!("error: {borrowed}")
+                        }
+                        results => panic!("{data_type} {name}: the entry points disagree: {results:?}"),
+                    };
+                    outcomes.push(format!("{data_type} {name}: {outcome}"));
+                }
+                outcomes_by_axis_type.push(outcomes);
+            }
+            assert_eq!(outcomes_by_axis_type[0], outcomes_by_axis_type[1], "{data_type}");
+            rows.extend(outcomes_by_axis_type.swap_remove(0));
+        }
+        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
+                                unreduced axes";
+        assert_eq!(
+            rows.join("\n"),
+            formatdoc! {"
+                bool sum -> none: +1 +1
+                bool max -> none: +1 +1
+                bool min -> none: +1 +1
+                bool none -> sum: +0 +0
+                bool none -> max: +0 +0
+                bool max -> sum: +1 +1
+                bool sum -> sum split: +4 +4
+                bool max -> max split: +4 +4
+                u1 sum -> none: +0 +0
+                u1 max -> none: +1 +1
+                u1 min -> none: +1 +1
+                u1 none -> sum: +0 +0
+                u1 none -> max: +0 +0
+                u1 max -> sum: +1 +1
+                u1 sum -> sum split: +4 +4
+                u1 max -> max split: +4 +4
+                i1 sum -> none: +0 +0
+                i1 max -> none: +0 +0
+                i1 min -> none: +0 +0
+                i1 none -> sum: +0 +0
+                i1 none -> max: +0 +0
+                i1 max -> sum: +0 +0
+                i1 sum -> sum split: +4 +4
+                i1 max -> max split: +4 +4
+                u2 sum -> none: +0 +0
+                u2 max -> none: +0 +0
+                u2 min -> none: +0 +0
+                u2 none -> sum: +0 +0
+                u2 none -> max: +0 +0
+                u2 max -> sum: +0 +0
+                u2 sum -> sum split: +4 +4
+                u2 max -> max split: +4 +4
+                i4 sum -> none: +1 +1
+                i4 max -> none: +1 +1
+                i4 min -> none: +1 +1
+                i4 none -> sum: +0 +0
+                i4 none -> max: +0 +0
+                i4 max -> sum: +1 +1
+                i4 sum -> sum split: +4 +4
+                i4 max -> max split: +4 +4
+                u8 sum -> none: +1 +1
+                u8 max -> none: +1 +1
+                u8 min -> none: +1 +1
+                u8 none -> sum: +0 +0
+                u8 none -> max: +0 +0
+                u8 max -> sum: +1 +1
+                u8 sum -> sum split: +4 +4
+                u8 max -> max split: +4 +4
+                i32 sum -> none: +1 +1
+                i32 max -> none: +1 +1
+                i32 min -> none: +1 +1
+                i32 none -> sum: +0 +0
+                i32 none -> max: +0 +0
+                i32 max -> sum: +1 +1
+                i32 sum -> sum split: +4 +4
+                i32 max -> max split: +4 +4
+                f32 sum -> none: +1 +1
+                f32 max -> none: +0 +0
+                f32 min -> none: +0 +0
+                f32 none -> sum: +0 +0
+                f32 none -> max: +0 +0
+                f32 max -> sum: +0 +0
+                f32 sum -> sum split: +4 +4
+                f32 max -> max split: +4 +4
+                f8e5m2 sum -> none: +1 +1
+                f8e5m2 max -> none: +0 +0
+                f8e5m2 min -> none: +0 +0
+                f8e5m2 none -> sum: +0 +0
+                f8e5m2 none -> max: +0 +0
+                f8e5m2 max -> sum: +0 +0
+                f8e5m2 sum -> sum split: +4 +4
+                f8e5m2 max -> max split: +4 +4
+                f8e4m3fnuz sum -> none: +1 +1
+                f8e4m3fnuz max -> none: +0 +0
+                f8e4m3fnuz min -> none: +0 +0
+                f8e4m3fnuz none -> sum: +0 +0
+                f8e4m3fnuz none -> max: +0 +0
+                f8e4m3fnuz max -> sum: +0 +0
+                f8e4m3fnuz sum -> sum split: +4 +4
+                f8e4m3fnuz max -> max split: +4 +4
+                f6e2m3fn sum -> none: +0 +0
+                f6e2m3fn max -> none: +0 +0
+                f6e2m3fn min -> none: +0 +0
+                f6e2m3fn none -> sum: +0 +0
+                f6e2m3fn none -> max: +0 +0
+                f6e2m3fn max -> sum: +0 +0
+                f6e2m3fn sum -> sum split: +4 +4
+                f6e2m3fn max -> max split: +4 +4
+                f8e8m0fnu sum -> none: +0 +0
+                f8e8m0fnu max -> none: +0 +0
+                f8e8m0fnu min -> none: +0 +0
+                f8e8m0fnu none -> sum: error: {missing_identity}
+                f8e8m0fnu none -> max: +0 +0
+                f8e8m0fnu max -> sum: error: {missing_identity}
+                f8e8m0fnu sum -> sum split: +4 +4
+                f8e8m0fnu max -> max split: +4 +4
+                c64 sum -> none: +1 +1
+                c64 max -> none: +0 +0
+                c64 min -> none: +0 +0
+                c64 none -> sum: +0 +0
+                c64 none -> max: +0 +0
+                c64 max -> sum: +0 +0
+                c64 sum -> sum split: +4 +4
+                c64 max -> max split: +4 +4"},
+        );
+
+        // The two differences that the contract of floating point sums allows, pinned on the CPU plugin with the bit
+        // patterns of `f32` values. Completing a sum of two negative zeros on the devices gives positive zero, because
+        // the collective starts from positive zero, and the plugin flushes a subnormal sum to zero, as it does in every
+        // addition. Introducing a sum compiles nothing and writes negative zero, the additive identity, to the other
+        // device, so a negative zero reads back as it was.
+        let session = Session::builder().client(client).build().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices[..2].to_vec()).unwrap();
+        let replicated = Sharding::replicated(logical_mesh, 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [3]);
+        let bits = |array: &Array| {
+            let values = values_from_bytes::<f32>(&array.copy_to_host_bytes().unwrap());
+            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        };
+        let contributions = [[-0f32, 1e-45, 1.], [-0., 0., 2.]]
+            .iter()
+            .zip(&devices)
+            .map(|(values, device)| (device.id(), Arc::<[u8]>::from(values_to_bytes(values))))
+            .collect::<Vec<_>>();
+        let sharding = Some(unreduced.clone());
+        let summands =
+            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, contributions).unwrap();
+        let target = Placement::new(mesh.clone(), replicated.clone()).unwrap();
+        let completed = summands.to_placement(&session, target).unwrap();
+        let bytes = values_to_bytes(&[-0f32, 1e-45, 1.]);
+        let value = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated), bytes).unwrap();
+        let introduced = value.to_placement(&session, Placement::new(mesh, unreduced).unwrap()).unwrap();
+        assert_eq!(session.cached_program_count(), 1);
+        assert_eq!(
+            [bits(&summands), bits(&completed), bits(&value), bits(&introduced)],
+            [
+                vec![0x8000_0000, 1, 0x4040_0000],
+                vec![0, 0, 0x4040_0000],
+                vec![0x8000_0000, 1, 0x3f80_0000],
+                vec![0x8000_0000, 1, 0x3f80_0000],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_place_within_client_keeps_pending_axes_that_both_meshes_share() {
+        // A placement that changes part of the reduction state keeps every pending axis that both ends have with the
+        // same name, size, and kind, whatever the other axes of either mesh, and completes or introduces only the
+        // others (refer to `kept_unreduced_axes`). Each placement goes from its source mesh to the same mesh, to the
+        // same devices with an unused axis `u` of size one, and to the same devices in reverse order, through both
+        // entry points, which must agree, and the three targets must give the same row, which lists the elements
+        // of every target shard in mesh order and the readback, which must equal that of the source. Minimum
+        // subnormal `f32` contributions along `x` with a sum introduced along `y` stay as they are (a completion would
+        // flush them on the CPU plugin). Integer contributions along `x` and `y` of which only `y` completes keep `7`
+        // and `11` along `x`. The contributions of `f8e8m0fnu`, which has no additive identity, take a sum introduced
+        // along an axis `y` of size one, which writes no identity, but not along one of size two.
+        let client = cpu_client(4);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let mesh = |axes: &[(&str, usize)], devices: Vec<Device>| {
+            let axes = axes.iter().map(|&(name, size)| MeshAxis::new(name, size, MeshAxisType::Auto).unwrap());
+            DeviceMesh::new(LogicalMesh::new(axes.collect()).unwrap(), devices).unwrap()
+        };
+        let pending = |mesh: &DeviceMesh, axes: &[&str]| {
+            Sharding::replicated(mesh.logical_mesh().clone(), 1)
+                .with_unreduced_axes(axes.iter().copied())
+                .unwrap()
+        };
+        let render = |data_type: DataType, bytes: &[u8]| match data_type {
+            DataType::F32 => format!("{:#010x}", u32::from_ne_bytes(bytes.try_into().unwrap())),
+            DataType::I32 => i32::from_ne_bytes(bytes.try_into().unwrap()).to_string(),
+            _ => format!("{:#04x}", bytes[0]),
+        };
+        let f32_bits = |bits: u32| bits.to_ne_bytes().to_vec();
+        let i32_bytes = |value: i32| value.to_ne_bytes().to_vec();
+        let (size_one, size_two) = (vec![("x", 2), ("y", 1)], vec![("x", 2), ("y", 2)]);
+        // Each case is its name, data type, source mesh axes, source and target unreduced axes, and the bytes of
+        // the contributions of the devices of the source mesh in mesh order.
+        let (x, x_y) = (vec!["x"], vec!["x", "y"]);
+        let cases = [
+            ("f32 sum(x) -> sum(x, y)", DataType::F32, &size_two, &x, &x_y, vec![f32_bits(1); 4]),
+            ("i32 sum(x, y) -> sum(x)", DataType::I32, &size_two, &x_y, &x, [3, 4, 5, 6].map(i32_bytes).to_vec()),
+            ("f8e8m0fnu sum(x) -> sum(x, y=1)", DataType::F8E8M0FNU, &size_one, &x, &x_y, vec![vec![0x7f]; 2]),
+            ("f8e8m0fnu sum(x) -> sum(x, y=2)", DataType::F8E8M0FNU, &size_two, &x, &x_y, vec![vec![0x7f]; 4]),
+        ];
+        let mut rows = Vec::new();
+        for (name, data_type, axes, source_axes, target_axes, contributions) in cases {
+            let devices = devices[..contributions.len()].to_vec();
+            let source_mesh = mesh(axes, devices.clone());
+            let with_unused = axes.iter().copied().chain([("u", 1)]).collect::<Vec<_>>();
+            let targets = [
+                ("the same mesh", source_mesh.clone()),
+                ("an unused axis", mesh(&with_unused, devices.clone())),
+                ("reversed devices", mesh(axes, devices.iter().rev().copied().collect())),
+            ];
+            let mut rows_by_target = Vec::new();
+            for (target_name, target_mesh) in targets {
+                let target_sharding = pending(&target_mesh, target_axes);
+                let mut results = Vec::new();
+                for consume in [false, true] {
+                    let session = Session::builder().client(client).build().unwrap();
+                    let shards = devices
+                        .iter()
+                        .zip(&contributions)
+                        .map(|(device, bytes)| (device.id(), Arc::<[u8]>::from(bytes.as_slice())));
+                    let r#type = ArrayType::new_static(data_type, [1]);
+                    let sharding = Some(pending(&source_mesh, source_axes));
+                    let source =
+                        Array::from_host_shards(&session, r#type, source_mesh.clone(), sharding, shards).unwrap();
+                    let expected = source.copy_to_host_bytes().unwrap();
+                    let target = Placement::new(target_mesh.clone(), target_sharding.clone()).unwrap();
+                    let placed = if consume {
+                        source.into_placement(&session, target)
+                    } else {
+                        source.to_placement(&session, target)
+                    };
+                    results.push(match placed {
+                        Ok(placed) => {
+                            assert_eq!(placed.sharding(), &target_sharding, "{name} onto {target_name}");
+                            let readback = placed.copy_to_host_bytes().unwrap();
+                            assert_eq!(readback, expected, "{name} onto {target_name}");
+                            let shards = placed
+                                .shards()
+                                .iter()
+                                .map(|shard| render(data_type, &shard.copy_to_host_bytes().unwrap()))
+                                .collect::<Vec<_>>();
+                            format!("{} = {}", shards.join(" "), render(data_type, &readback))
+                        }
+                        Err(error) => format!("error: {error}"),
+                    });
+                }
+                assert_eq!(results[0], results[1], "{name} onto {target_name}");
+                rows_by_target.push(results.swap_remove(0));
+            }
+            assert_eq!(rows_by_target[1..], [rows_by_target[0].clone(), rows_by_target[0].clone()]);
+            rows.push(format!("{name}: {}", rows_by_target[0]));
+        }
+        let missing_identity = "type `f8e8m0fnu` has no additive identity to split a value into summands along \
+                                unreduced axes";
+        assert_eq!(
+            rows.join("\n"),
+            formatdoc! {"
+                f32 sum(x) -> sum(x, y): 0x00000001 0x80000000 0x00000001 0x80000000 = 0x00000002
+                i32 sum(x, y) -> sum(x): 7 7 11 11 = 18
+                f8e8m0fnu sum(x) -> sum(x, y=1): 0x7f 0x7f = 0x80
+                f8e8m0fnu sum(x) -> sum(x, y=2): error: {missing_identity}"},
+        );
+    }
+
+    #[test]
+    fn test_array_place_within_client_serves_missing_replicas_from_the_same_contribution() {
+        // Sources on a 2x2 mesh of four CPU devices imported with buffers for only some of their replicas (`held` lists
+        // the devices in mesh order), placed with `to_placement` and `into_placement`, which must agree, with the bytes
+        // that each device holds afterwards. A placement serves a missing replica only from a replica of the same
+        // contribution (`ShardContribution`), so each sparse import gives the bytes of the full one or an error:
+        //   - A scalar that varies along the manual axis `m` (`11` at `m = 0` and `22` at `m = 1`) and introduces a
+        //     pending sum along `x` from devices 0 and 3 keeps both values (`[11, 22, 0, 0]`), because each is served
+        //     only from a replica of its own contribution.
+        //   - A replicated `[7, 8]` held only on devices 1 and 3 that a placement splits along `x` while introducing
+        //     a pending sum along `y` serves the devices at `y = 0` from those replicas, also when they are missing.
+        //   - A vector split along `m` that varies along it varies only between tiles, so moving it to a mesh that
+        //     renames `x` moves whole shards from any replica of each tile.
+        //   - A scalar that varies within a tile keeps its variation on the renamed mesh, so that move only moves its
+        //     contributions, also as whole shards.
+        //   - A completion on a mesh with a manual axis has no device strategy and plans a host round trip that no
+        //     process owns (its value has no one host readback), so it is rejected alike for every import.
+        let client = cpu_client(4);
+        let devices = client.addressable_devices().unwrap();
+        let mesh_devices = devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = |names: [(&str, MeshAxisType); 2]| {
+            let axes = names.iter().map(|(name, r#type)| MeshAxis::new(*name, 2, *r#type).unwrap()).collect();
+            DeviceMesh::new(LogicalMesh::new(axes).unwrap(), mesh_devices.clone()).unwrap()
+        };
+        let manual = mesh([("x", MeshAxisType::Explicit), ("m", MeshAxisType::Manual)]);
+        let renamed = mesh([("z", MeshAxisType::Explicit), ("m", MeshAxisType::Manual)]);
+        let explicit = mesh([("x", MeshAxisType::Explicit), ("y", MeshAxisType::Explicit)]);
+        let scalar = ArrayType::scalar(DataType::U8);
+        let vector = ArrayType::new_static(DataType::U8, [2]);
+        let varying = |mesh: &DeviceMesh, rank| {
+            Sharding::replicated(mesh.logical_mesh().clone(), rank).with_varying_manual_axes(["m"]).unwrap()
+        };
+        let split = |mesh: &DeviceMesh, axis: &str| {
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded([axis])]).unwrap()
+        };
+        let varying_tiles = |mesh: &DeviceMesh| split(mesh, "m").with_varying_manual_axes(["m"]).unwrap();
+        // Each row has a source type, mesh, sharding, and the bytes of the device at each index, a target, and
+        // the sets of devices that hold buffers, the first of which holds all of them.
+        let rows = [
+            (
+                "varying along m -> sum along x",
+                (&scalar, &manual, varying(&manual, 0), [vec![11], vec![22], vec![11], vec![22]]),
+                (&manual, varying(&manual, 0).with_unreduced_axes(["x"]).unwrap()),
+                vec![vec![0, 1, 2, 3], vec![0, 3], vec![1, 2], vec![0]],
+            ),
+            (
+                "varying along m -> renamed mesh",
+                (&scalar, &manual, varying(&manual, 0), [vec![11], vec![22], vec![11], vec![22]]),
+                (&renamed, varying(&renamed, 0)),
+                vec![vec![0, 1, 2, 3], vec![0, 3]],
+            ),
+            (
+                "sum along x, varying along m -> completed",
+                (
+                    &scalar,
+                    &manual,
+                    varying(&manual, 0).with_unreduced_axes(["x"]).unwrap(),
+                    [vec![1], vec![2], vec![10], vec![20]],
+                ),
+                (&manual, varying(&manual, 0)),
+                vec![vec![0, 1, 2, 3], vec![0, 3]],
+            ),
+            (
+                "tiles varying along m -> renamed mesh",
+                (&vector, &manual, varying_tiles(&manual), [vec![7], vec![9], vec![7], vec![9]]),
+                (&renamed, varying_tiles(&renamed)),
+                vec![vec![0, 1, 2, 3], vec![2, 3], vec![0, 3]],
+            ),
+            (
+                "replicated -> split along x, sum along y",
+                (
+                    &vector,
+                    &explicit,
+                    Sharding::replicated(explicit.logical_mesh().clone(), 1),
+                    [vec![7, 8], vec![7, 8], vec![7, 8], vec![7, 8]],
+                ),
+                (&explicit, split(&explicit, "x").with_unreduced_axes(["y"]).unwrap()),
+                vec![vec![0, 1, 2, 3], vec![1, 3]],
+            ),
+        ];
+        let mut outcomes = Vec::new();
+        for (name, (r#type, source_mesh, source_sharding, bytes), (mesh, sharding), helds) in rows {
+            for held in helds {
+                let (mut results, mut strategy) = (Vec::new(), String::new());
+                for consume in [false, true] {
+                    let session = Session::builder().client(client).build().unwrap();
+                    let buffers = held
+                        .iter()
+                        .map(|&index| {
+                            let rank = r#type.static_shape().unwrap().rank();
+                            let dimensions = if rank == 0 { Vec::new() } else { vec![bytes[index].len() as u64] };
+                            let device = devices[index].clone();
+                            client.buffer(bytes[index].as_slice(), BufferType::U8, dimensions, None, device, None)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    let source = Array::from_addressable_buffers(
+                        &session,
+                        r#type.clone(),
+                        source_mesh.clone(),
+                        Some(source_sharding.clone()),
+                        buffers,
+                    )
+                    .unwrap();
+                    strategy = planned_work(&source, &simulated_cross_host_layout, 0, mesh, &sharding)
+                        .map_or_else(|_| "no device strategy".to_string(), |work| work.strategy);
+                    let target = Placement::new(mesh.clone(), sharding.clone()).unwrap();
+                    let placed = if consume {
+                        source.into_placement(&session, target)
+                    } else {
+                        source.to_placement(&session, target)
+                    };
+                    results.push(
+                        placed
+                            .and_then(|placed| {
+                                assert_eq!(placed.sharding(), &sharding, "{name}");
+                                placed
+                                    .shards()
+                                    .iter()
+                                    .map(ArrayShard::copy_to_host_bytes)
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                assert_eq!(results[0], results[1], "{name} held {held:?}: the entry points disagree");
+                let outcome = match &results[0] {
+                    Ok(bytes) => format!("{bytes:?}"),
+                    Err(error) => format!("error: {error}"),
+                };
+                outcomes.push(format!("{name} held {held:?}: {strategy}: {outcome}"));
+            }
+        }
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                varying along m -> sum along x held [0, 1, 2, 3]: additive identities: [[11], [22], [0], [0]]
+                varying along m -> sum along x held [0, 3]: additive identities: [[11], [22], [0], [0]]
+                varying along m -> sum along x held [1, 2]: additive identities: [[11], [22], [0], [0]]
+                varying along m -> sum along x held [0]: additive identities: error: array shard #1 on device 1 has no addressable buffer
+                varying along m -> renamed mesh held [0, 1, 2, 3]: exact shards: [[11], [22], [11], [22]]
+                varying along m -> renamed mesh held [0, 3]: exact shards: [[11], [22], [11], [22]]
+                sum along x, varying along m -> completed held [0, 1, 2, 3]: host round trip: error: compiled reshard does not support `Manual` mesh axis m
+                sum along x, varying along m -> completed held [0, 3]: host round trip: error: compiled reshard does not support `Manual` mesh axis m
+                tiles varying along m -> renamed mesh held [0, 1, 2, 3]: exact shards: [[7], [9], [7], [9]]
+                tiles varying along m -> renamed mesh held [2, 3]: exact shards: [[7], [9], [7], [9]]
+                tiles varying along m -> renamed mesh held [0, 3]: exact shards: [[7], [9], [7], [9]]
+                replicated -> split along x, sum along y held [0, 1, 2, 3]: compiled reshard with additive identities: [[7], [0], [8], [0]]
+                replicated -> split along x, sum along y held [1, 3]: compiled reshard with additive identities: [[7], [0], [8], [0]]"},
+        );
+    }
+
+    #[test]
+    fn test_array_place_within_client_preserves_value_across_partial_completions() {
+        // Transitions of pending sums along the axes `x` and `y` of a 2x2 mesh that complete some of them and keep or
+        // introduce others, with contributions whose partial sums overflow or round in the element type (element 0 sums
+        // along `y` first and element 1 along `x`), each placed with `to_placement` and `into_placement`, which must
+        // agree. Each row lists the strategy, the programs that each entry point compiles, and the host readbacks of
+        // the source and of the result, which are equal bit for bit for every data type but `f32`. A partial completion
+        // of a data type that accumulates its sums in a wider type cannot run on the devices, because partial sums in
+        // the element type would change the value (e.g., the `f8e4m3fn` contributions `448`, `448`, `-448`, and
+        // `-448`, which sum to zero, have the partial sums `896` and `-896`, which are NaN in `f8e4m3fn`, and the
+        // `bf16` contributions `256`, `1`, `-256`, and `1` have the partial sum `257`, which rounds to `256`). The
+        // host round trip that remains would combine the partial sums that the target keeps, so both entry points
+        // return the partial-contribution error, which the rows list as `error` and `errors` in
+        // full. A data type that accumulates its sums in itself keeps them on the devices: integers are exact, and an
+        // `f32` partial completion fixes the order of accumulation to its partial sums first, as the contract of
+        // floating point sums allows, so the `f32` contributions `2^24`, `1`, `-2^24`, and `1`, which read back as
+        // `1`, read back as `2` after completing `x`. Moving a pending sum from `x` to `y` only moves its contributions
+        // (refer to `moves_contributions`), so it takes exact shards without arithmetic.
+        let client = cpu_client(4);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let rows = [
+            (DataType::F8E4M3FN, [448f64, 448., -448., -448.]),
+            (DataType::BF16, [256., 1., -256., 1.]),
+            (DataType::F32, [16777216., 1., -16777216., 1.]),
+            (DataType::I32, [f64::from(i32::MAX), 1., f64::from(i32::MIN), -1.]),
+        ];
+        let (mut outcomes, mut errors) = (Vec::new(), Vec::new());
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
+            let logical_mesh = LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, axis_type).unwrap(),
+                MeshAxis::new("y", 2, axis_type).unwrap(),
+            ])
+            .unwrap();
+            let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+            let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+            let split_x = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let pending = |sharding: &Sharding, axes: &[&str]| {
+                sharding.clone().with_unreduced_axes(axes.iter().copied()).unwrap()
+            };
+            let transitions = [
+                ("sum(x, y) -> sum(x)", &["x", "y"][..], pending(&replicated, &["x"])),
+                ("sum(x, y) -> sum(y)", &["x", "y"][..], pending(&replicated, &["y"])),
+                ("sum(x, y) -> none", &["x", "y"][..], replicated.clone()),
+                ("sum(x, y) -> sum(y) split along x", &["x", "y"][..], pending(&split_x, &["y"])),
+                ("sum(x) -> none", &["x"][..], replicated.clone()),
+                ("sum(x) -> sum(y)", &["x"][..], pending(&replicated, &["y"])),
+                ("sum(x) -> sum(x, y)", &["x"][..], pending(&replicated, &["x", "y"])),
+            ];
+            for (data_type, values) in rows {
+                let r#type = ArrayType::new_static(data_type, [2]);
+                let encode = |value: f64| {
+                    CoreArray::scalar(value).unwrap().convert_element_type(data_type).unwrap().logical_bytes()
+                };
+                let decode = |bytes: &[u8]| {
+                    let array = CoreArray::new(r#type.clone(), bytes.to_vec()).unwrap();
+                    array.convert_element_type(DataType::F64).unwrap().elements::<f64>().unwrap()
+                };
+                for (name, source_axes, target_sharding) in &transitions {
+                    let mut results = Vec::new();
+                    for consume in [false, true] {
+                        let session = Session::builder().client(client).build().unwrap();
+                        // The device at `(x, y)` holds `values[2 * x + y]` in element 0 and `values[x + 2 * y]` in
+                        // element 1, or, for a source with a pending sum along `x` only, `values[2 * x]` and
+                        // `values[2 * x + 1]`, so that its replicas along `y` hold equal contributions.
+                        let shards = devices.iter().enumerate().map(|(index, device)| {
+                            let (x, y) = (index / 2, index % 2);
+                            let elements = match source_axes.len() {
+                                2 => [values[2 * x + y], values[x + 2 * y]],
+                                _ => [values[2 * x], values[2 * x + 1]],
+                            };
+                            let bytes = elements.map(encode).concat();
+                            (device.id(), Arc::<[u8]>::from(bytes))
+                        });
+                        let sharding = Some(pending(&replicated, source_axes));
+                        let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
+                        let source = source.unwrap();
+                        let expected = source.copy_to_host_bytes().unwrap();
+                        let strategy = planned_work(&source, &simulated_cross_host_layout, 0, &mesh, target_sharding)
+                            .map(|work| work.strategy);
+                        let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
+                        let placed = if consume {
+                            source.into_placement(&session, target)
+                        } else {
+                            source.to_placement(&session, target)
+                        };
+                        let actual = placed.and_then(|placed| {
+                            assert_eq!(placed.sharding(), target_sharding, "{data_type} {name}");
+                            placed.copy_to_host_bytes()
+                        });
+                        let actual = actual.map_err(|error| error.to_string());
+                        results.push((strategy, session.cached_program_count(), expected, actual));
+                    }
+                    let [(strategy, programs, expected, actual), (_, consumed_programs, _, consumed)] =
+                        results.try_into().unwrap();
+                    assert_eq!(actual, consumed, "{axis_type:?} {data_type} {name}: the entry points disagree");
+                    let programs = format!("+{programs} +{consumed_programs}");
+                    let outcome = match (strategy, actual) {
+                        (Ok(strategy), Ok(actual)) => {
+                            if data_type != DataType::F32 {
+                                assert_eq!(expected, actual, "{axis_type:?} {data_type} {name}");
+                            }
+                            format!("{strategy} {programs}: {:?} -> {:?}", decode(&expected), decode(&actual))
+                        }
+                        (Err(planned), Err(error)) => {
+                            assert_eq!(planned, error, "{axis_type:?} {data_type} {name}");
+                            errors.push(format!("{axis_type:?} {data_type} {name}: {error}"));
+                            format!("error {programs}")
+                        }
+                        (strategy, actual) => panic!("{axis_type:?} {data_type} {name}: {strategy:?} {actual:?}"),
+                    };
+                    outcomes.push(format!("{axis_type:?} {data_type} {name}: {outcome}"));
+                }
+            }
+        }
+        let mut expected_errors = Vec::new();
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Auto] {
+            for (data_type, accumulation_type) in [(DataType::F8E4M3FN, DataType::F16), (DataType::BF16, DataType::F32)]
+            {
+                for (name, completed, kept) in [
+                    ("sum(x, y) -> sum(x)", "y", "x"),
+                    ("sum(x, y) -> sum(y)", "x", "y"),
+                    ("sum(x, y) -> sum(y) split along x", "x", "y"),
+                ] {
+                    expected_errors.push(format!(
+                        "{axis_type:?} {data_type} {name}: cannot place an array whose pending reduction the placement \
+                         keeps along the mesh axes `{kept}` and changes along others when no device strategy applies \
+                         (cannot complete a pending `sum` of `{data_type}` values along mesh axis `{completed}` and \
+                         keep it along mesh axis `{kept}` on the devices, because the partial sums would be rounded \
+                         to `{data_type}`, while the sum accumulates in `{accumulation_type}`), because the host \
+                         round trip that remains would combine the contributions that the placement keeps; complete \
+                         the reduction first",
+                    ));
+                }
+            }
+        }
+        assert_eq!(errors, expected_errors);
+        let outcomes = outcomes.into_iter().map(|outcome| outcome.replacen("Auto ", "", 1)).collect::<Vec<_>>();
+        let (explicit, auto) = outcomes.split_at(outcomes.len() / 2);
+        let explicit = explicit.iter().map(|outcome| outcome.replacen("Explicit ", "", 1)).collect::<Vec<_>>();
+        assert_eq!(explicit, auto, "both axis types must give the same rows");
+        assert_eq!(
+            auto.join("\n"),
+            indoc! {"
+                f8e4m3fn sum(x, y) -> sum(x): error +0 +0
+                f8e4m3fn sum(x, y) -> sum(y): error +0 +0
+                f8e4m3fn sum(x, y) -> none: compiled reshard +1 +1: [0.0, 0.0] -> [0.0, 0.0]
+                f8e4m3fn sum(x, y) -> sum(y) split along x: error +0 +0
+                f8e4m3fn sum(x) -> none: compiled reshard +1 +1: [0.0, 0.0] -> [0.0, 0.0]
+                f8e4m3fn sum(x) -> sum(y): exact shards +0 +0: [0.0, 0.0] -> [0.0, 0.0]
+                f8e4m3fn sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 0.0] -> [0.0, 0.0]
+                bf16 sum(x, y) -> sum(x): error +0 +0
+                bf16 sum(x, y) -> sum(y): error +0 +0
+                bf16 sum(x, y) -> none: compiled reshard +1 +1: [2.0, 2.0] -> [2.0, 2.0]
+                bf16 sum(x, y) -> sum(y) split along x: error +0 +0
+                bf16 sum(x) -> none: compiled reshard +1 +1: [0.0, 2.0] -> [0.0, 2.0]
+                bf16 sum(x) -> sum(y): exact shards +0 +0: [0.0, 2.0] -> [0.0, 2.0]
+                bf16 sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 2.0] -> [0.0, 2.0]
+                f32 sum(x, y) -> sum(x): compiled reshard +1 +1: [1.0, 2.0] -> [1.0, 2.0]
+                f32 sum(x, y) -> sum(y): compiled reshard +1 +1: [1.0, 2.0] -> [2.0, 1.0]
+                f32 sum(x, y) -> none: compiled reshard +1 +1: [1.0, 2.0] -> [1.0, 2.0]
+                f32 sum(x, y) -> sum(y) split along x: compiled reshard +1 +1: [1.0, 2.0] -> [2.0, 1.0]
+                f32 sum(x) -> none: compiled reshard +1 +1: [0.0, 2.0] -> [0.0, 2.0]
+                f32 sum(x) -> sum(y): exact shards +0 +0: [0.0, 2.0] -> [0.0, 2.0]
+                f32 sum(x) -> sum(x, y): additive identities +0 +0: [0.0, 2.0] -> [0.0, 2.0]
+                i32 sum(x, y) -> sum(x): compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
+                i32 sum(x, y) -> sum(y): compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
+                i32 sum(x, y) -> none: compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
+                i32 sum(x, y) -> sum(y) split along x: compiled reshard +1 +1: [-1.0, -1.0] -> [-1.0, -1.0]
+                i32 sum(x) -> none: compiled reshard +1 +1: [-1.0, 0.0] -> [-1.0, 0.0]
+                i32 sum(x) -> sum(y): exact shards +0 +0: [-1.0, 0.0] -> [-1.0, 0.0]
+                i32 sum(x) -> sum(x, y): additive identities +0 +0: [-1.0, 0.0] -> [-1.0, 0.0]"},
+        );
+    }
+
+    #[test]
+    fn test_array_place_within_client_keeps_partial_sums_or_rejects_the_placement() {
+        // The devices at `(0, 0)`, `(0, 1)`, `(1, 0)`, and `(1, 1)` of a 2x2 mesh hold the `f32` contributions `MAX`,
+        // `0`, `MAX`, and `-MAX`, whose combined value is infinite, to a value of five elements with a pending sum
+        // along `x` and `y`. Completing `y` keeps the partial sums `MAX` and `0` along `x`, which an untiled
+        // target does with a compiled reshard. A target split unevenly along `y` rules out every device
+        // strategy, and the host round trip that remains would combine the partial sums, so both entry points return
+        // the same error, which every process derives from the shardings. Each row lists the shards in mesh order and
+        // the readback of the result, with the equal elements of each as `value xcount`.
+        let client = cpu_client(4);
+        let devices = client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let source_sharding = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x", "y"]).unwrap();
+        let untiled = Sharding::replicated(logical_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let uneven = Sharding::new(logical_mesh, vec![ShardingDimension::sharded(["y"])])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+        let values = [f32::MAX, 0., f32::MAX, -f32::MAX];
+        let r#type = ArrayType::new_static(DataType::F32, [5]);
+        let render = |bytes: &[u8]| {
+            let elements = values_from_bytes::<f32>(bytes);
+            assert_eq!(elements, vec![elements[0]; elements.len()]);
+            let value = match elements[0] {
+                value if value == f32::MAX => "MAX".to_string(),
+                value => value.to_string(),
+            };
+            format!("{value} x{}", elements.len())
+        };
+        let mut outcomes = Vec::new();
+        for (name, target_sharding) in [("untiled", &untiled), ("split unevenly along y", &uneven)] {
+            let mut results = Vec::new();
+            for consume in [false, true] {
+                let session = Session::builder().client(client).build().unwrap();
+                let shards = devices
+                    .iter()
+                    .zip(values)
+                    .map(|(device, value)| (device.id(), Arc::<[u8]>::from(values_to_bytes(&[value; 5]))));
+                let sharding = Some(source_sharding.clone());
+                let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
+                let source = source.unwrap();
+                let reason = source.placement_planning_view().validate_compiled_reshard(&mesh, target_sharding).err();
+                let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
+                let placed = if consume {
+                    source.into_placement(&session, target)
+                } else {
+                    source.to_placement(&session, target)
+                };
+                let outcome = match placed {
+                    Ok(placed) => {
+                        assert_eq!(placed.sharding(), target_sharding);
+                        let shards = placed.shards().iter().map(|shard| shard.copy_to_host_bytes().unwrap());
+                        let shards = shards.map(|bytes| render(&bytes)).collect::<Vec<_>>().join(", ");
+                        format!("[{shards}] -> {}", render(&placed.copy_to_host_bytes().unwrap()))
+                    }
+                    Err(error) => {
+                        assert_eq!(
+                            error.to_string(),
+                            format!(
+                                "cannot place an array whose pending reduction the placement keeps along the mesh \
+                                 axes `x` and changes along others when no device strategy applies ({}), because the \
+                                 host round trip that remains would combine the contributions that the placement \
+                                 keeps; complete the reduction first, or place the array onto an even split",
+                                reason.as_ref().unwrap(),
+                            ),
+                        );
+                        "error".to_string()
+                    }
+                };
+                results.push(outcome);
+            }
+            assert_eq!(results[0], results[1], "{name}: the entry points disagree");
+            outcomes.push(format!("{name}: {}", results[0]));
+        }
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                untiled: [MAX x5, MAX x5, 0 x5, 0 x5] -> MAX x5
+                split unevenly along y: error"},
+        );
+    }
+
+    #[test]
+    fn test_array_place_within_client_compiled_reshard_on_mesh_of_other_processes() {
+        let client = cpu_client(2);
+        let local = Session::builder().client(client).build().unwrap().addressable_devices().unwrap();
+        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
+        let remote = [Device::new(next_id, 1), Device::new(next_id + 1, 1)];
+        let session = session_with_remote_devices(client, remote);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = |devices: [Device; 2]| DeviceMesh::new(logical_mesh.clone(), devices.to_vec()).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 2);
+        let rows = Sharding::new(
+            logical_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+
+        // Each case places a source with the given type and sharding on its own mesh onto the given sharding over the
+        // given devices with a compiled strategy, once on the devices of this process, which runs every program, and
+        // once on the devices of another process, of which this process holds only metadata. The first case reshards
+        // on the mesh of the source, and the second one gathers the source on its mesh, copies it to the reversed mesh,
+        // and reshards it there, because the declared layout rules out shard regions.
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let cases = [
+            ("same mesh", r#type.clone(), &replicated, &rows, false),
+            ("across meshes", r#type.with_layout(column_major.clone()), &rows, &replicated, true),
+        ];
+        for (case, r#type, source_sharding, sharding, reversed) in cases {
+            let target_mesh =
+                |[first, second]: [Device; 2]| if reversed { mesh([second, first]) } else { mesh([first, second]) };
+            let process_index = local[0].process_index();
+            let source = Array::from_host_buffer(
+                &session,
+                r#type.clone(),
+                mesh([local[0], local[1]]),
+                Some(source_sharding.clone()),
+                &values,
+            )
+            .unwrap();
+            let strategy = source.device_placement_strategy(
+                &cross_host_layout_resolver(session.client()),
+                &target_mesh([local[0], local[1]]),
+                sharding,
+                process_index,
+            );
+            if reversed {
+                assert!(matches!(strategy, Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { .. })), "{case}");
+            } else {
+                assert!(matches!(strategy, Ok(DevicePlacementStrategy::CompiledReshard { .. })), "{case}");
+            }
+            let target = Placement::new(target_mesh([local[0], local[1]]), sharding.clone()).unwrap();
+            let participant = source.to_placement(&session, target).unwrap();
+            let participant_moved = source
+                .clone()
+                .reshard_on_devices(&session, &target_mesh([local[0], local[1]]), sharding, false)
+                .unwrap();
+            assert_eq!(participant.addressable_shards().count(), 2, "{case}");
+            assert_eq!(participant.copy_to_host().unwrap().elements::<f32>().unwrap(), [1., 2., 3., 4.], "{case}");
+
+            // This process owns no device of either mesh, so it compiles and runs nothing, and it returns the type, the
+            // placement, and the commitment that the processes which own those devices compute for their results.
+            let peer_source = Array::from_addressable_buffers(
+                &session,
+                r#type,
+                mesh(remote),
+                Some(source_sharding.clone()),
+                Vec::new(),
+            )
+            .unwrap();
+            let cached_program_count = session.cached_program_count();
+            let target = Placement::new(target_mesh(remote), sharding.clone()).unwrap();
+            let placed = peer_source.to_placement(&session, target).unwrap();
+            let moved =
+                peer_source.clone().reshard_on_devices(&session, &target_mesh(remote), sharding, false).unwrap();
+            for output in [&placed, &moved] {
+                assert_eq!(output.mesh(), &target_mesh(remote), "{case}");
+                assert_eq!(output.sharding(), participant.sharding(), "{case}");
+                assert_eq!(output.addressable_shards().count(), 0, "{case}");
+                assert!(output.is_committed(), "{case}");
+                assert_eq!(output.block_until_ready().map_err(|error| error.to_string()), Ok(()), "{case}");
+            }
+            assert_eq!(placed.r#type(), participant.r#type(), "{case}");
+            assert_eq!(moved.r#type(), participant_moved.r#type(), "{case}");
+            assert_eq!(session.cached_program_count(), cached_program_count, "{case}");
+        }
+    }
+
+    #[test]
+    fn test_array_place_within_client_moves_only_required_cross_mesh_regions() {
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let source_mesh = two_device_mesh(client, MeshAxisType::Auto);
+        let source_sharding = Sharding::new(
+            source_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let source = Array::from_host_buffer(
+            &session,
+            ArrayType::new_static(DataType::F32, [4, 4]),
+            source_mesh,
+            Some(source_sharding),
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let target_mesh = four_device_mesh_x(client);
+        let target_sharding = Sharding::new(
+            target_mesh.logical_mesh().clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let regions = source
+            .placement_planning_view()
+            .plan_shard_regions(&target_mesh, &target_sharding)
+            .unwrap()
+            .unwrap();
+        // Each column needs two regions. Two of the eight regions are already on their target devices.
+        let copied_bytes = regions
+            .moves
+            .iter()
+            .filter(|movement| movement.source_device != movement.target_device)
+            .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
+            .sum::<usize>();
+        assert_eq!(regions.moves.len(), 8);
+        assert_eq!(copied_bytes, 48);
+
+        // The strategy keeps the regions that it derived to choose itself, which the placement then executes.
+        let process_index = client.process_index().unwrap();
+        let Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts }) = source.device_placement_strategy(
+            &cross_host_layout_resolver(session.client()),
+            &target_mesh,
+            &target_sharding,
+            process_index,
+        ) else {
+            panic!("a placement on another mesh of this process must use shard regions");
+        };
+        assert!(cross_host_layouts.is_empty());
+        assert_eq!(plan, regions);
+
+        let output = source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()).unwrap();
+        output.block_until_ready().unwrap();
+        assert_ne!(session.eager_dispatch_statistics().misses, 0);
+        assert!(output.execution_fence().is_some());
+        assert_eq!(
+            shard_values(&output),
+            vec![vec![0., 4., 8., 12.], vec![1., 5., 9., 13.], vec![2., 6., 10., 14.], vec![3., 7., 11., 15.]],
+        );
+        assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), values);
+    }
+
+    #[test]
+    fn test_array_place_within_client_reuses_donated_buffers_when_every_device_keeps_its_shard_type() {
+        // A donated array whose compiled reshard leaves every device with a shard of the type that it held there (e.g.,
+        // one that completes a pending sum) gives its buffers to the result, because the lowering pairs the input and
+        // the output of that reshard (refer to `has_same_shard_types`), as JAX pairs a donated argument of `jit` with a
+        // result of the same shard shape. Each row lists, per device in the order of the mesh, whether the result holds
+        // the buffer that the source held there, with donation and without it (i.e., with `to_placement`, which keeps
+        // the source), and the values of every shard. A row marked as forced runs the compiled reshard although
+        // another strategy (moves of whole shards) places it otherwise.
+        let client = cpu_client(4);
+        let session = Session::builder().client(client).build().unwrap();
+        let devices = session.addressable_devices().unwrap();
+        let square = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
+        let auto = two_device_mesh(client, MeshAxisType::Auto);
+        let explicit = two_device_mesh(client, MeshAxisType::Explicit);
+        let renamed_axes = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let renamed = DeviceMesh::new(renamed_axes, devices[..2].to_vec()).unwrap();
+        let split = |mesh: &DeviceMesh, axes: &[&str]| {
+            let dimension = match axes {
+                [] => ShardingDimension::replicated(),
+                axes => ShardingDimension::sharded(axes.iter().copied()),
+            };
+            Sharding::new(mesh.logical_mesh().clone(), vec![dimension]).unwrap()
+        };
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+        let dense = |mesh: &DeviceMesh, sharding: Sharding| {
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), Some(sharding), values.as_slice()).unwrap()
+        };
+        let pending = |mesh: &DeviceMesh, sharding: Sharding, contributions: &[&[f32]]| {
+            let sharding = sharding.with_unreduced_axes(["x"]).unwrap();
+            let shards = contributions
+                .iter()
+                .zip(mesh.devices())
+                .map(|(values, device)| (device.id(), Arc::<[u8]>::from(values_to_bytes(values))))
+                .collect::<Vec<_>>();
+            Array::from_host_shards(&session, r#type.clone(), mesh.clone(), Some(sharding), shards).unwrap()
+        };
+        // Native addresses of the buffers of `array`, which are ready and alive while they are read, and are only
+        // compared and never dereferenced.
+        let addresses = |array: &Array| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| {
+                    let buffer = shard.buffer().unwrap();
+                    buffer.ready().unwrap().r#await().unwrap();
+                    unsafe { buffer.unsafe_pointer().unwrap() }
+                })
+                .collect::<Vec<_>>()
+        };
+        let place = |source: Array, target: &Placement, forced: bool, donate: bool| {
+            let before = addresses(&source);
+            let placed = match (forced, donate) {
+                (true, _) => {
+                    let (mesh, sharding) = (target.mesh(), target.sharding());
+                    let (input, output) = (source.sharding().clone(), sharding.clone());
+                    let program = ReshardProgram { mesh: mesh.clone(), input, output };
+                    let strategy = DevicePlacementStrategy::CompiledReshard { program };
+                    let placed = source.place_with_strategy(strategy, 0, mesh, sharding, Memory::Device, None, donate);
+                    placed.map_err(|(error, _)| error).unwrap()
+                }
+                (false, true) => source.into_placement(&session, target.clone()).unwrap(),
+                (false, false) => source.to_placement(&session, target.clone()).unwrap(),
+            };
+            let reused = before.iter().zip(addresses(&placed)).map(|(before, after)| *before == after);
+            let reused = reused.collect::<Vec<_>>();
+            (reused, shard_values(&placed))
+        };
+
+        let sums: &[&[f32]] = &[&[1., 2., 3., 4.], &[10., 20., 30., 40.]];
+        let split_sums: &[&[f32]] = &[&[1., 2.], &[3., 4.], &[10., 20.], &[30., 40.]];
+        type Source<'a> = Box<dyn Fn() -> Array + 'a>;
+        let cases: Vec<(&str, Source<'_>, Placement, bool)> = vec![
+            (
+                "completed sum on an auto axis",
+                Box::new(|| pending(&auto, split(&auto, &[]), sums)),
+                Placement::new(auto.clone(), split(&auto, &[])).unwrap(),
+                false,
+            ),
+            (
+                "completed sum on an explicit axis",
+                Box::new(|| pending(&explicit, split(&explicit, &[]), sums)),
+                Placement::new(explicit.clone(), split(&explicit, &[])).unwrap(),
+                false,
+            ),
+            (
+                "completed sum of a split",
+                Box::new(|| pending(&square, split(&square, &["y"]), split_sums)),
+                Placement::new(square.clone(), split(&square, &["y"])).unwrap(),
+                false,
+            ),
+            (
+                "split to replicated",
+                Box::new(|| dense(&explicit, split(&explicit, &["x"]))),
+                Placement::new(explicit.clone(), split(&explicit, &[])).unwrap(),
+                false,
+            ),
+            (
+                "split along another axis, forced",
+                Box::new(|| dense(&square, split(&square, &["x"]))),
+                Placement::new(square.clone(), split(&square, &["y"])).unwrap(),
+                true,
+            ),
+            (
+                "renamed mesh",
+                Box::new(|| dense(&explicit, split(&explicit, &["x"]))),
+                Placement::new(renamed.clone(), split(&renamed, &["a"])).unwrap(),
+                false,
+            ),
+        ];
+        let outcomes = cases
+            .into_iter()
+            .map(|(name, source, target, forced)| {
+                let (donated, values) = place(source(), &target, forced, true);
+                let (borrowed, borrowed_values) = place(source(), &target, forced, false);
+                assert_eq!(values, borrowed_values, "{name}");
+                format!("{name}: donated {donated:?}, borrowed {borrowed:?}, values {values:?}")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes.join("\n"),
+            indoc! {"
+                completed sum on an auto axis: donated [true, true], borrowed [false, false], values [[11.0, 22.0, 33.0, 44.0], [11.0, 22.0, 33.0, 44.0]]
+                completed sum on an explicit axis: donated [true, true], borrowed [false, false], values [[11.0, 22.0, 33.0, 44.0], [11.0, 22.0, 33.0, 44.0]]
+                completed sum of a split: donated [true, true, true, true], borrowed [false, false, false, false], values [[11.0, 22.0], [33.0, 44.0], [11.0, 22.0], [33.0, 44.0]]
+                split to replicated: donated [false, false], borrowed [false, false], values [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]
+                split along another axis, forced: donated [true, true, true, true], borrowed [false, false, false, false], values [[1.0, 2.0], [3.0, 4.0], [1.0, 2.0], [3.0, 4.0]]
+                renamed mesh: donated [true, true], borrowed [true, true], values [[1.0, 2.0], [3.0, 4.0]]"},
+        );
     }
 
     #[test]

@@ -6,17 +6,16 @@
 //! does not check. [`Array::from_host_shards`] instead takes the bytes of each local shard, which may differ between
 //! processes and between the devices along unreduced axes. [`Session::place`] also accepts host values and uploads
 //! them through [`Array::from_host_buffer`], and it compares the values of the processes when every process of a run
-//! takes part in the destination (refer to
-//! [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)). Along unreduced axes of kind
-//! [`UnreducedKind::Sum`], a full host value is split into the value itself at coordinate zero and additive identities
-//! elsewhere, so the summands add up to the value. Each process uploads only the shards of the devices that the mesh
-//! assigns to it, so both constructors reject a device of this process that the mesh assigns to another process with
-//! [`ArrayError::DeviceProcessIndexMismatch`] and a device that the mesh assigns to this process but that its PJRT
-//! client does not address with [`ArrayError::NonAddressableDevice`], because no process would upload its shard, as
-//! imports of buffers and placements onto a mesh do. A device of another process that the session does not know (i.e.,
-//! that its PJRT client does not list and that it did not learn from its distributed runtime, refer to
-//! [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)) is rejected with
-//! [`ArrayError::UnknownDevice`] (refer to [`Session::devices`]). Both constructors reject a layout that does not
+//! takes part in the target (refer to [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)).
+//! Along unreduced axes of kind [`UnreducedKind::Sum`], a full host value is split into the value itself at coordinate
+//! zero and additive identities elsewhere, so the summands add up to the value. Each process uploads only the shards
+//! of the devices that the mesh assigns to it, so both constructors reject a device of this process that the mesh
+//! assigns to another process with [`ArrayError::DeviceProcessIndexMismatch`] and a device that the mesh assigns to
+//! this process but that its PJRT client does not address with [`ArrayError::NonAddressableDevice`], because no process
+//! would upload its shard, as imports of buffers and placements onto a mesh do. A device of another process that the
+//! session does not know (i.e., that its PJRT client does not list and that it did not learn from its distributed
+//! runtime, refer to [`SessionBuilder::distributed_runtime`](crate::SessionBuilder::distributed_runtime)) is rejected
+//! with [`ArrayError::UnknownDevice`] (refer to [`Session::devices`]). Both constructors reject a layout that does not
 //! address the shape of every shard. The CPU plugin rejects a strided layout for a value that needs buffers, even on
 //! a process that uploads no shards. Both constructors validate the bytes of every upload, including the storage of
 //! a [`ryft_core::Array`], which its safe mutable view can make invalid. They reject bytes that do not encode valid
@@ -96,10 +95,10 @@
 //! can come from different sources, so its readbacks also report a failed replica that they skip.
 //!
 //! Placements that read an array back and upload it again (e.g., the host fallback and the host relayouts of
-//! [`Array::to_placement`]) hand out their destination buffers first and finish the work on the background upload
-//! workers of the session, which a failure of that work poisons. Such a placement blocks on the readback only when the
-//! PJRT plugin lacks host to device transfer managers or their literal transfers. A process that holds no destination
-//! buffer of such a placement has no upload to report the work that produces the value, so the execution fence of its
+//! [`Array::to_placement`]) hand out their target buffers first and finish the work on the background upload workers
+//! of the session, which a failure of that work poisons. Such a placement blocks on the readback only when the PJRT
+//! plugin lacks host to device transfer managers or their literal transfers. A process that holds no target buffer
+//! of such a placement has no upload to report the work that produces the value, so the execution fence of its
 //! result is the fence of that work instead.
 
 use std::borrow::Cow;
@@ -120,7 +119,7 @@ use ryft_core::{
 };
 use ryft_pjrt::{
     Buffer, BufferSpecification, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError,
-    ExecutionFence, HostBuffer, HostDestination, HostToDeviceTransferManager, Memory as PjrtMemory,
+    ExecutionFence, HostBuffer, HostDestination as HostTarget, HostToDeviceTransferManager, Memory as PjrtMemory,
 };
 
 use crate::arrays::metadata::resolve_placement;
@@ -153,12 +152,12 @@ impl Array {
     /// mesh of `session` selected are ones that this process chose on its own, which a later placement onto devices of
     /// several processes takes into account (refer to [`crate::arrays::transfers`]).
     ///
-    /// When the destination mesh spans several processes, each process uploads only the shards of its own devices,
-    /// so every process must call this function with the same host value, which is a precondition of every whole-host
-    /// upload (e.g., also of a host value that [`Session::place`] uploads). Nothing compares the values across
-    /// processes, so differing values leave the shards and the replicas of the array inconsistent. Use
-    /// [`Self::from_host_shards`] for values that are meant to differ between processes (e.g., process-local
-    /// data, or values that vary along a manual mesh axis), which takes the bytes of each local shard.
+    /// When the target mesh spans several processes, each process uploads only the shards of its own devices, so every
+    /// process must call this function with the same host value, which is a precondition of every whole-host upload
+    /// (e.g., also of a host value that [`Session::place`] uploads). Nothing compares the values across processes, so
+    /// differing values leave the shards and the replicas of the array inconsistent. Use [`Self::from_host_shards`] for
+    /// values that are meant to differ between processes (e.g., process-local data, or values that vary along a manual
+    /// mesh axis), which takes the bytes of each local shard.
     ///
     /// Each addressable shard is uploaded to the memory requested by `r#type`.
     /// [`Memory::Device`](ryft_core::Memory::Device) uses the device's default memory. Host placements select
@@ -189,8 +188,8 @@ impl Array {
     ///   - `session`: [`Session`] the constructed array belongs to. Its client transfers the local addressable shard
     ///     buffers.
     ///   - `r#type`: Global [`ArrayType`] of the constructed array.
-    ///   - `mesh`: Destination [`DeviceMesh`], or [`None`] to use eager placement.
-    ///   - `sharding`: Optional runtime [`Sharding`] over the destination mesh.
+    ///   - `mesh`: Target [`DeviceMesh`], or [`None`] to use eager placement.
+    ///   - `sharding`: Optional runtime [`Sharding`] over the target mesh.
     ///   - `buffer`: Dense row-major host bytes for the full logical array.
     ///
     /// # Errors
@@ -291,8 +290,8 @@ impl Array {
     }
 
     /// Creates an [`Array`] like [`Self::from_host_buffer`] does, but from host bytes that `readback` produces later.
-    /// The destination buffers come from PJRT host to device transfer managers, which hand them out before their
-    /// contents exist, so this function returns without waiting for `readback`. Once `sources` is ready, one job on the
+    /// The target buffers come from PJRT host to device transfer managers, which hand them out before their contents
+    /// exist, so this function returns without waiting for `readback`. Once `sources` is ready, one job on the
     /// [`HostUploadWorkers`] of `session` runs `readback` and then uploads the bytes of each addressable shard. The job
     /// runs even when `sources` reports an error, which `readback` then returns. The shards receive the same slices,
     /// additive identities along unreduced axes, memory, and layout as with [`Self::from_host_buffer`], and the same
@@ -301,17 +300,17 @@ impl Array {
     /// otherwise (e.g., the replicas of a strided tile, or the additive identities along an unreduced axis) are
     /// uploaded from one shared copy (refer to [`PreparedHostShards`]).
     ///
-    /// The destination buffers are registered with the work tracking of `session` before this function returns, so
+    /// The target buffers are registered with the work tracking of `session` before this function returns, so
     /// [`Session::synchronize`] waits for the uploads. When `readback` fails, returns bytes of the wrong size or bytes
     /// that do not encode valid elements of the data type (refer to [`Self::from_host_buffer`]), or an upload cannot be
-    /// issued, the background job sets the error that `poison` derives from that failure on every destination buffer
-    /// that has not received its bytes. The execution fence of the returned array joins the readiness of every
-    /// destination buffer, so its readiness functions and readbacks all report that error, even a readback that reads
-    /// only one replica of each tile or that reads no bytes because the array has no elements. When no device of `mesh`
-    /// belongs to this process, there is nothing to upload, so this function submits no job and never calls `readback`.
-    /// No destination buffer could report the work that produces the value either, so the execution fence of the
-    /// returned array is `sources` instead, and the array still waits for and reports that work, as the uploads
-    /// of the processes that hold its shards do.
+    /// issued, the background job sets the error that `poison` derives from that failure on every target buffer that
+    /// has not received its bytes. The execution fence of the returned array joins the readiness of every target
+    /// buffer, so its readiness functions and readbacks all report that error, even a readback that reads only one
+    /// replica of each tile or that reads no bytes because the array has no elements. When no device of `mesh` belongs
+    /// to this process, there is nothing to upload, so this function submits no job and never calls `readback`. No
+    /// target buffer could report the work that produces the value either, so the execution fence of the returned array
+    /// is `sources` instead, and the array still waits for and reports that work, as the uploads of the processes that
+    /// hold its shards do.
     ///
     /// Returns [`None`] without calling `readback` when the PJRT plugin lacks host to device transfer managers or their
     /// literal transfers (refer to [`PendingHostUpload::new`]), or when `r#type` has [`DataType::Zero`] (i.e., when
@@ -321,14 +320,14 @@ impl Array {
     ///
     ///   - `session`: [`Session`] the constructed array belongs to.
     ///   - `r#type`: Global [`ArrayType`] of the constructed array.
-    ///   - `mesh`: Destination [`DeviceMesh`].
+    ///   - `mesh`: Target [`DeviceMesh`].
     ///   - `sharding`: Runtime [`Sharding`] over `mesh`.
     ///   - `sources`: [`ExecutionFence`] of everything that `readback` waits for (e.g., the fence that
     ///     [`Self::host_readback_fence`] returns for the array that `readback` reads back), so that the job does not
     ///     occupy a worker while those dependencies are pending (refer to [`HostUploadWorkers`]).
     ///   - `readback`: Function that returns the dense row-major host bytes of the full logical array. It runs in the
     ///     background job at most once, and it may block only on the work that `sources` covers.
-    ///   - `poison`: Function that converts a failure of the background work into the error that the destination
+    ///   - `poison`: Function that converts a failure of the background work into the error that the target
     ///     buffers report. It runs in the background job at most once.
     pub(super) fn from_host_buffer_in_background<R, P>(
         session: &Session,
@@ -349,14 +348,14 @@ impl Array {
             return Ok(None);
         }
 
-        // Register the submission before any destination buffer exists or the background job is submitted, so that a
+        // Register the submission before any target buffer exists or the background job is submitted, so that a
         // concurrent `Session::synchronize` takes a snapshot that includes this upload whenever the upload may already
         // be running (and may already have failed) by the time that snapshot waits. If this function returns before
-        // attaching the destination buffers (e.g., to fall back or because the job could not be submitted), dropping
+        // attaching the target buffers (e.g., to fall back or because the job could not be submitted), dropping
         // the reservation completes it right away without work, so it never blocks a synchronization.
         let mut work = session.reserve_work();
 
-        // Hand out every destination buffer before starting the background work, so that a plugin without transfer
+        // Hand out every target buffer before starting the background work, so that a plugin without transfer
         // managers or literal transfers falls back before anything has been read back.
         let client = session.client();
         let buffer_type = uploads.r#type.data_type().executable_buffer_type();
@@ -366,14 +365,14 @@ impl Array {
         let mut shards = Vec::with_capacity(uploads.shards.len());
         for shard in uploads.shards {
             let memory = shard.device.memory(uploads.r#type.memory())?;
-            let destination = PendingHostUpload::new(
+            let pending = PendingHostUpload::new(
                 client,
                 buffer_type,
                 shard.dimensions.clone(),
                 memory,
                 uploads.device_layout.clone(),
             )?;
-            let Some((upload, buffer)) = destination else {
+            let Some((upload, buffer)) = pending else {
                 return Ok(None);
             };
             pending_uploads.push(upload);
@@ -383,8 +382,8 @@ impl Array {
         let (r#type, sharding, mesh, layout) = (uploads.r#type, uploads.sharding, uploads.mesh, uploads.layout);
         let byte_count = uploads.byte_count;
 
-        // A process without destination buffers has nothing to upload, so it submits no job, which would only retain
-        // `readback` (and whatever it reads) until `sources` completes. No destination buffer could report the work
+        // A process without target buffers has nothing to upload, so it submits no job, which would only retain
+        // `readback` (and whatever it reads) until `sources` completes. No target buffer could report the work
         // that produces the value either, so the result waits for and reports `sources` instead.
         if buffers.is_empty() {
             let output = Self::from_addressable_buffers_internal(
@@ -400,7 +399,7 @@ impl Array {
         }
 
         // The background job reads the host value back once, before it prepares the bytes of the first shard, so that
-        // a failed readback or a readback with invalid element encodings poisons every destination buffer. The readback
+        // a failed readback or a readback with invalid element encodings poisons every target buffer. The readback
         // moves into a shared allocation without a copy, and the shards that are windows of it transfer straight from
         // that allocation.
         let data_type = r#type.data_type();
@@ -422,16 +421,16 @@ impl Array {
             Ok(shards.bytes(&host_bytes, index))
         };
 
-        // Hand the job that fills the destination buffers to the workers of the session before anything observes those
-        // buffers. Until it runs, nothing can complete them, and observing them can wait for them (e.g., building a
-        // fence from their events awaits an event whose callback PJRT fails to register), which would then never
+        // Hand the job that fills the target buffers to the workers of the session before anything observes those
+        // buffers. Until it runs, nothing can complete them, and observing them can wait for them (e.g., building
+        // a fence from their events awaits an event whose callback PJRT fails to register), which would then never
         // return. If the job cannot be handed over, dropping its transfer managers has already poisoned the buffers
         // that are about to be dropped here, and the reservation completes without work.
         session
             .host_upload_workers()
             .submit(sources, move || run_host_uploads(pending_uploads, prepare, poison))?;
 
-        // Attach the destination buffers to the reservation only once the job that completes them has been handed over,
+        // Attach the target buffers to the reservation only once the job that completes them has been handed over,
         // and only then join their readiness into the fence of the result, so that every readback of the result reports
         // a failed upload, even a readback that reads only one replica of each tile or no bytes at all. A failure to
         // build the result leaves the buffers tracked by the session until the job has filled or poisoned them.
@@ -595,9 +594,9 @@ impl Array {
     /// A readback that copies data uses only one replica of each distinct contribution to the value (i.e., the first
     /// local replica of each tile and, along unreduced axes, of each per-device value of a tile). The readback skips
     /// the remaining replicas. When each tile occupies a contiguous byte range of the dense array, each copy goes
-    /// directly into the destination. Otherwise, the copies are assembled on the host. When the [`Sharding`] has
-    /// unreduced axes, the separate per-device values (e.g., summands) are combined with the [`UnreducedKind`] of the
-    /// sharding. The values of each tile are combined in ascending order of their coordinates along the unreduced axes,
+    /// directly into the target. Otherwise, the copies are assembled on the host. When the [`Sharding`] has unreduced
+    /// axes, the separate per-device values (e.g., summands) are combined with the [`UnreducedKind`] of the sharding.
+    /// The values of each tile are combined in ascending order of their coordinates along the unreduced axes,
     /// irrespective of which replicas this process holds, so every process that holds the whole value reads back the
     /// same bytes. Sums of [`DataType::Boolean`] values combine with logical or. Tiles without elements contribute
     /// nothing, so they need no replica in this process. Arrays with no elements and [`DataType::Zero`] arrays produce
@@ -626,7 +625,7 @@ impl Array {
         }
 
         // Look up the element size once for the array and all its shards. The checked global byte count bounds the
-        // byte offsets of tiles that copy directly into the destination.
+        // byte offsets of tiles that copy directly into the target.
         let element_size_in_bytes = element_type.size_in_bytes()?;
         let global_element_count = global_shape.element_count()?;
         let total_byte_count =
@@ -645,8 +644,8 @@ impl Array {
         let global_strides = row_major_element_strides(global_shape.as_slice(), element_type)?;
         let mut work = self.session().reserve_work();
 
-        // When the selected shards are one replica of each tile and every tile occupies one contiguous byte range of
-        // the dense representation, each is copied directly into that range of one destination.
+        // When the selected shards are one replica of each tile and every tile occupies one contiguous byte range
+        // of the dense representation, each is copied directly into that range of one target.
         if contiguous_tiles {
             // The checked global byte count bounds the size and the offset of every tile.
             let tiles = shards
@@ -660,9 +659,9 @@ impl Array {
                     (*shard, start..start + byte_count)
                 })
                 .collect::<Vec<_>>();
-            let mut destination = HostDestination::new(total_byte_count);
+            let mut target = HostTarget::new(total_byte_count);
             let ranges = tiles.iter().map(|(_, range)| range.clone()).collect::<Vec<_>>();
-            let slices = destination.split(ranges.as_slice())?;
+            let slices = target.split(ranges.as_slice())?;
             let copies = tiles
                 .iter()
                 .zip(slices)
@@ -681,12 +680,12 @@ impl Array {
                 completion.block_until_ready()?;
             }
 
-            // Drop each returned slice so the destination can yield its full byte buffer.
+            // Drop each returned slice so the target can yield its full byte buffer.
             for copy in copies {
                 drop(copy.wait()?);
             }
 
-            return Ok(destination.into_bytes().ok().unwrap());
+            return Ok(target.into_bytes().ok().unwrap());
         }
 
         // Non-contiguous tiles and per-device values along unreduced axes need separate host buffers. Request
@@ -886,11 +885,11 @@ impl Array {
 
     /// Selects the shards that [`Self::copy_to_host_bytes`] of an array with elements copies, given the indices of
     /// the unreduced axes with multiple coordinates, and returns them together with whether they are tiles that the
-    /// readback copies directly into the dense destination. The selection is that of [`Self::readback_shards`]
-    /// (i.e., one local replica of each distinct contribution to the value). The readback copies the selected tiles
-    /// directly when each tile has one contribution and occupies one contiguous byte range of the dense representation
-    /// (e.g., when only the leading dimension is sharded, or for a replicated array). Otherwise, it assembles their
-    /// copies on the host.
+    /// readback copies directly into the dense target. The selection is that of [`Self::readback_shards`] (i.e., one
+    /// local replica of each distinct contribution to the value). The readback copies the selected tiles directly when
+    /// each tile has one contribution and occupies one contiguous byte range of the dense representation (e.g., when
+    /// only the leading dimension is sharded, or for a replicated array). Otherwise, it assembles their copies on
+    /// the host.
     fn host_readback_shards(&self, unreduced_axis_indices: &[usize]) -> Result<(Vec<&ArrayShard>, bool), Error> {
         let shards = self.readback_shards()?;
         if !unreduced_axis_indices.is_empty() {
@@ -1699,25 +1698,25 @@ impl AsRef<[u8]> for HostBufferSlice {
     }
 }
 
-/// Destination buffer of an upload from host memory whose bytes become available only after the buffer has been
-/// handed out, together with the PJRT [`HostToDeviceTransferManager`] that fills it. The manager is created for the
-/// memory of one device, so an upload to several devices needs several managers. It borrows the `'static` client of
-/// a [`Session`], so the upload job can move the manager to a background worker.
+/// Target buffer of an upload from host memory whose bytes become available only after the buffer has been handed out,
+/// together with the PJRT [`HostToDeviceTransferManager`] that fills it. The manager is created for the memory of one
+/// device, so an upload to several devices needs several managers. It borrows the `'static` client of a [`Session`],
+/// so the upload job can move the manager to a background worker.
 pub(super) struct PendingHostUpload {
-    /// Transfer manager that created the destination buffer, at index zero, and fills it.
+    /// Transfer manager that created the target buffer, at index zero, and fills it.
     manager: HostToDeviceTransferManager<'static>,
 
-    /// [`BufferType`] of the elements of the destination buffer.
+    /// [`BufferType`] of the elements of the target buffer.
     buffer_type: BufferType,
 
-    /// Dimensions of the destination buffer.
+    /// Dimensions of the target buffer.
     dimensions: Vec<u64>,
 }
 
 impl PendingHostUpload {
-    /// Creates the transfer manager for one destination buffer and returns it with that buffer, whose contents are
-    /// not yet defined. With [`None`] for `layout`, the PJRT plugin chooses the default device layout of the buffer
-    /// when it creates the manager, so this function does not need the plugin to report that layout.
+    /// Creates the transfer manager for one target buffer and returns it with that buffer, whose contents are not yet
+    /// defined. With [`None`] for `layout`, the PJRT plugin chooses the default device layout of the buffer when it
+    /// creates the manager, so this function does not need the plugin to report that layout.
     ///
     /// Returns [`None`] when the PJRT plugin does not implement transfer managers, or when its transfer managers do
     /// not support [literal transfers](HostToDeviceTransferManager::transfer_literal), which [`run_host_uploads`] uses
@@ -1727,11 +1726,11 @@ impl PendingHostUpload {
     ///
     /// # Parameters
     ///
-    ///   - `client`: PJRT client of the [`Session`] that the destination belongs to.
-    ///   - `buffer_type`: [`BufferType`] of the elements of the destination buffer.
-    ///   - `dimensions`: Dimensions of the destination buffer.
-    ///   - `memory`: PJRT memory that holds the destination buffer.
-    ///   - `layout`: Physical layout of the destination buffer, or [`None`] for the default layout of the plugin.
+    ///   - `client`: PJRT client of the [`Session`] that the target belongs to.
+    ///   - `buffer_type`: [`BufferType`] of the elements of the target buffer.
+    ///   - `dimensions`: Dimensions of the target buffer.
+    ///   - `memory`: PJRT memory that holds the target buffer.
+    ///   - `layout`: Physical layout of the target buffer, or [`None`] for the default layout of the plugin.
     pub(super) fn new(
         client: &'static Client<'static>,
         buffer_type: BufferType,
@@ -1768,7 +1767,7 @@ impl PendingHostUpload {
     }
 }
 
-/// Bounded set of named background threads (i.e., workers) that run the jobs of host uploads whose destination buffers
+/// Bounded set of named background threads (i.e., workers) that run the jobs of host uploads whose target buffers
 /// have already been handed out (refer to [`run_host_uploads`]). Every [`Session`] owns one, which all handles of that
 /// session share like its other resources, so the threads that pending host uploads occupy are bounded per session
 /// instead of growing with the number of uploads whose producers have stalled.
@@ -1806,10 +1805,10 @@ impl PendingHostUpload {
 /// # Shutdown
 ///
 /// Dropping the owner (i.e., when the last handle of its session goes away) stops each worker once no accepted job
-/// remains. The parked and queued jobs still run rather than being dropped (which would poison their destination
-/// buffers), because those buffers can outlive the session (e.g., in arrays that were moved to another session of the
-/// same client, or in PJRT buffers retained elsewhere) and must then hold the right values. The owner does not join
-/// its workers, because a worker can drop the owner itself (e.g., when a job holds the last handle of the session) and
+/// remains. The parked and queued jobs still run rather than being dropped (which would poison their target buffers),
+/// because those buffers can outlive the session (e.g., in arrays that were moved to another session of the same
+/// client, or in PJRT buffers retained elsewhere) and must then hold the right values. The owner does not join its
+/// workers, because a worker can drop the owner itself (e.g., when a job holds the last handle of the session) and
 /// because a job can stay parked for as long as its sources stay pending. The workers themselves hold only the shared
 /// queue, so they do not keep the owner alive. A job, however, retains whatever it captures, which can include a handle
 /// of the session (e.g., the source [`Array`] that the host fallback of [`Array::to_placement`] reads back, which also
@@ -1977,19 +1976,19 @@ struct HostUploadQueue {
     shut_down: bool,
 }
 
-/// Fills the destination buffers of `uploads` on the current worker. For each upload in order, calls `prepare` with
-/// the index of the upload to obtain its dense row-major host bytes and hands them to PJRT, which converts them to the
-/// layout of the destination buffer. After the first failure, the job stops preparing bytes and sets the error that
-/// `poison` derives from that failure on every destination buffer that has not received its bytes yet. Awaiting or
-/// reading such a buffer then reports that error, so no reader of a destination buffer can wait forever. The source
+/// Fills the target buffers of `uploads` on the current worker. For each upload in order, calls `prepare` with the
+/// index of the upload to obtain its dense row-major host bytes and hands them to PJRT, which converts them to the
+/// layout of the target buffer. After the first failure, the job stops preparing bytes and sets the error that
+/// `poison` derives from that failure on every target buffer that has not received its bytes yet. Awaiting or
+/// reading such a buffer then reports that error, so no reader of a target buffer can wait forever. The source
 /// fence passed to [`HostUploadWorkers::submit`] must cover everything that `prepare` waits for, apart from PJRT
 /// transfers that complete on their own, so that the job never holds a worker while it waits for another job or for
 /// an external producer (refer to [`HostUploadWorkers`] for why this guarantees progress). The job runs even when the
 /// fence reports an error, and `prepare` then reports that error itself (e.g., from the readback of a failed buffer).
 /// The job does not call back into PJRT from a PJRT callback. Transfer managers are [`Send`] but not [`Sync`], so the
 /// job takes ownership of them, uses them only from its worker, and drops them once every issued transfer has
-/// completed. Each transfer keeps its host bytes alive until PJRT has consumed them, and PJRT keeps each destination
-/// buffer alive independently of its manager, so callers may drop the destination buffers at any time. If submission
+/// completed. Each transfer keeps its host bytes alive until PJRT has consumed them, and PJRT keeps each target
+/// buffer alive independently of its manager, so callers may drop the target buffers at any time. If submission
 /// fails or `prepare` panics, dropping the job's transfer managers makes PJRT poison the unfinished buffers.
 pub(super) fn run_host_uploads<P, E>(uploads: Vec<PendingHostUpload>, mut prepare: P, poison: E)
 where
@@ -2016,7 +2015,7 @@ where
     }
 
     // Wait for the issued transfers before the transfer managers are dropped. A transfer that fails sets its error
-    // on its own destination buffer, so its error needs no further handling here.
+    // on its own target buffer, so its error needs no further handling here.
     let issued_count = events.len();
     for event in events {
         if let Err(error) = event.r#await() {
@@ -2038,7 +2037,7 @@ where
     }
 }
 
-/// Validates a physical layout before creating device buffers. Every process checks the destination format, including
+/// Validates a physical layout before creating device buffers. Every process checks the target format, including
 /// those that own none of its shards. PJRT host uploads accept only tiled device layouts, independently of the host
 /// byte strides. CPU PJRT supports minor-to-major permutations without tiles for uploads and runtime relayouts. A
 /// zero space array has no buffers to create. Placement strategies may repeat this inexpensive platform check.
@@ -2249,10 +2248,10 @@ const PROCESS_AXIS: &str = "processes";
 const DIGEST_WORDS: usize = 8;
 
 /// Message of the failed precondition error that the result of a placement, or an admitted placement call, reports
-/// when the processes of a run placed different values onto a destination that all of them share, or when another
+/// when the processes of a run placed different values onto a target that all of them share, or when another
 /// process rejected the same call. Refer to [`ValueComparison`] and [`Session::place`] for more information.
 pub(crate) const DIFFERENT_VALUES_MESSAGE: &str = "the processes of the run placed different values onto a \
-    destination that all of them share, or one of them rejected the same placement call, so their shards would not \
+    target that all of them share, or one of them rejected the same placement call, so their shards would not \
     form one array; place the same value on every process, or use `Array::from_host_shards` to place the part of the \
     array that each process holds";
 
@@ -2340,15 +2339,15 @@ impl Array {
     }
 }
 
-/// Comparison of the values that the processes of a run place onto a destination
+/// Comparison of the values that the processes of a run place onto a target
 /// that all of them share, which the placements of a session make when it enables it (refer to
 /// [`SessionBuilder::value_comparison`](crate::SessionBuilder::value_comparison)) and its run has more than one
 /// process. JAX compares the whole values of the processes with `process_allgather` when a host value or an uncommitted
-/// array is placed onto a destination that every process takes part in. Ryft compares their digests (i.e.,
+/// array is placed onto a target that every process takes part in. Ryft compares their digests (i.e.,
 /// [`value_digest`] and [`combined_digest`]) bit for bit using a compiled maximum all-reduce of 64 bytes
 /// over the same ordered PJRT devices (refer to [`ComparisonCollective::submit`]).
 pub(crate) struct ValueComparison {
-    /// Processes that a destination must hold exactly for its placement to compare values.
+    /// Processes that a target must hold exactly for its placement to compare values.
     processes: BTreeSet<usize>,
 
     /// Local PJRT capability to reach every process of this comparison, when available.
@@ -2406,9 +2405,9 @@ impl ValueComparison {
 
     /// Returns whether the placement of a value that every process places on its own (i.e., a host value or a locally
     /// assigned array) onto `request` compares that value, which is when `request` names a mesh whose devices belong
-    /// to exactly the processes of the run, as JAX compares only when every process takes part in the destination. A
-    /// device or in-place request never does. The decision reads only the request, which every process that makes the
-    /// same call shares, and never the value, its shape, or its bytes.
+    /// to exactly the processes of the run, as JAX compares only when every process takes part in the target. A device
+    /// or in-place request never does. The decision reads only the request, which every process that makes the same
+    /// call shares, and never the value, its shape, or its bytes.
     pub(crate) fn applies(&self, request: Option<&PlacementRequest>) -> bool {
         match request {
             Some(PlacementRequest::Resolved(placement)) => {
@@ -3620,7 +3619,7 @@ mod tests {
             Err(Error::Pjrt(PjrtError::Aborted { message: array_message, .. })) if array_message == message,
         ));
 
-        // The session tracks the destination buffers of both arrays and reports their failures in order.
+        // The session tracks the target buffers of both arrays and reports their failures in order.
         assert!(matches!(
             session.synchronize(),
             Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
@@ -3748,7 +3747,7 @@ mod tests {
             ExecutionFence::new(vec![event]),
             move || -> Result<Vec<u8>, Error> {
                 let _retained = readback_retained;
-                panic!("a process without destination devices must not read the value back")
+                panic!("a process without target devices must not read the value back")
             },
             |error| PjrtError::aborted(format!("upload failed: {error}")),
         )
@@ -3883,7 +3882,7 @@ mod tests {
             .unwrap()
         };
 
-        // This process holds no destination shard, so no upload of its own can report the producer of the value. The
+        // This process holds no target shard, so no upload of its own can report the producer of the value. The
         // result waits for the sources instead, as the uploads of the processes that hold the shards do.
         let (event, producer) = client.event(()).unwrap();
         let array = upload(ExecutionFence::new(vec![event]));
@@ -5099,7 +5098,7 @@ mod tests {
         assert_eq!(upload.buffer_type, BufferType::F32);
         assert_eq!(upload.dimensions, vec![2]);
 
-        // The destination buffer is pending until its transfer manager fills it, and dropping the manager without
+        // The target buffer is pending until its transfer manager fills it, and dropping the manager without
         // filling the buffer poisons it, so that no reader of the buffer can wait forever.
         assert_eq!(ExecutionFence::new(vec![buffer.ready().unwrap()]).is_ready(), Ok(false));
         drop(upload);
@@ -5337,7 +5336,7 @@ mod tests {
     fn test_run_host_uploads() {
         let client = cpu_client(2);
         let devices = client.addressable_devices().unwrap();
-        let destinations = || {
+        let targets = || {
             devices
                 .iter()
                 .map(|device| {
@@ -5350,8 +5349,8 @@ mod tests {
             values_from_bytes::<f32>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice())
         };
 
-        // Each destination buffer receives the bytes that are prepared for the index of its upload.
-        let (uploads, buffers) = destinations();
+        // Each target buffer receives the bytes that are prepared for the index of its upload.
+        let (uploads, buffers) = targets();
         run_host_uploads(
             uploads,
             |index| Ok(HostBufferSlice::from(values_to_bytes(&[index as f32, 1.]))),
@@ -5361,8 +5360,8 @@ mod tests {
 
         // After the first failure no further bytes are prepared, the buffers that already received their bytes keep
         // them, and the others report the error that is derived from the failure.
-        let (mut uploads, mut buffers) = destinations();
-        let (more_uploads, more_buffers) = destinations();
+        let (mut uploads, mut buffers) = targets();
+        let (more_uploads, more_buffers) = targets();
         uploads.extend(more_uploads);
         buffers.extend(more_buffers);
         let mut prepared = Vec::new();
@@ -5542,7 +5541,7 @@ mod tests {
             ("the second process", onto(mesh(&[(1, 1)]))),
             ("a device", Some(PlacementRequest::from(Device::new(0, 0)))),
             ("a memory", Some(PlacementRequest::from(Memory::Device))),
-            ("no destination", None),
+            ("no target", None),
         ];
         let outcomes =
             rows.iter().map(|(name, request)| (*name, comparison.applies(request.as_ref()))).collect::<Vec<_>>();
@@ -5556,7 +5555,7 @@ mod tests {
                 ("the second process", false),
                 ("a device", false),
                 ("a memory", false),
-                ("no destination", false),
+                ("no target", false),
             ],
         );
     }
@@ -5564,7 +5563,7 @@ mod tests {
     #[test]
     fn test_session_place_submits_one_value_comparison_per_call() {
         // Two devices of one process stand for the participants of two processes that contribute the same digest, and
-        // destinations on this process take part in the comparison. The positions that the session assigns count the
+        // targets on this process take part in the comparison. The positions that the session assigns count the
         // comparisons that the calls submit.
         let store: &'static SingleProcessKeyValueStore = Box::leak(Box::default());
         let options = ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() });
@@ -5833,7 +5832,7 @@ mod tests {
         }
         assert_eq!(
             DIFFERENT_VALUES_MESSAGE,
-            "the processes of the run placed different values onto a destination that all of them share, or one of \
+            "the processes of the run placed different values onto a target that all of them share, or one of \
              them rejected the same placement call, so their shards would not form one array; place the same value on \
              every process, or use `Array::from_host_shards` to place the part of the array that each process holds",
         );
