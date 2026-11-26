@@ -18,8 +18,8 @@
 //! [`ArrayShard::copy_to_host_bytes`] read values back to the host. The [`host`](mod@host) module implements the
 //! uploads and the readback of whole arrays, including the combination of the separate values that devices hold along
 //! unreduced mesh axes. See [`placement`](mod@placement) for the placement entry points and
-//! [`resharding`](mod@resharding) for the strategies that move runtime arrays. As in JAX, an array is committed to
-//! its devices when they were chosen on purpose (e.g., by a placement with a destination) and uncommitted when they are
+//! [`transfers`](mod@transfers) for the strategies that move runtime arrays. As in JAX, an array is committed to its
+//! devices when they were chosen on purpose (e.g., by a placement with a destination) and uncommitted when they are
 //! only a default (e.g., for a host value that was uploaded to the first device), and eager operations move uncommitted
 //! inputs to the devices of committed ones (refer to [`Array::is_committed`]). Array failures are reported through
 //! [`Error::Array`] with an [`ArrayError`].
@@ -61,10 +61,10 @@ use crate::{Error, Session, Type};
 pub mod host;
 pub mod metadata;
 pub mod placement;
-pub mod resharding;
 pub mod retained;
 pub mod shards;
 pub mod statistics;
+pub mod transfers;
 
 pub use placement::{PlaceInput, Placeable, PlacementOptions, SessionPlacementRequestParameter};
 pub use retained::RetainedArray;
@@ -735,7 +735,7 @@ impl Array {
     ///
     /// Every process of a distributed program that applies the same functions to the same kinds of inputs therefore
     /// computes the same fact for its own array, which is what lets every process choose the same strategy when it
-    /// places such an array on devices of several processes (refer to [`resharding`]).
+    /// places such an array on devices of several processes (refer to [`transfers`]).
     ///
     /// An array without the fact is treated as one whose devices every process knows, which holds only when every
     /// process of a distributed run names the same devices wherever a program names devices (e.g., the default mesh
@@ -1448,11 +1448,14 @@ mod tests {
         Array as CoreArray, ArrayIrType, ArrayIrValue, ArrayType, AssertionValue, Concretizable, DataType, Device,
         DeviceMesh, Differentiate, DifferentiationDual, DifferentiationError, Dimension, DimensionBounds,
         DimensionError, DimensionFromScalar, DimensionSize, DimensionVariable, Error as CoreError, Layout, LogicalMesh,
-        MaybeZero, Memory, MeshAxis, MeshAxisType, Neg, Place, Placed, Placement, ProgramError, Reference, Shape,
-        Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed, UnreducedKind,
-        Value as CoreValue, ValueProjection, WhilePredicate, differentiate_at,
+        MaybeZero, Memory, MeshAxis, MeshAxisType, Neg, Place, Placed, Placement, PlacementRequest, ProgramError,
+        Reference, Shape, Sharding, ShardingDimension, StaticShape, StridedLayout, TiledLayout, TypeError, Typed,
+        UnreducedKind, Value as CoreValue, ValueProjection, WhilePredicate, differentiate_at,
     };
-    use ryft_pjrt::{BufferType, Client, Error as PjrtError, ExecutionFence};
+    use ryft_pjrt::{
+        BufferSpecification, BufferType, Client, ClientOptions, CpuClientOptions, Error as PjrtError, ExecutionFence,
+        HostToDeviceTransferManager, load_cpu_plugin,
+    };
 
     use crate::arrays::metadata::ArrayOutputPlan;
     use crate::arrays::shards::ArrayShard;
@@ -1463,7 +1466,7 @@ mod tests {
         session_with_remote_devices, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Error, FromPjrt, RetainedArray, Session, ToPjrt, Value};
+    use crate::{Error, FromPjrt, PlacementOptions, RetainedArray, Session, ToPjrt, Value};
 
     use super::{Array, ArrayError, block_until_ready, ready};
 
@@ -1533,6 +1536,136 @@ mod tests {
         )
         .unwrap();
         (array, mesh, sharding)
+    }
+
+    /// Returns the PJRT memory kinds of the buffers that the addressable shards of `array` hold.
+    pub(super) fn shard_memory_kinds(array: &Array) -> Vec<String> {
+        array
+            .addressable_shards()
+            .map(|shard| shard.buffer().unwrap().memory().unwrap().kind().unwrap().into_owned())
+            .collect()
+    }
+
+    /// Returns the first addressable device of `client`.
+    pub(super) fn first_device(client: &ryft_pjrt::Client<'_>) -> Device {
+        Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()
+    }
+
+    /// Returns a new CPU client with `device_count` devices, all of which belong to process 1.
+    pub(super) fn process_one_cpu_client(device_count: usize) -> &'static ryft_pjrt::Client<'static> {
+        let options = CpuClientOptions { device_count: Some(device_count), process_id: Some(1) };
+        Box::leak(Box::new(load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap()))
+    }
+
+    /// Places `source` on `target` through each entry point that places one array, in the order
+    /// `Array::to_placement`, `Array::into_placement` (of a clone of `source`), and `Session::place`, which must all
+    /// place it alike.
+    pub(super) fn place_through_entry_points(
+        session: &Session,
+        source: &Array,
+        target: impl Into<PlacementRequest>,
+    ) -> [Result<Array, Error>; 3] {
+        let target = target.into();
+        [
+            source.to_placement(session, target.clone()),
+            source.clone().into_placement(session, target.clone()),
+            session.place(source.clone(), PlacementOptions::to(target)),
+        ]
+    }
+
+    /// Returns a session of process 0 of two, which owns the two devices `d0` and `d1` of a CPU client and declares
+    /// the two devices `R0` and `R1` of process 1, together with the mesh `[d0, R0, d1, R1]` with the explicit axes
+    /// `x` and `y` of size two, on which every device of process 0 has a device of process 1 along `y`.
+    pub(super) fn two_process_mesh_2x2() -> (Session, DeviceMesh) {
+        let client = cpu_client(2);
+        let local = Session::builder().client(client).build().unwrap().addressable_devices().unwrap();
+        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
+        let remote = [Device::new(next_id, 1), Device::new(next_id + 1, 1)];
+        let session = session_with_remote_devices(client, remote);
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(logical_mesh, vec![local[0], remote[0], local[1], remote[1]]).unwrap();
+        (session, mesh)
+    }
+
+    /// Renders the placements that two processes make of one value, those of process 0 first and each through two
+    /// entry points, as the bytes of the shards that each process holds or as `error: <message>`. Asserts that the
+    /// entry points of each process agree and that both processes return the same metadata when both succeed, so
+    /// that a process that owns no device of the target still returns the result of the owner without buffers.
+    /// Returns the outcomes of process 0 and of process 1.
+    pub(super) fn process_outcomes(placements: &[Result<Array, String>], context: &str) -> (String, String) {
+        let rendered = placements
+            .iter()
+            .map(|placed| match placed {
+                Ok(placed) => {
+                    placed.block_until_ready().unwrap();
+                    let shards = placed.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap());
+                    format!("{:?}", shards.collect::<Vec<_>>())
+                }
+                Err(error) => format!("error: {error}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], rendered[1], "{context}: the entry points of process 0 disagree");
+        assert_eq!(rendered[2], rendered[3], "{context}: the entry points of process 1 disagree");
+        if let [Ok(owner), _, Ok(other), _] = placements {
+            assert_eq!(other.r#type(), owner.r#type(), "{context}");
+            assert_eq!(other.mesh(), owner.mesh(), "{context}");
+            assert_eq!(other.sharding(), owner.sharding(), "{context}");
+            assert_eq!(other.is_committed(), owner.is_committed(), "{context}");
+        }
+        (rendered[0].clone(), rendered[2].clone())
+    }
+
+    /// Returns one transfer manager for each addressable device of `client`, in device order, each of which holds one
+    /// buffer of `specification` in the default memory of its device. The contents of those buffers stay undefined
+    /// until the test defines them or makes them fail through their managers, which it can do after the work that
+    /// reads them has started.
+    pub(super) fn transfer_managers<D: AsRef<[u64]> + Clone>(
+        client: &'static ryft_pjrt::Client<'static>,
+        specification: BufferSpecification<D>,
+    ) -> Vec<HostToDeviceTransferManager<'static>> {
+        client
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| {
+                let memory = device.default_memory().unwrap();
+                client.host_to_device_transfer_manager(vec![specification.clone()], memory).unwrap()
+            })
+            .collect()
+    }
+
+    /// Returns an `f32[4]` array that is replicated over `mesh`, which must hold every addressable device of the
+    /// client of `session`, together with the transfer managers whose buffers are its replicas (refer to
+    /// [`transfer_managers`]).
+    pub(super) fn pending_replicated_vector(
+        session: &Session,
+        mesh: &DeviceMesh,
+    ) -> (Array, Vec<HostToDeviceTransferManager<'static>>) {
+        let managers = transfer_managers(session.client(), BufferSpecification::new(BufferType::F32, [4u64]));
+        let buffers = managers.iter().map(|manager| manager.retrieve_buffer(0).unwrap()).collect();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let array = Array::from_addressable_buffers(session, r#type, mesh.clone(), Some(replicated), buffers).unwrap();
+        (array, managers)
+    }
+
+    /// Returns a mesh over `devices` with the one explicit axis `x`.
+    pub(super) fn explicit_mesh(devices: &[Device]) -> DeviceMesh {
+        let axis = MeshAxis::new("x", devices.len(), MeshAxisType::Explicit).unwrap();
+        DeviceMesh::new(LogicalMesh::new(vec![axis]).unwrap(), devices.to_vec()).unwrap()
+    }
+
+    /// Returns the rank of `client` in a CUDA job of two ranks, the devices of both ranks in the order of the client,
+    /// and a new session of `client`.
+    #[cfg(feature = "cuda-13")]
+    pub(super) fn cuda_rank_session(client: &'static Client<'static>) -> (usize, Vec<Device>, Session) {
+        let rank = client.process_index().unwrap();
+        let devices = client.devices().unwrap().iter().map(|device| Device::from_pjrt(device).unwrap()).collect();
+        (rank, devices, Session::builder().client(client).build().unwrap())
     }
 
     #[test]

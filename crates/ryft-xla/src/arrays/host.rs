@@ -39,7 +39,7 @@
 //! and rounded to the data type once, and a host value is split into summands by writing the additive identity of the
 //! data type to the devices that holds the unreduced additive identity, which is rejected with
 //! [`ArrayError::MissingUnreducedSumIdentity`] for a data type without such an identity. The device placements of
-//! [`crate::arrays::resharding`] read these functions to decide which changes of reduction state a compiled program
+//! [`crate::arrays::transfers`] read these functions to decide which changes of reduction state a compiled program
 //! makes and which need this module instead, and they introduce a pending sum by writing these identities themselves.
 //!
 //! For the sums of floating point and complex values that a collective completes, a device placement may differ from
@@ -151,7 +151,7 @@ impl Array {
     /// result. It is uncommitted only when its devices are this default and it lives on a single device, so an
     /// uncommitted array always lives on a single device. Whether committed or not, devices that neither `mesh` nor the
     /// mesh of `session` selected are ones that this process chose on its own, which a later placement onto devices of
-    /// several processes takes into account (refer to [`crate::arrays::resharding`]).
+    /// several processes takes into account (refer to [`crate::arrays::transfers`]).
     ///
     /// When the destination mesh spans several processes, each process uploads only the shards of its own devices,
     /// so every process must call this function with the same host value, which is a precondition of every whole-host
@@ -1365,7 +1365,7 @@ impl CollectiveReduction {
 }
 
 /// Classifies how a collective of XLA makes `change` for values of `data_type`, which is the one owner of that fact:
-/// the device placements of [`crate::arrays::resharding`] take the device path only for [`CollectiveReduction::Exact`]
+/// the device placements of [`crate::arrays::transfers`] take the device path only for [`CollectiveReduction::Exact`]
 /// and otherwise a host round trip with this module or an error, and the lowering of compiled programs (refer to
 /// `validate_pending_reduction_change` in `crate::lowering`) lowers [`CollectiveReduction::Exact`] and
 /// [`CollectiveReduction::DropsNan`] and rejects the rest before anything is compiled. The cases were decided by
@@ -1473,7 +1473,7 @@ pub(crate) fn compiled_reduction_rejection(data_type: DataType, change: Reductio
 /// than one is completed and another stays pending. Every other data type and kind accumulates in itself, where a
 /// partial completion only fixes the order of accumulation, which the contract of floating point sums allows. An axis
 /// of size one holds a single contribution and changes nothing. The rule reads only shared metadata, so every process
-/// decides alike. Its readers are the device placements of [`crate::arrays::resharding`], which take a host round trip
+/// decides alike. Its readers are the device placements of [`crate::arrays::transfers`], which take a host round trip
 /// instead, and the lowering of compiled programs, which rejects such a program before compilation because a compiled
 /// program has no exact alternative.
 pub(crate) fn partial_completion_rejection<

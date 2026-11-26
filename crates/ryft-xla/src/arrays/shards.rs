@@ -464,7 +464,7 @@ impl ShardLayout {
 /// same bytes. This definition is shared by the functions that substitute one shard for another or decide that an
 /// array holds the same bytes along a mesh axis. Host readback reads one replica per contribution (refer to
 /// [`Array::copy_to_host_bytes`]), and partial imports require equal bytes for a contribution's replicas (refer to
-/// [`Array::from_addressable_buffers`] and [`Array::from_host_shards`]). Placements in [`crate::arrays::resharding`]
+/// [`Array::from_addressable_buffers`] and [`Array::from_host_shards`]). Placements in [`crate::arrays::transfers`]
 /// use the same rules to find a local replica for a missing buffer, move shards or regions by slice (refer to
 /// [`Sharding::holds_one_value_per_slice`]) or by contribution, restrict an array to coordinate zero along the axes
 /// of an introduced sum (refer to [`Sharding::distinguishes_shards_along`]), and choose the process of a host round
@@ -559,7 +559,7 @@ impl Array {
 /// Reads the shard with `shape` that `buffer` holds back to the host in dense row-major order, irrespective of the
 /// physical layout of `buffer`. `wait` waits for the copy to the host and returns its bytes (e.g., by awaiting its
 /// [`Event`], or through the work tracking of a session). This is the one reader of a single shard, which
-/// [`ArrayShard::copy_to_host_bytes`] and the host round trips of placements (refer to [`crate::arrays::resharding`])
+/// [`ArrayShard::copy_to_host_bytes`] and the host round trips of placements (refer to [`crate::arrays::transfers`])
 /// use alike.
 ///
 /// A shard without elements issues no copy, because PJRT can answer a zero byte copy of a bounded-dynamic buffer with

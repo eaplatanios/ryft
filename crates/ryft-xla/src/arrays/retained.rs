@@ -13,8 +13,8 @@ use ryft_pjrt::{Client, ExecutionFence};
 
 use crate::arrays::host::validate_mesh_devices;
 use crate::arrays::metadata::ArrayMetadata;
-use crate::arrays::resharding::PlacementPlanningView;
 use crate::arrays::shards::{ArrayShard, ShardContribution};
+use crate::arrays::transfers::PlacementPlanningView;
 use crate::arrays::{Array, ArrayError, ArrayParts};
 use crate::{Error, Session};
 
