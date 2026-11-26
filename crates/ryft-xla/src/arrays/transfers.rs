@@ -400,6 +400,16 @@ impl Array {
         })
     }
 
+    /// Returns the addressable devices of the client of this array, which runs in the process with index
+    /// `process_index`, by their identifiers. A failed query of an identifier is returned as the error of PJRT that it
+    /// is, rather than leaving that device out, which a later lookup would report as a device that this process does
+    /// not address.
+    fn addressable_devices_by_id(&self, process_index: usize) -> Result<AddressableDevices, Error> {
+        let devices = self.client().addressable_devices()?;
+        let devices = devices.into_iter().map(|device| Ok((device.id()?, device))).collect::<Result<_, PjrtError>>()?;
+        Ok(AddressableDevices { process_index, devices })
+    }
+
     /// Places this array on the devices, with the sharding, and in the storage that `target` names, with the memory,
     /// layout, and host fallback rules of [`Self::to_placement`]. A request resolves its default memory into `target`
     /// (refer to [`PlacementRequest::target_memory`]), so a memory that `target` omits keeps the memory of this array.
@@ -1049,6 +1059,195 @@ impl Array {
         output.execution_fence = completion.join(self.execution_fence().cloned());
 
         Ok(output)
+    }
+
+    /// Places this array on `mesh` according to `sharding` by slicing on the source devices and joining the received
+    /// regions on the target devices, which [`Self::device_placement_strategy`] chose with `plan` (i.e., the moves of
+    /// the regions of every target shard) and `remote_layouts` (i.e., the default layout of the shape of every region
+    /// that crosses processes), both of which [`PlacementPlanningView::shard_region_plan`] derived. Every process
+    /// derives the same plan, and each one performs only the part of each move that [`ShardMove::role`] assigns to it.
+    ///
+    /// Slices and cross-host transfers read device buffers, so a source shard that the type of this array declares in
+    /// another memory, or in a layout other than the dense row-major one, is staged in device memory and in that layout
+    /// first (refer to [`Self::stage_region_source`]), once for all of its regions and only when a move reads it. The
+    /// result is in default device memory and declares no layout, whatever this array declares, because its buffers are
+    /// slices, received buffers, and concatenations in the default layout, as well as whole source shards in their own
+    /// layout. The caller moves it to the requested memory and layout (e.g., with [`Self::place_storage`]).
+    fn place_shard_regions(
+        &self,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        plan: &ShardMovePlan,
+        remote_layouts: &HashMap<StaticShape, ryft_pjrt::Layout>,
+    ) -> Result<Self, Error> {
+        let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
+        let targets = layout.descriptors();
+        let session = self.session();
+        let client = session.client();
+        let process_index = client.process_index()?;
+
+        let devices = self.addressable_devices_by_id(process_index)?;
+        let data_type = self.data_type();
+        let mut completion = PlacementCompletion::default();
+
+        // A region that this process sends to another one leaves from the planned device, with which its receiver pairs
+        // it, so a local replica that serves a planned one without a buffer is copied to that device first, once for
+        // all the regions of that shard, as for sends of whole shards. This process stages a source shard (refer to
+        // `Self::stage_region_source`) once, before its transfers when a send reads it and after them otherwise.
+        let replicas = LocalReplicas::new(process_index);
+        let mut work = session.reserve_work();
+        let mut transfers = Vec::new();
+        let mut staged_buffers = HashMap::new();
+        for movement in &plan.moves {
+            let device = movement.target_device;
+            match movement.role(process_index) {
+                Some(MoveRole::Send) => {
+                    let source = &self.shards()[movement.source_shard_index];
+                    let buffer = match staged_buffers.entry(source.index()) {
+                        Entry::Occupied(entry) => Arc::clone(entry.get()),
+                        Entry::Vacant(entry) => {
+                            let source_device = devices.get(source.device().id())?;
+                            let buffer = self.cross_host_source_buffer(
+                                &replicas,
+                                source.index(),
+                                source_device,
+                                &mut completion,
+                            )?;
+                            let buffer = self.stage_region_source(source, buffer, &mut work, &mut completion)?;
+                            Arc::clone(entry.insert(buffer))
+                        }
+                    };
+                    let buffer = Self::prepare_shard_region(
+                        session,
+                        data_type,
+                        source,
+                        buffer,
+                        &movement.slice,
+                        Some(&remote_layouts[&movement.shape()]),
+                        &mut completion,
+                    )?;
+                    transfers.push(CrossHostTransfer::Send {
+                        source: movement.source_device.id(),
+                        target: device.id(),
+                        transfer_key: movement.transfer_key,
+                        buffer,
+                    });
+                }
+                Some(MoveRole::Receive) => transfers.push(CrossHostTransfer::Receive {
+                    source: movement.source_device.id(),
+                    target: device.id(),
+                    transfer_key: movement.transfer_key,
+                    device: devices.get(device.id())?,
+                    element_type: plan.element_type,
+                    dimensions: cross_host_shape(movement.target_shard_index, &movement.shape())?,
+                }),
+                Some(MoveRole::Copy) | None => {}
+            }
+        }
+
+        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, Memory::Device)?;
+        let mut target_buffers = HashMap::new();
+        for received in received_buffers {
+            completion.track_buffer(&received.buffer)?;
+            target_buffers.insert(received.transfer_key, Arc::new(received.buffer));
+        }
+
+        completion.track_empty_shard_buffers(self)?;
+
+        // A region between two devices of this process involves no other process, so another local replica of its
+        // source slice can serve it when the planned one has no buffer, as for local copies of whole shards. A staged
+        // shard is the shard itself or a copy of a replica of its contribution on its device, so the regions of both
+        // phases share one staged buffer for each shard.
+        for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
+            let device = movement.target_device;
+            let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index, device)?;
+            let buffer = match staged_buffers.entry(source.index()) {
+                Entry::Occupied(entry) => Arc::clone(entry.get()),
+                Entry::Vacant(entry) => {
+                    let buffer = self.stage_region_source(source, Arc::clone(buffer), &mut work, &mut completion)?;
+                    Arc::clone(entry.insert(buffer))
+                }
+            };
+            let slice = &movement.slice;
+            let buffer = Self::prepare_shard_region(session, data_type, source, buffer, slice, None, &mut completion)?;
+            let buffer = if source.device() == device {
+                buffer
+            } else {
+                completion.track_new(&mut work, buffer.copy_to_device(devices.get(device.id())?.clone())?)?
+            };
+            target_buffers.insert(movement.transfer_key, buffer);
+        }
+
+        let mut regions = vec![Vec::new(); targets.len()];
+        for movement in &plan.moves {
+            regions[movement.target_shard_index].push(movement);
+        }
+
+        let mut buffers = Vec::new();
+        for (target, regions) in targets.iter().zip(regions) {
+            let device = target.device();
+            if device.process_index() != process_index {
+                continue;
+            }
+
+            // An empty shard has no intersections to transfer or concatenate. Its exact shape still belongs
+            // to the result, even when another dimension of that shape is nonzero.
+            if target.slice().iter().any(Range::is_empty) {
+                let dimensions = target.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
+                let specification = BufferSpecification::new(data_type.executable_buffer_type(), dimensions);
+                let buffer = client.uninitialized_buffer(specification, devices.get(device.id())?.clone())?;
+                buffers.push(completion.track_new(&mut work, buffer)?);
+                continue;
+            }
+
+            // Every region of a local target has exactly one local copy or cross-host receive.
+            let missing = ArrayError::MissingShardBuffer { shard_index: target.index(), device_id: device.id() };
+            let pieces = regions
+                .into_iter()
+                .map(|movement| {
+                    let buffer = target_buffers.remove(&movement.transfer_key).ok_or_else(|| missing.clone())?;
+                    Ok((movement.slice.as_slice(), buffer))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            buffers.push(Self::assemble_shard_regions(session, data_type, target, pieces, &mut completion)?);
+        }
+
+        let r#type = self.r#type().into_owned().with_memory(Memory::Device).with_layout(None).with_sharding(None)?;
+        let mut output = Self::from_addressable_buffers_internal(
+            session,
+            r#type,
+            Some(sharding.clone()),
+            mesh.clone(),
+            None,
+            buffers,
+            false,
+        )?;
+
+        // A readback reads one replica of each tile, so the fence of the result joins every copy, receive, slice,
+        // and concatenation that produced a buffer of the result with the fence of this array.
+        output.execution_fence = completion.join(self.execution_fence().cloned());
+        output.send_fence = send_fence;
+
+        Ok(output)
+    }
+
+    /// Returns the result of placing this array on `mesh` according to `sharding` in `memory` in a process
+    /// that takes no part in that placement (refer to [`Self::metadata_only_placement`]), after the checks of
+    /// [`Self::admit_host_round_trip_elsewhere`] for `round_trip`, which names the cause, the owner, the mesh,
+    /// and the sharding of a host round trip that another process makes for it, if any.
+    fn place_elsewhere(
+        &self,
+        round_trip: Option<(&HostRoundTripCause, Option<usize>, &DeviceMesh, &Sharding)>,
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        memory: Memory,
+        layout: Option<&Layout>,
+    ) -> Result<Self, Error> {
+        if let Some((cause, owner, round_trip_mesh, round_trip_sharding)) = round_trip {
+            self.admit_host_round_trip_elsewhere(cause, owner, round_trip_mesh, round_trip_sharding, memory, layout)?;
+        }
+        let r#type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(memory);
+        self.metadata_only_placement(self.session(), r#type, mesh, sharding)
     }
 
     /// Copies `buffer` to `memory`, recording the new buffer in `work` and `completion`. If no buffer has the
@@ -1809,171 +2008,6 @@ impl Array {
         Self::copy_shard_through_host(session, &buffer, shape, buffer_type, memory, Some(layout.clone()), completion)
     }
 
-    /// Places this array on `mesh` according to `sharding` by slicing on the source devices and joining the received
-    /// regions on the target devices, which [`Self::device_placement_strategy`] chose with `plan` (i.e., the moves
-    /// of the regions of every target shard) and `remote_layouts` (i.e., the default layout of the shape of every
-    /// region that crosses processes), both of which [`PlacementPlanningView::shard_region_plan`] derived. Every
-    /// process derives the same plan, and each one performs only the part of each move that [`ShardMove::role`] assigns
-    /// to it.
-    ///
-    /// Slices and cross-host transfers read device buffers, so a source shard that the type of this array declares in
-    /// another memory, or in a layout other than the dense row-major one, is staged in device memory and in that layout
-    /// first (refer to [`Self::stage_region_source`]), once for all of its regions and only when a move reads it. The
-    /// result is in default device memory and declares no layout, whatever this array declares, because its buffers are
-    /// slices, received buffers, and concatenations in the default layout, as well as whole source shards in their own
-    /// layout. The caller moves it to the requested memory and layout (e.g., with [`Self::place_storage`]).
-    fn place_shard_regions(
-        &self,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        plan: &ShardMovePlan,
-        remote_layouts: &HashMap<StaticShape, ryft_pjrt::Layout>,
-    ) -> Result<Self, Error> {
-        let layout = ShardLayout::new(&self.shape(), mesh, sharding)?;
-        let targets = layout.descriptors();
-        let session = self.session();
-        let client = session.client();
-        let process_index = client.process_index()?;
-
-        let devices = self.addressable_devices_by_id(process_index)?;
-        let data_type = self.data_type();
-        let mut completion = PlacementCompletion::default();
-
-        // A region that this process sends to another one leaves from the planned device, with which its receiver pairs
-        // it, so a local replica that serves a planned one without a buffer is copied to that device first, once for
-        // all the regions of that shard, as for sends of whole shards. This process stages a source shard (refer to
-        // `Self::stage_region_source`) once, before its transfers when a send reads it and after them otherwise (refer
-        // to the documentation of this module).
-        let replicas = LocalReplicas::new(process_index);
-        let mut work = session.reserve_work();
-        let mut transfers = Vec::new();
-        let mut staged_buffers = HashMap::new();
-        for movement in &plan.moves {
-            let device = movement.target_device;
-            match movement.role(process_index) {
-                Some(MoveRole::Send) => {
-                    let source = &self.shards()[movement.source_shard_index];
-                    let buffer = match staged_buffers.entry(source.index()) {
-                        Entry::Occupied(entry) => Arc::clone(entry.get()),
-                        Entry::Vacant(entry) => {
-                            let source_device = devices.get(source.device().id())?;
-                            let buffer = self.cross_host_source_buffer(
-                                &replicas,
-                                source.index(),
-                                source_device,
-                                &mut completion,
-                            )?;
-                            let buffer = self.stage_region_source(source, buffer, &mut work, &mut completion)?;
-                            Arc::clone(entry.insert(buffer))
-                        }
-                    };
-                    let buffer = Self::prepare_shard_region(
-                        session,
-                        data_type,
-                        source,
-                        buffer,
-                        &movement.slice,
-                        Some(&remote_layouts[&movement.shape()]),
-                        &mut completion,
-                    )?;
-                    transfers.push(CrossHostTransfer::Send {
-                        source: movement.source_device.id(),
-                        target: device.id(),
-                        transfer_key: movement.transfer_key,
-                        buffer,
-                    });
-                }
-                Some(MoveRole::Receive) => transfers.push(CrossHostTransfer::Receive {
-                    source: movement.source_device.id(),
-                    target: device.id(),
-                    transfer_key: movement.transfer_key,
-                    device: devices.get(device.id())?,
-                    element_type: plan.element_type,
-                    dimensions: cross_host_shape(movement.target_shard_index, &movement.shape())?,
-                }),
-                Some(MoveRole::Copy) | None => {}
-            }
-        }
-        let (send_fence, received_buffers) = issue_cross_host_transfers(session, transfers, Memory::Device)?;
-        let mut target_buffers = HashMap::new();
-        for received in received_buffers {
-            completion.track_buffer(&received.buffer)?;
-            target_buffers.insert(received.transfer_key, Arc::new(received.buffer));
-        }
-
-        completion.track_empty_shard_buffers(self)?;
-
-        // A region between two devices of this process involves no other process, so another local replica of its
-        // source slice can serve it when the planned one has no buffer, as for local copies of whole shards. A staged
-        // shard is the shard itself or a copy of a replica of its contribution on its device, so the regions of both
-        // phases share one staged buffer for each shard.
-        for movement in plan.moves_with_role(process_index, MoveRole::Copy) {
-            let device = movement.target_device;
-            let (source, buffer) = self.local_replica(&replicas, movement.source_shard_index, device)?;
-            let buffer = match staged_buffers.entry(source.index()) {
-                Entry::Occupied(entry) => Arc::clone(entry.get()),
-                Entry::Vacant(entry) => {
-                    let buffer = self.stage_region_source(source, Arc::clone(buffer), &mut work, &mut completion)?;
-                    Arc::clone(entry.insert(buffer))
-                }
-            };
-            let slice = &movement.slice;
-            let buffer = Self::prepare_shard_region(session, data_type, source, buffer, slice, None, &mut completion)?;
-            let buffer = if source.device() == device {
-                buffer
-            } else {
-                completion.track_new(&mut work, buffer.copy_to_device(devices.get(device.id())?.clone())?)?
-            };
-            target_buffers.insert(movement.transfer_key, buffer);
-        }
-
-        let mut regions = vec![Vec::new(); targets.len()];
-        for movement in &plan.moves {
-            regions[movement.target_shard_index].push(movement);
-        }
-        let mut buffers = Vec::new();
-        for (target, regions) in targets.iter().zip(regions) {
-            let device = target.device();
-            if device.process_index() != process_index {
-                continue;
-            }
-            // An empty shard has no intersections to transfer or concatenate. Its exact shape still belongs
-            // to the result, even when another dimension of that shape is nonzero.
-            if target.slice().iter().any(Range::is_empty) {
-                let dimensions = target.slice().iter().map(|range| range.len() as u64).collect::<Vec<_>>();
-                let specification = BufferSpecification::new(data_type.executable_buffer_type(), dimensions);
-                let buffer = client.uninitialized_buffer(specification, devices.get(device.id())?.clone())?;
-                buffers.push(completion.track_new(&mut work, buffer)?);
-                continue;
-            }
-            // Every region of a local target has exactly one local copy or cross-host receive.
-            let missing = ArrayError::MissingShardBuffer { shard_index: target.index(), device_id: device.id() };
-            let pieces = regions
-                .into_iter()
-                .map(|movement| {
-                    let buffer = target_buffers.remove(&movement.transfer_key).ok_or_else(|| missing.clone())?;
-                    Ok((movement.slice.as_slice(), buffer))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            buffers.push(Self::assemble_shard_regions(session, data_type, target, pieces, &mut completion)?);
-        }
-        let r#type = self.r#type().into_owned().with_memory(Memory::Device).with_layout(None).with_sharding(None)?;
-        let mut output = Self::from_addressable_buffers_internal(
-            session,
-            r#type,
-            Some(sharding.clone()),
-            mesh.clone(),
-            None,
-            buffers,
-            false,
-        )?;
-        // A readback reads one replica of each tile, so the fence of the result joins every copy, receive, slice, and
-        // concatenation that produced a buffer of the result with the fence of this array.
-        output.execution_fence = completion.join(self.execution_fence().cloned());
-        output.send_fence = send_fence;
-        Ok(output)
-    }
-
     /// Returns `buffer`, which holds the contribution of `shard`, a shard of this array on a device of this process, on
     /// the device of `shard`, staged for slicing and cross-host sends of its regions (refer to
     /// [`Self::place_shard_regions`]). That is the default memory of that device and, when this array declares a
@@ -2087,25 +2121,6 @@ impl Array {
             values = joined;
         }
         Ok(Arc::clone(values[0].1.shards()[0].buffer().unwrap()))
-    }
-
-    /// Returns the result of placing this array on `mesh` according to `sharding` in `memory` in a process that takes
-    /// no part in that placement (refer to [`Self::metadata_only_placement`]), after the checks of
-    /// [`Self::admit_host_round_trip_elsewhere`] for `round_trip`, which names the cause, the owner, the mesh, and the
-    /// sharding of a host round trip that another process makes for it, if any.
-    fn place_elsewhere(
-        &self,
-        round_trip: Option<(&HostRoundTripCause, Option<usize>, &DeviceMesh, &Sharding)>,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-        memory: Memory,
-        layout: Option<&Layout>,
-    ) -> Result<Self, Error> {
-        if let Some((cause, owner, round_trip_mesh, round_trip_sharding)) = round_trip {
-            self.admit_host_round_trip_elsewhere(cause, owner, round_trip_mesh, round_trip_sharding, memory, layout)?;
-        }
-        let r#type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(memory);
-        self.metadata_only_placement(self.session(), r#type, mesh, sharding)
     }
 
     /// Returns a handle of this array that a placement which fails after it started to run on this array returns for
@@ -2400,16 +2415,6 @@ impl Array {
         }
         let copied = buffer.copy_to_memory(devices.get(device.id())?.memory(self.r#type().memory())?)?;
         completion.track_new(work, copied)
-    }
-
-    /// Returns the addressable devices of the client of this array, which runs in the process with index
-    /// `process_index`, by their identifiers. A failed query of an identifier is returned as the error of PJRT that it
-    /// is, rather than leaving that device out, which a later lookup would report as a device that this process does
-    /// not address.
-    fn addressable_devices_by_id(&self, process_index: usize) -> Result<AddressableDevices, Error> {
-        let devices = self.client().addressable_devices()?;
-        let devices = devices.into_iter().map(|device| Ok((device.id()?, device))).collect::<Result<_, PjrtError>>()?;
-        Ok(AddressableDevices { process_index, devices })
     }
 
     /// Compiles `program`, the identity that reshards this array, which must be on the mesh of `program` with its

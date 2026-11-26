@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, Instruction, LogicalMesh, MeshAxisType,
-    Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily, PlaceOperation,
-    PlacementRequest, Program, ProgramError, Region as CoreRegion, RegionId, RegionPlacementSummary, RegionRef,
-    RequestedPlacement, Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation,
-    Transform, TransformArtifact, Type as CoreType, Typed, Value,
+    Parameterized, ParameterizedFamily, PlaceOperation, PlacementRequest, Program, ProgramError, Region as CoreRegion,
+    RegionId, RegionPlacementSummary, RegionRef, RequestedPlacement, Sharding, ShardingDimension,
+    StopGradientOperation, TagOperation, TransferToMemoryOperation, Transform, TransformArtifact, Type as CoreType,
+    Typed, Value,
 };
 
 use crate::lowering::emissions::{
@@ -519,23 +519,6 @@ impl ShardingLoweringExtension for Sharding {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns what `analyse` returns for the entry region of the program that lowering emits for `region` (refer to
-/// [`ProgramLoweringExtension::pruned_for_lowering`]), every output of `region` being used, which is `region` with its
-/// closure without the unused outputs of instructions that carry regions and without dead instructions and constants,
-/// or with its closure unchanged when it cannot be pruned (a program that cannot be pruned cannot be lowered either, so
-/// that an analysis of it never hides anything of such a program). The session constants of a region are read from this
-/// program (refer to [`owned_session_constants`]), as the placement requests of a region are read from the same program
-/// (refer to [`RegionPlacementSummary`]).
-fn analyse_pruned_region<V, O, R>(region: RegionRef<'_, V, O>, analyse: impl FnOnce(RegionRef<'_, V, O>) -> R) -> R
-where
-    V: Value<Type = Type>,
-    O: CoreOperation<Type = Type> + OperationPayloadProjection,
-{
-    let program = region.to_program();
-    let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
-    analyse(pruned.as_ref().unwrap_or(&program).entry_region_ref())
-}
-
 /// Derives the [`RegionPlacementSummary`] of the program that lowering emits for a region, and the devices that its
 /// placement requests name.
 pub(crate) trait RegionPlacementSummaryExtension: Sized {
@@ -616,8 +599,8 @@ fn entry_session_constants<O: LowerableOperationFamily>(
 }
 
 /// Returns the distinct arrays of the session constants (refer to [`RetainedArray`]) that the program that lowering
-/// emits for `region` holds in the regions that `region` owns, every output of `region` being used (refer to
-/// [`analyse_pruned_region`]), in the order of a walk of those regions. The regions that `region` owns are its
+/// emits for `region` holds in the regions that `region` owns, in the order of a walk of those regions. The program
+/// is pruned and simplified with every output of `region` treated as used. The regions that `region` owns are its
 /// computation regions (refer to [`RegionRef::computation_regions`]) except the callees of the `call`s among them
 /// and everything below those callees, because a call keeps its own placement boundary, so the regions of a
 /// `condition`, a loop, or a `rematerialize` nested in `region` are owned. A constant that only dead instructions use
@@ -637,7 +620,11 @@ pub(crate) fn owned_session_constants(
             .computation_regions()
             .any(|region| region.atoms().iter().any(|atom| matches!(atom.as_constant(), Some(Constant::Session(_)))));
         let constants = if has_session_constants {
-            analyse_pruned_region(region, |entry| Arc::from(entry_session_constants(entry, target_platform)))
+            let program = region.to_program();
+            let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
+            // If pruning or simplification fails, inspect the original program so the failed transform hides no captures.
+            let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
+            Arc::from(entry_session_constants(entry, target_platform))
         } else {
             Arc::from([])
         };
