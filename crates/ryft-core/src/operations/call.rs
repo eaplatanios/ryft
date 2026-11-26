@@ -3,7 +3,7 @@
 //! the inputs and outputs of the function and the devices that the function names), together with what only the call
 //! knows about where its inputs are placed. This module owns the backend-neutral contract of a call, which is its
 //! payload and boundary, its type rule, the analysis of the placement requests of its callee (refer to
-//! [`RegionPlacementSummary`]), and its rules for reference discharge, interpretation, partial evaluation, batching,
+//! [`RegionPlacementRequests`]), and its rules for reference discharge, interpretation, partial evaluation, batching,
 //! differentiation, and transposition. Every rule keeps a call boundary on the calls that it derives instead of
 //! inlining the callee, so a transformed call still runs its callee as one function.
 //!
@@ -198,7 +198,7 @@ impl<T: Type> CallOperation<T> {
     /// Returns this [`CallOperation`] with the boundary of its callee, made of `mesh`, the device mesh that the
     /// callee was compiled for when it names devices, and of the sharding override of each callee input and output, by
     /// position, where [`None`] marks a position without one. A callee names devices when it has a sharding override
-    /// or its program requests a placement that names devices (refer to [`RegionPlacementSummary::has_requests`]),
+    /// or its program requests a placement that names devices (refer to [`RegionPlacementRequests::has_requests`]),
     /// so `mesh` must be present whenever an override is. A missing override is implicit past the end of either list.
     /// A list without overrides is stored as absent.
     pub fn with_boundary(
@@ -299,6 +299,13 @@ impl<T: Type> CallOperation<T> {
         Ok(self)
     }
 
+    /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
+    /// [`Self::names_devices`]).
+    #[inline]
+    pub fn without_mesh(&self) -> Self {
+        Self { mesh: None, ..self.clone() }
+    }
+
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
     #[inline]
     pub fn capture_count(&self) -> usize {
@@ -334,41 +341,19 @@ impl<T: Type> CallOperation<T> {
     /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
     /// it states a placement at its boundary (refer to [`states_boundary_placement`]) or when its callee requests
     /// a placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
-    /// [`RegionPlacementSummary::has_requests`]), which `callee_names_devices` says and which is asked only when the
+    /// [`RegionPlacementRequests::has_requests`]), which `callee_names_devices` says and which is asked only when the
     /// call records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when
     /// the function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
     /// [`Program::into_pruned`]) can record a mesh that only a request of a dropped output named, which this function
     /// no longer reports, as JAX lowers a nested `jit` function pruned to the outputs that its caller uses and so
     /// without the shardings of the dropped ones. The analyses of a program (refer to
-    /// [`RegionPlacementSummary::requests`] and [`RegionPlacementSummary::device_naming`]) answer
+    /// [`RegionPlacementRequests::requests`] and [`RegionPlacementRequests::device_naming`]) answer
     /// `callee_names_devices` with the facts of the callee that they derive in the same pass over the program, so that
-    /// they never analyse a callee again for each call that encloses it.
+    /// they never analyze a callee again for each call that encloses it.
     #[inline]
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
-    }
-
-    /// Returns whether this call states a placement at the boundary of its callee, which is when an input or an output
-    /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
-    /// [`states_boundary_placement`]).
-    #[inline]
-    fn states_boundary_placement(&self) -> bool {
-        states_boundary_placement(self.boundary_shardings())
-    }
-
-    /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
-    /// [`Self::names_devices`]).
-    #[inline]
-    pub fn without_mesh(&self) -> Self {
-        Self { mesh: None, ..self.clone() }
-    }
-
-    /// Returns this call without the mesh of its function (refer to [`Self::function_mesh`]), for a call that a
-    /// transform places into a program, where it follows its caller.
-    #[inline]
-    pub fn without_function_mesh(&self) -> Self {
-        Self { function_mesh: None, ..self.clone() }
     }
 
     /// Returns whether this call leaves each input without a sharding override placed as it is (refer to
@@ -394,6 +379,21 @@ impl<T: Type> CallOperation<T> {
     #[inline]
     pub fn derived_input_shardings(&self) -> Option<&[Option<Sharding>]> {
         self.derived_input_shardings.as_deref()
+    }
+
+    /// Returns whether this call states a placement at the boundary of its callee, which is when an input or an output
+    /// has a sharding override, and not when its lists of overrides are empty or hold none (refer to
+    /// [`states_boundary_placement`]).
+    #[inline]
+    fn states_boundary_placement(&self) -> bool {
+        states_boundary_placement(self.boundary_shardings())
+    }
+
+    /// Returns this call without the mesh of its function (refer to [`Self::function_mesh`]), for a call that a
+    /// transform places into a program, where it follows its caller.
+    #[inline]
+    fn without_function_mesh(&self) -> Self {
+        Self { function_mesh: None, ..self.clone() }
     }
 
     /// Returns whether the callee has any boundary sharding override.
@@ -465,7 +465,9 @@ impl<T: Type> CallOperation<T> {
     ///   - `boundary`: Effective boundary sharding of each input of this call (refer to `effective_input_boundary`).
     ///   - `known_input_indices`: Input of this call that each known callee input receives.
     ///   - `residual_inputs`: Source of each residual callee input.
-    ///   - `outputs`: Source of each output of this call among the outputs of the known or the residual callee.
+    ///   - `outputs`: Outputs of the split, each as the index of the output of this call that it computes together with
+    ///     its position among the outputs of the known or the residual callee. A split on residual demand computes
+    ///     each demanded output twice, once in the known callee and once more in the residual callee.
     ///   - `known_output_count`: Number of outputs of the known callee, including its residual edges.
     ///   - `residual_output_count`: Number of outputs of the residual callee.
     ///   - `eager`: Whether the known program's parent is eager.
@@ -476,15 +478,15 @@ impl<T: Type> CallOperation<T> {
         boundary: &[Option<Sharding>],
         known_input_indices: &[usize],
         residual_inputs: &[ResidualInputSource],
-        outputs: &[PartialEvaluationOutput<usize>],
+        outputs: impl IntoIterator<Item = (usize, PartialEvaluationOutput<usize>)>,
         known_output_count: usize,
         residual_output_count: usize,
         eager: bool,
     ) -> (Self, Self) {
         let mut known_outputs = vec![None; known_output_count];
         let mut residual_outputs = vec![None; residual_output_count];
-        for (index, output) in outputs.iter().enumerate() {
-            let position = match *output {
+        for (index, output) in outputs {
+            let position = match output {
                 PartialEvaluationOutput::Known(position) => known_outputs.get_mut(position),
                 PartialEvaluationOutput::Unknown(position) => residual_outputs.get_mut(position),
             };
@@ -549,9 +551,9 @@ impl<T: Type> CallOperation<T> {
             .flat_map(Type::identities)
             .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
         {
-            return Err(TypeError::invalid(
-                "`call` with callee-local result identities requires `with_callee_type_signature`",
-            ));
+            return Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` with callee-local result identities requires `with_callee_type_signature`",
+            )));
         }
         Ok(TypeIdentityRenaming::new())
     }
@@ -709,15 +711,15 @@ impl CallOperation<ArrayIrType> {
     /// Returns whether this call requests the placement of a value explicitly, which is when the call names devices
     /// (refer to [`Self::names_devices`]) or its callee requests a placement anywhere in the regions that the backend
     /// runs, including one that only moves a value to another memory (refer to
-    /// [`RegionPlacementSummary::has_requests`]). A backend commits every result of a call that requests a placement,
+    /// [`RegionPlacementRequests::has_requests`]). A backend commits every result of a call that requests a placement,
     /// so the placement decision of an eager application by a backend and the forwarding of partial evaluation (refer
-    /// to `Self::returns_input_unchanged`) read it from here. `callee_summary` returns the [`RegionPlacementSummary`]
+    /// to `Self::returns_input_unchanged`) read it from here. `callee_requests` returns the [`RegionPlacementRequests`]
     /// of the callee for the target platform that the call runs on, or for no target platform (refer to
-    /// [`RegionPlacementSummary::new`]), and it is called only when the answer depends on the callee. The summary of a
+    /// [`RegionPlacementRequests::new`]), and it is called only when the answer depends on the callee. The summary of a
     /// callee depends on the callee and the platform alone, so it is derived once for each callee and platform and
     /// retained with the callee, and repeated applications only look it up.
-    pub fn requests_placement(&self, callee_summary: impl Fn() -> RegionPlacementSummary) -> bool {
-        self.names_devices(|| callee_summary().has_requests(false)).is_some() || callee_summary().has_requests(true)
+    pub fn requests_placement(&self, callee_requests: impl Fn() -> RegionPlacementRequests) -> bool {
+        self.names_devices(|| callee_requests().has_requests(false)).is_some() || callee_requests().has_requests(true)
     }
 
     /// Returns, for each input of an application of this call to arguments of types `input_types`, whether the call
@@ -763,8 +765,8 @@ impl CallOperation<ArrayIrType> {
         input_types: &[Cow<'_, ArrayIrType>],
     ) -> Vec<bool>
     where
-        V: Value<Type = ArrayIrType> + 'static,
-        O: Operation<Type = ArrayIrType> + OperationPayloadProjection + 'static,
+        V: 'static + Value<Type = ArrayIrType>,
+        O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
     {
         let public_array_count = input_types
             .iter()
@@ -773,7 +775,7 @@ impl CallOperation<ArrayIrType> {
             .count();
         if public_array_count != 1
             || self.function_mesh.is_some()
-            || self.requests_placement(|| RegionPlacementSummary::new(callee))
+            || self.requests_placement(|| RegionPlacementRequests::new(callee))
         {
             return vec![false; input_types.len()];
         }
@@ -930,8 +932,8 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
-        // Operands map onto the callee inputs one for one, so the operands that the callee does not use are dropped
-        // together with its unused outputs (as in JAX's `dce_jaxpr_pjit_rule`). The lifted capture prefix is always
+        // Inputs map onto the callee inputs one for one, so the inputs that the callee does not use are dropped
+        // together with its unused outputs, as in JAX's `dce_jaxpr_pjit_rule`. The lifted capture prefix is always
         // kept, because the captures in the callee refer to it by absolute position.
         let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
         kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
@@ -1013,9 +1015,9 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
     }
 }
 
-// A `call` operation forwards its operands onto its callee's inputs one for one and reports the callee's outputs as
-// its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands.
-// The callee's lifted capture prefix is unaffected, because threaded state is appended after every declared operand,
+// A `call` operation forwards its inputs onto its callee's inputs one for one and reports the callee's outputs as
+// its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading inputs.
+// The callee's lifted capture prefix is unaffected, because threaded state is appended after every declared input,
 // so the prefix keeps its positions. Instantiated result types belong to the source callee signature, which discharge
 // changes by turning discharged references into arrays and appending state inputs and outputs. The rebuilt call
 // therefore keeps the same caller-owned result identities but derives its result metadata from the rebuilt callee
@@ -1146,8 +1148,8 @@ impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for CallOperation<Ar
 // both sides.
 //
 // The split fires whenever the knownness of the call inputs is mixed (i.e., some inputs are known and some are not).
-// All-known and all-unknown calls preserve the original boundary, and their callee is bound as a shared program (an
-// interned callee, or a copy retained by the region transform cache of the callee), so that repeated calls of one
+// All-known and all-unknown calls preserve the original boundary, and their callee is bound as a shared program (i.e.,
+// an interned callee, or a copy retained by the region transform cache of the callee), so that repeated calls of one
 // callee keep sharing one region on either side. Under a residual policy, the outputs of a pure all-known call that
 // only forward call inputs resolve to those inputs, and a residual planner that demands an output of such a call whose
 // callee saves interior values asks this operation to split the call on residual demand (refer to
@@ -1234,7 +1236,7 @@ where
         // inputs, emit the residual side as the residual `call`, and reassemble the original output order. These
         // splits are not retained because the identity-bearing boundary needs call-local type identities.
         //
-        // A reference operand, a reference output, or a reference access anywhere in the callee closure keeps the call
+        // A reference input, a reference output, or a reference access anywhere in the callee closure keeps the call
         // whole. Splitting would spread the accesses to one root across two compiled calls whose known side runs
         // first, and a known reference-typed feeder of the residual side would then mean that both sides access the
         // same root, the same reordering hazard that keeps a `scan` body whole. The default rule preserves effect order
@@ -1251,7 +1253,7 @@ where
         }
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
         // split boundary would leave them naming a compacted or absent capture prefix, which fails lowering at best and
-        // silently aliases an unrelated leading operand at worst. Preserve the original call boundary for any callee
+        // silently aliases an unrelated leading input at worst. Preserve the original call boundary for any callee
         // whose closure still holds a capture constant.
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
@@ -1267,7 +1269,7 @@ where
             return fold_or_residualize_call(self, context, driver, inputs);
         }
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
-        // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
+        // merely repeat (i.e., JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
         let partition = partition.forward_residuals()?;
         // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
         // members of the original lifted-capture prefix that it still uses. The residual callee's inputs are call
@@ -1292,7 +1294,7 @@ where
             &boundary,
             partition.known_input_indices(),
             partition.residual_inputs(),
-            partition.outputs(),
+            partition.outputs().iter().copied().enumerate(),
             partition.known_program().output_count(),
             partition.residual_program().output_count(),
             context.parent().is_eager(),
@@ -1563,26 +1565,26 @@ where
 //
 // Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`. Rather than capturing the primal inputs as residual
 // factors and staging a linear `call`, the separate form keeps the compilation boundary and threads every residual
-// as a plain primal operand edge between two `call`s, so no symbolic capture is ever introduced. The enclosing
-// partial evaluation split then discovers the residual operand edges structurally, exactly as it does for the
+// as a plain primal input edge between two `call`s, so no symbolic capture is ever introduced. The enclosing
+// partial evaluation split then discovers the residual input edges structurally, exactly as it does for the
 // condition and rematerialize rules.
 //
 // For separate contexts, the rule linearizes the callee program capture-free through
-// [`Program::linearize`](crate::Program::linearize) under the operands' activity mask (an operand with a live
-// tangent is active, while the capture prefix, an operand with a structurally zero tangent, and a plumbing reference
-// operand that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal sub-program
+// [`Program::linearize`](crate::Program::linearize) under the activity mask of the inputs, giving a primal sub-program
 // `inputs -> [outputs..., residuals...]` and a tangent sub-program
-// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. Tangents for
-// zero differential spaces are omitted from both compact boundaries, and the tangent sub-program is projected onto the
-// output tangents that depend on an active input tangent (refer to
-// [`Program::output_dependence`](crate::Program::output_dependence) and
-// [`Program::with_outputs`](crate::Program::with_outputs)), since every other output tangent is a structural zero
-// (JAX's `which_nz_out`). When no output tangent is live and the projected tangent sub-program has no observable
-// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it:
+// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. An input with a
+// live tangent is active, while the capture prefix, an input with a structurally zero tangent, and a plumbing reference
+// input that receives no tangent reference are not, as under JAX's `which_nz`. Tangents for zero differential spaces
+// are omitted from both compact boundaries, and the tangent sub-program is projected onto the output tangents that
+// depend on an active input tangent (refer to [`Program::output_dependence`](crate::Program::output_dependence) and
+// [`Program::with_outputs`](crate::Program::with_outputs)), since every other output tangent is a structural zero, as
+// under JAX's `which_nz_out`. When no output tangent is live and the projected tangent sub-program has no observable
+// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it
+// takes the following steps.
 //
-//   1. Wraps the primal sub-program in a fresh `call` and stages it over the operand primals, recovering the
-//      primal outputs followed by the residual values (program variables produced by the staged primal call).
-//   2. Wraps the projected tangent sub-program in a fresh `call` and stages it over the active operand tangents
+//   1. Wraps the primal sub-program in a fresh `call` and stages it over the primal inputs, recovering the primal
+//      outputs followed by the residual values, which are program variables that the staged primal call produces.
+//   2. Wraps the projected tangent sub-program in a fresh `call` and stages it over the active input tangents
 //      followed by those residual values, recovering the live output tangents.
 //   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an output
 //      without a live tangent, into a [`DifferentiationDual`].
@@ -1591,12 +1593,6 @@ where
 // the split halves ride the fresh primal and tangent calls as shared callee regions. Preserving both `call`
 // boundaries keeps the callee body out of the caller's program, so forward mode over a `call` operation stays
 // compiled rather than inlined.
-//
-// # Parameters
-//
-//   - `context`: Active evaluation or staging context used to bind the differentiated calls.
-//   - `driver`: Call-scoped access to the attached callee region.
-//   - `inputs`: Primal and tangent values for the call operands.
 impl<C> DifferentiableOperation<C> for CallOperation<ArrayIrType>
 where
     C: Context<
@@ -1620,10 +1616,10 @@ where
 
         // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
         // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
-        // nondifferentiated plumbing that receives no tangent input. The remaining inputs take the operand duals'
-        // activity. An operand with a live tangent is active, while an operand with a structurally zero tangent is
-        // inactive like a missing one (i.e., JAX's `which_nz`), so it gets no tangent callee slot instead of being
-        // materialized as a zero operand. A plumbing reference operand, whose structurally zero tangent is a missing
+        // nondifferentiated plumbing that receives no tangent input. The remaining inputs take the activity of their
+        // duals. An input with a live tangent is active, while an input with a structurally zero tangent is inactive
+        // like a missing one (i.e., JAX's `which_nz`), so it gets no tangent callee slot instead of being
+        // materialized as a zero input. A plumbing reference input, whose structurally zero tangent is a missing
         // tangent reference, is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]`
         // and the tangent sub-program consumes `[active(input_tangents)..., residuals...]`. The residual count is the
         // number of trailing outputs of the primal sub-program beyond the original callee outputs.
@@ -1639,20 +1635,20 @@ where
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
         // A shared primal/tangent destination binds one fused call over the callee's forward mode program, projected
-        // onto its primal outputs and live output tangents (JAX's `_pjit_jvp`). An enclosing partial evaluation then
-        // splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
+        // onto its primal outputs and live output tangents, as JAX's `_pjit_jvp` does. An enclosing partial evaluation
+        // then splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
         if std::ptr::eq(context.primal(), context.tangent()) {
             self.validate_capture_prefix(input_types.len())?;
             let activity = TangentActivity::new(driver, callee, &activity)?;
             let output_activity = activity.output_tangent_liveness();
             let live_tangent_slots = activity.live_tangent_slots(output_activity);
             let program = activity.jvp_program();
-            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut fused_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             if live_tangent_slots.is_empty() && !program.effects().is_retained_when_unused() {
                 let callee = shared_call_callee(callee)?;
                 return context
                     .primal()
-                    .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &operands)?
+                    .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &fused_inputs)?
                     .into_iter()
                     .map(DifferentiationDual::new_with_zero_tangent)
                     .collect();
@@ -1663,11 +1659,11 @@ where
             } else {
                 Arc::new(program.as_ref().clone().with_outputs(&outputs.collect::<Vec<_>>())?)
             };
-            operands.extend(
+            fused_inputs.extend(
                 activity.input_indices().iter().map(|&index| inputs[index].tangent().as_value().unwrap().clone()),
             );
 
-            // The primal operands come first, so the lifted-capture prefix of the source call carries over unchanged.
+            // The primal inputs come first, so the lifted-capture prefix of the source call carries over unchanged.
             // Each tangent has the boundary sharding of its primal, as JAX's `_pjit_jvp` gives each tangent the
             // sharding of its primal.
             let live_outputs = (0..output_count).filter(|&index| output_activity[index]);
@@ -1684,7 +1680,7 @@ where
                     (0..output_count).chain(live_outputs).map(Some),
                 )
             });
-            let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
+            let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &fused_inputs)?;
             check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
             let mut tangents = outputs.split_off(output_count).into_iter();
             return outputs
@@ -1699,10 +1695,11 @@ where
         let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
 
         // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
-        // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee
-        // is projected onto the live output tangents, and every other output is paired with a structurally zero
-        // tangent. When no output tangent is live and the tangent callee has no observable effects, no tangent call is
-        // bound, and the source callee is bound as the primal call, since nothing would consume its residuals.
+        // output computed only from inactive inputs) is a structural zero, as under JAX's `which_nz_out`, so the
+        // tangent callee is projected onto the live output tangents, and every other output is paired with a
+        // structurally zero tangent. When no output tangent is live and the tangent callee has no observable effects,
+        // no tangent call is bound, and the source callee is bound as the primal call, since nothing would consume its
+        // residuals.
         //
         // The tangent program's leading inputs are compact active tangents, not the original primal input indices,
         // and its trailing residual inputs are held independent during dependence analysis. Linearization has
@@ -1732,24 +1729,24 @@ where
         } else {
             Arc::new(tangent_program.as_ref().clone().with_outputs(&live_tangent_slots)?)
         };
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
             let callee = shared_call_callee(callee)?;
             return context
                 .primal()
-                .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
+                .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &primal_inputs)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect();
         }
         let (primal_program, ..) = linearization.into_parts();
 
-        // Wrap the primal sub-program in a fresh `call` and bind it over the operand primals, recovering the
-        // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
-        // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
-        // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
-        // survives verbatim and its length carries over.
-        // The primal call has the boundary shardings of this call, and its trailing residuals have none.
+        // Wrap the primal sub-program in a fresh `call` and bind it over the primal inputs, recovering the primal
+        // outputs followed by the residual values. The shared sub-program handles are attached directly, so repeated
+        // binds of one derived callee intern by `Arc` identity instead of copying it again. The primal sub-program
+        // preserves the callee's inputs in order, so the original lifted-capture prefix survives verbatim and its
+        // length carries over. The primal call has the boundary shardings of this call, and its trailing residuals
+        // have none.
         //
         // The primal and the tangent call carry the mesh of the function, and so does the transposed call that a
         // pullback derives from them, so an eager linearization (e.g., of an eager VJP) runs each of them where the
@@ -1757,8 +1754,7 @@ where
         // `CallOperation::function_mesh`). An uncommitted argument enters an eager linearization without the
         // placement that it happens to have (refer to `Value::relocatable_type`), so the tangent and the cotangent of
         // such an argument may live on the devices of the function.
-        let boundary =
-            self.effective_input_boundary(&input_types, primal_operands.iter().map(|operand| operand.r#type()));
+        let boundary = self.effective_input_boundary(&input_types, primal_inputs.iter().map(|input| input.r#type()));
         let primal_call = C::Operation::from(CallOperation {
             function_mesh: self.function_mesh.clone(),
             ..self.with_derived_boundary_shardings(
@@ -1769,7 +1765,7 @@ where
             )
         });
         let mut primal_call_outputs =
-            context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
+            context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_inputs)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{CALL_OPERATION_NAME}` primal program produced {} outputs which is fewer than its {output_count} \
@@ -1781,26 +1777,25 @@ where
         let residuals = primal_call_outputs.split_off(output_count);
         let primal_outputs = primal_call_outputs;
 
-        // Wrap the tangent sub-program in a fresh `call` and bind it over only the active operand tangents followed
-        // by the residual values. Structurally zero tangents are inactive, so every active operand tangent is a live
-        // value and materializing it only unwraps it, while inactive operands (the capture prefix, structurally zero
-        // tangents, zero-space operands, and plumbing references) have no compact callee boundary slot.
-        let mut tangent_operands = inputs
+        // Wrap the tangent sub-program in a fresh `call` and bind it over only the active input tangents followed by
+        // the residual values. Structurally zero tangents are inactive, so every active input tangent is a live value
+        // and materializing it only unwraps it, while inactive inputs (i.e., the capture prefix, structurally zero
+        // tangents, inputs of zero differential spaces, and plumbing references) have no compact callee boundary slot.
+        let mut tangent_inputs = inputs
             .iter()
             .zip(&activity)
             .filter(|(_, active)| **active)
             .map(|(input, _)| input.tangent().clone().materialize(context.tangent()))
             .collect::<Result<Vec<_>, _>>()?;
-        tangent_operands.extend(
+        tangent_inputs.extend(
             residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
         );
         // The tangent callee's inputs are live input tangents followed by residuals and never a lifted-capture prefix.
         // Attached region capture constants cannot appear in it because fresh-root region traces reject bodies that
-        // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
+        // register captures with `ProgramError::DiscardedCaptures`, and a stale reference that slipped in anyway would
         // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
-        // value.
-        // Each active input tangent and each live output tangent has the boundary sharding of its primal, and the
-        // trailing residual inputs have none.
+        // value. Each active input tangent and each live output tangent has the boundary sharding of its primal, and
+        // the trailing residual inputs have none.
         let active_inputs = activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
         let live_outputs =
             output_activity.iter().enumerate().filter_map(|(index, active)| active.then_some(Some(index)));
@@ -1821,7 +1816,7 @@ where
         let tangent_outputs =
             context
                 .tangent()
-                .bind(tangent_call, AttachedRegions::Callees(&[tangent_program]), &tangent_operands)?;
+                .bind(tangent_call, AttachedRegions::Callees(&[tangent_program]), &tangent_inputs)?;
         let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
@@ -1844,8 +1839,8 @@ where
 }
 
 // Transpose rule for a primal tangent [`CallOperation`], forwarding to [`transpose_primal_call`] with the
-// cotangent references of its linear reference-typed operands resolved (and allocated on first use) through the
-// enclosing [`TranspositionContext`]. The callee is transposed through the driver, so instantiating this implementation
+// cotangent references of its linear reference inputs resolved, and allocated on first use, through the enclosing
+// [`TranspositionContext`]. The callee is transposed through the driver, so instantiating this implementation
 // introduces no recursive [`TransposableOperation`] obligation on the operation family `O`.
 impl<V, O> TransposableOperation<V, O> for CallOperation<ArrayIrType>
 where
@@ -1882,7 +1877,7 @@ where
     }
 }
 
-/// Placement request of one instruction of a program, as [`RegionPlacementSummary::requests`] returns it.
+/// Placement request of one instruction of a program, as [`RegionPlacementRequests::requests`] returns it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestedPlacement {
     /// A request that names the devices of this mesh (i.e., a `place` with a device target or a resolved target, or a
@@ -1902,20 +1897,20 @@ pub enum RequestedPlacement {
 /// [`Self::new`] and [`Self::for_target`] derive once for each region and target platform and retain with the region.
 /// Every analysis of the placement requests of a region reads it, which includes the facts that a call reads of its
 /// callee (refer to [`CallOperation::names_devices`] and [`CallOperation::requests_placement`]). The program
-/// that it analyses is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
+/// that it analyzes is the one that a backend runs for the region (i.e., the region pruned to the instructions that its
 /// outputs and its observable effects depend on, refer to [`Program::into_pruned`]), so a request that nothing uses is
 /// not among its requests, as JAX lowers a `jit` function without dead equations. The regions of an instruction that
-/// the backend never runs are not analysed either. These include scan bodies with zero iterations on every target
+/// the backend never runs are not analyzed either. These include scan bodies with zero iterations on every target
 /// and regions that a backend omits for a given target platform (refer to [`Self::for_target`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct RegionPlacementSummary {
+pub struct RegionPlacementRequests {
     /// Placement requests of the program, in the order of its regions and of the instructions in each region, with
     /// the name of the operation that makes each request (refer to [`Self::requests`]).
     requests: Arc<[(RequestedPlacement, &'static str)]>,
 }
 
-impl RegionPlacementSummary {
-    /// Returns the [`RegionPlacementSummary`] of the program of `region` without a target platform. Only scan bodies
+impl RegionPlacementRequests {
+    /// Returns the [`RegionPlacementRequests`] of the program of `region` without a target platform. Only scan bodies
     /// with zero iterations are omitted. Partial evaluation reads this summary, as does a backend that compiles a
     /// program before it knows its target platform. Refer to [`Self::for_target`] for how the summary is derived and
     /// retained.
@@ -1927,7 +1922,7 @@ impl RegionPlacementSummary {
         Self::derive(region, None, &|_, _| false)
     }
 
-    /// Returns the [`RegionPlacementSummary`] of the program of `region` that a backend runs for `target_platform`,
+    /// Returns the [`RegionPlacementRequests`] of the program of `region` that a backend runs for `target_platform`,
     /// whose lowering omits the regions of each instruction for which `omits_regions` returns `true` (e.g., the body of
     /// a named composite call that the backend implements for that platform). `omits_regions` must depend on the
     /// instruction and `target_platform` alone, because the summary depends on `region` and `target_platform` alone, so
@@ -1935,7 +1930,7 @@ impl RegionPlacementSummary {
     /// same region and platform (e.g., of the callee of each eager application of a call, or of a call that partial
     /// evaluation forwards) only looks it up. Its derivation prunes the closure of `region` once and walks the regions
     /// of the pruned program once, deriving what each call of that program reads of its callee in the same pass, so it
-    /// never analyses a nested region on its own, and the cost of a region is linear in the size of its closure however
+    /// never analyzes a nested region on its own, and the cost of a region is linear in the size of its closure however
     /// deeply its calls nest. A region without a placement request pays one scan of its computation regions.
     pub fn for_target<V, O>(
         region: RegionRef<'_, V, O>,
@@ -1955,7 +1950,7 @@ impl RegionPlacementSummary {
     /// a branch of a `condition` that drops the result of a `place`) or only computes an output of an instruction that
     /// carries regions that nothing uses (e.g., an output of a `condition` or of a `call` that the program drops).
     /// Nor is a request in the regions of an instruction that the backend never runs (refer to
-    /// [`RegionPlacementSummary`]).
+    /// [`RegionPlacementRequests`]).
     #[inline]
     pub fn requests(&self) -> &[(RequestedPlacement, &'static str)] {
         &self.requests
@@ -1977,10 +1972,10 @@ impl RegionPlacementSummary {
     /// region requests a placement that names devices (i.e., any request except one that only moves a value to another
     /// memory, refer to [`Self::has_requests`]) in the regions that the backend runs, which is what a call that records
     /// a mesh reads of its callee (refer to [`CallOperation::names_devices`]). The program must be the one that the
-    /// backend runs (i.e., it is already pruned, refer to [`Program::into_pruned`]), because each region is analysed as
-    /// the program holds it. The regions of the instructions for which `omits_regions` returns `true` are not analysed,
+    /// backend runs (i.e., it is already pruned, refer to [`Program::into_pruned`]), because each region is analyzed as
+    /// the program holds it. The regions of the instructions for which `omits_regions` returns `true` are not analyzed,
     /// and neither is the body of a scan with zero iterations (refer to [`ScanOperation::has_zero_iterations`]). The
-    /// function analyses each region at most once and reads its fact for every call of it and for every region that
+    /// function analyzes each region at most once and reads its fact for every call of it and for every region that
     /// encloses it, so that answering for every call of a program with nested calls costs one pass over the program,
     /// whereas the summary of each callee (refer to [`Self::for_target`]) would prune and walk the closure of each
     /// callee again.
@@ -2014,9 +2009,11 @@ impl RegionPlacementSummary {
             let summary = if !has_requests {
                 Self { requests: Arc::from([]) }
             } else {
-                analyse_pruned_region(region, |entry| Self {
-                    requests: Arc::from(entry_placement_requests(entry, omits_regions)),
-                })
+                let program = region.to_program();
+                let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
+                // Inspect the original program if pruning or simplification fails so the analysis stays conservative.
+                let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
+                Self { requests: Arc::from(entry_placement_requests(entry, omits_regions)) }
             };
             Ok(TransformArtifact::new(Vec::new(), summary))
         };
@@ -2066,238 +2063,6 @@ pub fn boundary_input_type(input_type: &ArrayType, boundary: &Sharding) -> Optio
 /// to [`CallOperation::names_devices`]) read.
 pub fn states_boundary_placement<'s>(overrides: impl IntoIterator<Item = &'s Sharding>) -> bool {
     overrides.into_iter().next().is_some()
-}
-
-/// Transposes a tangent [`CallOperation`] while retaining its compilation boundary.
-///
-/// The [`TranspositionDriver`] transposes the attached callee under the operands' linearity and cotangent-destination
-/// masks and the structural zeros of its output cotangents. Known operands supply residual or captured values and may
-/// appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
-/// structural zeros, live cotangent references, and known operands, in that order. A structural zero output cotangent
-/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary, although a
-/// dense backward rule inside the callee may still materialize the zero that it consumes. Reference outputs forward
-/// input roots and therefore have no separate output cotangent slot.
-///
-/// Returned cotangents follow the original input order. Linear value inputs receive call results, reference inputs
-/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
-///
-/// # Parameters
-///
-///   - `operation`: Primal tangent `call` staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
-///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the callee's inputs one to one. The
-///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
-///     entries carry the residual and captured-constant-tangent tracers the pullback reads.
-///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
-///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
-///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a
-///     live (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
-///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
-///     slot in the transposed callee at all.
-pub fn transpose_primal_call<V, O, D>(
-    operation: &CallOperation<ArrayIrType>,
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType>
-        + From<CallOperation<ArrayIrType>>
-        + From<CastOperation<ArrayIrType>>
-        + OperationProjection<ArrayType, Projected: From<ReshardOperation> + From<ParallelReduceOperation>>,
-    D: TranspositionDriver<V, O>,
-    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
-{
-    // A `call` operation with no live output cotangents and no live reference operand is a zero linear map, so
-    // every operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state
-    // cotangent flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred
-    // work or observable rule effects also keeps it live.
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-    if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.must_transpose()
-    {
-        return inputs
-            .iter()
-            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
-            .collect();
-    }
-
-    // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
-    // captured-constant tangent). The linear operands need not lead, because a captured compiled function threads its
-    // captured prefix as known leading operands. The dispatch guarantees a `Known` operand carries its pullback value,
-    // so each known tracer is read directly in callee-input order.
-    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let callee = driver.region(0)?;
-    check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
-
-    // Transpose the callee with respect to its linear inputs and with its structural zero output cotangents flagged,
-    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
-    // once per linearity and seed mask. A live reference-typed linear input is transposed with a `Reference`
-    // destination and a dead one with an `Ignore` destination, so the transposed callee maps
-    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
-    // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
-    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
-    // order, and flags of reference outputs are normalized away because those outputs never own a cotangent slot.
-    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = operand_linear
-        .iter()
-        .zip(cotangents.kinds())
-        .enumerate()
-        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
-        .unzip();
-    let output_types = callee.output_types();
-    check_count!("output", outputs, output_types.len(), ProgramError);
-    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
-    let transposed_callee = driver.transpose_program_with_zero_seeds(
-        callee,
-        &input_indices,
-        &[],
-        &zero_output_cotangents,
-        &destination_kinds,
-    )?;
-
-    // Stage a fresh `call` over the transposed callee on `[live_outputs..., cotangent_references...,
-    // known_input_values...]`. Its outputs are the linear-input cotangents. A reference output forwards a callee input
-    // root whose state cotangent lives in that operand's cotangent reference, so it owns no cotangent slot.
-    let mut operands = Vec::with_capacity(output_types.len() + inputs.len());
-    operands.extend(
-        outputs
-            .iter()
-            .zip(output_types.iter())
-            .filter(|(_, output_type)| !output_type.is_reference())
-            .filter_map(|(cotangent, _)| cotangent.as_value())
-            .cloned(),
-    );
-    operands.extend(cotangents.references().iter().cloned());
-    operands.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
-    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
-    // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
-    // traced through fresh-root contexts.
-    // Each output cotangent has the cotangent sharding of the boundary sharding of its output and each known input
-    // value the boundary sharding of its input, and the cotangent references have none, as JAX's `_pjit_transpose`
-    // gives the cotangents the cotangent shardings of their primals (`to_ct_spec`). Each returned linear input
-    // cotangent has the cotangent sharding of its input, whichever other inputs have a
-    // structurally zero or absent cotangent, which returns nothing (refer to `TransposedProgramCotangent`).
-    let mut transposed_call =
-        CallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
-    transposed_call.keeps_input_placements = operation.keeps_input_placements();
-    transposed_call.function_mesh = operation.function_mesh.clone();
-    // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
-    // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
-    // leaves its residuals where they are.
-    let boundary = operation.effective_input_boundary(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
-    // Seed operands enter on the tangent result's cotangent sharding when the call already knows its devices.
-    // Eager admission checks device commitments before applying these boundary shardings. The callee can then
-    // transpose any placement-only result cast using the seed's admitted type.
-    let function_mesh = operation
-        .function_mesh
-        .as_ref()
-        .filter(|function| function.logical_mesh().is_named())
-        .map(|function| function.logical_mesh());
-    let seed_shardings = outputs
-        .iter()
-        .zip(&output_types)
-        .filter(|(cotangent, output_type)| !output_type.is_reference() && cotangent.as_value().is_some())
-        .map(|(_, output_type)| {
-            let ArrayIrType::Array(output_type) = output_type else { return Ok(None) };
-            output_type
-                .sharding()
-                .filter(|sharding| Some(sharding.mesh()) == function_mesh)
-                .map(Sharding::cotangent)
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(TypeError::from)?;
-    transposed_call.derived_input_shardings = Some(
-        seed_shardings
-            .into_iter()
-            .chain(std::iter::repeat_n(None, cotangents.references().len()))
-            .chain(
-                inputs
-                    .iter()
-                    .zip(boundary)
-                    .filter(|(input, _)| input.as_known().is_some())
-                    .map(|(_, sharding)| sharding),
-            )
-            .collect(),
-    );
-    if let Some(mesh) = operation.mesh() {
-        // An override places a primal value, and the cotangent of that value has the dual reduction state (refer to
-        // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
-        // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of the
-        // override of its primal, as the cotangent types of those primals record it, and each known primal value is
-        // placed at the override itself. An input cotangent that the transposed call returns is the cotangent of the
-        // argument as the callee holds it once it has entered, so it carries no reduction state over auto mesh axes,
-        // which no type records (refer to `Sharding::without_auto_reduction_axes`).
-        let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
-        let output_cotangent_shardings = outputs
-            .iter()
-            .zip(output_types.iter())
-            .enumerate()
-            .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
-            .map(|(index, _)| cotangent_sharding(operation.output_sharding(index)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(TypeError::from)?;
-        let reference_shardings = cotangents.references().iter().map(|_| None);
-        let known_input_shardings = inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, input)| input.as_known().is_some())
-            .map(|(index, _)| operation.input_sharding(index).cloned());
-        let input_shardings = output_cotangent_shardings
-            .into_iter()
-            .chain(reference_shardings)
-            .chain(known_input_shardings)
-            .collect();
-        let output_shardings = input_indices
-            .iter()
-            .zip(transposed_callee.cotangents())
-            .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
-            .map(|(&index, _)| cotangent_sharding(operation.input_sharding(index)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(TypeError::from)?
-            .into_iter()
-            .map(|sharding| sharding.map(|sharding| sharding.without_auto_reduction_axes()))
-            .collect::<Vec<_>>();
-        transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
-    }
-    let transposed_call = O::from(transposed_call);
-    let input_cotangents = context.bind(
-        transposed_call,
-        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
-        operands.as_slice(),
-    )?;
-    let cotangent_types = input_indices
-        .iter()
-        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
-
-    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
-    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
-    // a value cotangent to the enclosing context.
-    inputs
-        .iter()
-        .map(|input| {
-            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
-            match cotangent {
-                Some(MaybeZero::Value(cotangent)) if !input.r#type().is_reference() => {
-                    let refined = input.r#type().cotangent().map_err(ProgramError::from)?;
-                    let cotangent = summed_input_cotangent(context, &refined, cotangent)?;
-                    let cotangent = refined_derived_value(context, operation.mesh(), refined, cotangent);
-                    return Ok(MaybeZero::Value(cotangent?));
-                }
-                Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
-                _ => {}
-            }
-            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-        })
-        .collect()
 }
 
 /// Formal callee input types and caller result types that bind [`TypeIdentity`](crate::TypeIdentity)s across one
@@ -2383,7 +2148,9 @@ impl<T: Type> CallTypeBindings<T> {
                 .flat_map(Type::identities)
                 .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
             {
-                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+                return Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` local result declarations must use fresh identities",
+                )));
             }
             return Ok(None);
         }
@@ -2450,7 +2217,9 @@ impl<T: Type> CallTypeBindings<T> {
             let target = renaming.target(identity).unwrap_or(identity);
             let forwarded = inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity);
             if forwarded && target != identity {
-                return Err(TypeError::invalid("call result declarations must preserve forwarded input identities"));
+                return Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` result declarations must preserve forwarded input identities",
+                )));
             }
             if !forwarded
                 && (target == identity
@@ -2460,7 +2229,9 @@ impl<T: Type> CallTypeBindings<T> {
                         .flat_map(Type::identities)
                         .any(|(_, original)| original == target))
             {
-                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+                return Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` local result declarations must use fresh identities",
+                )));
             }
         }
         Ok(renaming)
@@ -2490,7 +2261,9 @@ impl<T: Type> CallTypeBindings<T> {
     /// Returns a type error when a positional mask has the wrong arity.
     fn pruned(&self, inputs: &[bool], outputs: &[bool]) -> Result<Self, TypeError> {
         if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
-            return Err(TypeError::invalid("call result declaration pruning masks have incompatible arity"));
+            return Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` result declaration pruning masks have incompatible arity",
+            )));
         }
         Ok(Self {
             inputs: self
@@ -2556,7 +2329,7 @@ impl CallVariation {
     }
 }
 
-/// [`Transform`] marker under which [`RegionPlacementSummary::for_target`] retains the summary of a region with it, for
+/// [`Transform`] marker under which [`RegionPlacementRequests::for_target`] retains the summary of a region with it, for
 /// the target platform that its arguments name ([`None`] for no target), held as a [`String`] because the region-owned
 /// cache only retains owned arguments. Two summaries are retained, because an eager call reads the requests of its
 /// callee for the platform of its backend while partial evaluation and compilation read them for no target, and one
@@ -2565,7 +2338,7 @@ struct RegionPlacementAnalysis;
 
 impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for RegionPlacementAnalysis {
     type Arguments = Option<String>;
-    type Artifact = TransformArtifact<V, O, RegionPlacementSummary>;
+    type Artifact = TransformArtifact<V, O, RegionPlacementRequests>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 2;
 }
@@ -2589,18 +2362,18 @@ enum InstructionPlacementRequest<'o> {
 
 /// Whether each region of one program requests a placement that names devices (i.e., any request except one that only
 /// moves a value to another memory) in the regions that the backend runs, which is what a call that records a mesh
-/// reads of its callee (refer to [`CallOperation::names_devices`]). Each region of the program is analysed at most
+/// reads of its callee (refer to [`CallOperation::names_devices`]). Each region of the program is analyzed at most
 /// once, and its fact is read by every call of it and by every region that encloses it, so a pass over a program with
-/// nested calls is linear in the size of the program. The program must be the one that the backend runs (i.e., it is
-/// already pruned, refer to [`analyse_pruned_region`]), because a callee is analysed as the program holds it. The
-/// regions of an instruction that the backend omits are not analysed (refer to [`omits_placement_regions`]).
+/// nested calls is linear in the size of the program. The program must be the one that the backend runs (refer to
+/// [`Program::into_pruned`] and [`Program::into_simplified`]), because a callee is analyzed as the program holds it.
+/// The regions of an instruction that the backend omits are not analyzed (refer to [`omits_placement_regions`]).
 struct DeviceNamingAnalysis<'o, V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> {
     /// Whether the region at each index of the arena of the program names devices, or [`None`] if it has not been
-    /// analysed yet.
+    /// analyzed yet.
     names_devices: Vec<Option<bool>>,
 
     /// Returns whether the backend omits the regions of an instruction for the target platform of the analysis
-    /// (refer to [`RegionPlacementSummary::for_target`]).
+    /// (refer to [`RegionPlacementRequests::for_target`]).
     omits_regions: &'o dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
 }
 
@@ -2859,25 +2632,9 @@ fn validate_call_input_types<T: ArrayMemberType>(
     Ok(variation)
 }
 
-/// Returns what `analyse` returns for the entry region of the program that a backend runs for `region`, every output of
-/// `region` being used, which is `region` with its closure without the unused outputs of instructions that carry
-/// regions and without dead instructions and constants (refer to [`Program::into_pruned`] and
-/// [`Program::into_simplified`]), or with its closure unchanged when it cannot be pruned (a program that cannot be
-/// pruned cannot be lowered either, so that an analysis of it never hides anything of such a program). This is the one
-/// program that the summary of a region reads (refer to [`RegionPlacementSummary`]).
-fn analyse_pruned_region<V, O, R>(region: RegionRef<'_, V, O>, analyse: impl FnOnce(RegionRef<'_, V, O>) -> R) -> R
-where
-    V: Value<Type = ArrayIrType>,
-    O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
-{
-    let program = region.to_program();
-    let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
-    analyse(pruned.as_ref().unwrap_or(&program).entry_region_ref())
-}
-
 /// Returns the placement requests of the program whose entry region is `entry`, which is already pruned, in the regions
 /// that the backend runs, which omits the regions of the instructions for which `omits_regions` returns `true` (refer
-/// to [`RegionPlacementSummary::requests`]). The regions are visited in the order of
+/// to [`RegionPlacementRequests::requests`]). The regions are visited in the order of
 /// [`RegionRef::computation_regions`].
 fn entry_placement_requests<V, O>(
     entry: RegionRef<'_, V, O>,
@@ -2912,7 +2669,7 @@ where
 
 /// Returns whether the backend never runs the regions of `instruction` of `region`. This holds on every target for
 /// the body of a scan with zero iterations (refer to [`ScanOperation::has_zero_iterations`]) and for the regions for
-/// which `omits_regions` returns `true` (refer to [`RegionPlacementSummary::for_target`]).
+/// which `omits_regions` returns `true` (refer to [`RegionPlacementRequests::for_target`]).
 fn omits_placement_regions<V, O>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
@@ -2930,7 +2687,7 @@ where
 }
 
 /// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
-/// placement requests of a program, which [`RegionPlacementSummary`] reads.
+/// placement requests of a program, which [`RegionPlacementRequests`] reads.
 fn placement_request<O: Operation<Type = ArrayIrType> + OperationPayloadProjection>(
     operation: &O,
 ) -> Option<InstructionPlacementRequest<'_>> {
@@ -3140,13 +2897,10 @@ where
 /// case when `callee` has effects, references, nominal type identities, or capture constants. Splitting such a call on
 /// residual demand, or forwarding its outputs, would move effects, reference accesses, nominally scoped types, or
 /// captures that name its capture prefix across the boundary that validates them.
-fn keeps_call_boundary<V: Value<Type = ArrayIrType>, O, W: Value>(
+fn keeps_call_boundary<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>, W: Value>(
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
-) -> bool
-where
-    O: Operation<Type = ArrayIrType>,
-{
+) -> bool {
     !callee.effects().classes().is_empty() || !can_cache_call_split(callee, inputs)
 }
 
@@ -3154,13 +2908,10 @@ where
 /// includes their partition configuration, whereas references, captures, and nominal identities require the original
 /// boundary or call-local identities. All-known replay additionally excludes effects (refer to
 /// [`keeps_call_boundary`]).
-fn can_cache_call_split<V: Value<Type = ArrayIrType>, O, W: Value>(
+fn can_cache_call_split<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>, W: Value>(
     callee: RegionRef<'_, V, O>,
     inputs: &[PartialEvaluationValue<W>],
-) -> bool
-where
-    O: Operation<Type = ArrayIrType>,
-{
+) -> bool {
     !inputs
         .iter()
         .any(|input| input.r#type().is_reference() || input.r#type().identities().next().is_some())
@@ -3184,8 +2935,8 @@ fn forward_call_inputs<V, O, W>(
     outputs: Vec<PartialEvaluationValue<W>>,
 ) -> Vec<PartialEvaluationValue<W>>
 where
-    V: Value<Type = ArrayIrType> + 'static,
-    O: Operation<Type = ArrayIrType> + OperationPayloadProjection + 'static,
+    V: 'static + Value<Type = ArrayIrType>,
+    O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
     W: Value<Type = ArrayIrType>,
 {
     let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
@@ -3218,9 +2969,9 @@ where
 ///     replays the demanded outputs from those values.
 ///
 /// The residual callee reads the call inputs and the known outputs that its residual edges would merely repeat
-/// directly (JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and a residual planner
-/// plans those inputs like any other demanded value. The two callees are retained by the region transform cache of the
-/// callee (refer to [`CallSplitTransform`]) and bound as shared regions. Every call of one callee, including the
+/// directly (i.e., JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and a residual
+/// planner plans those inputs like any other demanded value. The two callees are retained by the region transform cache
+/// of the callee (refer to [`CallSplitTransform`]) and bound as shared regions. Every call of one callee, including the
 /// calls nested in the callees of an enclosing split, therefore shares one known callee and one residual callee for
 /// each kind of split and each policy, so the programs grow with the number of calls rather than with the size of
 /// their callees, and each callee is partitioned once rather than once per call. Calls whose partial evaluations round
@@ -3255,6 +3006,18 @@ where
 {
     let callee = driver.region(0)?;
     let keeps_trivial_splits_whole = matches!(kind, CallSplitKind::Knownness(_));
+    // A split on residual demand reports every output of the callee as known, followed by each demanded output once
+    // more as an output of the residual callee, in output order (refer to
+    // `PartialEvaluationContext::partition_residual_demand`). Each of those trailing outputs is therefore the call
+    // output that was demanded, whose boundary sharding the residual call keeps.
+    let demanded_output_indices = match &kind {
+        CallSplitKind::Knownness(_) => Vec::new(),
+        CallSplitKind::ResidualDemand(demanded_outputs) => demanded_outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, demanded)| demanded.then_some(index))
+            .collect(),
+    };
     let arguments = CallSplitArguments {
         kind,
         policy: context.residual_policy().cloned(),
@@ -3276,7 +3039,7 @@ where
         ))
     })?;
     let [known_callee, residual_callee] = artifact.programs() else {
-        unreachable!("`call` splits retain a known callee and a residual callee");
+        unreachable!("`{CALL_OPERATION_NAME}` splits retain a known callee and a residual callee");
     };
     if keeps_trivial_splits_whole && known_callee.instructions().is_empty() {
         return fold_or_residualize_call(operation, context, driver, inputs);
@@ -3303,7 +3066,7 @@ where
         &boundary,
         &split.known_input_indices,
         &split.residual_inputs,
-        &split.outputs,
+        (0..callee.output_types().len()).chain(demanded_output_indices).zip(split.outputs.iter().copied()),
         known_callee.output_count(),
         residual_callee.output_count(),
         context.parent().is_eager(),
@@ -3431,15 +3194,15 @@ fn batched_boundary_sharding(
 /// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
 /// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. A runtime array
 /// stores an unconstrained dimension replicated, so its buffers are those of `refined`. Inside a compiled program, the
-/// cast emits no sharding constraint (an unconstrained and a replicated dimension do not conflict over explicit mesh
-/// axes, and types record no placement over auto mesh axes), and the entry boundary of the program replicates an
+/// cast emits no sharding constraint, because an unconstrained and a replicated dimension do not conflict over explicit
+/// mesh axes and types record no placement over auto mesh axes, and the entry boundary of the program replicates an
 /// unconstrained dimension of any value that it exchanges.
 ///
 /// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
 /// an input of type `refined` for a callee input of the type of the value (refer to [`is_untracked_refinement`]), as
 /// the cotangent of an input that a staged caller of untracked type passes to a callee with an input sharding override
 /// is. This mirrors the forward direction, where the call takes that input as it is (refer to `call_input_variation`)
-/// and its lowering constrains the operand to the override, so the derivative returns to the type of the caller input.
+/// and its lowering constrains the input to the override, so the derivative returns to the type of the caller input.
 /// The cast only stops tracking the placement of the value, which a type without a sharding states nothing about, and
 /// keeps its values and buffers.
 ///
@@ -3544,6 +3307,238 @@ fn replicates_unconstrained_dimensions(left: &Sharding, right: &Sharding) -> boo
         && left.with_dimensions(right.dimensions().to_vec()).is_ok_and(|left| &left == right)
 }
 
+/// Transposes a tangent [`CallOperation`] while retaining its compilation boundary.
+///
+/// The [`TranspositionDriver`] transposes the attached callee under the linearity and cotangent destination masks of
+/// the inputs and the structural zeros of its output cotangents. Known inputs supply residual or captured values and
+/// may appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
+/// structural zeros, live cotangent references, and known inputs, in that order. A structural zero output cotangent
+/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary, although a
+/// dense backward rule inside the callee may still materialize the zero that it consumes. Reference outputs forward
+/// input roots and therefore have no separate output cotangent slot.
+///
+/// Returned cotangents follow the original input order. Linear value inputs receive call results, reference inputs
+/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
+///
+/// # Parameters
+///
+///   - `operation`: Primal tangent `call` staged into the tangent program.
+///   - `context`: Active transpose tracing context the pullback is staged into.
+///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
+///   - `inputs`: [`PartialValue`] knowledge of each input, mirroring the callee's inputs one to one. The
+///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
+///     entries carry the residual tracers and the tangent tracers of captured constants that the pullback reads.
+///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
+///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
+///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
+///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so the
+///     cotangent reference of a live reference input (i.e., one with a `Reference` destination) is an input of the
+///     transposed call, which accumulates into it in place and returns it by identity, while a dead reference input
+///     (i.e., one with an `Ignore` destination) has no slot in the transposed callee at all.
+fn transpose_primal_call<V, O, D>(
+    operation: &CallOperation<ArrayIrType>,
+    context: &mut TracingContext<V, O>,
+    driver: &D,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType>
+        + From<CallOperation<ArrayIrType>>
+        + From<CastOperation<ArrayIrType>>
+        + OperationProjection<ArrayType, Projected: From<ReshardOperation> + From<ParallelReduceOperation>>,
+    D: TranspositionDriver<V, O>,
+    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
+{
+    // A `call` operation with no live output cotangents and no live reference input is a zero linear map, so every
+    // input cotangent is zero. A live reference input keeps the call live, because its accumulated state cotangent
+    // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
+    // observable rule effects also keeps it live.
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.has_reference_state_destinations()
+        && !driver.region(0)?.must_transpose()
+    {
+        return inputs
+            .iter()
+            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
+            .collect();
+    }
+
+    // Each input maps to one callee input, independently linear (i.e., an input tangent) or known (i.e., a residual
+    // value or the tangent of a captured constant). The linear inputs need not lead, because a captured compiled
+    // function threads its captured prefix as known leading inputs. The dispatch guarantees that a `Known` input
+    // carries its pullback value, so each known tracer is read directly in callee input order.
+    let input_linearity = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
+    let callee = driver.region(0)?;
+    check_count!("input", input_linearity, callee.input_types().len(), ProgramError);
+
+    // Transpose the callee with respect to its linear inputs and with its structural zero output cotangents flagged,
+    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
+    // once per linearity and seed mask. A live linear reference input is transposed with a `Reference` destination and
+    // a dead one with an `Ignore` destination, so the transposed callee maps
+    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
+    // `[linear_input_cotangents...]`, in callee input order, where a live reference input's cotangent is its cotangent
+    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
+    // order, and flags of reference outputs are normalized away because those outputs never own a cotangent slot.
+    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = input_linearity
+        .iter()
+        .zip(cotangents.kinds())
+        .enumerate()
+        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+        .unzip();
+    let output_types = callee.output_types();
+    check_count!("output", outputs, output_types.len(), ProgramError);
+    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+    let transposed_callee = driver.transpose_program_with_zero_seeds(
+        callee,
+        &input_indices,
+        &[],
+        &zero_output_cotangents,
+        &destination_kinds,
+    )?;
+
+    // Stage a fresh `call` over the transposed callee on `[live_outputs..., cotangent_references...,
+    // known_input_values...]`. Its outputs are the cotangents of the linear inputs. A reference output forwards a
+    // callee input root whose state cotangent lives in the cotangent reference of that input, so it owns no cotangent
+    // slot.
+    let mut transposed_inputs = Vec::with_capacity(output_types.len() + inputs.len());
+    transposed_inputs.extend(
+        outputs
+            .iter()
+            .zip(output_types.iter())
+            .filter(|(_, output_type)| !output_type.is_reference())
+            .filter_map(|(cotangent, _)| cotangent.as_value())
+            .cloned(),
+    );
+    transposed_inputs.extend(cotangents.references().iter().cloned());
+    transposed_inputs.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
+    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
+    // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
+    // traced through fresh-root contexts. Each output cotangent has the cotangent sharding of the boundary sharding of
+    // its output and each known input value the boundary sharding of its input, and the cotangent references have none,
+    // as JAX's `_pjit_transpose` gives the cotangents the cotangent shardings of their primals through `to_ct_spec`.
+    // Each returned linear input cotangent has the cotangent sharding of its input, whichever other inputs have a
+    // structurally zero or absent cotangent, which returns nothing (refer to `TransposedProgramCotangent`).
+    let mut transposed_call =
+        CallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
+    transposed_call.keeps_input_placements = operation.keeps_input_placements();
+    transposed_call.function_mesh = operation.function_mesh.clone();
+    // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
+    // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
+    // leaves its residuals where they are.
+    let boundary = operation.effective_input_boundary(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
+    // Seed inputs enter on the tangent result's cotangent sharding when the call already knows its devices.
+    // Eager admission checks device commitments before applying these boundary shardings. The callee can then
+    // transpose any placement-only result cast using the seed's admitted type.
+    let function_mesh = operation
+        .function_mesh
+        .as_ref()
+        .filter(|function| function.logical_mesh().is_named())
+        .map(|function| function.logical_mesh());
+    let seed_shardings = outputs
+        .iter()
+        .zip(&output_types)
+        .filter(|(cotangent, output_type)| !output_type.is_reference() && cotangent.as_value().is_some())
+        .map(|(_, output_type)| {
+            let ArrayIrType::Array(output_type) = output_type else { return Ok(None) };
+            output_type
+                .sharding()
+                .filter(|sharding| Some(sharding.mesh()) == function_mesh)
+                .map(Sharding::cotangent)
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(TypeError::from)?;
+    transposed_call.derived_input_shardings = Some(
+        seed_shardings
+            .into_iter()
+            .chain(std::iter::repeat_n(None, cotangents.references().len()))
+            .chain(
+                inputs
+                    .iter()
+                    .zip(boundary)
+                    .filter(|(input, _)| input.as_known().is_some())
+                    .map(|(_, sharding)| sharding),
+            )
+            .collect(),
+    );
+    if let Some(mesh) = operation.mesh() {
+        // An override places a primal value, and the cotangent of that value has the dual reduction state (refer to
+        // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
+        // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of the
+        // override of its primal, as the cotangent types of those primals record it, and each known primal value is
+        // placed at the override itself. An input cotangent that the transposed call returns is the cotangent of the
+        // argument as the callee holds it once it has entered, so it carries no reduction state over auto mesh axes,
+        // which no type records (refer to `Sharding::without_auto_reduction_axes`).
+        let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
+        let output_cotangent_shardings = outputs
+            .iter()
+            .zip(output_types.iter())
+            .enumerate()
+            .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
+            .map(|(index, _)| cotangent_sharding(operation.output_sharding(index)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypeError::from)?;
+        let reference_shardings = cotangents.references().iter().map(|_| None);
+        let known_input_shardings = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.as_known().is_some())
+            .map(|(index, _)| operation.input_sharding(index).cloned());
+        let input_shardings = output_cotangent_shardings
+            .into_iter()
+            .chain(reference_shardings)
+            .chain(known_input_shardings)
+            .collect();
+        let output_shardings = input_indices
+            .iter()
+            .zip(transposed_callee.cotangents())
+            .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
+            .map(|(&index, _)| cotangent_sharding(operation.input_sharding(index)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypeError::from)?
+            .into_iter()
+            .map(|sharding| sharding.map(|sharding| sharding.without_auto_reduction_axes()))
+            .collect::<Vec<_>>();
+        transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
+    }
+    let transposed_call = O::from(transposed_call);
+    let input_cotangents = context.bind(
+        transposed_call,
+        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
+        transposed_inputs.as_slice(),
+    )?;
+    let cotangent_types = input_indices
+        .iter()
+        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
+
+    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
+    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
+    // a value cotangent to the enclosing context.
+    inputs
+        .iter()
+        .map(|input| {
+            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
+            match cotangent {
+                Some(MaybeZero::Value(cotangent)) if !input.r#type().is_reference() => {
+                    let refined = input.r#type().cotangent().map_err(ProgramError::from)?;
+                    let cotangent = summed_input_cotangent(context, &refined, cotangent)?;
+                    let cotangent = refined_derived_value(context, operation.mesh(), refined, cotangent);
+                    return Ok(MaybeZero::Value(cotangent?));
+                }
+                Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
+                _ => {}
+            }
+            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+        })
+        .collect()
+}
+
 /// Returns `cotangent`, the cotangent that the transposition of a call returns for an input whose cotangent type is
 /// `refined`, summed over the manual mesh axes along which it varies beyond `refined`. A call whose inputs vary along
 /// manual mesh axes beyond the callee input types runs its callee as if every input varied along all of them (refer
@@ -3580,6 +3575,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::hash::DefaultHasher;
     use std::sync::Mutex;
 
@@ -3595,18 +3591,19 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        CotangentDestinationKind, DotsSavable, Linearization, NothingSavable, RematerializationPolicyFn,
-        SaveOnlyTheseNames, TransposedProgram,
+        CotangentDestinationKind, DotsSavable, EverythingSavable, Linearization, NothingSavable,
+        RematerializationPolicyFn, SaveOnlyTheseNames, TransposedProgram,
     };
     use crate::operations::arithmetic::{MulOperation, NegOperation};
     use crate::operations::assertions::AssertOperation;
     use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::{
-        CompositeJvpRule, CompositeKey, CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition,
-        CustomRuleRegistration, CustomRuleTracer, NamedComposite,
-    };
+    use crate::operations::composites::operations::composite::{CompositeJvpRule, CompositeOperation};
+    use crate::operations::composites::operations::composite_transpose::CompositeTransposeOperation;
+    use crate::operations::composites::rules::CustomRuleTracer;
+    use crate::operations::composites::rules::definitions::{CompositeKey, CustomRuleDefinition, NamedComposite};
+    use crate::operations::composites::rules::registrations::CustomRuleRegistration;
     use crate::operations::constants::iota::IotaOperation;
     use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::constants::zero::ZeroOperation;
@@ -3695,6 +3692,13 @@ mod tests {
         builder
             .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee_region], inputs, None)
             .unwrap()[0]
+    }
+
+    /// Returns the hash of `operation` under the [`DefaultHasher`].
+    fn hash(operation: &CallOperation<ArrayIrType>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        operation.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Returns the logical mesh of one manual axis `x` of 2 devices, together with the local type `f32[1]` of the shard
@@ -3971,6 +3975,28 @@ mod tests {
         callee
     }
 
+    /// Stages the nested diamond `g_k(a, b) = g_{k-1}(a, b) + g_{k-1}(sin a, b)` of `depth` levels over
+    /// `g_0(a, b) = sin(a · b) ⊙ cos(a · b) + a` into `builder` with every level inlined, and returns its output. This
+    /// is the reference without calls of [`residual_demand_diamond_callee`].
+    fn add_inlined_residual_demand_diamond(
+        builder: &mut ProgramBuilder<TestValue, TestOperation>,
+        depth: usize,
+        left: AtomId,
+        right: AtomId,
+    ) -> AtomId {
+        if depth == 0 {
+            return add_residual_demand_leaf(builder, left, right);
+        }
+        let first = add_inlined_residual_demand_diamond(builder, depth - 1, left, right);
+        let shifted = builder
+            .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![left], None)
+            .unwrap()[0];
+        let second = add_inlined_residual_demand_diamond(builder, depth - 1, shifted, right);
+        builder
+            .add_instruction(ArrayOperation::from(AddOperation::new()), Vec::new(), vec![first, second], None)
+            .unwrap()[0]
+    }
+
     /// Returns `(x, w, b) ↦ x ⊙ y`, where `body` stages the calls that compute `y` from `w` and `b`, and, when `policy`
     /// is provided, wraps that function in a rematerialization under `policy`. Differentiating only `x` makes `y` the
     /// only value that the tangent needs, so every call stays all-known, while differentiating `w` as well makes every
@@ -4060,11 +4086,6 @@ mod tests {
 
     #[test]
     fn test_call_operation_with_boundary() {
-        let hash = |operation: &CallOperation<ArrayIrType>| {
-            let mut hasher = DefaultHasher::new();
-            operation.hash(&mut hasher);
-            hasher.finish()
-        };
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let reversed_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(1, 0), Device::new(0, 0)]).unwrap();
@@ -4230,9 +4251,19 @@ mod tests {
         assert_eq!(plain.derived_input_shardings(), None);
         assert_eq!(derived.derived_input_shardings(), Some(&[None, Some(replicated)][..]));
         assert_ne!(derived, plain);
+        assert_ne!(hash(&derived), hash(&plain));
+
+        // The function mesh takes part in equality but is neither hashed nor rendered.
         assert_eq!(plain.function_mesh(), None);
         let device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
-        assert_eq!(plain.with_function_mesh(&device_mesh).function_mesh(), Some(&device_mesh));
+        let meshed = plain.clone().with_function_mesh(&device_mesh);
+        assert_eq!(meshed.function_mesh(), Some(&device_mesh));
+        assert_ne!(meshed, plain);
+        assert_eq!(hash(&meshed), hash(&plain));
+        let render = |operation: &CallOperation<ArrayIrType>| {
+            std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string()
+        };
+        assert_eq!(render(&meshed), render(&plain));
     }
 
     #[test]
@@ -4324,7 +4355,9 @@ mod tests {
         );
         assert_eq!(
             CallOperation::new(2).with_callee_region(callee.entry_region_ref()),
-            Err(TypeError::invalid("`call` lifted capture prefix 2 exceeds its 1 callee inputs")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` lifted capture prefix 2 exceeds its 1 callee inputs",
+            ))),
         );
 
         // Generated callees can introduce local identities even when the source that was transformed had none.
@@ -4423,11 +4456,11 @@ mod tests {
         assert_eq!(call.validate_input_types(&[f32_vector_type(4)], &[placed]), Ok(()));
         assert_eq!(
             call.validate_input_types(&[f32_vector_type(4)], &[f32_vector_type(3)]),
-            Err(TypeError::invalid("`call` input #0 expected f32[4] but got f32[3]")),
+            Err(TypeError::invalid(format!("`{CALL_OPERATION_NAME}` input #0 expected f32[4] but got f32[3]"))),
         );
         assert_eq!(
             call.validate_input_types(&[f32_vector_type(4)], &[]),
-            Err(TypeError::invalid("`call` expected 1 input(s) but got 0")),
+            Err(TypeError::invalid(format!("`{CALL_OPERATION_NAME}` expected 1 input(s) but got 0"))),
         );
     }
 
@@ -4454,7 +4487,9 @@ mod tests {
         ] {
             assert_eq!(
                 call.validate_input_types(std::slice::from_ref(&declared), std::slice::from_ref(&actual)),
-                Err(TypeError::invalid(format!("`call` input #0 expected {declared} but got {actual}"))),
+                Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` input #0 expected {declared} but got {actual}",
+                ))),
             );
         }
 
@@ -4494,7 +4529,9 @@ mod tests {
             let actual = typed(&manual_mesh, varying_x_y);
             assert_eq!(
                 call.validate_input_types(std::slice::from_ref(&declared), std::slice::from_ref(&actual)),
-                Err(TypeError::invalid(format!("`call` input #0 expected {declared} but got {actual}"))),
+                Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` input #0 expected {declared} but got {actual}",
+                ))),
             );
         }
     }
@@ -4514,7 +4551,7 @@ mod tests {
         assert_eq!(operation.name(), CALL_OPERATION_NAME);
         assert_eq!(
             operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("`call` expects 1 attached callee region but got 0")),
+            Err(TypeError::invalid(format!("`{CALL_OPERATION_NAME}` expects 1 attached callee region but got 0"))),
         );
         assert_eq!(
             operation
@@ -4523,33 +4560,39 @@ mod tests {
             vec![array_type.clone(), dimension_type.clone()],
         );
 
-        // The call operands must match the callee boundary, which must cover the lifted capture prefix.
+        // The call inputs must match the callee boundary, which must cover the lifted capture prefix.
         assert_eq!(
             CallOperation::new(2)
                 .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface)),
-            Err(TypeError::invalid("`call` lifted capture prefix 2 exceeds its 1 callee inputs")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` lifted capture prefix 2 exceeds its 1 callee inputs",
+            ))),
         );
         assert_eq!(
             operation.infer_output_types(&[], std::slice::from_ref(&interface)),
-            Err(TypeError::invalid("`call` expected 1 input(s) but got 0")),
+            Err(TypeError::invalid(format!("`{CALL_OPERATION_NAME}` expected 1 input(s) but got 0"))),
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&array_type), std::slice::from_ref(&interface)),
-            Err(TypeError::invalid(format!("`call` input #0 expected {dimension_type} but got {array_type}"))),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` input #0 expected {dimension_type} but got {array_type}",
+            ))),
         );
 
         // A callee that defines its own result identities needs caller-owned result names.
         let local_interface = RegionInterface::new(Vec::new(), vec![dimension_type], EffectClasses::NONE);
         assert_eq!(
             operation.infer_output_types(&[], &[local_interface]),
-            Err(TypeError::invalid("`call` with callee-local result identities requires `with_callee_type_signature`")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` with callee-local result identities requires `with_callee_type_signature`",
+            ))),
         );
     }
 
     #[test]
     fn test_call_operation_input_region_provenance() {
-        // A call forwards its operands to the callee positionally, so input provenance is index-preserving for the
-        // single callee region and absent for any other region.
+        // A call forwards its inputs to the callee positionally, so input provenance preserves indices for the single
+        // callee region and is absent for any other region.
         let operation = CallOperation::<ArrayIrType>::new(2);
         assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::Input { index: 3 });
         assert_eq!(operation.input_region_provenance(1, 3), InputRegionProvenance::None);
@@ -4618,9 +4661,8 @@ mod tests {
 
     #[test]
     fn test_call_operation_prune_boundary() {
-        // The callee maps its lifted capture `c` and its operands `(x, y)` to `(cos(x), c * y)`. Using only the first
-        // output drops the operand `y` and the second output, while the capture prefix is kept although nothing uses
-        // it.
+        // The callee maps its lifted capture `c` and its inputs `(x, y)` to `(cos(x), c * y)`. Using only the first
+        // output drops the input `y` and the second output, while the capture prefix is kept although nothing uses it.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
         let callee = build_program(vec![r#type.clone(); 3], |builder, inputs| {
             let cosine = builder
@@ -4657,6 +4699,64 @@ mod tests {
     }
 
     #[test]
+    fn test_call_operation_prune_boundary_keeps_boundary_shardings_of_kept_positions() {
+        // The callee maps `(x, y, z)` to `(cos(x), x * z, sin(z))` and never uses `y`, and its caller drops the second
+        // output. Pruning drops the overrides at those positions, which differ from the boundary at the positions that
+        // follow them (i.e., no override for `z` and a replicated one for `sin(z)`), so a misindexed override would
+        // render.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh, 1);
+        let r#type = ArrayIrType::Array(f64_vector_type(4));
+        let callee = build_program(vec![r#type.clone(); 3], |builder, inputs| {
+            let cosine = builder
+                .add_instruction(ArrayOperation::from(CosOperation::new()), Vec::new(), vec![inputs[0]], None)
+                .unwrap()[0];
+            let product = builder
+                .add_instruction(
+                    ArrayOperation::from(MulOperation::new()),
+                    Vec::new(),
+                    vec![inputs[0], inputs[2]],
+                    None,
+                )
+                .unwrap()[0];
+            let sine = builder
+                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[2]], None)
+                .unwrap()[0];
+            vec![cosine, product, sine]
+        });
+        let program = build_program(vec![r#type; 3], |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0).with_boundary(
+                Some(&device_mesh),
+                vec![Some(replicated.clone()), Some(sharded.clone()), None],
+                vec![None, Some(sharded.clone()), Some(replicated.clone())],
+            ));
+            let outputs = builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap();
+            vec![outputs[0], outputs[2]]
+        });
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4], %4:f64[4] = call [
+                    input_shardings=[{mesh<['x'=2:auto]>, [{}]}, _],
+                    output_shardings=[_, {mesh<['x'=2:auto]>, [{}]}],
+                    devices=[0, 1],
+                ] %0 %2 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = cos %0
+                            %3:f64[4] = sin %1
+                        in (%2, %3)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+    }
+
+    #[test]
     fn test_call_operation_region_capture_input_count() {
         // The lifted capture prefix of a call is the capture prefix of its single callee region, and no other region
         // has one.
@@ -4667,10 +4767,10 @@ mod tests {
 
     #[test]
     fn test_call_operation_discharge_references() {
-        // `call` forwards its operands onto its callee one for one and reports the callee's outputs as its own, so
-        // the shared positional rewrite threads state through it. The callee gains the entering state after its
-        // declared inputs and publishes the final state after its declared outputs, while the call site keeps its own
-        // operand and output contract. The callee mutates the root and returns only the previous snapshot, so the
+        // `call` forwards its inputs onto its callee one for one and reports the callee's outputs as its own, so
+        // the shared positional rewrite threads state through it. The callee receives the entering state in place of
+        // its reference input and publishes the final state after its declared outputs, while the call site keeps its
+        // own input and output contract. The callee mutates the root and returns only the previous snapshot, so the
         // final state is exactly what the call site would otherwise have lost.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
@@ -4695,8 +4795,18 @@ mod tests {
         // leaves no external state behind and the rewritten call is the entry region's only instruction.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings(), &[]);
-        assert_eq!(discharged.program().output_types().len(), 2);
-        assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = call %0 %1 [
+                    callee={
+                        lambda %0:f32[], %1:f32[] .
+                        in (%0, %1)
+                    },
+                ]
+                in (%2, %3)"},
+        );
     }
 
     #[test]
@@ -4731,7 +4841,30 @@ mod tests {
 
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 2);
-        assert_eq!(discharged.program().output_count(), 4);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4], %3:f64[4] .
+                let %4:f64[4], %5:f64[4], %6:f64[4], %7:f64[4] = call %0 %1 %2 %3 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4], %2:f64[4], %3:f64[4] .
+                        let %4:f64[4], %5:f64[4] = call %0 %1 [
+                            callee={
+                                lambda %0:f64[4], %1:f64[4] .
+                                in (%0, %1)
+                            },
+                        ]
+                            %6:f64[4], %7:f64[4] = call %2 %3 [
+                                callee={
+                                    lambda %0:f64[4], %1:f64[4] .
+                                    in (%0, %1)
+                                },
+                            ]
+                        in (%4, %6, %5, %7)
+                    },
+                ]
+                in (%4, %5, %6, %7)"},
+        );
         assert_eq!(discharged.external_reference_bindings().len(), 2);
         assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(discharged.external_reference_bindings()[0].is_mutated());
@@ -4794,7 +4927,28 @@ mod tests {
 
         let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.program().output_count(), 2);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4], %3:bool[] .
+                let %4:f64[4], %5:f64[4] = call [capture_count=1] %1 %2 %3 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4], %2:bool[] .
+                        let %3:f64[4], %4:f64[4] = condition %2 %1 %0 [
+                            true={
+                                lambda %0:f64[4], %1:f64[4] .
+                                in (%1, %0)
+                            },
+                            false={
+                                lambda %0:f64[4], %1:f64[4] .
+                                in (%1, %0)
+                            },
+                        ]
+                        in (%3, %4)
+                    },
+                ]
+                in (%4, %5)"},
+        );
         assert_eq!(discharged.external_reference_bindings().len(), 2);
         assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(!discharged.external_reference_bindings()[0].is_mutated());
@@ -4823,7 +4977,18 @@ mod tests {
         // through the forwarded result is not a mutation, so no final-state output is appended.
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.program().output_count(), 1);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4] .
+                let %1:f64[4] = call %0 [
+                    callee={
+                        lambda %0:f64[4] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
         assert_eq!(discharged.external_reference_bindings().len(), 1);
         assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(!discharged.external_reference_bindings()[0].is_mutated());
@@ -4965,7 +5130,9 @@ mod tests {
         // The type rule of the call validates the inputs of a direct application before the callee runs.
         assert_eq!(
             context.bind(call, vec![callee], &[f32_value(f32_vector_type(3), &[2.0, 3.0, 4.0])]),
-            Err(ProgramError::from(TypeError::invalid("`call` input #0 expected f32[2] but got f32[3]"))),
+            Err(ProgramError::from(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` input #0 expected f32[2] but got f32[3]",
+            )))),
         );
     }
 
@@ -7218,6 +7385,39 @@ mod tests {
                 .unwrap()
                 .clone()
         };
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    let %1:f32[] = call [derived_input_shardings=[_]] %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            let %1:f32[] = mul %0 %0
+                                %2:f32[] = print [label=known, effect_class=unordered_io] %1
+                            in (%2)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = call [derived_input_shardings=[_, _]] %0 %1 [
+                        callee={
+                            lambda %0:f32[], %1:f32[] .
+                            let %2:f32[] = mul %0 %1
+                                %3:f32[] = print [label=residual, effect_class=unordered_io] %2
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
         assert!(Arc::ptr_eq(&first_callee(partition.known_program()), &first_callee(other.known_program())));
         assert!(Arc::ptr_eq(&first_callee(partition.residual_program()), &first_callee(other.residual_program())));
 
@@ -7272,7 +7472,40 @@ mod tests {
         let policy = ResidualPolicyReference::new(NothingSavable);
         let warm = program(false).partition_with_residual_policy(&[true, false], &policy).unwrap();
         let partition = program(true).partition_with_residual_policy(&[true, false], &policy).unwrap();
-        assert!(partition.known_program().instructions().is_empty());
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    in (%0)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = print [label=before] %0
+                        %3:f32[] = call [derived_input_shardings=[_]] %1 [
+                            callee={
+                                lambda %0:f32[] .
+                                let %1:f32[] = mul %0 %0
+                                    %2:f32[] = print [label=known] %1
+                                in (%2)
+                            },
+                        ]
+                        %4:f32[] = call [derived_input_shardings=[_, _]] %0 %3 [
+                            callee={
+                                lambda %0:f32[], %1:f32[] .
+                                let %2:f32[] = mul %0 %1
+                                    %3:f32[] = print [label=residual] %2
+                                in (%3)
+                            },
+                        ]
+                    in (%4)
+                }"},
+        );
         let known_callee =
             warm.known_program().region_ref(warm.known_program().instructions()[0].regions()[0]).unwrap();
         let cached_callee = partition
@@ -7284,6 +7517,8 @@ mod tests {
 
     #[test]
     fn test_call_operation_partially_evaluate_cached_effectful_splits_keep_outputless_residuals() {
+        // The callee returns the square of its known input and prints its unknown input, so the residual program keeps
+        // that print in a residual call without outputs, also when the split comes from the cache.
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let callee = Arc::new(build_program(vec![scalar_type.clone(); 2], |builder, inputs| {
             let squared = builder
@@ -7303,7 +7538,19 @@ mod tests {
         let warm = program.partition(&[true, false]).unwrap();
         let partition = program.partition(&[true, false]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
-        assert_eq!(partition.residual_program().output_count(), 0);
+        assert_eq!(
+            partition.residual_program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let () = call [derived_input_shardings=[_]] %0 [
+                    callee={
+                        lambda %0:f32[] .
+                        let %1:f32[] = print [label=residual] %0
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
         let scalar = |value: f32| f32_value(ArrayType::scalar(DataType::F32), &[value]);
         assert_eq!(partition.known_program().interpret(vec![scalar(2.0)]), Ok(vec![scalar(4.0)]));
         for unknown in [3.0, 5.0] {
@@ -7315,8 +7562,8 @@ mod tests {
     #[test]
     fn test_call_operation_partially_evaluate_keeps_forced_copies_under_specialization() {
         // Specializing a program never folds a copy that every execution must make (i.e., a `place` with `may_alias`
-        // disabled), whether the call that holds it is all known or split, so two executions of the specialized
-        // program return arrays with distinct storage. A call without such a copy still folds.
+        // disabled), so an all-known call whose callee makes one stays residual, and two executions of the specialized
+        // program return arrays with distinct storage. An all-known call without such a copy still folds.
         let array_type = ArrayType::new_static(DataType::F64, [4]);
         let r#type = ArrayIrType::Array(array_type.clone());
         let array = |values: &[f64]| f64_value(array_type.clone(), values);
@@ -7352,6 +7599,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4] = call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = place [may_alias=false] %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
         let first = evaluation.interpret(&context, &[]).unwrap();
         let second = evaluation.interpret(&context, &[]).unwrap();
         assert_eq!(first, vec![known.clone()]);
@@ -7405,6 +7665,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4] = call %1 %0 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = place [may_alias=false] %0
+                            %3:f64[4] = neg %1
+                        in (%2, %3)
+                    },
+                ]
+                in (%2, %3)"},
+        );
         let first = evaluation.interpret(&context, std::slice::from_ref(&unknown)).unwrap();
         let second = evaluation.interpret(&context, std::slice::from_ref(&unknown)).unwrap();
         assert_eq!(first, vec![known.clone(), array(&[-5.0, -6.0, -7.0, -8.0])]);
@@ -7439,12 +7713,24 @@ mod tests {
                 .unwrap();
             let partition = program.partition_with_residual_policy(&vec![true; input_count], &policy).unwrap();
             assert_eq!(partition.known_program().to_string(), program.to_string());
-            assert_eq!(partition.residual_program().instructions().len(), 0);
+            assert_eq!(
+                partition.residual_program().to_string(),
+                indoc! {"
+                    lambda  .
+                    in ()"},
+            );
         };
+
+        // Each callee returns an array input whose type is replicated over an explicit mesh, which is the only public
+        // array argument of its call, so forwarding would replace that output by the input if the guard did not keep
+        // the boundary of the call.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
 
         // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
         let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(dynamic_type.into());
         let output = builder
@@ -7452,15 +7738,17 @@ mod tests {
             .unwrap()[0];
         check_boundary(
             builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output, input], vec![Placeholder], vec![Placeholder; 2])
                 .unwrap(),
             0,
         );
 
         // An ordered assertion must keep the same owning call and execution order.
-        let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
+        let predicate_type = ArrayIrType::from(
+            ArrayType::scalar(DataType::Boolean).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
+        );
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(predicate_type.clone());
+        let predicate = builder.add_input(predicate_type);
         builder
             .add_instruction(
                 ArrayOperation::from(AssertOperation::<ArrayType>::new("required predicate")),
@@ -7479,9 +7767,15 @@ mod tests {
         // Reference handles keep their existing boundary semantics too.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder
+            .add_input(ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap().into());
         check_boundary(
             builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![reference, value],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
                 .unwrap(),
             0,
         );
@@ -7489,7 +7783,7 @@ mod tests {
         // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
         // concrete eager calls whole. Using a literal in a live trace makes the retained call directly observable.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(predicate_type);
+        let input = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let callee = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -7520,14 +7814,64 @@ mod tests {
     }
 
     #[test]
+    fn test_call_operation_partially_evaluate_forwards_unchanged_inputs() {
+        // The callee `f(a) = (a, sin(a))` returns its only input, whose type is replicated over an explicit mesh, and
+        // its call places nothing. The call therefore returns `a` unchanged whatever its argument is, so partial
+        // evaluation under a residual policy resolves the first output of an all-known call to the call input, and the
+        // known call no longer returns it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let r#type: ArrayIrType = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::replicated(mesh, 1))
+            .unwrap()
+            .into();
+        let callee = Arc::new(build_program(vec![r#type.clone()], |builder, inputs| {
+            let sine = builder
+                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[0]], None)
+                .unwrap()[0];
+            vec![inputs[0], sine]
+        }));
+        let program = build_program(vec![r#type], |builder, inputs| {
+            let callee = builder.intern_callee(&callee, None).unwrap();
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let policy = ResidualPolicyReference::new(NothingSavable);
+        assert_eq!(
+            program.partition_with_residual_policy(&[true], &policy).unwrap().to_string(),
+            indoc! {"
+                partition [known_inputs=[0], residual_inputs=[], outputs=[Known(0), Known(1)]]
+                known={
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call %0 [
+                        callee={
+                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                            let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
+                            in (%1)
+                        },
+                    ]
+                    in (%0, %1)
+                }
+                residual={
+                    lambda  .
+                    in ()
+                }"},
+        );
+    }
+
+    #[test]
     fn test_call_operation_partially_evaluate_does_not_forward_inputs_across_call_boundaries() {
         // The callee `f(a, x) = (a, sin(a) * x)` returns its first input, which the boundary of the compiled function
-        // that it comes from replicates. Logical types do not record that placement, so neither an all-known call of
-        // it nor the known call of its split may be replaced by its input under a residual policy.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        // that it comes from replicates on its own devices. Logical types do not record those devices, so neither an
+        // all-known call of it nor the known call of its split may be replaced by its input under a residual policy.
+        // The inputs are typed over an explicit mesh, so a known call whose only argument is `a` would otherwise be
+        // forwarded, which is the known call of the split under a policy that saves `sin(a)`. The all-known call also
+        // has `x` as a second public argument, and under a policy that saves nothing the known callee of the split is
+        // empty, so the whole call stays residual.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let replicated = Sharding::replicated(mesh, 1);
-        let r#type: ArrayIrType = ArrayType::new_static(DataType::F32, [4]).into();
+        let r#type: ArrayIrType =
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap().into();
         let callee = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let a = builder.add_input(r#type.clone());
@@ -7566,12 +7910,12 @@ mod tests {
             indoc! {"
                 partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0), Known(1)]]
                 known={
-                    lambda %0:f32[4], %1:f32[4] .
-                    let %2:f32[4], %3:f32[4] = call [output_shardings=[{mesh<['x'=2:auto]>, [{}]}, _], devices=[0, 1]] %0 %1 [
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %0 %1 [
                         callee={
-                            lambda %0:f32[4], %1:f32[4] .
-                            let %2:f32[4] = sin %0
-                                %3:f32[4] = mul %2 %1
+                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
+                                %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %2 %1
                             in (%0, %3)
                         },
                     ]
@@ -7591,20 +7935,56 @@ mod tests {
                     outputs=[Unknown(0), Unknown(1)],
                 ]
                 known={
-                    lambda %0:f32[4] .
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
                     in (%0)
                 }
                 residual={
-                    lambda %0:f32[4], %1:f32[4] .
-                    let %2:f32[4], %3:f32[4] = call [output_shardings=[{mesh<['x'=2:auto]>, [{}]}, _], devices=[0, 1]] %1 %0 [
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %1 %0 [
                         callee={
-                            lambda %0:f32[4], %1:f32[4] .
-                            let %2:f32[4] = sin %0
-                                %3:f32[4] = mul %2 %1
+                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
+                                %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %2 %1
                             in (%0, %3)
                         },
                     ]
                     in (%2, %3)
+                }"},
+        );
+        let policy = ResidualPolicyReference::new(EverythingSavable);
+        assert_eq!(
+            program.partition_with_residual_policy(&[true, false], &policy).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [
+                        output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _],
+                        derived_input_shardings=[{mesh<['x'=2:explicit]>, [{}]}],
+                        devices=[0, 1],
+                    ] %0 [
+                        callee={
+                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                            let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
+                            in (%0, %1)
+                        },
+                    ]
+                    in (%1, %2)
+                }
+                residual={
+                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [derived_input_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %0 %1 [
+                        callee={
+                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    in (%2)
                 }"},
         );
     }
@@ -7617,11 +7997,17 @@ mod tests {
         // evaluation keeps `w` as an output of the call instead of forwarding the argument, because a staged known
         // program may later be interpreted eagerly, where a committed `b` selects the devices of the call, moves `w`
         // there, and commits it (refer to `CallOperation::returns_input_unchanged`). The known program therefore
-        // returns the output of the call, which a residual planner then plans as a value of its own.
+        // returns the output of the call, which a residual planner then plans as a value of its own. Both arguments are
+        // replicated over an explicit mesh, so that their number alone keeps `w` from being forwarded.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let matrix_type: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 2])
+            .with_sharding(Sharding::replicated(mesh, 2))
+            .unwrap()
+            .into();
         let callee = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let left = builder.add_input(residual_demand_matrix_type());
-            let right = builder.add_input(residual_demand_matrix_type());
+            let left = builder.add_input(matrix_type.clone());
+            let right = builder.add_input(matrix_type.clone());
             let output = builder
                 .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![left, right], None)
                 .unwrap()[0];
@@ -7636,8 +8022,8 @@ mod tests {
             )
         };
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let w = builder.add_input(residual_demand_matrix_type());
-        let b = builder.add_input(residual_demand_matrix_type());
+        let w = builder.add_input(matrix_type.clone());
+        let b = builder.add_input(matrix_type);
         let callee_region = builder.intern_callee(&callee, None).unwrap();
         let derived = CallOperation::<ArrayIrType>::new(0).with_derived_input_shardings(vec![None, None]);
         let outputs = builder
@@ -7655,11 +8041,11 @@ mod tests {
             indoc! {"
                 partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0), Known(1)]]
                 known={
-                    lambda %0:f32[2, 2], %1:f32[2, 2] .
-                    let %2:f32[2, 2], %3:f32[2, 2] = call [derived_input_shardings=[_, _]] %0 %1 [
+                    lambda %0:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %1:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
+                    let %2:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %3:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = call [derived_input_shardings=[_, _]] %0 %1 [
                         callee={
-                            lambda %0:f32[2, 2], %1:f32[2, 2] .
-                            let %2:f32[2, 2] = mul %0 %1
+                            lambda %0:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %1:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
+                            let %2:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = mul %0 %1
                             in (%0, %2)
                         },
                     ]
@@ -7739,6 +8125,74 @@ mod tests {
 
         // Rematerialization changes neither the primal value nor the derivatives.
         assert_residual_demand_linearizations_match(&repeated(4, Some(policy)), &repeated(4, None), &[0], None);
+    }
+
+    #[test]
+    fn test_call_operation_split_on_residual_demand_keeps_output_overrides_of_replayed_outputs() {
+        // The replay call recomputes the demanded output of the call, so it keeps the sharding override of that output,
+        // as the known call does for the output that it still returns.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let output_sharding = Sharding::replicated(mesh, 2);
+        let callee = residual_demand_leaf_callee();
+        let policy = ResidualPolicyReference::new(DotsSavable);
+        let program = residual_demand_program(Some(policy), |builder, weights, bias| {
+            let callee = builder.intern_callee(&callee, None).unwrap();
+            let call = CallOperation::new(0).with_boundary(
+                Some(&device_mesh),
+                Vec::new(),
+                vec![Some(output_sharding.clone())],
+            );
+            builder.add_instruction(TestOperation::Call(call), vec![callee], vec![weights, bias], None).unwrap()[0]
+        });
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2], %4:f32[2, 2] = call [
+                    output_shardings=[{mesh<['x'=2:auto]>, [{}, {}]}, _],
+                    derived_input_shardings=[{mesh<['x'=2:auto]>, [{}, {}]}, {mesh<['x'=2:auto]>, [{}, {}]}],
+                    devices=[0, 1],
+                ] %1 %2 [
+                    callee={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %0 %1
+                            %3:f32[2, 2] = sin %2
+                            %4:f32[2, 2] = cos %2
+                            %5:f32[2, 2] = mul %3 %4
+                            %6:f32[2, 2] = add %5 %0
+                        in (%6, %2)
+                    },
+                ]
+                    %5:f32[2, 2] = mul %0 %3
+                in (%5, %1, %4)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 [
+                    body={
+                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                        let %3:f32[2, 2] = call [
+                            output_shardings=[{mesh<['x'=2:auto]>, [{}, {}]}],
+                            derived_input_shardings=[{mesh<['x'=2:auto]>, [{}, {}]}, _],
+                            devices=[0, 1],
+                        ] %1 %2 [
+                            callee={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = sin %1
+                                    %3:f32[2, 2] = cos %1
+                                    %4:f32[2, 2] = mul %2 %3
+                                    %5:f32[2, 2] = add %4 %0
+                                in (%5)
+                            },
+                        ]
+                            %4:f32[2, 2] = mul %3 %0
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
+        );
     }
 
     #[test]
@@ -7933,7 +8387,7 @@ mod tests {
                     .to_vec()
             });
 
-        // Ordinary partial evaluation preserves the original compiled-call boundary and expanded residual.
+        // Ordinary partial evaluation preserves the boundary of the original compiled call and the expanded residual.
         let ordinary = program.partition(&[false, true]).unwrap();
         assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
         assert_eq!(
@@ -8283,9 +8737,35 @@ mod tests {
         let partition = program
             .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(DotsSavable))
             .unwrap();
-        assert_eq!(partition.known_program().instructions().len(), 1);
-        assert!(matches!(partition.known_program().instructions()[0].operation(), TestOperation::Call(_)));
-        assert_eq!(partition.known_program().output_ids(), partition.known_program().instructions()[0].outputs());
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f32[2, 2] .
+                    let %2:f32[2, 2] = call %0 %1 [
+                        callee={
+                            lambda %0:bool[], %1:f32[2, 2] .
+                            let () = assert [message=\"required predicate\", labels=[]] %0
+                                %2:f32[2, 2] = dot [
+                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                ] %1 %1
+                                %3:f32[2, 2] = sin %2
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }
+                residual={
+                    lambda %0:f32[2, 2], %1:f32[2, 2] .
+                    let %2:f32[2, 2] = mul %1 %0
+                    in (%2)
+                }"},
+        );
     }
 
     #[test]
@@ -8422,21 +8902,25 @@ mod tests {
                 )?;
                 Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
             },
-            vec![vector.clone()],
+            vec![vector],
         )
         .unwrap();
-        assert_eq!(program.input_types(), vec![vector.clone()]);
-        assert_eq!(program.output_types(), vec![vector]);
-        let TestOperation::Call(call) = program.instructions()[0].operation() else {
-            panic!("expected call");
-        };
-        assert_eq!(call.capture_count(), 1);
 
         // The batched callee receives the extent as its leading input, and it does not return the extent, because that
         // bookkeeping output would only forward the input and an eager parent cannot return it from a compiled call.
-        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
-        assert_eq!(body.input_types().len(), 2);
-        assert_eq!(body.output_ids(), &[body.input_ids()[1]]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:dimension<3> = const 3
+                    %2:f32[3] = call [capture_count=1, derived_input_shardings=[_, _]] %1 %0 [
+                        callee={
+                            lambda %0:dimension<3>, %1:f32[3] .
+                            in (%1)
+                        },
+                    ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -8446,9 +8930,8 @@ mod tests {
         let batch_split =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
                 .unwrap();
-        let batch_type = ArrayIrType::Array(
-            ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(batch_split.clone()).unwrap(),
-        );
+        let batch_type =
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(batch_split).unwrap());
         let callee = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let input = builder.add_input(item.into());
@@ -8475,10 +8958,7 @@ mod tests {
                 vec![batch_type.clone()],
             )
             .unwrap();
-            let TestOperation::Call(call) = program.instructions()[0].operation() else {
-                panic!("expected call");
-            };
-            (call.derived_input_shardings().map(<[_]>::to_vec), program.output_types()[0].to_string())
+            program.to_string()
         };
 
         // The batched callee is created by batching, so the batched call is a derived call, which places each item
@@ -8490,17 +8970,49 @@ mod tests {
         // call of a `jit` dispatcher places nothing, so the types of their batched callees record no placement. The
         // leading extent input has no boundary.
         let derived = |shardings| CallOperation::<ArrayIrType>::new(0).with_derived_input_shardings(shardings);
-        let split_output = "f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}]".to_string();
-        let unplaced_output = "f32[2, 4]".to_string();
-        assert_eq!(batched(CallOperation::new(0)), (Some(vec![None, Some(batch_split.clone())]), split_output.clone()));
+        let split = indoc! {"
+            lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+            let %1:dimension<2> = const 2
+                %2:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = call [
+                    capture_count=1,
+                    derived_input_shardings=[_, {mesh<['x'=2:explicit]>, [{'x'}, {}]}],
+                ] %1 %0 [
+                    callee={
+                        lambda %0:dimension<2>, %1:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                        let %2:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] = sin %1
+                        in (%2)
+                    },
+                ]
+            in (%2)"};
+        assert_eq!(batched(CallOperation::new(0)), split);
+        assert_eq!(batched(derived(vec![Some(Sharding::replicated(mesh, 1))])), split);
         assert_eq!(
-            batched(derived(vec![Some(Sharding::replicated(mesh.clone(), 1))])),
-            (Some(vec![None, Some(batch_split)]), split_output),
+            batched(derived(vec![None])),
+            indoc! {"
+                lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                let %1:dimension<2> = const 2
+                    %2:f32[2, 4] = call [capture_count=1, derived_input_shardings=[_, _]] %1 %0 [
+                        callee={
+                            lambda %0:dimension<2>, %1:f32[2, 4] .
+                            let %2:f32[2, 4] = sin %1
+                            in (%2)
+                        },
+                    ]
+                in (%2)"},
         );
-        assert_eq!(batched(derived(vec![None])), (Some(vec![None, None]), unplaced_output.clone()));
         assert_eq!(
             batched(CallOperation::new(0).with_kept_input_placements()),
-            (Some(vec![None, None]), unplaced_output),
+            indoc! {"
+                lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                let %1:dimension<2> = const 2
+                    %2:f32[2, 4] = call [capture_count=1, derived_input_shardings=[_, _], keeps_input_placements=true] %1 %0 [
+                        callee={
+                            lambda %0:dimension<2>, %1:f32[2, 4] .
+                            let %2:f32[2, 4] = sin %1
+                            in (%2)
+                        },
+                    ]
+                in (%2)"},
         );
     }
 
@@ -8668,8 +9180,8 @@ mod tests {
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let dimension = builder.add_input(dimension_type.clone());
-        let array = builder.add_input(array_type.clone());
+        let dimension = builder.add_input(dimension_type);
+        let array = builder.add_input(array_type);
         let callee = builder.import_region(callee.entry_region_ref());
         let outputs = builder
             .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![dimension, array], None)
@@ -8680,15 +9192,25 @@ mod tests {
             .unwrap();
 
         let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_types(), vec![dimension_type.clone(), array_type.clone(), array_type.clone()]);
-        assert_eq!(jvp.output_types(), vec![dimension_type, array_type.clone(), array_type]);
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:dimension<size ∈ [1, 9)>, %1:f64[], %2:f64[] .
+                let %3:dimension<size ∈ [1, 9)>, %4:f64[], %5:f64[] = call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
+                    callee={
+                        lambda %0:dimension<size ∈ [1, 9)>, %1:f64[], %2:f64[] .
+                        in (%0, %1, %2)
+                    },
+                ]
+                in (%3, %4, %5)"},
+        );
     }
 
     #[test]
     fn test_call_operation_jvp_keeps_capture_prefix_inactive() {
         // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
-        // inactive over that prefix, numeric captures included, so the fused callee consumes the primal operands,
-        // capture prefix first, followed only by the live operand tangent.
+        // inactive over that prefix, numeric captures included, so the fused callee consumes the primal inputs,
+        // capture prefix first, followed only by the live input tangent.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
         let callee = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -8731,7 +9253,7 @@ mod tests {
     #[test]
     fn test_call_operation_jvp_threads_plumbing_and_active_references() {
         // The callee `f(captured, r, x) = { r += x; read(r) * read(captured) }` behind `call[capture_count=1]`
-        // reads a captured plumbing reference and mutates an active reference operand.
+        // reads a captured plumbing reference and mutates an active reference input.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
@@ -9045,8 +9567,9 @@ mod tests {
     #[test]
     fn test_call_operation_jvp_preserves_local_result_shape_relationships() {
         // `f(x, size) = broadcast(x, [dimension_from_scalar(size)])` is linear in `x` and returns an array whose extent
-        // the callee defines itself. The JVP rule binds separate primal and tangent calls, so the output tangent shares
-        // the primal output's extent only if that extent reaches the tangent call through a residual.
+        // the callee defines itself. The JVP rule binds one fused call whose callee broadcasts the primal and the
+        // tangent over the same extent, so the call declares one local extent that the output tangent shares with the
+        // primal output.
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::replicated(logical_mesh, 0);
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
@@ -9077,9 +9600,58 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let outputs = program.jvp().unwrap().output_types().into_owned();
-        assert_eq!(outputs.len(), 2);
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:i64[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %3:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}], %4:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = call [
+                    output_types=[f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}], f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}]],
+                    derived_input_shardings=[_, _, _],
+                ] %0 %1 %2 [
+                    callee={
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:i64[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                        let %3:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %1
+                            %4:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = broadcast [output_axes=[]] %0 %3
+                            %5:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = broadcast [output_axes=[]] %2 %3
+                        in (%4, %5)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        let outputs = jvp.output_types().into_owned();
         assert_eq!(outputs[1], outputs[0].tangent().unwrap());
+
+        // A linearization binds a primal call and a tangent call instead, so the output tangent shares the extent of
+        // the primal output only because that extent reaches the tangent call as a residual. The primal call returns
+        // the residual under an identity of its own, at which the callee of the tangent call is instantiated.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:i64[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %2:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}], %3:dimension<rows ∈ [0, 8)> = call [
+                    output_types=[f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}], dimension<rows ∈ [0, 8)>],
+                    derived_input_shardings=[_, _],
+                ] %0 %1 [
+                    callee={
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:i64[][sharding={mesh<['x'=1:auto]>, []}] .
+                        let %2:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %1
+                            %3:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = broadcast [output_axes=[]] %0 %2
+                        in (%3, %2)
+                    },
+                ]
+                in (%2, %3)
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<rows ∈ [0, 8)> .
+                let %2:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = call [derived_input_shardings=[_]] %0 %1 [
+                    callee={
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:dimension<rows ∈ [0, 8)> .
+                        let %2:f32[rows][sharding={mesh<['x'=1:auto]>, [{}]}] = broadcast [output_axes=[]] %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -9168,28 +9740,6 @@ mod tests {
 
     #[test]
     fn test_call_operation_jvp_shares_callees_of_nested_calls() {
-        /// Stages the nested diamond `g_k(a, b) = g_{k-1}(a, b) + g_{k-1}(sin a, b)` of `depth` levels over
-        /// `g_0(a, b) = sin(a · b) ⊙ cos(a · b) + a` into `builder` with every level inlined, and returns its output.
-        /// This is the call-free reference of [`residual_demand_diamond_callee`].
-        fn add_inlined_residual_demand_diamond(
-            builder: &mut ProgramBuilder<TestValue, TestOperation>,
-            depth: usize,
-            left: AtomId,
-            right: AtomId,
-        ) -> AtomId {
-            if depth == 0 {
-                return add_residual_demand_leaf(builder, left, right);
-            }
-            let first = add_inlined_residual_demand_diamond(builder, depth - 1, left, right);
-            let shifted = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![left], None)
-                .unwrap()[0];
-            let second = add_inlined_residual_demand_diamond(builder, depth - 1, shifted, right);
-            builder
-                .add_instruction(ArrayOperation::from(AddOperation::new()), Vec::new(), vec![first, second], None)
-                .unwrap()[0]
-        }
-
         let nested = |depth: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
             let callee = residual_demand_diamond_callee(depth);
             residual_demand_program(policy, |builder, weights, bias| add_call(builder, &callee, vec![weights, bias]))
@@ -9287,8 +9837,8 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_transpose_ignores_dead_reference_operands() {
-        // The linear callee `ẏ = { ṫr += ẋ; ẋ }` only stores into its reference operand and forwards `x`. Under an
+    fn test_call_operation_transpose_ignores_dead_reference_inputs() {
+        // The linear callee `ẏ = { ṫr += ẋ; ẋ }` only stores into its reference input and forwards `x`. Under an
         // `Ignore` destination for the reference no later instruction accumulated into its root and the callee never
         // reads it, so the callee is transposed with an `Ignore` destination as well. The transposed call consumes
         // `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
@@ -9340,7 +9890,7 @@ mod tests {
 
     #[test]
     fn test_call_operation_transpose_threads_cotangent_references() {
-        // The linear callee `ẏ = { ṫr += ẋ; read(ṫr) }` accumulates into its reference operand and reads it back.
+        // The linear callee `ẏ = { ṫr += ẋ; read(ṫr) }` accumulates into its reference input and reads it back.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
@@ -9372,8 +9922,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        // Transposed under a `Reference` destination for the reference operand, the pullback consumes `[ȳ, r̄]` and
-        // returns the cotangent reference by identity ahead of `x̄`. The reference operand's cotangent lives in that
+        // Transposed under a `Reference` destination for the reference input, the pullback consumes `[ȳ, r̄]` and
+        // returns the cotangent reference by identity ahead of `x̄`. The cotangent of the reference input lives in that
         // destination, which the transposed call accumulates into in place, so the pullback forwards its own
         // destination input rather than the call's forwarded reference output, while `x̄` is the call's second output.
         // The transposed callee is exactly the transposition of the inlined callee under the same destinations.
@@ -9403,7 +9953,7 @@ mod tests {
 
     #[test]
     fn test_call_operation_transpose_omits_dead_seeds_beside_cotangent_references() {
-        // The callee `ẏ = { ṫr += ẋ; (read(ṫr), ẋ) }` accumulates into its reference operand, reads it back, and
+        // The callee `ẏ = { ṫr += ẋ; (read(ṫr), ẋ) }` accumulates into its reference input, reads it back, and
         // forwards `x`. Only the read is live, so the forwarded output's seed is a structural zero. Under a `Reference`
         // destination the transposed call consumes `[ȳ₀, r̄]` with no input for the dead seed, accumulates into `r̄` in
         // place, and returns `x̄` read back from it.
@@ -9503,23 +10053,21 @@ mod tests {
         assert_eq!(
             pullback.program().to_string(),
             indoc! {"
-            lambda %0:f32[] .
-            let %1:f32[] = call [derived_input_shardings=[_]] %0 [
-                callee={
-                    lambda %0:f32[] .
-                    in (%0)
-                },
-            ]
-            in (%1)
-        "}
-            .trim_end()
+                lambda %0:f32[] .
+                let %1:f32[] = call [derived_input_shardings=[_]] %0 [
+                    callee={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
         );
     }
 
     #[test]
     fn test_call_operation_transpose_omits_dead_dynamic_seeds() {
         // The callee `(x, z) ↦ (x, z)` returns both of its dynamically shaped inputs, and only `z` is live. The dead
-        // output's seed is a structural zero of type `f64[dead]`, whose extent no operand of the call defines. The
+        // output's seed is a structural zero of type `f64[dead]`, whose extent no input of the call defines. The
         // transposed call has no input for that seed, so it needs no extent for it. It consumes the live seed alone,
         // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
         let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
@@ -9900,7 +10448,8 @@ mod tests {
         // stated as an input override, an output override, or both, as when it is inferred, for every reduction state
         // of its argument over explicit axes, which its type records. The cotangent of a value with a pending sum has a
         // completed one and the reverse (refer to `Sharding::cotangent`), so the transposed call places each cotangent
-        // that crosses the boundary at the cotangent sharding of the override of its primal.
+        // that crosses the boundary at the cotangent sharding of the override of its primal. A pending maximum defines
+        // no cotangent, so its pullback is rejected alike with and without overrides.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let replicated = Sharding::replicated(mesh, 0);
@@ -9930,6 +10479,11 @@ mod tests {
             });
             program.transpose_with_respect_to(&[0], &[]).map_err(|error| error.to_string())
         };
+        // Each row shows the outcome of the inferred boundary, so that a row cannot agree merely by failing alike.
+        let describe = |outcome: &Result<Vec<ArrayIrType>, String>| match outcome {
+            Ok(types) => format!("returns {}", types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")),
+            Err(error) => format!("fails with `{error}`"),
+        };
         let mut outcomes = Vec::new();
         for sharding in &states {
             let reference = pullback(sharding, false, false).map(|pullback| pullback.output_types().into_owned());
@@ -9937,8 +10491,8 @@ mod tests {
                 let derivative = pullback(sharding, input_override, output_override)
                     .map(|pullback| pullback.output_types().into_owned());
                 let outcome = match derivative == reference {
-                    true => "agrees".to_string(),
-                    false => format!("has {derivative:?} instead of {reference:?}"),
+                    true => format!("agrees and {}", describe(&reference)),
+                    false => format!("{} instead of {}", describe(&derivative), describe(&reference)),
                 };
                 outcomes.push(format!("{sharding}, {input_override}, {output_override}: {outcome}"));
             }
@@ -9946,18 +10500,18 @@ mod tests {
         assert_eq!(
             outcomes.join("\n"),
             indoc! {"
-                {mesh<['x'=2:explicit]>, []}, true, false: agrees
-                {mesh<['x'=2:explicit]>, []}, false, true: agrees
-                {mesh<['x'=2:explicit]>, []}, true, true: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, true, false: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, false, true: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, true, true: agrees
-                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, true, false: agrees
-                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, false, true: agrees
-                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, true, true: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, true, false: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, false, true: agrees
-                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, true, true: agrees"},
+                {mesh<['x'=2:explicit]>, []}, true, false: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, []}]
+                {mesh<['x'=2:explicit]>, []}, false, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, []}]
+                {mesh<['x'=2:explicit]>, []}, true, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, []}]
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, true, false: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], reduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, false, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], reduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}}, true, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], reduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, true, false: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, false, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], reduced={'x'}}, true, true: agrees and returns f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}}]
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, true, false: agrees and fails with `type f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}] does not define a cotangent representation`
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, false, true: agrees and fails with `type f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}] does not define a cotangent representation`
+                {mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}, true, true: agrees and fails with `type f32[][sharding={mesh<['x'=2:explicit]>, [], unreduced={'x'}, unreduced_kind=max}] does not define a cotangent representation`"},
         );
         // The transposed call of a call whose overrides hold a pending sum places the cotangents at a completed one.
         assert_eq!(
@@ -9981,7 +10535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_summary_new() {
+    fn test_region_placement_requests_new() {
         let vector_type = ArrayIrType::Array(f32_vector_type(4));
         let device = Device::new(1, 0);
         let device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
@@ -9995,7 +10549,7 @@ mod tests {
             let target = PlacementRequest::from(device);
             builder.add_instruction(place(target), Vec::new(), vec![moved], None).unwrap().to_vec()
         });
-        let summary = RegionPlacementSummary::new(program.entry_region_ref());
+        let summary = RegionPlacementRequests::new(program.entry_region_ref());
         assert_eq!(
             summary.requests(),
             &[
@@ -10007,7 +10561,7 @@ mod tests {
         let program = build_program(vec![vector_type.clone()], |builder, inputs| {
             builder.add_instruction(place(memory.clone()), Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
         });
-        let summary = RegionPlacementSummary::new(program.entry_region_ref());
+        let summary = RegionPlacementRequests::new(program.entry_region_ref());
         assert!(summary.has_requests(true));
         assert!(!summary.has_requests(false));
 
@@ -10018,7 +10572,7 @@ mod tests {
                 .unwrap();
             inputs.to_vec()
         });
-        assert_eq!(RegionPlacementSummary::new(program.entry_region_ref()).requests(), &[]);
+        assert_eq!(RegionPlacementRequests::new(program.entry_region_ref()).requests(), &[]);
 
         // A call that records a mesh names its devices when its callee requests a placement that names devices, and
         // names none when its callee only moves a value to another memory.
@@ -10036,14 +10590,14 @@ mod tests {
             })
         };
         assert_eq!(
-            RegionPlacementSummary::new(call_program(PlacementRequest::from(device)).entry_region_ref()).requests(),
+            RegionPlacementRequests::new(call_program(PlacementRequest::from(device)).entry_region_ref()).requests(),
             &[
                 (RequestedPlacement::Devices(device_mesh.clone()), CALL_OPERATION_NAME),
                 (RequestedPlacement::Devices(device_mesh.clone()), PLACE_OPERATION_NAME),
             ],
         );
         assert_eq!(
-            RegionPlacementSummary::new(call_program(memory).entry_region_ref()).requests(),
+            RegionPlacementRequests::new(call_program(memory).entry_region_ref()).requests(),
             &[(RequestedPlacement::Memory, PLACE_OPERATION_NAME)],
         );
 
@@ -10062,15 +10616,15 @@ mod tests {
                 builder.add_instruction(scan, vec![body], inputs.to_vec(), None).unwrap().to_vec()
             })
         };
-        assert_eq!(RegionPlacementSummary::new(scan_program(0).entry_region_ref()).requests(), &[]);
+        assert_eq!(RegionPlacementRequests::new(scan_program(0).entry_region_ref()).requests(), &[]);
         assert_eq!(
-            RegionPlacementSummary::new(scan_program(1).entry_region_ref()).requests(),
+            RegionPlacementRequests::new(scan_program(1).entry_region_ref()).requests(),
             &[(RequestedPlacement::Devices(device_mesh), PLACE_OPERATION_NAME)],
         );
     }
 
     #[test]
-    fn test_region_placement_summary_for_target() {
+    fn test_region_placement_requests_for_target() {
         // A request in the regions that a backend omits for a target platform is not a request of the program for that
         // platform, and the summary of each platform is retained separately.
         let vector_type = ArrayIrType::Array(f32_vector_type(4));
@@ -10091,112 +10645,61 @@ mod tests {
         };
         let placed = [(RequestedPlacement::Devices(device_mesh), PLACE_OPERATION_NAME)];
         let entry = program.entry_region_ref();
-        assert_eq!(RegionPlacementSummary::for_target(entry, "omitting", omits_scans).requests(), &[]);
-        assert_eq!(RegionPlacementSummary::for_target(entry, "keeping", |_, _| false).requests(), &placed);
-        assert_eq!(RegionPlacementSummary::new(entry).requests(), &placed);
-        assert_eq!(RegionPlacementSummary::for_target(entry, "omitting", omits_scans).requests(), &[]);
+        assert_eq!(RegionPlacementRequests::for_target(entry, "omitting", omits_scans).requests(), &[]);
+        assert_eq!(RegionPlacementRequests::for_target(entry, "keeping", |_, _| false).requests(), &placed);
+        assert_eq!(RegionPlacementRequests::new(entry).requests(), &placed);
+        assert_eq!(RegionPlacementRequests::for_target(entry, "omitting", omits_scans).requests(), &[]);
     }
 
     #[test]
-    fn test_transpose_primal_call() {
-        // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
-        // has no input for it and the transposed call consumes the value output's seed alone.
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
-        let value_program_type = ArrayIrType::Array(value_type.clone());
-        let source = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value = builder.add_input(value_program_type.clone());
-            let predicate = Array::from_elements(predicate_type.clone(), &[true, false, true, false]).unwrap();
-            let predicate = builder.add_constant(ArrayIrValue::Array(predicate));
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![value, predicate],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let transposed = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value_cotangent = builder.add_input(value_program_type.clone());
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<TestValue, TestOperation>::new();
-        let value_cotangent = context.input(value_program_type.clone());
-
-        let contributions = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(value_program_type.clone())],
-            &[
-                MaybeZero::Value(value_cotangent.clone()),
-                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
-            ],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
-
-        assert!(
-            matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_program_type)
-        );
-        let builder = context.builder().borrow();
-        let [call] = builder.instructions() else {
-            panic!("expected the transposed call to be the only staged instruction");
-        };
-        assert!(matches!(call.operation(), TestOperation::Call(_)));
-        assert_eq!(call.inputs(), &[value_cotangent.atom_id().unwrap()]);
-    }
-
-    #[test]
-    fn test_transpose_primal_call_uses_cotangent_descriptors_for_zero_cotangents() {
+    fn test_declared_input_sharding() {
+        // An executable places an argument of a declared type without a sharding replicated over its own mesh, and an
+        // argument of a declared type with a sharding at that sharding, whatever its own mesh is.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
-        let tangent_type = ArrayIrType::Array(tangent_type);
-        // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
-        // identity-region boundary rather than an empty driver that cannot answer that query.
-        let mut source_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = source_builder.add_input(tangent_type.clone());
-        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = transpose_builder.add_input(expected.clone());
-        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<TestValue, TestOperation>::new();
-        let cotangents = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(tangent_type.clone())],
-            &[MaybeZero::Zero(tangent_type.clone())],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
-        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(declared_input_sharding(&f32_vector_type(4), &mesh), Sharding::replicated(mesh.clone(), 1));
+        assert_eq!(
+            declared_input_sharding(&f32_vector_type(4).with_sharding(split.clone()).unwrap(), &other_mesh),
+            split,
+        );
+    }
 
-        let known = context.input(tangent_type.clone());
-        let cotangents = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Known(known)],
-            &[MaybeZero::Zero(tangent_type)],
-            &CotangentDestinations::without_references([true]),
-        )
+    #[test]
+    fn test_boundary_input_type() {
+        // A declared type without a sharding takes the placement of its boundary without the auto mesh axes, which
+        // types never record.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
         .unwrap();
-        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+        let split = |axes: &[&str]| Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]);
+        let item_type = f32_vector_type(4);
+        let split_type = item_type.clone().with_sharding(split(&["x"]).unwrap()).unwrap();
+        let replicated_type = item_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        assert_eq!(boundary_input_type(&item_type, &split(&["x"]).unwrap()), Some(split_type.clone()));
+        assert_eq!(boundary_input_type(&item_type, &split(&["x", "a"]).unwrap()), Some(split_type.clone()));
+        assert_eq!(boundary_input_type(&item_type, &split(&["a"]).unwrap()), Some(replicated_type));
+
+        // A declared type that records a sharding keeps it, and a boundary with a pending reduction states more than
+        // a type without a sharding can.
+        assert_eq!(boundary_input_type(&split_type, &split(&["x"]).unwrap()), None);
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(boundary_input_type(&item_type, &unreduced), None);
+    }
+
+    #[test]
+    fn test_states_boundary_placement() {
+        // A boundary states a placement exactly when it has at least one sharding override, so an empty list of
+        // overrides and a list that holds none state nothing.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh, 1);
+        let overrides = [None, Some(replicated.clone()), None];
+        assert!(!states_boundary_placement([]));
+        assert!(!states_boundary_placement([None::<Sharding>, None].iter().flatten()));
+        assert!(states_boundary_placement([&replicated]));
+        assert!(states_boundary_placement(overrides.iter().flatten()));
     }
 
     #[test]
@@ -10232,22 +10735,28 @@ mod tests {
         assert_eq!(retained.definitions(), first.definitions());
         assert_eq!(
             first.pruned(&[], &[true; 3]),
-            Err(TypeError::invalid("call result declaration pruning masks have incompatible arity")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` result declaration pruning masks have incompatible arity",
+            ))),
         );
 
         // A declaration cannot export the callee's private name verbatim or rename a forwarded input.
         assert_eq!(
             CallTypeBindings::with_outputs(&inputs, &outputs, outputs.clone()),
-            Err(TypeError::invalid("call local result declarations must use fresh identities")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` local result declarations must use fresh identities",
+            ))),
         );
         let other = ArrayIrType::from(DimensionType::new("other", bounds));
         assert_eq!(
             CallTypeBindings::with_outputs(&inputs, &inputs, vec![other]),
-            Err(TypeError::invalid("call result declarations must preserve forwarded input identities")),
+            Err(TypeError::invalid(format!(
+                "`{CALL_OPERATION_NAME}` result declarations must preserve forwarded input identities",
+            ))),
         );
         assert_eq!(
             CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs().to_vec()),
-            Ok(Some(first.clone()))
+            Ok(Some(first.clone())),
         );
     }
 
@@ -10445,8 +10954,8 @@ mod tests {
         let ordinary_residual = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let partitions = std::cell::Cell::new(0);
-        let mut emitted_counts = Vec::new();
+        let partitions = Cell::new(0);
+        let mut renderings = Vec::new();
         for repeated_residual in [false, false, true, true] {
             let driver = SplitCacheDriver { callee: callee.clone(), repeated_residual };
             let outer = TracingContext::<TestValue, TestOperation>::new();
@@ -10456,7 +10965,7 @@ mod tests {
             let partition = |callee: RegionRef<'_, TestValue, TestOperation>| {
                 partitions.set(partitions.get() + 1);
                 if repeated_residual {
-                    // Repeated-call partitioning permits known effects in its fresh analysis despite the caller's
+                    // Partitioning for repeated calls permits known effects in its fresh analysis despite the caller's
                     // effect folding restriction. Emission still defers those effects through the active context.
                     callee.partition(&[true, false])
                 } else {
@@ -10480,12 +10989,63 @@ mod tests {
                 &partition,
             )
             .unwrap();
-            let known_count = context.parent().builder().borrow().instructions().len();
+            let known_program = context
+                .parent()
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
+                .unwrap();
             drop(inputs);
             let evaluation = context.into_evaluation(outputs).unwrap();
-            emitted_counts.push([known_count, evaluation.program().instructions().len()]);
+            renderings.push(format!("{known_program}\n{}", evaluation.program()));
         }
-        assert_eq!(emitted_counts, vec![[1, 1], [1, 1], [0, 2], [0, 2]]);
+
+        // Ordinary specialization stages the pure square on the known side, while partitioning for repeated calls
+        // defers the known print, so the whole split lands in the residual program. Repeating a mode reuses its split.
+        let ordinary = indoc! {"
+            lambda %0:f32[] .
+            let %1:f32[] = call [derived_input_shardings=[_]] %0 [
+                callee={
+                    lambda %0:f32[] .
+                    let %1:f32[] = mul %0 %0
+                    in (%1)
+                },
+            ]
+            in ()
+            lambda %0:f32[], %1:f32[] .
+            let %2:f32[] = call [derived_input_shardings=[_, _]] %0 %1 [
+                callee={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = print [label=known, effect_class=unordered_io] %1
+                        %3:f32[] = mul %0 %2
+                        %4:f32[] = print [label=residual, effect_class=unordered_io] %3
+                    in (%4)
+                },
+            ]
+            in (%2)"};
+        let repeated = indoc! {"
+            lambda %0:f32[] .
+            in ()
+            lambda %0:f32[], %1:f32[] .
+            let %2:f32[] = call [derived_input_shardings=[_]] %1 [
+                callee={
+                    lambda %0:f32[] .
+                    let %1:f32[] = mul %0 %0
+                        %2:f32[] = print [label=known, effect_class=unordered_io] %1
+                    in (%2)
+                },
+            ]
+                %3:f32[] = call [derived_input_shardings=[_, _]] %0 %2 [
+                    callee={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = mul %0 %1
+                            %3:f32[] = print [label=residual, effect_class=unordered_io] %2
+                        in (%3)
+                    },
+                ]
+            in (%3)"};
+        assert_eq!(renderings, vec![ordinary, ordinary, repeated, repeated]);
         // Debug builds re-derive every cache hit to validate deterministic derivation.
         assert_eq!(partitions.get(), if cfg!(debug_assertions) { 4 } else { 2 });
     }
@@ -10517,12 +11077,12 @@ mod tests {
         let sharding = replicated.sharding().unwrap().clone();
         assert!(!is_untracked_refinement(
             &ArrayIrType::Array(replicated.clone()),
-            &ArrayIrType::Array(replicated.clone())
+            &ArrayIrType::Array(replicated.clone()),
         ));
         assert!(!is_untracked_refinement(&untracked, &untracked));
         assert!(!is_untracked_refinement(
             &ArrayIrType::Array(replicated.clone()),
-            &ArrayIrType::Array(f32_vector_type(3))
+            &ArrayIrType::Array(f32_vector_type(3)),
         ));
         for sharding in [
             sharding.clone().with_unreduced_axes(["y"]).unwrap(),
@@ -10567,12 +11127,131 @@ mod tests {
         let auto_mesh = LogicalMesh::new(axes(MeshAxisType::Auto)).unwrap();
         assert!(!replicates_unconstrained_dimensions(
             &open,
-            &sharding(&auto_mesh, vec![replicated.clone(), split.clone()])
+            &sharding(&auto_mesh, vec![replicated.clone(), split.clone()]),
         ));
         let open = sharding(&mesh, vec![unconstrained, replicated.clone()]);
         let closed = sharding(&mesh, vec![replicated.clone(), replicated]);
         assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_unreduced_axes(["y"]).unwrap()));
         assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_reduced_axes(["y"]).unwrap()));
         assert!(!replicates_unconstrained_dimensions(&open, &closed.with_varying_manual_axes(["y"]).unwrap()));
+    }
+
+    #[test]
+    fn test_transpose_primal_call() {
+        // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
+        // has no input for it and the transposed call consumes the value output's seed alone.
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
+        let value_program_type = ArrayIrType::Array(value_type.clone());
+        let source = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let value = builder.add_input(value_program_type.clone());
+            let predicate = Array::from_elements(predicate_type.clone(), &[true, false, true, false]).unwrap();
+            let predicate = builder.add_constant(ArrayIrValue::Array(predicate));
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![value, predicate],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let transposed = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let value_cotangent = builder.add_input(value_program_type.clone());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let driver = TestTranspositionDriver { source, transposed };
+        let mut context = TracingContext::<TestValue, TestOperation>::new();
+        let value_cotangent = context.input(value_program_type.clone());
+
+        let contributions = transpose_primal_call(
+            &CallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(value_program_type.clone())],
+            &[
+                MaybeZero::Value(value_cotangent.clone()),
+                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+            ],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+
+        let [MaybeZero::Value(contribution)] = &contributions[..] else {
+            panic!("expected one cotangent contribution");
+        };
+        assert_eq!(contribution.r#type().as_ref(), &value_program_type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![contribution.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4] = call [derived_input_shardings=[_]] %0 [
+                    callee={
+                        lambda %0:f32[4] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_transpose_primal_call_uses_cotangent_descriptors_for_zero_cotangents() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
+        let tangent_type = ArrayIrType::Array(tangent_type);
+        // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real boundary of
+        // the identity region rather than an empty driver that cannot answer that query.
+        let mut source_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = source_builder.add_input(tangent_type.clone());
+        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut transpose_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = transpose_builder.add_input(expected.clone());
+        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let driver = TestTranspositionDriver { source, transposed };
+        let mut context = TracingContext::<TestValue, TestOperation>::new();
+        let cotangents = transpose_primal_call(
+            &CallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(tangent_type.clone())],
+            &[MaybeZero::Zero(tangent_type.clone())],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+
+        let known = context.input(tangent_type.clone());
+        let cotangents = transpose_primal_call(
+            &CallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Known(known)],
+            &[MaybeZero::Zero(tangent_type)],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
     }
 }

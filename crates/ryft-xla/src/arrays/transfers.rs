@@ -1127,7 +1127,7 @@ impl Array {
                         // then match the static shape and default layout that the receiver allocates.
                         let buffer =
                             Self::buffer_in_device_memory(session, self.r#type().memory(), buffer, &mut completion)?;
-                        let buffer = Self::cross_host_sendable_buffer(
+                        let buffer = Self::buffer_for_cross_host_send(
                             session,
                             self.data_type(),
                             shard.device(),
@@ -2088,7 +2088,7 @@ impl Array {
     /// records its fence. When the plugin cannot lower or compile that conversion, the shard is copied through host
     /// memory into a new buffer in `layout` with [`Self::copy_shard_through_host`] instead, and `completion` records
     /// the readiness of that buffer. That is the only entry of a host round trip for a cross-host send.
-    fn cross_host_sendable_buffer(
+    fn buffer_for_cross_host_send(
         session: &Session,
         data_type: DataType,
         device: Device,
@@ -2145,7 +2145,7 @@ impl Array {
     /// `source` on its device, on that device. `source_buffer` must be in the default memory of that device. A region
     /// that a remote transfer sends (i.e., with `remote_layout`, which is the default layout of the plugin for its
     /// shape) is a static buffer of its shape in that layout, because a cross-host send moves the whole allocation of
-    /// its buffer, so [`Self::cross_host_sendable_buffer`] converts a region whose allocation differs from the
+    /// its buffer, so [`Self::buffer_for_cross_host_send`] converts a region whose allocation differs from the
     /// receiver's (e.g., a whole source shard of a bounded-dynamic result). `completion` records the fences of the programs
     /// and the readiness of the buffers that produce it.
     fn prepare_shard_region(
@@ -2180,7 +2180,7 @@ impl Array {
         // A receive declares the shape of the region and uses the default device layout of the plugin.
         if let Some(layout) = remote_layout {
             let shape = StaticShape::new(slice.iter().map(Range::len).collect::<Vec<_>>());
-            buffer = Self::cross_host_sendable_buffer(
+            buffer = Self::buffer_for_cross_host_send(
                 session,
                 data_type,
                 source.device(),
@@ -7245,7 +7245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_cross_host_sendable_buffer() {
+    fn test_array_buffer_for_cross_host_send() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -7273,7 +7273,7 @@ mod tests {
             let mut completion = PlacementCompletion::default();
             let buffer =
                 Array::buffer_in_device_memory(&session, memory, Arc::clone(original), &mut completion).unwrap();
-            let sent = Array::cross_host_sendable_buffer(
+            let sent = Array::buffer_for_cross_host_send(
                 &session,
                 DataType::F32,
                 shard.device(),
@@ -7323,7 +7323,7 @@ mod tests {
             assert_eq!(padded_buffer.specification().unwrap().layout, default_layout);
             let mut completion = PlacementCompletion::default();
             let buffer = Arc::clone(padded_buffer);
-            let sent = Array::cross_host_sendable_buffer(
+            let sent = Array::buffer_for_cross_host_send(
                 &session,
                 DataType::F32,
                 shard.device(),
