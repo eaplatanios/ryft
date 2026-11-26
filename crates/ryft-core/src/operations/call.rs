@@ -474,9 +474,8 @@ impl<T: Type> CallOperation<T> {
     /// records a mesh and has no overrides. Staging records the mesh from the whole program. If pruning drops the
     /// last request that names it, this function no longer reports it.
     /// The analyses of a program (i.e., [`RegionPlacementRequests::requests`] and
-    /// [`RegionPlacementRequests::device_naming`]) answer `callee_names_devices` with the facts of the callee that they
-    /// derive in the same pass over the program, so that they never analyze a callee again for each call that encloses
-    /// it.
+    /// [`RegionPlacementRequests::names_devices_predicate`]) answer `callee_names_devices` with facts they derive in
+    /// the same pass over the program, so that they never analyze a callee again for each call that encloses it.
     #[inline]
     pub fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
@@ -1878,8 +1877,6 @@ pub struct RegionPlacementRequests {
     requests: Arc<[(RequestedPlacement, &'static str)]>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl RegionPlacementRequests {
     /// Returns the [`RegionPlacementRequests`] of the program of `region` without a target platform. Only scan bodies
     /// with zero iterations are omitted. Partial evaluation reads this summary, as does a backend that compiles a
@@ -1954,7 +1951,7 @@ impl RegionPlacementRequests {
     /// whereas the summary of each callee (refer to [`Self::for_target`]) would prune and walk the closure of each
     /// callee again.
     #[inline]
-    pub fn device_naming<'o, V, O>(
+    pub fn names_devices_predicate<'o, V, O>(
         entry: RegionRef<'_, V, O>,
         omits_regions: &'o dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
     ) -> impl FnMut(RegionRef<'_, V, O>) -> bool + use<'o, V, O>
@@ -1977,7 +1974,8 @@ impl RegionPlacementRequests {
         V: 'static + Value<Type = ArrayIrType>,
         O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
     {
-        let derive = |region: RegionRef<'_, V, O>| -> Result<_, Infallible> {
+        let arguments = target_platform.map(str::to_owned);
+        let Ok(artifact) = region.transform::<RegionPlacementAnalysis, _, Infallible>(arguments, |region, _| {
             let has_requests = region.computation_regions().any(|region| {
                 region.instructions().iter().any(|instruction| placement_request(instruction.operation()).is_some())
             });
@@ -1986,18 +1984,48 @@ impl RegionPlacementRequests {
             } else {
                 let program = region.to_program();
                 let pruned = program.clone().into_pruned().and_then(|program| program.into_simplified());
+
                 // Inspect the original program if pruning or simplification fails so the analysis stays conservative.
                 let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
-                Self { requests: Arc::from(entry_placement_requests(entry, omits_regions)) }
+                let mut naming = DeviceNamingAnalysis::new(entry.arena().len(), omits_regions);
+                let mut requests = Vec::new();
+                let mut visited = vec![false; entry.arena().len()];
+                let mut pending = vec![entry.id()];
+
+                // Follow the order of `RegionRef::computation_regions`, skipping regions the backend omits.
+                while let Some(id) = pending.pop() {
+                    if std::mem::replace(&mut visited[id.index()], true) {
+                        continue;
+                    }
+
+                    let Ok(region) = entry.with_id(id) else { continue };
+                    for instruction in region.instructions() {
+                        if let Some(request) = naming.request(region, instruction) {
+                            requests.push((request, instruction.operation().name()));
+                        }
+
+                        if !omits_placement_regions(region, instruction, omits_regions) {
+                            pending.extend(instruction.regions().iter().copied().enumerate().filter_map(
+                                |(index, id)| {
+                                    (instruction.operation().region_role(index) == Some(RegionRole::Computation))
+                                        .then_some(id)
+                                },
+                            ));
+                        }
+                    }
+                }
+
+                Self { requests: Arc::from(requests) }
             };
+
             Ok(TransformArtifact::new(Vec::new(), summary))
-        };
-        let arguments = target_platform.map(str::to_owned);
-        let Ok(artifact) =
-            region.transform::<RegionPlacementAnalysis, _, Infallible>(arguments, |region, _| derive(region));
+        });
+
         artifact.metadata().clone()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the sharding with which an executable that is compiled for a mesh whose logical mesh is `mesh` places a
 /// public argument of declared type `input_type` that has no input sharding override and no runtime placement (e.g.,
@@ -2595,41 +2623,6 @@ fn validate_call_input_types<T: ArrayMemberType>(
         }
     }
     Ok(variation)
-}
-
-/// Returns the placement requests of the program whose entry region is `entry`, which is already pruned, in the regions
-/// that the backend runs, which omits the regions of the instructions for which `omits_regions` returns `true` (refer
-/// to [`RegionPlacementRequests::requests`]). The regions are visited in the order of
-/// [`RegionRef::computation_regions`].
-fn entry_placement_requests<V, O>(
-    entry: RegionRef<'_, V, O>,
-    omits_regions: &dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
-) -> Vec<(RequestedPlacement, &'static str)>
-where
-    V: Value<Type = ArrayIrType>,
-    O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
-{
-    let mut naming = DeviceNamingAnalysis::new(entry.arena().len(), omits_regions);
-    let mut requests = Vec::new();
-    let mut visited = vec![false; entry.arena().len()];
-    let mut pending = vec![entry.id()];
-    while let Some(id) = pending.pop() {
-        if std::mem::replace(&mut visited[id.index()], true) {
-            continue;
-        }
-        let Ok(region) = entry.with_id(id) else { continue };
-        for instruction in region.instructions() {
-            if let Some(request) = naming.request(region, instruction) {
-                requests.push((request, instruction.operation().name()));
-            }
-            if !omits_placement_regions(region, instruction, omits_regions) {
-                pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                    (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
-                }));
-            }
-        }
-    }
-    requests
 }
 
 /// Returns whether the backend never runs the regions of `instruction` of `region`. This holds on every target for

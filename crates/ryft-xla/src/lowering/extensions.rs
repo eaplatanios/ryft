@@ -257,13 +257,13 @@ where
         // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
         // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
         // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
-        // pruned program (refer to `RegionPlacementRequests::device_naming`), so that nested calls cost one pass over
-        // the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
+        // pruned program (refer to `RegionPlacementRequests::names_devices_predicate`), so nested calls cost one pass
+        // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
         // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
         let arena = program.entry_region_ref().arena();
         let omitted: &dyn Fn(RegionRef<'_, Constant, Operation>, &Instruction<Operation>) -> bool =
             &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
-        let mut names_devices = RegionPlacementRequests::device_naming(program.entry_region_ref(), omitted);
+        let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
         let mut stale = HashSet::new();
         for (index, region) in program.regions().iter().enumerate() {
             let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
