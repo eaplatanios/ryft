@@ -402,7 +402,7 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
 /// the actual arguments. It states the facts that the types of the arguments omit, and the application consumes it
 /// instead of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which
 /// sees types only, forwards an input through a call only where this decision returns it unchanged whatever the
-/// arguments are (refer to `CallOperation::returns_input_unchanged`).
+/// arguments are.
 pub(crate) struct EagerCallDecision<'o> {
     /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
     /// their committed public arguments agree on their devices, and none carries a pending reduction that its boundary
@@ -517,7 +517,7 @@ pub(crate) trait CallEagerExtension {
     /// `validate_input_reduction`), because a reshard never completes a pending reduction, so an eager call rejects
     /// what an execution rejects, whatever placement the decision chooses. The results are committed when a public
     /// argument is committed or when the callee commits its public outputs on the selected devices (refer to
-    /// [`CallOperation::requests_placement`] and [`commits_public_outputs`]), which includes every application that
+    /// [`CallOperation::has_placement_requests`] and [`commits_public_outputs`]), which includes every application that
     /// runs on the named mesh of its function, as JAX commits every result of a `jit` function under `set_mesh`, and
     /// excludes an application that runs where its arguments are, whatever logical mesh they record.
     ///
@@ -593,7 +593,7 @@ impl CallEagerExtension for CallOperation<Type> {
         // `commits_public_outputs`).
         let committed = |mesh: &DeviceMesh, function_mesh: bool| {
             public_arrays.clone().any(Array::is_committed)
-                || commits_public_outputs(mesh, function_mesh, self.requests_placement(callee_requests))
+                || commits_public_outputs(mesh, function_mesh, self.has_placement_requests(callee_requests))
         };
         // The call records its mesh when it is staged, for no target, so whether it still names devices is read for the
         // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
@@ -895,7 +895,7 @@ impl InterpretableOperation<Session> for CallOperation<Type> {
 // mesh axes, so that a replicated override stops the compiler from splitting the value, like the replicated result of
 // an execution. An effective input sharding without an override that the operand type already has is not constrained
 // again, unless the mesh has auto axes, along which the operand type cannot show where the operand is (refer to
-// `CallOperation::boundary_input_placement`).
+// `CallOperation::boundary_input_sharding_constraint`).
 impl LowerableOperation for CallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -936,7 +936,9 @@ impl LowerableOperation for CallOperation<Type> {
                 // such a state, because the entry of the outermost program completes it or admission rejects it, so the
                 // constraint neither introduces nor completes a reduction over auto mesh axes, of any kind. Only the
                 // outputs of a call can still introduce one (refer to `lower_boundary_constraint`).
-                let Some(sharding) = self.boundary_input_placement(index, actual, declared).map(Cow::into_owned) else {
+                let Some(sharding) =
+                    self.boundary_input_sharding_constraint(index, actual, declared).map(Cow::into_owned)
+                else {
                     return Ok(value);
                 };
                 lower_boundary_constraint(lowerer, value, ty, &sharding.without_auto_reduction_axes())

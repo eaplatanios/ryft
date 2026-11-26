@@ -947,15 +947,6 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// A `call` operation forwards its inputs onto its callee's inputs one for one and reports the callee's outputs as
-// its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading inputs.
-// The callee's lifted capture prefix is unaffected, because threaded state is appended after every declared input,
-// so the prefix keeps its positions. Instantiated result types belong to the source callee signature, which discharge
-// changes by turning discharged references into arrays and appending state inputs and outputs. The rebuilt call
-// therefore keeps the same caller-owned result identities but derives its result metadata from the rebuilt callee
-// signature.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for CallOperation<T>
 where
     T: ArrayMemberType + From<ArrayType> + From<P::Referent>,
@@ -968,6 +959,13 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        // A `call` operation forwards its inputs onto its callee's inputs one for one and reports the callee's outputs
+        // as its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading
+        // inputs. The callee's lifted capture prefix is unaffected, because threaded state is appended after every
+        // declared input, so the prefix keeps its positions. Instantiated result types belong to the source callee
+        // signature, which discharge changes by turning discharged references into arrays and appending state inputs
+        // and outputs. The rebuilt call therefore keeps the same caller-owned result identities but derives its result
+        // metadata from the rebuilt callee signature.
         let result_renaming = match &self.output_types {
             Some(_) => {
                 let callee = driver.region(0)?;
@@ -975,6 +973,7 @@ where
             }
             None => None,
         };
+
         context.discharge_positional_region_operation(self, driver, inputs, 0, |_, regions| {
             let Some(result_renaming) = result_renaming else { return Ok(self.clone()) };
             check_count!("region", regions, 1, TypeError);
@@ -990,11 +989,6 @@ where
     }
 }
 
-// Reference interpretation of a call in an eager context of this crate (refer to `interpret_call`), which accepts
-// exactly the inputs that staging accepts and returns outputs of the types that the type rule of the call infers. Each
-// input is resharded to where the call places it (i.e., the sharding that its callee input type declares, or its
-// boundary sharding when that type declares none), which changes no value of an `Array`, so that the callee receives
-// the input at the placement that a backend gives it.
 impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<V, O>>
     for CallOperation<ArrayIrType>
 where
@@ -1007,23 +1001,16 @@ where
         driver: &D,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
+        // Reference interpretation of a call in an eager context of this crate, which accepts exactly the inputs
+        // that staging accepts and returns outputs of the types that the type rule of the call infers. Each input is
+        // resharded to where the call places it (i.e., the sharding that its callee input type declares, or its
+        // boundary sharding when that type declares none), which changes no value of an `Array`, so that the callee
+        // receives the input at the placement that a backend gives it.
         interpret_call(self, context, driver, inputs, |input, sharding| input.reshard(sharding), |input, _| Ok(input))
             .map(|(_, outputs)| outputs)
     }
 }
 
-// The `shard_map` emulation runs a call once for all emulated devices when its callee communicates across them or when
-// an input varies along manual mesh axes beyond its callee input type, by the reference interpretation of a call (refer
-// to `interpret_call`), which reshards the value of every device of an input whose placement differs from its callee
-// input type, and whose region replay runs the callee in lockstep. That replay validates neither the entry nor the
-// outputs of the callee, so only the validation of the type rule of the call applies there. An input that varies
-// beyond its callee input type enters the callee without that extra variation, which changes no value of any device,
-// so that the callee runs at the types that it was traced at, as a backend runs it, because manual variation is not
-// materialized inside a manual computation. The operations of the callee that have regions of their own (e.g., a
-// `condition` or a `while` loop) were typed for those inputs and would reject the wider variation. An output that the
-// callee computes from invariant inputs alone, or from inputs that entered it without their extra variation, still
-// varies along the manual mesh axes along which inputs vary beyond their callee input types, as the type rule of the
-// call states (refer to `CallVariation`), so that every later operation receives the output at its staged type.
 impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<LockstepDomain<O>> for CallOperation<ArrayIrType> {
     fn interpret<D: InterpretationDriver<LockstepDomain<O>>>(
         &self,
@@ -1031,31 +1018,51 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<LockstepDomain<O>>
         driver: &D,
         inputs: &[LockstepValue<O>],
     ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
-        let reshard = |input: LockstepValue<O>, sharding: &Sharding| {
-            let values = input.into_values().into_iter().map(|value| value.reshard(sharding)).collect::<Result<_, _>>();
-            LockstepValue::new(values?, context)
-        };
-        let narrow = |input: LockstepValue<O>, axes: &BTreeSet<String>| {
-            let values = input
-                .into_values()
-                .into_iter()
-                .map(|value| match value {
-                    ArrayIrValue::Array(array) => {
-                        let r#type = array.r#type().into_owned();
-                        let Some(mut sharding) = r#type.sharding().cloned() else {
-                            return Ok(ArrayIrValue::Array(array));
-                        };
-                        let variation = sharding.varying_manual_axes().difference(axes).cloned().collect::<Vec<_>>();
-                        sharding.set_varying_manual_axes(variation).map_err(TypeError::from)?;
-                        let r#type = r#type.with_sharding(sharding).map_err(TypeError::from)?;
-                        Array::from_logical_bytes(r#type, &array.logical_bytes()).map(ArrayIrValue::Array)
-                    }
-                    value => Ok(value),
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            LockstepValue::new(values, context)
-        };
-        let (output_types, outputs) = interpret_call(self, context, driver, inputs, reshard, narrow)?;
+        // The `shard_map` emulation runs a call once for all emulated devices when its callee communicates across them
+        // or when an input varies along manual mesh axes beyond its callee input type, by the reference interpretation
+        // of a call, which reshards the value of every device of an input whose placement differs from its callee input
+        // type, and whose region replay runs the callee in lockstep. That replay validates neither the entry nor the
+        // outputs of the callee, so only the validation of the type rule of the call applies there. An input that
+        // varies beyond its callee input type enters the callee without that extra variation, which changes no value of
+        // any device, so that the callee runs at the types that it was traced at, as a backend runs it, because manual
+        // variation is not materialized inside a manual computation. The operations of the callee that have regions of
+        // their own (e.g., a `condition` or a `while` loop) were typed for those inputs and would reject the wider
+        // variation. An output that the callee computes from invariant inputs alone, or from inputs that entered it
+        // without their extra variation, still varies along the manual mesh axes along which inputs vary beyond their
+        // callee input types, as the type rule of the call states, so that every later operation receives the output
+        // at its staged type.
+        let (output_types, outputs) = interpret_call(
+            self,
+            context,
+            driver,
+            inputs,
+            |input: LockstepValue<O>, sharding: &Sharding| {
+                let values =
+                    input.into_values().into_iter().map(|value| value.reshard(sharding)).collect::<Result<_, _>>();
+                LockstepValue::new(values?, context)
+            },
+            |input: LockstepValue<O>, axes: &BTreeSet<String>| {
+                let values = input
+                    .into_values()
+                    .into_iter()
+                    .map(|value| match value {
+                        ArrayIrValue::Array(array) => {
+                            let r#type = array.r#type().into_owned();
+                            let Some(mut sharding) = r#type.sharding().cloned() else {
+                                return Ok(ArrayIrValue::Array(array));
+                            };
+                            let variation =
+                                sharding.varying_manual_axes().difference(axes).cloned().collect::<Vec<_>>();
+                            sharding.set_varying_manual_axes(variation).map_err(TypeError::from)?;
+                            let r#type = r#type.with_sharding(sharding).map_err(TypeError::from)?;
+                            Array::from_logical_bytes(r#type, &array.logical_bytes()).map(ArrayIrValue::Array)
+                        }
+                        value => Ok(value),
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                LockstepValue::new(values, context)
+            },
+        )?;
         check_count!("output", outputs, output_types.len(), ProgramError);
         outputs
             .into_iter()
@@ -1076,6 +1083,8 @@ impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for CallOperation<Ar
         Some(self.interpret(context, driver, inputs))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Online partial evaluation rule for a staged `call` operation, which is ryft's analogue of JAX's call partial
 // evaluation rules. It splits the callee against the caller's knownness while preserving the `call` boundary on

@@ -7025,7 +7025,7 @@ mod tests {
         // record. Every entry point that runs the call on the arguments themselves agrees with an execution of the
         // callee, which rejects arguments committed to different devices and arguments of another client, including
         // partial evaluation, which may forward an argument through the call only where the call provably returns it
-        // unchanged (refer to `CallEagerExtension::eager_decision` and `CallOperation::returns_input_unchanged`).
+        // unchanged (refer to `CallEagerExtension::eager_decision`).
         let pair_type = vector_type.clone();
         let pair_callee: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
             compile(|pair| pair, (pair_type.clone(), pair_type.clone()), &session, second_canonical_mesh.clone())
@@ -7116,7 +7116,7 @@ mod tests {
         // the interpretation rule of the call, partial evaluation, which may forward the argument through the call, a
         // `jit` caller, which is specialized for the argument, and the interpretation of a caller that drops the result
         // of the call), because a call admits its arguments before, and independently of, any decision to move one of
-        // them (refer to `CallEagerExtension::eager_decision` and `CallOperation::returns_input_unchanged`).
+        // them (refer to `CallEagerExtension::eager_decision`).
         let pending_sum = |mesh: &DeviceMesh| {
             let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1).with_unreduced_axes(["x"]).unwrap();
             let r#type = vector_type.clone().with_sharding(sharding.without_auto_axes()).unwrap();
