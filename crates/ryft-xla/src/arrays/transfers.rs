@@ -696,7 +696,7 @@ impl Array {
                         // Keep a source for host fallback only if execution cannot take its buffers. A clone here
                         // would prevent a donation when this handle owns the buffers exclusively.
                         let source = (!donate || !array.has_unique_shard_buffers()).then(|| array.clone());
-                        array.execute_reshard(&program, reshard.as_ref()).map_err(|error| (error, source))
+                        array.execute_reshard_program(&program, reshard.as_ref()).map_err(|error| (error, source))
                     }
                     Err(error) => Err((error, Some(array))),
                 }
@@ -712,7 +712,7 @@ impl Array {
                     Some(gather) => self.with_filled_local_buffers().and_then(|source| {
                         let source = source.unwrap_or_else(|| self.clone());
                         let compiled = source.compile_reshard_on_same_mesh(gather, false)?;
-                        source.execute_reshard(gather, compiled.as_ref())
+                        source.execute_reshard_program(gather, compiled.as_ref())
                     }),
                     None => Ok(self.clone()),
                 };
@@ -732,7 +732,7 @@ impl Array {
                         // they share no storage with the original. Carry the cross-host sends into the result.
                         let send_fence = copies.send_fence.clone();
                         let compiled = copies.compile_reshard_on_same_mesh(&reshard, true)?;
-                        let mut output = copies.execute_reshard(&reshard, compiled.as_ref())?;
+                        let mut output = copies.execute_reshard_program(&reshard, compiled.as_ref())?;
                         output.send_fence = send_fence;
                         Ok(output)
                     });
@@ -2409,6 +2409,46 @@ impl Array {
         Ok(planned.unwrap_or(DevicePlacementStrategy::ProcessLocalValue))
     }
 
+    /// Compiles `program`, the identity that reshards this array, which must be on the mesh of `program` with its
+    /// input sharding, to its output sharding, or returns `None` when this process does not run `program` (refer to
+    /// [`ReshardProgram::runs_on`]). The program is compiled over [`ReshardProgram::compiled_mesh`], which types the
+    /// explicit mesh axes along which it changes the reduction state as auto, and [`Self::execute_reshard_program`] then moves
+    /// this array onto that mesh and its result back. The input and the output of the program are declared in the
+    /// memory of this array, so the program accepts this array and returns its result in the same memory. If `donate`
+    /// is `true`, the input of the program is marked as donated so that PJRT can reuse the memory of its buffers for
+    /// the output buffers. The compilation cache is keyed by the complete lowered computation, including its input
+    /// and output sharding annotations and PJRT options.
+    fn compile_reshard_on_same_mesh(
+        &self,
+        program: &ReshardProgram,
+        donate: bool,
+    ) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
+        let session = self.session();
+        if !program.runs_on(session.client().process_index()?) {
+            return Ok(None);
+        }
+
+        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
+        // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
+        // The type keeps the memory of this array, which the identity carries over to the output.
+        let bare_input_type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(self.r#type().memory());
+        let mesh = program.compiled_mesh()?;
+        let (input, output) = if mesh == program.mesh {
+            (program.input.clone(), program.output.clone())
+        } else {
+            let logical_mesh = mesh.logical_mesh();
+            (program.input.with_mesh(logical_mesh.clone())?, program.output.with_mesh(logical_mesh.clone())?)
+        };
+
+        let options = Options::new(mesh)
+            .with_input_shardings(vec![input])
+            .with_output_shardings(vec![output])
+            .with_donate(donate);
+        let staged = stage(|input| input, bare_input_type, options)?;
+
+        Ok(Some(session.compile_staged_function(staged)?))
+    }
+
     // TODO(eaplatanios): Review from here onwards.
 
     /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
@@ -2443,46 +2483,6 @@ impl Array {
         self.rebuilt(r#type, mesh, sharding, buffers, completion)
     }
 
-    /// Compiles `program`, the identity that reshards this array, which must be on the mesh of `program` with its
-    /// input sharding, to its output sharding, or returns `None` when this process does not run `program` (refer to
-    /// [`ReshardProgram::runs_on`]). The program is compiled over [`ReshardProgram::compiled_mesh`], which types the
-    /// explicit mesh axes along which it changes the reduction state as auto, and [`Self::execute_reshard`] then moves
-    /// this array onto that mesh and its result back. The input and the output of the program are declared in the
-    /// memory of this array, so the program accepts this
-    /// array and returns its result in the same memory. If `donate` is `true`, the input of the program is marked as
-    /// donated so that PJRT can reuse the memory of its buffers for the output buffers.
-    ///
-    /// The compilation cache is keyed by the complete lowered computation, including its input and output sharding
-    /// annotations and PJRT options.
-    fn compile_reshard_on_same_mesh(
-        &self,
-        program: &ReshardProgram,
-        donate: bool,
-    ) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
-        let session = self.session();
-        if !program.runs_on(session.client().process_index()?) {
-            return Ok(None);
-        }
-
-        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached as
-        // `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`. The
-        // type keeps the memory of this array, which the identity carries over to the output.
-        let bare_input_type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(self.r#type().memory());
-        let mesh = program.compiled_mesh()?;
-        let (input, output) = if mesh == program.mesh {
-            (program.input.clone(), program.output.clone())
-        } else {
-            let logical_mesh = mesh.logical_mesh();
-            (program.input.with_mesh(logical_mesh.clone())?, program.output.with_mesh(logical_mesh.clone())?)
-        };
-        let options = Options::new(mesh)
-            .with_input_shardings(vec![input])
-            .with_output_shardings(vec![output])
-            .with_donate(donate);
-        let staged = stage(|input| input, bare_input_type, options)?;
-        Ok(Some(session.compile_staged_function(staged)?))
-    }
-
     /// Executes `reshard`, which [`Self::compile_reshard_on_same_mesh`] compiled from `program` for this array, on this
     /// array. Without `reshard` (i.e., in a process that does not run `program`), this function runs nothing and
     /// returns the metadata of the output of `program` (refer to [`Self::place_without_local_buffers`]). The execution
@@ -2492,7 +2492,7 @@ impl Array {
     /// The executable runs on [`ReshardProgram::compiled_mesh`], so when that mesh types an axis differently, this
     /// array enters it as the same shards on that mesh, and its result leaves it as the same shards on the mesh of
     /// `program`. Both conversions preserve pending reductions, storage, and completion fences.
-    fn execute_reshard(
+    fn execute_reshard_program(
         self,
         program: &ReshardProgram,
         reshard: Option<&CompiledFunction<ArrayType, ArrayType>>,
@@ -3445,7 +3445,7 @@ impl ReshardProgram {
     /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it
     /// owns a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in
     /// none of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so
-    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Array::execute_reshard`]).
+    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Array::execute_reshard_program`]).
     fn runs_on(&self, process_index: usize) -> bool {
         self.mesh.devices().iter().any(|device| device.process_index() == process_index)
     }
