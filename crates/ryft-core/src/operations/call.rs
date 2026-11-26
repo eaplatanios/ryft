@@ -863,10 +863,31 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
             Err(_) => output_types,
         };
 
-        match variation {
-            Some(variation) => variation.apply(self.name(), output_types),
-            None => Ok(output_types),
-        }
+        let Some((mesh, axes)) = variation else {
+            return Ok(output_types);
+        };
+
+        output_types
+            .into_iter()
+            .enumerate()
+            .map(|(index, r#type)| {
+                let Ok(array_type) = r#type.as_array_type() else {
+                    return Ok(r#type);
+                };
+                let mut sharding = match array_type.sharding() {
+                    None => Sharding::replicated(mesh.clone(), array_type.rank()),
+                    Some(sharding) if sharding.mesh() == &mesh => sharding.clone(),
+                    Some(_) => {
+                        return Err(TypeError::invalid(format!(
+                            "`{CALL_OPERATION_NAME}` output #{index} has type {array_type}, which cannot vary along \
+                             the manual mesh axes {axes:?} of mesh `{mesh}` along which its inputs vary",
+                        )));
+                    }
+                };
+                sharding.extend_varying_manual_axes(axes.iter().cloned())?;
+                Ok(T::from(array_type.clone().with_sharding(sharding)?))
+            })
+            .collect()
     }
 
     #[inline]
@@ -957,8 +978,8 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
                 if self.capture_count != 0 {
                     operation.field("capture_count", self.capture_count)?;
                 }
-                if let Some(outputs) = &self.output_types {
-                    operation.list("output_types", outputs.outputs())?;
+                if let Some(bindings) = &self.output_types {
+                    operation.list("output_types", bindings.outputs.as_ref())?;
                 }
                 if let Some(shardings) = &self.input_shardings {
                     operation.list("input_shardings", render_shardings(shardings))?;
@@ -2060,8 +2081,6 @@ impl RegionPlacementRequests {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Formal callee input types and caller result types that bind [`TypeIdentity`](crate::TypeIdentity)s across one
 /// sealed call boundary. The bindings are encoded in these two type signatures, and the stored metadata contains no
 /// runtime values.
@@ -2105,12 +2124,14 @@ impl<T: Type> CallTypeBindings<T> {
         {
             return Ok(None);
         }
+
         let mut unavailable = inputs
             .iter()
             .chain(outputs)
             .flat_map(Type::identities)
             .map(|(_, identity)| identity.clone())
             .collect::<Vec<_>>();
+
         let mut renaming = TypeIdentityRenaming::new();
         for (_, identity) in outputs.iter().flat_map(Type::identities) {
             if renaming.target(identity).is_none()
@@ -2119,6 +2140,7 @@ impl<T: Type> CallTypeBindings<T> {
                 unavailable.push(renaming.insert_fresh(identity.clone(), &unavailable)?);
             }
         }
+
         let outputs =
             outputs.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Self { inputs: inputs.into(), outputs: outputs.into() }))
@@ -2154,11 +2176,6 @@ impl<T: Type> CallTypeBindings<T> {
         let signature = Self { inputs: inputs.into(), outputs: outputs.into() };
         signature.renaming(inputs, callee_outputs)?;
         Ok(Some(signature))
-    }
-
-    /// Returns the formal result types retained by the caller.
-    fn outputs(&self) -> &[T] {
-        &self.outputs
     }
 
     /// Returns the caller-owned identities defined by this call, once each in result occurrence order.
@@ -2279,52 +2296,7 @@ impl<T: Type> CallTypeBindings<T> {
     }
 }
 
-/// Manual mesh axes along which inputs of a call vary beyond what the callee input types declare (e.g., a value of a
-/// `shard_map` body that varies along the manual axes of the map, passed to a function compiled for a plain type),
-/// along which every output of the call then varies too (refer to `validate_call_input_types`). The callee runs as if
-/// every input varied along all of them, so the transposition of the call sums the cotangent of an input that varies
-/// along fewer of them over the others (refer to `summed_input_cotangent`).
-struct CallVariation {
-    /// Logical mesh of the manual axes, which is the mesh of the sharding of the varying inputs.
-    mesh: LogicalMesh,
-
-    /// Manual mesh axes along which the inputs vary beyond their callee input types.
-    axes: BTreeSet<String>,
-}
-
-impl CallVariation {
-    /// Returns `output_types`, the output types of a call named `operation_name`, each varying along the axes of this
-    /// variation as well. An output without a sharding takes a replicated sharding over the mesh of this variation,
-    /// and an output with a sharding over another mesh is rejected.
-    fn apply<T: ArrayMemberType + From<ArrayType>>(
-        &self,
-        operation_name: &'static str,
-        output_types: Vec<T>,
-    ) -> Result<Vec<T>, TypeError> {
-        output_types
-            .into_iter()
-            .enumerate()
-            .map(|(index, r#type)| {
-                let Ok(array_type) = r#type.as_array_type() else {
-                    return Ok(r#type);
-                };
-                let mut sharding = match array_type.sharding() {
-                    None => Sharding::replicated(self.mesh.clone(), array_type.rank()),
-                    Some(sharding) if sharding.mesh() == &self.mesh => sharding.clone(),
-                    Some(_) => {
-                        return Err(TypeError::invalid(format!(
-                            "`{operation_name}` output #{index} has type {array_type}, which cannot vary along the \
-                             manual mesh axes {:?} of mesh `{}` along which its inputs vary",
-                            self.axes, self.mesh,
-                        )));
-                    }
-                };
-                sharding.extend_varying_manual_axes(self.axes.iter().cloned())?;
-                Ok(T::from(array_type.clone().with_sharding(sharding)?))
-            })
-            .collect()
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`Transform`] marker under which [`RegionPlacementRequests::for_target`] retains the summary of a region with it, for
 /// the target platform that its arguments name ([`None`] for no target), held as a [`String`] because the region-owned
@@ -2537,10 +2509,9 @@ struct CallSplit {
 /// with the kind of reduction, where a declared type without a sharding describes a fully reduced value. The input may
 /// vary along more manual mesh axes than the declared type, which a value of a `shard_map` body does where the callee
 /// declares none, as a JAX `jit` function called on such a value is retraced at its varying type, and the outputs of
-/// the call then vary along those axes too (refer to `CallVariation`). When both types have shardings, the mesh of the
-/// declared sharding must define every mesh axis that carries manual variation or reduction state of the input as the
-/// mesh of the input defines it, because one name must not denote two different axes for state that crosses the call
-/// boundary, while other axes may differ (refer to `validate_preserved_mesh_axes`).
+/// the call then vary along those axes too. When both types have shardings, the declared sharding's mesh must define
+/// every axis that carries manual variation or reduction state as the input mesh defines it. This preserves the
+/// meaning of the axis across the call boundary. Other axes may differ (refer to `validate_preserved_mesh_axes`).
 fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTreeSet<String>> {
     fn components(
         sharding: Option<&Sharding>,
@@ -2581,15 +2552,15 @@ fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTre
 
 /// Validates that a call accepts `input_types` as the inputs of a callee whose input types are `expected_types`, in
 /// count and position, and reports the first input that it rejects as a type error naming `operation_name`. A call
-/// accepts an input of exactly the callee input type and every input that `call_input_variation` accepts. Returns the
-/// manual mesh axes along which the inputs vary beyond the callee input types, if any, along which the outputs of the
-/// call vary too, so that every context that binds a call infers the same outputs. This implements the rule that
-/// [`CallOperation::validate_input_types`] owns.
+/// accepts an input of exactly the callee input type and every input that `call_input_variation` accepts. If any inputs
+/// vary beyond their callee input types, returns the logical mesh they share and the union of their additional manual
+/// axes. Every array output of the call varies along those axes too, so every context that binds a call infers the
+/// same outputs. This implements the rule that [`CallOperation::validate_input_types`] owns.
 fn validate_call_input_types<T: ArrayMemberType>(
     operation_name: &'static str,
     expected_types: &[T],
     input_types: &[T],
-) -> Result<Option<CallVariation>, TypeError> {
+) -> Result<Option<(LogicalMesh, BTreeSet<String>)>, TypeError> {
     if expected_types.len() != input_types.len() {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` expected {} input(s) but got {}",
@@ -2597,7 +2568,7 @@ fn validate_call_input_types<T: ArrayMemberType>(
             input_types.len(),
         )));
     }
-    let mut variation = None::<CallVariation>;
+    let mut variation = None::<(LogicalMesh, BTreeSet<String>)>;
     for (index, (expected, actual)) in expected_types.iter().zip(input_types).enumerate() {
         if expected == actual {
             continue;
@@ -2615,13 +2586,12 @@ fn validate_call_input_types<T: ArrayMemberType>(
             continue;
         };
         match &mut variation {
-            None => variation = Some(CallVariation { mesh: mesh.clone(), axes }),
-            Some(variation) if &variation.mesh == mesh => variation.axes.extend(axes),
-            Some(variation) => {
+            None => variation = Some((mesh.clone(), axes)),
+            Some((variation_mesh, variation_axes)) if *variation_mesh == *mesh => variation_axes.extend(axes),
+            Some((variation_mesh, _)) => {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` input #{index} varies along manual mesh axes of mesh `{mesh}`, but an earlier \
-                     input varies along those of mesh `{}`",
-                    variation.mesh,
+                     input varies along those of mesh `{variation_mesh}`",
                 )));
             }
         }
@@ -3560,11 +3530,11 @@ where
 
 /// Returns `cotangent`, the cotangent that the transposition of a call returns for an input whose cotangent type is
 /// `refined`, summed over the manual mesh axes along which it varies beyond `refined`. A call whose inputs vary along
-/// manual mesh axes beyond the callee input types runs its callee as if every input varied along all of them (refer
-/// to `CallVariation`), as a JAX `jit` function is retraced with `pvary` inserted on the inputs that vary along fewer
-/// axes. Each shard along such an axis then holds one contribution to the cotangent of such an input, and their sum
-/// is its cotangent, which a mesh-form `parallel_reduce` computes as the transposition of `parallel_vary` does. Every
-/// other cotangent, including every cotangent of a call without that variation, is returned unchanged.
+/// manual mesh axes beyond the callee input types runs its callee as if every input varied along all of them, as a JAX
+/// `jit` function is retraced with `pvary` inserted on the inputs that vary along fewer axes. Each shard along such an
+/// axis then holds one contribution to the cotangent of such an input, and their sum is its cotangent, which a
+/// mesh-form `parallel_reduce` computes as the transposition of `parallel_vary` does. Every other cotangent, including
+/// every cotangent of a call without that variation, is returned unchanged.
 fn summed_input_cotangent<C>(context: &C, refined: &ArrayIrType, cotangent: C::Value) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType, Projected: From<ParallelReduceOperation>>>,
@@ -10735,23 +10705,23 @@ mod tests {
         // families, while forwarded input names stay shared.
         let first = CallTypeBindings::fresh(&inputs, &outputs).unwrap().unwrap();
         let second = CallTypeBindings::fresh(&inputs, &outputs).unwrap().unwrap();
-        assert_eq!(first.outputs()[0], input);
-        assert_eq!(first.outputs()[1], first.outputs()[2]);
-        assert_ne!(first.outputs()[1], local);
-        assert_ne!(first.outputs()[1], second.outputs()[1]);
+        assert_eq!(first.outputs[0], input);
+        assert_eq!(first.outputs[1], first.outputs[2]);
+        assert_ne!(first.outputs[1], local);
+        assert_ne!(first.outputs[1], second.outputs[1]);
         assert_eq!(first.definitions().len(), 1);
-        assert_eq!(first.instantiated(&inputs).unwrap(), first.outputs());
+        assert_eq!(first.instantiated(&inputs).unwrap(), first.outputs.as_ref());
         let renaming = first.renaming(&inputs, &outputs).unwrap();
-        assert_eq!(local.rename_identities(&renaming).unwrap(), first.outputs()[1]);
+        assert_eq!(local.rename_identities(&renaming).unwrap(), first.outputs[1]);
         assert_eq!(input.rename_identities(&renaming).unwrap(), input);
 
         // Instantiating a forwarded input in another namespace must not rename the call's local result.
         let actual = ArrayIrType::from(DimensionType::new("actual", bounds));
         let instantiated = first.instantiated(std::slice::from_ref(&actual)).unwrap();
         assert_eq!(instantiated[0], actual);
-        assert_eq!(&instantiated[1..], &first.outputs()[1..]);
+        assert_eq!(&instantiated[1..], &first.outputs[1..]);
         let retained = first.pruned(&[true], &[true, false, true]).unwrap();
-        assert_eq!(retained.outputs(), &[input.clone(), first.outputs()[2].clone()]);
+        assert_eq!(retained.outputs.as_ref(), &[input.clone(), first.outputs[2].clone()]);
         assert_eq!(retained.definitions(), first.definitions());
         assert_eq!(
             first.pruned(&[], &[true; 3]),
@@ -10774,10 +10744,7 @@ mod tests {
                 "`{CALL_OPERATION_NAME}` result declarations must preserve forwarded input identities",
             ))),
         );
-        assert_eq!(
-            CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs().to_vec()),
-            Ok(Some(first.clone())),
-        );
+        assert_eq!(CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs.to_vec()), Ok(Some(first.clone())));
     }
 
     #[test]
@@ -10791,12 +10758,12 @@ mod tests {
         let outputs = [output_type.clone(), output_type];
         let first = CallTypeBindings::fresh(std::slice::from_ref(&input_type), &outputs).unwrap().unwrap();
         let second = CallTypeBindings::fresh(std::slice::from_ref(&input_type), &outputs).unwrap().unwrap();
-        assert_ne!(first.outputs(), second.outputs());
-        assert_eq!(first.outputs()[0], first.outputs()[1]);
+        assert_ne!(first.outputs, second.outputs);
+        assert_eq!(first.outputs[0], first.outputs[1]);
         let actual_input = ArrayType::new_static(DataType::F32, [2]);
         let actual = first.instantiated(std::slice::from_ref(&actual_input)).unwrap();
         assert_eq!(actual[0].shape().dimensions()[0], 2usize.into());
-        assert_eq!(actual[0].shape().dimensions()[1], first.outputs()[0].shape().dimensions()[1]);
+        assert_eq!(actual[0].shape().dimensions()[1], first.outputs[0].shape().dimensions()[1]);
         assert_eq!(actual[0], actual[1]);
         let callee_outputs = outputs
             .iter()
@@ -10808,7 +10775,7 @@ mod tests {
         assert_eq!(callee_outputs[0].rename_identities(&renaming).unwrap(), actual[0]);
         assert_eq!(first.definitions().len(), 1);
         let retained =
-            CallTypeBindings::with_outputs(std::slice::from_ref(&input_type), &outputs, first.outputs().to_vec())
+            CallTypeBindings::with_outputs(std::slice::from_ref(&input_type), &outputs, first.outputs.to_vec())
                 .unwrap()
                 .unwrap();
         assert_eq!(retained.instantiated(&[actual_input]).unwrap(), actual);
@@ -10817,7 +10784,7 @@ mod tests {
         renamed.insert(first.definitions()[0].clone(), local.clone()).unwrap();
         let rebound = first.renamed(&renamed).unwrap();
         assert_eq!(rebound.definitions(), vec![local]);
-        assert_ne!(rebound.outputs(), first.outputs());
+        assert_ne!(rebound.outputs, first.outputs);
     }
 
     #[test]
