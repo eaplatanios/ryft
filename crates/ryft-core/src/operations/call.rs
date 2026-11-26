@@ -175,8 +175,6 @@ pub struct CallOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: Type> CallOperation<T> {
     /// Creates a new [`CallOperation`]. The flat callee program is supplied as a shared region attachment to
     /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
@@ -196,8 +194,8 @@ impl<T: Type> CallOperation<T> {
     }
 
     /// Returns this [`CallOperation`] with the boundary of its callee, made of `mesh`, the device mesh that the
-    /// callee was compiled for when it names devices, and of the sharding override of each callee input and output, by
-    /// position, where [`None`] marks a position without one. A callee names devices when it has a sharding override
+    /// callee was compiled for when it names devices, and of the sharding override of each callee input and output,
+    /// by position, where [`None`] marks a position without one. A callee names devices when it has a sharding override
     /// or its program requests a placement that names devices (refer to [`RegionPlacementRequests::has_requests`]),
     /// so `mesh` must be present whenever an override is. A missing override is implicit past the end of either list.
     /// A list without overrides is stored as absent.
@@ -232,6 +230,13 @@ impl<T: Type> CallOperation<T> {
         self
     }
 
+    /// Returns this call without the device mesh that it records, for a call that names no devices.
+    /// Refer to [`Self::names_devices`] for more information.
+    #[inline]
+    pub fn without_mesh(&self) -> Self {
+        Self { mesh: None, ..self.clone() }
+    }
+
     /// Returns this call with `mesh`, the device mesh that the called function was compiled for, which decides where
     /// an eager application of the call by a backend runs (refer to [`Self::function_mesh`]). A call nested in another
     /// compiled function runs where its caller runs whatever this mesh is.
@@ -250,6 +255,22 @@ impl<T: Type> CallOperation<T> {
     pub fn with_derived_input_shardings(mut self, shardings: Vec<Option<Sharding>>) -> Self {
         self.derived_input_shardings = Some(Arc::from(shardings));
         self
+    }
+
+    /// Instantiates a sealed callee's result names, using its cached signature to recognize identity-free boundaries
+    /// without cloning their input and output types. An identity-bearing callee follows the ordinary signature path.
+    fn with_callee_region<V: Value<Type = T>, O: Operation<Type = T>>(
+        mut self,
+        callee: RegionRef<'_, V, O>,
+    ) -> Result<Self, TypeError> {
+        self.validate_capture_prefix(callee.input_ids().len())?;
+        if callee.type_identity_signature().identities().is_empty() {
+            // A closed signature without identities proves that `CallTypeBindings::fresh` would return `None` before
+            // attempting any renaming. Preserve that exact payload, including when replacing an older signature.
+            self.output_types = None;
+            return Ok(self);
+        }
+        self.with_callee_type_signature(&callee.input_types(), &callee.output_types())
     }
 
     /// Returns this call instantiated for one call site of a callee with the exact signature `input_types` and
@@ -271,40 +292,19 @@ impl<T: Type> CallOperation<T> {
         Ok(self)
     }
 
-    /// Instantiates a sealed callee's result names, using its cached signature to recognize identity-free boundaries
-    /// without cloning their input and output types. An identity-bearing callee follows the ordinary signature path.
-    fn with_callee_region<V: Value<Type = T>, O: Operation<Type = T>>(
-        mut self,
-        callee: RegionRef<'_, V, O>,
-    ) -> Result<Self, TypeError> {
-        self.validate_capture_prefix(callee.input_ids().len())?;
-        if callee.type_identity_signature().identities().is_empty() {
-            // A closed signature without identities proves that `CallTypeBindings::fresh` would return `None` before
-            // attempting any renaming. Preserve that exact payload, including when replacing an older signature.
-            self.output_types = None;
-            return Ok(self);
-        }
-        self.with_callee_type_signature(&callee.input_types(), &callee.output_types())
-    }
-
     /// Retains caller-owned result identities after a callee boundary rewrite, including reference discharge.
     #[inline]
-    fn with_result_type_signature(
+    fn with_caller_output_types(
         mut self,
         input_types: &[T],
         callee_outputs: &[T],
-        outputs: Vec<T>,
+        caller_output_types: Vec<T>,
     ) -> Result<Self, TypeError> {
-        self.output_types = CallTypeBindings::with_outputs(input_types, callee_outputs, outputs)?;
+        self.output_types = CallTypeBindings::with_outputs(input_types, callee_outputs, caller_output_types)?;
         Ok(self)
     }
 
-    /// Returns this call without the device mesh that it records, for a call that names no devices (refer to
-    /// [`Self::names_devices`]).
-    #[inline]
-    pub fn without_mesh(&self) -> Self {
-        Self { mesh: None, ..self.clone() }
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
     #[inline]
@@ -1046,12 +1046,12 @@ where
             check_count!("region", regions, 1, TypeError);
             let input_types = regions[0].input_types();
             let callee_outputs = regions[0].output_types();
-            let outputs = callee_outputs
+            let caller_output_types = callee_outputs
                 .iter()
                 .map(|r#type| r#type.rename_identities(&result_renaming))
                 .collect::<Result<Vec<_>, _>>()?;
             let operation = Self { output_types: None, ..self.clone() };
-            Ok(operation.with_result_type_signature(&input_types, &callee_outputs, outputs)?)
+            Ok(operation.with_caller_output_types(&input_types, &callee_outputs, caller_output_types)?)
         })
     }
 }
@@ -4308,7 +4308,7 @@ mod tests {
         assert_eq!(instantiated[0], instantiated[1]);
         assert_eq!(operation.defined_type_identities().len(), 1);
         let retained = CallOperation::<ArrayType>::new(0)
-            .with_result_type_signature(std::slice::from_ref(&input_type), &output_types, outputs.clone())
+            .with_caller_output_types(std::slice::from_ref(&input_type), &output_types, outputs.clone())
             .unwrap();
         assert_eq!(retained.instantiated_output_types(&[input_type]).unwrap(), Some(outputs));
     }

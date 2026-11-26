@@ -691,12 +691,12 @@ impl Array {
                     Ok(None) => self,
                     Err(error) => return Err((error, Some(self))),
                 };
-                match array.compile_reshard_on_same_mesh(&program, donate) {
+                match program.compile(&array, donate) {
                     Ok(reshard) => {
                         // Keep a source for host fallback only if execution cannot take its buffers. A clone here
                         // would prevent a donation when this handle owns the buffers exclusively.
                         let source = (!donate || !array.has_unique_shard_buffers()).then(|| array.clone());
-                        array.execute_reshard_program(&program, reshard.as_ref()).map_err(|error| (error, source))
+                        program.execute(array, reshard.as_ref()).map_err(|error| (error, source))
                     }
                     Err(error) => Err((error, Some(array))),
                 }
@@ -711,8 +711,8 @@ impl Array {
                     // its buffers and fills any missing local ones that the executable needs.
                     Some(gather) => self.with_filled_local_buffers().and_then(|source| {
                         let source = source.unwrap_or_else(|| self.clone());
-                        let compiled = source.compile_reshard_on_same_mesh(gather, false)?;
-                        source.execute_reshard_program(gather, compiled.as_ref())
+                        let compiled = gather.compile(&source, false)?;
+                        gather.execute(source, compiled.as_ref())
                     }),
                     None => Ok(self.clone()),
                 };
@@ -731,8 +731,8 @@ impl Array {
                         // The replicated handle has been dropped, so PJRT can reuse the copies' buffers when
                         // they share no storage with the original. Carry the cross-host sends into the result.
                         let send_fence = copies.send_fence.clone();
-                        let compiled = copies.compile_reshard_on_same_mesh(&reshard, true)?;
-                        let mut output = copies.execute_reshard_program(&reshard, compiled.as_ref())?;
+                        let compiled = reshard.compile(&copies, true)?;
+                        let mut output = reshard.execute(copies, compiled.as_ref())?;
                         output.send_fence = send_fence;
                         Ok(output)
                     });
@@ -2409,48 +2409,6 @@ impl Array {
         Ok(planned.unwrap_or(DevicePlacementStrategy::ProcessLocalValue))
     }
 
-    /// Compiles `program`, the identity that reshards this array, which must be on the mesh of `program` with its
-    /// input sharding, to its output sharding, or returns `None` when this process does not run `program` (refer to
-    /// [`ReshardProgram::runs_on`]). The program is compiled over [`ReshardProgram::compiled_mesh`], which types the
-    /// explicit mesh axes along which it changes the reduction state as auto, and [`Self::execute_reshard_program`] then moves
-    /// this array onto that mesh and its result back. The input and the output of the program are declared in the
-    /// memory of this array, so the program accepts this array and returns its result in the same memory. If `donate`
-    /// is `true`, the input of the program is marked as donated so that PJRT can reuse the memory of its buffers for
-    /// the output buffers. The compilation cache is keyed by the complete lowered computation, including its input
-    /// and output sharding annotations and PJRT options.
-    fn compile_reshard_on_same_mesh(
-        &self,
-        program: &ReshardProgram,
-        donate: bool,
-    ) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
-        let session = self.session();
-        if !program.runs_on(session.client().process_index()?) {
-            return Ok(None);
-        }
-
-        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
-        // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
-        // The type keeps the memory of this array, which the identity carries over to the output.
-        let bare_input_type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(self.r#type().memory());
-        let mesh = program.compiled_mesh()?;
-        let (input, output) = if mesh == program.mesh {
-            (program.input.clone(), program.output.clone())
-        } else {
-            let logical_mesh = mesh.logical_mesh();
-            (program.input.with_mesh(logical_mesh.clone())?, program.output.with_mesh(logical_mesh.clone())?)
-        };
-
-        let options = Options::new(mesh)
-            .with_input_shardings(vec![input])
-            .with_output_shardings(vec![output])
-            .with_donate(donate);
-        let staged = stage(|input| input, bare_input_type, options)?;
-
-        Ok(Some(session.compile_staged_function(staged)?))
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
     /// of this array with some axes of size one (refer to [`DeviceMeshExtension::at_coordinate_zero`]), along which
     /// this array must be replicated, so that the shards of those devices hold its whole value. The result has the
@@ -2483,46 +2441,6 @@ impl Array {
         self.rebuilt(r#type, mesh, sharding, buffers, completion)
     }
 
-    /// Executes `reshard`, which [`Self::compile_reshard_on_same_mesh`] compiled from `program` for this array, on this
-    /// array. Without `reshard` (i.e., in a process that does not run `program`), this function runs nothing and
-    /// returns the metadata of the output of `program` (refer to [`Self::place_without_local_buffers`]). The execution
-    /// fence of the result joins the execution fence of this array with the fence of the launch (refer to the
-    /// documentation of this module). This function consumes the array so that a donation takes effect.
-    ///
-    /// The executable runs on [`ReshardProgram::compiled_mesh`], so when that mesh types an axis differently, this
-    /// array enters it as the same shards on that mesh, and its result leaves it as the same shards on the mesh of
-    /// `program`. Both conversions preserve pending reductions, storage, and completion fences.
-    fn execute_reshard_program(
-        self,
-        program: &ReshardProgram,
-        reshard: Option<&CompiledFunction<ArrayType, ArrayType>>,
-    ) -> Result<Self, Error> {
-        let Some(reshard) = reshard else {
-            let r#type = ArrayType::new(self.data_type(), self.shape().into()).with_memory(self.r#type().memory());
-            return self.place_without_local_buffers(self.session(), r#type, &program.mesh, &program.output);
-        };
-        let mut completion = PlacementCompletion::default();
-        completion.track_fence(self.execution_fence());
-        let session = self.session().clone();
-        let mesh = program.compiled_mesh()?;
-        let mut output = if mesh == program.mesh {
-            reshard.executable().execute(&session, self)?
-        } else {
-            // Consume each handle as it is retyped so the input's buffers can still be donated to the executable.
-            let retype_mesh = |array: Self, mesh: &DeviceMesh| -> Result<Self, Error> {
-                debug_assert_eq!(array.mesh().devices(), mesh.devices());
-                let sharding = array.sharding().with_mesh(mesh.logical_mesh().clone())?;
-                let r#type = array.r#type().into_owned().with_sharding(None)?;
-                let buffers = array.shards().iter().filter_map(|shard| shard.buffer().cloned()).collect();
-                array.rebuilt(r#type, mesh, sharding, buffers, PlacementCompletion::default())
-            };
-            let input = retype_mesh(self, &mesh)?;
-            retype_mesh(reshard.executable().execute(&session, input)?, &program.mesh)?
-        };
-        output.execution_fence = completion.join(output.execution_fence.take());
-        Ok(output)
-    }
-
     /// Returns an array of the session of this array with `r#type`, `buffers`, and `sharding` over `mesh`, which keeps
     /// the send fence, the commitment, and the locally assigned devices of this array, and whose execution fence joins
     /// the execution fence of this array with `completion`.
@@ -2553,6 +2471,8 @@ impl Array {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Device work that places an [`Array`] on a mesh with a sharding, which [`Array::device_placement_strategy`] chooses
 /// from information that every process shares, so that the processes of a placement agree on it.
@@ -2597,7 +2517,7 @@ enum DevicePlacementStrategy {
         cross_host_layouts: HashMap<StaticShape, ryft_pjrt::Layout>,
     },
 
-    /// Reshards an array on its own mesh with a compiled program (refer to [`Array::compile_reshard_on_same_mesh`]).
+    /// Reshards an array on its own mesh with a compiled program (refer to [`ReshardProgram::compile`]).
     CompiledReshard {
         /// Program that reshards the array on its mesh.
         program: ReshardProgram,
@@ -3425,10 +3345,10 @@ impl PlacementCompletion {
     }
 }
 
-/// Compiled program that a placement runs on the devices of one mesh to reshard an array there, which is the identity
-/// with sharding annotations on its input and its output (refer to [`Array::compile_reshard_on_same_mesh`]). The
-/// strategy of a placement fixes its programs from information that every process shares, so every process that runs
-/// one of them runs the same program.
+/// Program that a placement compiles and runs on the devices of one mesh to reshard an array there, which is the
+/// identity with sharding annotations on its input and its output (refer to [`Self::compile`]). The strategy of a
+/// placement fixes its programs from information that every process shares, so every process that runs one of them
+/// runs the same program.
 #[derive(Clone, Debug, PartialEq)]
 struct ReshardProgram {
     /// Mesh whose devices run the program, which is the mesh of its input and of its output.
@@ -3445,7 +3365,7 @@ impl ReshardProgram {
     /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it
     /// owns a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in
     /// none of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so
-    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Array::execute_reshard_program`]).
+    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Self::execute`]).
     fn runs_on(&self, process_index: usize) -> bool {
         self.mesh.devices().iter().any(|device| device.process_index() == process_index)
     }
@@ -3483,6 +3403,79 @@ impl ReshardProgram {
             .with_axis_types(changed_axes, MeshAxisType::Auto)?
             .with_axis_types(kept_axes, MeshAxisType::Explicit)?;
         Ok(DeviceMesh::new(logical_mesh, self.mesh.devices().to_vec())?)
+    }
+
+    /// Compiles this program, the identity that reshards `array`, which must be on the mesh of this program with its
+    /// input sharding, to its output sharding, or returns `None` when this process does not run this program (refer to
+    /// [`Self::runs_on`]). The program is compiled over [`Self::compiled_mesh`], which types the explicit mesh axes
+    /// along which it changes the reduction state as auto, and [`Self::execute`] then moves `array` onto that mesh and
+    /// its result back. The input and the output of the program are declared in the memory of `array`, so the program
+    /// accepts `array` and returns its result in the same memory. If `donate` is `true`, the input of the program is
+    /// marked as donated so that PJRT can reuse the memory of its buffers for the output buffers. The compilation
+    /// cache is keyed by the complete lowered computation, including its input and output sharding annotations and
+    /// PJRT options.
+    fn compile(&self, array: &Array, donate: bool) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
+        let session = array.session();
+        if !self.runs_on(session.client().process_index()?) {
+            return Ok(None);
+        }
+
+        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
+        // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
+        // The type keeps the memory of the array, which the identity carries over to the output.
+        let bare_input_type =
+            ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
+        let mesh = self.compiled_mesh()?;
+        let (input, output) = if mesh == self.mesh {
+            (self.input.clone(), self.output.clone())
+        } else {
+            let logical_mesh = mesh.logical_mesh();
+            (self.input.with_mesh(logical_mesh.clone())?, self.output.with_mesh(logical_mesh.clone())?)
+        };
+
+        let options = Options::new(mesh)
+            .with_input_shardings(vec![input])
+            .with_output_shardings(vec![output])
+            .with_donate(donate);
+        let staged = stage(|input| input, bare_input_type, options)?;
+
+        Ok(Some(session.compile_staged_function(staged)?))
+    }
+
+    /// Executes `compiled`, which [`Self::compile`] compiled from this program for `array`, on `array`. Without
+    /// `compiled` (i.e., in a process that does not run this program), this function runs nothing and returns the
+    /// metadata of the output of this program (refer to [`Array::place_without_local_buffers`]). The execution fence
+    /// of the result joins the execution fence of `array` with the fence of the launch (refer to the documentation of
+    /// this module). This function takes `array` by value so that a donation takes effect.
+    ///
+    /// The executable runs on [`Self::compiled_mesh`], so when that mesh types an axis differently, `array` enters it
+    /// as the same shards on that mesh, and its result leaves it as the same shards on the mesh of this program. Both
+    /// conversions preserve pending reductions, storage, and completion fences.
+    fn execute(&self, array: Array, compiled: Option<&CompiledFunction<ArrayType, ArrayType>>) -> Result<Array, Error> {
+        let Some(compiled) = compiled else {
+            let r#type = ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
+            return array.place_without_local_buffers(array.session(), r#type, &self.mesh, &self.output);
+        };
+        let mut completion = PlacementCompletion::default();
+        completion.track_fence(array.execution_fence());
+        let session = array.session().clone();
+        let mesh = self.compiled_mesh()?;
+        let mut output = if mesh == self.mesh {
+            compiled.executable().execute(&session, array)?
+        } else {
+            // Consume each handle as it is retyped so the input's buffers can still be donated to the executable.
+            let retype_mesh = |array: Array, mesh: &DeviceMesh| -> Result<Array, Error> {
+                debug_assert_eq!(array.mesh().devices(), mesh.devices());
+                let sharding = array.sharding().with_mesh(mesh.logical_mesh().clone())?;
+                let r#type = array.r#type().into_owned().with_sharding(None)?;
+                let buffers = array.shards().iter().filter_map(|shard| shard.buffer().cloned()).collect();
+                array.rebuilt(r#type, mesh, sharding, buffers, PlacementCompletion::default())
+            };
+            let input = retype_mesh(array, &mesh)?;
+            retype_mesh(compiled.executable().execute(&session, input)?, &self.mesh)?
+        };
+        output.execution_fence = completion.join(output.execution_fence.take());
+        Ok(output)
     }
 }
 
@@ -8262,7 +8255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_compile_reshard_on_same_mesh_keeps_reduction_state() {
+    fn test_reshard_program_compile_keeps_reduction_state() {
         // A reshard that keeps a pending reduction along the axis `x` of a 2x2 mesh whose axes are explicit or auto
         // moves the contributions as they are (over an auto axis, because the program types that axis as explicit), so
         // its optimized program has no all-reduce (only the all-to-all that a change of split needs), while one that
@@ -8325,7 +8318,7 @@ mod tests {
                     Array::from_host_shards(&session, r#type, mesh.clone(), Some(input.clone()), contributions)
                         .unwrap();
                 let program = ReshardProgram { mesh: mesh.clone(), input, output };
-                let compiled = source.compile_reshard_on_same_mesh(&program, false).unwrap().unwrap();
+                let compiled = program.compile(&source, false).unwrap().unwrap();
                 // The cache returns the program that the reshard compiled, because its staged function lowers alike.
                 let lowered = compiled.staged().into_inner().lower(&session).unwrap();
                 let optimized = session.compilation_cache().compile(&session, lowered.lowered_program()).unwrap();
@@ -8995,7 +8988,7 @@ mod tests {
     fn test_validate_reduction_transition_plans_only_programs_that_lowering_accepts() {
         // Every change of reduction state that the planner leaves to a compiled reshard lowers, because the lowering
         // rejects the changes that the same classification (`collective_reduction`) does not let the planner make on
-        // the devices. Each such cell lowers the program that `Array::compile_reshard_on_same_mesh` stages, over the
+        // the devices. Each such cell lowers the program that `ReshardProgram::compile` stages, over the
         // mesh of `ReshardProgram::compiled_mesh`, for every data type with values, both axis types, and every pair of
         // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a
         // pending sum plans the program of its placement without that sum, whose identities are written without a

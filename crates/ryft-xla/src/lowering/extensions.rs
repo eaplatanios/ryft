@@ -739,8 +739,6 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
         .collect()
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -749,11 +747,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayType, CALL_OPERATION_NAME, CompositeKey, CompositeOperation, ConstrainSharding, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionValue, DomainTracingContext,
-        EffectClass, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
+        CustomRuleRegistration, DataType, Device, DeviceMesh, DimensionValue, DomainTracingContext, EffectClass,
+        FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
         PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder,
-        Reshape, Reshard, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag,
-        TransferToMemory, Typed, ValueProjection, shard_map,
+        Reshard, ScanOperation, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag, TransferToMemory,
+        TypeError, Typed, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -797,20 +795,11 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module() {
+    fn test_program_to_mlir_module() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
-
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            {
-                let sharding = sharding.clone();
-                move |x: ArrayTracer| x.sin().unwrap().reshard(&sharding).unwrap()
-            },
-            global_input_type.clone(),
-        )
-        .unwrap();
-
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(move |x: ArrayTracer| x.sin().unwrap().reshard(&sharding).unwrap(), test_vector_type(8)).unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {"
@@ -828,43 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_reshard_then_reshape() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            {
-                let sharding = sharding.clone();
-                move |x: ArrayTracer| {
-                    x.reshard(&sharding)
-                        .unwrap()
-                        .reshape(Shape::new(vec![Dimension::Static(1), Dimension::Static(8), Dimension::Static(1)]))
-                        .unwrap()
-                }
-            },
-            input_type,
-        )
-        .unwrap();
-
-        assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
-            indoc! {"
-                module {
-                  sdy.mesh @mesh = <[\"x\"=4]>
-                  func.func @main(%arg0: tensor<8xf32>) -> \
-                        (tensor<1x8x1xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {\"x\"}, {}]>}) {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{\"x\"}]> : tensor<8xf32>
-                    %1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>
-                    return %1 : tensor<1x8x1xf32>
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
-    fn test_program_extension_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
+    fn test_program_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
         // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
         // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
         // the tracked type by marking the explicit axis replicated. The result is not the result of a `place`, so its
@@ -876,19 +829,11 @@ mod tests {
         .unwrap();
         let tracked = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let constraint = test_sharding(&mesh, vec![ShardingDimension::sharded(["a"])], vec![]);
-        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-            .with_sharding(tracked.clone())
-            .unwrap();
-
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            {
-                let constraint = constraint.clone();
-                move |x: ArrayTracer| x.constrain_sharding(&constraint).unwrap()
-            },
-            global_input_type.clone(),
+            move |x: ArrayTracer| x.constrain_sharding(&constraint).unwrap(),
+            test_vector_type(8).with_sharding(tracked).unwrap(),
         )
         .unwrap();
-
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {"
@@ -905,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_annotates_placed_results() {
+    fn test_program_to_mlir_module_annotates_placed_results() {
         // A result that a `place` produces, also through an operation that returns its input unchanged, is annotated
         // with the target of that `place`, including its split along the auto axis that the result type drops, as
         // compilation places it.
@@ -916,11 +861,9 @@ mod tests {
         .unwrap();
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let target = Placement::new(mesh, sharding).unwrap();
-        let traced: TracedProgram<ArrayType, ArrayType> = trace(
-            move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(),
-            ArrayType::new_static(DataType::F32, [8]),
-        )
-        .unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(), test_vector_type(8))
+                .unwrap();
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {"
@@ -937,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_passes_imported_arrays_as_arguments() {
+    fn test_program_to_mlir_module_passes_imported_arrays_as_arguments() {
         // An array that the traced function imports becomes a session constant, which enters the module as a hidden
         // argument that precedes the inputs and is annotated as the array is placed, as compilation passes it.
         let client = cpu_client(1);
@@ -969,13 +912,13 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings() {
+    fn test_program_to_mlir_module_with_shardings() {
         // Explicit shardings are attached to the arguments and the results of the function. The global types have no
         // sharding here, so without explicit shardings the signature is not annotated, as `to_mlir_module` renders it.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedProgram<ArrayType, ArrayType> =
-            trace(|x: ArrayTracer| x.sin().unwrap(), ArrayType::new_static(DataType::F32, [8])).unwrap();
+            trace(|x: ArrayTracer| x.sin().unwrap(), test_vector_type(8)).unwrap();
         let shardings = Some(std::slice::from_ref(&sharding));
         assert_eq!(
             traced.to_mlir_module_with_shardings("main", shardings, shardings).unwrap(),
@@ -1008,27 +951,27 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_rejects_boundaries_that_are_not_arrays() {
+    fn test_program_to_mlir_module_with_shardings_rejects_boundaries_that_are_not_arrays() {
         // The export reads array types at the boundary of the program, so a program whose input is a dimension is
         // rejected before anything is lowered.
         let dimension_type = Type::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
         let (_, program) =
             DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), vec![dimension_type]).unwrap();
         assert_eq!(
-            program.to_mlir_module_with_shardings("main", None, None).unwrap_err().to_string(),
-            "expected array type but got dimension type",
+            program.to_mlir_module_with_shardings("main", None, None),
+            Err(Error::from(ProgramError::from(TypeError::invalid("expected array type but got dimension type")))),
         );
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_rejects_imports_over_other_topologies() {
+    fn test_program_to_mlir_module_with_shardings_rejects_imports_over_other_topologies() {
         // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
         // cannot hold an array over two devices, and the error names the cause and the way forward.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 1);
-        let array_type = ArrayType::new_static(DataType::F32, [4]);
+        let array_type = test_vector_type(4);
         let array = Array::from_host_buffer(
             &session,
             array_type.clone().with_sharding(sharding.clone()).unwrap(),
@@ -1049,17 +992,21 @@ mod tests {
         let signature = Sharding::replicated(LogicalMesh::single_device(), 1);
         let signatures = Some(std::slice::from_ref(&signature));
         assert_eq!(
-            traced.to_mlir_module_with_shardings("main", signatures, signatures).unwrap_err().to_string(),
-            "the traced program imports an array of type `f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]`, whose mesh \
-             does not have the topology of the mesh `['device'=1:auto]` of the signature of the module, because a \
-             plain `trace` keeps the type of an array that it imports; stage or compile the function for a device \
-             mesh over `['device'=1:auto]` through a `Session` instead (e.g., with `stage` or `compile`), which \
-             receives the array on that mesh",
+            traced.to_mlir_module_with_shardings("main", signatures, signatures),
+            Err(Error::from(ProgramError::InvalidArgument {
+                message: "the traced program imports an array of type \
+                          `f32[4][sharding={mesh<['x'=2:auto]>, [{}]}]`, whose mesh does not have the topology of the \
+                          mesh `['device'=1:auto]` of the signature of the module, because a plain `trace` keeps the \
+                          type of an array that it imports; stage or compile the function for a device mesh over \
+                          `['device'=1:auto]` through a `Session` instead (e.g., with `stage` or `compile`), which \
+                          receives the array on that mesh"
+                    .to_string(),
+            })),
         );
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_placements() {
+    fn test_program_to_mlir_module_with_shardings_closes_unconstrained_result_placements() {
         // The runtime placement of a result reads an unconstrained dimension of the target of the `place` that produces
         // it, or of a result sharding override, as replicated, so the result is annotated with that dimension closed,
         // as compilation annotates it, while the constraint inside the function keeps it open.
@@ -1115,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_closes_unconstrained_result_types() {
+    fn test_program_to_mlir_module_with_shardings_closes_unconstrained_result_types() {
         // A result that is computed from the result of a `place` inherits the unconstrained dimension of its target in
         // its type, which its runtime placement reads as replicated as well, so it is annotated with that dimension
         // closed, as compilation annotates it.
@@ -1166,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_leaves_results_open_over_auto_axes() {
+    fn test_program_to_mlir_module_with_shardings_leaves_results_open_over_auto_axes() {
         // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
         // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
         // result is annotated open over it, as compilation annotates it.
@@ -1183,7 +1130,7 @@ mod tests {
                 let placed = x.place(&target, None).unwrap();
                 placed.clone() + placed
             },
-            ArrayType::new_static(DataType::F32, [4]),
+            test_vector_type(4),
         )
         .unwrap();
         assert_eq!(
@@ -1203,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_keeps_effectful_dead_shard_maps() {
+    fn test_program_to_mlir_module_with_shardings_keeps_effectful_dead_shard_maps() {
         // Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
         // ordinary results, so the lowered manual computation only threads the effect token of its body.
         let (traced, sharding) = traced_effectful_dead_shard_map();
@@ -1239,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_extension_to_mlir_module_with_shardings_executes_effectful_dead_shard_maps_on_cpu() {
+    fn test_program_to_mlir_module_with_shardings_executes_effectful_dead_shard_maps_on_cpu() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
             .to_mlir_module_with_shardings(
@@ -1298,14 +1245,168 @@ mod tests {
     }
 
     #[test]
+    fn test_program_pruned_for_lowering() {
+        // The callee `f(x) = (x, place(x, CPU 1))` names devices only through the `place` that computes its second
+        // output, and its call records their mesh. A program that returns both outputs keeps that mesh. A program that
+        // drops the second output loses the `place` to pruning, so its call is lowered as one that names no devices.
+        let vector_type = test_vector_type(4);
+        let device = Device::new(1, 0);
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let callee = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let operation = PlaceOperation::new(PlacementRequest::from(device), None);
+            let placed = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            Arc::new(builder.build(vec![input, placed], vec![Placeholder], vec![Placeholder; 2]).unwrap())
+        };
+        let program = |output_indices: &[usize]| {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let regions = vec![builder.intern_callee(&callee, None).unwrap()];
+            let call = Operation::Call(CallOperation::new(0).with_boundary(Some(&mesh), Vec::new(), Vec::new()));
+            let outputs = builder.add_instruction(call, regions, vec![input], None).unwrap().to_vec();
+            let outputs = output_indices.iter().map(|&index| outputs[index]).collect::<Vec<_>>();
+            let output_count = outputs.len();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; output_count])
+                .unwrap()
+        };
+        assert_eq!(
+            program(&[0, 1]).pruned_for_lowering(None).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4], %2:f32[4] = call [devices=[1]] %0 [
+                    callee={
+                        lambda %0:f32[4] .
+                        let %1:f32[4] = place [target=device(1)] %0
+                        in (%0, %1)
+                    },
+                ]
+                in (%1, %2)"},
+        );
+        assert_eq!(
+            program(&[0]).pruned_for_lowering(None).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4] = call %0 [
+                    callee={
+                        lambda %0:f32[4] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_program_has_placement_requests() {
+        let sharding = |axis_type: MeshAxisType| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap()
+        };
+        let (auto_sharding, explicit_sharding) = (sharding(MeshAxisType::Auto), sharding(MeshAxisType::Explicit));
+        let device = Device::new(0, 0);
+        let has_requests = |traced: TracedProgram<ArrayType, ArrayType>| {
+            (traced.has_placement_requests(None, true), traced.has_placement_requests(None, false))
+        };
+
+        // A `place` with a device target and a `constrain_sharding` always count.
+        let placed = trace(|x: ArrayTracer| x.place(&device, None).unwrap(), test_vector_type(4)).unwrap();
+        assert_eq!(has_requests(placed), (true, true));
+        let constrained =
+            trace(|x: ArrayTracer| x.constrain_sharding(&auto_sharding).unwrap(), test_vector_type(4)).unwrap();
+        assert_eq!(has_requests(constrained), (true, true));
+
+        // A `place` with an in-place target names no devices, so it counts only among the memory requests.
+        let moved = trace(|x: ArrayTracer| x.place(&Memory::Host { pinned: true }, None).unwrap(), test_vector_type(4))
+            .unwrap();
+        assert_eq!(has_requests(moved), (true, false));
+
+        // A `place` without a target, a `reshard`, and operations that place nothing request no placement.
+        let kept = trace(|x: ArrayTracer| x.place(&None::<Placement>, None).unwrap(), test_vector_type(4)).unwrap();
+        assert_eq!(has_requests(kept), (false, false));
+        let resharded = trace(|x: ArrayTracer| x.reshard(&explicit_sharding).unwrap(), test_vector_type(4)).unwrap();
+        assert_eq!(has_requests(resharded), (false, false));
+        let computed = trace(|x: ArrayTracer| x.sin().unwrap(), test_vector_type(4)).unwrap();
+        assert_eq!(has_requests(computed), (false, false));
+    }
+
+    #[test]
+    fn test_program_output_sharding_sources() {
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(0, 0), Device::new(1, 0)],
+        )
+        .unwrap();
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let vector_type = test_vector_type(4);
+
+        // An output that a `place` produces, also through an operation that returns its input unchanged, has the
+        // placement of the target, an output that returns an argument is placed where that argument enters, and the
+        // program determines no sharding for an output that it computes.
+        let target = Placement::new(mesh.clone(), split.clone()).unwrap();
+        let traced: TracedProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
+            move |x: ArrayTracer| {
+                let placed = x.place(&target, None).unwrap().stop_gradient().unwrap();
+                let computed = x.sin().unwrap();
+                (placed, x, computed)
+            },
+            vector_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            traced.output_sharding_sources(3, |constant| constant.sharding().clone()),
+            vec![Some(OutputShardingSource::Determined(split.clone())), Some(OutputShardingSource::Input(0)), None],
+        );
+        assert_eq!(
+            traced.output_sharding_sources(1, |constant| constant.sharding().clone()),
+            vec![Some(OutputShardingSource::Determined(split.clone()))],
+        );
+
+        // The boundary of the callee `f(x) = (x, x)` takes precedence over its body. An output of a call with a
+        // sharding override has that override, and an output that returns a callee input is placed where the executable
+        // of the callee places that input, which is replicated over the mesh that the call names. The same output of a
+        // call that names no devices is followed back to the input of the call.
+        let callee = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            Arc::new(builder.build(vec![input, input], vec![Placeholder], vec![Placeholder; 2]).unwrap())
+        };
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(vector_type.into());
+        let regions = vec![builder.intern_callee(&callee, None).unwrap()];
+        let call = CallOperation::new(0).with_boundary(Some(&mesh), Vec::new(), vec![Some(split.clone())]);
+        let placed =
+            builder.add_instruction(Operation::Call(call), regions.clone(), vec![input], None).unwrap().to_vec();
+        let call = Operation::Call(CallOperation::new(0));
+        let followed = builder.add_instruction(call, regions, vec![input], None).unwrap()[1];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![placed[0], placed[1], followed],
+                vec![Placeholder],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            program.output_sharding_sources(3, |constant| constant.sharding().clone()),
+            vec![
+                Some(OutputShardingSource::Determined(split)),
+                Some(OutputShardingSource::Determined(replicated)),
+                Some(OutputShardingSource::Input(0)),
+            ],
+        );
+    }
+
+    #[test]
     fn test_program_output_sharding_sources_follow_operations_that_keep_the_placement_of_their_input() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let vector_type = ArrayType::new_static(DataType::F32, [4]);
-        let input = crate::Array::from_host_buffer(
+        let vector_type = test_vector_type(4);
+        let input = Array::from_host_buffer(
             &session,
             vector_type.clone(),
             mesh.clone(),
@@ -1339,21 +1440,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_dimensions_with_unconstrained_replicated() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let dimensions = vec![
-            ShardingDimension::sharded(["x"]),
-            ShardingDimension::unconstrained(),
-            ShardingDimension::replicated(),
-        ];
-        let sharding = Sharding::new(mesh, dimensions).unwrap();
-        assert_eq!(
-            sharding.dimensions_with_unconstrained_replicated().to_vec(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
-        );
-    }
-
-    #[test]
     fn test_sharding_with_unconstrained_dimensions_replicated() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded = |second: ShardingDimension| {
@@ -1370,81 +1456,66 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_requests_requested_mesh() {
-        let vector_type = test_vector_type(4);
-        let first = Device::new(0, 0);
-        let second = Device::new(1, 0);
-        let device_mesh = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
-        let program = |targets: Vec<PlacementRequest>| {
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let mut value = builder.add_input(vector_type.clone().into());
-            for target in targets {
-                value = builder
-                    .add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![value], None)
-                    .unwrap()[0];
-            }
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let requested = |program: &FlatProgram<Session>| {
-            RegionPlacementRequests::for_lowering(program.entry_region_ref(), None)
-                .requested_mesh()
-                .map(|requested| requested.map(|(mesh, _)| mesh))
-                .map_err(|error| error.to_string())
-        };
-        let memory = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
-
-        // A request that only moves a value to another memory names no devices, and requests that name the same
-        // devices form one mesh, which a device target names as the canonical mesh of that device.
-        assert_eq!(requested(&program(vec![memory.clone()])), Ok(None));
-        assert!(program(vec![memory.clone()]).has_placement_requests(None, true));
-        assert!(!program(vec![memory.clone()]).has_placement_requests(None, false));
+    fn test_sharding_dimensions_with_unconstrained_replicated() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let dimensions = vec![
+            ShardingDimension::sharded(["x"]),
+            ShardingDimension::unconstrained(),
+            ShardingDimension::replicated(),
+        ];
+        let sharding = Sharding::new(mesh, dimensions).unwrap();
         assert_eq!(
-            requested(&program(vec![memory, PlacementRequest::from(first), PlacementRequest::from(first)])),
-            Ok(Some(device_mesh(first))),
+            sharding.dimensions_with_unconstrained_replicated().to_vec(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
         );
-
-        // Requests that name different devices do not form one mesh.
-        assert_eq!(
-            requested(&program(vec![PlacementRequest::from(first), PlacementRequest::from(second)])),
-            Err("cannot lower `place`: it requests a placement onto the devices [1], while another placement \
-                 request of the same program names the devices [0], and the two do not form one mesh"
-                .to_string()),
-        );
-
-        // A device target and a named mesh of the same device select the named mesh in either order, and a device
-        // target of an input that is tracked over a mesh of one device keeps that logical mesh, as the type rule of
-        // `place` does.
-        let named = LogicalMesh::new(vec![MeshAxis::new("named", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let named_mesh = DeviceMesh::new(named.clone(), vec![second]).unwrap();
-        let named_target =
-            PlacementRequest::from(Placement::new(named_mesh.clone(), Sharding::replicated(named.clone(), 1)).unwrap());
-        for targets in [
-            vec![named_target.clone(), PlacementRequest::from(second)],
-            vec![PlacementRequest::from(second), named_target.clone()],
-        ] {
-            assert_eq!(requested(&program(targets)), Ok(Some(named_mesh.clone())));
-        }
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let named_type = vector_type.clone().with_sharding(Sharding::replicated(named, 1)).unwrap();
-        let input = builder.add_input(named_type.into());
-        let output = builder
-            .add_instruction(PlaceOperation::new(PlacementRequest::from(second), None), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(requested(&program), Ok(Some(named_mesh)));
     }
 
     #[test]
-    fn test_region_placement_requests_new_of_nested_calls() {
+    fn test_region_placement_requests_for_lowering() {
+        // A `place` in the body of a named composite call is a request where lowering emits the body, and not for a
+        // target whose backend implementation replaces the whole call (i.e., `ryft.tests.xla_named_square` version 1
+        // on CUDA, refer to `omits_regions`), so that the eager placement of the enclosing operation does not read it.
+        // The requests are retained for each platform separately.
+        let vector_type = test_vector_type(4);
+        let other = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_devices = DeviceMesh::new(other.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
+        let placement = Placement::new(other_devices.clone(), Sharding::replicated(other, 1)).unwrap();
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let operation = PlaceOperation::new(PlacementRequest::from(placement), None);
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
+        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("placing").with_named_composite(named));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(vector_type.into());
+        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
+        let program = program.unwrap();
+        let requests = |target_platform| {
+            RegionPlacementRequests::for_lowering(program.entry_region_ref(), target_platform)
+                .requests()
+                .to_vec()
+        };
+        let placed = vec![(RequestedPlacement::Devices(other_devices), PLACE_OPERATION_NAME)];
+        assert_eq!(requests(None), placed);
+        assert_eq!(requests(Some("cuda")), vec![]);
+        assert_eq!(requests(Some("cpu")), placed);
+        assert_eq!(requests(Some("cuda")), vec![]);
+    }
+
+    #[test]
+    fn test_region_placement_requests_for_lowering_of_nested_calls() {
         // `f(x) = place(x, CPU 0)` wrapped in 40 functions that each call the previous one. The call of each wrapper
         // names devices because the request in the innermost callee does, which the analysis of a wrapper reads from
         // the facts of its callee that it derives in the same pass over the pruned program, rather than by analyzing
-        // the callee of every nested call again, which took time exponential in the depth of the nesting (about 4.5
-        // seconds for 20 wrappers in a debug build), and would not finish for these 40. Staging nests as deeply as
+        // the callee of every nested call again, which took time exponential in the depth of the nesting (i.e., about
+        // 4.5 seconds for 20 wrappers in a debug build), and would not finish for these 40. Staging nests as deeply as
         // the functions do, so the test runs on a thread with a larger stack.
         let depth = 40;
         let requests = std::thread::Builder::new()
@@ -1480,49 +1551,10 @@ mod tests {
     }
 
     #[test]
-    fn test_region_placement_requests_new_skips_bodies_that_the_target_replaces() {
-        // A `place` in the body of a named composite call is a request where lowering emits the body, and not for a
-        // target whose backend implementation replaces the whole call (`ryft.tests.xla_named_square` version 1 on
-        // CUDA, refer to `omits_regions`), so that the eager placement of the enclosing operation does not read it.
-        // The requests are retained for each platform separately.
-        let vector_type = ArrayType::new_static(DataType::F32, [4]);
-        let other = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let other_devices = DeviceMesh::new(other.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
-        let placement = Placement::new(other_devices.clone(), Sharding::replicated(other, 1)).unwrap();
-        let body = {
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let input = builder.add_input(vector_type.clone().into());
-            let operation = PlaceOperation::new(PlacementRequest::from(placement), None);
-            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
-        };
-        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
-        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
-        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("placing").with_named_composite(named));
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let input = builder.add_input(vector_type.into());
-        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
-        let regions = vec![builder.intern_callee(&body, None).unwrap()];
-        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
-        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
-        let program = program.unwrap();
-        let requests = |target_platform| {
-            RegionPlacementRequests::for_lowering(program.entry_region_ref(), target_platform)
-                .requests()
-                .to_vec()
-        };
-        let placed = vec![(RequestedPlacement::Devices(other_devices), PLACE_OPERATION_NAME)];
-        assert_eq!(requests(None), placed);
-        assert_eq!(requests(Some("cuda")), vec![]);
-        assert_eq!(requests(Some("cpu")), placed);
-        assert_eq!(requests(Some("cuda")), vec![]);
-    }
-
-    #[test]
-    fn test_region_placement_requests_new_skips_the_bodies_of_scans_without_iterations() {
+    fn test_region_placement_requests_for_lowering_skips_the_bodies_of_scans_without_iterations() {
         // A `place` in the body of a scan is a request when the length of the scan admits an iteration, and not on any
         // target when its length is zero, because lowering then emits nothing of its body (refer to `omits_regions`).
-        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let vector_type = test_vector_type(4);
         let elsewhere = Device::new(1, 0);
         let body = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -1553,5 +1585,220 @@ mod tests {
         assert_eq!(requests(0, Some("cpu")), vec![]);
         assert_eq!(requests(1, None), placed);
         assert_eq!(requests(1, Some("cpu")), placed);
+    }
+
+    #[test]
+    fn test_region_placement_requests_requested_mesh() {
+        let vector_type = test_vector_type(4);
+        let first = Device::new(0, 0);
+        let second = Device::new(1, 0);
+        let device_mesh = |device: Device| DeviceMesh::new(LogicalMesh::single_device(), vec![device]).unwrap();
+        let program = |targets: Vec<PlacementRequest>| {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let mut value = builder.add_input(vector_type.clone().into());
+            for target in targets {
+                value = builder
+                    .add_instruction(PlaceOperation::new(target, None), Vec::new(), vec![value], None)
+                    .unwrap()[0];
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let requested = |program: &FlatProgram<Session>| {
+            RegionPlacementRequests::for_lowering(program.entry_region_ref(), None)
+                .requested_mesh()
+                .map(|requested| requested.map(|(mesh, _)| mesh))
+        };
+        let memory = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
+
+        // A request that only moves a value to another memory names no devices, and requests that name the same
+        // devices form one mesh, which a device target names as the canonical mesh of that device.
+        assert_eq!(requested(&program(vec![memory.clone()])), Ok(None));
+        assert_eq!(
+            requested(&program(vec![memory, PlacementRequest::from(first), PlacementRequest::from(first)])),
+            Ok(Some(device_mesh(first))),
+        );
+
+        // Requests that name different devices do not form one mesh.
+        assert_eq!(
+            requested(&program(vec![PlacementRequest::from(first), PlacementRequest::from(second)])),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: PLACE_OPERATION_NAME.to_string(),
+                reason: "it requests a placement onto the devices [1], while another placement request of the same \
+                         program names the devices [0], and the two do not form one mesh"
+                    .to_string(),
+            })),
+        );
+
+        // A device target and a named mesh of the same device select the named mesh in either order, and a device
+        // target of an input that is tracked over a mesh of one device keeps that logical mesh, as the type rule of
+        // `place` does.
+        let named = LogicalMesh::new(vec![MeshAxis::new("named", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let named_mesh = DeviceMesh::new(named.clone(), vec![second]).unwrap();
+        let named_target =
+            PlacementRequest::from(Placement::new(named_mesh.clone(), Sharding::replicated(named.clone(), 1)).unwrap());
+        for targets in [
+            vec![named_target.clone(), PlacementRequest::from(second)],
+            vec![PlacementRequest::from(second), named_target.clone()],
+        ] {
+            assert_eq!(requested(&program(targets)), Ok(Some(named_mesh.clone())));
+        }
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let named_type = vector_type.clone().with_sharding(Sharding::replicated(named, 1)).unwrap();
+        let input = builder.add_input(named_type.into());
+        let output = builder
+            .add_instruction(PlaceOperation::new(PlacementRequest::from(second), None), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(requested(&program), Ok(Some(named_mesh)));
+    }
+
+    #[test]
+    fn test_merge_requested_placement() {
+        let canonical = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
+        let named = |name: &str| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new(name, 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+            DeviceMesh::new(mesh, vec![Device::new(0, 0)]).unwrap()
+        };
+        let (first_named, second_named) = (named("first"), named("second"));
+        let elsewhere = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(1, 0)]).unwrap();
+
+        // The first request that names devices is recorded with the name of its operation.
+        let mut requested = None;
+        assert_eq!(merge_requested_placement(&mut requested, Cow::Borrowed(&canonical), PLACE_OPERATION_NAME), Ok(()));
+        assert_eq!(requested, Some((Cow::Borrowed(&canonical), PLACE_OPERATION_NAME)));
+
+        // A named mesh of the same device replaces the canonical mesh and is kept when the canonical mesh or another
+        // named mesh of that device follows it.
+        assert_eq!(merge_requested_placement(&mut requested, Cow::Borrowed(&first_named), CALL_OPERATION_NAME), Ok(()));
+        assert_eq!(requested, Some((Cow::Borrowed(&first_named), CALL_OPERATION_NAME)));
+        assert_eq!(merge_requested_placement(&mut requested, Cow::Borrowed(&canonical), PLACE_OPERATION_NAME), Ok(()));
+        assert_eq!(
+            merge_requested_placement(&mut requested, Cow::Borrowed(&second_named), PLACE_OPERATION_NAME),
+            Ok(()),
+        );
+        assert_eq!(requested, Some((Cow::Borrowed(&first_named), CALL_OPERATION_NAME)));
+
+        // A request that names other devices does not form one mesh with the recorded request, which is kept.
+        assert_eq!(
+            merge_requested_placement(&mut requested, Cow::Borrowed(&elsewhere), PLACE_OPERATION_NAME),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: PLACE_OPERATION_NAME.to_string(),
+                reason: "it requests a placement onto the devices [1], while another placement request of the same \
+                         program names the devices [0], and the two do not form one mesh"
+                    .to_string(),
+            })),
+        );
+        assert_eq!(requested, Some((Cow::Borrowed(&first_named), CALL_OPERATION_NAME)));
+    }
+
+    #[test]
+    fn test_entry_output_shardings() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = |dimension: ShardingDimension| Sharding::new(mesh.clone(), vec![dimension]).unwrap();
+        let split = sharded(ShardingDimension::sharded(["x"]));
+        let replicated = sharded(ShardingDimension::replicated());
+        let open = sharded(ShardingDimension::unconstrained());
+        let plain_type = test_vector_type(4);
+        let split_type = plain_type.clone().with_sharding(split.clone()).unwrap();
+
+        // Output sharding overrides are used whatever the program and the output types state, with their unconstrained
+        // dimensions replicated.
+        assert_eq!(
+            entry_output_shardings(
+                std::slice::from_ref(&split_type),
+                Some(std::slice::from_ref(&open)),
+                &[Some(OutputShardingSource::Determined(split.clone()))],
+                &[],
+            ),
+            Ok(vec![Some(replicated.clone())]),
+        );
+
+        // Without overrides, an output has the placement that the program determines for it or that of the argument
+        // that it returns, with its unconstrained dimensions replicated, and otherwise the sharding of its type, if
+        // any.
+        assert_eq!(
+            entry_output_shardings(
+                &[plain_type.clone(), plain_type.clone(), plain_type.clone(), split_type, plain_type.clone()],
+                None,
+                &[
+                    Some(OutputShardingSource::Determined(split.clone())),
+                    Some(OutputShardingSource::Input(0)),
+                    Some(OutputShardingSource::Input(1)),
+                    None,
+                    None,
+                ],
+                &[Some(open), None],
+            ),
+            Ok(vec![Some(split.clone()), Some(replicated.clone()), None, Some(split), None]),
+        );
+
+        // A placement that the program gives an output keeps only the reduction state that the output type records.
+        let pending = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let pending_type = plain_type.clone().with_sharding(pending.clone()).unwrap();
+        assert_eq!(
+            entry_output_shardings(
+                &[plain_type, pending_type],
+                None,
+                &[
+                    Some(OutputShardingSource::Determined(pending.clone())),
+                    Some(OutputShardingSource::Determined(pending.clone())),
+                ],
+                &[],
+            ),
+            Ok(vec![Some(replicated), Some(pending)]),
+        );
+    }
+
+    #[test]
+    fn test_entry_outputs_with_compiler_chosen_placement() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let annotation = Sharding::replicated(mesh.clone(), 1);
+        let plain_type = test_vector_type(4);
+        let open_type = plain_type
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::unconstrained()]).unwrap())
+            .unwrap();
+        let open = |output_type: &ArrayType,
+                    output_shardings: Option<&[Sharding]>,
+                    source: Option<OutputShardingSource>,
+                    annotation: Option<Sharding>| {
+            entry_outputs_with_compiler_chosen_placement(
+                std::slice::from_ref(output_type),
+                output_shardings,
+                &[source],
+                &[annotation],
+            )
+        };
+
+        // An output is open when its annotation is over a mesh with an auto axis along which the compiler has a choice
+        // and nothing fixes its placement.
+        assert_eq!(open(&plain_type, None, None, Some(annotation.clone())), vec![true]);
+        assert_eq!(open(&plain_type, None, None, Some(Sharding::replicated(explicit_mesh, 1))), vec![false]);
+        assert_eq!(open(&plain_type, None, None, None), vec![false]);
+
+        // An output sharding override and a placement that the program gives the output fix it.
+        let overrides = Some(std::slice::from_ref(&annotation));
+        assert_eq!(open(&plain_type, overrides, None, Some(annotation.clone())), vec![false]);
+        let source = Some(OutputShardingSource::Input(0));
+        assert_eq!(open(&plain_type, None, source, Some(annotation.clone())), vec![false]);
+
+        // Reduction state and manual variation in the annotation fix it, and so does an unconstrained dimension in the
+        // output type, which the runtime placement of the output reads as replicated.
+        let unreduced = annotation.clone().with_unreduced_axes(["a"]).unwrap();
+        assert_eq!(open(&plain_type, None, None, Some(unreduced)), vec![false]);
+        let reduced = annotation.clone().with_reduced_axes(["a"]).unwrap();
+        assert_eq!(open(&plain_type, None, None, Some(reduced)), vec![false]);
+        let varying = annotation.clone().with_varying_manual_axes(["m"]).unwrap();
+        assert_eq!(open(&plain_type, None, None, Some(varying)), vec![false]);
+        assert_eq!(open(&open_type, None, None, Some(annotation)), vec![false]);
     }
 }
