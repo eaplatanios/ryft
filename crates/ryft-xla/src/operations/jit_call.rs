@@ -36,14 +36,12 @@ use ryft_mlir::{
 
 use crate::compilation::domains::{
     argument_type, boundary_input_type, commits_public_outputs, declared_input_sharding, entered_argument_sharding,
-    is_named_mesh, states_boundary_placement,
-};
-use crate::compilation::placements::{
-    entry_boundary_sharding, has_placement_requests_in_region, has_untracked_auto_axes,
+    states_boundary_placement,
 };
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
+use crate::lowering::extensions::{ShardingLoweringExtension, has_placement_requests_in_region};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
@@ -51,6 +49,7 @@ use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::lower_cast_shape;
 use crate::operations::{Operation, unread_lifted_captures};
+use crate::sharding::LogicalMeshExtension;
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     Session, Type, Value,
@@ -562,9 +561,9 @@ impl<T: CoreType> JitCallOperation<T> {
     /// Returns this call with the boundary of its callee, made of `mesh`, the device mesh that the callee was compiled
     /// for when it names devices, and of the sharding override of each callee input and output, by position, where
     /// [`None`] marks a position without one. A callee names devices when it has a sharding override or its program
-    /// requests a placement that names devices (refer to `has_placement_requests`), so `mesh` must be present whenever
-    /// an override is.
-    /// A missing override is implicit past the end of either list. A list without overrides is stored as absent.
+    /// requests a placement that names devices (refer to `ProgramLoweringExtension::has_placement_requests`), so `mesh`
+    /// must be present whenever an override is. A missing override is implicit past the end of either list. A list
+    /// without overrides is stored as absent.
     pub(crate) fn with_boundary(
         mut self,
         mesh: Option<&DeviceMesh>,
@@ -673,17 +672,18 @@ impl<T: CoreType> JitCallOperation<T> {
         self.mesh.as_ref()
     }
 
-    /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when it
-    /// states a placement at its boundary (refer to [`Self::states_boundary_placement`]) or when its callee requests a
-    /// placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
+    /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
+    /// it states a placement at its boundary (refer to [`Self::states_boundary_placement`]) or when its callee requests
+    /// a placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
     /// `has_placement_requests_in_region`), which `callee_names_devices` says and which is asked only when the call
     /// records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when the
     /// function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
-    /// `pruned_for_lowering`) can record a mesh that only a request of a dropped output named, which this function no
-    /// longer reports, as JAX lowers a nested `jit` function pruned to the outputs that its caller uses and so without
-    /// the shardings of the dropped ones. The analysis of a program (refer to `placement_requests` and
-    /// `pruned_for_lowering`) answers `callee_names_devices` with the facts of the callee that it derives in the same
-    /// pass over the program, so that it never analyses a callee again for each call that encloses it.
+    /// `ProgramLoweringExtension::pruned_for_lowering`) can record a mesh that only a request of a dropped output
+    /// named, which this function no longer reports, as JAX lowers a nested `jit` function pruned to the outputs that
+    /// its caller uses and so without the shardings of the dropped ones. The analysis of a program (refer to
+    /// `placement_requests` and `ProgramLoweringExtension::pruned_for_lowering`) answers `callee_names_devices` with
+    /// the facts of the callee that it derives in the same pass over the program, so that it never analyses a callee
+    /// again for each call that encloses it.
     pub(crate) fn names_devices(&self, callee_names_devices: impl FnOnce() -> bool) -> Option<&DeviceMesh> {
         let mesh = self.mesh.as_ref()?;
         (self.states_boundary_placement() || callee_names_devices()).then_some(mesh)
@@ -834,7 +834,7 @@ impl<T: CoreType> JitCallOperation<T> {
         if eager && let Some(mesh) = &self.function_mesh {
             // A named function fixes the devices independently of the inputs available to each side of the split.
             // The residual side also keeps an anonymous function mesh for later application (e.g., a pullback).
-            if is_named_mesh(mesh.logical_mesh()) {
+            if mesh.logical_mesh().is_named() {
                 known_call.function_mesh = Some(mesh.clone());
             }
             residual_call.function_mesh = Some(mesh.clone());
@@ -1064,12 +1064,13 @@ impl JitCallOperation<Type> {
     ///     [`Self::boundary_input_sharding`]), or keeps its sharding when the mesh topologies agree and is replicated
     ///     otherwise. Its devices are named for every process, so they are not locally assigned.
     ///   - A call runs on the mesh of its function (refer to [`Self::with_function_mesh`]) in the same way when that
-    ///     mesh is named (refer to [`is_named_mesh`]), as JAX runs a `jit` function under `set_mesh`, and commits its
-    ///     results. On the anonymous mesh of one device, it does so only when no public argument is committed, as JAX
-    ///     runs a `jit` function under `default_device`, with uncommitted results, and a committed public argument
-    ///     decides as below. This decision is taken only for the call that the session applies. A call nested in its
-    ///     callee, or in a region of another eager operation (e.g., `condition`), is compiled into the computation of
-    ///     that call or operation and runs where it runs, as a nested call runs where its compiled caller runs.
+    ///     mesh is named (refer to [`LogicalMeshExtension::is_named`]), as JAX runs a `jit` function under `set_mesh`,
+    ///     and commits its results. On the anonymous mesh of one device, it does so only when no public argument is
+    ///     committed, as JAX runs a `jit` function under `default_device`, with uncommitted results, and a committed
+    ///     public argument decides as below. This decision is taken only for the call that the session applies. A
+    ///     call nested in its callee, or in a region of another eager operation (e.g., `condition`), is compiled into
+    ///     the computation of that call or operation and runs where it runs, as a nested call runs where its compiled
+    ///     caller runs.
     ///   - Any other call runs where its public arguments are, as JAX runs a `jit` function without shardings.
     ///     Committed public arguments must agree on their devices, as JAX rejects a `jit` call whose committed
     ///     arguments are on different devices ("Received incompatible devices for jitted computation"), and they
@@ -1151,7 +1152,7 @@ impl JitCallOperation<Type> {
         let names_devices = || has_placement_requests_in_region(callee, Some(target_platform), false);
         let function_assignment = || {
             let mesh = self.function_mesh.as_ref()?;
-            if is_named_mesh(mesh.logical_mesh()) {
+            if mesh.logical_mesh().is_named() {
                 Some((mesh, false))
             } else if !public_arrays.clone().any(Array::is_committed) {
                 Some((mesh, session.uses_local_default_device(mesh)))
@@ -1316,7 +1317,7 @@ impl JitCallOperation<Type> {
         let sharding = self.boundary_input_sharding(index, actual, declared)?;
         let moves = self.input_sharding(index).is_some()
             || actual.sharding() != Some(sharding.as_ref())
-            || has_untracked_auto_axes(&sharding);
+            || sharding.mesh().has_untracked_auto_axes();
         moves.then_some(sharding)
     }
 
@@ -2618,7 +2619,7 @@ pub fn transpose_primal_jit_call<
     let function_mesh = operation
         .function_mesh
         .as_ref()
-        .filter(|function| is_named_mesh(function.logical_mesh()))
+        .filter(|function| function.logical_mesh().is_named())
         .map(|function| function.logical_mesh());
     let seed_shardings = outputs
         .iter()
@@ -2784,7 +2785,7 @@ impl InterpretableOperation<Session> for JitCallOperation<Type> {
 // of the function places its arguments and results. The overrides are applied at the call site, as constraints on the
 // operands and on the results of the call, rather than as annotations of the callee, because the callee may be inlined
 // or shared with calls that carry other overrides. Each constraint is the sharding with which the function annotates
-// its own boundary (refer to `entry_boundary_sharding`), and it is closed over auto mesh axes, so that a replicated
+// its own boundary (refer to `ShardingLoweringExtension::entry_boundary_sharding`), and it is closed over auto mesh axes, so that a replicated
 // override stops the compiler from splitting the value, like the replicated result of an execution. An effective input
 // sharding without an override that the operand type already has is not constrained again, unless the mesh has auto
 // axes, along which the operand type cannot show where the operand is (refer to
@@ -3504,7 +3505,7 @@ where
 /// (i.e., `{?}`) and the other replicates (refer to [`replicates_unconstrained_dimensions`]) is cast to `refined` as
 /// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
 /// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. An eager array
-/// stores an unconstrained dimension replicated (refer to `entry_boundary_sharding` in `lowering/mod.rs`), so its
+/// stores an unconstrained dimension replicated (refer to `ShardingLoweringExtension::entry_boundary_sharding`), so its
 /// buffers are those of `refined`. Inside a compiled program, the cast emits no sharding constraint (an unconstrained
 /// and a replicated dimension do not conflict over explicit mesh axes, and types record no placement over auto mesh
 /// axes), and the entry boundary of the program replicates an unconstrained dimension of any value that it exchanges.
@@ -4169,7 +4170,8 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 /// sharding of the corresponding position of the boundary of its callee (i.e., its override, or the declared sharding
 /// of an input without one, refer to [`JitCallOperation::boundary_input_sharding`]), and returns the constrained value.
 /// The constraint is the sharding with which the called function annotates that position of its own boundary (refer to
-/// [`entry_boundary_sharding`]), closed over auto mesh axes. Values that are not arrays are returned unchanged.
+/// [`ShardingLoweringExtension::entry_boundary_sharding`]), closed over auto mesh axes. Values that are not arrays
+/// are returned unchanged.
 ///
 /// # Errors
 ///
@@ -4187,7 +4189,7 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // The override states the placement along every mesh axis, so it is lowered for a type that tracks no placement,
     // with which a constraint is not merged (refer to `ConstrainShardingOperation::lowered_sharding`).
     let untracked_type = array_type.clone().with_sharding(None)?;
-    let declared = entry_boundary_sharding(sharding)?;
+    let declared = sharding.entry_boundary_sharding()?;
     // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
     let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
     validate_declared_pending_reduction(

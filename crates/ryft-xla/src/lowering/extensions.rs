@@ -1,10 +1,3 @@
-//! StableHLO/Shardy export and placement preparation shared by XLA lowering, compilation, and eager dispatch.
-//! [`ProgramExtension`](crate::ProgramExtension) exports a traced XLA program to MLIR.
-//! [`ProgramLoweringExtension`](crate::lowering::extensions::ProgramLoweringExtension) prepares programs for lowering
-//! and queries their placements. [`ShardingLoweringExtension`](crate::lowering::extensions::ShardingLoweringExtension)
-//! normalizes shardings at the executable boundary. Region-level analyses supply the placement requests and retained
-//! constants that eager dispatch uses to choose devices and commit results.
-
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -29,13 +22,11 @@ use crate::lowering::{LowerableOperationFamily, LoweringError};
 use crate::sharding::LogicalMeshExtension;
 use crate::{Constant, Error, JitCallOperation, Operation, RetainedArray, Type};
 
-// TODO(eaplatanios): Review this module.
-
 /// Exports staged [`Program`]s of the XLA backend whose inputs and outputs are arrays (e.g., a
 /// [`TracedProgram`](crate::TracedProgram)) as StableHLO/Shardy MLIR modules. The export reads the global input and
-/// output types of the program (refer to [`Program::input_type`] and [`Program::output_type`]).
-/// Programs over a custom operation family can use [`to_mlir_module_for_program`](crate::to_mlir_module_for_program)
-/// and supply their entry signatures explicitly.
+/// output types of the program (refer to [`Program::input_type`] and [`Program::output_type`]). Programs over a custom
+/// operation family can use [`to_mlir_module_for_program`](crate::to_mlir_module_for_program) and supply their entry
+/// signatures explicitly.
 pub trait ProgramExtension {
     /// Renders a full StableHLO/Shardy MLIR module for this traced XLA program, whose function signature
     /// carries the shardings of the global input and output types that have one. Refer to
@@ -60,21 +51,21 @@ pub trait ProgramExtension {
     /// arguments carry the sharding of each of their global types that has one, and the results carry the placement
     /// that the program gives them (i.e., the target of a `place` that produces them, including over auto mesh axes,
     /// or the sharding of the argument that they return, also through the callee of a `jit_call`) or otherwise the
-    /// sharding of their global types, as the compilation path of [`Session`](crate::Session) does. Like that path, arguments and
-    /// results replicate the unconstrained dimensions of their shardings, which their runtime placements read as
-    /// replicated, and results whose placement over auto mesh axes nothing fixes are left open over those axes, so that
-    /// the compiler chooses it. Unlike that path, which places a value without either as replicated because it lowers
-    /// for concrete placed arrays, such a value is left unannotated here, so that Shardy propagates its placement from
-    /// the program. Arrays that the traced function imports (i.e., its session constants) enter the function as hidden
-    /// arguments that precede the inputs. The export annotates them with the placements of those arrays, as
-    /// compilation for a [`Session`](crate::Session) does.
+    /// sharding of their global types, as the compilation path of [`Session`](crate::Session) does. Like that path,
+    /// arguments and results replicate the unconstrained dimensions of their shardings, which their runtime placements
+    /// read as replicated, and results whose placement over auto mesh axes nothing fixes are left open over those axes,
+    /// so that the compiler chooses it. Unlike that path, which places a value without either as replicated because it
+    /// lowers for concrete placed arrays, such a value is left unannotated here, so that Shardy propagates its
+    /// placement from the program. Arrays that the traced function imports (i.e., its session constants) enter the
+    /// function as hidden arguments that precede the inputs. The export annotates them with the placements of those
+    /// arrays, as compilation for a [`Session`](crate::Session) does.
     ///
-    /// The traced program is pruned before lowering, as the compilation of a [`Session`](crate::Session) prunes it, which drops dead
-    /// outputs of instructions that carry regions together with the body computation that only they use (e.g., the
-    /// dead primal outputs of a forward mode `shard_map` whose residuals feed a gradient), and is then simplified. A
-    /// `shard_map` whose ordinary outputs are all dead but whose body has observable effects (e.g., prints with the
-    /// [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary outputs and
-    /// lowers to a manual computation that only threads its effect token.
+    /// The traced program is pruned before lowering, as the compilation of a [`Session`](crate::Session) prunes it,
+    /// which drops dead outputs of instructions that carry regions together with the body computation that only they
+    /// use (e.g., the dead primal outputs of a forward mode `shard_map` whose residuals feed a gradient), and is then
+    /// simplified. A `shard_map` whose ordinary outputs are all dead but whose body has observable effects (e.g.,
+    /// prints with the [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo) effect) is kept with no ordinary
+    /// outputs and lowers to a manual computation that only threads its effect token.
     ///
     /// # Parameters
     ///
@@ -89,9 +80,9 @@ pub trait ProgramExtension {
     /// Returns [`Error::Core`] when an input or output of the program is not an array, when pruning or simplifying the
     /// traced program fails, or when the program imports an array whose type names a mesh of another topology than the
     /// meshes of the signature, because a plain trace keeps the type of an array that it imports (a function compiled
-    /// through a [`Session`](crate::Session), whose captures follow its call, receives it where it runs instead). Lowering failures use
-    /// the corresponding [`Error`] variants (e.g., for an invalid function name, mismatched signature shardings,
-    /// unresolved references or state, or operations that the backend cannot lower).
+    /// through a [`Session`](crate::Session), whose captures follow its call, receives it where it runs instead).
+    /// Lowering failures use the corresponding [`Error`] variants (e.g., for an invalid function name, mismatched
+    /// signature shardings, unresolved references or state, or operations that the backend cannot lower).
     fn to_mlir_module_with_shardings<S: AsRef<str>>(
         &self,
         function_name: S,
@@ -183,6 +174,8 @@ where
         .into_stable_hlo())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Prepares XLA programs for lowering and analyzes their entry placements.
 pub(crate) trait ProgramLoweringExtension: Sized {
