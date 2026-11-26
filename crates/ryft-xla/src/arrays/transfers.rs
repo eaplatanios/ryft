@@ -1755,7 +1755,13 @@ impl Array {
             return Err((cause.without_host_route(), None));
         }
 
-        let array = if self.moves_to_owner_view(mesh, sharding, process_index) {
+        let array = if !self.data_type().is_zero()
+            && self.is_locally_assigned()
+            && self.mesh() != mesh
+            && self.mesh().logical_mesh() == mesh.logical_mesh()
+            && mesh.devices().iter().all(|device| device.process_index() == process_index)
+            && keeps_some_contributions(self.sharding(), sharding)
+        {
             // The owner can run the shared plan after a local whole-shard placement that preserves each
             // contribution. If that move fails, the original array remains available for host fallback.
             let (shape, element_type) = (self.shape(), self.data_type().executable_buffer_type());
@@ -2271,9 +2277,9 @@ impl Array {
         Ok(buffer)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Borrows the source metadata and global shard descriptors without exposing its buffers or session.
+    /// Borrows the source metadata and global shard descriptors without exposing its buffers or session
+    /// and returns them as a [`PlacementPlanningView`].
+    #[inline]
     fn placement_planning_view(&self) -> PlacementPlanningView<'_, impl Iterator<Item = &ShardDescriptor> + Clone> {
         PlacementPlanningView {
             metadata: &self.parts.metadata,
@@ -2281,38 +2287,22 @@ impl Array {
         }
     }
 
-    /// Returns whether this process moves its own value onto `mesh` before it runs the strategy that
-    /// [`Self::device_placement_strategy`] chose for placing this array on `mesh` according to `sharding`, which is the
-    /// case when this process, with index `process_index`, owns every device of `mesh`, holds a locally assigned value
-    /// over the logical mesh of `mesh` on other devices (e.g., in another order), and the placement keeps some of its
-    /// contributions. Every process then admits the placement by planning the value on `mesh` (refer to
-    /// [`Self::device_placement_strategy`]), and the owner moves its value there with local whole-shard copies
-    /// before running the plan (refer to [`Self::try_reshard_on_devices`]).
-    fn moves_to_owner_view(&self, mesh: &DeviceMesh, sharding: &Sharding, process_index: usize) -> bool {
-        !self.data_type().is_zero()
-            && self.is_locally_assigned()
-            && self.mesh() != mesh
-            && self.mesh().logical_mesh() == mesh.logical_mesh()
-            && mesh.devices().iter().all(|device| device.process_index() == process_index)
-            && keeps_some_contributions(self.sharding(), sharding)
-    }
-
     /// Chooses the device work that places this array on `mesh` according to `sharding` in the process with index
     /// `process_index`, or returns the error that rules out all of it. `layout_resolver` supplies the layouts needed
-    /// for cross-host transfers. [`Self::try_reshard_on_devices`] executes the chosen strategy, and the
-    /// agreement test of this module plans every process of a distributed placement with this same function.
+    /// for cross-host transfers. [`Self::try_reshard_on_devices`] executes the chosen strategy, and the agreement test
+    /// of this module plans every process of a distributed placement with this same function.
     ///
     /// Every process of a distributed placement calls this function for the same placement and then performs only its
     /// own part of the chosen strategy, so every process must derive the same transfers and programs. This function
-    /// therefore reads only the information that every process shares (refer to the documentation of this module). It
-    /// never reads a buffer or a physical layout, and it reads `process_index` only for a locally assigned array.
+    /// therefore reads only the information that every process shares. It never reads a buffer or a physical layout,
+    /// and it reads `process_index` only for a locally assigned array.
     ///
     /// An array with [locally assigned devices](Self::is_locally_assigned) is placed with
     /// [`DevicePlacementStrategy::ProcessLocalValue`], except that when one process owns every target device, that
     /// owner takes the strategy that [`PlacementPlanningView::strategy`] chooses for the view of its value on its
-    /// devices, if one applies, and every other process takes
-    /// [`DevicePlacementStrategy::OnOwner`] with that plan, so that it admits exactly what the owner runs. Any other
-    /// array is placed with the strategies of [`PlacementPlanningView::strategy`].
+    /// devices, if one applies, and every other process takes [`DevicePlacementStrategy::OnOwner`] with that plan,
+    /// so that it admits exactly what the owner runs. Any other array is placed with the strategies of
+    /// [`PlacementPlanningView::strategy`].
     fn device_placement_strategy(
         &self,
         layout_resolver: &CrossHostLayoutResolver<'_>,
@@ -2330,21 +2320,21 @@ impl Array {
 
         // Placing the value with local work only also handles every placement that no shared strategy supports (e.g.,
         // an uneven split whose regions need a cross-host layout that the plugin does not report), so it remains the
-        // choice when none applies. Its readback and upload would combine contributions that the target keeps
-        // (refer to `keeps_some_contributions`), so such a placement is made by the one process that owns every
-        // target device, and a target over several processes is the same error on every process. Whether
-        // one process owns the target reads only the target, so every process decides alike.
+        // choice when none applies. Its readback and upload would combine contributions that the target keeps (refer
+        // to `keeps_some_contributions`), so such a placement is made by the one process that owns every target device,
+        // and a target over several processes is the same error on every process. Whether one process owns the target
+        // reads only the target, so every process decides alike.
         //
-        // When one process owns the target, every process decides which strategy that owner runs from the plan of
-        // the view of the value on the owner's devices, which reads only metadata
-        // that all of them hold. The owner runs a shared strategy whenever one applies, which for a placement that
-        // keeps contributions is the only choice (so its rejection is the same error on every process), and otherwise
-        // only when it is not a host round trip for a cause on the devices, which the upload of the owner replaces.
-        // Every other process then takes no part and checks only what that strategy checks before it submits anything
-        // (refer to `DevicePlacementStrategy::OnOwner`), or, when the owner uploads its own value, what that upload
-        // checks (refer to `Self::place_process_local_value`). The owner runs the plan of the view over the logical
-        // mesh of the target, after moving its value there when the placement keeps contributions (refer to
-        // `Self::moves_to_owner_view`), and plans its own value otherwise, whose admission is that of the view.
+        // When one process owns the target, every process decides which strategy that owner runs from the plan of the
+        // view of the value on the owner's devices, which reads only metadata that all of them hold. The owner runs a
+        // shared strategy whenever one applies, which for a placement that keeps contributions is the only choice (so
+        // its rejection is the same error on every process), and otherwise only when it is not a host round trip for
+        // a cause on the devices, which the upload of the owner replaces. Every other process then takes no part and
+        // checks only what that strategy checks before it submits anything, or, when the owner uploads its own value,
+        // what that upload checks (refer to `Self::place_process_local_value`). The owner runs the plan of the view
+        // over the logical mesh of the target, after moving its value there when the placement keeps contributions
+        // and the logical meshes match (refer to `Self::try_reshard_on_devices`). Otherwise, it plans again from
+        // its own value.
         let owner = mesh.devices()[0].process_index();
         let one_owner = mesh.devices().iter().all(|device| device.process_index() == owner);
         let keeps = keeps_some_contributions(self.sharding(), sharding);
@@ -2354,10 +2344,12 @@ impl Array {
             }
             .into());
         }
+
         if !one_owner {
             return Ok(DevicePlacementStrategy::ProcessLocalValue);
         }
-        // Give the owner's view the source topology on the target devices. If the source needs more devices,
+
+        // Give the owner's view the source topology on the target devices. If the source needs more devices.
         // every process fills out the view with the same synthetic IDs above the largest target ID.
         let source_device_count = self.mesh().devices().len();
         let target_devices = mesh.devices();
@@ -2367,14 +2359,16 @@ impl Array {
                 let id =
                     first_free_id.and_then(|id| id.checked_add(offset)).ok_or_else(|| Error::SizeLimitExceeded {
                         message: format!(
-                            "planning a placement of a locally assigned array onto devices of process {owner} needs a \
-                         device identifier above {}",
+                            "planning a placement of a locally assigned array onto devices of process {} needs a \
+                             device identifier above {}",
+                            owner,
                             DeviceId::MAX,
                         ),
                     })?;
                 Ok(Device::new(id, owner))
             })
             .collect::<Result<Vec<_>, Error>>()?;
+
         let devices = target_devices.iter().copied().chain(further).take(source_device_count).collect();
         let view_mesh = DeviceMesh::new(self.mesh().logical_mesh().clone(), devices)?;
         let view = (view_mesh != *self.mesh())
@@ -2386,6 +2380,7 @@ impl Array {
             }
             None => self.placement_planning_view().strategy(layout_resolver, mesh, sharding),
         };
+
         let shared = |planned: Result<DevicePlacementStrategy, Error>| match planned {
             Ok(strategy)
                 if keeps || !matches!(strategy.host_round_trip_cause(), Some(HostRoundTripCause::Device(_))) =>
@@ -2395,18 +2390,26 @@ impl Array {
             Err(error) if keeps => Err(error),
             _ => Ok(None),
         };
+
         let Some(planned) = shared(planned)? else {
             return Ok(DevicePlacementStrategy::ProcessLocalValue);
         };
+
         if owner != process_index {
             return Ok(DevicePlacementStrategy::OnOwner { strategy: Box::new(planned) });
         }
-        if view.is_none() || self.moves_to_owner_view(mesh, sharding, process_index) {
+
+        // A distinct view with matching logical meshes already has the target devices. When the placement keeps
+        // contributions, the owner will move its value onto that view before executing this plan.
+        if view.is_none() || (self.mesh().logical_mesh() == mesh.logical_mesh() && keeps) {
             return Ok(planned);
         }
+
         let planned = shared(self.placement_planning_view().strategy(layout_resolver, mesh, sharding))?;
         Ok(planned.unwrap_or(DevicePlacementStrategy::ProcessLocalValue))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
     /// of this array with some axes of size one (refer to [`DeviceMeshExtension::at_coordinate_zero`]), along which

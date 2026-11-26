@@ -155,7 +155,12 @@ where
             program.output_sharding_sources(output_types.len(), |constant| constant.sharding().clone());
         let output_annotations =
             entry_output_shardings(&output_types, output_shardings, &sharding_sources, &input_shardings)?;
-        let open_outputs = entry_open_outputs(&output_types, output_shardings, &sharding_sources, &output_annotations);
+        let open_outputs = entry_outputs_with_compiler_chosen_placement(
+            &output_types,
+            output_shardings,
+            &sharding_sources,
+            &output_annotations,
+        );
         Ok(lower_mlir_module_for_program_with_value_shardings(
             &program,
             &capture_types,
@@ -617,17 +622,15 @@ pub(crate) fn merge_requested_placement<'r>(
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the sharding with which the entry function of a program annotates each of its outputs, whose types are
 /// `output_types`, and which describes the buffers that the outputs are returned in. These are the `output_shardings`
 /// overrides when they are provided, and otherwise the placement that the program gives each output (i.e., the
 /// corresponding element of `sharding_sources`, as [`ProgramLoweringExtension::output_sharding_sources`] returns them,
 /// where an entry argument is placed as the corresponding element of `argument_shardings`), or the sharding of the
-/// output type when the program gives it none (e.g., when that argument has no sharding). An output without either has
-/// no sharding. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
-/// [`TracedProgram`](crate::TracedProgram) both choose the shardings of outputs with this function, so that an exported
-/// module places its outputs as the executable that a session compiles for it does.
+/// output type when the program gives it none (e.g., when that argument has no sharding). An output without either
+/// has no sharding. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
+/// [`TracedProgram`](crate::TracedProgram) both choose the shardings of outputs with this function,
+/// so that an exported module places its outputs as the executable that a session compiles for it does.
 ///
 /// An override, a `place` target, an argument placement, or an output type may leave dimensions unconstrained, but the
 /// runtime placement of an array reads such a dimension as replicated, and the output type records it exactly, so it
@@ -689,13 +692,13 @@ pub(crate) fn entry_output_shardings(
     }
 }
 
-/// Returns whether the entry function of a program leaves each of its outputs, whose types are `output_types` and whose
-/// annotations are `output_annotations` (i.e., the shardings that [`entry_output_shardings`] returns for
+/// Returns whether the entry function of a program leaves each of its outputs, whose types are `output_types`
+/// and whose annotations are `output_annotations` (i.e., the shardings that [`entry_output_shardings`] returns for
 /// `output_shardings` and `sharding_sources`), open over the auto mesh axes of its annotation, so that the compiler
 /// chooses the placement of the output along those axes, like JAX lowers the outputs of a `jit` function without
 /// `out_shardings`. Compilation for a [`Session`](crate::Session) and the StableHLO export of a
-/// [`TracedProgram`](crate::TracedProgram) both decide this with this function, so that an exported module leaves open
-/// the outputs whose placement the compiler chooses for the executable that a session compiles for it.
+/// [`TracedProgram`](crate::TracedProgram) both decide this with this function, so that an exported module
+/// leaves open the outputs whose placement the compiler chooses for the executable that a session compiles for it.
 ///
 /// An output is open when it has an annotation over a mesh with an auto axis larger than one (i.e., one along which the
 /// compiler has a choice), and when nothing else fixes its placement. An output sharding override, a placement that the
@@ -706,11 +709,11 @@ pub(crate) fn entry_output_shardings(
 ///
 /// Export lowers a program without a device mesh, so it can only decide what the program and its signature state.
 /// It cannot know whether compilation runs the program partitioned, because a program with bounded dynamic shapes
-/// runs as fully replicated replicas whose outputs are never open, nor which placements the compiler then chooses for
-/// the open outputs, which only the compiled executable reports. It also cannot know the runtime placements of
+/// runs as fully replicated replicas whose outputs are never open, nor which placements the compiler then chooses
+/// for the open outputs, which only the compiled executable reports. It also cannot know the runtime placements of
 /// arguments without signature shardings, whose types do not record auto mesh axes, so that their annotations and
 /// those of the outputs that return them are left to Shardy.
-pub(crate) fn entry_open_outputs(
+pub(crate) fn entry_outputs_with_compiler_chosen_placement(
     output_types: &[ArrayType],
     output_shardings: Option<&[Sharding]>,
     sharding_sources: &[Option<OutputShardingSource>],
@@ -735,6 +738,8 @@ pub(crate) fn entry_open_outputs(
         })
         .collect()
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {

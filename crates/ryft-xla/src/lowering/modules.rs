@@ -280,7 +280,7 @@ where
 /// entry function argument (i.e., captures first) and per result, so that only the values whose sharding is known carry
 /// an `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program. The results
 /// flagged in `open_outputs` (i.e., one flag per result, or none at all) are lowered open over auto mesh axes, so that
-/// the compiler chooses their placement over those axes (refer to `entry_open_outputs`).
+/// the compiler chooses their placement over those axes (refer to `entry_outputs_with_compiler_chosen_placement`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
     Input,

@@ -70,7 +70,7 @@ pub(crate) enum NamedCompositeImplementation {
         reason: String,
     },
 
-    /// Test implementation of `ryft.tests.xla_named_square` version 1 on CUDA, which squares its input.
+    /// Squares the input of a named composite in lowering and eager dispatch tests.
     #[cfg(test)]
     TestSquare,
 }
@@ -86,7 +86,9 @@ impl NamedCompositeImplementation {
     ) -> Option<Self> {
         match (key.name(), key.version(), target_platform) {
             #[cfg(test)]
-            ("ryft.tests.xla_named_square", 1, Some("cuda")) => Some(Self::TestSquare),
+            ("ryft.tests.xla_named_square", 1, Some("cuda")) | ("ryft.tests.xla_cpu_named_square", 1, Some("cpu")) => {
+                Some(Self::TestSquare)
+            }
             _ => select_attention_implementation(key, input_types, output_types, target_platform),
         }
     }

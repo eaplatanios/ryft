@@ -37,8 +37,8 @@ use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
 use crate::lowering::extensions::{
-    OutputShardingSource, ProgramLoweringExtension, ShardingLoweringExtension, entry_open_outputs,
-    entry_output_shardings,
+    OutputShardingSource, ProgramLoweringExtension, ShardingLoweringExtension, entry_output_shardings,
+    entry_outputs_with_compiler_chosen_placement,
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
 use crate::lowering::signatures::ExecutableSignature;
@@ -734,7 +734,7 @@ impl Session {
                 let requested = options.output_shardings().map(|shardings| &shardings[index]).or_else(|| {
                     match &sharding_sources[index] {
                         Some(OutputShardingSource::Determined(sharding)) => Some(sharding),
-                        Some(OutputShardingSource::Argument(index)) => {
+                        Some(OutputShardingSource::Input(index)) => {
                             program_argument_shardings.get(*index).and_then(Option::as_ref)
                         }
                         None => None,
@@ -810,9 +810,10 @@ impl Session {
         let lowered_output_shardings = use_shardy_partitioner.then_some(output_annotations.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. The StableHLO
-        // export of traced programs makes the same decision (refer to `entry_open_outputs`). Hidden reference states
-        // are always placed as declared, and so is every output of a program that runs as replicas without Shardy.
-        let public_open_outputs = entry_open_outputs(
+        // export of traced programs makes the same decision (refer to `entry_outputs_with_compiler_chosen_placement`).
+        // Hidden reference states are always placed as declared, and so is every output of a program that runs as
+        // replicas without Shardy.
+        let public_open_outputs = entry_outputs_with_compiler_chosen_placement(
             &output_types[..output_count],
             options.output_shardings(),
             &sharding_sources,
