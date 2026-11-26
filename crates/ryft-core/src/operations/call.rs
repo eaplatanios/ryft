@@ -1084,40 +1084,6 @@ impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for CallOperation<Ar
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Online partial evaluation rule for a staged `call` operation, which is ryft's analogue of JAX's call partial
-// evaluation rules. It splits the callee against the caller's knownness while preserving the `call` boundary on
-// both sides.
-//
-// The split fires whenever the knownness of the call inputs is mixed (i.e., some inputs are known and some are not).
-// All-known and all-unknown calls preserve the original boundary, and their callee is bound as a shared program (i.e.,
-// an interned callee, or a copy retained by the region transform cache of the callee), so that repeated calls of one
-// callee keep sharing one region on either side. Under a residual policy, the outputs of a pure all-known call that
-// only forward call inputs resolve to those inputs, and a residual planner that demands an output of such a call whose
-// callee saves interior values asks this operation to split the call on residual demand (refer to
-// `PartiallyEvaluatableOperation::split_on_residual_demand`). That split binds a known call that also returns those
-// values and a replay call that recomputes the demanded outputs from them, as JAX's `_pjit_partial_eval_custom` does.
-// Whether the mixed call's known inputs are concrete values of an eager known-side context or tracers into a live outer
-// trace does not matter, as in JAX's call partial evaluation rules, which always bind the known call. The known side is
-// bound through the default fold-or-residualize policy, which applies it under an eager context (e.g., the eager
-// context of a backend, which compiles and executes it) and stages it into the outer program under a staging context.
-// The `shard_map` rule follows the same policy.
-//
-// When a split fires, the callee is split through the shared
-// [`PartitionedProgram`](crate::partial::PartitionedProgram) machinery. The known side is bound into the
-// enclosing known-side context as a `call` over the known call inputs that it uses, and the residual side is
-// emitted as the residual `call` over the surviving unknown call inputs plus the known-side call's residual-edge
-// outputs. Residual edges that would merely repeat a known call input or a known call output are
-// [forwarded](crate::partial::PartitionedProgram::forward_residuals), so the residual call consumes that input or
-// output directly and the known-side call does not return the same value twice. For a pure callee (i.e., one without
-// effects, references, captures, or nominal type identities), both kinds of split are retained by the region transform
-// cache of the callee and bound as shared regions (refer to `split_call`), as JAX caches its call partial
-// evaluation per callee, knownness, and policy, so repeated and nested calls of one callee reuse one split instead of
-// partitioning and copying the callee at every call site. A callee with references or captures keeps its boundary,
-// and a callee with nominal type identities is split per call when its inputs are mixed. Effectful mixed calls also
-// share their splits, keyed by the driver's repeated-residual mode because that mode determines effect placement.
-// Effectful and identity-bearing all-known calls remain whole on residual demand.
 impl<V, C> PartiallyEvaluatableOperation<C> for CallOperation<ArrayIrType>
 where
     V: 'static + Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1136,6 +1102,33 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // This implementation splits the callee against the caller's knownness while preserving the `call` boundary on
+        // both sides. The split fires whenever the knownness of the call inputs is mixed (i.e., some inputs are known
+        // and some are not). All-known and all-unknown calls preserve the original boundary, and their callee is bound
+        // as a shared program (i.e., an interned callee, or a copy retained by the region transform cache of the
+        // callee), so that repeated calls of one callee keep sharing one region on either side. Under a residual
+        // policy, the outputs of a pure all-known call that only forward call inputs resolve to those inputs, and a
+        // residual planner that demands an output of such a call whose callee saves interior values asks this operation
+        // to split the call on residual demand (i.e., `PartiallyEvaluatableOperation::split_on_residual_demand`).
+        // That split binds a known call that also returns those values and a replay call that recomputes the demanded
+        // outputs from them. Whether the mixed call's known inputs are concrete values of an eager known-side context
+        // or tracers into a live outer trace does not matter, as in JAX's call partial evaluation rules, which always
+        // bind the known call. The known side is bound through the default fold-or-residualize policy, which applies it
+        // under an eager context (e.g., the eager context of a backend, which compiles and executes it) and stages it
+        // into the outer program under a staging context. The `shard_map` rule follows the same policy. When a split
+        // fires, the callee is split through the shared `PartitionedProgram` machinery. The known side is bound into
+        // the enclosing known-side context as a `call` over the known call inputs that it uses, and the residual side
+        // is emitted as the residual `call` over the surviving unknown call inputs plus the known-side call's
+        // residual-edge outputs. Residual edges that would merely repeat a known call input or a known call output
+        // are forwarded, so the residual call consumes that input or output directly and the known-side call does not
+        // return the same value twice. For a pure callee (i.e., one without effects, references, captures, or nominal
+        // type identities), both kinds of split are retained by the region transform cache of the callee and bound as
+        // shared regions, so repeated and nested calls of one callee reuse one split instead of partitioning and
+        // copying the callee at every call site. A callee with references or captures keeps its boundary, and a callee
+        // with nominal type identities is split per call when its inputs are mixed. Effectful mixed calls also share
+        // their splits, keyed by the driver's repeated-residual mode because that mode determines effect placement.
+        // Effectful and identity-bearing all-known calls remain whole on residual demand.
+
         let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
         let callee = driver.region(0)?;
         if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
@@ -1148,6 +1141,7 @@ where
             }
             return Ok(outputs);
         }
+
         // The split calls have separate boundaries. Preserve the original call's staged result types when its caller
         // supplied staged declarations.
         let output_types = if inputs.iter().any(|input| input.declared_type().is_some()) {
@@ -1156,6 +1150,7 @@ where
         } else {
             None
         };
+
         let declare_outputs = |outputs| {
             if let Some(output_types) = &output_types {
                 PartialEvaluationValue::with_declared_output_types(outputs, output_types)
@@ -1194,26 +1189,31 @@ where
         if accesses_references {
             return fold_or_residualize_call(self, context, driver, inputs);
         }
+
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
-        // split boundary would leave them naming a compacted or absent capture prefix, which fails lowering at best and
-        // silently aliases an unrelated leading input at worst. Preserve the original call boundary for any callee
+        // split boundary would leave them naming a compacted or absent capture prefix, which fails lowering at best
+        // and silently aliases an unrelated leading input at worst. Preserve the original call boundary for any callee
         // whose closure still holds a capture constant.
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
             return fold_or_residualize_call(self, context, driver, inputs);
         }
+
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
         let partition = driver.partition_program(context, callee, input_known.as_slice())?;
+
         // A trivial partition, whose known program contains no instructions, hoists no work because its known side
         // can only forward known inputs as residual edges. Keep the original boundary and let the default materialize
         // those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
             return fold_or_residualize_call(self, context, driver, inputs);
         }
+
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
         // merely repeat (i.e., JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
         let partition = partition.forward_residuals()?;
+
         // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
         // members of the original lifted-capture prefix that it still uses. The residual callee's inputs are call
         // inputs, known call outputs, and residual edges, which never form a capture prefix. The guard above already
@@ -1271,21 +1271,17 @@ where
         {
             return Ok(None);
         }
-        let partition =
-            |callee: RegionRef<'_, V, C::Operation>| context.partition_residual_demand(callee, demanded_outputs);
+
         let kind = CallSplitKind::ResidualDemand(demanded_outputs.to_vec());
-        let mut outputs = split_call(self, context, driver, inputs, kind, &partition)?;
+        let mut outputs =
+            split_call(self, context, driver, inputs, kind, &|callee: RegionRef<'_, V, C::Operation>| {
+                context.partition_residual_demand(callee, demanded_outputs)
+            })?;
         let replayed_outputs = outputs.split_off(callee.output_types().len());
         Ok(Some(ResidualDemandSplit::new(outputs, replayed_outputs)?))
     }
 }
 
-// Batching rule for [`CallOperation`]. The callee region is rebatched over the mapped input axes through
-// [`BatchingDriver::batch_program`], and the batched call is bound through `context.parent()` with the batched callee
-// attached again. An eager parent (e.g., the eager context of a backend, which compiles and executes it) applies the
-// batched call immediately, a staging parent stages it into the enclosing program, and a differentiation parent
-// dispatches it through its own `call` JVP rule, which is what serves `vmap` nested inside `gradient` and
-// `linearize` closures.
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for CallOperation<ArrayIrType>
 where
     C: Context<Type = ArrayIrType>,
@@ -1299,7 +1295,14 @@ where
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        // The callee region is rebatched over the mapped input axes through `BatchingDriver::batch_program`, and
+        // the batched call is bound through `context.parent()` with the batched callee attached again. An eager parent
+        // (e.g., the eager context of a backend, which compiles and executes it) applies the batched call immediately,
+        // a staging parent stages it into the enclosing program, and a differentiation parent dispatches it through its
+        // own `call` Jacobian-Vector Product (JVP) rule, which is what serves `vmap` nested inside `gradient` and
+        // `linearize` closures.
         let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
+
         // Only an all-replicated call at an anonymous level can bind its original callee unchanged. A named level must
         // rebatch the callee even then, because the callee may read that level by name (e.g., through `axis_index`),
         // and binding it unchanged would let that read escape the level that binds it.
@@ -1315,6 +1318,7 @@ where
                 .map(ArrayIrBatch::replicated)
                 .collect::<Vec<_>>());
         }
+
         // The canonical array IR transform threads one leading dimension through the callee as its first input and
         // first output. Treat the input as an additional explicit capture, so that the original capture order remains,
         // and drop the bookkeeping output from the callee itself rather than after the call. The output only forwards
@@ -1339,8 +1343,9 @@ where
             ArrayIrType::Array(r#type) => Some(r#type.clone()),
             _ => None,
         };
-        // The batched callee is created by this transform, so its declared input types are only traced types, and the
-        // batched call is a derived call in every case, which places each input at the effective boundary of the
+
+        // The batched callee is created by this transform, so its declared input types are only traced types, and
+        // the batched call is a derived call in every case, which places each input at the effective boundary of the
         // original call for its items (refer to `with_derived_boundary_shardings`). The boundary shardings gain the
         // batch dimension of each batched value (refer to `batched_boundary_sharding`), and the leading extent input
         // has none.
@@ -1352,6 +1357,7 @@ where
                 }))
                 .collect::<Result<_, _>>()?,
         );
+
         let operation = Self {
             keeps_input_placements: self.keeps_input_placements,
             derived_input_shardings,
@@ -1378,6 +1384,7 @@ where
         } else {
             operation
         };
+
         let outputs = context.parent().bind(operation, vec![callee], &values)?;
         check_count!("output", outputs, axes.len(), ProgramError);
         outputs
@@ -1401,21 +1408,20 @@ where
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         // Rebatch the callee when inputs are mapped or when it can address the batching level by name. Only an
-        // all-replicated call at an anonymous level can bind its original callee unchanged.
-        //
-        // Unlike the forward mode and transpose rules below, this rebatching is deliberately not served from the
-        // callee region's retained transform cache. The batched program depends on live `BatchingContext` state (i.e.,
-        // the batch extent, the axis name, and the surrounding nesting), so caching it against the callee region and
-        // its input axes alone would risk exactly the unsound key reuse that the cache is designed to avoid. Caching it
-        // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
-        // (refer to its gate G8), through a batching policy hook returning `Option<key>` where `None` keeps a policy
+        // all-replicated call at an anonymous level can bind its original callee unchanged. Unlike the forward mode and
+        // transpose rules below, this rebatching is deliberately not served from the callee region's retained transform
+        // cache. The batched program depends on live `BatchingContext` state (i.e., the batch extent, the axis name,
+        // and the surrounding nesting), so caching it against the callee region and its input axes alone would risk
+        // exactly the unsound key reuse that the cache is designed to avoid. Caching it needs a complete key and a
+        // measured benefit, through a batching policy hook returning `Option<key>` where `None` keeps a policy
         // uncached, so that soundness stays opt-in per policy.
+        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let boundary = self.effective_boundary_input_shardings(
             &driver.region(0)?.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
+
         let batch_callee = ArrayBatch::common_batch_size(inputs)?.is_some() || context.axis_name().is_some();
         let (batched_callee, output_axes) = if batch_callee {
             let input_batch_axes = inputs
@@ -1432,6 +1438,7 @@ where
                     ProgramBatchingOutputAxesPolicy::Natural,
                 )?
                 .into_parts();
+
             // The core program batching pass returns canonical nonnegative physical positions.
             let output_axes = output_axes
                 .iter()
@@ -1443,10 +1450,11 @@ where
             let output_axes = vec![None; callee.output_types().len()];
             (callee.to_program(), output_axes)
         };
+
         let operation = Self::new(self.capture_count()).with_callee_region(batched_callee.entry_region_ref())?;
-        // The batched call is a derived call in every case, as in the batching rule of the array IR form, and its
-        // boundary shardings gain the batch dimension of each mapped value at its batch axis (refer to
-        // `batched_boundary_sharding`).
+
+        // The batched call is a derived call in every case, as in the batching rule of the array IR form,
+        // and its boundary shardings gain the batch dimension of each mapped value at its batch axis.
         let derived_input_shardings = Some(
             inputs
                 .iter()
@@ -1458,6 +1466,7 @@ where
                 })
                 .collect::<Result<_, _>>()?,
         );
+
         let operation = Self {
             keeps_input_placements: self.keeps_input_placements,
             derived_input_shardings,
@@ -1487,6 +1496,7 @@ where
         } else {
             operation
         };
+
         let outputs = context.parent().bind(
             operation,
             AttachedRegions::Callees(&[Arc::new(batched_callee)]),
@@ -1499,6 +1509,8 @@ where
             .collect::<Result<Vec<_>, _>>()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Capture-free forward mode rule (i.e., JVP rule) for [`CallOperation`]. When the primal and tangent contexts are
 // shared (e.g., for `jvp` and for the fused program that a `rematerialize` rule partitions), the rule binds one fused
