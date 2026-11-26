@@ -308,34 +308,29 @@ impl Array {
             .place_with_request(session, target.into(), false, ValueComparison::of_session(session)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     // TODO(eaplatanios): Should this be moved to `placement.rs`?
-    /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the
-    /// target. This is the `ryft` analogue of JAX's `jax.device_put(arr, sharding, donate=True)`.
+    /// Moves this array to the provided placement, consuming `self` and donating its source buffers to the target.
     ///
-    /// Donation is best effort, as in JAX. Only the compiled reshard on the mesh of this array donates its input, and
-    /// PJRT may then reuse a source buffer for a target shard, which can save the memory of the source array for
-    /// large training tensors. Nothing guarantees that saving. A buffer can be reused only when every device holds a
-    /// shard of the same type before and after the reshard, which is when the lowering pairs the output of the
-    /// reshard with its donated input (e.g., completing a pending sum keeps the buffers of a uniquely owned array on
-    /// the CPU plugin, as `jax.jit` with a donated argument does), and not when the shards change shape (e.g., moving
-    /// a uniquely owned `64x64` array from row shards to replicas on four devices allocates four new buffers). The
-    /// other strategies (e.g., moves of whole shards, shard regions, a reshard across meshes, or the host fallback) do
-    /// not donate, a buffer that another handle shares is never donated, and PJRT may still allocate new output
-    /// buffers. Because `self` is consumed at the language boundary, the donated buffers are not
-    /// observable to the caller after this function returns. Rust ownership therefore enforces the same invariant that
-    /// the `donate=True` flag carries in JAX, without exposing a runtime hazard.
+    /// Donation is best effort. Only the compiled reshard on the mesh of this array donates its input, and PJRT may
+    /// then reuse a source buffer for a target shard, which can save the memory of the source array for large training
+    /// tensors. Nothing guarantees that saving. A buffer can be reused only when every device holds a shard of the same
+    /// type before and after the reshard, which is when the lowering pairs the output of the reshard with its donated
+    /// input (e.g., completing a pending sum keeps the buffers of a uniquely owned array on the CPU plugin), and not
+    /// when the shards change shape (e.g., moving a uniquely owned `64x64` array from row shards to replicas on four
+    /// devices allocates four new buffers). The other strategies (e.g., moves of whole shards, shard regions, a reshard
+    /// across meshes, or the host fallback) do not donate, a buffer that another handle shares is never donated, and
+    /// PJRT may still allocate new output buffers. Because `self` is consumed at the language boundary, the donated
+    /// buffers are not observable to the caller after this function returns.
     ///
     /// The strategies follow [`Self::to_placement`], and donation never changes which of them is chosen, so the
     /// compiled reshard of an array with a pending reduction (i.e., unreduced axes in its runtime sharding) completes
     /// or keeps the reduction on the devices with or without donation, and a change of reduction state that the
     /// compiled reshard cannot make (e.g., introducing a pending maximum, or completing a pending maximum of floating
-    /// point values) takes the host fallback from both entry points. Donation changes only what follows a
-    /// compiled reshard whose execution fails while this array holds its buffers exclusively, which may have handed
-    /// them to PJRT. [`Self::to_placement`] then still falls back to a host transfer, whereas this function returns the
-    /// error. When another handle shares the buffers of this array (e.g., a clone that the caller keeps), nothing can
-    /// be donated, and this function falls back as [`Self::to_placement`] does.
+    /// point values) takes the host fallback from both entry points. Donation changes only what follows a compiled
+    /// reshard whose execution fails while this array holds its buffers exclusively, which may have handed them to
+    /// PJRT. [`Self::to_placement`] then still falls back to a host transfer, whereas this function returns the error.
+    /// When another handle shares the buffers of this array (e.g., a clone that the caller keeps), nothing can be
+    /// donated, and this function falls back as [`Self::to_placement`] does.
     ///
     /// # Parameters
     ///
@@ -346,9 +341,10 @@ impl Array {
         self.place_with_request(session, target.into(), true, ValueComparison::of_session(session)?)
     }
 
-    // TODO(eaplatanios): Should this be moved to `placement.rs`?
-    /// Places this array as `request` asks, which [`Self::to_placement`] and [`Self::into_placement`] do with the
-    /// [`ValueComparison`] of `session`. The request is resolved against this array (refer to
+    // TODO(eaplatanios): Should this be moved to `placement.rs`? Also, should we rename `run_placement_dispatch` and
+    //  `place_from_other_client`? Are there better names for them that are more consistent with our conventions?
+    /// Places this array as `request` asks, which [`Self::to_placement`] and [`Self::into_placement`]
+    /// do with the [`ValueComparison`] of `session`. The request is resolved against this array (refer to
     /// [`Self::resolve_placement_request`]) and placed with [`Self::run_placement_dispatch`], or with
     /// [`Self::place_from_other_client`] for an array of another PJRT client than that of `session`. Only a request
     /// that names neither devices nor a sharding (i.e., an [`PlacementRequest::InPlace`] request, which names only a
@@ -365,8 +361,8 @@ impl Array {
     ///
     ///   - `session`: [`Session`] that provides the PJRT client and the compilation cache.
     ///   - `request`: [`PlacementRequest`] that specifies the target.
-    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array for
-    ///     its output (refer to [`Self::run_placement_dispatch`]).
+    ///   - `donate`: Whether a compiled reshard on the mesh of this array may reuse the buffers of this array
+    ///     for its output (refer to [`Self::run_placement_dispatch`]).
     ///   - `comparison`: [`ValueComparison`] of the values of the processes, if this placement makes one.
     pub(super) fn place_with_request(
         self,
@@ -404,6 +400,8 @@ impl Array {
         let output = if locally_assigned && !in_place { output.with_new_identity() } else { output };
         Ok(output.with_locally_assigned(locally_assigned && in_place).with_value_comparison(verdict))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     // TODO(eaplatanios): Should this be moved to `placement.rs` (and maybe more of the functions of this module)?
     /// Checks that `session` can place this array onto `request`, which [`Self::place_with_request`] and the
