@@ -16,7 +16,7 @@ use ryft_core::{
     LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized,
     PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME,
     Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
-    declared_input_sharding, states_boundary_placement,
+    declared_input_sharding,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -1394,12 +1394,12 @@ fn requests_placement(
     target_platform: Option<&str>,
     includes_memory_requests: bool,
 ) -> bool {
-    let overrides = options
+    let mut overrides = options
         .input_shardings()
         .into_iter()
         .flatten()
         .chain(options.output_shardings().into_iter().flatten());
-    states_boundary_placement(overrides) || program.has_placement_requests(target_platform, includes_memory_requests)
+    overrides.next().is_some() || program.has_placement_requests(target_platform, includes_memory_requests)
 }
 
 /// Validates that the staged `output_types` carry the output sharding overrides of `options` (i.e.,
@@ -1934,7 +1934,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_states_boundary_placement() {
+    fn test_compile_statefully_with_captures_commits_outputs_for_boundary_shardings() {
         // A nullary function that returns an uncommitted capture on a mesh of one device leaves its result uncommitted
         // when it states no placement at its boundary, also when its options hold an empty list of input overrides,
         // which states nothing, and commits it when an output override states a placement.
@@ -1963,12 +1963,10 @@ mod tests {
             [
                 committed(Options::new(mesh.clone())),
                 committed(Options::new(mesh.clone()).with_input_shardings(vec![])),
-                committed(Options::new(mesh.clone()).with_output_shardings(vec![replicated.clone()])),
+                committed(Options::new(mesh.clone()).with_output_shardings(vec![replicated])),
             ],
             [false, false, true],
         );
-        assert!(!states_boundary_placement([]));
-        assert!(states_boundary_placement([&replicated]));
     }
 
     #[test]

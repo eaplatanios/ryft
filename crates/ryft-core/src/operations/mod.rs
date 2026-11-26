@@ -62,7 +62,7 @@ pub use attention::{
 };
 pub use call::{
     CALL_OPERATION_NAME, CallOperation, RegionPlacementRequests, RequestedPlacement, boundary_input_type,
-    declared_input_sharding, states_boundary_placement,
+    declared_input_sharding,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,
