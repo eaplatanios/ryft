@@ -221,33 +221,34 @@ const COMBINED_CONTRIBUTIONS_ERROR_MESSAGE: &str = "cannot place an array with a
      placement would have to combine the contributions of the pending reduction (complete the reduction first)";
 
 impl Array {
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Checks, from metadata alone, a placement of this array, whose PJRT client is not that of `session`, onto
-    /// `target`, which [`Self::place_across_clients`] and the admission of an [`Array`] leaf of [`Session::place`]
-    /// both call, so that they admit the same placements. PJRT copies buffers only within one client, so such a
-    /// placement reads the value back and uploads it. The target session must recognize the mesh (refer to
-    /// [`validate_mesh_devices`]). For a value with bytes, the transfer must keep no distinct contributions apart
-    /// (refer to [`keeps_some_contributions`]). Each process that owns a target device must be able to read
+    /// `target`, which [`Self::place_across_clients`] and the admission of an [`Array`] leaf of [`Session::place`] both
+    /// call, so that they admit the same placements. PJRT copies buffers only within one client, so such a placement
+    /// reads the value back and uploads it. The target session must recognize the mesh. For a value with bytes, the
+    /// transfer must keep no distinct contributions apart. Each process that owns a target device must be able to read
     /// the full value back. A [locally assigned](Self::is_locally_assigned) source gives each process its own value.
-    /// A standalone bridge between two fully local meshes permits different client process indices. Shared
-    /// distributed placement requires a common process numbering scheme and a single target owner, which
-    /// every participant identifies and checks against the source shard metadata.
+    /// A standalone bridge between two fully local meshes permits different client process indices. Shared distributed
+    /// placement requires a common process numbering scheme and a single target owner, which every participant
+    /// identifies and checks against the source shard metadata.
     fn validate_placement_from_other_client(&self, session: &Session, target: &Placement) -> Result<(), Error> {
         validate_mesh_devices(session, target.mesh())?;
+
         let layout = self.placement_layout(target.layout(), target.mesh(), target.sharding())?;
         validate_device_layout(session.client(), self.data_type(), layout.as_ref(), false)?;
+
         if self.data_type().is_zero() || self.shape().as_slice().contains(&0) {
             return Ok(());
         }
+
         if keeps_some_contributions(self.sharding(), target.sharding()) {
             return Err(PjrtError::invalid_argument(
-                "cannot place an array of another PJRT client onto a target that keeps the contributions of its \
-                 pending reduction or manual variation apart, because the transfer between the clients reads back \
-                 their combined value",
+                "cannot place an array of another PJRT client onto a target that keeps the contributions \
+                 of its pending reduction or manual variation apart, because the transfer between the clients reads \
+                 back their combined value",
             )
             .into());
         }
+
         let process_index = session.client().process_index()?;
         let devices = target.mesh().devices();
         let processes = devices.iter().map(Device::process_index).collect::<HashSet<_>>();
@@ -258,13 +259,15 @@ impl Array {
             }
             return Ok(());
         }
+
         if processes.len() > 1 {
             return Err(PjrtError::invalid_argument(
-                "cannot place an array of another PJRT client onto the devices of more than one process unless every \
-                 process holds its own value of the array",
+                "cannot place an array of another PJRT client onto the devices of more than one process \
+                 unless every process holds its own value of the array",
             )
             .into());
         }
+
         let owner = devices[0].process_index();
         if owner == process_index {
             let source_process = self.client().process_index()?;
@@ -278,27 +281,33 @@ impl Array {
             }
         }
 
-        // Only the owner of the target reads this array back. All participants check the source shards using the
-        // common process numbering before the owner checks its buffers.
+        // Only the owner of the target reads this array back. All participants check the source shards
+        // using the common process numbering before the owner checks its buffers.
         validate_one_value_per_contribution(
             self.mesh(),
             self.sharding(),
             self.shards().iter().map(ArrayShard::descriptor),
         )?;
+
         if let Some(shard) = self.placement_planning_view().contribution_missing_from(owner) {
             return Err(PjrtError::invalid_argument(format!(
-                "cannot place an array of another PJRT client onto the devices of process {owner}, which holds no \
-                 replica of shard #{} of the array, because the transfer between the clients reads back the value \
-                 of the array on that process",
+                "cannot place an array of another PJRT client onto the devices of process {}, which holds no replica \
+                 of shard #{} of the array, because the transfer between the clients reads back the value of the array \
+                 on that process",
+                owner,
                 shard.index(),
             ))
             .into());
         }
+
         if owner == process_index {
             self.validate_host_readback()?;
         }
+
         Ok(())
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Places this array, whose PJRT client is not that of `session`, onto `target` as an array of `session`, as JAX
     /// places an array onto the devices of another backend. PJRT copies buffers only within one client, so this
