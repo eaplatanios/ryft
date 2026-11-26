@@ -312,7 +312,7 @@ where
 
     #[inline]
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool {
-        has_placement_requests_in_region(self.entry_region_ref(), target_platform, includes_memory_requests)
+        RegionPlacementSummary::new(self.entry_region_ref(), target_platform).has_requests(includes_memory_requests)
     }
 
     #[inline]
@@ -321,6 +321,156 @@ where
         output_count: usize,
         constant_sharding: F,
     ) -> Vec<Option<OutputShardingSource>> {
+        /// Returns the source of the sharding of each output of `region`, which
+        /// [`ProgramLoweringExtension::output_sharding_sources`] describes, with [`OutputShardingSource::Argument`]
+        /// naming an input of `region`. An output that returns a [`RetainedArray`] has the placement of that array,
+        /// which enters the executable as a hidden argument with that placement, and which has no buffer whose
+        /// placement the compiler could report when it has the zero data type. The placements of the callee regions
+        /// of `jit_call`s are computed once per callee and memoized in `callee_sources`, because repeated calls share
+        /// their callee region. The inputs of `region` and the producer of each of its values, together with the
+        /// position of that value among the outputs of its producer, are indexed once, so that following an output back
+        /// to an input costs one lookup per step rather than a scan of the inputs or of the outputs of an instruction.
+        fn region_output_sharding_sources<O: LowerableOperationFamily, F: Fn(&RetainedArray) -> Sharding>(
+            region: RegionRef<'_, Constant, O>,
+            constant_sharding: &F,
+            callee_sources: &mut HashMap<RegionId, Rc<[Option<OutputShardingSource>]>>,
+        ) -> Rc<[Option<OutputShardingSource>]> {
+            let mut producers = vec![None; region.atoms().len()];
+            for (instruction_index, instruction) in region.instructions().iter().enumerate() {
+                for (output_index, output) in instruction.outputs().iter().enumerate() {
+                    producers[output.index()] = Some((instruction_index, output_index));
+                }
+            }
+
+            // A value that is several inputs is placed as the first of them, so later positions are visited first.
+            let mut input_positions = vec![None; region.atoms().len()];
+            for (position, input) in region.input_ids().iter().enumerate().rev() {
+                input_positions[input.index()] = Some(position);
+            }
+
+            let mut output_source = |output_id: AtomId| {
+                let mut value_id = output_id;
+                loop {
+                    let Some((instruction_index, output_index)) = producers[value_id.index()] else {
+                        if let Some(Constant::Session(constant)) = region.atoms()[value_id.index()].as_constant() {
+                            return Some(OutputShardingSource::Determined(constant_sharding(constant)));
+                        }
+
+                        return input_positions[value_id.index()].map(OutputShardingSource::Argument);
+                    };
+
+                    let instruction = &region.instructions()[instruction_index];
+                    let operation = instruction.operation();
+                    let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
+                        match operation.target() {
+                            Some(PlacementRequest::Resolved(target)) => {
+                                return Some(OutputShardingSource::Determined(target.sharding().clone()));
+                            }
+                            Some(PlacementRequest::Device { .. }) => {
+                                // A device target completes a pending reduction over mesh axes of size one, so its
+                                // result can have another sharding than its input, which is then the placement of the
+                                // result.
+                                let sharding = |atom: AtomId| match region.atoms()[atom.index()].r#type().as_ref() {
+                                    Type::Array(array_type) => array_type.sharding().cloned(),
+                                    _ => None,
+                                };
+
+                                let output_sharding = sharding(instruction.outputs()[output_index]);
+                                if output_sharding != sharding(*instruction.inputs().first()?) {
+                                    return output_sharding.map(OutputShardingSource::Determined);
+                                }
+
+                                0
+                            }
+                            Some(PlacementRequest::InPlace { .. }) | None => {
+                                // An in-place target leaves its input on the devices where it lives with its sharding,
+                                // so the result is placed as its input is.
+                                0
+                            }
+                        }
+                    } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<TransferToMemoryOperation>().is_some()
+                    {
+                        // These operations return each of their inputs as the output at the same position, and a memory
+                        // transfer keeps the devices and the sharding of its input like an in-place `place` target
+                        // does.
+                        output_index
+                    } else if let Some(broadcast) = operation.projected_payload::<BroadcastOperation>() {
+                        let source = region.atoms()[instruction.inputs().first()?.index()].r#type();
+                        let Type::Array(source) = source.as_ref() else { return None };
+                        let target = broadcast.output_type();
+
+                        // A transpose can forget tracked sharding to match an untracked cotangent type. Keep the split
+                        // chosen by an explicit placement. An auto mesh still leaves this choice to the partitioner.
+                        let explicit_mesh = source.sharding().is_some_and(|sharding| {
+                            sharding.mesh().axes().iter().all(|axis| axis.r#type() == MeshAxisType::Explicit)
+                        });
+                        if !explicit_mesh
+                            || target.sharding().is_some()
+                            || source.shape() != target.shape()
+                            || !broadcast.output_axes().iter().copied().eq(0..source.rank())
+                            || !target.is_refined_by(source)
+                        {
+                            return None;
+                        }
+
+                        0
+                    } else {
+                        let call = operation.projected_payload::<JitCallOperation<Type>>()?;
+
+                        // The inputs of the callee receive the inputs of the call positionally, and the results of the
+                        // call are the results of the callee. A sharding override of the boundary of the callee places
+                        // the result or the forwarded input that it covers, as an execution of the callee does, which
+                        // its body cannot always show (e.g., a replicated override over auto mesh axes stages nothing).
+                        if let Some(sharding) = call.output_sharding(output_index) {
+                            return Some(OutputShardingSource::Determined(sharding.clone()));
+                        }
+
+                        let callee = *instruction.regions().first()?;
+                        let sources = match callee_sources.get(&callee) {
+                            Some(sources) => Rc::clone(sources),
+                            None => {
+                                let sources = region_output_sharding_sources(
+                                    region.with_id(callee).ok()?,
+                                    constant_sharding,
+                                    callee_sources,
+                                );
+                                callee_sources.insert(callee, Rc::clone(&sources));
+                                sources
+                            }
+                        };
+
+                        match sources.get(output_index)?.as_ref()? {
+                            OutputShardingSource::Determined(sharding) => {
+                                return Some(OutputShardingSource::Determined(sharding.clone()));
+                            }
+                            OutputShardingSource::Argument(index) => {
+                                let actual = region.atoms()[instruction.inputs().get(*index)?.index()].r#type();
+                                let callee = region.with_id(callee).ok()?;
+                                let declared = callee.input_types();
+                                match (actual.as_ref(), declared.get(*index)?) {
+                                    (Type::Array(actual), declared) => {
+                                        match call.boundary_input_sharding(*index, actual, declared) {
+                                            Some(sharding) => {
+                                                return Some(OutputShardingSource::Determined(sharding.into_owned()));
+                                            }
+                                            None => *index,
+                                        }
+                                    }
+                                    _ => *index,
+                                }
+                            }
+                        }
+                    };
+
+                    value_id = *instruction.inputs().get(input_index)?;
+                }
+            };
+
+            region.output_ids().iter().map(|&output_id| output_source(output_id)).collect()
+        }
+
         let mut callee_sources = HashMap::new();
         region_output_sharding_sources(self.entry_region_ref(), &constant_sharding, &mut callee_sources)[..output_count]
             .to_vec()
@@ -355,31 +505,6 @@ impl ShardingLoweringExtension for Sharding {
             .collect();
         Ok(self.with_dimensions(dimensions)?)
     }
-}
-
-/// Returns whether `region` requests the placement of a value explicitly in any of the regions that lowering emits for
-/// it for `target_platform` (refer to [`ProgramLoweringExtension::has_placement_requests`] and
-/// [`RegionPlacementSummary::requests`]), every output of `region` being used. This is the one test of whether a
-/// program requests a placement, which commitment (refer to `commits_public_outputs` in `crate::compilation::domains`),
-/// whether a compiled function names the devices of its mesh, the placement decision of an eager call, and partial
-/// evaluation all read. It reads the requests that [`RegionPlacementSummary::requests`] retains with `region`, so it
-/// analyses each region once for each platform.
-pub(crate) fn has_placement_requests_in_region<V, O>(
-    region: RegionRef<'_, V, O>,
-    target_platform: Option<&str>,
-    includes_memory_requests: bool,
-) -> bool
-where
-    V: Value<Type = Type> + 'static,
-    O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
-{
-    RegionPlacementSummary::new(region, target_platform)
-        .requests()
-        .iter()
-        .any(|(request, _)| match request {
-            RequestedPlacement::Memory => includes_memory_requests,
-            RequestedPlacement::Devices(_) | RequestedPlacement::Sharding => true,
-        })
 }
 
 /// Placement request of one instruction of the program that lowering emits, as [`RegionPlacementSummary::requests`]
@@ -417,7 +542,7 @@ where
 
 /// Facts about the placements in the program that lowering emits for one region, every output of that region being
 /// used, which [`Self::new`] derives once for each region and retains with it. Every analysis of the placement
-/// requests of a region reads it: [`has_placement_requests_in_region`], [`requested_placement_mesh`], and the facts
+/// requests of a region reads it: [`Self::has_requests`], [`Self::requested_mesh`], and the facts
 /// that a call reads of its callee (refer to
 /// [`JitCallOperation::names_devices`] and [`JitCallOperation::requests_placement`]). It follows the regions that
 /// lowering emits for one target platform (refer to `omits_regions`), so it is retained for each platform.
@@ -474,6 +599,40 @@ impl RegionPlacementSummary {
     #[inline]
     pub(crate) fn requests(&self) -> &[(RequestedPlacement, &'static str)] {
         &self.requests
+    }
+
+    /// Returns whether the program requests the placement of a value explicitly (refer to [`Self::requests`]), counting
+    /// the requests that only move a value to another memory when `includes_memory_requests` is set. This is the one
+    /// test of whether a region requests a placement, which commitment (refer to `commits_public_outputs` in
+    /// `crate::compilation::domains`), whether a compiled function names the devices of its mesh, the placement
+    /// decision of an eager call, and partial evaluation all read (refer to
+    /// [`ProgramLoweringExtension::has_placement_requests`]).
+    pub(crate) fn has_requests(&self, includes_memory_requests: bool) -> bool {
+        self.requests.iter().any(|(request, _)| match request {
+            RequestedPlacement::Memory => includes_memory_requests,
+            RequestedPlacement::Devices(_) | RequestedPlacement::Sharding => true,
+        })
+    }
+
+    /// Returns the devices that the placement requests of the program name (refer to [`Self::requests`]), as the mesh
+    /// of a request that names devices together with the name of the operation that makes it, or [`None`] when no
+    /// request names devices. A device target is resolved as [`RequestedPlacement`] documents, and a request over a
+    /// named mesh of the same devices takes precedence over the canonical mesh (refer to
+    /// [`merge_requested_placement`]), so that the result does not depend on the order of the requests. The caller
+    /// merges the requests of other regions with [`merge_requested_placement`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::UnsupportedOperation`] when two requests name different devices, which no single mesh
+    /// runs.
+    pub(crate) fn requested_mesh(&self) -> Result<Option<(DeviceMesh, &'static str)>, Error> {
+        let mut requested = None;
+        for (request, operation) in self.requests.iter() {
+            if let RequestedPlacement::Devices(mesh) = request {
+                merge_requested_placement(&mut requested, Cow::Borrowed(mesh), operation)?;
+            }
+        }
+        Ok(requested.map(|(mesh, operation)| (mesh.into_owned(), operation)))
     }
 }
 
@@ -724,7 +883,7 @@ pub(crate) enum InstructionPlacementRequest<'o> {
 /// Returns the placement request that `operation` makes explicitly, if any. This is the one classification of the
 /// placement requests of a program, which both [`ProgramLoweringExtension::has_placement_requests`] (and through it
 /// whether a compiled function names the devices of its mesh, refer to `requests_placement` in
-/// `crate::compilation::domains`) and [`requested_placement_mesh`] project.
+/// `crate::compilation::domains`) and [`RegionPlacementSummary::requested_mesh`] project.
 pub(crate) fn placement_request<O: CoreOperation<Type = Type> + OperationPayloadProjection>(
     operation: &O,
 ) -> Option<InstructionPlacementRequest<'_>> {
@@ -742,40 +901,12 @@ pub(crate) fn placement_request<O: CoreOperation<Type = Type> + OperationPayload
     Some(InstructionPlacementRequest::Mesh(mesh))
 }
 
-/// Returns the devices that the placement requests of the program that lowering emits for `region` and
-/// `target_platform` name (refer to [`RegionPlacementSummary::requests`]), as the mesh of a request that names devices
-/// together with the name of the operation that makes it, or [`None`] when no such request names devices. A device
-/// target is resolved as [`RequestedPlacement`] documents, and a request over a named mesh of the same devices takes
-/// precedence over the canonical mesh (refer to [`merge_requested_placement`]), so that the result does not depend on
-/// the order of the requests. The caller merges the requests of other regions with [`merge_requested_placement`].
-///
-/// # Errors
-///
-/// Returns [`LoweringError::UnsupportedOperation`] when two requests name different devices, which no single mesh
-/// runs.
-pub(crate) fn requested_placement_mesh<'r, V, O>(
-    region: RegionRef<'r, V, O>,
-    target_platform: Option<&str>,
-) -> Result<Option<(Cow<'r, DeviceMesh>, &'static str)>, Error>
-where
-    V: Value<Type = Type> + 'static,
-    O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
-{
-    let mut requested = None;
-    for (request, operation) in RegionPlacementSummary::new(region, target_platform).requests().iter() {
-        if let RequestedPlacement::Devices(mesh) = request {
-            merge_requested_placement(&mut requested, Cow::Owned(mesh.clone()), operation)?;
-        }
-    }
-    Ok(requested)
-}
-
 /// Merges `mesh`, the devices that a placement request of the operation named `operation` names, into `requested`, the
 /// request that names devices among those seen before it, if any, together with the name of its operation. A request
 /// over the canonical mesh of one device (i.e., [`LogicalMesh::single_device`], over which a device target whose input
-/// tracks no mesh is resolved, refer to [`requested_placement_mesh`]) gives way to a request over another logical mesh
-/// of the same device, whichever comes first, so that a bare device and a named mesh of that device select the named
-/// mesh in either order. Requests over two named meshes of the same devices keep the first.
+/// tracks no mesh is resolved, refer to [`RegionPlacementSummary::requested_mesh`]) gives way to a request over another
+/// logical mesh of the same device, whichever comes first, so that a bare device and a named mesh of that device select
+/// the named mesh in either order. Requests over two named meshes of the same devices keep the first.
 ///
 /// # Errors
 ///
@@ -931,140 +1062,6 @@ pub(crate) fn entry_open_outputs(
                     .is_some_and(|sharding| sharding.dimensions().contains(&ShardingDimension::Unconstrained))
         })
         .collect()
-}
-
-/// Returns the source of the sharding of each output of `region`, which
-/// [`ProgramLoweringExtension::output_sharding_sources`] describes, with [`OutputShardingSource::Argument`] naming an
-/// input of `region`. An output that returns a [`RetainedArray`] has the placement of that array, which enters the
-/// executable as a hidden argument with that placement, and which has no buffer whose placement the compiler could
-/// report when it has the zero data type. The placements of the callee regions of `jit_call`s are computed once per
-/// callee and memoized in `callee_sources`, because repeated calls share their callee region. The inputs of `region`
-/// and the producer of each of its values, together with the position of that value among the outputs of its producer,
-/// are indexed once, so that following an output back to an input costs one lookup per step rather than a scan of the
-/// inputs or of the outputs of an instruction.
-fn region_output_sharding_sources<O: LowerableOperationFamily>(
-    region: RegionRef<'_, Constant, O>,
-    constant_sharding: &impl Fn(&RetainedArray) -> Sharding,
-    callee_sources: &mut HashMap<RegionId, Rc<[Option<OutputShardingSource>]>>,
-) -> Rc<[Option<OutputShardingSource>]> {
-    let mut producers = vec![None; region.atoms().len()];
-    for (instruction_index, instruction) in region.instructions().iter().enumerate() {
-        for (output_index, output) in instruction.outputs().iter().enumerate() {
-            producers[output.index()] = Some((instruction_index, output_index));
-        }
-    }
-    // A value that is several inputs is placed as the first of them, so later positions are visited first.
-    let mut input_positions = vec![None; region.atoms().len()];
-    for (position, input) in region.input_ids().iter().enumerate().rev() {
-        input_positions[input.index()] = Some(position);
-    }
-    let mut output_source = |output_id: AtomId| {
-        let mut value_id = output_id;
-        loop {
-            let Some((instruction_index, output_index)) = producers[value_id.index()] else {
-                if let Some(Constant::Session(constant)) = region.atoms()[value_id.index()].as_constant() {
-                    return Some(OutputShardingSource::Determined(constant_sharding(constant)));
-                }
-                return input_positions[value_id.index()].map(OutputShardingSource::Argument);
-            };
-            let instruction = &region.instructions()[instruction_index];
-            let operation = instruction.operation();
-            let input_index = if let Some(operation) = operation.projected_payload::<PlaceOperation>() {
-                match operation.target() {
-                    Some(PlacementRequest::Resolved(target)) => {
-                        return Some(OutputShardingSource::Determined(target.sharding().clone()));
-                    }
-                    Some(PlacementRequest::Device { .. }) => {
-                        // A device target completes a pending reduction over mesh axes of size one, so its result can
-                        // have another sharding than its input, which is then the placement of the result.
-                        let sharding = |atom: AtomId| match region.atoms()[atom.index()].r#type().as_ref() {
-                            Type::Array(array_type) => array_type.sharding().cloned(),
-                            _ => None,
-                        };
-                        let output_sharding = sharding(instruction.outputs()[output_index]);
-                        if output_sharding != sharding(*instruction.inputs().first()?) {
-                            return output_sharding.map(OutputShardingSource::Determined);
-                        }
-                        0
-                    }
-                    // An in-place target leaves its input on the devices where it lives with its sharding, so the
-                    // result is placed as its input is.
-                    Some(PlacementRequest::InPlace { .. }) | None => 0,
-                }
-            } else if operation.projected_payload::<StopGradientOperation<ArrayType>>().is_some()
-                || operation.projected_payload::<TagOperation<ArrayType>>().is_some()
-                || operation.projected_payload::<TransferToMemoryOperation>().is_some()
-            {
-                // These operations return each of their inputs as the output at the same position, and a memory
-                // transfer keeps the devices and the sharding of its input like an in-place `place` target does.
-                output_index
-            } else if let Some(broadcast) = operation.projected_payload::<BroadcastOperation>() {
-                let source = region.atoms()[instruction.inputs().first()?.index()].r#type();
-                let Type::Array(source) = source.as_ref() else { return None };
-                let target = broadcast.output_type();
-                // A transpose can forget tracked sharding to match an untracked cotangent type. Keep the split
-                // chosen by an explicit placement. An auto mesh still leaves this choice to the partitioner.
-                let explicit_mesh = source.sharding().is_some_and(|sharding| {
-                    sharding.mesh().axes().iter().all(|axis| axis.r#type() == MeshAxisType::Explicit)
-                });
-                if !explicit_mesh
-                    || target.sharding().is_some()
-                    || source.shape() != target.shape()
-                    || !broadcast.output_axes().iter().copied().eq(0..source.rank())
-                    || !target.is_refined_by(source)
-                {
-                    return None;
-                }
-                0
-            } else if let Some(call) = operation.projected_payload::<JitCallOperation<Type>>() {
-                // The inputs of the callee receive the inputs of the call positionally, and the results of the call
-                // are the results of the callee. A sharding override of the boundary of the callee places the result
-                // or the forwarded input that it covers, as an execution of the callee does, which its body cannot
-                // always show (e.g., a replicated override over auto mesh axes stages nothing).
-                if let Some(sharding) = call.output_sharding(output_index) {
-                    return Some(OutputShardingSource::Determined(sharding.clone()));
-                }
-                let callee = *instruction.regions().first()?;
-                let sources = match callee_sources.get(&callee) {
-                    Some(sources) => Rc::clone(sources),
-                    None => {
-                        let sources = region_output_sharding_sources(
-                            region.with_id(callee).ok()?,
-                            constant_sharding,
-                            callee_sources,
-                        );
-                        callee_sources.insert(callee, Rc::clone(&sources));
-                        sources
-                    }
-                };
-                match sources.get(output_index)?.as_ref()? {
-                    OutputShardingSource::Determined(sharding) => {
-                        return Some(OutputShardingSource::Determined(sharding.clone()));
-                    }
-                    OutputShardingSource::Argument(index) => {
-                        let actual = region.atoms()[instruction.inputs().get(*index)?.index()].r#type();
-                        let callee = region.with_id(callee).ok()?;
-                        let declared = callee.input_types();
-                        match (actual.as_ref(), declared.get(*index)?) {
-                            (Type::Array(actual), declared) => {
-                                match call.boundary_input_sharding(*index, actual, declared) {
-                                    Some(sharding) => {
-                                        return Some(OutputShardingSource::Determined(sharding.into_owned()));
-                                    }
-                                    None => *index,
-                                }
-                            }
-                            _ => *index,
-                        }
-                    }
-                }
-            } else {
-                return None;
-            };
-            value_id = *instruction.inputs().get(input_index)?;
-        }
-    };
-    region.output_ids().iter().map(|&output_id| output_source(output_id)).collect()
 }
 
 #[cfg(test)]
@@ -1665,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_requested_placement_mesh() {
+    fn test_region_placement_summary_requested_mesh() {
         let vector_type = test_vector_type(4);
         let first = Device::new(0, 0);
         let second = Device::new(1, 0);
@@ -1683,8 +1680,9 @@ mod tests {
                 .unwrap()
         };
         let requested = |program: &FlatProgram<Session>| {
-            requested_placement_mesh(program.entry_region_ref(), None)
-                .map(|requested| requested.map(|(mesh, _)| mesh.into_owned()))
+            RegionPlacementSummary::new(program.entry_region_ref(), None)
+                .requested_mesh()
+                .map(|requested| requested.map(|(mesh, _)| mesh))
                 .map_err(|error| error.to_string())
         };
         let memory = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
@@ -1763,8 +1761,8 @@ mod tests {
                             .unwrap();
                 }
                 let program = function.source_program().program();
-                let requested = requested_placement_mesh(program.entry_region_ref(), None).unwrap();
-                assert_eq!(requested.map(|(requested, _)| requested.into_owned()), Some(mesh.clone()));
+                let requested = RegionPlacementSummary::new(program.entry_region_ref(), None).requested_mesh();
+                assert_eq!(requested.unwrap().map(|(requested, _)| requested), Some(mesh.clone()));
                 assert_eq!(program.pruned_for_lowering(None).unwrap().to_string(), program.to_string());
                 (mesh, RegionPlacementSummary::new(program.entry_region_ref(), None).requests().to_vec())
             })

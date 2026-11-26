@@ -41,7 +41,7 @@ use crate::compilation::domains::{
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
-use crate::lowering::extensions::{ShardingLoweringExtension, has_placement_requests_in_region};
+use crate::lowering::extensions::{RegionPlacementSummary, ShardingLoweringExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::lower_nested_program_inline;
 use crate::lowering::states::CollectiveLoweringState;
@@ -675,7 +675,7 @@ impl<T: CoreType> JitCallOperation<T> {
     /// Returns the device mesh that this call names (refer to [`Self::mesh`]), which is the mesh that it records when
     /// it states a placement at its boundary (refer to [`Self::states_boundary_placement`]) or when its callee requests
     /// a placement that names devices (i.e., any request except one that only moves a value to another memory, refer to
-    /// `has_placement_requests_in_region`), which `callee_names_devices` says and which is asked only when the call
+    /// `RegionPlacementSummary::has_requests`), which `callee_names_devices` says and which is asked only when the call
     /// records a mesh and states no placement at its boundary, and [`None`] otherwise. The mesh is recorded when the
     /// function is staged, from its whole program, so a call whose outputs pruning dropped (refer to
     /// `ProgramLoweringExtension::pruned_for_lowering`) can record a mesh that only a request of a dropped output
@@ -1149,7 +1149,7 @@ impl JitCallOperation<Type> {
         };
         // The call records its mesh when it is staged, for no target, so whether it still names devices is read for the
         // platform of this session, as the pruning of a compiled caller reads it (refer to `Self::names_devices`).
-        let names_devices = || has_placement_requests_in_region(callee, Some(target_platform), false);
+        let names_devices = || RegionPlacementSummary::new(callee, Some(target_platform)).has_requests(false);
         let function_assignment = || {
             let mesh = self.function_mesh.as_ref()?;
             if mesh.logical_mesh().is_named() {
@@ -1369,7 +1369,7 @@ impl JitCallOperation<Type> {
     /// Returns whether this call of `callee` requests the placement of a value explicitly, which is when the call names
     /// devices (refer to [`Self::names_devices`]) or the callee requests a placement anywhere in the regions that
     /// lowering emits for it, including one that only moves a value to another memory (refer to
-    /// `has_placement_requests_in_region`). Every such request commits every result of the call (refer to
+    /// `RegionPlacementSummary::has_requests`). Every such request commits every result of the call (refer to
     /// [`commits_public_outputs`]), which the placement decision of an eager application (refer to
     /// [`Self::eager_decision`]) and the forwarding of partial evaluation (refer to [`Self::returns_input_unchanged`])
     /// read from here, for the platform `target_platform` that the call is lowered for ([`None`] for no target). The
@@ -1381,8 +1381,8 @@ impl JitCallOperation<Type> {
         V: CoreValue<Type = Type> + 'static,
         O: CoreOperation<Type = Type> + OperationPayloadProjection + 'static,
     {
-        self.names_devices(|| has_placement_requests_in_region(callee, target_platform, false)).is_some()
-            || has_placement_requests_in_region(callee, target_platform, true)
+        let summary = || RegionPlacementSummary::new(callee, target_platform);
+        self.names_devices(|| summary().has_requests(false)).is_some() || summary().has_requests(true)
     }
 
     /// Returns, for each input of an application of this call to arguments of types `input_types`, whether the call
